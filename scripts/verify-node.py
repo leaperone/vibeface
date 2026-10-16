@@ -118,10 +118,13 @@ class Node:
         self.client = Client(self.url)
         self.process = None
         self.log = None
-        result = subprocess.run(
-            [str(binary), "init", "--data-dir", str(self.directory),
-             "--listen", f"127.0.0.1:{self.port}", "--root", str(workspace)],
-            capture_output=True, timeout=20)
+        try:
+            result = subprocess.run(
+                [str(binary), "init", "--data-dir", str(self.directory),
+                 "--listen", f"127.0.0.1:{self.port}", "--root", str(workspace)],
+                capture_output=True, timeout=45)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"{name}: CLI initialization timed out") from None
         require(result.returncode == 0, f"{name}: CLI initialization succeeds")
         self.configure(claude_bin=str(fixture), timeout_secs=60)
 
@@ -159,11 +162,14 @@ class Node:
 
     def pair(self, owner, network, username, password):
         invitation = owner.client.rpc("invite", roles=["gateway", "relay", "replica", "scheduler", "executor"])
-        result = subprocess.run(
-            [str(self.binary), "pair", "--data-dir", str(self.directory),
-             "--url", owner.url, "--network-id", network, "--code", invitation["code"],
-             "--username", username, "--password-stdin"],
-            input=(password + "\n").encode(), capture_output=True, timeout=40)
+        try:
+            result = subprocess.run(
+                [str(self.binary), "pair", "--data-dir", str(self.directory),
+                 "--url", owner.url, "--network-id", network, "--code", invitation["code"],
+                 "--username", username, "--password-stdin"],
+                input=(password + "\n").encode(), capture_output=True, timeout=40)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"{self.name}: CLI pairing timed out") from None
         require(result.returncode == 0, f"{self.name}: pinned CLI pairing succeeds")
 
 
@@ -247,6 +253,8 @@ def dispatch(client, value, status=200):
 def succeeded(client, node, operation_id):
     record = operation(client, node, operation_id)
     require(record is not None, "accepted operation is queryable")
+    if record["state"] in {"failed", "rejected", "unknown"}:
+        raise RuntimeError(f"operation {operation_id} reached {record['state']}")
     return record if record["state"] == "succeeded" else None
 
 
@@ -273,6 +281,16 @@ def verify_blobs(node, network):
         return len(rows)
     finally:
         connection.close()
+
+
+def verify_no_model_budget(nodes):
+    for node in nodes:
+        connection = sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True)
+        try:
+            used = connection.execute("SELECT COALESCE(SUM(used),0) FROM budget_days").fetchone()[0]
+            require(used == 0, "ordinary progress and replay never reserve management model budget")
+        finally:
+            connection.close()
 
 
 def acceptance(options):
@@ -390,7 +408,7 @@ def acceptance(options):
         a.stop()
         gate.touch(mode=0o600)
         wait_for("B finishes while A is offline", lambda: succeeded(c.client, b, "fixture-delayed-send"))
-        notification = "result:fixture-delayed-send"
+        notification = "result:fixture-delayed-send:succeeded"
         wait_for("C receives durable B result notification", lambda: any(n["notification_id"] == notification for n in c.client.rpc("notifications", client_id="phone")["notifications"]))
         wait_for("C receives live event stream update", lambda: len(stream.lines) > 0)
         after = c.client.rpc("conversation", conversation_id=conversation)
@@ -419,7 +437,7 @@ def acceptance(options):
         wait_for("B completes without any connected client", lambda: succeeded(b.client, b, "fixture-offline-send"))
         c.start()
         c.client.login("owner_c", password_c)
-        wait_for("persistent notification delivered after reconnect", lambda: any(n["notification_id"] == "result:fixture-offline-send" for n in c.client.rpc("notifications", client_id="phone")["notifications"]))
+        wait_for("persistent notification delivered after reconnect", lambda: any(n["notification_id"] == "result:fixture-offline-send:succeeded" for n in c.client.rpc("notifications", client_id="phone")["notifications"]))
         require(all(n["notification_id"] != notification for n in c.client.rpc("notifications", client_id="phone")["notifications"]), "client ACK remains durable after restart")
         passed("offline notifications replay after reconnect and per-client ACK persists", "real_nodes_with_stream_json_fixture")
 
@@ -449,7 +467,9 @@ def acceptance(options):
         wait_for("revoked node receives updated trust", lambda: revoked(c.client))
         a.client.rpc("operation", target_node=c.node_id, operation_id="anything", status=400)
         require(len(invocations(run)) == 3, "sync/restart/revocation never creates extra executor calls")
+        verify_no_model_budget(nodes)
         passed("revocation rejects further data or execution access")
+        passed("ordinary notifications and history replay use no management-model budget")
         report["status"] = "passed"
         report["fixture_invocations"] = len(invocations(run))
         report["event_count"] = count
