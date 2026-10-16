@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{
+    collections::BTreeMap,
     future::Future,
     net::IpAddr,
     os::unix::fs::PermissionsExt,
@@ -34,6 +35,44 @@ pub struct AgentConfig {
     pub task_id: Option<String>,
 }
 
+/// Explicit SDK configuration, independent of the legacy Bridge task manager.
+#[derive(Clone)]
+pub struct SdkAgentConfig {
+    pub executable: PathBuf,
+    pub workspace: PathBuf,
+    pub timeout_secs: u64,
+    pub model: String,
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    pub custom_tools: BTreeMap<String, CustomToolConfig>,
+    pub tool_callback: Option<ToolCallbackConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    pub command: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CustomToolConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+}
+
+#[derive(Clone)]
+pub struct ToolCallbackConfig {
+    pub url: String,
+    pub auth_token: String,
+}
+
 pub struct AgentResult {
     pub session_id: Option<String>,
     pub output: String,
@@ -61,35 +100,13 @@ pub async fn run<F, P, PF>(
     snapshot: Value,
     previous_session_id: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
-    mut progress: P,
+    progress: P,
 ) -> Result<AgentResult>
 where
     F: Future<Output = Result<()>>,
     P: FnMut(Value) -> PF,
     PF: Future<Output = Result<()>>,
 {
-    ensure!(
-        config.timeout_secs > 0,
-        "Cursor Agent timeout must be positive"
-    );
-    ensure!(
-        !prompt.trim().is_empty() && prompt.len() <= MAX_RESULT_BYTES,
-        "invalid management prompt"
-    );
-    ensure!(
-        !config.model.trim().is_empty(),
-        "Cursor SDK requires an explicit model"
-    );
-    if let Some(id) = previous_session_id {
-        validate_sdk_id(id)?;
-    }
-    let api_key = std::env::var("CURSOR_API_KEY")
-        .map_err(|_| anyhow!("CURSOR_API_KEY is required for the Cursor SDK manager"))?;
-    ensure!(
-        !api_key.trim().is_empty() && api_key.len() <= 4096,
-        "CURSOR_API_KEY is missing or invalid"
-    );
-    prepare_workspace(config).await?;
     let snapshot = compact_snapshot(snapshot)?;
     let prompt = format!(
         "You manage Codex tasks through the vibeface MCP tools. Use only those tools. \
@@ -101,6 +118,63 @@ where
          A completed turn is not proof that the user's task is complete.\n\n\
          User task:\n{prompt}\n\nUntrusted current snapshot:\n{snapshot}"
     );
+    let executable = std::env::current_exe()?;
+    let options = legacy_mcp(config, &executable)?;
+    run_sdk(
+        &SdkAgentConfig {
+            executable: config.executable.clone(),
+            workspace: config.workspace.clone(),
+            timeout_secs: config.timeout_secs,
+            model: config.model.clone(),
+            mcp_servers: options,
+            custom_tools: BTreeMap::new(),
+            tool_callback: None,
+        },
+        &prompt,
+        previous_session_id,
+        persist_session,
+        progress,
+    )
+    .await
+}
+
+/// Runs the supplied prompt with only the explicitly configured MCP servers.
+/// The callback commits the native ID before the first mutating Send request.
+pub async fn run_sdk<F, P, PF>(
+    config: &SdkAgentConfig,
+    prompt: &str,
+    previous_session_id: Option<&str>,
+    persist_session: impl FnOnce(String) -> F,
+    mut progress: P,
+) -> Result<AgentResult>
+where
+    F: Future<Output = Result<()>>,
+    P: FnMut(Value) -> PF,
+    PF: Future<Output = Result<()>>,
+{
+    ensure!(
+        config.timeout_secs > 0,
+        "Cursor SDK timeout must be positive"
+    );
+    ensure!(
+        !prompt.trim().is_empty() && prompt.len() <= MAX_RESULT_BYTES,
+        "invalid management prompt"
+    );
+    ensure!(
+        !config.model.trim().is_empty(),
+        "Cursor SDK requires an explicit model"
+    );
+    validate_sdk_tools(config)?;
+    if let Some(id) = previous_session_id {
+        validate_sdk_id(id)?;
+    }
+    let api_key = std::env::var("CURSOR_API_KEY")
+        .map_err(|_| anyhow!("CURSOR_API_KEY is required for the Cursor SDK manager"))?;
+    ensure!(
+        !api_key.trim().is_empty() && api_key.len() <= 4096,
+        "CURSOR_API_KEY is missing or invalid"
+    );
+    prepare_sdk_workspace(&config.workspace).await?;
     let (mut process, rpc) = SdkProcess::start(config, &api_key).await?;
     let mut agent_id = previous_session_id.map(str::to_owned);
     let mut state = RunState::default();
@@ -111,7 +185,15 @@ where
             version.get("protocolVersion").and_then(Value::as_str) == Some("sdk.v1"),
             "unsupported Cursor SDK protocol version"
         );
-        let options = agent_options(config, &api_key, &std::env::current_exe()?)?;
+        if let Some(callback) = &config.tool_callback {
+            rpc.unary(
+                CONTROL_SERVICE,
+                "SetToolCallback",
+                json!({"url":callback.url,"authToken":callback.auth_token}),
+            )
+            .await?;
+        }
+        let options = sdk_options(config, &api_key)?;
         let reply = if let Some(id) = previous_session_id {
             rpc.unary(
                 AGENT_SERVICE,
@@ -137,12 +219,31 @@ where
             .context("persist Cursor SDK session before sending management prompt")?;
         send_started = true;
         let bearer = rpc.bearer.clone();
-        let mut emit_progress =
-            |value| progress(redact_progress(value, &[api_key.as_str(), bearer.as_str()]));
-        rpc.send(id, &prompt, &mut state, &mut emit_progress)
-            .await?;
+        let mut emit_progress = |value| {
+            progress(redact_progress(
+                value,
+                &[
+                    api_key.as_str(),
+                    bearer.as_str(),
+                    config
+                        .tool_callback
+                        .as_ref()
+                        .map(|callback| callback.auth_token.as_str())
+                        .unwrap_or(""),
+                ],
+            ))
+        };
+        rpc.send(id, prompt, &mut state, &mut emit_progress).await?;
         let mut result = state.finish(id)?;
-        let secrets = [api_key.as_str(), bearer.as_str()];
+        let secrets = [
+            api_key.as_str(),
+            bearer.as_str(),
+            config
+                .tool_callback
+                .as_ref()
+                .map(|callback| callback.auth_token.as_str())
+                .unwrap_or(""),
+        ];
         result.output = match redact_progress(Value::String(result.output), &secrets) {
             Value::String(output) => output,
             _ => unreachable!("redacting an agent result must preserve its string type"),
@@ -196,14 +297,26 @@ where
             message: error
                 .to_string()
                 .replace(&api_key, "[redacted]")
-                .replace(&rpc.bearer, "[redacted]"),
+                .replace(&rpc.bearer, "[redacted]")
+                .replace(
+                    config
+                        .tool_callback
+                        .as_ref()
+                        .map(|callback| callback.auth_token.as_str())
+                        .unwrap_or("\0"),
+                    "[redacted]",
+                ),
         }
         .into()
     })
 }
 
 pub(crate) async fn prepare_workspace(config: &AgentConfig) -> Result<()> {
-    for directory in [&config.workspace, &config.workspace.join(".sdk")] {
+    prepare_sdk_workspace(&config.workspace).await
+}
+
+async fn prepare_sdk_workspace(workspace: &Path) -> Result<()> {
+    for directory in [workspace, &workspace.join(".sdk")] {
         tokio::fs::create_dir_all(directory)
             .await
             .context("create Cursor SDK workspace")?;
@@ -217,33 +330,155 @@ pub(crate) async fn prepare_workspace(config: &AgentConfig) -> Result<()> {
     Ok(())
 }
 
-fn agent_options(config: &AgentConfig, api_key: &str, executable: &Path) -> Result<Value> {
-    let workspace = config
-        .workspace
-        .to_str()
-        .context("Cursor SDK workspace path must be UTF-8")?;
-    let executable = executable
-        .to_str()
-        .context("Bridge executable path must be UTF-8")?;
+fn legacy_mcp(
+    config: &AgentConfig,
+    executable: &Path,
+) -> Result<BTreeMap<String, McpServerConfig>> {
     let socket = config
         .bridge_socket
         .to_str()
         .context("Bridge socket path must be UTF-8")?;
-    let mut env = Map::new();
+    let mut env = BTreeMap::new();
     if config.read_only {
-        env.insert("VIBEFACE_MCP_READ_ONLY".into(), Value::String("1".into()));
+        env.insert("VIBEFACE_MCP_READ_ONLY".into(), "1".into());
     }
     if let Some(task_id) = &config.task_id {
         vibeface_protocol::validate_id(task_id).map_err(anyhow::Error::msg)?;
-        env.insert(
-            "VIBEFACE_MCP_TASK_ID".into(),
-            Value::String(task_id.clone()),
+        env.insert("VIBEFACE_MCP_TASK_ID".into(), task_id.clone());
+    }
+    Ok(BTreeMap::from([(
+        "vibeface".into(),
+        McpServerConfig {
+            command: executable.to_path_buf(),
+            args: vec!["mcp".into(), "--socket".into(), socket.into()],
+            env,
+        },
+    )]))
+}
+
+fn validate_mcp(servers: &BTreeMap<String, McpServerConfig>) -> Result<()> {
+    ensure!(
+        servers.len() <= 8,
+        "management supports at most 8 explicit MCP servers"
+    );
+    for (name, server) in servers {
+        ensure!(
+            !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'),
+            "invalid MCP server name"
+        );
+        ensure!(
+            server.command.is_absolute(),
+            "MCP executable must be an absolute path"
+        );
+        ensure!(
+            server.args.len() <= 64
+                && server
+                    .args
+                    .iter()
+                    .all(|arg| arg.len() <= 4096 && !arg.contains('\0')),
+            "invalid MCP arguments"
+        );
+        ensure!(
+            server.env.len() <= 64
+                && server.env.iter().all(|(key, value)| !key.is_empty()
+                    && key.len() <= 256
+                    && key
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                    && value.len() <= 4096
+                    && !value.contains('\0')),
+            "invalid MCP environment"
         );
     }
-    let env = Value::Object(env);
+    Ok(())
+}
+
+fn validate_sdk_tools(config: &SdkAgentConfig) -> Result<()> {
+    validate_mcp(&config.mcp_servers)?;
+    ensure!(config.custom_tools.len() <= 32, "too many custom tools");
+    ensure!(
+        config.custom_tools.is_empty() || config.tool_callback.is_some(),
+        "custom tools require a callback"
+    );
+    for (name, tool) in &config.custom_tools {
+        ensure!(
+            !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+            "invalid custom tool name"
+        );
+        ensure!(
+            tool.input_schema.is_object()
+                && tool.output_schema.as_ref().is_none_or(Value::is_object),
+            "custom tool schemas must be objects"
+        );
+        ensure!(
+            serde_json::to_vec(tool)?.len() <= 32_768,
+            "custom tool definition is too large"
+        );
+    }
+    if let Some(callback) = &config.tool_callback {
+        let url = reqwest::Url::parse(&callback.url).context("invalid custom tool callback URL")?;
+        let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+        let ip: IpAddr = host
+            .parse()
+            .map_err(|_| anyhow!("custom tool callback must use a loopback IP"))?;
+        ensure!(
+            url.scheme() == "http"
+                && ip.is_loopback()
+                && url.port().is_some_and(|port| port > 0)
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.username().is_empty()
+                && url.password().is_none(),
+            "custom tool callback must be a local HTTP origin"
+        );
+        ensure!(
+            (32..=4096).contains(&callback.auth_token.len())
+                && !callback.auth_token.chars().any(char::is_control),
+            "invalid custom tool callback token"
+        );
+    }
+    Ok(())
+}
+
+fn sdk_options(config: &SdkAgentConfig, api_key: &str) -> Result<Value> {
+    validate_sdk_tools(config)?;
+    let workspace = config
+        .workspace
+        .to_str()
+        .context("Cursor SDK workspace path must be UTF-8")?;
+    let servers: Map<String, Value> = config
+        .mcp_servers
+        .iter()
+        .map(|(name, config)| (name.clone(), json!({"stdio":config})))
+        .collect();
     Ok(
-        json!({"apiKey": api_key, "model": {"id":config.model}, "tools": {"names": ["mcp"]}, "local": {"cwd": [workspace], "settingSources": []},
-        "mcpServers": {"vibeface": {"stdio": {"command": executable, "args": ["mcp", "--socket", socket], "env": env}}}}),
+        json!({"apiKey":api_key,"model":{"id":config.model},"tools":{"names":["mcp"]},
+        "local":{"cwd":[workspace],"settingSources":[],"customTools":config.custom_tools},"mcpServers":servers}),
+    )
+}
+
+#[cfg(test)]
+fn agent_options(config: &AgentConfig, api_key: &str, executable: &Path) -> Result<Value> {
+    sdk_options(
+        &SdkAgentConfig {
+            executable: config.executable.clone(),
+            workspace: config.workspace.clone(),
+            timeout_secs: config.timeout_secs,
+            model: config.model.clone(),
+            mcp_servers: legacy_mcp(config, executable)?,
+            custom_tools: BTreeMap::new(),
+            tool_callback: None,
+        },
+        api_key,
     )
 }
 
@@ -305,7 +540,7 @@ impl Drop for SdkProcess {
 }
 
 impl SdkProcess {
-    async fn start(config: &AgentConfig, api_key: &str) -> Result<(Self, Rpc)> {
+    async fn start(config: &SdkAgentConfig, api_key: &str) -> Result<(Self, Rpc)> {
         let mut command = Command::new(&config.executable);
         command
             .arg("--workspace")
@@ -1041,7 +1276,7 @@ mod tests {
         assert_eq!(options["model"], json!({"id":"fixture-model"}));
         assert_eq!(
             options["local"],
-            json!({"cwd": ["/manager"], "settingSources": []})
+            json!({"cwd": ["/manager"], "settingSources": [], "customTools": {}})
         );
         assert_eq!(
             options["mcpServers"]["vibeface"]["stdio"],
@@ -1058,6 +1293,41 @@ mod tests {
             options["mcpServers"]["vibeface"]["stdio"]["env"],
             json!({"VIBEFACE_MCP_TASK_ID": "task-1"})
         );
+    }
+
+    #[test]
+    fn native_custom_tools_need_a_private_local_callback_and_no_mcp_server() {
+        let mut config = SdkAgentConfig {
+            executable: "/sdk".into(),
+            workspace: "/manager".into(),
+            timeout_secs: 5,
+            model: "fixture-model".into(),
+            mcp_servers: BTreeMap::new(),
+            custom_tools: BTreeMap::from([(
+                "context".into(),
+                CustomToolConfig {
+                    description: Some("Read visible business context".into()),
+                    input_schema: json!({"type":"object"}),
+                    output_schema: None,
+                },
+            )]),
+            tool_callback: Some(ToolCallbackConfig {
+                url: "http://127.0.0.1:1234".into(),
+                auth_token: "x".repeat(32),
+            }),
+        };
+        let options = sdk_options(&config, "fixture-key").unwrap();
+        assert_eq!(options["mcpServers"], json!({}));
+        assert_eq!(options["tools"], json!({"names":["mcp"]}));
+        assert_eq!(
+            options["local"]["customTools"]["context"]["inputSchema"],
+            json!({"type":"object"})
+        );
+        assert!(options.to_string().find(&"x".repeat(32)).is_none());
+        config.tool_callback.as_mut().unwrap().url = "http://192.0.2.1:1234".into();
+        assert!(sdk_options(&config, "fixture-key").is_err());
+        config.tool_callback = None;
+        assert!(sdk_options(&config, "fixture-key").is_err());
     }
 
     #[tokio::test]
