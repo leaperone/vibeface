@@ -1,13 +1,7 @@
-mod agent;
-mod codex;
-mod local_api;
-mod mcp;
-mod runtime;
-mod store;
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use vibeface_bridge::{mcp, runtime};
 use vibeface_protocol::{CommandRequest, CommandStatus};
 
 #[derive(Parser)]
