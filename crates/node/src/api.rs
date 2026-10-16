@@ -115,12 +115,46 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         "non-loopback HTTP requires allow_insecure_lan; use HTTPS for public access"
     );
     let listener = TcpListener::bind(node.config.listen).await?;
-    axum::serve(
-        listener,
-        router(node).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    let tools = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let tool_url = format!("http://{}", tools.local_addr()?);
+    let internal = tool_router(node.clone(), Site::parse(&tool_url)?);
+    node.tool_url
+        .set(tool_url)
+        .map_err(|_| anyhow::anyhow!("tool listener is already initialized"))?;
+    tokio::try_join!(
+        async {
+            axum::serve(
+                listener,
+                router(node).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        },
+        async {
+            axum::serve(
+                tools,
+                internal.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        }
+    )?;
     Ok(())
+}
+
+fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
+    let app = App {
+        node,
+        site: Some(site),
+        attempts: Arc::new(Mutex::new(HashMap::new())),
+    };
+    Router::new()
+        .route("/api/tools", post(tool))
+        .route(
+            CALLBACK,
+            post(tool_callback).layer(DefaultBodyLimit::max(MAX_BODY_BYTES / 2)),
+        )
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(app.clone(), boundary))
+        .with_state(app)
 }
 
 pub fn router(node: Arc<Runtime>) -> Router {
@@ -495,6 +529,9 @@ fn validate_tool_call(name: &str, call_id: &str) -> ApiResult<()> {
 }
 
 async fn events(State(app): State<App>, headers: HeaderMap) -> ApiResult<Response> {
+    if headers.contains_key(header::AUTHORIZATION) {
+        return Err(ApiError::auth());
+    }
     let authorization = access(&app, &headers, false).await?;
     let receiver = app.node.events.subscribe();
     let output = stream::unfold(
