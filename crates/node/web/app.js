@@ -149,7 +149,7 @@ function updateComposer() {
   $("message-form").querySelector('[type="submit"]').disabled = !allowed || $("message-form").querySelector('[type="submit"]').getAttribute("aria-busy") === "true";
   $("manager-hint").textContent = !state.data ? "先创建或选择一个会话。" : incomplete() ? "等待上下文补齐后再发送。" : !node?.capabilities?.manager ? "设备尚未配置调度 Agent。执行会话仍可直接操作。" : !node.online ? "所选调度设备离线，请切换其他入口或设备。" : "消息将交给所选设备上的调度 Agent。";
 }
-function persistPendingMessages() { storage.set(networkKey("pending-messages"), [...state.pendingMessages].map(([id, message]) => [id, { message_id: message.message_id, conversation_id: id, scheduler_node: message.scheduler_node }]), true); }
+function persistPendingMessages() { storage.set(networkKey("pending-messages"), [...state.pendingMessages], true); }
 function renderMessages() {
   const messages = state.data?.messages || []; const key = `${state.conversationId}:${messages.map((item) => item.event_hash || item.message_id).join(",")}`;
   if (key === state.renderKey) return; state.renderKey = key;
