@@ -121,17 +121,7 @@ impl Store {
         node_id: &str,
         role: Option<NodeRole>,
     ) -> Result<NodeCertificate> {
-        let bundle = self.trust_bundle(network_id)?.context("unknown network")?;
-        let node = bundle
-            .nodes
-            .into_iter()
-            .find(|n| n.node_id == node_id)
-            .context("node is not currently authorized")?;
-        ensure!(!node.revoked, "node has been revoked");
-        if let Some(role) = role {
-            ensure!(node.roles.contains(&role), "node lacks required role");
-        }
-        Ok(node)
+        authorize_node_from(&self.connection, network_id, node_id, role)
     }
     pub fn save_local_identity(
         &mut self,
@@ -191,8 +181,8 @@ impl Store {
         } else {
             tx.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'pending')",params![network_id,envelope.hash,event.scope_id,event.author,event.sequence,encoded])?;
         }
+        rebuild_projections_from(&tx, network_id)?;
         tx.commit()?;
-        self.rebuild_projections(network_id)?;
         let status: String = self.connection.query_row(
             "SELECT status FROM events WHERE network_id=? AND hash=?",
             params![network_id, envelope.hash],
@@ -214,26 +204,42 @@ impl Store {
         created_at_ms: i64,
     ) -> Result<SignedEvent> {
         let author = identity.node_id()?;
-        self.authorize_node(network_id, &author, None)?;
-        let heads = self.heads(network_id, scope_id)?;
-        ensure!(
-            self.missing_dependencies(network_id, &heads)?.is_complete(),
-            "scope has incomplete or conflicting history"
-        );
-        let sequence: u64 = self.connection.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM events WHERE network_id=? AND scope_id=? AND author=?",params![network_id,scope_id,author],|r|r.get(0))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        authorize_node_from(&tx, network_id, &author, None)?;
+        let events = load_events_from(&tx, network_id)?;
+        let heads = heads_from_events(&events, scope_id);
+        for hash in closure_hashes(&events, &heads) {
+            let stored = events.get(&hash).context("scope has missing history")?;
+            ensure!(
+                stored.status == "ready",
+                "scope has incomplete or conflicting history"
+            );
+            for blob in &stored.event.blobs {
+                ensure!(
+                    has_blob_from(&tx, network_id, blob)?,
+                    "scope has missing blob content"
+                );
+            }
+        }
+        let sequence:u64=tx.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM events WHERE network_id=? AND scope_id=? AND author=?",params![network_id,scope_id,author],|r|r.get(0))?;
         let previous: Option<String> = if sequence == 1 {
             None
         } else {
-            Some(self.connection.query_row("SELECT hash FROM events WHERE network_id=? AND scope_id=? AND author=? AND sequence=? AND status='ready'",params![network_id,scope_id,author,sequence-1],|r|r.get(0))?)
+            Some(tx.query_row("SELECT hash FROM events WHERE network_id=? AND scope_id=? AND author=? AND sequence=? AND status='ready'",params![network_id,scope_id,author,sequence-1],|r|r.get(0))?)
         };
         for blob in &blobs {
-            ensure!(self.has_blob(network_id, blob)?, "required blob missing");
+            ensure!(
+                has_blob_from(&tx, network_id, blob)?,
+                "required blob missing"
+            );
         }
         let envelope = identity.sign_event(Event {
             version: WIRE_VERSION,
             network_id: network_id.into(),
             scope_id: scope_id.into(),
-            author,
+            author: author.clone(),
             sequence,
             previous,
             parents: heads,
@@ -241,12 +247,9 @@ impl Store {
             body,
             blobs,
         })?;
-        let outcome = self.ingest_event(network_id, &envelope)?;
-        ensure!(
-            outcome.status == "ready",
-            "local event failed materialization: {}",
-            outcome.status
-        );
+        tx.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'ready')",params![network_id,envelope.hash,scope_id,author,sequence,serde_json::to_string(&envelope)?])?;
+        rebuild_projections_from(&tx, network_id)?;
+        tx.commit()?;
         Ok(envelope)
     }
     fn load_events(&self, network_id: &str) -> Result<BTreeMap<String, StoredEvent>> {
@@ -264,18 +267,7 @@ impl Store {
         )
     }
     pub fn heads(&self, network_id: &str, scope_id: &str) -> Result<Vec<EventHash>> {
-        let events = self.load_events(network_id)?;
-        let mut heads: BTreeSet<String> = events
-            .iter()
-            .filter(|(_, e)| e.event.scope_id == scope_id)
-            .map(|(h, _)| h.clone())
-            .collect();
-        for entry in events.values().filter(|e| e.event.scope_id == scope_id) {
-            for parent in dependencies(&entry.event) {
-                heads.remove(parent);
-            }
-        }
-        Ok(heads.into_iter().collect())
+        Ok(heads_from_events(&self.load_events(network_id)?, scope_id))
     }
     pub fn missing_dependencies(
         &self,
@@ -403,11 +395,16 @@ impl Store {
             "blob size mismatch or limit exceeded"
         );
         ensure!(digest(content) == expected.hash, "blob hash mismatch");
-        self.connection.execute(
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT INTO blobs(network_id,hash,size,content) VALUES(?,?,?,?) ON CONFLICT(network_id,hash) DO UPDATE SET size=excluded.size,content=excluded.content",
             params![network_id, expected.hash, expected.size, content],
         )?;
-        self.rebuild_projections(network_id)
+        rebuild_projections_from(&tx, network_id)?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn get_blob(&self, network_id: &str, hash: &str) -> Result<Option<Vec<u8>>> {
         let content: Option<Vec<u8>> = self
@@ -433,144 +430,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut events = load_events_from(&tx, network_id)?;
-        let mut author_sequences: BTreeMap<(String, String, u64), Vec<String>> = BTreeMap::new();
-        for (hash, e) in &events {
-            author_sequences
-                .entry((
-                    e.event.scope_id.clone(),
-                    e.event.author.clone(),
-                    e.event.sequence,
-                ))
-                .or_default()
-                .push(hash.clone());
-        }
-        for e in events.values_mut() {
-            e.status = "pending".into();
-        }
-        for hashes in author_sequences.values().filter(|v| v.len() > 1) {
-            for hash in hashes {
-                events.get_mut(hash).unwrap().status = "conflict".into();
-            }
-        }
-        for hash in events.keys().cloned().collect::<Vec<_>>() {
-            let event = &events[&hash].event;
-            if let Some(previous) = &event.previous {
-                if let Some(prior) = events.get(previous) {
-                    if prior.event.scope_id != event.scope_id
-                        || prior.event.author != event.author
-                        || prior.event.sequence + 1 != event.sequence
-                    {
-                        events.get_mut(&hash).unwrap().status = "invalid".into();
-                    }
-                }
-            }
-        }
-        let all: BTreeSet<String> = events.keys().cloned().collect();
-        let ordered = topological(&events, &all);
-        for hash in &ordered {
-            let e = &events[hash];
-            if e.status != "pending" {
-                continue;
-            }
-            let deps: Vec<String> = dependencies(&e.event).cloned().collect();
-            if deps.iter().any(|h| {
-                events
-                    .get(h)
-                    .is_some_and(|p| matches!(p.status.as_str(), "invalid" | "conflict"))
-            }) {
-                events.get_mut(hash).unwrap().status = "invalid".into();
-                continue;
-            }
-            if !deps
-                .iter()
-                .all(|h| events.get(h).is_some_and(|p| p.status == "ready"))
-            {
-                continue;
-            }
-            let mut blobs_complete = true;
-            for blob in &e.event.blobs {
-                if !has_blob_from(&tx, network_id, blob)? {
-                    blobs_complete = false;
-                    break;
-                }
-            }
-            if blobs_complete {
-                events.get_mut(hash).unwrap().status = "ready".into();
-            }
-        }
-        for (hash, e) in &events {
-            tx.execute(
-                "UPDATE events SET status=? WHERE network_id=? AND hash=?",
-                params![e.status, network_id, hash],
-            )?;
-        }
-        tx.execute("DELETE FROM conversations WHERE network_id=?", [network_id])?;
-        tx.execute("DELETE FROM messages WHERE network_id=?", [network_id])?;
-        tx.execute("DELETE FROM tasks WHERE network_id=?", [network_id])?;
-        tx.execute(
-            "DELETE FROM notification_outbox WHERE network_id=? AND derived=1",
-            [network_id],
-        )?;
-        tx.execute(
-            "DELETE FROM notification_acks WHERE network_id=? AND event_hash!=''",
-            [network_id],
-        )?;
-        for (ordinal, hash) in ordered.iter().enumerate() {
-            let stored = &events[hash];
-            if stored.status != "ready" {
-                continue;
-            }
-            let event = &stored.event;
-            match &event.body {
-                EventBody::ConversationCreated { title } => {
-                    tx.execute("INSERT OR IGNORE INTO conversations(network_id,conversation_id,title) VALUES(?,?,?)",params![network_id,event.scope_id,title])?;
-                }
-                EventBody::MessagePosted {
-                    message_id,
-                    role,
-                    text,
-                } => {
-                    tx.execute("INSERT INTO messages(network_id,conversation_id,event_hash,message_id,role,text,created_at_ms,ordinal) VALUES(?,?,?,?,?,?,?,?)",params![network_id,event.scope_id,hash,message_id,role,text,event.created_at_ms,ordinal])?;
-                }
-                EventBody::TaskCreated {
-                    task_id,
-                    title,
-                    goal,
-                    acceptance,
-                } => {
-                    tx.execute("INSERT OR IGNORE INTO tasks(network_id,conversation_id,task_id,title,goal,acceptance,status,detail,event_hash) VALUES(?,?,?,?,?,?,'open','',?)",params![network_id,event.scope_id,task_id,title,goal,acceptance,hash])?;
-                }
-                EventBody::TaskChanged {
-                    task_id,
-                    status,
-                    detail,
-                } => {
-                    tx.execute("UPDATE tasks SET status=?,detail=?,event_hash=? WHERE network_id=? AND conversation_id=? AND task_id=?",params![status,detail,hash,network_id,event.scope_id,task_id])?;
-                }
-                EventBody::NotificationRaised {
-                    notification_id,
-                    kind,
-                    text,
-                } => {
-                    let notification = Notification {
-                        notification_id: notification_id.clone(),
-                        conversation_id: event.scope_id.clone(),
-                        kind: kind.clone(),
-                        text: text.clone(),
-                        event_hash: hash.clone(),
-                    };
-                    tx.execute("INSERT OR IGNORE INTO notification_outbox(network_id,notification_id,record,derived) VALUES(?,?,?,1)",params![network_id,notification_id,serde_json::to_string(&notification)?])?;
-                }
-                EventBody::NotificationAcknowledged {
-                    notification_id,
-                    client_id,
-                } => {
-                    tx.execute("INSERT OR IGNORE INTO notification_acks(network_id,notification_id,client_id,event_hash) VALUES(?,?,?,?)",params![network_id,notification_id,client_id,hash])?;
-                }
-                _ => {}
-            }
-        }
+        rebuild_projections_from(&tx, network_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -837,11 +697,53 @@ impl Store {
         network_id: &str,
         operation_id: &str,
     ) -> Result<OperationRecord> {
-        let changed=self.connection.execute("UPDATE operations SET state='\"running\"' WHERE network_id=? AND operation_id=? AND state='\"accepted\"'",params![network_id,operation_id])?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let encoded: String = tx.query_row(
+            "SELECT request FROM operations WHERE network_id=? AND operation_id=?",
+            params![network_id, operation_id],
+            |r| r.get(0),
+        )?;
+        let request: OperationRequest = serde_json::from_str(&encoded)?;
+        authorize_node_from(
+            &tx,
+            network_id,
+            &request.target_node,
+            Some(NodeRole::Executor),
+        )?;
+        let revision:Option<u64>=tx.query_row("SELECT revision FROM execution_sessions WHERE network_id=? AND target_node=? AND session_id=?",params![network_id,request.target_node,request.session_id],|r|r.get(0)).optional()?;
+        ensure!(
+            revision.unwrap_or(0) == request.expected_revision,
+            "execution session changed before claim"
+        );
+        let events = load_events_from(&tx, network_id)?;
+        let heads = if request.basis_heads.is_empty() {
+            heads_from_events(&events, &request.conversation_id)
+        } else {
+            request.basis_heads.clone()
+        };
+        for hash in closure_hashes(&events, &heads) {
+            let event = events
+                .get(&hash)
+                .context("operation basis is missing before claim")?;
+            ensure!(
+                event.status == "ready",
+                "operation basis became incomplete or conflicting"
+            );
+            for blob in &event.event.blobs {
+                ensure!(
+                    has_blob_from(&tx, network_id, blob)?,
+                    "operation basis content became incomplete"
+                );
+            }
+        }
+        let changed=tx.execute("UPDATE operations SET state='\"running\"' WHERE network_id=? AND operation_id=? AND state='\"accepted\"'",params![network_id,operation_id])?;
         ensure!(
             changed == 1,
             "operation is not accepted or has already been claimed"
         );
+        tx.commit()?;
         self.operation(network_id, operation_id)?
             .context("operation disappeared")
     }
@@ -954,11 +856,17 @@ impl Store {
             state: "running".into(),
             result: Value::Null,
         };
-        let changed=self.connection.execute("INSERT OR IGNORE INTO continuation_claims(network_id,result_event_hash,policy_version,record) VALUES(?,?,?,?)",params![network_id,result_event_hash,policy_version,serde_json::to_string(&claim)?])?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        authorize_node_from(&tx, network_id, scheduler_node, Some(NodeRole::Scheduler))?;
+        authorize_node_from(&tx, network_id, &event.author, None)?;
+        let changed=tx.execute("INSERT OR IGNORE INTO continuation_claims(network_id,result_event_hash,policy_version,record) VALUES(?,?,?,?)",params![network_id,result_event_hash,policy_version,serde_json::to_string(&claim)?])?;
         ensure!(
             changed == 1,
             "continuation has already been claimed; reconcile its original attempt"
         );
+        tx.commit()?;
         Ok(claim)
     }
     pub fn continuation(
@@ -1124,24 +1032,223 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
+fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result<()> {
+    let mut events = load_events_from(connection, network_id)?;
+    let mut author_sequences: BTreeMap<(String, String, u64), Vec<String>> = BTreeMap::new();
+    for (hash, e) in &events {
+        author_sequences
+            .entry((
+                e.event.scope_id.clone(),
+                e.event.author.clone(),
+                e.event.sequence,
+            ))
+            .or_default()
+            .push(hash.clone());
+    }
+    for e in events.values_mut() {
+        e.status = "pending".into();
+    }
+    for hashes in author_sequences.values().filter(|v| v.len() > 1) {
+        for hash in hashes {
+            events.get_mut(hash).unwrap().status = "conflict".into();
+        }
+    }
+    for hash in events.keys().cloned().collect::<Vec<_>>() {
+        let event = &events[&hash].event;
+        if let Some(previous) = &event.previous {
+            if let Some(prior) = events.get(previous) {
+                if prior.event.scope_id != event.scope_id
+                    || prior.event.author != event.author
+                    || prior.event.sequence + 1 != event.sequence
+                {
+                    events.get_mut(&hash).unwrap().status = "invalid".into();
+                }
+            }
+        }
+    }
+    let all: BTreeSet<String> = events.keys().cloned().collect();
+    let ordered = topological(&events, &all);
+    for hash in &ordered {
+        let e = &events[hash];
+        if e.status != "pending" {
+            continue;
+        }
+        let deps: Vec<String> = dependencies(&e.event).cloned().collect();
+        if deps.iter().any(|h| {
+            events
+                .get(h)
+                .is_some_and(|p| matches!(p.status.as_str(), "invalid" | "conflict"))
+        }) {
+            events.get_mut(hash).unwrap().status = "invalid".into();
+            continue;
+        }
+        if !deps
+            .iter()
+            .all(|h| events.get(h).is_some_and(|p| p.status == "ready"))
+        {
+            continue;
+        }
+        let mut blobs_complete = true;
+        for blob in &e.event.blobs {
+            if !has_blob_from(connection, network_id, blob)? {
+                blobs_complete = false;
+                break;
+            }
+        }
+        if blobs_complete {
+            events.get_mut(hash).unwrap().status = "ready".into();
+        }
+    }
+    for (hash, e) in &events {
+        connection.execute(
+            "UPDATE events SET status=? WHERE network_id=? AND hash=?",
+            params![e.status, network_id, hash],
+        )?;
+    }
+    connection.execute("DELETE FROM conversations WHERE network_id=?", [network_id])?;
+    connection.execute("DELETE FROM messages WHERE network_id=?", [network_id])?;
+    connection.execute("DELETE FROM tasks WHERE network_id=?", [network_id])?;
+    connection.execute(
+        "DELETE FROM notification_outbox WHERE network_id=? AND derived=1",
+        [network_id],
+    )?;
+    connection.execute(
+        "DELETE FROM notification_acks WHERE network_id=? AND event_hash!=''",
+        [network_id],
+    )?;
+    for (ordinal, hash) in ordered.iter().enumerate() {
+        let stored = &events[hash];
+        if stored.status != "ready" {
+            continue;
+        }
+        let event = &stored.event;
+        match &event.body {
+            EventBody::ConversationCreated { title } => {
+                connection.execute("INSERT OR IGNORE INTO conversations(network_id,conversation_id,title) VALUES(?,?,?)",params![network_id,event.scope_id,title])?;
+            }
+            EventBody::MessagePosted {
+                message_id,
+                role,
+                text,
+            } => {
+                connection.execute("INSERT INTO messages(network_id,conversation_id,event_hash,message_id,role,text,created_at_ms,ordinal) VALUES(?,?,?,?,?,?,?,?)",params![network_id,event.scope_id,hash,message_id,role,text,event.created_at_ms,ordinal])?;
+            }
+            EventBody::TaskCreated {
+                task_id,
+                title,
+                goal,
+                acceptance,
+            } => {
+                connection.execute("INSERT OR IGNORE INTO tasks(network_id,conversation_id,task_id,title,goal,acceptance,status,detail,event_hash) VALUES(?,?,?,?,?,?,'open','',?)",params![network_id,event.scope_id,task_id,title,goal,acceptance,hash])?;
+            }
+            EventBody::TaskChanged {
+                task_id,
+                status,
+                detail,
+            } => {
+                connection.execute("UPDATE tasks SET status=?,detail=?,event_hash=? WHERE network_id=? AND conversation_id=? AND task_id=?",params![status,detail,hash,network_id,event.scope_id,task_id])?;
+            }
+            EventBody::NotificationRaised {
+                notification_id,
+                kind,
+                text,
+            } => {
+                let notification = Notification {
+                    notification_id: notification_id.clone(),
+                    conversation_id: event.scope_id.clone(),
+                    kind: kind.clone(),
+                    text: text.clone(),
+                    event_hash: hash.clone(),
+                };
+                connection.execute("INSERT OR IGNORE INTO notification_outbox(network_id,notification_id,record,derived) VALUES(?,?,?,1)",params![network_id,notification_id,serde_json::to_string(&notification)?])?;
+            }
+            EventBody::NotificationAcknowledged {
+                notification_id,
+                client_id,
+            } => {
+                connection.execute("INSERT OR IGNORE INTO notification_acks(network_id,notification_id,client_id,event_hash) VALUES(?,?,?,?)",params![network_id,notification_id,client_id,hash])?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+fn authorize_node_from(
+    connection: &Connection,
+    network_id: &str,
+    node_id: &str,
+    role: Option<NodeRole>,
+) -> Result<NodeCertificate> {
+    let encoded: String = connection
+        .query_row(
+            "SELECT bundle FROM networks WHERE network_id=?",
+            [network_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .context("unknown network")?;
+    let bundle: TrustBundle = serde_json::from_str(&encoded)?;
+    verify_trust_bundle(&bundle)?;
+    ensure!(
+        bundle.network_id == network_id,
+        "stored trust bundle network mismatch"
+    );
+    let node = bundle
+        .nodes
+        .into_iter()
+        .find(|n| n.node_id == node_id)
+        .context("node is not currently authorized")?;
+    ensure!(!node.revoked, "node has been revoked");
+    if let Some(role) = role {
+        ensure!(node.roles.contains(&role), "node lacks required role");
+    }
+    Ok(node)
+}
+fn heads_from_events(events: &BTreeMap<String, StoredEvent>, scope_id: &str) -> Vec<String> {
+    let mut heads: BTreeSet<String> = events
+        .iter()
+        .filter(|(_, e)| e.event.scope_id == scope_id)
+        .map(|(h, _)| h.clone())
+        .collect();
+    for entry in events.values().filter(|e| e.event.scope_id == scope_id) {
+        for parent in dependencies(&entry.event) {
+            heads.remove(parent);
+        }
+    }
+    heads.into_iter().collect()
+}
 fn load_events_from(
     connection: &Connection,
     network_id: &str,
 ) -> Result<BTreeMap<String, StoredEvent>> {
     let mut query = connection
-        .prepare("SELECT hash,envelope,status FROM events WHERE network_id=? ORDER BY hash")?;
+        .prepare("SELECT hash,envelope,status,scope_id,author,sequence FROM events WHERE network_id=? ORDER BY hash")?;
     let rows = query.query_map([network_id], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, u64>(5)?,
         ))
     })?;
     let mut result = BTreeMap::new();
     for row in rows {
-        let (hash, envelope, status) = row?;
+        let (hash, envelope, status, scope, author, sequence) = row?;
         let envelope: SignedEvent = serde_json::from_str(&envelope)?;
-        let event = serde_json::from_str(&envelope.canonical_body)?;
+        ensure!(envelope.hash == hash, "stored event hash mismatch");
+        let body: Event = serde_json::from_str(&envelope.canonical_body)?;
+        let public_key: String = connection.query_row(
+            "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
+            params![network_id, body.author],
+            |r| r.get(0),
+        )?;
+        let event = verify_signed_event(network_id, &envelope, &public_key)?;
+        ensure!(
+            event.scope_id == scope && event.author == author && event.sequence == sequence,
+            "stored event metadata does not match signed body"
+        );
         result.insert(
             hash,
             StoredEvent {
@@ -1564,6 +1671,92 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn queued_operation_cannot_start_after_known_executor_revocation() -> Result<()> {
+        let a = LocalIdentity::generate();
+        let network = a.network_id()?;
+        let mut store = memory(&a, None)?;
+        let event = conversation(&mut store, &a)?;
+        let request = request(&a, "queued", vec![event.hash])?;
+        store.accept_operation(&network, &request)?;
+        let mut certificate = a.certificate(roles())?;
+        certificate.revoked = true;
+        store.install_trust_bundle(&network, &a.sign_trust_bundle(2, vec![certificate])?)?;
+        assert!(store.claim_operation(&network, "queued").is_err());
+        assert_eq!(
+            store.operation(&network, "queued")?.unwrap().state,
+            OperationState::Accepted
+        );
+        Ok(())
+    }
+    #[test]
+    fn concurrent_local_writers_serialize_author_sequences_and_projection_updates() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("vibeface-writers-{}", uuid::Uuid::new_v4()));
+        let db = root.join("node.sqlite3");
+        let owner = LocalIdentity::generate();
+        let network = owner.network_id()?;
+        let mut initial = Store::open(&db)?;
+        initial.install_trust_bundle(
+            &network,
+            &owner.sign_trust_bundle(1, vec![owner.certificate(roles())?])?,
+        )?;
+        conversation(&mut initial, &owner)?;
+        drop(initial);
+        let first = Store::open(&db)?;
+        let second = Store::open(&db)?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for (writer, mut store) in [first, second].into_iter().enumerate() {
+            let barrier = barrier.clone();
+            let owner = owner.clone();
+            let network = network.clone();
+            workers.push(std::thread::spawn(move || -> Result<()> {
+                barrier.wait();
+                for index in 0..6 {
+                    store.append_event(
+                        &owner,
+                        &network,
+                        "conversation",
+                        EventBody::MessagePosted {
+                            message_id: format!("{writer}-{index}"),
+                            role: "user".into(),
+                            text: format!("{writer}-{index}"),
+                        },
+                        vec![],
+                        index,
+                    )?;
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap()?;
+        }
+        let final_store = Store::open(&db)?;
+        assert_eq!(final_store.messages(&network, "conversation")?.len(), 12);
+        let context = final_store.context(&network, "conversation", &[])?;
+        assert!(context.missing.is_complete());
+        assert_eq!(context.events.len(), 13);
+        assert_eq!(context.heads.len(), 1);
+        drop(final_store);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
+    fn corrupted_stored_event_never_becomes_a_complete_context() -> Result<()> {
+        let a = LocalIdentity::generate();
+        let network = a.network_id()?;
+        let mut store = memory(&a, None)?;
+        let mut event = conversation(&mut store, &a)?;
+        event.canonical_body = event.canonical_body.replace("work", "tampered");
+        store.connection.execute(
+            "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
+            params![serde_json::to_string(&event)?, network, event.hash],
+        )?;
+        assert!(store.context(&network, "conversation", &[]).is_err());
+        assert!(store.rebuild_projections(&network).is_err());
+        Ok(())
+    }
+    #[test]
     fn operation_cas_reserves_resources_and_reconciles_unknown_without_replay() -> Result<()> {
         let a = LocalIdentity::generate();
         let network = a.network_id()?;
@@ -1671,6 +1864,10 @@ mod tests {
             store.operation(&network, "send")?.unwrap().state,
             OperationState::Running
         );
+        let mut newer = store.session(&network, &a.node_id()?, "session")?.unwrap();
+        newer.revision = 2;
+        store.upsert_session(&network, &newer)?;
+        assert!(store.claim_operation(&network, "steer").is_err());
         Ok(())
     }
     #[test]
