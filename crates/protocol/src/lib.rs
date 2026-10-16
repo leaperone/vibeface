@@ -16,6 +16,40 @@ pub enum RpcId {
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum Command {
     Snapshot,
+    ListTasks,
+    ResolveCommand {
+        command_id: String,
+        evidence: String,
+    },
+    ReadTask {
+        task_id: String,
+    },
+    CreateTask {
+        task: TaskInput,
+    },
+    UpdateTask {
+        task_id: String,
+        update: TaskUpdate,
+    },
+    ControlTask {
+        task_id: String,
+        action: TaskControl,
+    },
+    TaskCommand {
+        task_id: String,
+        command: Box<Command>,
+    },
+    ChatHistory {
+        #[serde(default)]
+        after: u64,
+        #[serde(default = "history_limit")]
+        limit: usize,
+    },
+    /// Internal ledger command; client submissions are rejected.
+    RunTask {
+        task_id: String,
+        captured_event_seq: u64,
+    },
     ListThreads {
         #[serde(default)]
         cursor: Option<String>,
@@ -58,6 +92,9 @@ pub enum Command {
 
 impl Command {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(thread_id) = self.thread_id() {
+            validate_id(thread_id)?;
+        }
         let bounded = |s: &str| {
             if s.trim().is_empty() || s.len() > MAX_TEXT_BYTES {
                 Err("text must be nonempty and at most 65536 bytes".into())
@@ -66,7 +103,48 @@ impl Command {
             }
         };
         match self {
-            Self::StartTurn { text, .. } | Self::SteerTurn { text, .. } => bounded(text),
+            Self::ResolveCommand {
+                command_id,
+                evidence,
+            } => {
+                validate_id(command_id)?;
+                bounded_text(evidence)
+            }
+            Self::ReadTask { task_id } | Self::RunTask { task_id, .. } => validate_id(task_id),
+            Self::CreateTask { task } => task.validate(),
+            Self::UpdateTask { task_id, update } => {
+                validate_id(task_id)?;
+                update.validate()
+            }
+            Self::ControlTask { task_id, action } => {
+                validate_id(task_id)?;
+                action.validate()
+            }
+            Self::TaskCommand { task_id, command } => {
+                validate_id(task_id)?;
+                if !matches!(
+                    command.as_ref(),
+                    Self::ReadThread { .. }
+                        | Self::ResumeThread { .. }
+                        | Self::ListTurns { .. }
+                        | Self::StartThread { .. }
+                        | Self::StartTurn { .. }
+                        | Self::SteerTurn { .. }
+                        | Self::InterruptTurn { .. }
+                ) {
+                    return Err("unsupported task-scoped command".into());
+                }
+                command.validate()
+            }
+            Self::ChatHistory { limit, .. } if *limit == 0 || *limit > 1000 => {
+                Err("history limit must be 1-1000".into())
+            }
+            Self::SteerTurn { text, turn_id, .. } => {
+                validate_id(turn_id)?;
+                bounded(text)
+            }
+            Self::StartTurn { text, .. } => bounded(text),
+            Self::InterruptTurn { turn_id, .. } => validate_id(turn_id),
             Self::Manage { prompt } => bounded(prompt),
             Self::StartThread { cwd } => bounded(cwd),
             Self::RespondRequest { response, .. }
@@ -89,8 +167,169 @@ impl Command {
             | Self::StartTurn { thread_id, .. }
             | Self::SteerTurn { thread_id, .. }
             | Self::InterruptTurn { thread_id, .. } => Some(thread_id),
+            Self::TaskCommand { command, .. } => command.thread_id(),
             _ => None,
         }
+    }
+
+    pub fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::ReadTask { task_id }
+            | Self::UpdateTask { task_id, .. }
+            | Self::ControlTask { task_id, .. }
+            | Self::TaskCommand { task_id, .. }
+            | Self::RunTask { task_id, .. } => Some(task_id),
+            Self::CreateTask { task } => Some(&task.id),
+            _ => None,
+        }
+    }
+}
+
+fn history_limit() -> usize {
+    100
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Queued,
+    Running,
+    NeedsContinue,
+    WaitingUser,
+    Blocked,
+    Paused,
+    AwaitingReview,
+    Completed,
+    Unknown,
+}
+
+impl TaskStatus {
+    pub fn allows_auto(self) -> bool {
+        matches!(self, Self::Queued | Self::Running | Self::NeedsContinue)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskInput {
+    pub id: String,
+    pub goal: String,
+    pub cwd: String,
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    pub auto_continue: bool,
+    #[serde(default)]
+    pub decision_limit: u32,
+}
+impl TaskInput {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_id(&self.id)?;
+        bounded_text(&self.goal)?;
+        bounded_text(&self.cwd)?;
+        if self.acceptance_criteria.is_empty() || self.acceptance_criteria.len() > 32 {
+            return Err("task requires 1-32 acceptance criteria".into());
+        }
+        for criterion in &self.acceptance_criteria {
+            bounded_text(criterion)?;
+        }
+        if self.decision_limit > 1000 || (self.auto_continue && self.decision_limit == 0) {
+            return Err("automatic tasks require 1-1000 decisions".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskUpdate {
+    #[serde(default)]
+    pub status: Option<TaskStatus>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<String>,
+    #[serde(default)]
+    pub thread_ids: Option<Vec<String>>,
+}
+impl TaskUpdate {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.status == Some(TaskStatus::Completed) {
+            return Err("completion requires explicit user acceptance".into());
+        }
+        for text in [&self.summary, &self.evidence].into_iter().flatten() {
+            bounded_text(text)?;
+        }
+        if let Some(threads) = &self.thread_ids {
+            if threads.len() > 64 {
+                return Err("at most 64 threads per task".into());
+            }
+            for thread in threads {
+                validate_id(thread)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskControl {
+    Pause,
+    Resume {
+        auto_continue: bool,
+        decision_limit: u32,
+    },
+    Accept {
+        evidence: String,
+    },
+}
+impl TaskControl {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Resume {
+                auto_continue,
+                decision_limit,
+            } if *decision_limit > 1000 || (*auto_continue && *decision_limit == 0) => {
+                Err("automatic tasks require 1-1000 decisions".into())
+            }
+            Self::Accept { evidence } => bounded_text(evidence),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TaskRecord {
+    pub id: String,
+    pub goal: String,
+    pub cwd: String,
+    pub acceptance_criteria: Vec<String>,
+    pub thread_ids: Vec<String>,
+    pub status: TaskStatus,
+    pub auto_continue: bool,
+    pub remaining_decisions: u32,
+    pub summary: Option<String>,
+    pub evidence: Option<String>,
+    pub dirty_seq: u64,
+    pub handled_seq: u64,
+    pub manager_session: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ChatMessage {
+    pub seq: u64,
+    pub command_id: String,
+    pub role: String,
+    pub content: Value,
+    pub at_ms: u64,
+}
+
+fn bounded_text(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() || text.len() > MAX_TEXT_BYTES {
+        Err("text must be nonempty and at most 65536 bytes".into())
+    } else {
+        Ok(())
     }
 }
 
@@ -203,6 +442,7 @@ pub enum ToServer {
     Heartbeat,
     Event { event: BridgeEvent },
     CommandUpdate { record: CommandRecord },
+    CommandUnknown { id: String, error: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
