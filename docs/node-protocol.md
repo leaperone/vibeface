@@ -100,7 +100,7 @@ HTTP 错误返回 `{"error":"说明"}`。API 成功接收操作后仍需查询�
 | `reconcile` | `target_node`、`operation_id` | 查询实际执行结果，已知时更新账本 |
 | `resolve_unknown` | `target_node`、`operation_id`、`outcome`、`evidence` | 本人根据证据解决未知结果，不重发操作 |
 
-工单状态为 `open`、`working`、`blocked`、`needs_review`、`accepted` 或 `cancelled`。`accepted` 和 `cancelled` 只能由本人设置。`resolve_unknown.outcome` 为 `succeeded` 或 `failed`，证据至少 12 字节。
+工单状态为 `open`、`working`、`blocked`、`needs_review`、`accepted` 或 `cancelled`。`accepted` 和 `cancelled` 只能由本人设置，Agent 不能将它们改回活动状态。`resolve_unknown.outcome` 为 `succeeded` 或 `failed`，证据至少 12 字节。
 
 `message_id`、`conversation_id`、`task_id` 和 `operation_id` 是业务去重身份。重试保留原 ID 和原内容；同 ID 换内容会被拒绝。管理 Agent 的可用工具仅为 `nodes`、`context`、`create_task`、`update_task`、`open_execution`、`send_execution` 和 `execution_status`。
 
@@ -128,6 +128,8 @@ HTTP 错误返回 `{"error":"说明"}`。API 成功接收操作后仍需查询�
 ```
 
 `task_id` 可为 `null`。`basis_heads` 标记本次操作依据的已知历史。目标 Node 在接单前拉取并校验其依赖闭包、派发记录和必要附件。空数组不表示全网没有其他历史。
+
+Agent 向已关联工单的执行会话提交新工作时，必须显式提供活动工单的 `task_id`，不能省略编号来绕过验收或取消。本人可明确提交不关联工单的操作；从未关联工单的会话也允许 `null`。此约束依据执行节点已知的本地账本，不代表未同步节点之间的全局共识。
 
 | action.type | 其他字段 | 执行器支持 |
 |---|---|---|

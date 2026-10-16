@@ -755,6 +755,78 @@ mod tests {
         std::fs::remove_dir_all(public_dir)?;
         Ok(())
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_message_retries_record_one_trigger() -> Result<()> {
+        let dir = fixture()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let network = conversation(&node).await?;
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut calls = Vec::new();
+        for _ in 0..16 {
+            let node = node.clone();
+            let network = network.clone();
+            let barrier = barrier.clone();
+            calls.push(tokio::spawn(async move {
+                barrier.wait().await;
+                node.rpc(Access { network_id: network, human: true, conversation_id: None },
+                    json!({"method":"message", "conversation_id":"chat", "message_id":"same-message", "text":"same goal"})).await
+            }));
+        }
+        let mut triggers = BTreeSet::new();
+        for call in calls {
+            triggers.insert(call.await??["trigger"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(triggers.len(), 1);
+        let count = node.store.lock().await.context(&network, "chat", &[])?.events.iter()
+            .filter(|event| matches!(&event.body, EventBody::MessagePosted { message_id, .. } if message_id == "same-message")).count();
+        assert_eq!(count, 1);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn task_retry_recovers_missing_grant_once_without_reopening() -> Result<()> {
+        let dir = fixture()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let network = conversation(&node).await?;
+        for (task_id, status) in [
+            ("active", "open"),
+            ("accepted", "accepted"),
+            ("cancelled", "cancelled"),
+        ] {
+            task(&node, &network, task_id, false).await?;
+            if status != "open" {
+                node.append(
+                    &network,
+                    "chat",
+                    EventBody::TaskChanged {
+                        task_id: task_id.into(),
+                        status: status.into(),
+                        detail: "user ended this task".into(),
+                    },
+                )
+                .await?;
+            }
+        }
+        drop(node);
+        let node = Arc::new(Runtime::open(&dir).await?);
+        for _ in 0..2 {
+            for task_id in ["active", "accepted", "cancelled"] {
+                task(&node, &network, task_id, true).await?;
+            }
+        }
+        let store = node.store.lock().await;
+        assert!(followup_authorized(&store, &network, "chat", "active")?);
+        for task_id in ["accepted", "cancelled"] {
+            assert!(!followup_authorized(&store, &network, "chat", task_id)?);
+        }
+        let grants = store.context(&network, "chat", &[])?.events.into_iter()
+            .filter(|event| matches!(&event.body, EventBody::DecisionRecorded { decision_id, .. } if decision_id.starts_with("auto:"))).count();
+        assert_eq!(grants, 1);
+        drop(store);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     #[tokio::test]
     async fn registration_recovers_after_auth_and_trust_commits() -> Result<()> {
         for trust_committed in [false, true] {
@@ -1631,11 +1703,14 @@ impl Runtime {
             blobs,
             now_ms(),
         )?;
+        self.publish_changed(network, scope, &event.hash);
+        Ok(event)
+    }
+    fn publish_changed(&self, network: &str, scope: &str, event_hash: &str) {
         let _ = self.events.send(Update {
             network_id: network.into(),
-            payload: json!({"type":"changed","conversation_id":scope,"event_hash":event.hash}),
+            payload: json!({"type":"changed","conversation_id":scope,"event_hash":event_hash}),
         });
-        Ok(event)
     }
     pub async fn raise_notification(
         &self,
@@ -1906,43 +1981,43 @@ impl Runtime {
                     .as_str()
                     .unwrap_or(&self.identity.node_id()?)
                     .to_owned();
-                let duplicate = self
-                    .store
-                    .lock()
-                    .await
-                    .messages(network, &scope)?
-                    .into_iter()
-                    .find(|m| m.message_id == message_id);
-                let trigger = if let Some(old) = duplicate {
-                    ensure!(
-                        old.text == text && old.role == "user",
-                        "message ID reused with different content"
-                    );
-                    let envelope = self
-                        .store
-                        .lock()
-                        .await
-                        .event(network, &old.event_hash)?
-                        .context("message event missing")?;
-                    let event = self.store.lock().await.verify_event(network, &envelope)?;
-                    ensure!(
-                        matches!(&event.body, EventBody::MessagePosted { scheduler_node: Some(selected), .. } if selected == &target),
-                        "retry this message through its original scheduler; send a new message to continue elsewhere"
-                    );
-                    old.event_hash
-                } else {
-                    self.append(
-                        network,
-                        &scope,
-                        EventBody::MessagePosted {
-                            message_id,
-                            role: "user".into(),
-                            text,
-                            scheduler_node: Some(target.clone()),
-                        },
-                    )
-                    .await?
-                    .hash
+                let trigger = {
+                    let mut store = self.store.lock().await;
+                    let duplicate = store
+                        .messages(network, &scope)?
+                        .into_iter()
+                        .find(|message| message.message_id == message_id);
+                    if let Some(old) = duplicate {
+                        ensure!(
+                            old.text == text && old.role == "user",
+                            "message ID reused with different content"
+                        );
+                        let envelope = store
+                            .event(network, &old.event_hash)?
+                            .context("message event missing")?;
+                        let event = store.verify_event(network, &envelope)?;
+                        ensure!(
+                            matches!(&event.body, EventBody::MessagePosted { scheduler_node: Some(selected), .. } if selected == &target),
+                            "retry this message through its original scheduler; send a new message to continue elsewhere"
+                        );
+                        old.event_hash
+                    } else {
+                        let event = store.append_event(
+                            &self.identity,
+                            network,
+                            &scope,
+                            EventBody::MessagePosted {
+                                message_id,
+                                role: "user".into(),
+                                text,
+                                scheduler_node: Some(target.clone()),
+                            },
+                            vec![],
+                            now_ms(),
+                        )?;
+                        self.publish_changed(network, &scope, &event.hash);
+                        event.hash
+                    }
                 };
                 if target == self.identity.node_id()? {
                     self.require_role(network, NodeRole::Scheduler).await?;
@@ -1970,49 +2045,62 @@ impl Runtime {
                 let title = field(&input, "title")?;
                 let goal = field(&input, "goal")?;
                 let acceptance = field(&input, "acceptance")?;
-                let existing = self
-                    .store
-                    .lock()
-                    .await
-                    .tasks(network, &scope)?
-                    .into_iter()
-                    .find(|t| t.task_id == task_id);
-                if let Some(old) = existing {
-                    ensure!(
-                        old.title == title && old.goal == goal && old.acceptance == acceptance,
-                        "task ID reused with different content"
-                    );
-                    return Ok(json!(old));
-                }
-                let event = self
-                    .append(
-                        network,
-                        &scope,
-                        EventBody::TaskCreated {
-                            task_id: task_id.clone(),
-                            title: title.into(),
-                            goal: goal.into(),
-                            acceptance: acceptance.into(),
-                        },
-                    )
-                    .await?;
-                if input["auto_followup"].as_bool() == Some(true) {
-                    ensure!(access.human, "automatic follow-up needs user authorization");
-                    self.append(
-                        network,
-                        &scope,
-                        EventBody::DecisionRecorded {
-                            decision_id: format!("auto:{task_id}"),
-                            text: format!(
-                                "User enabled bounded automatic follow-up for task {task_id}"
-                            ),
-                            effective_constraints: vec![format!("auto_followup:{task_id}")],
-                            tool_configuration: json!({"auto_followup":task_id}),
-                        },
-                    )
-                    .await?;
-                }
-                Ok(json!(event))
+                let result = {
+                    let mut store = self.store.lock().await;
+                    let existing = store
+                        .tasks(network, &scope)?
+                        .into_iter()
+                        .find(|task| task.task_id == task_id);
+                    let terminal = existing.as_ref().is_some_and(|task| {
+                        matches!(task.status.as_str(), "accepted" | "cancelled")
+                    });
+                    let result = if let Some(old) = existing {
+                        ensure!(
+                            old.title == title && old.goal == goal && old.acceptance == acceptance,
+                            "task ID reused with different content"
+                        );
+                        json!(old)
+                    } else {
+                        let event = store.append_event(
+                            &self.identity,
+                            network,
+                            &scope,
+                            EventBody::TaskCreated {
+                                task_id: task_id.clone(),
+                                title: title.into(),
+                                goal: goal.into(),
+                                acceptance: acceptance.into(),
+                            },
+                            vec![],
+                            now_ms(),
+                        )?;
+                        self.publish_changed(network, &scope, &event.hash);
+                        json!(event)
+                    };
+                    if input["auto_followup"].as_bool() == Some(true)
+                        && !terminal
+                        && !followup_authorized(&store, network, &scope, &task_id)?
+                    {
+                        let event = store.append_event(
+                            &self.identity,
+                            network,
+                            &scope,
+                            EventBody::DecisionRecorded {
+                                decision_id: format!("auto:{task_id}"),
+                                text: format!(
+                                    "User enabled bounded automatic follow-up for task {task_id}"
+                                ),
+                                effective_constraints: vec![format!("auto_followup:{task_id}")],
+                                tool_configuration: json!({"auto_followup":task_id}),
+                            },
+                            vec![],
+                            now_ms(),
+                        )?;
+                        self.publish_changed(network, &scope, &event.hash);
+                    }
+                    result
+                };
+                Ok(result)
             }
             "update_task" => {
                 let scope = scope.context("conversation_id is required")?;
@@ -2050,10 +2138,7 @@ impl Runtime {
                         now_ms(),
                     )?
                 };
-                let _ = self.events.send(Update {
-                    network_id: network.clone(),
-                    payload: json!({"type":"changed","conversation_id":scope,"event_hash":event.hash}),
-                });
+                self.publish_changed(network, &scope, &event.hash);
                 Ok(json!(event))
             }
             "operate" => {
