@@ -1,0 +1,18 @@
+base_branch = "main"
+
+[[scope]]
+prefix = ""
+name = "Rust workspace"
+check = "cargo fmt --all -- --check"
+build = "cargo test --workspace --locked"
+
+[[domain_check]]
+name = "Rust diagnostics"
+trigger_paths = ["crates/**", "Cargo.toml", "Cargo.lock"]
+command = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+
+[review]
+extra_checklist = "Check command deduplication, uncertain write results, device connection ownership, local socket permissions, and manager token budgets. Server must not run an AI agent."
+
+[report]
+language = "zh"
