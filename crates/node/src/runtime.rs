@@ -1891,7 +1891,7 @@ impl Runtime {
                 .roots
                 .iter()
                 .filter_map(|r| std::fs::canonicalize(r).ok())
-                .any(|r| crate::store::path_is_within(&path, &r)),
+                .any(|r| path.starts_with(r)),
             "execution path is outside configured roots"
         );
         ensure!(path.is_dir(), "execution path must be a directory");

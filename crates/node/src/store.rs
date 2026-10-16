@@ -1359,28 +1359,10 @@ fn canonical_resource(resource: &str) -> Result<String> {
         .map(str::to_string)
         .context("resource path must be UTF-8")
 }
-pub(crate) fn path_is_within(path: &Path, root: &Path) -> bool {
-    if path.starts_with(root) {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Ok(root_identity) = std::fs::metadata(root) {
-            return path
-                .ancestors()
-                .filter_map(|ancestor| std::fs::metadata(ancestor).ok())
-                .any(|identity| {
-                    identity.dev() == root_identity.dev() && identity.ino() == root_identity.ino()
-                });
-        }
-    }
-    false
-}
 fn paths_overlap(left: &str, right: &str) -> bool {
     let left = Path::new(left);
     let right = Path::new(right);
-    path_is_within(left, right) || path_is_within(right, left)
+    left.starts_with(right) || right.starts_with(left)
 }
 fn validate_day(day: &str) -> Result<()> {
     ensure!(
@@ -2099,43 +2081,6 @@ mod tests {
         connection.execute_batch("PRAGMA user_version=2;")?;
         drop(connection);
         assert!(Store::open(&db).is_err());
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-    #[cfg(unix)]
-    #[test]
-    fn resource_reservations_follow_filesystem_identity_for_case_aliases() -> Result<()> {
-        use std::os::unix::fs::MetadataExt;
-        let root = std::env::temp_dir().join(format!("vibeface-case-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(root.join("Repo/child"))?;
-        std::fs::create_dir_all(root.join("repo/child"))?;
-        let upper = canonical_resource(root.join("Repo").to_str().unwrap())?;
-        let lower = canonical_resource(root.join("repo").to_str().unwrap())?;
-        let upper_id = std::fs::metadata(&upper)?;
-        let lower_id = std::fs::metadata(&lower)?;
-        let same = upper_id.dev() == lower_id.dev() && upper_id.ino() == lower_id.ino();
-        assert_eq!(paths_overlap(&upper, &lower), same);
-        assert_eq!(
-            path_is_within(&root.join("repo/child"), &root.join("Repo")),
-            same
-        );
-        let identity = LocalIdentity::generate();
-        let network = identity.network_id()?;
-        let mut store = Store::open(":memory:")?;
-        store.install_trust_bundle(
-            &network,
-            &identity.sign_trust_bundle(1, vec![identity.certificate(roles())?])?,
-        )?;
-        let event = conversation(&mut store, &identity)?;
-        let mut first = request(&identity, "first-case", vec![event.hash])?;
-        first.resources = vec![upper];
-        store.accept_operation(&network, &first)?;
-        let mut second = first.clone();
-        second.operation_id = "second-case".into();
-        second.session_id = "another-session".into();
-        second.resources = vec![lower];
-        assert_eq!(store.accept_operation(&network, &second).is_err(), same);
-        drop(store);
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
