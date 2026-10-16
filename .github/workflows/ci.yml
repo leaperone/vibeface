@@ -217,7 +217,7 @@ jobs:
           if gh release view "$RELEASE_TAG" --json isDraft > "$RUNNER_TEMP/release.json"; then
             python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["isDraft"], "Refusing to overwrite a public release"' "$RUNNER_TEMP/release.json"
           else
-            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --generate-notes --target "$GITHUB_SHA" "${release_flags[@]}"
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --generate-notes --target "$GITHUB_SHA" --prerelease="$PRERELEASE" --latest=false
           fi
           gh release upload "$RELEASE_TAG" packages/* --clobber
           gh release view "$RELEASE_TAG" --json assets > "$RUNNER_TEMP/release-assets.json"
