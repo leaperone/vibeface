@@ -109,6 +109,20 @@ pub enum NodeRole {
     Executor,
 }
 
+pub fn validate_role_dependencies(roles: &[NodeRole]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        roles.contains(&NodeRole::Replica)
+            || !roles.iter().any(|role| {
+                matches!(
+                    role,
+                    NodeRole::Gateway | NodeRole::Scheduler | NodeRole::Executor
+                )
+            }),
+        "gateway, scheduler and executor roles require replica"
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NodeCertificate {

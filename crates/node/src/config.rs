@@ -1,4 +1,7 @@
-use crate::{crypto::LocalIdentity, model::NodeRole};
+use crate::{
+    crypto::LocalIdentity,
+    model::{NodeRole, validate_role_dependencies},
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -69,6 +72,7 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        validate_role_dependencies(&self.roles)?;
         let url = reqwest::Url::parse(&self.public_url)?;
         let local_origin = url.host_str().is_some_and(|h| {
             h == "localhost"
@@ -166,4 +170,33 @@ pub fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
         "stop the Node using this data directory before changing its local pairing state",
     )?;
     Ok(lock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn business_roles_require_replica() {
+        let mut config = Config::local("127.0.0.1:0".parse().unwrap(), vec![], false);
+        assert!(config.validate().is_ok());
+        for roles in [
+            vec![NodeRole::Relay],
+            vec![NodeRole::Replica],
+            vec![NodeRole::Relay, NodeRole::Replica],
+            vec![NodeRole::Gateway, NodeRole::Relay, NodeRole::Replica],
+            vec![NodeRole::Scheduler, NodeRole::Replica],
+            vec![NodeRole::Executor, NodeRole::Replica],
+        ] {
+            config.roles = roles;
+            assert!(config.validate().is_ok());
+        }
+        for role in [NodeRole::Gateway, NodeRole::Scheduler, NodeRole::Executor] {
+            config.roles = vec![role, NodeRole::Relay];
+            assert_eq!(
+                config.validate().unwrap_err().to_string(),
+                "gateway, scheduler and executor roles require replica"
+            );
+        }
+    }
 }

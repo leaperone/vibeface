@@ -1,6 +1,6 @@
 use crate::{
     crypto::{LocalIdentity, verify_trust_bundle},
-    model::TrustBundle,
+    model::{NodeRole, TrustBundle, validate_role_dependencies},
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use argon2::{
@@ -412,6 +412,9 @@ impl AuthStore {
         roles.sort_unstable();
         roles.dedup();
         let roles_json = serde_json::to_string(&roles)?;
+        let node_roles: Vec<NodeRole> =
+            serde_json::from_str(&roles_json).context("invalid invitation roles")?;
+        validate_role_dependencies(&node_roles)?;
         let code = random_secret();
         let now = now_ms();
         let transaction = self
@@ -603,7 +606,6 @@ fn set_private(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::NodeRole;
 
     const PASSWORD: &str = "a correct local password";
 
@@ -803,7 +805,11 @@ mod tests {
     fn pairing_invites_are_network_scoped_single_use_and_expire() {
         let mut fixture = Fixture::new();
         fixture.register();
-        let roles = vec!["scheduler".to_owned(), "executor".to_owned()];
+        let roles = vec![
+            "scheduler".to_owned(),
+            "executor".to_owned(),
+            "replica".to_owned(),
+        ];
         let code = fixture
             .store
             .create_invite(&network(), roles.clone())
@@ -811,7 +817,7 @@ mod tests {
         let node_id = "11".repeat(32);
         let grant = fixture.store.pairing_invite(&code, &node_id).unwrap();
         assert_eq!(grant.network_id, network());
-        assert_eq!(grant.roles, vec!["executor", "scheduler"]);
+        assert_eq!(grant.roles, vec!["executor", "replica", "scheduler"]);
         assert!(!grant.claimed);
         fixture.store.consume_invite(&code, &node_id).unwrap();
         assert!(
@@ -830,13 +836,19 @@ mod tests {
         assert!(
             fixture
                 .store
-                .create_invite("network-b", vec!["executor".to_owned()])
+                .create_invite(
+                    "network-b",
+                    vec!["executor".to_owned(), "replica".to_owned()]
+                )
                 .is_err()
         );
 
         let code = fixture
             .store
-            .create_invite(&network(), vec!["executor".to_owned()])
+            .create_invite(
+                &network(),
+                vec!["executor".to_owned(), "replica".to_owned()],
+            )
             .unwrap();
         let barrier = std::sync::Barrier::new(2);
         let accepted = std::thread::scope(|scope| {
@@ -863,12 +875,36 @@ mod tests {
     }
 
     #[test]
+    fn pairing_invites_require_replica_for_business_roles() {
+        let mut fixture = Fixture::new();
+        fixture.register();
+        for role in ["gateway", "scheduler", "executor"] {
+            assert_eq!(
+                fixture
+                    .store
+                    .create_invite(&network(), vec![role.into()])
+                    .unwrap_err()
+                    .to_string(),
+                "gateway, scheduler and executor roles require replica"
+            );
+        }
+        for roles in [
+            vec!["relay".into()],
+            vec!["replica".into()],
+            vec!["relay".into(), "replica".into()],
+            vec!["gateway".into(), "replica".into()],
+        ] {
+            assert!(fixture.store.create_invite(&network(), roles).is_ok());
+        }
+    }
+
+    #[test]
     fn claimed_invite_survives_reopen_for_only_the_same_device() {
         let mut fixture = Fixture::new();
         fixture.register();
         let code = fixture
             .store
-            .create_invite(&network(), vec!["executor".into()])
+            .create_invite(&network(), vec!["executor".into(), "replica".into()])
             .unwrap();
         let node_id = "33".repeat(32);
         fixture.store.consume_invite(&code, &node_id).unwrap();
@@ -879,13 +915,13 @@ mod tests {
             .unwrap();
         fixture
             .store
-            .create_invite(&network(), vec!["executor".into()])
+            .create_invite(&network(), vec!["executor".into(), "replica".into()])
             .unwrap();
         let mut reopened = AuthStore::open(&fixture.root.join("auth.sqlite")).unwrap();
         let grant = reopened.pairing_invite(&code, &node_id).unwrap();
         assert!(grant.claimed);
         assert_eq!(grant.network_id, network());
-        assert_eq!(grant.roles, vec!["executor"]);
+        assert_eq!(grant.roles, vec!["executor", "replica"]);
         reopened.consume_invite(&code, &node_id).unwrap();
         assert!(reopened.pairing_invite(&code, &"44".repeat(32)).is_err());
         assert!(reopened.consume_invite(&code, &"44".repeat(32)).is_err());
