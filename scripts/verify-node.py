@@ -45,7 +45,8 @@ def wait_for(description, predicate, timeout=35):
         except (OSError, ValueError, AssertionError, http.client.HTTPException) as error:
             last_error = error
         time.sleep(0.15)
-    suffix = f" ({type(last_error).__name__})" if last_error else ""
+    suffix = (f" ({last_error})" if isinstance(last_error, TimeoutError)
+              else f" ({type(last_error).__name__})" if last_error else "")
     raise AssertionError(f"timed out waiting for {description}{suffix}")
 
 
@@ -89,25 +90,33 @@ class Client:
             body = json.dumps(payload).encode()
             request_headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.url + path, body, request_headers)
+        description = f"{request.get_method()} {self.url}{urllib.parse.urlsplit(path).path}"
+        if path == "/api/rpc" and isinstance(payload, dict):
+            description += f" RPC {payload.get('method', '?')}"
         try:
-            response = urllib.request.urlopen(request, timeout=timeout)
-        except urllib.error.HTTPError as error:
-            response = error
-        with response:
-            observed = response.status
-            encoded = response.read(4 * 1024 * 1024 + 1)
-            require(len(encoded) <= 4 * 1024 * 1024, "HTTP response is bounded")
-            require(observed == status,
-                    f"{path}: expected HTTP {status}, received {observed}")
-            value = json.loads(encoded) if encoded else None
-            cookie = response.headers.get("Set-Cookie")
-            if cookie and observed == 200 and path == "/api/login":
-                require("HttpOnly" in cookie and "SameSite=Strict" in cookie,
-                        "login cookie has HttpOnly and SameSite")
-                self.cookie = cookie.split(";", 1)[0]
-                self.csrf = value["csrf"]
-                self.account = value["account"]
-            return value
+            try:
+                response = urllib.request.urlopen(request, timeout=timeout)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                observed = response.status
+                encoded = response.read(4 * 1024 * 1024 + 1)
+                require(len(encoded) <= 4 * 1024 * 1024, "HTTP response is bounded")
+                require(observed == status,
+                        f"{path}: expected HTTP {status}, received {observed}")
+                value = json.loads(encoded) if encoded else None
+                cookie = response.headers.get("Set-Cookie")
+                if cookie and observed == 200 and path == "/api/login":
+                    require("HttpOnly" in cookie and "SameSite=Strict" in cookie,
+                            "login cookie has HttpOnly and SameSite")
+                    self.cookie = cookie.split(";", 1)[0]
+                    self.csrf = value["csrf"]
+                    self.account = value["account"]
+                return value
+        except (TimeoutError, urllib.error.URLError) as error:
+            if isinstance(error, urllib.error.URLError) and not isinstance(error.reason, TimeoutError):
+                raise
+            raise TimeoutError(f"{description} exceeded HTTP timeout of {timeout}s") from None
 
     def login(self, username, password):
         return self.request("/api/login", {"username": username, "password": password})
