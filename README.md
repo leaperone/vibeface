@@ -49,7 +49,7 @@ A 把任务派发到 B 后，B 在接单前取得所需上下文。A 离线时�
 
 - [部署与使用 Node](docs/node.md) 包括局域网、公网中继、SDK、后台运行和制品安装。
 - [Node 协议参考](docs/node-protocol.md) 包括 HTTP、事件 DAG、操作状态和通知确认。
-- [构建与发布](docs/releasing.md) 说明四平台包、SHA256、升级和版本发布。PR 与 `main` 的 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 只生成 Actions 制品；公开版本见 [Releases](https://github.com/leaperone/vibeface/releases)。
+- [构建与发布](docs/releasing.md) 说明四平台包、SHA256、升级及 stable/nightly/rc tag 规则。PR 与 `main` 的 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 只生成 Actions 制品；公开版本见 [Releases](https://github.com/leaperone/vibeface/releases)，nightly 与 rc 为预发布。
 - `scripts/package-node.sh` 生成当前平台的压缩包和 SHA256 文件，默认输出到 `.artifacts/packages/`。
 
 可在仓库根目录运行对应检查。命令本身不代表本次提交已经通过，实际结果以 PR 的验证记录为准。
