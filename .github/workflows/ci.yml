@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.metadata.outputs.version }}
+      channel: ${{ steps.metadata.outputs.channel }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,12 +37,20 @@ jobs:
         run: |
           cargo metadata --no-deps --format-version 1 --locked > "$RUNNER_TEMP/cargo-metadata.json"
           python3 - "$RUNNER_TEMP/cargo-metadata.json" <<'PY'
-          import json, os, sys
+          import datetime, json, os, re, sys
           package = next(p for p in json.load(open(sys.argv[1]))["packages"] if p["name"] == "vibeface-node")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f'version={package["version"]}\nmsrv={package["rust_version"]}\n')
+          version = package["version"]
+          number = r"(?:0|[1-9][0-9]*)"
+          match = re.fullmatch(rf"{number}\.{number}\.{number}(?:-(nightly)\.([0-9]{{8}})\.([1-9][0-9]*)|-(rc)\.([1-9][0-9]*))?", version)
+          assert match, "Expected X.Y.Z, X.Y.Z-nightly.YYYYMMDD.N or X.Y.Z-rc.N"
+          channel = "nightly" if match[1] else "rc" if match[4] else "stable"
+          if channel == "nightly":
+              date = match[2]
+              datetime.date(int(date[:4]), int(date[4:6]), int(date[6:]))
           if os.environ["REF_TYPE"] == "tag":
-              assert os.environ["REF_NAME"] == f'v{package["version"]}', "Release tag must exactly match the Cargo version"
+              assert os.environ["REF_NAME"] == f"v{version}", "Release tag must exactly match the Cargo version"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f'version={version}\nmsrv={package["rust_version"]}\nchannel={channel}\nprerelease={str(channel != "stable").lower()}\n')
           PY
           if [[ "$REF_TYPE" == tag ]]; then
             git merge-base --is-ancestor HEAD origin/main
@@ -177,6 +187,8 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.ref_name }}
       VERSION: ${{ needs.check.outputs.version }}
+      RELEASE_CHANNEL: ${{ needs.check.outputs.channel }}
+      PRERELEASE: ${{ needs.check.outputs.prerelease }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -198,10 +210,14 @@ jobs:
           done
       - name: Upload complete draft and publish
         run: |
+          release_flags=(--prerelease="$PRERELEASE" --latest=false)
+          if [[ "$RELEASE_CHANNEL" == stable ]]; then
+            release_flags=(--prerelease=false --latest=true)
+          fi
           if gh release view "$RELEASE_TAG" --json isDraft > "$RUNNER_TEMP/release.json"; then
             python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["isDraft"], "Refusing to overwrite a public release"' "$RUNNER_TEMP/release.json"
           else
-            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --generate-notes --target "$GITHUB_SHA"
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --generate-notes --target "$GITHUB_SHA" "${release_flags[@]}"
           fi
           gh release upload "$RELEASE_TAG" packages/* --clobber
           gh release view "$RELEASE_TAG" --json assets > "$RUNNER_TEMP/release-assets.json"
@@ -215,4 +231,4 @@ jobs:
           for asset in packages/*; do
             cmp "$asset" "$RUNNER_TEMP/release-download/$(basename "$asset")"
           done
-          gh release edit "$RELEASE_TAG" --draft=false
+          gh release edit "$RELEASE_TAG" --draft=false "${release_flags[@]}"

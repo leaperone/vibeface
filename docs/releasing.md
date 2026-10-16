@@ -35,10 +35,22 @@ cd vibeface-node-<version>-<target>
 
 ## 显式发布版本
 
+整个 workspace 使用同一版本；Git tag 在 Cargo 版本前加 `v`，不按组件分别发布。
+
+| 渠道 | Tag 格式 | 示例 | GitHub Release |
+| --- | --- | --- | --- |
+| stable | `vX.Y.Z` | `v0.0.1` | 正式版本，标记为 Latest |
+| nightly | `vX.Y.Z-nightly.YYYYMMDD.N` | `v0.0.1-nightly.20261016.1` | 预发布，不标记为 Latest |
+| rc | `vX.Y.Z-rc.N` | `v0.0.1-rc.1` | 预发布，不标记为 Latest |
+
+`X.Y.Z` 是目标正式版本，数字不带前导零。nightly 日期按发布时的 UTC 日历日期填写，`N` 是该目标版本、当天从 `1` 递增的发布序号；rc 的 `N` 则在该目标版本内从 `1` 递增。日期必须有效，序号不带前导零。本次首个版本为 `0.0.1-nightly.20261016.1`：本地日期虽为 10 月 17 日，UTC 日期仍为 10 月 16 日。
+
+nightly 表示开发预发布，需显式选择对应版本，不能通过 GitHub 的 Latest 稳定版入口获取。tag 一经发布不可移动、删除重用或覆盖；不创建可变的 `nightly` tag，不追加 build metadata 或 SHA。包内 `BUILD-INFO.json` 记录实际源码提交。
+
 1. 通过 PR 更新 workspace 版本及 `Cargo.lock`，完成检查并合并到 `main`。
-2. 在已合并的提交创建并推送 `v<version>` tag。tag 必须与 Cargo 版本完全相同，且指向已进入 `main` 的提交。
+2. 按上述格式在已合并的提交创建并推送 `v<version>` tag。tag 必须与 Cargo 版本完全相同，且指向已进入 `main` 的提交；CI 拒绝其他后缀或格式。
 3. 查看 tag 触发的 CI，确认质量检查和四个平台的包验收全部成功。
-4. 发布任务创建 draft Release，上传四个包和四个 checksum，核对资产清单并重新下载逐字节比较，最后公开 Release。
+4. 发布任务创建相应渠道的 draft Release，上传四个包和四个 checksum，核对资产清单并重新下载逐字节比较，最后按渠道公开 Release。恢复已有 draft 时也会校正预发布和 Latest 属性。
 
 只有发布任务拥有 `contents: write` 权限。失败留下的 draft 可以在修复原因后重跑；公开 Release 不会被覆盖。同名公开版本需要更正时，使用新的版本和 tag。合并 PR 不会自动推送 tag。
 
