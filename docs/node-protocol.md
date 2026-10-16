@@ -30,6 +30,8 @@
 | `timeout_secs` | 单次适配器超时，默认 600 秒 |
 | `daily_decision_limit` | 本 Node 每个网络的 UTC 每日管理调用次数，默认 20 |
 
+`gateway`、`scheduler`、`executor` 依赖 `replica`，配置和配对邀请都会校验此条件。无需 Agent 的入口可启用 `gateway`、`replica` 和可选 `relay`；纯 `relay` 可以只转发消息而不保存业务副本。当前不提供无本地历史的 Gateway 代理模式。
+
 启用管理 Agent 时，`manager` 对象包含以下全部字段。程序路径在后台运行时使用绝对路径。Cursor 模式要求非空 `model`，Codex 模式可用空字符串选择其默认模型。
 
 ```json

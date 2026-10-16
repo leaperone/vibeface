@@ -794,7 +794,10 @@ mod tests {
         let device_id = device.node_id()?;
         let code = {
             let mut auth = node.auth.lock().await;
-            let code = auth.create_invite(&account.network_id, vec!["executor".into()])?;
+            let code = auth.create_invite(
+                &account.network_id,
+                vec!["executor".into(), "replica".into()],
+            )?;
             auth.consume_invite(&code, &device_id)?;
             code
         };
@@ -805,7 +808,7 @@ mod tests {
             let mut store = node.store.lock().await;
             let old = store.trust_bundle(&account.network_id)?.unwrap();
             let mut nodes = old.nodes;
-            nodes.push(device.certificate(vec![NodeRole::Executor])?);
+            nodes.push(device.certificate(vec![NodeRole::Executor, NodeRole::Replica])?);
             let bundle = owner.sign_trust_bundle(old.revision + 1, nodes)?;
             store.install_trust_bundle(&account.network_id, &bundle)?;
             assert!(
