@@ -185,18 +185,17 @@ where
         .as_ref()
         .map(|path| resolve_executable(path))
         .transpose()?;
-    let owned_id = match session_id {
-        Some(id) => id.to_owned(),
-        None => open_codex_thread(config).await?,
-    };
-    let id = owned_id.as_str();
-    persist_session(id.to_owned())
-        .await
-        .map_err(|error| ManagerError {
-            uncertain: false,
-            session_id: Some(id.into()),
-            message: format!("persist Codex SDK session before send: {error}"),
-        })?;
+    let mut native = session_id.map(str::to_owned);
+    let mut persist = Some(persist_session);
+    if let Some(id) = &native {
+        persist.take().unwrap()(id.clone())
+            .await
+            .map_err(|error| ManagerError {
+                uncertain: false,
+                session_id: native.clone(),
+                message: format!("persist Codex SDK session before resume: {error}"),
+            })?;
+    }
     let mut command = Command::new(&config.node_bin);
     command
         .arg(&config.codex_sdk_script)
@@ -230,16 +229,16 @@ where
     let mut sent = false;
     let secrets = secret_values(config);
     let operation = async {
-        write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":id,"cwd":config.workspace,"model":config.model,"codex_path":codex,
+        write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":native,"cwd":config.workspace,"model":config.model,"codex_path":codex,
             "mcp_servers":config.mcp_servers,"tool_cli":tool_cli,"tool_env":config.tool_env})).await?;
         let mut reader = BufReader::new(stdout);
         let ready = read_message(&mut reader).await?;
         ensure!(
-            ready["type"] == "ready" && ready["session_id"].as_str() == Some(id),
+            ready["type"] == "ready" && ready["session_id"].as_str() == native.as_deref(),
             "Codex SDK did not confirm the expected native session"
         );
         sent = true;
-        write_message(&mut stdin, &json!({"type":"ack","session_id":id})).await?;
+        write_message(&mut stdin, &json!({"type":"ack","session_id":native})).await?;
         let mut total = 0;
         loop {
             let message = redact(read_message(&mut reader).await?, &secrets);
@@ -249,10 +248,28 @@ where
                 "Codex SDK stream exceeded the size limit"
             );
             match message["type"].as_str() {
+                Some("session") => {
+                    let id = message["session_id"]
+                        .as_str()
+                        .context("Codex SDK session event has no native ID")?;
+                    vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
+                    ensure!(
+                        native.as_deref().is_none_or(|previous| previous == id),
+                        "Codex SDK changed its native session"
+                    );
+                    native = Some(id.into());
+                    if let Some(persist) = persist.take() {
+                        persist(id.into())
+                            .await
+                            .context("persist observed Codex SDK native session")?;
+                    }
+                    write_message(&mut stdin, &json!({"type":"session_ack","session_id":id}))
+                        .await?;
+                }
                 Some("event") => progress(message["event"].clone()).await?,
                 Some("result") => {
                     ensure!(
-                        message["session_id"].as_str() == Some(id),
+                        native.is_some() && message["session_id"].as_str() == native.as_deref(),
                         "Codex SDK returned a different native session"
                     );
                     let output = message["final_response"]
@@ -265,7 +282,7 @@ where
                         "Codex SDK sidecar exited unsuccessfully after its result"
                     );
                     return Ok(AgentResult {
-                        session_id: Some(id.into()),
+                        session_id: native.clone(),
                         output: output.into(),
                         usage: message
                             .get("usage")
@@ -294,60 +311,22 @@ where
     };
     stderr_task.abort();
     if outcome.is_err() {
-        let _ = child.kill().await;
+        let _ = write_message(&mut stdin, &json!({"type":"cancel"})).await;
+        if tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+        }
     }
     outcome.map_err(|error| {
         ManagerError {
             uncertain: sent,
-            session_id: Some(id.into()),
+            session_id: native,
             message: redact_string(error.to_string(), &secrets),
         }
         .into()
     })
-}
-
-async fn open_codex_thread(config: &ManagerConfig) -> Result<String> {
-    use vibeface_bridge::codex::CodexClient;
-    use vibeface_protocol::Command as CodexCommand;
-    let socket = config
-        .codex_socket
-        .clone()
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| {
-                PathBuf::from(home).join(".codex/app-server-control/app-server-control.sock")
-            })
-        })
-        .context("Codex socket is not configured")?;
-    let (events, _) = tokio::sync::mpsc::unbounded_channel();
-    let client = CodexClient::start(socket, events);
-    let ready = async {
-        loop {
-            if client.snapshot().await["connection"]["state"] == "connected" {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(config.timeout_secs.min(10)), ready)
-        .await
-        .context("Codex local app-server is unavailable")?;
-    let cwd = config
-        .workspace
-        .to_str()
-        .context("manager workspace must be UTF-8")?;
-    let response = client
-        .execute(&CodexCommand::StartThread { cwd: cwd.into() })
-        .await
-        .map_err(|error| ManagerError {
-            uncertain: error.uncertain,
-            session_id: None,
-            message: error.message,
-        })?;
-    let id = response["thread"]["id"]
-        .as_str()
-        .context("Codex did not return a native thread ID")?;
-    vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
-    Ok(id.into())
 }
 
 fn resolve_executable(path: &Path) -> Result<PathBuf> {
@@ -456,6 +435,67 @@ mod tests {
                 .is_err()
         );
     }
+    #[tokio::test]
+    async fn fresh_sdk_native_id_is_persisted_and_failed_persistence_is_unknown() {
+        let directory =
+            std::env::temp_dir().join(format!("vibeface-manager-fixture-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let script = directory.join("fixture.sh");
+        tokio::fs::write(
+            &script,
+            r#"IFS= read -r init || exit 1
+printf '%s\n' '{"type":"ready","session_id":null}'
+IFS= read -r ack || exit 2
+printf '%s\n' '{"type":"session","session_id":"fixture-native"}'
+IFS= read -r confirmed || exit 3
+case "$confirmed" in *session_ack*) ;; *) exit 4 ;; esac
+test -f persisted || exit 5
+printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"done","usage":null}'
+"#,
+        )
+        .await
+        .unwrap();
+        let config = ManagerConfig {
+            kind: ManagerKind::CodexSdk,
+            workspace: directory.clone(),
+            node_bin: "/bin/sh".into(),
+            codex_bin: "/usr/bin/true".into(),
+            codex_sdk_script: script,
+            timeout_secs: 5,
+            ..ManagerConfig::default()
+        };
+        let marker = directory.join("persisted");
+        let result = run_manager(
+            &config,
+            "fixture",
+            None,
+            move |id| async move {
+                assert_eq!(id, "fixture-native");
+                tokio::fs::write(marker, b"yes").await?;
+                Ok(())
+            },
+            |_| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.session_id.as_deref(), Some("fixture-native"));
+        assert_eq!(result.output, "done");
+        let error = run_manager(
+            &config,
+            "fixture",
+            None,
+            |_| async { anyhow::bail!("fixture storage failed") },
+            |_| async { Ok(()) },
+        )
+        .await
+        .err()
+        .unwrap();
+        let error = error.downcast_ref::<ManagerError>().unwrap();
+        assert!(error.uncertain);
+        assert_eq!(error.session_id.as_deref(), Some("fixture-native"));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
     #[test]
     fn callback_credentials_are_not_serialized() {
         let config = ManagerConfig {
