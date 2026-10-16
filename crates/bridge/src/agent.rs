@@ -21,6 +21,7 @@ const MAX_SNAPSHOT_BYTES: usize = 16_384;
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_STREAM_BYTES: usize = 16_777_216;
 const MAX_RESULT_BYTES: usize = 65_536;
+const MAX_PROMPT_BYTES: usize = MAX_RESULT_BYTES + MAX_SNAPSHOT_BYTES + 4096;
 const AGENT_SERVICE: &str = "SdkAgentService";
 const CONTROL_SERVICE: &str = "SdkBridgeControlService";
 
@@ -107,6 +108,10 @@ where
     P: FnMut(Value) -> PF,
     PF: Future<Output = Result<()>>,
 {
+    ensure!(
+        !prompt.trim().is_empty() && prompt.len() <= MAX_RESULT_BYTES,
+        "invalid management prompt"
+    );
     let snapshot = compact_snapshot(snapshot)?;
     let prompt = format!(
         "You manage Codex tasks through the vibeface MCP tools. Use only those tools. \
@@ -157,7 +162,7 @@ where
         "Cursor SDK timeout must be positive"
     );
     ensure!(
-        !prompt.trim().is_empty() && prompt.len() <= MAX_RESULT_BYTES,
+        !prompt.trim().is_empty() && prompt.len() <= MAX_PROMPT_BYTES,
         "invalid management prompt"
     );
     ensure!(
