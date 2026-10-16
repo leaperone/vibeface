@@ -64,6 +64,8 @@
 | `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | Cursor SDK 原生工具回调 |
 | `/peer` | GET，WebSocket upgrade | 设备认证、同步和中继 |
 
+仅首次回环注册可取得本机配置的调度及执行角色。其条件为本机尚无账户，且监听地址与 `public_url` 都指向回环地址。其他注册只授予本机已启用的接入、中继和副本角色，不能使用托管主机的项目目录或 Agent。
+
 注册及登录正文为 `{"username":"name","password":"..."}`。登录返回 `account` 和 `csrf`，并设置 `vibeface_session` cookie。cookie 为 HttpOnly、SameSite=Strict；HTTPS origin 额外设置 Secure。会话有效期为 7 天。
 
 浏览器变更请求携带 cookie、匹配的 `Origin` 和 `X-CSRF-Token`。cookie 只适用于当前 origin，切换入口重新登录。网页切换入口可携带非秘密的 conversation ID 和 basis heads。

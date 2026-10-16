@@ -36,7 +36,9 @@ cd vibeface-node-<version>-<target>
 
 打开 `http://127.0.0.1:4790`，选择“创建账户”，随后登录。用户名使用 3 至 64 个 ASCII 字母、数字、点、短横线或下划线，大小写不区分。密码为 12 至 1024 字节。
 
-注册创建一个新的个人网络。首台注册设备保管该网络的根签名私钥，配对邀请和设备撤销只能在这台设备发起。这是设备信任的签发位置，不是会话数据的永久主节点，也不是调度负责人。
+注册创建一个新的个人网络。只有尚无账户、监听地址与 `public_url` 都是回环地址时，首个账户才获得本机已配置的调度和执行角色。先在本机完成这一步，再开放 LAN 或公网；其他注册账户只获得接入、中继和副本角色，不能使用服务器的项目目录或执行器。
+
+首台注册设备保管该网络的根签名私钥，配对邀请和设备撤销只能在这台设备发起。这是设备信任的签发位置，不是会话数据的永久主节点，也不是调度负责人。
 
 `init` 不覆盖现有身份和配置。默认数据目录为 `$HOME/.vibeface`，包含 `identity.json`、`config.json`、`auth.sqlite3`、`node.sqlite3` 和运行状态。使用独立目录运行不同 Node。同一目录同时只允许运行一个进程。
 
@@ -110,18 +112,17 @@ Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它�
 
 ## 开放可信局域网入口
 
-初始化时显式开启明文 LAN，并把 `--public-url` 设为客户端实际使用的地址：
+先在回环地址初始化并注册本人账户，再停止 Node，修改 `config.json` 的以下字段，保留其他配置：
 
-```sh
-./vibeface-node init \
-	--data-dir "$HOME/.vibeface" \
-	--listen 0.0.0.0:4790 \
-	--public-url http://192.168.1.10:4790 \
-	--allow-insecure-lan \
-	--root /absolute/path/to/projects
+```json
+{
+	"listen": "0.0.0.0:4790",
+	"public_url": "http://192.168.1.10:4790",
+	"allow_insecure_lan": true
+}
 ```
 
-将示例 IP 替换为本机 LAN 地址。已有 Node 编辑配置中的 `listen`、`public_url` 和 `allow_insecure_lan` 后重启，不重新初始化。防火墙需要允许入站连接。
+将示例 IP 替换为本机 LAN 地址，保存后重启，不重新初始化。防火墙需要允许入站连接。通过明文 LAN 配对的新设备，也需在自己的配置中开启 `allow_insecure_lan`；该设备仍可只监听回环地址，通过出站 WebSocket 接收请求。
 
 Node 校验请求的 `Host` 和 `Origin` 是否匹配 `public_url`。`0.0.0.0` 是监听地址，不是浏览器入口。通过其他 IP 或域名访问同一监听端口会被拒绝。
 
@@ -129,7 +130,9 @@ HTTP 没有传输加密。密码、会话 cookie 和配对信息可能被监听�
 
 ## 通过公网节点中继
 
-公网入口也运行同一个 `vibeface-node`。在公网主机设置 `public_url` 为 HTTPS origin，通过反向代理提供 TLS。Node 本身监听 HTTP，推荐绑定回环地址，让反向代理访问。
+公网入口也运行同一个 `vibeface-node`。若该主机要为本人运行管理 Agent 或执行器，先在回环入口完成首个账户注册，再开放公网。公网注册的新账户不能调用这台主机的 Agent 和项目目录，需要配对本人的调度及执行设备。
+
+在公网主机设置 `public_url` 为 HTTPS origin，通过反向代理提供 TLS。Node 本身监听 HTTP，推荐绑定回环地址，让反向代理访问。
 
 反向代理保留公网 `Host`，转发原始 `Origin`，支持 `/peer` 的 WebSocket upgrade 和 `/api/events` 的 SSE 长连接。不能把 `Host` 改成内部 `127.0.0.1:4790`，也不能为 SSE 启用响应缓冲。`public_url` 不包含路径、查询参数或凭证。
 
@@ -158,7 +161,7 @@ NAT 后的设备通过出站 WebSocket 连接公网 Node，连接建立后双方
 
 Codex 执行器支持打开、读取、发送、调整当前 turn、中断和回答原请求。Claude Code 与 Cursor CLI 只支持打开和发送，其他操作明确拒绝。CLI 遇到需要交互审批的工作不会自动放行；需要完整审批往返时使用 Codex。
 
-Node 默认尝试为本数据目录启动 `codex app-server`。要连接已有实例，在 `config.json` 设置 `codex_socket`。`codex_bin`、`claude_bin`、`cursor_bin` 指向对应程序。启动网页成功不等于程序已安装、已登录或模型可用，应查看执行会话的实际状态。
+Node 默认尝试启动与本机身份关联的私有 `codex app-server`，socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix socket 路径长度限制。要连接已有实例，在 `config.json` 设置 `codex_socket`。`codex_bin`、`claude_bin`、`cursor_bin` 指向对应程序。启动网页成功不等于程序已安装、已登录或模型可用，应查看执行会话的实际状态。
 
 勾选“完成执行后，让调度 Agent 继续检查”会授予该工单自动后续权限。普通内容片段和进度不调用管理模型；需要自动决策时才调用。`daily_decision_limit` 按个人网络限制当前 Node 的 UTC 每日管理调用次数，失败调用也可能消耗已预留次数。各 Node 分别记账，不构成全网 token 或费用硬上限。
 
