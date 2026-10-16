@@ -110,7 +110,7 @@ mod tests {
                         owner.certificate(vec![NodeRole::Gateway])?,
                         replica.certificate(vec![NodeRole::Replica])?,
                         relay.certificate(vec![NodeRole::Relay])?,
-                        scheduler.certificate(vec![NodeRole::Scheduler])?,
+                        scheduler.certificate(vec![NodeRole::Scheduler, NodeRole::Replica])?,
                     ],
                 )?,
             )?;
@@ -141,6 +141,23 @@ mod tests {
                 OperationState::Unknown,
                 json!({}),
             )?;
+        }
+        for (origin, human, expected) in [
+            (&scheduler, true, "origin cannot assert human authority"),
+            (&scheduler, false, "no peer route available"),
+            (&owner, true, "no peer route available"),
+        ] {
+            let message = Inbound {
+                network_id: network.clone(),
+                origin: origin.node_id()?,
+                request_id: "approval-origin-test".into(),
+                payload: json!({"type":"execute","human":human,"request":request}),
+                broadcast: false,
+            };
+            assert_eq!(
+                node.handle_peer(&message).await.unwrap_err().to_string(),
+                expected
+            );
         }
         let resolution = json!({"type":"resolve_unknown","target_node":node.identity.node_id()?,"operation_id":request.operation_id,"outcome":"succeeded","evidence":"verified test fixture process stopped"});
         for origin in [&replica, &relay] {
@@ -2345,6 +2362,11 @@ impl Runtime {
                         || sender.roles.contains(&NodeRole::Gateway),
                     "origin cannot dispatch"
                 );
+                let human = input["human"].as_bool().unwrap_or(false);
+                ensure!(
+                    !human || sender.roles.contains(&NodeRole::Gateway),
+                    "origin cannot assert human authority"
+                );
                 let request: OperationRequest = serde_json::from_value(input["request"].clone())?;
                 ensure!(request.network_id == *network, "wrong operation network");
                 // Admission holds the complete dispatched history before any external call.
@@ -2361,8 +2383,7 @@ impl Runtime {
                         .is_complete(),
                     "dispatch context is incomplete"
                 );
-                self.admit_operation(request, input["human"].as_bool().unwrap_or(false))
-                    .await
+                self.admit_operation(request, human).await
             }
             "session" => {
                 self.session_fact(
