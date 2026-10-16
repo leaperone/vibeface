@@ -55,9 +55,6 @@ impl CodexClient {
 
     pub async fn execute(&self, command: &Command) -> Result<Value, CodexError> {
         command.validate().map_err(rejected)?;
-        if matches!(command, Command::Snapshot) {
-            return Ok(self.snapshot().await);
-        }
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Execute {
@@ -228,17 +225,12 @@ fn request_id(message: &Value) -> Option<RpcId> {
 fn mutates(command: &Command) -> bool {
     !matches!(
         command,
-        Command::Snapshot
-            | Command::ListThreads { .. }
-            | Command::ReadThread { .. }
-            | Command::ListTurns { .. }
-            | Command::Manage { .. }
+        Command::ReadThread { .. } | Command::ListTurns { .. }
     )
 }
 
 fn wire_command(command: &Command) -> Option<(&'static str, Value)> {
     Some(match command {
-        Command::ListThreads { cursor } => ("thread/list", json!({"cursor":cursor,"limit":50})),
         Command::ReadThread { thread_id } => (
             "thread/read",
             json!({"threadId":thread_id,"includeTurns":false}),
@@ -246,10 +238,6 @@ fn wire_command(command: &Command) -> Option<(&'static str, Value)> {
         Command::ListTurns { thread_id, cursor } => (
             "thread/turns/list",
             json!({"threadId":thread_id,"cursor":cursor,"limit":20,"itemsView":"full"}),
-        ),
-        Command::ResumeThread { thread_id } => (
-            "thread/resume",
-            json!({"threadId":thread_id,"excludeTurns":true}),
         ),
         Command::StartThread { cwd } => ("thread/start", json!({"cwd":cwd})),
         Command::StartTurn { thread_id, text } => (
@@ -268,7 +256,7 @@ fn wire_command(command: &Command) -> Option<(&'static str, Value)> {
             "turn/interrupt",
             json!({"threadId":thread_id,"turnId":turn_id}),
         ),
-        _ => return None,
+        Command::RespondRequest { .. } => return None,
     })
 }
 
@@ -552,15 +540,8 @@ async fn run_session(
                         }
                     }
                     PendingKind::Command(execute) => {
-                        {
-                            let mut cache = cache.write().await;
-                            cache.observe_thread(&result["thread"]);
-                            if let Some(threads) = result["data"].as_array()
-                                && matches!(execute.command, Command::ListThreads { .. }) {
-                                    for thread in threads { cache.observe_thread(thread); }
-                                }
-                        }
-                        if matches!(execute.command, Command::StartThread { .. } | Command::ResumeThread { .. })
+                        cache.write().await.observe_thread(&result["thread"]);
+                        if matches!(execute.command, Command::StartThread { .. })
                             && let Some(id) = result["thread"]["id"].as_str() { state.subscribed.insert(id.into()); }
                         let _ = execute.reply.send(Ok(result));
                     }
