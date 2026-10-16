@@ -1,4 +1,8 @@
-use anyhow::{Context, Result, anyhow, bail};
+use crate::{
+    crypto::{LocalIdentity, verify_trust_bundle},
+    model::TrustBundle,
+};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -83,6 +87,7 @@ impl AuthStore {
              CREATE TABLE IF NOT EXISTS auth_owner_keys (
                  network_id TEXT PRIMARY KEY,
                  secret_key TEXT NOT NULL,
+                 bootstrap_bundle TEXT NOT NULL,
                  FOREIGN KEY (network_id) REFERENCES auth_accounts(network_id)
              );
              CREATE TABLE IF NOT EXISTS auth_sessions (
@@ -123,13 +128,20 @@ impl AuthStore {
         &mut self,
         username: &str,
         password: &str,
-        network_id: &str,
-        owner_secret: String,
+        owner: &LocalIdentity,
+        bootstrap: &TrustBundle,
     ) -> Result<Account> {
-        if owner_secret.len() != 64 || !owner_secret.bytes().all(|c| c.is_ascii_hexdigit()) {
-            bail!("owner secret must be a 32-byte hex key");
-        }
-        self.create_account(username, password, network_id, Some(&owner_secret))
+        verify_trust_bundle(bootstrap)?;
+        ensure!(
+            bootstrap.revision == 1 && bootstrap.owner_public_key == owner.public_key_hex()?,
+            "registration requires the owner's original bootstrap bundle"
+        );
+        self.create_account(
+            username,
+            password,
+            &bootstrap.network_id,
+            Some((owner, bootstrap)),
+        )
     }
 
     pub fn install_account(
@@ -146,7 +158,7 @@ impl AuthStore {
         username: &str,
         password: &str,
         network_id: &str,
-        owner_secret: Option<&str>,
+        owner: Option<(&LocalIdentity, &TrustBundle)>,
     ) -> Result<Account> {
         let username = normalize_username(username)?;
         validate_password(password)?;
@@ -179,10 +191,10 @@ impl AuthStore {
         if inserted != 1 {
             bail!("username or network already registered");
         }
-        if let Some(owner_secret) = owner_secret {
+        if let Some((owner, bootstrap)) = owner {
             transaction.execute(
-                "INSERT INTO auth_owner_keys (network_id, secret_key) VALUES (?1, ?2)",
-                params![network_id, owner_secret],
+                "INSERT INTO auth_owner_keys (network_id, secret_key, bootstrap_bundle) VALUES (?1, ?2, ?3)",
+                params![network_id, owner.secret_key_hex, serde_json::to_string(bootstrap)?],
             )?;
         }
         transaction.commit()?;
@@ -363,6 +375,16 @@ impl AuthStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn registration_bundles(&self) -> Result<Vec<TrustBundle>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT bootstrap_bundle FROM auth_owner_keys ORDER BY network_id")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect()
     }
 
     pub fn accounts(&self) -> Result<Vec<Account>> {
@@ -581,8 +603,17 @@ fn set_private(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::NodeRole;
 
     const PASSWORD: &str = "a correct local password";
+
+    fn network() -> String {
+        LocalIdentity {
+            secret_key_hex: "12".repeat(32),
+        }
+        .network_id()
+        .unwrap()
+    }
 
     struct Fixture {
         root: std::path::PathBuf,
@@ -598,8 +629,14 @@ mod tests {
         }
 
         fn register(&mut self) -> Account {
+            let owner = LocalIdentity {
+                secret_key_hex: "12".repeat(32),
+            };
+            let bootstrap = owner
+                .sign_trust_bundle(1, vec![owner.certificate(vec![NodeRole::Gateway]).unwrap()])
+                .unwrap();
             self.store
-                .register("Harry", PASSWORD, "network-a", "12".repeat(32))
+                .register("Harry", PASSWORD, &owner, &bootstrap)
                 .unwrap()
         }
     }
@@ -650,8 +687,22 @@ mod tests {
     fn account_uniqueness_owner_separation_and_validation() {
         let mut fixture = Fixture::new();
         fixture.register();
+        let bootstrap = fixture.store.registration_bundles().unwrap().pop().unwrap();
+        assert_eq!(bootstrap.network_id, network());
+        assert!(
+            fixture
+                .store
+                .register(
+                    "wrong-owner",
+                    PASSWORD,
+                    &LocalIdentity::generate(),
+                    &bootstrap
+                )
+                .is_err()
+        );
+        assert_eq!(fixture.store.accounts().unwrap().len(), 1);
         assert_eq!(
-            fixture.store.owner("network-a").unwrap().unwrap(),
+            fixture.store.owner(&network()).unwrap().unwrap(),
             "12".repeat(32)
         );
         assert!(fixture.store.owner("network-b").unwrap().is_none());
@@ -664,7 +715,7 @@ mod tests {
         assert!(
             fixture
                 .store
-                .install_account("someone", PASSWORD, "network-a")
+                .install_account("someone", PASSWORD, &network())
                 .is_err()
         );
         fixture
@@ -673,6 +724,10 @@ mod tests {
             .unwrap();
         assert!(fixture.store.owner("network-b").unwrap().is_none());
         assert_eq!(fixture.store.accounts().unwrap().len(), 2);
+        assert_eq!(
+            fixture.store.registration_bundles().unwrap(),
+            vec![bootstrap]
+        );
         for username in ["ab", "has space", "../", "名字"] {
             assert!(
                 fixture
@@ -751,11 +806,11 @@ mod tests {
         let roles = vec!["scheduler".to_owned(), "executor".to_owned()];
         let code = fixture
             .store
-            .create_invite("network-a", roles.clone())
+            .create_invite(&network(), roles.clone())
             .unwrap();
         let node_id = "11".repeat(32);
         let grant = fixture.store.pairing_invite(&code, &node_id).unwrap();
-        assert_eq!(grant.network_id, "network-a");
+        assert_eq!(grant.network_id, network());
         assert_eq!(grant.roles, vec!["executor", "scheduler"]);
         assert!(!grant.claimed);
         fixture.store.consume_invite(&code, &node_id).unwrap();
@@ -765,7 +820,7 @@ mod tests {
                 .consume_invite(&code, &"22".repeat(32))
                 .is_err()
         );
-        let expired = fixture.store.create_invite("network-a", roles).unwrap();
+        let expired = fixture.store.create_invite(&network(), roles).unwrap();
         fixture
             .store
             .connection
@@ -781,7 +836,7 @@ mod tests {
 
         let code = fixture
             .store
-            .create_invite("network-a", vec!["executor".to_owned()])
+            .create_invite(&network(), vec!["executor".to_owned()])
             .unwrap();
         let barrier = std::sync::Barrier::new(2);
         let accepted = std::thread::scope(|scope| {
@@ -813,7 +868,7 @@ mod tests {
         fixture.register();
         let code = fixture
             .store
-            .create_invite("network-a", vec!["executor".into()])
+            .create_invite(&network(), vec!["executor".into()])
             .unwrap();
         let node_id = "33".repeat(32);
         fixture.store.consume_invite(&code, &node_id).unwrap();
@@ -824,12 +879,12 @@ mod tests {
             .unwrap();
         fixture
             .store
-            .create_invite("network-a", vec!["executor".into()])
+            .create_invite(&network(), vec!["executor".into()])
             .unwrap();
         let mut reopened = AuthStore::open(&fixture.root.join("auth.sqlite")).unwrap();
         let grant = reopened.pairing_invite(&code, &node_id).unwrap();
         assert!(grant.claimed);
-        assert_eq!(grant.network_id, "network-a");
+        assert_eq!(grant.network_id, network());
         assert_eq!(grant.roles, vec!["executor"]);
         reopened.consume_invite(&code, &node_id).unwrap();
         assert!(reopened.pairing_invite(&code, &"44".repeat(32)).is_err());

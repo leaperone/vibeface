@@ -756,6 +756,115 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn registration_recovers_after_auth_and_trust_commits() -> Result<()> {
+        for trust_committed in [false, true] {
+            let dir = fixture()?;
+            let node = Runtime::open(&dir).await?;
+            let owner = LocalIdentity::generate();
+            let bootstrap = owner.sign_trust_bundle(
+                1,
+                vec![node.identity.certificate(node.config.roles.clone())?],
+            )?;
+            let account = node.auth.lock().await.register(
+                "owner",
+                "a-valid-test-password",
+                &owner,
+                &bootstrap,
+            )?;
+            if trust_committed {
+                node.store
+                    .lock()
+                    .await
+                    .install_trust_bundle(&account.network_id, &bootstrap)?;
+            }
+            drop(node);
+            for _ in 0..2 {
+                let node = Runtime::open(&dir).await?;
+                assert_eq!(
+                    node.auth
+                        .lock()
+                        .await
+                        .login("owner", "a-valid-test-password")?
+                        .account,
+                    account
+                );
+                let store = node.store.lock().await;
+                assert_eq!(
+                    store.trust_bundle(&account.network_id)?,
+                    Some(bootstrap.clone())
+                );
+                assert_eq!(
+                    store
+                        .local_identity(&account.network_id, &node.identity.node_id()?)?
+                        .context("registration identity was not recovered")?
+                        .public_key_hex()?,
+                    node.identity.public_key_hex()?
+                );
+            }
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn registration_recovery_preserves_public_roles_and_newer_revocations() -> Result<()> {
+        for revoked in [None, Some(false), Some(true)] {
+            let dir = fixture()?;
+            let mut cfg = Config::load(&dir)?;
+            cfg.public_url = "https://node.example".into();
+            cfg.save(&dir)?;
+            let node = Runtime::open(&dir).await?;
+            let owner = LocalIdentity::generate();
+            let bootstrap = owner.sign_trust_bundle(
+                1,
+                vec![node.identity.certificate(vec![
+                    NodeRole::Gateway,
+                    NodeRole::Relay,
+                    NodeRole::Replica,
+                ])?],
+            )?;
+            let account = node.auth.lock().await.register(
+                "owner",
+                "a-valid-test-password",
+                &owner,
+                &bootstrap,
+            )?;
+            let expected = if let Some(revoked) = revoked {
+                let mut certificate = node.identity.certificate(vec![NodeRole::Gateway])?;
+                certificate.revoked = revoked;
+                let newer = owner.sign_trust_bundle(2, vec![certificate])?;
+                node.store
+                    .lock()
+                    .await
+                    .install_trust_bundle(&account.network_id, &newer)?;
+                newer
+            } else {
+                bootstrap
+            };
+            drop(node);
+            cfg.public_url = format!("http://{}", cfg.listen);
+            cfg.save(&dir)?;
+            let node = Runtime::open(&dir).await?;
+            let local = node.identity.node_id()?;
+            let store = node.store.lock().await;
+            assert_eq!(store.trust_bundle(&account.network_id)?, Some(expected));
+            for role in [NodeRole::Scheduler, NodeRole::Executor] {
+                assert!(
+                    store
+                        .authorize_node(&account.network_id, &local, Some(role))
+                        .is_err()
+                );
+            }
+            assert_eq!(
+                store.local_identity(&account.network_id, &local)?.is_some(),
+                revoked != Some(true)
+            );
+            drop(store);
+            drop(node);
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+    #[tokio::test]
     async fn completion_receipt_recovers_history_and_notifies_once_after_reopen() -> Result<()> {
         let dir = fixture()?;
         let node = Runtime::open(&dir).await?;
@@ -1194,8 +1303,29 @@ impl Runtime {
         let mut config = Config::load(dir)?;
         let process_lock = config::lock_data_dir(dir)?;
         let identity = config::identity(dir)?;
-        let store = Arc::new(Mutex::new(Store::open(dir.join("node.sqlite3"))?));
-        let auth = Arc::new(Mutex::new(AuthStore::open(&dir.join("auth.sqlite3"))?));
+        let mut store = Store::open(dir.join("node.sqlite3"))?;
+        let auth = AuthStore::open(&dir.join("auth.sqlite3"))?;
+        let local = identity.node_id()?;
+        for bootstrap in auth.registration_bundles()? {
+            let network = &bootstrap.network_id;
+            let current = match store.trust_bundle(network)? {
+                Some(current) => current,
+                None => {
+                    store.install_trust_bundle(network, &bootstrap)?;
+                    bootstrap.clone()
+                }
+            };
+            if current
+                .nodes
+                .iter()
+                .any(|node| node.node_id == local && !node.revoked)
+                && store.local_identity(network, &local)?.is_none()
+            {
+                store.save_local_identity(network, &identity)?;
+            }
+        }
+        let store = Arc::new(Mutex::new(store));
+        let auth = Arc::new(Mutex::new(auth));
         let (hub, peer_rx) = PeerHub::new(identity.clone(), store.clone(), &config.roles);
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1395,7 +1525,7 @@ impl Runtime {
                 .collect()
         };
         let bundle = owner.sign_trust_bundle(1, vec![self.identity.certificate(roles)?])?;
-        let account = auth.register(username, password, &network, owner.secret_key_hex.clone())?;
+        let account = auth.register(username, password, &owner, &bundle)?;
         drop(auth);
         let mut store = self.store.lock().await;
         store.install_trust_bundle(&network, &bundle)?;
