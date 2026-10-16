@@ -82,6 +82,7 @@ CREATE TABLE operations (
   session_id TEXT NOT NULL,
   request TEXT NOT NULL,
   state TEXT NOT NULL,
+  control INTEGER NOT NULL DEFAULT 0,
   result TEXT NOT NULL,
   PRIMARY KEY(network_id,operation_id)
 );

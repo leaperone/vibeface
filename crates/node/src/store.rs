@@ -714,6 +714,32 @@ impl Store {
         network_id: &str,
         request: &OperationRequest,
     ) -> Result<OperationRecord> {
+        self.admit_operation(network_id, request, false)
+    }
+    pub fn accept_control_operation(
+        &mut self,
+        network_id: &str,
+        request: &OperationRequest,
+    ) -> Result<OperationRecord> {
+        ensure!(
+            request.resources.is_empty(),
+            "control operations cannot reserve resources"
+        );
+        ensure!(
+            matches!(
+                request.action.get("type").and_then(Value::as_str),
+                Some("read" | "steer" | "interrupt" | "respond_request")
+            ),
+            "invalid control operation action"
+        );
+        self.admit_operation(network_id, request, true)
+    }
+    fn admit_operation(
+        &mut self,
+        network_id: &str,
+        request: &OperationRequest,
+        control: bool,
+    ) -> Result<OperationRecord> {
         ensure!(
             request.network_id == network_id,
             "operation network mismatch"
@@ -780,7 +806,7 @@ impl Store {
             revision.unwrap_or(0) == request.expected_revision,
             "stale execution session revision"
         );
-        let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE network_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"'))",params![network_id,request.target_node,request.session_id],|r|r.get(0))?;
+        let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE network_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"') AND (?=0 OR control=1))",params![network_id,request.target_node,request.session_id,control],|r|r.get(0))?;
         ensure!(!busy, "execution session has an unresolved operation");
         {
             let mut statement =
@@ -795,7 +821,7 @@ impl Store {
                 );
             }
         }
-        tx.execute("INSERT INTO operations(network_id,operation_id,target_node,session_id,request,state,result) VALUES(?,?,?,?,?,'\"accepted\"','null')",params![network_id,request.operation_id,request.target_node,request.session_id,encoded])?;
+        tx.execute("INSERT INTO operations(network_id,operation_id,target_node,session_id,request,state,control,result) VALUES(?,?,?,?,?,'\"accepted\"',?,'null')",params![network_id,request.operation_id,request.target_node,request.session_id,encoded,control])?;
         for resource in resources {
             tx.execute("INSERT INTO resource_reservations(network_id,operation_id,target_node,resource) VALUES(?,?,?,?)",params![network_id,request.operation_id,request.target_node,resource])?;
         }
@@ -1596,6 +1622,54 @@ mod tests {
             store
                 .finish_operation(&network, "operation", OperationState::Failed, Value::Null)
                 .is_err()
+        );
+        Ok(())
+    }
+    #[test]
+    fn running_send_allows_deduped_controls_but_blocks_other_sends_and_controls() -> Result<()> {
+        let a = LocalIdentity::generate();
+        let network = a.network_id()?;
+        let mut store = memory(&a, None)?;
+        let root = conversation(&mut store, &a)?;
+        store.upsert_session(&network, &session(&a, "session")?)?;
+        let mut send = request(&a, "send", vec![root.hash])?;
+        send.action = json!({"type":"send","text":"work"});
+        send.resources = vec!["/tmp/vibeface-active-turn".into()];
+        store.accept_operation(&network, &send)?;
+        store.claim_operation(&network, "send")?;
+        let mut another = send.clone();
+        another.operation_id = "send-again".into();
+        assert!(store.accept_operation(&network, &another).is_err());
+        assert!(store.accept_control_operation(&network, &another).is_err());
+        let mut control = send.clone();
+        control.operation_id = "interrupt".into();
+        control.action = json!({"type":"interrupt"});
+        control.resources.clear();
+        assert_eq!(
+            store.accept_control_operation(&network, &control)?.state,
+            OperationState::Accepted
+        );
+        store.claim_operation(&network, "interrupt")?;
+        assert_eq!(
+            store.accept_control_operation(&network, &control)?.state,
+            OperationState::Running
+        );
+        let mut second = control.clone();
+        second.operation_id = "steer".into();
+        second.action = json!({"type":"steer","text":"more"});
+        assert!(store.accept_control_operation(&network, &second).is_err());
+        store.finish_operation(
+            &network,
+            "interrupt",
+            OperationState::Succeeded,
+            Value::Null,
+        )?;
+        assert!(store.accept_operation(&network, &another).is_err());
+        second.expected_revision = 1;
+        store.accept_control_operation(&network, &second)?;
+        assert_eq!(
+            store.operation(&network, "send")?.unwrap().state,
+            OperationState::Running
         );
         Ok(())
     }
