@@ -298,7 +298,6 @@ pub async fn run(
                 ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
                 ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
             ]),
-            ..ManagerConfig::default()
         };
         {
             let mut store = node.store.lock().await;
