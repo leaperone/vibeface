@@ -783,17 +783,15 @@ impl Store {
         let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE network_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"'))",params![network_id,request.target_node,request.session_id],|r|r.get(0))?;
         ensure!(!busy, "execution session has an unresolved operation");
         {
-            let mut statement = tx.prepare(
-                "SELECT resource FROM resource_reservations WHERE network_id=? AND target_node=?",
-            )?;
-            let existing = statement.query_map(params![network_id, request.target_node], |r| {
-                r.get::<_, String>(0)
-            })?;
+            let mut statement =
+                tx.prepare("SELECT resource FROM resource_reservations WHERE target_node=?")?;
+            let existing =
+                statement.query_map(params![request.target_node], |r| r.get::<_, String>(0))?;
             for row in existing {
                 let existing = row?;
                 ensure!(
                     !resources.iter().any(|r| paths_overlap(r, &existing)),
-                    "resource overlaps an unresolved operation: {existing}"
+                    "resource overlaps an unresolved operation on this device"
                 );
             }
         }
@@ -1645,6 +1643,31 @@ mod tests {
         };
         store.put_blob(&na, &blob, b"private")?;
         assert!(store.get_blob(&nb, &blob.hash)?.is_none());
+        Ok(())
+    }
+    #[test]
+    fn same_device_resources_are_reserved_across_networks_without_sharing_records() -> Result<()> {
+        let a = LocalIdentity::generate();
+        let b = LocalIdentity::generate();
+        let na = a.network_id()?;
+        let nb = b.network_id()?;
+        let mut store = memory(&a, None)?;
+        store.install_trust_bundle(
+            &nb,
+            &b.sign_trust_bundle(1, vec![a.certificate(roles())?, b.certificate(roles())?])?,
+        )?;
+        let ea = conversation(&mut store, &a)?;
+        let eb = conversation(&mut store, &b)?;
+        let mut ra = request(&a, "same-op", vec![ea.hash])?;
+        ra.resources = vec!["/tmp/vibeface-shared-device".into()];
+        let mut rb = request(&b, "same-op", vec![eb.hash])?;
+        rb.target_node = a.node_id()?;
+        rb.resources = ra.resources.clone();
+        store.accept_operation(&na, &ra)?;
+        assert!(store.accept_operation(&nb, &rb).is_err());
+        assert!(store.operation(&nb, "same-op")?.is_none());
+        rb.resources = vec!["/tmp/vibeface-separate-device".into()];
+        store.accept_operation(&nb, &rb)?;
         Ok(())
     }
     #[test]
