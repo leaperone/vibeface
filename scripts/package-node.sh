@@ -43,6 +43,10 @@ if "$build"; then cargo "${build_args[@]}"; fi
 version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$repo/Cargo.toml" | head -n 1)"
 [[ -n "$version" && -n "$target" ]] || { echo 'Could not determine package version or target.' >&2; exit 1; }
 case "$version$target" in *[!a-zA-Z0-9._-]*) echo 'Invalid package version or target.' >&2; exit 1 ;; esac
+source_commit='null'
+if "$build" && [[ -z "$(git status --porcelain --untracked-files=normal)" ]]; then
+  source_commit="\"$(git rev-parse HEAD)\""
+fi
 
 mkdir -p "$output"
 output="$(cd "$output" && pwd)"
@@ -52,6 +56,7 @@ name="vibeface-node-$version-$target"
 package="$staging/$name"
 mkdir -p "$package/sidecars" "$package/scripts"
 cp "$binary" "$package/vibeface-node"
+printf '{"version":"%s","target":"%s","source_commit":%s}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
 cp "$repo/README.md" "$package/"
 cp -R "$repo/docs" "$package/docs"

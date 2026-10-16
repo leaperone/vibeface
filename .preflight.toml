@@ -16,6 +16,16 @@ name = "JavaScript syntax"
 trigger_paths = ["crates/node/sdk/**", "crates/node/web/**"]
 command = "node --check crates/node/sdk/codex-manager.mjs && node --check crates/node/web/app.js"
 
+[[domain_check]]
+name = "Delivery scripts and workflow"
+trigger_paths = ["scripts/*.sh", ".github/workflows/**"]
+command = "bash -n scripts/package-node.sh scripts/install-node-service.sh && shellcheck scripts/package-node.sh scripts/install-node-service.sh && actionlint .github/workflows/ci.yml"
+
+[[domain_check]]
+name = "Migration integrity"
+trigger_paths = ["crates/node/migrations/**"]
+command = "atlas migrate validate --dir file://crates/node/migrations"
+
 [review]
 extra_checklist = "Check command deduplication, uncertain write results, device connection ownership, local socket permissions, and manager token budgets. A public Node may also schedule or execute; no permanent coordinator or task owner. Verify network and conversation scoping, complete DAG context and no side effects from replay."
 
