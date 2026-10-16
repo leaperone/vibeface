@@ -22,7 +22,6 @@ pub enum ExecutorKind {
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
     pub codex_socket: Option<PathBuf>,
-    pub codex_bin: PathBuf,
     pub claude_bin: PathBuf,
     pub cursor_bin: PathBuf,
     pub timeout_secs: u64,
@@ -32,7 +31,6 @@ impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
             codex_socket: None,
-            codex_bin: "codex".into(),
             claude_bin: "claude".into(),
             cursor_bin: "cursor-agent".into(),
             timeout_secs: 600,

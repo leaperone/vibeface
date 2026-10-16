@@ -283,7 +283,7 @@ pub async fn run(
         };
         let prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &node.config.roots)?;
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
-        let mut config = ManagerConfig {
+        let config = ManagerConfig {
             kind, workspace: settings.workspace, model: settings.model,
             timeout_secs: node.config.timeout_secs,
             cursor_sdk_bin: settings.cursor_sdk_bin, node_bin: settings.node_bin,
@@ -300,7 +300,6 @@ pub async fn run(
             ]),
             ..ManagerConfig::default()
         };
-        config.codex_socket = node.config.codex_socket.clone();
         {
             let mut store = node.store.lock().await;
             store.reserve_budget(network, &utc_day(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()), 1, node.config.daily_decision_limit)?;
