@@ -54,6 +54,14 @@ def private_json(path, value):
     path.chmod(0o600)
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def available_port():
     with socket.socket() as stream:
         stream.bind(("127.0.0.1", 0))
@@ -178,6 +186,7 @@ class Events:
         self.client = client
         self.lines = []
         self.ready = threading.Event()
+        self.stopped = threading.Event()
         self.connection = None
         self.thread = threading.Thread(target=self.read, daemon=True)
 
@@ -190,7 +199,7 @@ class Events:
             if response.status != 200:
                 return
             self.ready.set()
-            while True:
+            while not self.stopped.is_set():
                 line = response.readline()
                 if not line:
                     return
@@ -204,9 +213,10 @@ class Events:
         require(self.ready.wait(8), "authenticated SSE subscription opens")
 
     def close(self):
-        if self.connection:
-            self.connection.close()
+        self.stopped.set()
         self.thread.join(timeout=4)
+        if self.connection and not self.thread.is_alive():
+            self.connection.close()
 
 
 def fixture_executor(arguments):
@@ -308,8 +318,9 @@ def acceptance(options):
     password_a, password_b, password_c = [secrets.token_urlsafe(24) for _ in range(3)]
     nodes = []
     report = {"status": "running", "evidence": [], "provider_calls": 0,
+              "binary_sha256": file_sha256(binary),
               "not_checked": ["paid model output and SDK reasoning", "real LAN/public ingress",
-                              "rendered browser UI", "hostile DAG import rejection (covered by store tests)"]}
+                              "rendered browser UI", "hostile DAG import rejection (run store module tests separately)"]}
     stream = None
 
     def passed(description, kind="real_node_processes"):
@@ -464,12 +475,14 @@ def acceptance(options):
         a.client.login("owner_a", password_a)
         wait_for("owner reconnects to B", lambda: any(n["node_id"] == b.node_id and n["online"] for n in a.client.rpc("nodes")["nodes"]))
         a.client.rpc("revoke", node_id=c.node_id)
-        wait_for("revoked node receives updated trust", lambda: revoked(c.client))
+        wait_for("B installs device revocation", lambda: any(n["node_id"] == c.node_id and n["revoked"] for n in b.client.rpc("nodes")["nodes"]))
+        wait_for("known revocation rejects C remote access", lambda: revoked_remote(c.client, b))
         a.client.rpc("operation", target_node=c.node_id, operation_id="anything", status=400)
         require(len(invocations(run)) == 3, "sync/restart/revocation never creates extra executor calls")
         verify_no_model_budget(nodes)
-        passed("revocation rejects further data or execution access")
+        passed("known revocation rejects further cross-node data and execution access")
         passed("ordinary notifications and history replay use no management-model budget")
+        require(file_sha256(binary) == report["binary_sha256"], "binary did not change during acceptance")
         report["status"] = "passed"
         report["fixture_invocations"] = len(invocations(run))
         report["event_count"] = count
@@ -498,8 +511,8 @@ def unknown_record(client, node, operation_id):
     return record if record and record["state"] == "unknown" else None
 
 
-def revoked(client):
-    client.rpc("nodes", status=400)
+def revoked_remote(client, target):
+    client.rpc("session", target_node=target.node_id, session_id="fixture-main", status=400)
     return True
 
 
