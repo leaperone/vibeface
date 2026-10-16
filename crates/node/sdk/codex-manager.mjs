@@ -179,7 +179,9 @@ function validateInit(value) {
   }
   rejectUnknownFields(value, INIT_FIELDS, "init");
   const prompt = requireString(value.prompt, "prompt", MAX_PROMPT_BYTES);
-  const sessionId = requireId(value.session_id);
+  const sessionId = value.session_id === undefined || value.session_id === null || value.session_id === ""
+    ? null
+    : requireId(value.session_id);
   const model = value.model === undefined || value.model === null || value.model === ""
     ? undefined
     : requireString(value.model, "model", MAX_MODEL_BYTES);
@@ -233,6 +235,10 @@ function write(value) {
   const frame = JSON.stringify(value);
   if (bytes(frame) > MAX_FRAME_BYTES) throw new ProtocolError("sidecar output frame exceeded the size limit");
   process.stdout.write(`${frame}\n`);
+}
+
+function closeInput() {
+  if (!process.stdin.destroyed) process.stdin.destroy();
 }
 
 function sdkConfig(input) {
@@ -349,6 +355,57 @@ async function readFrame(reader) {
   }
 }
 
+function startControlPump(reader, controller) {
+  let pendingSessionAck = null;
+  const queuedSessionAcks = [];
+  let closed = false;
+  const rejectPending = (error) => {
+    if (pendingSessionAck) {
+      pendingSessionAck.reject(error);
+      pendingSessionAck = null;
+    }
+  };
+  const task = (async () => {
+    try {
+      while (true) {
+        const frame = await readFrame(reader);
+        if (isObject(frame) && frame.type === "session_ack" && Object.keys(frame).every((key) => ["type", "session_id"].includes(key))) {
+          if (!pendingSessionAck || frame.session_id !== pendingSessionAck.id) {
+            if (queuedSessionAcks.length >= 4) throw new ProtocolError("too many queued session ACKs");
+            queuedSessionAcks.push(frame.session_id);
+            continue;
+          }
+          pendingSessionAck.resolve();
+          pendingSessionAck = null;
+          continue;
+        }
+        if (isObject(frame) && frame.type === "cancel" && Object.keys(frame).every((key) => ["type", "session_id"].includes(key))) {
+          throw new ProtocolError("Codex execution cancelled");
+        }
+        throw new ProtocolError("unexpected control frame");
+      }
+    } catch (error) {
+      closed = true;
+      rejectPending(error);
+      controller.abort();
+    }
+  })();
+  return {
+    task,
+    waitSessionAck(id) {
+      if (closed || pendingSessionAck) return Promise.reject(new ProtocolError("session ACK channel is unavailable"));
+      const queued = queuedSessionAcks.indexOf(id);
+      if (queued >= 0) {
+        queuedSessionAcks.splice(queued, 1);
+        return Promise.resolve();
+      }
+      return new Promise((resolve, reject) => {
+        pendingSessionAck = { id, resolve, reject };
+      });
+    },
+  };
+}
+
 async function run(input, reader, secrets) {
   const cwd = await validateCwd(input.cwd);
   const codexPath = await validateExecutable(input.codexPath, "codex_path");
@@ -364,29 +421,48 @@ async function run(input, reader, secrets) {
     ],
     env: childEnvironment(input),
   });
-  const thread = codex.resumeThread(input.sessionId, {
+  const threadOptions = {
     model: input.model,
     threadSource: "vibeface-node-manager",
     workingDirectory: cwd,
+    skipGitRepoCheck: true,
     approvalPolicy: "never",
     webSearchMode: "disabled",
-  });
+  };
+  const thread = input.sessionId === null
+    ? codex.startThread(threadOptions)
+    : codex.resumeThread(input.sessionId, threadOptions);
 
   write({ type: "ready", session_id: input.sessionId, protocol: 1 });
   const ack = await readFrame(reader);
-  if (!isObject(ack) || ack.type !== "ack" || ack.session_id !== input.sessionId || Object.keys(ack).some((key) => !["type", "session_id"].includes(key))) {
+  if (!isObject(ack) || ack.type !== "ack" || (ack.session_id ?? null) !== input.sessionId || Object.keys(ack).some((key) => !["type", "session_id"].includes(key))) {
     throw new ProtocolError("expected an ACK for the confirmed session");
   }
 
-  const streamed = await thread.runStreamed(input.prompt);
+  const controller = new AbortController();
+  const onSignal = () => controller.abort();
+  process.once("SIGTERM", onSignal);
+  process.once("SIGINT", onSignal);
+  const control = startControlPump(reader, controller);
+  const streamed = await thread.runStreamed(input.prompt, { signal: controller.signal });
   let finalResponse = "";
   let usage = null;
   let turnCompleted = false;
+  let nativeSessionId = input.sessionId;
   let streamBytes = 0;
   for await (const rawEvent of streamed.events) {
     const event = redact(rawEvent, secrets);
-    if (event?.type === "thread.started" && event.thread_id !== input.sessionId) {
-      throw new ProtocolError("Codex resumed a different native session");
+    if (event?.type === "thread.started") {
+      const observed = requireId(event.thread_id, "thread_id");
+      if (nativeSessionId !== null && observed !== nativeSessionId) {
+        throw new ProtocolError("Codex resumed a different native session");
+      }
+      if (nativeSessionId === null) {
+        nativeSessionId = observed;
+        const sessionAck = control.waitSessionAck(observed);
+        write({ type: "session", session_id: observed });
+        await sessionAck;
+      }
     }
     if (event?.type === "item.completed" && event.item?.type === "agent_message") {
       finalResponse = event.item.text ?? "";
@@ -402,8 +478,14 @@ async function run(input, reader, secrets) {
     if (event?.type === "turn.failed") throw new Error(event.error?.message || "Codex turn failed");
   }
   if (!turnCompleted) throw new Error("Codex stream ended without turn.completed");
+  if (nativeSessionId === null) throw new Error("Codex stream ended without a native session ID");
   if (bytes(finalResponse) > MAX_RESULT_BYTES) throw new ProtocolError("Codex final response exceeded the size limit");
-  write({ type: "result", session_id: input.sessionId, final_response: redactString(finalResponse, secrets), usage: bounded(redact(usage, secrets), MAX_EVENT_BYTES) });
+  write({ type: "result", session_id: nativeSessionId, final_response: redactString(finalResponse, secrets), usage: bounded(redact(usage, secrets), MAX_EVENT_BYTES) });
+  controller.abort();
+  process.removeListener("SIGTERM", onSignal);
+  process.removeListener("SIGINT", onSignal);
+  void control.task;
+  closeInput();
 }
 
 const reader = frameReader(process.stdin);
@@ -424,5 +506,6 @@ try {
   } catch {
     process.stderr.write(`${redactString(message, outputSecrets)}\n`);
   }
+  closeInput();
   process.exitCode = 1;
 }

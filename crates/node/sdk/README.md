@@ -1,21 +1,28 @@
 # Codex SDK sidecar
 
 `codex-manager.mjs` is a small JSON-lines adapter for the pinned
-`@openai/codex-sdk` `0.163.0` package. The Rust manager creates a native Codex
-thread through the local app-server when needed, then starts this sidecar with
-that already persisted thread ID.
+`@openai/codex-sdk` `0.163.0` package. The Rust manager starts this sidecar
+with a persisted thread ID when resuming, or with a null ID for a fresh SDK
+thread.
 
 The first frame must be an `init` object. It contains `prompt`, `session_id`,
 `cwd`, optional `model`, and `codex_path`, plus optional `mcp_servers`,
 `tool_cli`, and `tool_env`. Paths are absolute and all fields have byte and
 count limits. An omitted or empty model uses the account's configured default.
-The sidecar emits one `ready` frame containing the same `session_id`, then waits
-for `{ "type": "ack", "session_id": "..." }` before invoking the model. A
-missing session ID is rejected before the SDK is constructed, so a fresh SDK
-thread cannot send a prompt before the Rust store persists its ID.
+The sidecar emits one `ready` frame containing the requested `session_id` and
+waits for an `ack` before invoking the model. For a fresh request, the SDK's
+first `thread.started` event is converted to a `session` frame. The sidecar
+waits for `{ "type": "session_ack", "session_id": "..." }` before forwarding
+that event or any later event, so the Rust store can persist the native ID.
 
 After the ACK, SDK events are forwarded as `{ "type": "event", "event": ... }`.
 The terminal frame is `{ "type": "result", "session_id", "final_response", "usage" }`.
+The control stream accepts `{ "type": "cancel", "session_id": "..." }` and
+aborts the SDK run. EOF and SIGTERM also abort the run.
+For a fresh thread, the native ID is learned only after the first SDK
+submission begins. The caller must durably mark the operation as running before
+sending the initial ACK; any failure after that point is uncertain and must not
+be replayed automatically. `session_ack` only confirms persistence of the ID.
 Validation failures and failed turns produce a bounded `error` frame. Secrets in
 tool environments and inherited API-key variables are redacted from forwarded
 frames. Stderr is diagnostic only and is never part of the protocol.
