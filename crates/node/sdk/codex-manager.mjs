@@ -258,16 +258,21 @@ function sdkConfig(input) {
     web_search: "disabled",
     check_for_update_on_startup: false,
     analytics: { enabled: false },
-    feedback: false,
+    feedback: { enabled: false },
     include_apps_instructions: false,
     include_collaboration_mode_instructions: false,
     include_environment_context: false,
     include_environment_context_time: false,
     include_permissions_instructions: false,
+    shell_environment_policy: {
+      inherit: "all",
+      ignore_default_excludes: true,
+      include_only: ["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "VIBEFACE_NODE_URL", "VIBEFACE_TOOL_TOKEN", "VIBEFACE_NODE_CONVERSATION", "VIBEFACE_NODE_NETWORK"],
+    },
     mcp_servers: mcpServers,
     features: {
       shell_tool: true,
-      unified_exec: false,
+      unified_exec: true,
       unified_exec_tty: false,
       stable_environment_tools: false,
       view_image: false,
@@ -276,8 +281,8 @@ function sdkConfig(input) {
       web_search_request: false,
       web_search_cached: false,
       standalone_web_search: false,
-      code_mode: false,
-      code_mode_host: false,
+      code_mode: true,
+      code_mode_host: true,
       code_mode_only: false,
       code_mode_only_strict_3p_tools: false,
       multi_agent: false,
@@ -293,7 +298,6 @@ function sdkConfig(input) {
       skip_host_skill_discovery: true,
       apply_patch_freeform: false,
     },
-    experimental_use_unified_exec_tool: false,
   };
 }
 
@@ -318,11 +322,32 @@ function childEnvironment(input) {
     "no_proxy",
   ];
   const env = {};
+  const providerKeys = JSON.parse(process.env.VIBEFACE_CODEX_PROVIDER_ENV_KEYS || "[]");
+  if (!Array.isArray(providerKeys) || providerKeys.length > MAX_ENV || providerKeys.some((key) => typeof key !== "string" || !ENV_KEY_PATTERN.test(key))) throw new ProtocolError("invalid provider environment key list");
+  allowed.push(...providerKeys);
   for (const key of allowed) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
   for (const [key, value] of Object.entries(input.toolEnv)) env[key] = value;
   return env;
+}
+
+function managerPrompt(prompt, toolCli) {
+  if (toolCli === undefined) return prompt;
+  const executable = `'${toolCli.replaceAll("'", "'\"'\"'")}'`;
+  const tools = [
+    ["nodes", {}, "List reachable execution nodes, capabilities and allowed roots."],
+    ["context", { offset: 0, limit: 20 }, "Page original conversation events. For referenced blobs, add blob_hash; offset counts bytes and limit counts KiB."],
+    ["create_task", { task_id: "stable-id", title: "title", goal: "goal", acceptance: "human acceptance criteria" }, "Create a task. Reuse its task_id when retrying."],
+    ["open_execution", { operation_id: "stable-id", session_id: "stable-id", target_node: "node-id", executor: "codex", cwd: "/allowed/root" }, "Open an execution session. executor is codex, cursor_agent or claude_code. task_id is optional."],
+    ["send_execution", { operation_id: "stable-id", session_id: "existing-id", target_node: "node-id", expected_revision: 0, text: "task instructions" }, "Send to an existing session at its current revision. task_id is optional. Reconcile unknown results before any resend."],
+    ["execution_status", { target_node: "node-id", session_id: "existing-id" }, "Read actual execution status without sending work or approving anything."],
+    ["update_task", { task_id: "existing-id", status: "working", detail: "progress" }, "Record progress. status is open, working, blocked or needs_review. Only the human may accept or cancel tasks."],
+  ];
+  const catalog = tools.map(([name, args, description]) => `${name} ${JSON.stringify(args)}\n${description}`).join("\n\n");
+  const result = `Node tool access is available through your command-execution tool. Run this executable with a tool name and one shell-quoted JSON object:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor example, run ${executable} tool nodes --json '{}'. The CLI reads its scoped loopback connection from the existing environment and prints a JSON result. Do not read or print credential variables. Use these Node tools to manage tasks and execution; do not use MCP, edit project files or launch executors directly. Conversation and network scope are supplied by the CLI. Use the real results and report errors instead of claiming a failed call succeeded.\n\nAvailable tool arguments and meanings follow. Replace example values with the requested values.\n${catalog}\n\n${prompt}`;
+  if (bytes(result) > MAX_PROMPT_BYTES) throw new ProtocolError("management prompt with Node tool instructions exceeded the size limit");
+  return result;
 }
 
 async function* frameReader(stream) {
@@ -410,7 +435,7 @@ async function run(input, reader, secrets) {
   const cwd = await validateCwd(input.cwd);
   const codexPath = await validateExecutable(input.codexPath, "codex_path");
   const toolCli = input.toolCli === undefined ? undefined : await validateExecutable(input.toolCli, "tool_cli");
-  if (toolCli !== undefined) input.toolEnv.VIBEFACE_TOOL_CLI = toolCli;
+  const prompt = managerPrompt(input.prompt, toolCli);
 
   const codex = new Codex({
     codexPathOverride: codexPath,
@@ -444,7 +469,7 @@ async function run(input, reader, secrets) {
   process.once("SIGTERM", onSignal);
   process.once("SIGINT", onSignal);
   const control = startControlPump(reader, controller);
-  const streamed = await thread.runStreamed(input.prompt, { signal: controller.signal });
+  const streamed = await thread.runStreamed(prompt, { signal: controller.signal });
   let finalResponse = "";
   let usage = null;
   let turnCompleted = false;
@@ -497,6 +522,7 @@ try {
     ...Object.values(input.mcpServers).flatMap((server) => Object.values(server.env)),
     process.env.CODEX_API_KEY,
     process.env.OPENAI_API_KEY,
+    ...Object.entries(process.env).filter(([key]) => /(?:_KEY|_TOKEN|_SECRET|_PASSWORD)$/.test(key)).map(([, value]) => value),
   ].filter((value) => typeof value === "string");
   await run(input, reader, outputSecrets);
 } catch (error) {

@@ -56,7 +56,7 @@ impl Default for ManagerConfig {
         Self {
             kind: ManagerKind::CursorSdk,
             workspace: ".".into(),
-            model: "composer-2.5".into(),
+            model: "auto".into(),
             timeout_secs: 600,
             cursor_sdk_bin: "cursor-sdk-bridge".into(),
             node_bin: "node".into(),
@@ -197,8 +197,13 @@ where
             })?;
     }
     let mut command = Command::new(&config.node_bin);
+    let provider_keys = provider_environment_keys()?;
     command
         .arg(&config.codex_sdk_script)
+        .env(
+            "VIBEFACE_CODEX_PROVIDER_ENV_KEYS",
+            serde_json::to_string(&provider_keys)?,
+        )
         .current_dir(&config.workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -390,7 +395,79 @@ fn secret_values(config: &ManagerConfig) -> Vec<String> {
             })
             .map(|(_, value)| value),
     );
+    if config.kind == ManagerKind::CodexSdk
+        && let Ok(keys) = provider_environment_keys()
+    {
+        values.extend(
+            keys.iter()
+                .filter_map(|key| std::env::var(key).ok())
+                .filter(|value| !value.is_empty()),
+        );
+    }
     values
+}
+fn provider_environment_keys() -> Result<Vec<String>> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".codex")));
+    let Some(home) = home else {
+        return Ok(vec![]);
+    };
+    let path = home.join("config.toml");
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    ensure!(
+        std::fs::metadata(&path)?.len() <= 1_048_576,
+        "Codex configuration is too large"
+    );
+    provider_keys_from_config(&std::fs::read_to_string(path)?)
+}
+fn provider_keys_from_config(source: &str) -> Result<Vec<String>> {
+    let config: toml::Value =
+        toml::from_str(source).context("invalid Codex provider configuration")?;
+    let profile = config
+        .get("profile")
+        .and_then(toml::Value::as_str)
+        .and_then(|p| config.get("profiles")?.get(p));
+    let provider = profile
+        .and_then(|p| p.get("model_provider"))
+        .or_else(|| config.get("model_provider"))
+        .and_then(toml::Value::as_str);
+    let Some(provider) = provider.and_then(|p| config.get("model_providers")?.get(p)) else {
+        return Ok(vec![]);
+    };
+    let mut keys = vec![];
+    if let Some(key) = provider.get("env_key").and_then(toml::Value::as_str) {
+        keys.push(key.to_owned());
+    }
+    if let Some(headers) = provider
+        .get("env_http_headers")
+        .and_then(toml::Value::as_table)
+    {
+        for value in headers.values() {
+            keys.push(
+                value
+                    .as_str()
+                    .context("invalid provider header environment key")?
+                    .to_owned(),
+            );
+        }
+    }
+    ensure!(keys.len() <= 64, "too many provider environment keys");
+    for key in &keys {
+        ensure!(
+            !key.is_empty()
+                && key.len() <= 256
+                && key.bytes().enumerate().all(|(i, c)| c == b'_'
+                    || c.is_ascii_alphabetic()
+                    || (i > 0 && c.is_ascii_digit())),
+            "invalid provider environment key"
+        );
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
 }
 fn redact_string(mut text: String, secrets: &[String]) -> String {
     for secret in secrets.iter().filter(|value| !value.is_empty()) {
@@ -420,6 +497,22 @@ fn redact(value: Value, secrets: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_environment_uses_only_selected_profile_and_header_keys() -> Result<()> {
+        let config = "model_provider='unused'\nprofile='local'\n[profiles.local]\nmodel_provider='active'\n[model_providers.active]\nenv_key='CUSTOM_API_KEY'\nenv_http_headers={X-Test='HEADER_TOKEN'}\n[model_providers.unused]\nenv_key='UNRELATED_SECRET'";
+        assert_eq!(
+            provider_keys_from_config(config)?,
+            vec!["CUSTOM_API_KEY", "HEADER_TOKEN"]
+        );
+        assert!(
+            provider_keys_from_config(
+                "model_provider='p'\n[model_providers.p]\nenv_key='invalid-name'"
+            )
+            .is_err()
+        );
+        assert!(provider_keys_from_config("model='default'")?.is_empty());
+        Ok(())
+    }
     #[tokio::test]
     async fn sdk_frames_require_newline_and_valid_bounded_json() {
         assert_eq!(

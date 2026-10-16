@@ -36,7 +36,7 @@
 {
 	"provider": "cursor_sdk",
 	"workspace": "/absolute/manager-workspace",
-	"model": "composer-2.5",
+	"model": "auto",
 	"cursor_sdk_bin": "/absolute/bin/cursor-sdk-bridge",
 	"node_bin": "/absolute/bin/node",
 	"codex_sdk_script": "/absolute/sidecars/codex-manager.mjs"
@@ -71,6 +71,8 @@
 浏览器变更请求携带 cookie、匹配的 `Origin` 和 `X-CSRF-Token`。cookie 只适用于当前 origin，切换入口重新登录。网页切换入口可携带非秘密的 conversation ID 和 basis heads。
 
 `/api/tools` 只接受本机 SDK 调用期间签发的短期 bearer token，权限固定到一个个人网络和业务会话。它不能替代用户登录，也不是供外部 Bot 长期保存的访问密钥。管理 Agent 无法通过该 token 创建账户、配对、撤销、审批或验收工单。
+
+Node 为管理 SDK 另开一个随机端口的回环 HTTP listener，提供 `/api/tools` 和 Cursor 原生回调；SDK 使用此入口，不依赖公网或 LAN 的 `public_url`。`/api/events` 仅接受登录 cookie，不接受管理 Agent 的 bearer token。
 
 HTTP 错误返回 `{"error":"说明"}`。API 成功接收操作后仍需查询账本；HTTP 2xx 不等于编码工作或工单完成。
 
@@ -206,3 +208,7 @@ SSE 的 `update` 用于刷新当前网络的视图；接收溢出时发 `reset`�
 本人授权自动后续后，产生结果的执行 Node 以 `(result_event_hash, policy_version)` 持久领取一次处理，可选择本机或其他可达调度 Node。委托结果未知时保留状态并查询原调用，不因超时再派给另一台。
 
 `daily_decision_limit` 限制每个 Node 上、每个个人网络的 UTC 每日管理 SDK 调用次数。预算先预留，失败调用不保证退回；它不限制执行器自身调用，也不是 token 或账单上限。
+
+每条用户消息在签名 `MessagePosted.scheduler_node` 中固定本次调度目标。相同 `message_id` 重试只补送给该目标，不在另一节点重新调用模型。切换入口后继续工作时提交一条新消息，可选择任意已授权调度节点。这个目标只属于该消息，不是会话或工单的负责人。
+
+`reconcile` 在目标执行节点确认账本不存在时返回 `state=not_found`、`operation=null` 和目标节点身份。节点不可达返回错误，不当作不存在。网页允许本人确认旧请求结束后解除本地待核对记录，不自动重发。

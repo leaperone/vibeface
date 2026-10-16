@@ -60,11 +60,11 @@ cd vibeface-node-<version>-<target>
 	--root /absolute/path/to/projects \
 	--manager cursor_sdk \
 	--workspace /absolute/path/to/manager-workspace \
-	--model composer-2.5 \
+	--model auto \
 	--cursor-sdk-bin /absolute/path/to/bin/cursor-sdk-bridge
 ```
 
-此命令用于尚未初始化的 Node。`composer-2.5` 是模型示例，不保证账户可用。SDK 程序在本机运行，模型请求仍发往 Cursor 服务，消耗 Cursor 额度。
+此命令用于尚未初始化的 Node。默认使用 `auto` 模型。SDK 程序在本机运行，模型请求仍发往 Cursor 服务，消耗 Cursor 额度。
 
 Cursor 使用 SDK 原生自定义工具回调连接 Rust Node。产品链路不启动 MCP Server，也不要求 Bot 或浏览器支持 MCP。管理 Agent 只能使用限定到当前个人网络及业务会话的工具，不能替本人回答编码审批、授权自动后续或验收工单。
 
@@ -84,7 +84,7 @@ Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它�
 
 可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。源码运行时先在 `crates/node/sdk/` 安装依赖，将 `--codex-sdk-script` 指向该目录的入口。
 
-这个适配器通过本机 `vibeface-node tool` 命令调用受限工具，使用只读文件系统权限，并允许网络访问。它没有 shell 命令白名单或已验证的外部域名隔离，不能当作隔离不可信模型或不可信插件的安全边界。Cursor SDK 与 Codex SDK 的工具运行方式不同，不承诺完全相同的权限隔离。
+这个适配器通过本机 `vibeface-node tool` 命令调用受限工具，使用只读文件系统权限，保留 shell 和网络访问。Codex 子进程环境按变量名筛选，shell 只获得运行及当前会话工具所需的变量；Provider 凭证不放进 shell 环境。它没有 shell 命令白名单或已验证的外部域名隔离，不能当作隔离不可信模型或不可信插件的安全边界。Cursor SDK 与 Codex SDK 的工具运行方式不同，不承诺完全相同的权限隔离。
 
 ## 连接自己的设备
 

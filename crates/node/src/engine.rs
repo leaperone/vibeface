@@ -1,5 +1,5 @@
 //! Local execution transports. Durable admission and authorization belong to the Node runtime.
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{future::Future, path::PathBuf, time::Duration};
@@ -148,6 +148,45 @@ impl Engine {
                 json!({"connection":{"state":"unconfigured"},"threads":{},"pending_requests":[]})
             }
         }
+    }
+
+    pub(crate) async fn read_turn(&self, native_id: &str, turn_id: &str) -> Result<Option<Value>> {
+        vibeface_protocol::validate_id(native_id).map_err(anyhow::Error::msg)?;
+        vibeface_protocol::validate_id(turn_id).map_err(anyhow::Error::msg)?;
+        let codex = self
+            .codex
+            .as_ref()
+            .context("Codex socket is not configured")?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut cursor = None;
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..64 {
+                let page = codex
+                    .execute(&Command::ListTurns {
+                        thread_id: native_id.into(),
+                        cursor: cursor.clone(),
+                    })
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                let turns = page["data"]
+                    .as_array()
+                    .context("Codex turn page has no data")?;
+                if let Some(turn) = turns.iter().find(|turn| turn["id"] == turn_id) {
+                    return Ok(Some(turn.clone()));
+                }
+                let Some(next) = page["nextCursor"].as_str() else {
+                    return Ok(None);
+                };
+                ensure!(
+                    seen.insert(next.to_owned()),
+                    "Codex turn pagination repeated a cursor"
+                );
+                cursor = Some(next.to_owned());
+            }
+            anyhow::bail!("Codex turn lookup exceeded its page limit")
+        })
+        .await
+        .context("Codex turn lookup timed out")?
     }
 
     pub async fn execute<F, Fut>(
@@ -314,6 +353,79 @@ fn codex_error(error: CodexError, native_session_id: Option<String>) -> EngineEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn turn_lookup_pages_until_the_exact_native_turn() -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::UnixListener;
+        use tokio_tungstenite::tungstenite::Message;
+        let dir = std::env::temp_dir().join(format!("vft-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let socket = dir.join("codex.sock");
+        let listener = UnixListener::bind(&socket)?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let initialize: Value =
+                serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            ws.send(Message::Text(
+                json!({"id":initialize["id"],"result":{}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            let initialized: Value =
+                serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(initialized["method"], "initialized");
+            for (cursor, result) in [
+                (
+                    Value::Null,
+                    json!({"data":[{"id":"other","status":"completed"}],"nextCursor":"page-2"}),
+                ),
+                (
+                    json!("page-2"),
+                    json!({"data":[{"id":"wanted","status":"failed"}],"nextCursor":null}),
+                ),
+            ] {
+                let request: Value =
+                    serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(request["method"], "thread/turns/list");
+                assert_eq!(request["params"]["threadId"], "native-thread");
+                assert_eq!(request["params"]["cursor"], cursor);
+                ws.send(Message::Text(
+                    json!({"id":request["id"],"result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let engine = Engine::new(
+            ExecutorConfig {
+                codex_socket: Some(socket),
+                ..ExecutorConfig::default()
+            },
+            events,
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while engine.snapshot().await["connection"]["state"] != "connected" {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            engine.read_turn("native-thread", "wanted").await?,
+            Some(json!({"id":"wanted","status":"failed"}))
+        );
+        server.await?;
+        drop(engine);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[test]
     fn actions_reject_invalid_text_and_unknown_fields() {
         assert!(EngineAction::Send { text: " ".into() }.validate().is_err());

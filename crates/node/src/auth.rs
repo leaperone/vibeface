@@ -43,6 +43,7 @@ pub struct LoginSession {
 pub struct InviteGrant {
     pub network_id: String,
     pub roles: Vec<String>,
+    pub claimed: bool,
 }
 
 pub struct AuthStore {
@@ -96,7 +97,8 @@ impl AuthStore {
                  code_hash TEXT PRIMARY KEY,
                  network_id TEXT NOT NULL REFERENCES auth_accounts(network_id),
                  roles_json TEXT NOT NULL,
-                 expires_at_ms INTEGER NOT NULL
+                 expires_at_ms INTEGER NOT NULL,
+                 claimed_node_id TEXT
              );
              CREATE TABLE IF NOT EXISTS auth_password_rate (
                  kind TEXT PRIMARY KEY CHECK (kind IN ('login', 'register')),
@@ -393,9 +395,12 @@ impl AuthStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("DELETE FROM auth_invites WHERE expires_at_ms <= ?1", [now])?;
+        transaction.execute(
+            "DELETE FROM auth_invites WHERE expires_at_ms <= ?1 AND claimed_node_id IS NULL",
+            [now],
+        )?;
         let pending: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM auth_invites WHERE network_id = ?1",
+            "SELECT COUNT(*) FROM auth_invites WHERE network_id = ?1 AND claimed_node_id IS NULL",
             [network_id],
             |row| row.get(0),
         )?;
@@ -416,29 +421,57 @@ impl AuthStore {
         Ok(code)
     }
 
-    pub fn consume_invite(&mut self, code: &str) -> Result<InviteGrant> {
-        if !is_secret(code) {
+    pub fn pairing_invite(&self, code: &str, node_id: &str) -> Result<InviteGrant> {
+        if !is_secret(code) || !is_secret(node_id) {
             bail!("invitation is invalid or expired");
         }
-        let transaction = self
+        let grant: Option<(String, String, Option<String>)> = self
             .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let grant: Option<(String, String)> = transaction
             .query_row(
-                "SELECT network_id, roles_json FROM auth_invites
-                 WHERE code_hash = ?1 AND expires_at_ms > ?2",
-                params![secret_hash(code), now_ms()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT network_id, roles_json, claimed_node_id FROM auth_invites
+                 WHERE code_hash = ?1 AND (expires_at_ms > ?2 OR claimed_node_id = ?3)",
+                params![secret_hash(code), now_ms(), node_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let (network_id, roles) = grant.context("invitation is invalid or expired")?;
+        let (network_id, roles, claimed_node_id) =
+            grant.context("invitation is invalid or expired")?;
+        if claimed_node_id
+            .as_deref()
+            .is_some_and(|claimed| claimed != node_id)
+        {
+            bail!("invitation is invalid or expired");
+        }
         let roles = serde_json::from_str(&roles).context("invalid stored invitation")?;
-        transaction.execute(
-            "DELETE FROM auth_invites WHERE code_hash = ?1",
-            [secret_hash(code)],
+        Ok(InviteGrant {
+            network_id,
+            roles,
+            claimed: claimed_node_id.is_some(),
+        })
+    }
+
+    pub fn consume_invite(&mut self, code: &str, node_id: &str) -> Result<()> {
+        if !is_secret(code) || !is_secret(node_id) {
+            bail!("invitation is invalid or expired");
+        }
+        let changed = self.connection.execute(
+            "UPDATE auth_invites SET claimed_node_id = ?1
+             WHERE code_hash = ?2 AND ((expires_at_ms > ?3 AND claimed_node_id IS NULL)
+             OR claimed_node_id = ?1)",
+            params![node_id, secret_hash(code), now_ms()],
         )?;
-        transaction.commit()?;
-        Ok(InviteGrant { network_id, roles })
+        if changed != 1 {
+            bail!("invitation is invalid or expired");
+        }
+        Ok(())
+    }
+
+    pub fn complete_invite(&mut self, code: &str, node_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM auth_invites WHERE code_hash = ?1 AND claimed_node_id = ?2",
+            params![secret_hash(code), node_id],
+        )?;
+        Ok(())
     }
 }
 
@@ -720,17 +753,25 @@ mod tests {
             .store
             .create_invite("network-a", roles.clone())
             .unwrap();
-        let grant = fixture.store.consume_invite(&code).unwrap();
+        let node_id = "11".repeat(32);
+        let grant = fixture.store.pairing_invite(&code, &node_id).unwrap();
         assert_eq!(grant.network_id, "network-a");
         assert_eq!(grant.roles, vec!["executor", "scheduler"]);
-        assert!(fixture.store.consume_invite(&code).is_err());
+        assert!(!grant.claimed);
+        fixture.store.consume_invite(&code, &node_id).unwrap();
+        assert!(
+            fixture
+                .store
+                .consume_invite(&code, &"22".repeat(32))
+                .is_err()
+        );
         let expired = fixture.store.create_invite("network-a", roles).unwrap();
         fixture
             .store
             .connection
             .execute("UPDATE auth_invites SET expires_at_ms = 0", [])
             .unwrap();
-        assert!(fixture.store.consume_invite(&expired).is_err());
+        assert!(fixture.store.consume_invite(&expired, &node_id).is_err());
         assert!(
             fixture
                 .store
@@ -744,12 +785,16 @@ mod tests {
             .unwrap();
         let barrier = std::sync::Barrier::new(2);
         let accepted = std::thread::scope(|scope| {
+            let root = &fixture.root;
+            let barrier = &barrier;
+            let code = &code;
             let attempts: Vec<_> = (0..2)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut store = AuthStore::open(&fixture.root.join("auth.sqlite")).unwrap();
+                .map(|index| {
+                    let node_id = format!("{index:064x}");
+                    scope.spawn(move || {
+                        let mut store = AuthStore::open(&root.join("auth.sqlite")).unwrap();
                         barrier.wait();
-                        store.consume_invite(&code).is_ok()
+                        store.consume_invite(code, &node_id).is_ok()
                     })
                 })
                 .collect();
@@ -760,6 +805,39 @@ mod tests {
                 .count()
         });
         assert_eq!(accepted, 1);
+    }
+
+    #[test]
+    fn claimed_invite_survives_reopen_for_only_the_same_device() {
+        let mut fixture = Fixture::new();
+        fixture.register();
+        let code = fixture
+            .store
+            .create_invite("network-a", vec!["executor".into()])
+            .unwrap();
+        let node_id = "33".repeat(32);
+        fixture.store.consume_invite(&code, &node_id).unwrap();
+        fixture
+            .store
+            .connection
+            .execute("UPDATE auth_invites SET expires_at_ms = 0", [])
+            .unwrap();
+        fixture
+            .store
+            .create_invite("network-a", vec!["executor".into()])
+            .unwrap();
+        let mut reopened = AuthStore::open(&fixture.root.join("auth.sqlite")).unwrap();
+        let grant = reopened.pairing_invite(&code, &node_id).unwrap();
+        assert!(grant.claimed);
+        assert_eq!(grant.network_id, "network-a");
+        assert_eq!(grant.roles, vec!["executor"]);
+        reopened.consume_invite(&code, &node_id).unwrap();
+        assert!(reopened.pairing_invite(&code, &"44".repeat(32)).is_err());
+        assert!(reopened.consume_invite(&code, &"44".repeat(32)).is_err());
+        reopened.complete_invite(&code, &"44".repeat(32)).unwrap();
+        assert!(reopened.pairing_invite(&code, &node_id).is_ok());
+        reopened.complete_invite(&code, &node_id).unwrap();
+        assert!(reopened.pairing_invite(&code, &node_id).is_err());
     }
 
     #[cfg(unix)]

@@ -30,13 +30,17 @@ frames. Stderr is diagnostic only and is never part of the protocol.
 The sidecar uses the official TypeScript SDK, which wraps `codex exec
 --experimental-json`. The SDK has no native custom-tool callback. `tool_cli` is
 therefore available through the Codex shell tool with the `vibeface_manager`
-permissions profile. That profile denies filesystem writes and requests
-loopback network access for `127.0.0.1` and `localhost`. The sidecar disables
-unified exec, child-agent features, web search, apps, plugins, and host skill
-discovery. Codex's standalone exec path does not currently prove that an
-external-domain allow-list is enforced, so the sidecar makes no such claim.
-The SDK does not expose a command allow-list either. The prompt and CLI wrapper
-remain responsible for restricting shell commands. Optional MCP servers are
+permissions profile. Code mode, its host, and unified exec are enabled so the
+model can call that CLI. The profile denies filesystem writes; shell execution
+and network access remain available. The Codex child process and its shell use
+explicit environment-variable lists. The shell receives scoped Node tool
+credentials without the inherited Provider credential variables.
+The sidecar disables child-agent features, web search, apps, plugins, and host
+skill discovery. It requests loopback network rules, but the standalone exec
+path has not demonstrated an enforced external-domain allow-list. There is no
+shell command allow-list. Prompt instructions and the scoped CLI do not sandbox
+other shell commands; do not use this adapter as an isolation boundary for an
+untrusted model or plugin. Optional MCP servers are
 accepted only when explicitly supplied in `init` and may use `enabled_tools`
 allow-lists.
 

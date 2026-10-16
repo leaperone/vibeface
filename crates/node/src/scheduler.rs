@@ -246,6 +246,12 @@ pub async fn run(
                 || matches!(&event.body, EventBody::ExecutionObserved { status, .. } if matches!(status.as_str(), "completed" | "succeeded" | "failed" | "rejected" | "interrupted")),
             "invalid scheduler trigger"
         );
+        if let EventBody::MessagePosted { scheduler_node, .. } = &event.body {
+            ensure!(
+                scheduler_node.as_deref() == Some(node.identity.node_id()?.as_str()),
+                "this message is addressed to another scheduler; send a new message to continue here"
+            );
+        }
         let context = store.context(network, &conversation, &[])?;
         ensure!(
             context.missing.is_complete(),
@@ -276,20 +282,19 @@ pub async fn run(
             (serde_json::to_value(store.tasks(network, &conversation)?)?, targets)
         };
         let prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &node.config.roots)?;
-        let loopback = if node.config.listen.is_ipv6() { "[::1]" } else { "127.0.0.1" };
-        let local_url = format!("http://{loopback}:{}", node.config.listen.port());
+        let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
         let mut config = ManagerConfig {
             kind, workspace: settings.workspace, model: settings.model,
             timeout_secs: node.config.timeout_secs,
             cursor_sdk_bin: settings.cursor_sdk_bin, node_bin: settings.node_bin,
             codex_bin: node.config.codex_bin.clone(), codex_sdk_script: settings.codex_sdk_script,
             custom_tools: tools(),
-            tool_callback_url: Some(format!("{local_url}/sdk.v1.SdkCustomToolCallbackService/CallCustomTool")),
+            tool_callback_url: Some(local_url.clone()),
             tool_callback_token: Some(token.clone()),
             tool_cli: Some(std::env::current_exe()?),
             tool_env: BTreeMap::from([
                 ("VIBEFACE_NODE_URL".into(), local_url),
-                ("VIBEFACE_NODE_TOKEN".into(), token.clone()),
+                ("VIBEFACE_TOOL_TOKEN".into(), token.clone()),
                 ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
                 ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
             ]),
@@ -338,7 +343,7 @@ pub async fn run(
             tool_configuration: json!({"provider":settings.provider,"model":config.model,"tools":tools().keys().collect::<Vec<_>>(),"trigger":trigger}),
         }, blobs.clone()).await?;
         node.append_blobs(network, &conversation, EventBody::MessagePosted {
-            message_id: invocation.message_id.clone(), role: "assistant".into(), text: output,
+            message_id: invocation.message_id.clone(), role: "assistant".into(), text: output, scheduler_node: None,
         }, blobs).await?;
         invocation.state = InvocationState::Completed;
         {
@@ -658,6 +663,7 @@ mod tests {
             created_at_ms: 0,
             body: EventBody::MessagePosted {
                 message_id: n.to_string(),
+                scheduler_node: None,
                 role: "user".into(),
                 text,
             },

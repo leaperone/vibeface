@@ -26,6 +26,8 @@ pub enum EventBody {
         message_id: String,
         role: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scheduler_node: Option<NodeId>,
     },
     TaskCreated {
         task_id: String,

@@ -26,15 +26,15 @@ struct StoredEvent {
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        if path != Path::new(":memory:") {
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                let existed = parent.exists();
-                std::fs::create_dir_all(parent)?;
-                #[cfg(unix)]
-                if !existed {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-                }
+        if path != Path::new(":memory:")
+            && let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+        {
+            let existed = parent.exists();
+            std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            if !existed {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
             }
         }
         let connection = Connection::open(path)?;
@@ -191,7 +191,7 @@ impl Store {
         Ok(IngestOutcome {
             hash: envelope.hash.clone(),
             status,
-            missing: self.missing_dependencies(network_id, &[envelope.hash.clone()])?,
+            missing: self.missing_dependencies(network_id, std::slice::from_ref(&envelope.hash))?,
         })
     }
     pub fn append_event(
@@ -1055,15 +1055,13 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
     }
     for hash in events.keys().cloned().collect::<Vec<_>>() {
         let event = &events[&hash].event;
-        if let Some(previous) = &event.previous {
-            if let Some(prior) = events.get(previous) {
-                if prior.event.scope_id != event.scope_id
-                    || prior.event.author != event.author
-                    || prior.event.sequence + 1 != event.sequence
-                {
-                    events.get_mut(&hash).unwrap().status = "invalid".into();
-                }
-            }
+        if let Some(previous) = &event.previous
+            && let Some(prior) = events.get(previous)
+            && (prior.event.scope_id != event.scope_id
+                || prior.event.author != event.author
+                || prior.event.sequence + 1 != event.sequence)
+        {
+            events.get_mut(&hash).unwrap().status = "invalid".into();
         }
     }
     let all: BTreeSet<String> = events.keys().cloned().collect();
@@ -1130,6 +1128,7 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
                 message_id,
                 role,
                 text,
+                ..
             } => {
                 connection.execute("INSERT INTO messages(network_id,conversation_id,event_hash,message_id,role,text,created_at_ms,ordinal) VALUES(?,?,?,?,?,?,?,?)",params![network_id,event.scope_id,hash,message_id,role,text,event.created_at_ms,ordinal])?;
             }
@@ -1283,10 +1282,10 @@ fn closure_hashes(events: &BTreeMap<String, StoredEvent>, heads: &[String]) -> B
     let mut result = BTreeSet::new();
     let mut stack = heads.to_vec();
     while let Some(hash) = stack.pop() {
-        if result.insert(hash.clone()) {
-            if let Some(event) = events.get(&hash) {
-                stack.extend(dependencies(&event.event).cloned());
-            }
+        if result.insert(hash.clone())
+            && let Some(event) = events.get(&hash)
+        {
+            stack.extend(dependencies(&event.event).cloned());
         }
     }
     result
@@ -1432,6 +1431,7 @@ mod tests {
             created_at_ms: 2,
             body: EventBody::MessagePosted {
                 message_id: text.into(),
+                scheduler_node: None,
                 role: "user".into(),
                 text: text.into(),
             },
@@ -1499,7 +1499,7 @@ mod tests {
         assert!(replica.messages(&network, "conversation")?.is_empty());
         assert_eq!(
             replica
-                .missing_dependencies(&network, &[left.hash.clone()])?
+                .missing_dependencies(&network, std::slice::from_ref(&left.hash))?
                 .events,
             vec![root.hash.clone()]
         );
@@ -1718,6 +1718,7 @@ mod tests {
                         "conversation",
                         EventBody::MessagePosted {
                             message_id: format!("{writer}-{index}"),
+                            scheduler_node: None,
                             role: "user".into(),
                             text: format!("{writer}-{index}"),
                         },

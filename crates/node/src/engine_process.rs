@@ -50,6 +50,7 @@ where
 
     let mut native = session.native_session_id.clone();
     let mut invoked = false;
+    let mut session_started = false;
     let operation = async {
         if native.is_none() {
             let id = match session.executor {
@@ -69,8 +70,9 @@ where
         let result = match action {
             EngineAction::Open {} => json!({"state":"ready"}),
             EngineAction::Send { text } => {
-                let summary =
-                    send_process(config, session, id, &text, &events, &mut invoked).await?;
+                let outcome = send_process(config, session, id, &text, &events, &mut invoked).await;
+                session_started = invoked;
+                let summary = outcome?;
                 if let Some(failure) = summary.failure {
                     // A provider terminal failure is a known result, unlike a lost stream.
                     invoked = false;
@@ -91,6 +93,9 @@ where
         })
     };
     let outcome = tokio::time::timeout(Duration::from_secs(config.timeout_secs), operation).await;
+    if session.executor == ExecutorKind::ClaudeCode && !session_started && !invoked {
+        native = session.native_session_id.clone();
+    }
     match outcome {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(error)) => Err(EngineError {
@@ -235,6 +240,7 @@ async fn read_stream<R: AsyncRead + Unpin>(
     events: &UnboundedSender<Value>,
 ) -> Result<StreamSummary> {
     let mut reader = BufReader::new(reader);
+    let secret_values = secrets();
     let mut summary = StreamSummary::default();
     let mut total = 0usize;
     let mut line = Vec::new();
@@ -242,7 +248,14 @@ async fn read_stream<R: AsyncRead + Unpin>(
         let available = reader.fill_buf().await?;
         if available.is_empty() {
             if !line.is_empty() {
-                observe_line(&mut summary, &line, executor, native_id, events)?;
+                observe_line(
+                    &mut summary,
+                    &line,
+                    executor,
+                    native_id,
+                    events,
+                    &secret_values,
+                )?;
             }
             return Ok(summary);
         }
@@ -259,7 +272,14 @@ async fn read_stream<R: AsyncRead + Unpin>(
         let complete = line.last() == Some(&b'\n');
         reader.consume(length);
         if complete {
-            observe_line(&mut summary, &line, executor, native_id, events)?;
+            observe_line(
+                &mut summary,
+                &line,
+                executor,
+                native_id,
+                events,
+                &secret_values,
+            )?;
             line.clear();
         }
     }
@@ -271,6 +291,7 @@ fn observe_line(
     executor: ExecutorKind,
     native_id: &str,
     events: &UnboundedSender<Value>,
+    secret_values: &[String],
 ) -> Result<()> {
     if line.iter().all(u8::is_ascii_whitespace) {
         return Ok(());
@@ -328,17 +349,12 @@ fn observe_line(
         }
         return Ok(());
     }
-    // Progress contains no raw model text, environment fields, or tool arguments.
     let executor = match executor {
         ExecutorKind::CursorAgent => "cursor_agent",
         ExecutorKind::ClaudeCode => "claude_code",
         ExecutorKind::Codex => "codex",
     };
-    let event = match kind {
-        "system" | "user" | "assistant" | "tool_call" | "stream_event" => kind,
-        _ => "progress",
-    };
-    let _ = events.send(json!({"kind":"executor_progress","executor":executor,"event":event}));
+    let _ = events.send(json!({"kind":"executor_progress","executor":executor,"native_session_id":native_id,"event":redact_value(value, secret_values)}));
     Ok(())
 }
 
@@ -417,6 +433,7 @@ mod tests {
                 ExecutorKind::ClaudeCode,
                 "native-1",
                 &events,
+                &[],
             )?;
         }
         Ok(summary)
@@ -446,6 +463,24 @@ mod tests {
             json!({"type":"result","subtype":"success","is_error":false,"session_id":"native-1"});
         assert!(observe(&[terminal.clone(), terminal.clone()]).is_err());
         assert!(observe(&[terminal, json!({"type":"assistant"})]).is_err());
+    }
+
+    #[test]
+    fn progress_is_redacted_before_leaving_the_executor() -> Result<()> {
+        let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut summary = StreamSummary::default();
+        observe_line(
+            &mut summary,
+            br#"{"type":"assistant","message":{"text":"credential-test-secret"}}"#,
+            ExecutorKind::ClaudeCode,
+            "native-1",
+            &events,
+            &["credential-test-secret".into()],
+        )?;
+        let progress = receiver.try_recv()?;
+        assert_eq!(progress["event"]["message"]["text"], "[REDACTED]");
+        assert!(!serde_json::to_string(&progress)?.contains("credential-test-secret"));
+        Ok(())
     }
 
     #[test]

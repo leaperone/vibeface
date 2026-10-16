@@ -51,6 +51,7 @@ pub struct Inbound {
 pub struct PeerHub {
     identity: LocalIdentity,
     store: Arc<Mutex<Store>>,
+    relay_enabled: bool,
     state: Mutex<State>,
     inbound: mpsc::Sender<Inbound>,
     sockets: Arc<Semaphore>,
@@ -137,12 +138,14 @@ impl PeerHub {
     pub fn new(
         identity: LocalIdentity,
         store: Arc<Mutex<Store>>,
+        enabled_roles: &[NodeRole],
     ) -> (Arc<Self>, mpsc::Receiver<Inbound>) {
         let (inbound, receive) = mpsc::channel(256);
         (
             Arc::new(Self {
                 identity,
                 store,
+                relay_enabled: enabled_roles.contains(&NodeRole::Relay),
                 state: Mutex::new(State::default()),
                 inbound,
                 sockets: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
@@ -586,7 +589,8 @@ impl PeerHub {
         } else if packet.body.kind == Kind::Broadcast {
             self.deliver(&packet).await?;
         }
-        if packet.hops_remaining > 0
+        if self.relay_enabled
+            && packet.hops_remaining > 0
             && self
                 .store
                 .lock()
@@ -633,10 +637,9 @@ impl PeerHub {
                 .pending
                 .get(&key)
                 .is_some_and(|p| p.origin == packet.body.origin)
+                && let Some(pending) = state.pending.remove(&key)
             {
-                if let Some(pending) = state.pending.remove(&key) {
-                    let _ = pending.reply.send(packet.body.payload.clone());
-                }
+                let _ = pending.reply.send(packet.body.payload.clone());
             }
         } else {
             self.inbound
@@ -783,7 +786,7 @@ where
     while let Some(frame) = socket.next().await {
         if let Some(text) = frame?.into_text()? {
             ensure!(text.len() <= limit, "peer handshake too large");
-            return Ok(serde_json::from_str(&text).context("invalid peer handshake")?);
+            return serde_json::from_str(&text).context("invalid peer handshake");
         }
     }
     bail!("peer disconnected during handshake")
@@ -821,7 +824,82 @@ mod tests {
             .map(|node| node.certificate(roles()))
             .collect::<Result<Vec<_>>>()?;
         store.install_trust_bundle(&network, &owner.sign_trust_bundle(1, certificates)?)?;
-        Ok(PeerHub::new(identity.clone(), Arc::new(Mutex::new(store))))
+        Ok(PeerHub::new(
+            identity.clone(),
+            Arc::new(Mutex::new(store)),
+            &roles(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn forwarding_requires_both_enabled_and_certified_relay_role() -> Result<()> {
+        let a = LocalIdentity::generate();
+        let b = LocalIdentity::generate();
+        let c = LocalIdentity::generate();
+        let network = a.network_id()?;
+        let (sender, _) = hub(&a, &a, &[&a, &b, &c])?;
+        let (enabled, _) = hub(&a, &b, &[&a, &b, &c])?;
+        let (disabled, mut inbound) =
+            PeerHub::new(b.clone(), enabled.store.clone(), &[NodeRole::Replica]);
+        let (send, mut receive) = mpsc::channel(4);
+        for hub in [&enabled, &disabled] {
+            hub.state.lock().await.links.insert(
+                (network.clone(), c.node_id()?),
+                Link {
+                    id: "test".into(),
+                    outbound: true,
+                    send: send.clone(),
+                },
+            );
+        }
+        let packet = sender.packet(
+            &network,
+            Some(c.node_id()?),
+            Kind::Request,
+            json!("relay"),
+            None,
+        )?;
+        disabled
+            .receive_packet(&network, &a.node_id()?, packet.clone())
+            .await?;
+        assert!(receive.try_recv().is_err());
+        enabled
+            .receive_packet(&network, &a.node_id()?, packet)
+            .await?;
+        let forwarded: Packet = serde_json::from_str(&receive.try_recv()?.text)?;
+        assert_eq!(forwarded.hops_remaining, MAX_HOPS - 1);
+        let packet = sender.packet(
+            &network,
+            Some(b.node_id()?),
+            Kind::Request,
+            json!("local"),
+            None,
+        )?;
+        disabled
+            .receive_packet(&network, &a.node_id()?, packet)
+            .await?;
+        assert_eq!(inbound.try_recv()?.payload, json!("local"));
+        let mut restricted = b.certificate(roles())?;
+        restricted.roles.retain(|r| r != &NodeRole::Relay);
+        enabled.store.lock().await.install_trust_bundle(
+            &network,
+            &a.sign_trust_bundle(
+                2,
+                vec![a.certificate(roles())?, restricted, c.certificate(roles())?],
+            )?,
+        )?;
+        let packet = sender.packet(
+            &network,
+            Some(c.node_id()?),
+            Kind::Request,
+            json!("no certificate"),
+            None,
+        )?;
+        enabled
+            .receive_packet(&network, &a.node_id()?, packet)
+            .await?;
+        assert!(receive.try_recv().is_err());
+        Ok(())
     }
 
     #[tokio::test]

@@ -173,7 +173,13 @@ fn init(options: Init) -> Result<()> {
             workspace: workspace
                 .canonicalize()
                 .context("resolve manager workspace")?,
-            model: options.model.unwrap_or_default(),
+            model: options.model.unwrap_or_else(|| {
+                if matches!(manager, Manager::CursorSdk) {
+                    "auto".into()
+                } else {
+                    String::new()
+                }
+            }),
             cursor_sdk_bin: options.cursor_sdk_bin,
             node_bin: options.node_bin,
             codex_sdk_script: match options.codex_sdk_script {
@@ -256,6 +262,7 @@ fn read_password() -> Result<String> {
 
 async fn pair(options: Pair) -> Result<()> {
     let dir = options.data.data_dir;
+    let _node_lock = config::lock_data_dir(&dir)?;
     let mut configuration = Config::load(&dir)?;
     let identity = config::identity(&dir)?;
     let mut url = origin(&options.url)?;
