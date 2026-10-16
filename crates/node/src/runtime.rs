@@ -478,6 +478,156 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn agent_cannot_silently_detach_a_session_from_its_latest_admitted_task() -> Result<()> {
+        async fn admit_steer(
+            node: &Arc<Runtime>,
+            request: &OperationRequest,
+            human: bool,
+        ) -> Result<()> {
+            node.admit_operation(request.clone(), human).await?;
+            let operation = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let operation = node
+                        .store
+                        .lock()
+                        .await
+                        .operation(&request.network_id, &request.operation_id)
+                        .unwrap()
+                        .unwrap();
+                    if operation.state.terminal() {
+                        break operation;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert_eq!(operation.state, OperationState::Failed);
+            assert!(
+                operation.result["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unsupported")
+            );
+            drop(node.completion_lock.lock().await);
+            Ok(())
+        }
+
+        let dir = fixture()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let network = conversation(&node).await?;
+        task(&node, &network, "task", false).await?;
+        task(&node, &network, "next-task", false).await?;
+        let human = Access {
+            network_id: network.clone(),
+            human: true,
+            conversation_id: Some("chat".into()),
+        };
+        let mut associated = queued(
+            &node,
+            &network,
+            "seed",
+            json!({"type":"send","text":"test"}),
+        )
+        .await?;
+        {
+            let mut store = node.store.lock().await;
+            store.claim_operation(&network, "seed")?;
+            store.finish_operation(&network, "seed", OperationState::Succeeded, json!({}))?;
+            associated.operation_id = "associated".into();
+            associated.task_id = Some("task".into());
+            associated.expected_revision = 1;
+            store.accept_operation(&network, &associated)?;
+            let mut concurrent = associated.clone();
+            concurrent.operation_id = "concurrent-untasked-steer".into();
+            concurrent.task_id = None;
+            concurrent.action = json!({"type":"steer","turn_id":"turn","text":"test"});
+            concurrent.resources.clear();
+            store.accept_control_operation(&network, &concurrent)?;
+            for operation in [&associated, &concurrent] {
+                store.claim_operation(&network, &operation.operation_id)?;
+            }
+            for operation in [&associated, &concurrent] {
+                store.finish_operation(
+                    &network,
+                    &operation.operation_id,
+                    OperationState::Succeeded,
+                    json!({}),
+                )?;
+            }
+        }
+        let mut request = associated.clone();
+        request.operation_id = "untasked".into();
+        request.task_id = None;
+        request.expected_revision = 2;
+        request.resources.clear();
+        for status in ["working", "accepted", "cancelled"] {
+            node.rpc(human.clone(), json!({"method":"update_task","conversation_id":"chat","task_id":"task","status":status})).await?;
+            for action in [
+                json!({"type":"steer","turn_id":"turn","text":"test"}),
+                json!({"type":"send","text":"test"}),
+                json!({"type":"open","executor":"claude_code","cwd":dir}),
+            ] {
+                request.action = action;
+                assert!(
+                    node.admit_operation(request.clone(), false)
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("task_id is required")
+                );
+            }
+        }
+        assert_eq!(
+            node.admit_operation(associated.clone(), false).await?["operation"]["state"],
+            "succeeded"
+        );
+        let mut unadmitted = request.clone();
+        unadmitted.operation_id = "unadmitted".into();
+        unadmitted.expected_revision = 99;
+        node.append(
+            &network,
+            "chat",
+            EventBody::DispatchRecorded {
+                operation_id: unadmitted.operation_id.clone(),
+                task_id: None,
+                target_node: unadmitted.target_node.clone(),
+                session_id: unadmitted.session_id.clone(),
+                action: json!(unadmitted),
+            },
+        )
+        .await?;
+        assert!(node.admit_operation(request.clone(), false).await.is_err());
+        request.action = json!({"type":"steer","turn_id":"turn","text":"test"});
+        for (operation, human, task_id) in [
+            ("retask", false, Some("next-task")),
+            ("human-detach", true, None),
+            ("agent-after-detach", false, None),
+        ] {
+            request.operation_id = operation.into();
+            request.task_id = task_id.map(String::from);
+            request.basis_heads = node.store.lock().await.heads(&network, "chat")?;
+            admit_steer(&node, &request, human).await?;
+            request.expected_revision += 1;
+        }
+        request.operation_id = "never-task-associated".into();
+        request.session_id = "plain-session".into();
+        request.expected_revision = 0;
+        request.basis_heads = node.store.lock().await.heads(&network, "chat")?;
+        {
+            let mut store = node.store.lock().await;
+            let mut session = store
+                .session(&network, &request.target_node, "seed")?
+                .unwrap();
+            session.session_id = request.session_id.clone();
+            session.revision = 0;
+            store.upsert_session(&network, &session)?;
+        }
+        admit_steer(&node, &request, false).await?;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[tokio::test]
     async fn peer_mutations_and_replica_reads_enforce_roles() -> Result<()> {
         let dir = fixture()?;
         let mut node = Arc::new(Runtime::open(&dir).await?);
@@ -2525,18 +2675,41 @@ impl Runtime {
             &request.session_id,
         )?;
         let existing_operation = store.operation(&request.network_id, &request.operation_id)?;
-        if !human
-            && existing_operation.is_none()
-            && matches!(kind, "open" | "send" | "steer")
-            && let Some(task) = &request.task_id
-        {
-            require_task_write(
-                &store,
-                &request.network_id,
-                &request.conversation_id,
-                task,
-                false,
-            )?;
+        if !human && existing_operation.is_none() && matches!(kind, "open" | "send" | "steer") {
+            if let Some(task) = &request.task_id {
+                require_task_write(
+                    &store,
+                    &request.network_id,
+                    &request.conversation_id,
+                    task,
+                    false,
+                )?;
+            } else {
+                let previous: Vec<_> = store
+                    .operations(&request.network_id)?
+                    .into_iter()
+                    .map(|operation| operation.request)
+                    .filter(|operation| {
+                        operation.target_node == request.target_node
+                            && operation.session_id == request.session_id
+                            && matches!(
+                                operation.action["type"].as_str(),
+                                Some("open" | "send" | "steer")
+                            )
+                    })
+                    .collect();
+                let latest_revision = previous
+                    .iter()
+                    .map(|operation| operation.expected_revision)
+                    .max();
+                ensure!(
+                    !previous.iter().any(|operation| {
+                        Some(operation.expected_revision) == latest_revision
+                            && operation.task_id.is_some()
+                    }),
+                    "task_id is required for new agent work in a task-associated execution session"
+                );
+            }
         }
         let session = if kind == "open" {
             ensure!(
