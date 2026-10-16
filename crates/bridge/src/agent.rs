@@ -31,19 +31,8 @@ pub struct SdkAgentConfig {
     pub workspace: PathBuf,
     pub timeout_secs: u64,
     pub model: String,
-    pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_callback: Option<ToolCallbackConfig>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct McpServerConfig {
-    pub command: PathBuf,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -271,49 +260,7 @@ async fn prepare_sdk_workspace(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_mcp(servers: &BTreeMap<String, McpServerConfig>) -> Result<()> {
-    ensure!(
-        servers.len() <= 8,
-        "management supports at most 8 explicit MCP servers"
-    );
-    for (name, server) in servers {
-        ensure!(
-            !name.is_empty()
-                && name.len() <= 64
-                && name
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'),
-            "invalid MCP server name"
-        );
-        ensure!(
-            server.command.is_absolute(),
-            "MCP executable must be an absolute path"
-        );
-        ensure!(
-            server.args.len() <= 64
-                && server
-                    .args
-                    .iter()
-                    .all(|arg| arg.len() <= 4096 && !arg.contains('\0')),
-            "invalid MCP arguments"
-        );
-        ensure!(
-            server.env.len() <= 64
-                && server.env.iter().all(|(key, value)| !key.is_empty()
-                    && key.len() <= 256
-                    && key
-                        .chars()
-                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-                    && value.len() <= 4096
-                    && !value.contains('\0')),
-            "invalid MCP environment"
-        );
-    }
-    Ok(())
-}
-
 fn validate_sdk_tools(config: &SdkAgentConfig) -> Result<()> {
-    validate_mcp(&config.mcp_servers)?;
     ensure!(config.custom_tools.len() <= 32, "too many custom tools");
     ensure!(
         config.custom_tools.is_empty() || config.tool_callback.is_some(),
@@ -370,14 +317,9 @@ fn sdk_options(config: &SdkAgentConfig, api_key: &str) -> Result<Value> {
         .workspace
         .to_str()
         .context("Cursor SDK workspace path must be UTF-8")?;
-    let servers: Map<String, Value> = config
-        .mcp_servers
-        .iter()
-        .map(|(name, config)| (name.clone(), json!({"stdio":config})))
-        .collect();
     Ok(
         json!({"apiKey":api_key,"model":{"id":config.model},"tools":{"names":["mcp"]},
-        "local":{"cwd":[workspace],"settingSources":[],"customTools":config.custom_tools},"mcpServers":servers}),
+        "local":{"cwd":[workspace],"settingSources":[],"customTools":config.custom_tools},"mcpServers":{}}),
     )
 }
 
@@ -1127,7 +1069,6 @@ mod tests {
             workspace: "/manager".into(),
             timeout_secs: 5,
             model: "fixture-model".into(),
-            mcp_servers: BTreeMap::new(),
             custom_tools: BTreeMap::from([(
                 "context".into(),
                 CustomToolConfig {

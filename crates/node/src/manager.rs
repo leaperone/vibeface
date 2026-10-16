@@ -14,7 +14,7 @@ use tokio::{
     process::Command,
 };
 use vibeface_bridge::agent::{
-    self, AgentResult, CustomToolConfig, McpServerConfig, SdkAgentConfig, ToolCallbackConfig,
+    self, AgentResult, CustomToolConfig, SdkAgentConfig, ToolCallbackConfig,
 };
 
 const MAX_LINE: usize = 1_048_576;
@@ -37,10 +37,7 @@ pub struct ManagerConfig {
     pub cursor_sdk_bin: PathBuf,
     pub node_bin: PathBuf,
     pub codex_bin: PathBuf,
-    pub codex_socket: Option<PathBuf>,
     pub codex_sdk_script: PathBuf,
-    #[serde(default)]
-    pub mcp_servers: BTreeMap<String, McpServerConfig>,
     #[serde(default)]
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_callback_url: Option<String>,
@@ -61,10 +58,8 @@ impl Default for ManagerConfig {
             cursor_sdk_bin: "cursor-sdk-bridge".into(),
             node_bin: "node".into(),
             codex_bin: "codex".into(),
-            codex_socket: None,
             codex_sdk_script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("sdk/codex-manager.mjs"),
-            mcp_servers: BTreeMap::new(),
             custom_tools: BTreeMap::new(),
             tool_callback_url: None,
             tool_callback_token: None,
@@ -123,7 +118,6 @@ where
                     workspace: config.workspace.clone(),
                     timeout_secs: config.timeout_secs,
                     model: config.model.clone(),
-                    mcp_servers: config.mcp_servers.clone(),
                     custom_tools: config.custom_tools.clone(),
                     tool_callback: callback,
                 },
@@ -235,7 +229,7 @@ where
     let secrets = secret_values(config);
     let operation = async {
         write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":native,"cwd":config.workspace,"model":config.model,"codex_path":codex,
-            "mcp_servers":config.mcp_servers,"tool_cli":tool_cli,"tool_env":config.tool_env})).await?;
+            "tool_cli":tool_cli,"tool_env":config.tool_env})).await?;
         let mut reader = BufReader::new(stdout);
         let ready = read_message(&mut reader).await?;
         ensure!(

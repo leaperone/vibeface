@@ -9,13 +9,9 @@ const MAX_EVENT_BYTES = 65_536;
 const MAX_STREAM_BYTES = 16_777_216;
 const MAX_ID_BYTES = 256;
 const MAX_MODEL_BYTES = 256;
-const MAX_SERVERS = 8;
-const MAX_ARGS = 64;
 const MAX_ENV = 64;
 const MAX_ENV_VALUE_BYTES = 4_096;
-const MAX_TOOLS = 128;
 const ID_PATTERN = /^[^\u0000-\u001f\u007f\r\n]{1,256}$/;
-const NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,255}$/;
 const RESERVED_TOOL_ENV = new Set([
   "CODEX_HOME",
@@ -33,12 +29,9 @@ const INIT_FIELDS = new Set([
   "cwd",
   "model",
   "codex_path",
-  "mcp_servers",
   "tool_cli",
   "tool_env",
 ]);
-
-const MCP_FIELDS = new Set(["command", "args", "env", "enabled_tools"]);
 
 class ProtocolError extends Error {
   constructor(message) {
@@ -86,68 +79,20 @@ function rejectUnknownFields(value, allowed, name) {
   }
 }
 
-function validateArgs(args, name) {
-  if (args === undefined) return [];
-  if (!Array.isArray(args) || args.length > MAX_ARGS) {
-    throw new ProtocolError(`${name}.args must contain at most ${MAX_ARGS} strings`);
-  }
-  return args.map((arg, index) => {
-    if (typeof arg !== "string" || bytes(arg) > 4_096 || arg.includes("\0")) {
-      throw new ProtocolError(`${name}.args[${index}] is invalid`);
-    }
-    return arg;
-  });
-}
-
-function validateEnv(env, name, { rejectReserved = false } = {}) {
+function validateEnv(env, name) {
   if (env === undefined) return {};
   if (!isObject(env) || Object.keys(env).length > MAX_ENV) {
     throw new ProtocolError(`${name} must contain at most ${MAX_ENV} entries`);
   }
   const result = {};
   for (const [key, value] of Object.entries(env)) {
-    if (!ENV_KEY_PATTERN.test(key) || (rejectReserved && RESERVED_TOOL_ENV.has(key))) {
+    if (!ENV_KEY_PATTERN.test(key) || RESERVED_TOOL_ENV.has(key)) {
       throw new ProtocolError(`${name} contains an invalid or reserved key`);
     }
     if (typeof value !== "string" || bytes(value) > MAX_ENV_VALUE_BYTES || value.includes("\0")) {
       throw new ProtocolError(`${name}.${key} is invalid`);
     }
     result[key] = value;
-  }
-  return result;
-}
-
-function validateEnabledTools(value, name) {
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.length > MAX_TOOLS) {
-    throw new ProtocolError(`${name}.enabled_tools must contain at most ${MAX_TOOLS} names`);
-  }
-  return value.map((tool, index) => {
-    if (typeof tool !== "string" || bytes(tool) === 0 || bytes(tool) > 256 || tool.includes("\0")) {
-      throw new ProtocolError(`${name}.enabled_tools[${index}] is invalid`);
-    }
-    return tool;
-  });
-}
-
-function validateMcpServers(value) {
-  if (value === undefined) return {};
-  if (!isObject(value) || Object.keys(value).length > MAX_SERVERS) {
-    throw new ProtocolError(`mcp_servers must contain at most ${MAX_SERVERS} servers`);
-  }
-  const result = {};
-  for (const [name, raw] of Object.entries(value)) {
-    if (!NAME_PATTERN.test(name) || !isObject(raw)) {
-      throw new ProtocolError(`invalid MCP server ${name}`);
-    }
-    rejectUnknownFields(raw, MCP_FIELDS, `mcp_servers.${name}`);
-    result[name] = {
-      command: requireAbsolutePath(raw.command, `mcp_servers.${name}.command`),
-      args: validateArgs(raw.args, `mcp_servers.${name}`),
-      env: validateEnv(raw.env, `mcp_servers.${name}.env`),
-      enabled_tools: validateEnabledTools(raw.enabled_tools, `mcp_servers.${name}`),
-      required: true,
-    };
   }
   return result;
 }
@@ -193,9 +138,8 @@ function validateInit(value) {
     cwd: value.cwd,
     model,
     codexPath: value.codex_path,
-    mcpServers: validateMcpServers(value.mcp_servers),
     toolCli,
-    toolEnv: validateEnv(value.tool_env, "tool_env", { rejectReserved: true }),
+    toolEnv: validateEnv(value.tool_env, "tool_env"),
   };
 }
 
@@ -241,17 +185,7 @@ function closeInput() {
   if (!process.stdin.destroyed) process.stdin.destroy();
 }
 
-function sdkConfig(input) {
-  const mcpServers = {};
-  for (const [name, server] of Object.entries(input.mcpServers)) {
-    mcpServers[name] = {
-      command: server.command,
-      args: server.args,
-      env: server.env,
-      required: server.required,
-      ...(server.enabled_tools ? { enabled_tools: server.enabled_tools } : {}),
-    };
-  }
+function sdkConfig() {
   return {
     approval_policy: "never",
     default_permissions: "vibeface_manager",
@@ -269,7 +203,7 @@ function sdkConfig(input) {
       ignore_default_excludes: true,
       include_only: ["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "VIBEFACE_NODE_URL", "VIBEFACE_TOOL_TOKEN", "VIBEFACE_NODE_CONVERSATION", "VIBEFACE_NODE_NETWORK"],
     },
-    mcp_servers: mcpServers,
+    mcp_servers: {},
     features: {
       shell_tool: true,
       unified_exec: true,
@@ -439,7 +373,7 @@ async function run(input, reader, secrets) {
 
   const codex = new Codex({
     codexPathOverride: codexPath,
-    config: sdkConfig(input),
+    config: sdkConfig(),
     configOverrides: [
       'permissions.vibeface_manager.filesystem={":root"="read"}',
       'permissions.vibeface_manager.network={enabled=true,allow_local_binding=true,mode="limited",domains={"127.0.0.1"="allow","localhost"="allow"}}',
@@ -519,7 +453,6 @@ try {
   const input = validateInit(await readFrame(reader));
   outputSecrets = [
     ...Object.values(input.toolEnv),
-    ...Object.values(input.mcpServers).flatMap((server) => Object.values(server.env)),
     process.env.CODEX_API_KEY,
     process.env.OPENAI_API_KEY,
     ...Object.entries(process.env).filter(([key]) => /(?:_KEY|_TOKEN|_SECRET|_PASSWORD)$/.test(key)).map(([, value]) => value),

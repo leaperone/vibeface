@@ -6,8 +6,8 @@ with a persisted thread ID when resuming, or with a null ID for a fresh SDK
 thread.
 
 The first frame must be an `init` object. It contains `prompt`, `session_id`,
-`cwd`, optional `model`, and `codex_path`, plus optional `mcp_servers`,
-`tool_cli`, and `tool_env`. Paths are absolute and all fields have byte and
+`cwd`, optional `model`, and `codex_path`, plus optional `tool_cli` and
+`tool_env`. Paths are absolute and all fields have byte and
 count limits. An omitted or empty model uses the account's configured default.
 The sidecar emits one `ready` frame containing the requested `session_id` and
 waits for an `ack` before invoking the model. For a fresh request, the SDK's
@@ -40,9 +40,7 @@ skill discovery. It requests loopback network rules, but the standalone exec
 path has not demonstrated an enforced external-domain allow-list. There is no
 shell command allow-list. Prompt instructions and the scoped CLI do not sandbox
 other shell commands; do not use this adapter as an isolation boundary for an
-untrusted model or plugin. Optional MCP servers are
-accepted only when explicitly supplied in `init` and may use `enabled_tools`
-allow-lists.
+untrusted model or plugin.
 
 Install the pinned dependency from this directory with `npm ci`.
 
