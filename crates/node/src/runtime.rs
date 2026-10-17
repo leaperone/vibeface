@@ -985,6 +985,47 @@ mod tests {
                 .len(),
             1
         );
+        {
+            let mut store = node.store.lock().await;
+            let head = store.heads(&network, "chat")?.remove(0);
+            let envelope = store.event(&network, &head)?.context("head missing")?;
+            let mut event = store.verify_event(&network, &envelope)?;
+            event.sequence += 1;
+            event.previous = Some(head.clone());
+            event.parents = vec![head, "ab".repeat(32)];
+            event.body = EventBody::ContextCheckpoint {
+                summary: "child arrived before its other parent".into(),
+                covered_heads: vec![],
+            };
+            store.ingest_event(&network, &node.identity.sign_event(event)?)?;
+            assert!(!store.context(&network, "chat", &[])?.missing.is_complete());
+        }
+        let access = Access {
+            network_id: network.clone(),
+            human: true,
+            conversation_id: None,
+            manager: None,
+        };
+        let duplicate = node.rpc(access.clone(), json!({"method":"message","conversation_id":"chat","message_id":"same-message","text":"same goal"})).await?;
+        assert!(triggers.contains(duplicate["trigger"].as_str().context("trigger missing")?));
+        let changed = node.rpc(access.clone(), json!({"method":"message","conversation_id":"chat","message_id":"same-message","text":"changed goal"})).await.unwrap_err();
+        assert!(changed.to_string().contains("different content"));
+        let changed_intent = node.rpc(access.clone(), json!({"method":"message","conversation_id":"chat","message_id":"same-message","text":"same goal","report_results":true})).await.unwrap_err();
+        assert!(
+            changed_intent
+                .to_string()
+                .contains("cannot change its follow-up intent")
+        );
+        let fresh = node.rpc(access, json!({"method":"message","conversation_id":"chat","message_id":"new-message","text":"new goal"})).await.unwrap_err();
+        assert!(fresh.to_string().contains("context is incomplete"));
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .scheduler_jobs(&network, "chat", &node.identity.node_id()?)?
+                .len(),
+            1
+        );
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())

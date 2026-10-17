@@ -242,7 +242,7 @@ pub(super) fn append_report_intent_from(
     let author = identity.node_id()?;
     authorize_node_from(connection, network, &author, Some(NodeRole::Gateway))?;
     authorize_node_from(connection, network, target, Some(NodeRole::Scheduler))?;
-    let events = scope_events(connection, network, scope)?;
+    let events = load_events_from(connection, network)?;
     let source = events.get(&message.hash).context("message is missing")?;
     ensure!(
         source.envelope == *message && source.event.author == author,
@@ -266,6 +266,7 @@ pub(super) fn append_report_intent_from(
         );
         return Ok(Some(hash.to_owned()));
     }
+    scope_events(connection, network, scope)?;
     let intent = FollowupIntentV1 {
         network_id: network.into(),
         conversation_id: scope.into(),

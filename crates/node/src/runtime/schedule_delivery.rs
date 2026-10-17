@@ -659,13 +659,19 @@ impl Runtime {
         let text = field(input, "text")?.to_owned();
         let (event, receipt) = {
             let mut store = self.store.lock().await;
-            ensure!(
-                store
-                    .context(network, &scope, &heads(input)?)?
-                    .missing
-                    .is_complete(),
-                "context is incomplete; wait for synchronization"
-            );
+            if !store
+                .messages(network, &scope)?
+                .iter()
+                .any(|message| message.message_id == message_id && message.role == "user")
+            {
+                ensure!(
+                    store
+                        .context(network, &scope, &heads(input)?)?
+                        .missing
+                        .is_complete(),
+                    "context is incomplete; wait for synchronization"
+                );
+            }
             store.accept_message(
                 &self.identity,
                 network,
