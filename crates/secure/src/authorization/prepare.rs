@@ -201,6 +201,341 @@ impl VerifiedPolicySet {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RemoteExecutionSelection {
+    execution_resource: ResourceRef,
+    target_public_key: PublicKey,
+    execution_grant: ObjectHash,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+pub struct VerifiedRemoteExecution {
+    state: VerifiedPolicySet,
+    source: VerifiedClientAuthorization,
+    selection: RemoteExecutionSelection,
+    context: PrepareContext,
+    action: Action,
+    heads: Vec<PolicyStamp>,
+    verified_at_ms: u64,
+}
+
+fn client_time(now: f64) -> Result<u64> {
+    require(
+        now.is_finite() && now >= 0.0 && now.fract() == 0.0 && now <= 9_007_199_254_740_991.0,
+        "invalid remote client clock",
+    )?;
+    Ok(now as u64)
+}
+
+/// Both pin sets come from independently saved trust, never from an unknown Node response.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyRemoteExecution))]
+pub fn verify_remote_execution(
+    auth: &VerifiedClientAuthorization,
+    project_bundle_json: &str,
+    project_pins_json: &str,
+    execution_bundle_json: &str,
+    execution_pins_json: &str,
+    selection_json: &str,
+    context_json: &str,
+    expected_action: &str,
+    now_ms: f64,
+) -> crate::Result<VerifiedRemoteExecution> {
+    (|| -> Result<VerifiedRemoteExecution> {
+        let now = client_time(now_ms)?;
+        require(
+            project_bundle_json.len() <= 1_048_576
+                && execution_bundle_json.len() <= 1_048_576
+                && project_pins_json.len() <= MAX_PROOF_BYTES
+                && execution_pins_json.len() <= MAX_PROOF_BYTES
+                && selection_json.len() <= MAX_PROOF_BYTES
+                && context_json.len() <= MAX_PROOF_BYTES,
+            "remote execution proof is too large",
+        )?;
+        let project: ClientAuthorizationBundle = serde_json::from_str(project_bundle_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid Project policy bundle"))?;
+        let execution: ClientAuthorizationBundle = serde_json::from_str(execution_bundle_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid execution policy bundle"))?;
+        let project_pins: Vec<PolicyPin> = serde_json::from_str(project_pins_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid Project pins"))?;
+        let execution_pins: Vec<PolicyPin> = serde_json::from_str(execution_pins_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid independent execution pins"))?;
+        let project_state = replay_policies(&project_pins, &project.journal)?;
+        let source_key = &project_state
+            .find_device(&auth.scope.device_id)?
+            .payload
+            .public_key;
+        let baseline = verify_client_authorization(
+            project_bundle_json,
+            project_pins_json,
+            auth.scope.account_id.as_str(),
+            auth.scope.space_id.as_str(),
+            source_key.as_str(),
+            now_ms,
+        )
+        .map_err(|_| {
+            AuthorizationError::InvalidProof("Project policy does not match client authorization")
+        })?;
+        require(
+            baseline.scope == auth.scope
+                && baseline.heads == auth.heads
+                && baseline.grant_leaf == auth.grant_leaf
+                && baseline.audience == auth.audience
+                && baseline.audience_public_key == auth.audience_public_key,
+            "remote execution changed the verified Project authorization",
+        )?;
+        let mut pins = BTreeMap::<PolicyDomain, PolicyPin>::new();
+        for pin in project_pins.into_iter().chain(execution_pins) {
+            if let Some(saved) = pins.get_mut(&pin.domain) {
+                require(
+                    saved.genesis_root == pin.genesis_root,
+                    "independent policy roots conflict",
+                )?;
+                if let Some(candidate) = pin.minimum_head {
+                    match &saved.minimum_head {
+                        Some(current)
+                            if (current.authority_epoch, current.sequence)
+                                == (candidate.authority_epoch, candidate.sequence) =>
+                        {
+                            require(current == &candidate, "independent policy heads conflict")?
+                        }
+                        Some(current)
+                            if (current.authority_epoch, current.sequence)
+                                > (candidate.authority_epoch, candidate.sequence) =>
+                        {
+                            ()
+                        }
+                        _ => saved.minimum_head = Some(candidate),
+                    }
+                }
+            } else {
+                pins.insert(pin.domain.clone(), pin);
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let mut journal = Vec::new();
+        for entry in project.journal.into_iter().chain(execution.journal) {
+            if seen.insert(ObjectHash::body(&entry)?) {
+                journal.push(entry);
+            }
+        }
+        let state = replay_policies(&pins.into_values().collect::<Vec<_>>(), &journal)?;
+        for head in &auth.heads {
+            require(
+                state.head(&head.domain) == Some(head),
+                "remote proof changed the Project head",
+            )?;
+        }
+        let selection: RemoteExecutionSelection = serde_json::from_str(selection_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid remote execution selection"))?;
+        require(
+            selection.execution_grant == execution.grant_leaf,
+            "execution bundle has another grant",
+        )?;
+        let context: PrepareContext = serde_json::from_str(context_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid remote prepare context"))?;
+        let action: Action = serde_json::from_value(Value::String(expected_action.into()))
+            .map_err(|_| AuthorizationError::InvalidProof("unknown remote action"))?;
+        let project = ResourceRef {
+            space: auth.scope.space_id.clone(),
+            resource: context.context.workspace_resource.clone().ok_or(
+                AuthorizationError::InvalidProof("remote Project resource is missing"),
+            )?,
+        };
+        require(
+            scope_covers(&auth.grant_scope, &project)
+                && auth.actions.contains(&action)
+                && context.execution_target_public_key.as_ref()
+                    == Some(&selection.target_public_key),
+            "remote selection differs from the verified client scope",
+        )?;
+        state.verify_execution_destination(
+            &project,
+            &auth.audience,
+            &selection.execution_resource,
+            &selection.target_public_key,
+            &selection.execution_grant,
+            &context.context,
+            action,
+            now,
+        )?;
+        let target = state.find_device(&DeviceId::from_key(&selection.target_public_key))?;
+        let mut budget = Budget::default();
+        let mut dependencies = auth
+            .heads
+            .iter()
+            .cloned()
+            .map(|head| (head.domain.clone(), head))
+            .collect();
+        state.validate_certificate(
+            target,
+            now,
+            &mut budget,
+            &mut dependencies,
+            &mut BTreeSet::new(),
+        )?;
+        state.expand_authorities(now, &mut budget, &mut dependencies)?;
+        Ok(VerifiedRemoteExecution {
+            state,
+            source: auth.clone(),
+            selection,
+            context,
+            action,
+            heads: dependencies.into_values().collect(),
+            verified_at_ms: now,
+        })
+    })()
+    .map_err(|error| error.to_string())
+}
+
+impl VerifiedRemoteExecution {
+    fn signing_authorization(
+        &self,
+        auth: &VerifiedClientAuthorization,
+        body: &Value,
+        now: u64,
+    ) -> Result<VerifiedClientAuthorization> {
+        require(
+            now >= self.verified_at_ms
+                && auth.scope == self.source.scope
+                && auth.heads == self.source.heads
+                && auth.grant_leaf == self.source.grant_leaf
+                && auth.audience == self.source.audience
+                && auth.audience_public_key == self.source.audience_public_key,
+            "remote handle belongs to a different or refreshed Project authorization",
+        )?;
+        let selected = remote_selection(body)?.ok_or(AuthorizationError::InvalidProof(
+            "remote selection is missing",
+        ))?;
+        require(
+            selected
+                == (
+                    self.selection.execution_resource.clone(),
+                    self.selection.target_public_key.clone(),
+                    self.selection.execution_grant.clone(),
+                )
+                && raw_resource(body)?.space == auth.scope.space_id,
+            "request changed its independently verified execution destination",
+        )?;
+        let project = raw_resource(body)?;
+        self.state.verify_execution_destination(
+            &project,
+            &auth.audience,
+            &self.selection.execution_resource,
+            &self.selection.target_public_key,
+            &self.selection.execution_grant,
+            &self.context.context,
+            self.action,
+            now,
+        )?;
+        let mut result = auth.clone();
+        result.heads = self.heads.clone();
+        Ok(result)
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+impl VerifiedRemoteExecution {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = selectionJson))]
+    pub fn selection_json(&self) -> crate::Result<String> {
+        serde_json::to_string(&self.selection)
+            .map_err(|_| "remote selection encoding failed".into())
+    }
+    pub fn prepare(
+        &self,
+        auth: &VerifiedClientAuthorization,
+        body_json: &str,
+        context_json: &str,
+        expected_action: &str,
+        operation_id: &str,
+        gateway_public_key: &str,
+        identity: &Identity,
+        now_ms: f64,
+    ) -> crate::Result<String> {
+        let now = client_time(now_ms).map_err(|error| error.to_string())?;
+        let body: Value =
+            serde_json::from_str(body_json).map_err(|_| "invalid remote request".to_owned())?;
+        let context: PrepareContext =
+            serde_json::from_str(context_json).map_err(|_| "invalid remote context".to_owned())?;
+        require(
+            context == self.context
+                && serde_json::to_value(self.action)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some(expected_action),
+            "remote context or action differs from its verified handle",
+        )
+        .map_err(|error| error.to_string())?;
+        let qualified = self
+            .signing_authorization(auth, &body, now)
+            .map_err(|error| error.to_string())?;
+        sign_client_prepare_intent(
+            &qualified,
+            body_json,
+            context_json,
+            expected_action,
+            operation_id,
+            gateway_public_key,
+            identity,
+            now_ms,
+        )
+    }
+    pub fn sign(
+        &self,
+        auth: &VerifiedClientAuthorization,
+        template_json: &str,
+        body_json: &str,
+        expected_action: &str,
+        operation_id: &str,
+        gateway_public_key: &str,
+        identity: &Identity,
+        now_ms: f64,
+    ) -> crate::Result<String> {
+        (|| -> Result<String> {
+            let now = client_time(now_ms)?;
+            let body: Value = serde_json::from_str(body_json)
+                .map_err(|_| AuthorizationError::InvalidProof("invalid remote request"))?;
+            let invocation: Invocation = serde_json::from_str(template_json)
+                .map_err(|_| AuthorizationError::InvalidProof("invalid remote invocation"))?;
+            let auth = self.signing_authorization(auth, &body, now)?;
+            require(
+                invocation.context == self.context.context && invocation.action == self.action,
+                "remote invocation changed its verified context or action",
+            )?;
+            let intent = PrepareIntent {
+                request: invocation.clone(),
+                binding_generation: self.context.binding_generation,
+                canonical_cwd: self.context.canonical_cwd.clone(),
+                execution_target_public_key: self.context.execution_target_public_key.clone(),
+            };
+            check_raw_context(&intent, &body, &auth.audience_public_key)?;
+            let gateway = PublicKey::parse(gateway_public_key)?;
+            require(
+                gateway != PublicKey::of(identity),
+                "gateway cannot be client key",
+            )?;
+            let presenter = if gateway == auth.audience_public_key {
+                DeviceId::from_key(&PublicKey::of(identity))
+            } else {
+                DeviceId::from_key(&gateway)
+            };
+            sign_client_invocation_inner(
+                &auth,
+                template_json,
+                body_json,
+                expected_action,
+                operation_id,
+                identity,
+                now_ms,
+                &presenter,
+            )
+        })()
+        .map_err(|error| error.to_string())
+    }
+}
+
 fn remote_selection(body: &Value) -> Result<Option<(ResourceRef, PublicKey, ObjectHash)>> {
     let fields = [
         body.get("execution_resource"),
@@ -712,10 +1047,29 @@ mod tests {
     use crate::authorization::tests::{Fixture, NOW};
     use serde_json::json;
 
-    fn client(f: &Fixture, leaf: Option<ObjectHash>) -> (VerifiedClientAuthorization, Identity) {
+    fn client_material(
+        f: &Fixture,
+        leaf: Option<ObjectHash>,
+    ) -> (
+        VerifiedClientAuthorization,
+        Identity,
+        ClientAuthorizationBundle,
+        Vec<PolicyPin>,
+    ) {
         let user = Identity::from_secret_hex(&hex::encode([4; 32])).unwrap();
         let space = SpaceId::personal(&f.account);
-        let leaf = leaf.unwrap_or_else(|| f.state.grants.keys().next().unwrap().clone());
+        let leaf = leaf.unwrap_or_else(|| {
+            f.state
+                .grants
+                .iter()
+                .find(|(_, grant)| {
+                    grant.payload.grantee == Grantee::Actor(Actor::Account(f.account.clone()))
+                        && grant.payload.actions.contains(&Action::MessageAppend)
+                })
+                .unwrap()
+                .0
+                .clone()
+        });
         let ah = f.state.account_history(&f.account).unwrap();
         let sh = f.state.space_history(&space).unwrap();
         let mut journal = Vec::new();
@@ -787,6 +1141,10 @@ mod tests {
             NOW as f64,
         )
         .unwrap();
+        (auth, user, bundle, pins)
+    }
+    fn client(f: &Fixture, leaf: Option<ObjectHash>) -> (VerifiedClientAuthorization, Identity) {
+        let (auth, user, _, _) = client_material(f, leaf);
         (auth, user)
     }
     fn body(auth: &VerifiedClientAuthorization) -> Value {
@@ -966,7 +1324,7 @@ mod tests {
         f.state
             .install_space(Signed::sign(document, &f.root).unwrap())
             .unwrap();
-        let (auth, user) = client(&f, None);
+        let (auth, user, bundle, pins) = client_material(&f, None);
         let body = json!({"method":"operate","space_id":space,"resource_id":project.resource,
             "authorization_id":"prepare_1","conversation_id":"chat","task_ref":context.task,
             "execution_resource":execution,"target_public_key":execution_key,"execution_grant":leaf,
@@ -978,7 +1336,84 @@ mod tests {
             execution_target_public_key: Some(execution_key.clone()),
             ..Default::default()
         };
-        let signed = sign(&auth, &body, &raw, &user, "execution_send").unwrap();
+        let mut execution_bundle = bundle.clone();
+        execution_bundle.grant_leaf = leaf.clone();
+        let selection = json!({"execution_resource":execution,"target_public_key":execution_key,"execution_grant":leaf});
+        let handle = verify_remote_execution(
+            &auth,
+            &serde_json::to_string(&bundle).unwrap(),
+            &serde_json::to_string(&pins).unwrap(),
+            &serde_json::to_string(&execution_bundle).unwrap(),
+            &serde_json::to_string(&pins).unwrap(),
+            &selection.to_string(),
+            &serde_json::to_string(&raw).unwrap(),
+            "execution_send",
+            NOW as f64,
+        )
+        .unwrap();
+        let signed: Signed<PrepareIntent> = serde_json::from_str(
+            &handle
+                .prepare(
+                    &auth,
+                    &body.to_string(),
+                    &serde_json::to_string(&raw).unwrap(),
+                    "execution_send",
+                    "prepare_1",
+                    auth.audience_public_key().as_str(),
+                    &user,
+                    NOW as f64,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let final_wire = handle
+            .sign(
+                &auth,
+                &serde_json::to_string(&signed.payload.request).unwrap(),
+                &body.to_string(),
+                "execution_send",
+                "prepare_1",
+                auth.audience_public_key().as_str(),
+                &user,
+                NOW as f64,
+            )
+            .unwrap();
+        let final_invocation: Signed<Invocation> = serde_json::from_str(&final_wire).unwrap();
+        assert!(
+            f.state
+                .verify_invocation(
+                    &final_invocation,
+                    &RequestFacts {
+                        resource: project.clone(),
+                        action: Action::ExecutionSend,
+                        audience: audience.clone(),
+                        operation_id: "prepare_1".into(),
+                        body_hash: ObjectHash::body(&body).unwrap(),
+                        context: context.clone()
+                    },
+                    &TransportEvidence::DirectNoise {
+                        device: DeviceId::from_key(&PublicKey::of(&user))
+                    },
+                    NOW
+                )
+                .is_ok()
+        );
+        let mut changed_body = body.clone();
+        changed_body["target_public_key"] = json!(PublicKey::of(&user));
+        assert!(
+            handle
+                .prepare(
+                    &auth,
+                    &changed_body.to_string(),
+                    &serde_json::to_string(&raw).unwrap(),
+                    "execution_send",
+                    "prepare_1",
+                    auth.audience_public_key().as_str(),
+                    &user,
+                    NOW as f64
+                )
+                .is_err()
+        );
         let verified = check(&f, &signed, &body, Action::ExecutionSend, NOW).unwrap();
         assert_eq!(
             verified.execution_destination().unwrap().grant_leaf(),
