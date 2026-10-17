@@ -798,16 +798,24 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
         let outcome = async {
             let persisted = root.join("observed-native-session.json");
             let record = persisted.clone();
-            let run = run_manager_authorized(&engine, &context, &config, "Use your command-execution tool to run '/opt/vibeface/sdk/codex-manager.mjs' tool nodes --json '{}' exactly once. Read its JSON result. Reply with exactly the marker field from that real result. Do not invent the marker. Do not read files, change files, use network tools or run other commands.", None, move |id| async move { crate::config::private_write(&record, &serde_json::to_vec(&id)?)?; Ok(()) }, |_| async { Ok(()) });
+            let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = progress.clone();
+            let run = run_manager_authorized(&engine, &context, &config, "Use your command-execution tool to run '/opt/vibeface/sdk/codex-manager.mjs' tool nodes --json '{}' exactly once. Read its JSON result. Reply with exactly the marker field from that real result. Do not invent the marker. Do not read files, change files, use network tools or run other commands.", None, move |id| async move { crate::config::private_write(&record, &serde_json::to_vec(&id)?)?; Ok(()) }, move |event| { captured.lock().unwrap().push(event); async { Ok(()) } });
             tokio::pin!(run);
             let result = loop {
                 tokio::select! {
-                    result = &mut run => break result?,
+                    result = &mut run => break result,
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {
                         engine.renew_manager(&context, vibeface_protocol::now_ms() + 30_000).await?;
                     }
                 }
             };
+            let observed = json!({"output":result.as_ref().ok().map(|r| r.output.as_str()),"error":result.as_ref().err().map(ToString::to_string),"expected_marker":marker,"callback_calls":calls.load(Ordering::SeqCst),"events":*progress.lock().unwrap()});
+            if let Ok(path) = std::env::var("VIBEFACE_MANAGER_MODEL_EVIDENCE") {
+                crate::config::private_write(std::path::Path::new(&path), &serde_json::to_vec_pretty(&observed)?)?;
+            }
+            let result = result?;
+            println!("manager-real-model-observed={}", json!({"output":result.output,"callback_calls":calls.load(Ordering::SeqCst)}));
             ensure!(result.output.trim() == marker, "real Manager did not return the real tool marker");
             ensure!(calls.load(Ordering::SeqCst) == 1, "real Manager tool call count differed from one");
             ensure!(result.session_id.is_some() && serde_json::from_slice::<String>(&std::fs::read(&persisted)?)? == *result.session_id.as_ref().unwrap(), "real Manager session was not durably observed before continuing");

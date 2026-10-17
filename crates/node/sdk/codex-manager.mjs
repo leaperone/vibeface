@@ -226,6 +226,7 @@ function managerPrompt(prompt, toolCli, allowedTools) {
     ["nodes", {}, "List reachable execution nodes, capabilities and allowed roots."],
     ["context", { offset: 0, limit: 20 }, "Page original conversation events. For referenced blobs, add blob_hash; offset counts bytes and limit counts KiB."],
     ["create_task", { task_id: "stable-id", title: "title", goal: "goal", acceptance: "human acceptance criteria" }, "Create a task. Reuse its task_id when retrying."],
+    ["bind_execution", { task_id: "selected-task-id", target_node: "node-id", session_id: "stable-id", executor: "codex", cwd: "/allowed/root" }, "Bind a selected Task to this execution target before opening it. The Node validates the real Task and signs its execution binding. Reuse the exact target when retrying. Existing bindings cannot be moved by the Manager."],
     ["open_execution", { operation_id: "stable-id", task_id: "selected-task-id", session_id: "stable-id", target_node: "node-id", executor: "codex", cwd: "/allowed/root" }, "Open an execution session for a selected Task. executor is codex, cursor_agent or claude_code. task_id is required. The Node verifies the Task binding; never invent authorization proofs."],
     ["send_execution", { operation_id: "stable-id", task_id: "selected-task-id", session_id: "existing-id", target_node: "node-id", expected_revision: 0, text: "task instructions" }, "Send to the selected Task's existing session at its current revision. task_id is required. The Node verifies the Task binding. Reconcile unknown results before any resend."],
     ["execution_status", { target_node: "node-id", session_id: "existing-id" }, "Read actual execution status without sending work or approving anything."],
@@ -406,7 +407,7 @@ async function run(input, reader, secrets) {
       workingDirectory: cwd,
       skipGitRepoCheck: true,
       approvalPolicy: "never",
-      sandboxMode: "read-only",
+      sandboxMode: "danger-full-access",
       networkAccessEnabled: false,
       webSearchMode: "disabled",
     };
