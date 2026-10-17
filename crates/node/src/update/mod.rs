@@ -205,7 +205,6 @@ pub async fn run(options: Update) -> Result<()> {
                 manifest(&candidate)?.version == latest.version,
                 "staged version changed"
             );
-            prepare_sidecar(&data, &policy.install_root, &previous, &candidate).await?;
             prepare_firewall(&data, &policy.install_root, &candidate).await?;
             let service = Service::load(&data).await?;
             let lease = match maintenance::acquire(&data).await {
@@ -380,7 +379,6 @@ async fn activate(
     service.stop().await?;
     let lock = wait_for_node_lock(data).await?;
     backup(data, &journal.backup)?;
-    normalize_sidecar(data, &policy.install_root, &journal.previous)?;
     switch(&policy.install_root, &journal.candidate)?;
     drop(lock);
     service.start().await?;
@@ -570,64 +568,6 @@ fn backup(source: &Path, destination: &Path) -> Result<()> {
         }
     }
     File::open(destination)?.sync_all()?;
-    Ok(())
-}
-
-fn uses_bundled_sidecar(script: &Path, root: &Path, previous: &Path) -> bool {
-    script == previous.join("sidecars/codex-manager.mjs")
-        || script == root.join("current/sidecars/codex-manager.mjs")
-}
-
-async fn prepare_sidecar(
-    data: &Path,
-    root: &Path,
-    previous: &Path,
-    candidate: &Path,
-) -> Result<()> {
-    let config = config::Config::load(data)?;
-    let Some(manager) = config.manager else {
-        return Ok(());
-    };
-    if manager.provider != "codex_sdk"
-        || !uses_bundled_sidecar(&manager.codex_sdk_script, root, previous)
-    {
-        return Ok(());
-    }
-    let mut npm = Command::new("npm");
-    if manager.node_bin.is_absolute() {
-        let directory = manager
-            .node_bin
-            .parent()
-            .context("node executable has no parent")?;
-        let executable = directory.join("npm");
-        ensure!(
-            executable.is_file(),
-            "npm must be installed alongside the configured Node executable"
-        );
-        npm = Command::new(executable);
-        let mut paths = vec![directory.to_path_buf()];
-        paths.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
-        npm.env("PATH", std::env::join_paths(paths)?);
-    }
-    npm.args(["ci", "--omit=dev", "--ignore-scripts"])
-        .current_dir(candidate.join("sidecars"));
-    checked(
-        &mut npm,
-        "install the new Codex SDK dependencies before stopping the node",
-    )
-    .await
-}
-
-fn normalize_sidecar(data: &Path, root: &Path, previous: &Path) -> Result<()> {
-    let mut config = config::Config::load(data)?;
-    if let Some(manager) = &mut config.manager
-        && uses_bundled_sidecar(&manager.codex_sdk_script, root, previous)
-    {
-        manager.codex_sdk_script = root.join("current/sidecars/codex-manager.mjs");
-        config.save(data)?;
-    }
     Ok(())
 }
 
@@ -958,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn service_and_sidecar_paths_match_only_the_managed_defaults() {
+    fn service_paths_match_only_the_managed_defaults() {
         let root = sandbox();
         let data = root.join("data");
         fs::create_dir(&data).unwrap();
@@ -970,17 +910,6 @@ mod tests {
         ];
         assert!(service_data_matches(&args, &data));
         assert!(!service_data_matches(&args, &root));
-        let old = root.join("releases/1.0.0");
-        assert!(uses_bundled_sidecar(
-            &old.join("sidecars/codex-manager.mjs"),
-            &root,
-            &old
-        ));
-        assert!(!uses_bundled_sidecar(
-            &root.join("custom/codex-manager.mjs"),
-            &root,
-            &old
-        ));
         fs::remove_dir_all(root).unwrap();
     }
 
