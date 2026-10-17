@@ -954,12 +954,9 @@ mod tests {
             Value::Null,
             None,
         )?;
-        assert!(
-            receiver
-                .receive_packet(&network, &a.node_id()?, packet)
-                .await
-                .is_err()
-        );
+        receiver
+            .receive_packet(&network, &a.node_id()?, packet)
+            .await?;
         assert!(inbound.try_recv().is_err());
         Ok(())
     }
