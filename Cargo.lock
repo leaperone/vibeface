@@ -2274,7 +2274,6 @@ dependencies = [
  "vibeface-bridge",
  "vibeface-protocol",
  "vibeface-secure",
- "zeroize",
 ]
 
 [[package]]

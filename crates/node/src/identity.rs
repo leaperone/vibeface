@@ -10,12 +10,12 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod local;
-pub mod recovery;
 pub use local::IdentityStore;
 
 pub const IDENTITY_VERSION: u32 = 1;
 pub const MAX_MEMBERS: usize = 1024;
 pub const MAX_GOVERNANCE_EVENTS: usize = 1024;
+pub const MAX_HISTORICAL_NODES: usize = 4096;
 const MAX_PARENTS: usize = 64;
 const MAX_MANAGEMENT_DEPTH: usize = 128;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -184,16 +184,44 @@ impl Genesis {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct HistoricalNode {
+    pub subject_id: String,
+    pub public_key: String,
+}
+
+impl HistoricalNode {
+    pub fn validate(&self) -> Result<()> {
+        validate_id(&self.public_key)?;
+        ensure!(
+            self.subject_id == crypto::fingerprint(&self.public_key)?,
+            "historical Node fingerprint mismatch"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RootCheckpoint {
     pub version: u32,
     pub network_id: NetworkId,
     pub epoch: u64,
     pub members: Vec<Member>,
+    pub historical_nodes: Vec<HistoricalNode>,
     pub signature: String,
 }
 
 impl RootCheckpoint {
-    pub fn create(root: &LocalIdentity, epoch: u64, mut members: Vec<Member>) -> Result<Self> {
+    pub fn create(root: &LocalIdentity, epoch: u64, members: Vec<Member>) -> Result<Self> {
+        Self::create_with_history(root, epoch, members, vec![])
+    }
+
+    pub fn create_with_history(
+        root: &LocalIdentity,
+        epoch: u64,
+        mut members: Vec<Member>,
+        mut historical_nodes: Vec<HistoricalNode>,
+    ) -> Result<Self> {
         ensure!(
             (2..=MAX_SAFE_INTEGER).contains(&epoch),
             "invalid recovery epoch"
@@ -207,11 +235,13 @@ impl RootCheckpoint {
                 .all(|member| member.public_key != root_public_key),
             "recovery root cannot be a daily device or client identity"
         );
+        historical_nodes.extend(member_history(&members));
         let mut checkpoint = Self {
             version: IDENTITY_VERSION,
             network_id: root.network_id()?,
             epoch,
             members,
+            historical_nodes: canonical_history(historical_nodes)?,
             signature: String::new(),
         };
         checkpoint.signature =
@@ -233,6 +263,21 @@ impl RootCheckpoint {
             "invalid recovery checkpoint"
         );
         validate_members(&self.members)?;
+        validate_history(&self.historical_nodes)?;
+        ensure!(
+            self.historical_nodes.iter().all(|node| {
+                node.public_key != genesis.owner_public_key
+                    && !genesis
+                        .initial_members
+                        .iter()
+                        .chain(&self.members)
+                        .any(|member| {
+                            member.subject_id == node.subject_id
+                                && member.kind == IdentityKind::Client
+                        })
+            }),
+            "historical authors must be Node identities"
+        );
         ensure!(
             self.members
                 .iter()
@@ -246,6 +291,53 @@ impl RootCheckpoint {
             &self.signature,
         )
     }
+}
+
+fn member_history(members: &[Member]) -> Vec<HistoricalNode> {
+    members
+        .iter()
+        .filter(|member| member.kind == IdentityKind::Node)
+        .map(|member| HistoricalNode {
+            subject_id: member.subject_id.clone(),
+            public_key: member.public_key.clone(),
+        })
+        .collect()
+}
+
+fn canonical_history(history: Vec<HistoricalNode>) -> Result<Vec<HistoricalNode>> {
+    ensure!(
+        history.len() <= MAX_HISTORICAL_NODES + 2 * MAX_MEMBERS + MAX_GOVERNANCE_EVENTS,
+        "too many historical Node identities"
+    );
+    let mut nodes = BTreeMap::new();
+    for node in history {
+        node.validate()?;
+        if let Some(old) = nodes.insert(node.subject_id.clone(), node.clone()) {
+            ensure!(old == node, "conflicting historical Node identity");
+        }
+        ensure!(
+            nodes.len() <= MAX_HISTORICAL_NODES,
+            "too many historical Node identities"
+        );
+    }
+    Ok(nodes.into_values().collect())
+}
+
+fn validate_history(history: &[HistoricalNode]) -> Result<()> {
+    ensure!(
+        history.len() <= MAX_HISTORICAL_NODES,
+        "too many historical Node identities"
+    );
+    ensure!(
+        history
+            .windows(2)
+            .all(|pair| pair[0].subject_id < pair[1].subject_id),
+        "duplicate or noncanonical historical Node identities"
+    );
+    for node in history {
+        node.validate()?;
+    }
+    Ok(())
 }
 
 fn validate_members(members: &[Member]) -> Result<()> {
@@ -482,8 +574,13 @@ impl NetworkState {
             checkpoint.epoch > self.epoch(),
             "recovery epoch rollback or conflict"
         );
-        self.checkpoint = Some(checkpoint);
-        self.events.clear();
+        let next = Self {
+            genesis: self.genesis.clone(),
+            checkpoint: Some(checkpoint),
+            events: vec![],
+        };
+        preserve_history(self, &next)?;
+        *self = next;
         Ok(())
     }
 
@@ -499,6 +596,7 @@ impl NetworkState {
             "recovery epoch rollback rejected"
         );
         if incoming.epoch() > self.epoch() {
+            preserve_history(self, incoming)?;
             return Ok(incoming.clone());
         }
         ensure!(
@@ -664,6 +762,38 @@ impl NetworkState {
             revoked: revoked.into_iter().collect(),
         })
     }
+
+    pub fn historical_nodes(&self) -> Result<Vec<HistoricalNode>> {
+        self.project()?;
+        let mut history = member_history(&self.genesis.initial_members);
+        if let Some(checkpoint) = &self.checkpoint {
+            history.extend(checkpoint.historical_nodes.clone());
+            history.extend(member_history(&checkpoint.members));
+        }
+        for event in &self.events {
+            if let GovernanceAction::Grant { member } = &event.action
+                && member.kind == IdentityKind::Node
+            {
+                history.extend(member_history(std::slice::from_ref(member)));
+            }
+        }
+        canonical_history(history)
+    }
+}
+
+fn preserve_history(previous: &NetworkState, next: &NetworkState) -> Result<()> {
+    let kept: BTreeMap<_, _> = next
+        .historical_nodes()?
+        .into_iter()
+        .map(|node| (node.subject_id, node.public_key))
+        .collect();
+    for node in previous.historical_nodes()? {
+        ensure!(
+            kept.get(&node.subject_id) == Some(&node.public_key),
+            "root checkpoint omits a known historical Node identity"
+        );
+    }
+    Ok(())
 }
 
 fn project_members(
@@ -1041,6 +1171,99 @@ mod tests {
         let root_member = Member::client(&root, "unsafe client", true)?;
         assert!(Genesis::create(&root, vec![root_member.clone()]).is_err());
         assert!(RootCheckpoint::create(&root, 2, vec![root_member]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn historical_author_signature_survives_recovery_without_online_authority() -> Result<()> {
+        let (root, admin, _, mut state) = setup()?;
+        let old_node = LocalIdentity::generate();
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::node(&old_node, "retired", vec![NodeRole::Replica])?,
+        )?)?;
+        let event = old_node.sign_event(crate::model::Event {
+            version: 1,
+            network_id: state.genesis.network_id.clone(),
+            scope_id: "archive".into(),
+            author: old_node.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 1,
+            body: crate::model::EventBody::ConversationCreated {
+                title: "old context".into(),
+            },
+            blobs: vec![],
+        })?;
+        state.append(GovernanceEvent::revoke(
+            &admin,
+            &state.project()?,
+            &old_node.node_id()?,
+        )?)?;
+        let original = state.clone();
+        let retained = state.historical_nodes()?;
+        state.recover(RootCheckpoint::create_with_history(
+            &root,
+            2,
+            vec![Member::client(&admin, "admin", true)?],
+            retained.clone(),
+        )?)?;
+        assert!(state.events.is_empty());
+        let fresh: NetworkState = serde_json::from_slice(&serde_json::to_vec(&state)?)?;
+        let author = fresh
+            .historical_nodes()?
+            .into_iter()
+            .find(|node| node.subject_id == old_node.node_id().unwrap())
+            .unwrap();
+        assert_eq!(
+            crypto::verify_signed_event(&fresh.genesis.network_id, &event, &author.public_key)?
+                .scope_id,
+            "archive"
+        );
+        assert!(
+            fresh
+                .project()?
+                .authorize_node(&old_node.node_id()?, None)
+                .is_err()
+        );
+        assert_eq!(retained, original.historical_nodes()?);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_cannot_discard_known_authors_or_tamper_with_root_history() -> Result<()> {
+        let (root, admin, _, mut state) = setup()?;
+        let node = LocalIdentity::generate();
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::node(&node, "node", vec![NodeRole::Replica])?,
+        )?)?;
+        let members = vec![Member::client(&admin, "admin", true)?];
+        let incomplete = RootCheckpoint::create(&root, 2, members.clone())?;
+        assert!(state.recover(incomplete.clone()).is_err());
+        let incoming = NetworkState {
+            genesis: state.genesis.clone(),
+            checkpoint: Some(incomplete),
+            events: vec![],
+        };
+        assert!(state.merge(&incoming).is_err());
+        let mut checkpoint =
+            RootCheckpoint::create_with_history(&root, 2, members, state.historical_nodes()?)?;
+        checkpoint.historical_nodes[0].public_key = admin.public_key_hex()?;
+        assert!(checkpoint.verify(&state.genesis).is_err());
+        assert!(
+            validate_history(&vec![
+                HistoricalNode {
+                    subject_id: node.node_id()?,
+                    public_key: node.public_key_hex()?
+                };
+                MAX_HISTORICAL_NODES + 1
+            ])
+            .is_err()
+        );
         Ok(())
     }
 

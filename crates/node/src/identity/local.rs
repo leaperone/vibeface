@@ -1,8 +1,7 @@
 //! Private, local state for identity handshakes and network membership.
 //!
-//! This module deliberately stores only hashes for one-time capabilities and
-//! session tokens.  It never stores a root private key or signs a governance
-//! grant on behalf of a browser.
+//! One-time capability secrets stay on the client; this database stores their
+//! hashes and signed pairing receipts, never a recovery root or client private key.
 
 use super::{AuthorizationView, IdentityKind, Member, NetworkState};
 use crate::crypto;
