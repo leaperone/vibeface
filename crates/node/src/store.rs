@@ -607,8 +607,11 @@ impl Store {
             "binding references a different task"
         );
         ensure!(
-            self.missing_dependencies(&binding.network_id, &[binding.task_ref.clone()])?
-                .is_complete(),
+            self.missing_dependencies(
+                &binding.network_id,
+                std::slice::from_ref(&binding.task_ref)
+            )?
+            .is_complete(),
             "binding task history is incomplete or conflicting"
         );
         self.authorize_node(

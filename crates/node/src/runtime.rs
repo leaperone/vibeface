@@ -2814,21 +2814,19 @@ impl Runtime {
                 proof.binding.target_node != request.target_node
                     || proof.binding.session_id != request.session_id
             })
-        {
-            if let Ok(reply) = self
+            && let Ok(reply) = self
                 .peer_request(
                     &request.network_id,
                     &event.author,
                     serde_json::json!({"type":"task_binding","task_ref":creation.hash}),
                 )
                 .await
-                && !reply["binding"].is_null()
-            {
-                let proof: crate::binding::SignedBinding =
-                    serde_json::from_value(reply["binding"].clone())?;
-                self.store.lock().await.install_binding(&proof)?;
-                existing = Some(proof);
-            }
+            && !reply["binding"].is_null()
+        {
+            let proof: crate::binding::SignedBinding =
+                serde_json::from_value(reply["binding"].clone())?;
+            self.store.lock().await.install_binding(&proof)?;
+            existing = Some(proof);
         }
         if let Some(proof) = existing {
             request.binding = Some(proof);
