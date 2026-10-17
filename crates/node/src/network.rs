@@ -821,22 +821,12 @@ impl NetworkHub {
             .map_err(|_| anyhow::anyhow!("network service queue full"))
     }
     async fn mdns(&self, listen: SocketAddr) -> Result<()> {
-        let daemon = ServiceDaemon::new()?;
+        let daemon = MdnsGuard(ServiceDaemon::new()?);
         let node_id = self.identity.node_id()?;
-        let properties = [("node_id", node_id.as_str()), ("path", "/api/network/ws")];
         if !listen.ip().is_loopback() {
-            let service = ServiceInfo::new(
-                SERVICE_TYPE,
-                &node_id,
-                &format!("vf-{}.local.", &node_id[..16]),
-                "",
-                listen.port(),
-                &properties[..],
-            )?
-            .enable_addr_auto();
-            daemon.register(service)?;
+            daemon.0.register(mdns_service(&node_id, listen.port())?)?;
         }
-        let events = daemon.browse(SERVICE_TYPE)?;
+        let events = daemon.0.browse(SERVICE_TYPE)?;
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         loop {
             interval.tick().await;
@@ -868,7 +858,13 @@ impl NetworkHub {
                     }
                     ServiceEvent::ServiceRemoved(_, name) => {
                         if let Some(target) = name.strip_suffix(&format!(".{SERVICE_TYPE}")) {
-                            self.state.lock().await.candidates.remove(target);
+                            if target.len() == 32 && target.bytes().all(|b| b.is_ascii_hexdigit()) {
+                                self.state
+                                    .lock()
+                                    .await
+                                    .candidates
+                                    .retain(|id, _| !id.starts_with(target));
+                            }
                         }
                     }
                     _ => {}
@@ -876,6 +872,26 @@ impl NetworkHub {
             }
         }
     }
+}
+
+struct MdnsGuard(ServiceDaemon);
+impl Drop for MdnsGuard {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown();
+    }
+}
+fn mdns_service(node_id: &str, port: u16) -> Result<ServiceInfo> {
+    check_id(node_id)?;
+    let properties = [("node_id", node_id), ("path", "/api/network/ws")];
+    Ok(ServiceInfo::new(
+        SERVICE_TYPE,
+        &node_id[..32],
+        &format!("vf-{}.local.", &node_id[..16]),
+        "",
+        port,
+        &properties[..],
+    )?
+    .enable_addr_auto())
 }
 
 #[derive(Default)]
@@ -1130,6 +1146,24 @@ mod tests {
         })
         .await
         .context("encrypted frame timed out")?
+    }
+
+    #[test]
+    fn mdns_uses_valid_dns_labels_and_retains_the_full_identity() -> Result<()> {
+        let node_id = LocalIdentity::generate().node_id()?;
+        let service = mdns_service(&node_id, 4790)?;
+        assert!(
+            service
+                .get_fullname()
+                .split('.')
+                .all(|label| label.len() <= 63)
+        );
+        assert_eq!(
+            service.get_property_val_str("node_id"),
+            Some(node_id.as_str())
+        );
+        assert_eq!(service.get_port(), 4790);
+        Ok(())
     }
 
     #[tokio::test]
