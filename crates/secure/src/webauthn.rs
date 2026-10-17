@@ -461,7 +461,12 @@ impl VerifiedPasskeyRegistration {
                 && self.relying_party.rp_id == record.rp_id()
                 && self.relying_party.origin == record.origin()
                 && self.user_handle == record.user_handle()
-                && self.backup_eligible == record.backup_eligible(),
+                && self.backup_eligible == record.backup_eligible()
+                && record.record().payload.initial_state
+                    == (AuthenticatorState {
+                        sign_count: self.sign_count,
+                        backup_state: self.backup_state,
+                    }),
             "authorized passkey record does not match registration",
         )
     }
@@ -593,6 +598,11 @@ impl RegisteredPasskey {
         require(
             !state.backup_state || record.backup_eligible(),
             "invalid stored passkey backup state",
+        )?;
+        let floor = record.state_floor();
+        require(
+            state.sign_count >= floor.sign_count && state.backup_state == floor.backup_state,
+            "passkey state is below its accepted policy floor",
         )?;
         Ok(Self {
             account: record.account().clone(),
@@ -1363,6 +1373,10 @@ pub(crate) mod tests {
             user_handle: proof.user_handle().to_owned(),
             backup_eligible: proof.backup_eligible(),
             client_enrollment: crate::authorization::PasskeyClientEnrollment::AccountClient,
+            initial_state: AuthenticatorState {
+                sign_count: proof.sign_count(),
+                backup_state: proof.backup_state(),
+            },
             issued_under: initial.clone(),
             not_before_ms: NOW,
             expires_at_ms: NOW + 1000000,
