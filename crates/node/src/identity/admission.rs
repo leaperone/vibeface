@@ -1,5 +1,5 @@
 use super::{
-    event_authorization::append_admitted_dispatch_in,
+    event_authorization::{append_admitted_dispatch_in, current_event_authorization},
     journal::PolicyState,
     policy::{FreshnessProof, request_facts_from},
 };
@@ -7,9 +7,10 @@ use crate::{
     crypto::LocalIdentity,
     engine::{EngineAction, ExecutorKind},
     model::{
-        AdmissionProof, ExecutionSession, MAX_EVENT_BYTES, OperationRecord, OperationRequest,
-        OperationState, StoredTransport,
+        AdmissionProof, AgentSession, ExecutionSession, MAX_EVENT_BYTES, OperationRecord,
+        OperationRequest, OperationState, StoredTransport,
     },
+    scheduler::{self, Invocation as SchedulerInvocation, InvocationState, LocalSession},
     store::{
         Store, canonical_resource, closure_hashes, has_blob_from, heads_from_events,
         load_events_from, paths_overlap, validate_operation_binding_from,
@@ -17,11 +18,11 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use vibeface_secure::authorization::{
-    Actor, CheckStage, ObjectHash, PolicyDomain, RequestFacts, TransportEvidence,
-    VerifiedAdmission, VerifiedAuthorization, VerifiedPolicySet,
+    Action, Actor, CheckStage, ObjectHash, PolicyDomain, RequestFacts, SessionRef,
+    TransportEvidence, VerifiedAdmission, VerifiedAuthorization, VerifiedPolicySet,
 };
 
 pub(crate) fn check_policy_heads_in(
@@ -530,6 +531,15 @@ fn lease_deadline_from(
         "persisted execution lease has invalid stage"
     );
     let stored = load_admission_from(connection, space, operation_id)?;
+    verify_lease_record(connection, policy, &stored, &lease)
+}
+
+fn verify_lease_record(
+    connection: &Connection,
+    policy: &PolicyState,
+    stored: &StoredAdmission,
+    lease: &LeaseRecord,
+) -> Result<u64> {
     let historical = policy.historical(&lease.proof.challenge.policies, lease.checked_at_ms)?;
     let facts = request_facts_from(
         connection,
@@ -537,13 +547,28 @@ fn lease_deadline_from(
         &stored.proof.source_body,
         &stored.proof.invocation.payload.audience,
     )?;
-    let admission = reconstruct_admission(policy, &stored.proof, &facts, &stored.transport)?;
-    let auth = historical.verify_operation_authorization(
-        &admission,
-        &facts,
-        &stored.transport,
-        lease.checked_at_ms,
-    )?;
+    let auth = if lease.proof.challenge.stage == CheckStage::Admit {
+        ensure!(
+            lease.checked_at_ms == stored.proof.admitted_at_ms
+                && lease.proof.challenge == stored.proof.challenge
+                && lease.proof.receipts == stored.proof.receipts,
+            "initial manager lease differs from its original admission"
+        );
+        historical.verify_invocation(
+            &stored.proof.invocation,
+            &facts,
+            &stored.transport,
+            lease.checked_at_ms,
+        )?
+    } else {
+        let admission = reconstruct_admission(policy, &stored.proof, &facts, &stored.transport)?;
+        historical.verify_operation_authorization(
+            &admission,
+            &facts,
+            &stored.transport,
+            lease.checked_at_ms,
+        )?
+    };
     let freshness = historical.verify_freshness(
         &auth,
         &lease.proof.challenge,
@@ -558,7 +583,432 @@ fn lease_deadline_from(
     Ok(lease.deadline)
 }
 
+pub(crate) struct ManagerAdmission {
+    pub(crate) manager_id: String,
+    pub(crate) invocation: SchedulerInvocation,
+    pub(crate) previous_native_id: Option<String>,
+    pub(crate) fresh: bool,
+    pub(crate) lease_expires_at_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagerClaim {
+    manager_id: String,
+    conversation_id: String,
+    trigger: String,
+}
+
+fn local_from<T: DeserializeOwned>(
+    connection: &Connection,
+    space: &str,
+    key: &str,
+) -> Result<Option<T>> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![space, key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    value
+        .map(|value| Ok(serde_json::from_str(&value)?))
+        .transpose()
+}
+
+fn set_local_in(
+    tx: &Transaction<'_>,
+    space: &str,
+    key: &str,
+    value: &impl Serialize,
+) -> Result<()> {
+    tx.execute("INSERT INTO local_values(space_id,key,value) VALUES(?,?,?) ON CONFLICT(space_id,key) DO UPDATE SET value=excluded.value",
+        params![space,key,serde_json::to_string(value)?])?;
+    Ok(())
+}
+
+fn manager_field<'a>(body: &'a Value, field: &str) -> Result<&'a str> {
+    let value = body[field]
+        .as_str()
+        .with_context(|| format!("manager {field} is required"))?;
+    ensure!(
+        !value.is_empty() && value.len() <= 1024,
+        "invalid manager field"
+    );
+    Ok(value)
+}
+
+fn check_manager_parent(
+    connection: &Connection,
+    policy: &PolicyState,
+    auth: &VerifiedAuthorization,
+    body: &Value,
+    now_ms: u64,
+) -> Result<()> {
+    ensure!(
+        body["method"] == "agent_start"
+            && auth.action() == Action::AgentStart
+            && matches!(auth.actor(), Actor::Service(_)),
+        "manager requires an admitted service agent-start invocation"
+    );
+    let space = auth.resource().space.as_str();
+    let conversation = manager_field(body, "conversation_id")?;
+    let trigger = manager_field(body, "trigger")?;
+    ensure!(
+        auth.operation_id() == format!("manager:{trigger}"),
+        "manager authorization does not identify its trigger"
+    );
+    let sdk_session: SessionRef = serde_json::from_value(body["sdk_session"].clone())?;
+    ensure!(
+        sdk_session.session_id == trigger,
+        "manager SDK session does not identify its trigger"
+    );
+    let descriptor: AgentSession = local_from(
+        connection,
+        space,
+        &format!("agent-session:{}", sdk_session.session_id),
+    )?
+    .context("manager has no persisted service delegation")?;
+    ensure!(
+        descriptor.space_id == auth.resource().space
+            && descriptor.resource_id == auth.resource().resource
+            && descriptor.sdk_session == sdk_session
+            && descriptor.device == *auth.device()
+            && auth.actor() == &Actor::Service(descriptor.service.clone())
+            && descriptor.conversation_id == conversation
+            && descriptor.grant_leaf == auth.signed_invocation().payload.grant_leaf
+            && descriptor.initiator == *auth.initiator()
+            && descriptor.initiating_grant == auth.signed_invocation().payload.initiating_grant
+            && descriptor.parent_invocation.as_str() == manager_field(body, "parent_invocation")?
+            && now_ms < descriptor.expires_at_ms,
+        "manager invocation differs from its persisted delegation"
+    );
+    let events = load_events_from(connection, space)?;
+    let event = events.get(trigger).context("manager trigger is missing")?;
+    ensure!(
+        event.status == "ready"
+            && event.event.scope_id == conversation
+            && event.event.resource_id == auth.resource().resource
+            && matches!(&event.event.body, crate::model::EventBody::MessagePosted { role, text, .. } if role == "user" && !text.trim().is_empty()),
+        "manager trigger is not a ready account message in its resource"
+    );
+    let parent = current_event_authorization(policy, connection, &event.event, &events, now_ms)?;
+    ensure!(
+        matches!(parent.actor(), Actor::Account(_))
+            && parent.resource() == auth.resource()
+            && parent.actor() == auth.initiator()
+            && parent.invocation_hash() == &descriptor.parent_invocation
+            && auth
+                .grant_path()
+                .contains(&parent.signed_invocation().payload.grant_leaf),
+        "manager delegation differs from its current account parent"
+    );
+    Ok(())
+}
+
+fn load_manager_from(
+    connection: &Connection,
+    space: &str,
+    manager_id: &str,
+) -> Result<(ManagerClaim, StoredAdmission, SchedulerInvocation)> {
+    let trigger = manager_id
+        .strip_prefix("manager:")
+        .context("invalid manager authorization ID")?;
+    let claim: ManagerClaim =
+        local_from(connection, space, &format!("manager-admission:{trigger}"))?
+            .context("manager has no admitted trigger claim")?;
+    ensure!(
+        claim.manager_id == manager_id && claim.trigger == trigger,
+        "manager admission mapping mismatch"
+    );
+    let stored = load_authorization_from(connection, space, manager_id)?;
+    ensure!(
+        manager_field(&stored.proof.source_body, "conversation_id")? == claim.conversation_id
+            && manager_field(&stored.proof.source_body, "trigger")? == claim.trigger,
+        "manager admission source mismatch"
+    );
+    let invocation: SchedulerInvocation = local_from(
+        connection,
+        space,
+        &scheduler::key("invocation", &claim.conversation_id, &claim.trigger),
+    )?
+    .context("manager invocation record is missing")?;
+    ensure!(
+        invocation.trigger == claim.trigger
+            && invocation.message_id
+                == format!(
+                    "scheduler-message-{}",
+                    crate::crypto::digest(&serde_json::to_vec(&(
+                        space,
+                        &claim.conversation_id,
+                        &claim.trigger
+                    ))?)
+                ),
+        "manager invocation metadata does not identify its admitted trigger"
+    );
+    Ok((claim, stored, invocation))
+}
+
+fn manager_lease_from(
+    connection: &Connection,
+    policy: &PolicyState,
+    space: &str,
+    manager_id: &str,
+) -> Result<u64> {
+    let (_, stored, _) = load_manager_from(connection, space, manager_id)?;
+    let lease: LeaseRecord = local_from(connection, space, &format!("lease:{manager_id}"))?
+        .context("manager lease is missing")?;
+    ensure!(
+        matches!(
+            lease.proof.challenge.stage,
+            CheckStage::Admit | CheckStage::Renew
+        ),
+        "manager lease has incorrect stage"
+    );
+    verify_lease_record(connection, policy, &stored, &lease)
+}
+
 impl Store {
+    pub(crate) fn claim_authorized_manager(
+        &mut self,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        transport: &TransportEvidence,
+        source_body: &Value,
+        boot: &str,
+        sdk_config: &str,
+        now_ms: u64,
+    ) -> Result<ManagerAdmission> {
+        source_matches(auth, source_body)?;
+        ensure!(
+            !boot.is_empty()
+                && boot.len() <= 1024
+                && !sdk_config.is_empty()
+                && manager_field(source_body, "sdk_config")? == sdk_config,
+            "manager execution configuration differs from signed request"
+        );
+        ensure!(
+            matches!(transport, TransportEvidence::LocalAgentAdapter { .. }),
+            "manager start requires a local service adapter"
+        );
+        let facts = self.request_facts(source_body, auth.audience())?;
+        let checked = self.policy.verified().verify_invocation(
+            auth.signed_invocation(),
+            &facts,
+            transport,
+            now_ms,
+        )?;
+        ensure!(
+            checked.invocation_hash() == auth.invocation_hash(),
+            "manager invocation changed"
+        );
+        let freshness = self.policy.verified().verify_freshness(
+            auth,
+            &proof.challenge,
+            &proof.receipts,
+            now_ms,
+        )?;
+        self.policy
+            .verified()
+            .admit_operation(auth, &freshness, now_ms)?;
+        let space = auth.resource().space.as_str();
+        let conversation = manager_field(source_body, "conversation_id")?;
+        let trigger = manager_field(source_body, "trigger")?;
+        let invocation_key = scheduler::key("invocation", conversation, trigger);
+        let session_key = scheduler::key("session", conversation, "");
+        let manager_key = format!("manager-admission:{trigger}");
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_policy_heads_in(&tx, self.policy.verified(), auth, now_ms)?;
+        check_manager_parent(&tx, &self.policy, auth, source_body, now_ms)?;
+        if local_from::<ManagerClaim>(&tx, space, &manager_key)?.is_some() {
+            let (claim, stored, mut previous) = load_manager_from(&tx, space, auth.operation_id())?;
+            ensure!(
+                stored.proof.source_body == *source_body && stored.transport == *transport,
+                "manager trigger was reused with a different request"
+            );
+            check_challenge_record(&tx, auth, proof, stored.proof.challenge == proof.challenge)?;
+            let deadline = manager_lease_from(&tx, &self.policy, space, &claim.manager_id)?;
+            if previous.state == InvocationState::Running && previous.boot != boot {
+                previous.state = InvocationState::Unknown;
+                set_local_in(&tx, space, &invocation_key, &previous)?;
+                let mut session: LocalSession =
+                    local_from(&tx, space, &session_key)?.context("manager session is missing")?;
+                if session
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| active.trigger == trigger)
+                {
+                    session.active = Some(previous.clone());
+                    session.native_id = None;
+                    set_local_in(&tx, space, &session_key, &session)?;
+                }
+            }
+            tx.commit()?;
+            return Ok(ManagerAdmission {
+                manager_id: claim.manager_id,
+                invocation: previous,
+                previous_native_id: None,
+                fresh: false,
+                lease_expires_at_ms: deadline,
+            });
+        }
+        ensure!(
+            local_from::<SchedulerInvocation>(&tx, space, &invocation_key)?.is_none(),
+            "manager trigger exists without admitted authorization"
+        );
+        let mut session: LocalSession = local_from(&tx, space, &session_key)?.unwrap_or_default();
+        if let Some(active) = session.active.take() {
+            let old_id = format!("manager:{}", active.trigger);
+            let (_, _, mut old) = load_manager_from(&tx, space, &old_id)?;
+            if old.state == InvocationState::Running {
+                ensure!(
+                    old.boot != boot,
+                    "a manager invocation is already running for this conversation"
+                );
+                old.state = InvocationState::Unknown;
+                set_local_in(
+                    &tx,
+                    space,
+                    &scheduler::key("invocation", conversation, &old.trigger),
+                    &old,
+                )?;
+            }
+            if old.state == InvocationState::Unknown {
+                session.native_id = None;
+            }
+        }
+        if session.sdk_config.as_deref() != Some(sdk_config) {
+            session.native_id = None;
+            session.sdk_config = Some(sdk_config.into());
+        }
+        consume_authorization_in(
+            &tx,
+            self.policy.verified(),
+            auth,
+            proof,
+            transport,
+            source_body,
+            None,
+            now_ms,
+        )?;
+        let invocation = SchedulerInvocation {
+            state: InvocationState::Running,
+            boot: boot.into(),
+            trigger: trigger.into(),
+            message_id: format!(
+                "scheduler-message-{}",
+                crate::crypto::digest(&serde_json::to_vec(&(space, conversation, trigger))?)
+            ),
+        };
+        let previous_native_id = session.native_id.clone();
+        session.active = Some(invocation.clone());
+        set_local_in(&tx, space, &invocation_key, &invocation)?;
+        set_local_in(&tx, space, &session_key, &session)?;
+        set_local_in(
+            &tx,
+            space,
+            &manager_key,
+            &ManagerClaim {
+                manager_id: auth.operation_id().into(),
+                conversation_id: conversation.into(),
+                trigger: trigger.into(),
+            },
+        )?;
+        let deadline = freshness.expires_at_ms().min(auth.expires_at_ms());
+        save_lease_in(&tx, space, auth.operation_id(), proof, now_ms, deadline)?;
+        tx.commit()?;
+        Ok(ManagerAdmission {
+            manager_id: auth.operation_id().into(),
+            invocation,
+            previous_native_id,
+            fresh: true,
+            lease_expires_at_ms: deadline,
+        })
+    }
+
+    pub(crate) fn manager_authorization(
+        &self,
+        space: &str,
+        manager_id: &str,
+        now_ms: u64,
+    ) -> Result<VerifiedAuthorization> {
+        let (_, stored, _) = load_manager_from(&self.connection, space, manager_id)?;
+        let facts = self.request_facts(
+            &stored.proof.source_body,
+            &stored.proof.invocation.payload.audience,
+        )?;
+        let admitted =
+            reconstruct_admission(&self.policy, &stored.proof, &facts, &stored.transport)?;
+        let auth = self.policy.verified().verify_operation_authorization(
+            &admitted,
+            &facts,
+            &stored.transport,
+            now_ms,
+        )?;
+        check_manager_parent(
+            &self.connection,
+            &self.policy,
+            &auth,
+            &stored.proof.source_body,
+            now_ms,
+        )?;
+        Ok(auth)
+    }
+
+    pub(crate) fn renew_authorized_manager(
+        &mut self,
+        space: &str,
+        manager_id: &str,
+        proof: &FreshnessProof,
+        now_ms: u64,
+    ) -> Result<u64> {
+        let auth = self.manager_authorization(space, manager_id, now_ms)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (claim, stored, invocation) = load_manager_from(&tx, space, manager_id)?;
+        ensure!(
+            invocation.state == InvocationState::Running
+                && stored.proof.invocation == *auth.signed_invocation(),
+            "only the original running manager can renew its lease"
+        );
+        let session: LocalSession = local_from(
+            &tx,
+            space,
+            &scheduler::key("session", &claim.conversation_id, ""),
+        )?
+        .context("manager session is missing")?;
+        ensure!(
+            session
+                .active
+                .as_ref()
+                .is_some_and(|active| active.trigger == invocation.trigger
+                    && active.boot == invocation.boot
+                    && active.state == InvocationState::Running)
+                && session.sdk_config.as_deref()
+                    == Some(manager_field(&stored.proof.source_body, "sdk_config")?),
+            "manager execution session changed before renewal"
+        );
+        ensure!(
+            now_ms < manager_lease_from(&tx, &self.policy, space, manager_id)?,
+            "manager lease already expired"
+        );
+        check_manager_parent(&tx, &self.policy, &auth, &stored.proof.source_body, now_ms)?;
+        let deadline = consume_challenge_in(
+            &tx,
+            self.policy.verified(),
+            &auth,
+            proof,
+            CheckStage::Renew,
+            now_ms,
+        )?;
+        save_lease_in(&tx, space, manager_id, proof, now_ms, deadline)?;
+        tx.commit()?;
+        Ok(deadline)
+    }
+
     pub fn authorize_read(
         &self,
         auth: &VerifiedAuthorization,
@@ -1607,6 +2057,335 @@ pub(crate) mod tests {
             .connection
             .execute("UPDATE current_policy_heads SET sequence=sequence+1", [])?;
         assert!(store.authorize_read(&auth, &proof, NOW + 1).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+    use crate::identity::test_support::{TestNetwork, now};
+    use serde_json::json;
+    use vibeface_secure::{
+        Identity,
+        authorization::{Grantee, JournalEntry, Nonce, PublicKey, Signed, SpaceId},
+    };
+
+    struct Fixture {
+        network: TestNetwork,
+        store: Store,
+        auth: VerifiedAuthorization,
+        transport: TransportEvidence,
+        body: Value,
+        proof: FreshnessProof,
+        service_grant: ObjectHash,
+        sdk_config: String,
+    }
+
+    impl Fixture {
+        fn new() -> Result<Self> {
+            let network = TestNetwork::new()?;
+            let mut store = network.memory()?;
+            network.conversation(&mut store, "conversation")?;
+            let service = vibeface_secure::authorization::ServiceId::from_key(&PublicKey::parse(
+                &network.node.public_key_hex()?,
+            )?);
+            let mut child = store
+                .authorization_state()
+                .grant(&network.bundle.grant_leaf)
+                .unwrap()
+                .payload
+                .clone();
+            child.parent = Some(network.bundle.grant_leaf.clone());
+            child.grantee = Grantee::Actor(Actor::Service(service.clone()));
+            child.actions = vec![Action::AgentStart];
+            child.remaining_delegations -= 1;
+            child.issued_under = store
+                .authorization_state()
+                .head(&PolicyDomain::Space(network.space.clone()))
+                .unwrap()
+                .clone();
+            child.nonce = Nonce::random()?;
+            let child = Signed::sign(child, &network.client)?;
+            let service_grant = child.hash()?;
+            let mut document = store
+                .authorization_state()
+                .space(&network.space)
+                .unwrap()
+                .clone();
+            document.previous = store
+                .authorization_state()
+                .head(&PolicyDomain::Space(network.space.clone()))
+                .cloned();
+            document.sequence += 1;
+            document.grants.push(service_grant.clone());
+            document.grants.sort();
+            store.install_policy_journal(
+                &[
+                    JournalEntry::Grant(child),
+                    JournalEntry::Space(Signed::sign(document, &network.root)?),
+                ],
+                now(),
+            )?;
+            let trigger = network.message(&mut store, "conversation", "please work on this")?;
+            let sdk_session = SessionRef {
+                target: vibeface_secure::authorization::DeviceId::from_key(&PublicKey::parse(
+                    &network.node.public_key_hex()?,
+                )?),
+                session_id: trigger.hash.clone(),
+            };
+            let descriptor = store.agent_grant(
+                network.space.as_str(),
+                "conversation",
+                &service,
+                &sdk_session,
+                &trigger.hash,
+                now(),
+            )?;
+            let sdk_config = crate::crypto::digest(b"actual manager configuration");
+            let mut body = network.body("agent_start", "conversation");
+            body["authorization_id"] = json!(format!("manager:{}", trigger.hash));
+            body["trigger"] = json!(trigger.hash);
+            body["sdk_session"] = json!(descriptor.sdk_session);
+            body["parent_invocation"] = json!(descriptor.parent_invocation);
+            body["sdk_config"] = json!(sdk_config);
+            let key = PublicKey::parse(&network.node.public_key_hex()?)?;
+            let audience = vibeface_secure::authorization::Audience {
+                service: service.clone(),
+                device: vibeface_secure::authorization::DeviceId::from_key(&key),
+            };
+            let facts = store.request_facts(&body, &audience)?;
+            let signer = Identity::from_secret_hex(&network.node.secret_key_hex)
+                .map_err(anyhow::Error::msg)?;
+            let signed = Signed::sign(
+                vibeface_secure::authorization::Invocation {
+                    version: vibeface_secure::authorization::AUTH_VERSION,
+                    actor: Actor::Service(service.clone()),
+                    device: descriptor.device.clone(),
+                    initiator: descriptor.initiator,
+                    initiating_grant: descriptor.initiating_grant,
+                    resource: facts.resource.clone(),
+                    action: Action::AgentStart,
+                    audience,
+                    presenter: descriptor.device,
+                    operation_id: facts.operation_id.clone(),
+                    body_hash: facts.body_hash.clone(),
+                    grant_leaf: descriptor.grant_leaf,
+                    expected_policies: descriptor.expected_policies,
+                    context: facts.context.clone(),
+                    nonce: Nonce::random()?,
+                    not_before_ms: now(),
+                    expires_at_ms: now() + 10_000,
+                },
+                &signer,
+            )?;
+            let transport = TransportEvidence::LocalAgentAdapter {
+                service,
+                session: sdk_session,
+            };
+            let auth = store.authorize_request(&signed, &facts, &transport, now())?;
+            let proof = network.freshness(&mut store, &auth, CheckStage::Admit, now())?;
+            Ok(Self {
+                network,
+                store,
+                auth,
+                transport,
+                body,
+                proof,
+                service_grant,
+                sdk_config,
+            })
+        }
+
+        fn claim(&mut self, boot: &str) -> Result<ManagerAdmission> {
+            self.store.claim_authorized_manager(
+                &self.auth,
+                &self.proof,
+                &self.transport,
+                &self.body,
+                boot,
+                &self.sdk_config,
+                now(),
+            )
+        }
+    }
+
+    #[test]
+    fn manager_claim_is_once_and_a_new_boot_preserves_unknown_work() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let first = fixture.claim("boot-a")?;
+        assert!(first.fresh && first.previous_native_id.is_none());
+        assert_eq!(first.lease_expires_at_ms, now() + 10_000);
+        let duplicate = fixture.claim("boot-a")?;
+        assert!(
+            !duplicate.fresh
+                && duplicate.manager_id == first.manager_id
+                && duplicate.invocation.state == InvocationState::Running
+        );
+        let space = fixture.network.space.as_str();
+        let session_key = scheduler::key("session", "conversation", "");
+        let mut session: LocalSession =
+            local_from(&fixture.store.connection, space, &session_key)?.unwrap();
+        session.native_id = Some("native-manager".into());
+        fixture
+            .store
+            .local_set(space, &session_key, &serde_json::to_value(session)?)?;
+        let resumed = fixture.claim("boot-b")?;
+        assert!(!resumed.fresh && resumed.invocation.state == InvocationState::Unknown);
+        let session: LocalSession = local_from(
+            &fixture.store.connection,
+            fixture.network.space.as_str(),
+            &session_key,
+        )?
+        .unwrap();
+        assert!(
+            session.native_id.is_none()
+                && session.active.unwrap().state == InvocationState::Unknown
+        );
+        assert_eq!(
+            fixture.store.connection.query_row(
+                "SELECT count(*) FROM accepted_authorizations WHERE action='agent_start'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            1
+        );
+        assert!(
+            fixture
+                .store
+                .operations(fixture.network.space.as_str())?
+                .is_empty()
+        );
+        let auth = fixture.store.manager_authorization(
+            fixture.network.space.as_str(),
+            &first.manager_id,
+            now() + 1,
+        )?;
+        let proof =
+            fixture
+                .network
+                .freshness(&mut fixture.store, &auth, CheckStage::Renew, now() + 1)?;
+        assert!(
+            fixture
+                .store
+                .renew_authorized_manager(
+                    fixture.network.space.as_str(),
+                    &first.manager_id,
+                    &proof,
+                    now() + 1
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manager_claim_rolls_back_nonce_and_session_if_any_persisted_part_fails() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        assert!(
+            fixture
+                .store
+                .claim_authorized_manager(
+                    &fixture.auth,
+                    &fixture.proof,
+                    &fixture.transport,
+                    &fixture.body,
+                    "boot",
+                    "different-sdk",
+                    now()
+                )
+                .is_err()
+        );
+        fixture.store.connection.execute_batch("CREATE TRIGGER reject_manager_mapping BEFORE INSERT ON local_values WHEN NEW.key LIKE 'manager-admission:%' BEGIN SELECT RAISE(ABORT,'manager mapping failure'); END")?;
+        assert!(fixture.claim("boot").is_err());
+        assert_eq!(
+            fixture.store.connection.query_row(
+                "SELECT count(*) FROM accepted_authorizations WHERE action='agent_start'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            0
+        );
+        assert_eq!(fixture.store.connection.query_row("SELECT count(*) FROM local_values WHERE key LIKE 'scheduler:%' OR key LIKE 'manager-admission:%'", [], |row| row.get::<_,u64>(0))?,0);
+        assert!(!fixture.store.connection.query_row(
+            "SELECT consumed FROM authorization_challenges WHERE space_id=? AND nonce=?",
+            params![
+                fixture.network.space.as_str(),
+                fixture.proof.challenge.nonce.as_str()
+            ],
+            |row| row.get::<_, bool>(0)
+        )?);
+        fixture
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER reject_manager_mapping")?;
+        assert!(fixture.claim("boot")?.fresh);
+        Ok(())
+    }
+
+    #[test]
+    fn manager_renewal_uses_original_admission_and_stops_after_grant_revocation() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let first = fixture.claim("boot")?;
+        let space = fixture.network.space.as_str();
+        let auth = fixture
+            .store
+            .manager_authorization(space, &first.manager_id, now() + 5_000)?;
+        let proof = fixture.network.freshness(
+            &mut fixture.store,
+            &auth,
+            CheckStage::Renew,
+            now() + 5_000,
+        )?;
+        let deadline = fixture.store.renew_authorized_manager(
+            space,
+            &first.manager_id,
+            &proof,
+            now() + 5_000,
+        )?;
+        assert_eq!(deadline, now() + 35_000);
+        assert!(
+            fixture
+                .store
+                .manager_authorization(space, &first.manager_id, now() + 10_001)
+                .is_ok()
+        );
+        let mut document = fixture
+            .store
+            .authorization_state()
+            .space(&SpaceId::parse(space)?)
+            .unwrap()
+            .clone();
+        document.previous = fixture
+            .store
+            .authorization_state()
+            .head(&PolicyDomain::Space(SpaceId::parse(space)?))
+            .cloned();
+        document.sequence += 1;
+        document
+            .grants
+            .retain(|hash| hash != &fixture.service_grant);
+        fixture.store.install_policy_journal(
+            &[JournalEntry::Space(Signed::sign(
+                document,
+                &fixture.network.root,
+            )?)],
+            now() + 6_000,
+        )?;
+        assert!(
+            fixture
+                .store
+                .manager_authorization(space, &first.manager_id, now() + 10_001)
+                .is_err()
+        );
+        assert_eq!(
+            fixture.store.connection.query_row(
+                "SELECT count(*) FROM accepted_authorizations WHERE action='agent_start'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            1
+        );
         Ok(())
     }
 }
