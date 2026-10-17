@@ -85,6 +85,8 @@ pub struct Config {
     pub claude_bin: PathBuf,
     pub cursor_bin: PathBuf,
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub execution_isolation: Option<crate::engine::ExecutionIsolationConfig>,
     pub daily_decision_limit: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -119,6 +121,7 @@ impl Config {
             claude_bin: "claude".into(),
             cursor_bin: "cursor-agent".into(),
             timeout_secs: 600,
+            execution_isolation: None,
             daily_decision_limit: 20,
         }
     }
@@ -148,6 +151,9 @@ impl Config {
             self.timeout_secs > 0 && self.timeout_secs <= 86400,
             "invalid executor timeout"
         );
+        if let Some(isolation) = &self.execution_isolation {
+            isolation.validate()?;
+        }
         for root in &self.roots {
             ensure!(
                 root.is_absolute() && root.is_dir(),

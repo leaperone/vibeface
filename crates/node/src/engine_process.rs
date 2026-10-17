@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use super::{
     EngineAction, EngineError, EngineResult, ExecutorConfig, ExecutorKind, ExecutorSession,
+    isolation::IsolatedProcess,
 };
 
 const MAX_LINE_BYTES: usize = 1_048_576;
@@ -22,6 +23,7 @@ pub async fn execute<F, Fut>(
     action: EngineAction,
     persist_native: F,
     events: UnboundedSender<Value>,
+    isolated: Option<&IsolatedProcess>,
 ) -> std::result::Result<EngineResult, EngineError>
 where
     F: FnOnce(String) -> Fut,
@@ -56,7 +58,7 @@ where
             let id = match session.executor {
                 ExecutorKind::ClaudeCode => Uuid::new_v4().to_string(),
                 ExecutorKind::CursorAgent => {
-                    create_cursor_chat(config, session, &mut invoked).await?
+                    create_cursor_chat(config, session, &mut invoked, isolated).await?
                 }
                 ExecutorKind::Codex => bail!("Codex must use its native transport"),
             };
@@ -70,7 +72,8 @@ where
         let result = match action {
             EngineAction::Open {} => json!({"state":"ready"}),
             EngineAction::Send { text } => {
-                let outcome = send_process(config, session, id, &text, &events, &mut invoked).await;
+                let outcome =
+                    send_process(config, session, id, &text, &events, &mut invoked, isolated).await;
                 session_started = invoked;
                 let summary = outcome?;
                 if let Some(failure) = summary.failure {
@@ -116,10 +119,20 @@ async fn create_cursor_chat(
     config: &ExecutorConfig,
     session: &ExecutorSession,
     invoked: &mut bool,
+    isolated: Option<&IsolatedProcess>,
 ) -> Result<String> {
-    let mut child = Command::new(&config.cursor_bin)
+    let mut command = isolated.map_or_else(
+        || Command::new(&config.cursor_bin),
+        |isolated| isolated.command("cursor-agent"),
+    );
+    let cwd = if isolated.is_some() {
+        std::path::Path::new("/project")
+    } else {
+        &session.cwd
+    };
+    let mut child = command
         .args(["create-chat", "--workspace"])
-        .arg(&session.cwd)
+        .arg(cwd)
         .current_dir(&session.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -159,10 +172,14 @@ async fn send_process(
     text: &str,
     events: &UnboundedSender<Value>,
     invoked: &mut bool,
+    isolated: Option<&IsolatedProcess>,
 ) -> Result<StreamSummary> {
     let mut command = match session.executor {
         ExecutorKind::CursorAgent => {
-            let mut command = Command::new(&config.cursor_bin);
+            let mut command = isolated.map_or_else(
+                || Command::new(&config.cursor_bin),
+                |isolated| isolated.command("cursor-agent"),
+            );
             command
                 .args([
                     "--resume",
@@ -174,11 +191,18 @@ async fn send_process(
                     "enabled",
                     "--workspace",
                 ])
-                .arg(&session.cwd);
+                .arg(if isolated.is_some() {
+                    std::path::Path::new("/project")
+                } else {
+                    &session.cwd
+                });
             command
         }
         ExecutorKind::ClaudeCode => {
-            let mut command = Command::new(&config.claude_bin);
+            let mut command = isolated.map_or_else(
+                || Command::new(&config.claude_bin),
+                |isolated| isolated.command("claude"),
+            );
             command.args([
                 if session.native_session_id.is_some() {
                     "--resume"
