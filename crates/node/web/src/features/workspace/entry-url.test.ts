@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { conversationHref } from "./entry-url.ts"
 import { isIncomplete, mergeBasis } from "./labels.ts"
-import { parseConversation, parseNodes, parsePending } from "./model.ts"
+import { inputText, parseConversation, parseNodes, parsePending } from "./model.ts"
 import { parseReconcile, reconcileDecision } from "./reconcile.ts"
 
 const context = {
@@ -44,4 +44,13 @@ test("stored operations retain request contents and enforce the personal network
   assert.deepEqual(parsePending([pending], "network")[0]?.request, full)
   assert.throws(() => parsePending([pending], "other-network"))
   assert.throws(() => parsePending([{ ...pending, target_node: "other" }], "network"))
+})
+
+test("creation fields use the server UTF-8 byte limits and reject whitespace", () => {
+  assert.equal(inputText("  名称  ", "会话名称", 512), "名称")
+  assert.equal(inputText("中".repeat(170), "会话名称", 512), "中".repeat(170))
+  assert.throws(() => inputText("中".repeat(171), "会话名称", 512), /512/)
+  assert.throws(() => inputText("   ", "工单目标", 65536), /不能为空/)
+  assert.equal(inputText("a".repeat(65536), "验收条件", 65536).length, 65536)
+  assert.throws(() => inputText("中".repeat(21846), "验收条件", 65536), /65536/)
 })

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { canSend, composerHint, prepareSend, roleLabel } from './protocol.ts'
+import { canSend, composerHint, isSubmitKey, prepareSend, roleLabel } from './protocol.ts'
 
 const ready = { hasConversation: true, loaded: true, missing: false, schedulerOnline: true, managerReady: true, schedulerNodeId: 'node-1' }
 test('send stays disabled until the conversation and scheduler are ready', () => {
@@ -26,4 +26,19 @@ test('an explicit retry preserves the complete original message request', () => 
   assert.deepEqual(retry.body.basis_heads, ['head-1'])
   assert.equal(prepareSend({ conversationId: 'chat', text: '另一句', schedulerNodeId: 'node-a', entryNode: 'entry-a', pending: first.pending, heads: [] }).ok, false)
   assert.equal(prepareSend({ conversationId: 'other-chat', text: '继续', schedulerNodeId: 'node-a', entryNode: 'entry-a', pending: first.pending, heads: [] }).ok, false)
+})
+
+test('Enter submits only after IME composition finishes and Shift Enter remains a newline', () => {
+  const enter = { key: 'Enter', shiftKey: false, isComposing: false, keyCode: 13 }
+  assert.equal(isSubmitKey(enter), true)
+  assert.equal(isSubmitKey({ ...enter, isComposing: true }), false)
+  assert.equal(isSubmitKey({ ...enter, keyCode: 229 }), false)
+  assert.equal(isSubmitKey({ ...enter, shiftKey: true }), false)
+  assert.equal(isSubmitKey({ ...enter, key: 'a' }), false)
+})
+test('invalid message content is rejected before a durable request is created', () => {
+  const input = { conversationId: 'chat', schedulerNodeId: 'node-a', entryNode: 'entry-a', pending: null, heads: [] }
+  assert.equal(prepareSend({ ...input, text: '  ' }).ok, false)
+  assert.equal(prepareSend({ ...input, text: '中'.repeat(21846) }).ok, false)
+  assert.equal(prepareSend({ ...input, text: 'a'.repeat(65536) }).ok, true)
 })

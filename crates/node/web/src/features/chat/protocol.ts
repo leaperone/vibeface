@@ -1,3 +1,4 @@
+import { inputText } from '../workspace/model.ts'
 import { newId } from '../workspace/storage.ts'
 import type { MessageRequest, PendingMessage, TranscriptMessage } from './types.ts'
 
@@ -33,8 +34,9 @@ export function prepareSend(input: {
   pending: PendingMessage | null
   heads: string[]
 }): { ok: true; pending: PendingMessage; body: MessageRequest } | { ok: false; error: string } {
-  const text = input.text.trim()
-  if (!text) return { ok: false, error: '先填写消息内容。' }
+  let text: string
+  try { text = inputText(input.text, '消息内容', 65536) }
+  catch (caught) { return { ok: false, error: caught instanceof Error ? caught.message : '消息内容无效。' } }
   if (input.pending && (input.pending.text !== text || input.pending.conversation_id !== input.conversationId)) {
     return { ok: false, error: '此会话有一条消息尚未确认，请先核对原消息，再发送新内容。' }
   }
@@ -48,3 +50,7 @@ export function prepareSend(input: {
   } }
 }
 export function messageKey(message: TranscriptMessage): string { return message.event_hash }
+
+export function isSubmitKey(event: Pick<KeyboardEvent, 'key' | 'shiftKey' | 'isComposing' | 'keyCode'>): boolean {
+  return event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229
+}

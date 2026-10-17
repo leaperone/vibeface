@@ -5,6 +5,13 @@ import type {
   PendingConversation, PendingTask,
 } from "./types"
 
+export function inputText(value: string, label: string, maxBytes: number): string {
+  const normalized = value.trim()
+  if (!normalized) throw new Error(`${label}不能为空。`)
+  if (new TextEncoder().encode(normalized).length > maxBytes) throw new Error(`${label}不能超过 ${maxBytes} 字节。`)
+  return normalized
+}
+
 export function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("节点响应必须是对象。")
   return value as Record<string, unknown>

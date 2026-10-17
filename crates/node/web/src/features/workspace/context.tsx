@@ -6,7 +6,7 @@ import { prepareSend } from "../chat/protocol"
 import { conversationHref } from "./entry-url"
 import { isIncomplete, mergeBasis, missingCount, stateNames } from "./labels"
 import {
-  frontierMap, parseConversation, parseConversations, parseNodes, parseNotifications, parseOperation,
+  frontierMap, inputText, parseConversation, parseConversations, parseNodes, parseNotifications, parseOperation,
   parsePending, parsePendingMessages, parsePendingConversation, parsePendingTasks, parseSession, record,
 } from "./model"
 import { errorText, parseReconcile, reconcileDecision, type ReconcileRecord } from "./reconcile"
@@ -19,6 +19,7 @@ import type {
 function useWorkspaceState(connection: ReadyConnection) {
   const networkId = connection.principal.network_id
   const clientId = connection.principal.subject_id
+  const canAutoFollowup = connection.info.roles.includes("gateway")
   const [booted, setBooted] = useState(false)
   const [writeState, setWriteState] = useState<"checking" | "writable" | "readonly" | "unsupported">("checking")
   const writer = useRef(false)
@@ -254,7 +255,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   return {
     info: connection.info, connectionOnline: current(), connectionText: "已建立端到端加密连接",
     error, noticeText, view, setView, nodes, conversations, conversationId, data, notifications, pending, actual,
-    pendingConversation, pendingTask: pendingTasks.find((item) => item.conversation_id === conversationId) ?? null,
+    canAutoFollowup, pendingConversation, pendingTask: pendingTasks.find((item) => item.conversation_id === conversationId) ?? null,
     refreshing, schedulerNodeId, setSchedulerNodeId, incomplete, chatSlot, messagePending, messageBusy,
     writable: writeState === "writable",
     writeNotice: writeState === "readonly" ? "另一个页面正在操作此浏览器设备。此页只读，关闭其他页面后重新连接。"
@@ -264,7 +265,8 @@ function useWorkspaceState(connection: ReadyConnection) {
       ? `上下文尚未完整，已暂停派发。缺少事件 ${missingCount(data.missing.events)}，附件 ${missingCount(data.missing.blobs)}，冲突 ${missingCount(data.missing.conflicts)}。`
       : `此入口已取得已知上下文，共 ${data.heads.length} 个历史位置。其他离线设备可能仍有未同步记录。`,
     selectConversation, refresh, run, announce: setNoticeText, notificationButton,
-    createConversation: (proposedId: string, title: string) => withMutation("create-conversation", async () => {
+    createConversation: (proposedId: string, inputTitle: string) => withMutation("create-conversation", async () => {
+      const title = inputText(inputTitle, "会话名称", 512)
       const prior = creationsRef.current
       if (prior && prior.title !== title) throw new Error(`还有待确认的会话“${prior.title}”，请保留原名称重试。`)
       const request = prior ?? { conversation_id: proposedId, title }
@@ -280,9 +282,13 @@ function useWorkspaceState(connection: ReadyConnection) {
     createTask: (input: { taskId: string; title: string; goal: string; acceptance: string; autoFollowup: boolean }) => withMutation(`create-task:${activeId.current}`, async () => {
       const context = requireContext(), id = context.conversation?.conversation_id
       if (!id) throw new Error("先选择会话。")
+      const title = inputText(input.title, "工单标题", 65536)
+      const goal = inputText(input.goal, "工单目标", 65536)
+      const acceptance = inputText(input.acceptance, "验收条件", 65536)
+      if (input.autoFollowup && !canAutoFollowup) throw new Error("当前入口未启用接入角色，不能授权自动继续检查。")
       const prior = tasksRef.current.find((item) => item.conversation_id === id)
-      if (prior && (prior.title !== input.title || prior.goal !== input.goal || prior.acceptance !== input.acceptance || prior.auto_followup !== input.autoFollowup)) throw new Error("还有待确认的工单，请保留原内容与继续检查设置重试。")
-      const request = prior ?? { conversation_id: id, task_id: input.taskId, title: input.title, goal: input.goal, acceptance: input.acceptance, auto_followup: input.autoFollowup }
+      if (prior && (prior.title !== title || prior.goal !== goal || prior.acceptance !== acceptance || prior.auto_followup !== input.autoFollowup)) throw new Error("还有待确认的工单，请保留原内容与继续检查设置重试。")
+      const request = prior ?? { conversation_id: id, task_id: input.taskId, title, goal, acceptance, auto_followup: input.autoFollowup }
       const next = [...tasksRef.current.filter((item) => item.conversation_id !== id), request]
       writeStorage(scoped("pending-tasks"), next, true)
       tasksRef.current = next; setPendingTasks(next)

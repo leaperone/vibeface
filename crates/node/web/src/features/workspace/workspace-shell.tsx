@@ -45,7 +45,6 @@ const views: Array<[WorkspaceView, string]> = [
 export function WorkspaceShell() {
   const workspace = useWorkspace()
   const device = useDevice()
-  const requestId = useRef<string | null>(null)
   const titleRef = useRef<HTMLInputElement>(null)
   const newConversationRef = useRef<HTMLButtonElement>(null)
   const [creating, setCreating] = useState(false)
@@ -110,11 +109,9 @@ export function WorkspaceShell() {
                       event.preventDefault()
                       const form = event.currentTarget
                       if (!form.reportValidity()) return
-                      const id = requestId.current ?? (requestId.current = newId())
                       setCreatingConversation(true)
                       void workspace.run(async () => {
-                        await workspace.createConversation(id, String(new FormData(form).get("title") ?? "").trim())
-                        requestId.current = null
+                        await workspace.createConversation(newId(), String(new FormData(form).get("title") ?? "").trim())
                         form.reset()
                         setCreating(false)
                       }).finally(() => setCreatingConversation(false))

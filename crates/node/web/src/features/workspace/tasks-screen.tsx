@@ -1,6 +1,6 @@
 "use client"
 
-import { useRef, useState } from "react"
+import { useState } from "react"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -18,7 +18,6 @@ const taskStatuses = ["open", "working", "blocked", "needs_review", "accepted", 
 
 export function TasksScreen() {
   const workspace = useWorkspace()
-  const requestId = useRef<string | null>(null)
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [autoFollowup, setAutoFollowup] = useState(false)
@@ -42,17 +41,15 @@ export function TasksScreen() {
               event.preventDefault()
               const form = event.currentTarget
               if (!form.reportValidity()) return
-              const id = requestId.current ?? (requestId.current = newId())
               setBusy(true)
               void workspace.run(async () => {
                 await workspace.createTask({
-                  taskId: id,
+                  taskId: newId(),
                   title: String(new FormData(form).get("title") ?? "").trim(),
                   goal: String(new FormData(form).get("goal") ?? "").trim(),
                   acceptance: String(new FormData(form).get("acceptance") ?? "").trim(),
                   autoFollowup: pending?.auto_followup ?? autoFollowup,
                 })
-                requestId.current = null
                 form.reset()
                 setAutoFollowup(false)
                 setOpen(false)
@@ -74,9 +71,10 @@ export function TasksScreen() {
               </Field>
               <Field>
                 <div className="flex items-center gap-2">
-                  <Checkbox id="task-followup" disabled={Boolean(pending)} checked={pending?.auto_followup ?? autoFollowup} onCheckedChange={(checked: boolean | "indeterminate") => setAutoFollowup(checked === true)} />
+                  <Checkbox id="task-followup" disabled={Boolean(pending) || !workspace.canAutoFollowup} checked={pending?.auto_followup ?? autoFollowup} onCheckedChange={(checked: boolean | "indeterminate") => setAutoFollowup(checked === true)} />
                   <FieldLabel htmlFor="task-followup">完成执行后，让调度 Agent 继续检查</FieldLabel>
                 </div>
+                {!workspace.canAutoFollowup ? <p>当前入口未启用接入角色，无法授权自动继续检查。</p> : null}
               </Field>
               <SubmitButton busy={busy}>创建工单</SubmitButton>
             </FieldGroup>

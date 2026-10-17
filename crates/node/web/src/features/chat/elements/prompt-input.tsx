@@ -1,4 +1,5 @@
 import { useRef, type ChangeEvent, type KeyboardEvent } from 'react'
+import { isSubmitKey } from '../protocol'
 
 import {
   InputGroup,
@@ -45,7 +46,7 @@ export function PromptInput({
           className="min-h-14 p-3"
           onChange={(event: ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)}
           onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
-            if (event.key === 'Enter' && !event.shiftKey) {
+            if (isSubmitKey(event.nativeEvent)) {
               event.preventDefault()
               formRef.current?.requestSubmit()
             }
