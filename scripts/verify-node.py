@@ -779,7 +779,24 @@ def fixture_manager(arguments):
                 value = json.load(response)
             accepted = True
         except urllib.error.HTTPError as error:
-            require(error.code == 400 and rejection in json.load(error).get("error", ""),
+            raw_error = error.read(16385)
+            constraint = ""
+            diagnostic = "HTTP error response truncated: exceeds 16384 bytes"
+            if len(raw_error) <= 16384:
+                try:
+                    payload = json.loads(raw_error)
+                    constraint = payload.get("error", "") if isinstance(payload, dict) else ""
+                    if not isinstance(constraint, str):
+                        constraint = ""
+                    diagnostic = constraint or "HTTP error response has no string error field"
+                except (ValueError, UnicodeDecodeError):
+                    diagnostic = "HTTP error response is not valid JSON"
+            fixture_record(run, "manager-tool-errors.jsonl", {
+                "conversation_id": context["conversation_id"], "trigger": trigger, "name": name,
+                "http_status": error.code,
+                "error": diagnostic.replace(environment["VIBEFACE_TOOL_TOKEN"], "[redacted]")[:2048],
+                "elapsed_ms": round((time.monotonic() - started) * 1000)})
+            require(error.code == 400 and rejection in constraint,
                     "negative tool check rejects specifically for its expected authority constraint")
             value, accepted = None, False
         fixture_record(run, "manager-tools.jsonl", {"conversation_id": context["conversation_id"],
