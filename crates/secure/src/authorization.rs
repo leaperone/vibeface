@@ -3356,7 +3356,24 @@ mod tests {
                 NOW as f64,
             )
         };
-        assert!(verify(&bundle).is_ok());
+        let verified = verify(&bundle).unwrap();
+        assert_eq!(verified.resources().len(), 1);
+        assert_eq!(
+            verified.resources()[0].payload.resource,
+            f.resource.resource
+        );
+        let policy: serde_json::Value =
+            serde_json::from_str(&verified.policy_json().unwrap()).unwrap();
+        assert_eq!(
+            policy["resources"][0]["payload"]["resource"],
+            f.resource.resource.as_str()
+        );
+        assert!(
+            !verified
+                .policy_json()
+                .unwrap()
+                .contains(hidden_resource.as_str())
+        );
         let mut missing = bundle.clone();
         missing
             .journal
@@ -4831,6 +4848,7 @@ pub struct VerifiedClientAuthorization {
     audience_public_key: PublicKey,
     constraints: GrantConstraints,
     account_enrollment_rights: Vec<AccountRight>,
+    resources: Vec<Signed<ResourceRecord>>,
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedClientAuthorization {
@@ -4841,7 +4859,7 @@ impl VerifiedClientAuthorization {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = policyJson))]
     pub fn policy_json(&self) -> crate::Result<String> {
         serde_json::to_string(
-            &serde_json::json!({"heads": self.heads, "grant_leaf": self.grant_leaf,"actions": self.actions,"scope": self.grant_scope,"audience": self.audience,"audience_public_key": self.audience_public_key,"constraints": self.constraints,"account_enrollment_rights":self.account_enrollment_rights}),
+            &serde_json::json!({"heads": self.heads, "grant_leaf": self.grant_leaf,"actions": self.actions,"scope": self.grant_scope,"audience": self.audience,"audience_public_key": self.audience_public_key,"constraints": self.constraints,"account_enrollment_rights":self.account_enrollment_rights,"resources":self.resources}),
         )
         .map_err(|_| "policy encoding failed".to_owned())
     }
@@ -4943,6 +4961,27 @@ pub fn verify_client_authorization(
             &mut BTreeSet::new(),
         )?;
         state.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
+        let mut resources = Vec::new();
+        if let Some(document) = state.space(&space) {
+            for hash in &document.resources {
+                let Some(record) = state.resources.get(hash) else {
+                    continue;
+                };
+                if record.payload.kind == ResourceKind::Project
+                    && record.payload.host == leaf.audience.service
+                    && scope_covers(
+                        &leaf.scope,
+                        &ResourceRef {
+                            space: record.payload.space.clone(),
+                            resource: record.payload.resource.clone(),
+                        },
+                    )
+                {
+                    budget.verify(record)?;
+                    resources.push(record.clone());
+                }
+            }
+        }
         let account_enrollment_rights = state
             .account(&account)
             .and_then(|a| {
@@ -4975,6 +5014,7 @@ pub fn verify_client_authorization(
             audience_public_key: target.payload.public_key.clone(),
             constraints: leaf.constraints.clone(),
             account_enrollment_rights,
+            resources,
         })
     }
     verify(
@@ -5366,6 +5406,9 @@ impl VerifiedClientAuthorization {
     }
     pub fn account_enrollment_rights(&self) -> &[AccountRight] {
         &self.account_enrollment_rights
+    }
+    pub fn resources(&self) -> &[Signed<ResourceRecord>] {
+        &self.resources
     }
 }
 /// Reconstruct signed history from independent local pins. It grants no fresh write lease.
