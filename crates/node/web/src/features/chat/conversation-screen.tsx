@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 
 import './chat.css'
 
-import { ConversationThread } from './elements/chat.tsx'
+import { Chat } from './elements/chat.tsx'
 import { PromptInput } from './elements/prompt-input.tsx'
 import {
   browserStore,
@@ -211,7 +211,7 @@ export function ConversationScreen({
   return (
     <section className="conversation-screen" aria-label="调度会话">
       {error ? <p role="alert">{error}</p> : null}
-      <ConversationThread messages={loaded ? payload.messages : []} emptyTitle={empty.title} emptyDetail={empty.detail} />
+      <Chat messages={loaded ? payload.messages : []} emptyTitle={empty.title} emptyDetail={empty.detail} />
       <PromptInput
         value={text}
         hint={hint}

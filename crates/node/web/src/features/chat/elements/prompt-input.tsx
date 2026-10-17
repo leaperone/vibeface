@@ -1,4 +1,11 @@
-import { useRef } from 'react'
+import { useRef, type ChangeEvent, type KeyboardEvent } from 'react'
+
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupTextarea,
+} from '@/components/ui/input-group'
 
 export function PromptInput({
   value,
@@ -19,39 +26,46 @@ export function PromptInput({
   return (
     <form
       ref={formRef}
-      className="chat-composer"
       onSubmit={(event) => {
         event.preventDefault()
         if (disabled || busy) return
         onSubmit()
       }}
     >
-      <label htmlFor="message-text">给调度 Agent 发消息</label>
-      <textarea
-        id="message-text"
-        name="text"
-        rows={3}
-        required
-        maxLength={100000}
-        value={value}
-        placeholder="描述目标，或询问某个任务的进展…"
-        aria-describedby="manager-hint"
-        onChange={(event) => onChange(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter' && !event.shiftKey) {
-            event.preventDefault()
-            formRef.current?.requestSubmit()
-          }
-        }}
-      />
-      <div className="chat-composer-bar">
-        <button type="submit" disabled={disabled || busy} aria-busy={busy || undefined}>
-          发送消息
-        </button>
-      </div>
-      <p id="manager-hint" className="chat-hint">
-        {hint}
-      </p>
+      <InputGroup>
+        <InputGroupTextarea
+          id="message-text"
+          name="text"
+          required
+          maxLength={100000}
+          value={value}
+          placeholder="描述目标，或询问某个任务的进展…"
+          aria-label="给调度 Agent 发消息"
+          aria-describedby="manager-hint"
+          className="min-h-14 p-3"
+          onChange={(event: ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)}
+          onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault()
+              formRef.current?.requestSubmit()
+            }
+          }}
+        />
+        <InputGroupAddon align="block-end" className="pt-1">
+          <InputGroupButton
+            type="submit"
+            variant="default"
+            size="icon-sm"
+            disabled={disabled || busy}
+            aria-busy={busy || undefined}
+            aria-label="发送消息"
+            className="ml-auto rounded-full"
+          >
+            发送消息
+          </InputGroupButton>
+        </InputGroupAddon>
+      </InputGroup>
+      <p id="manager-hint">{hint}</p>
     </form>
   )
 }
