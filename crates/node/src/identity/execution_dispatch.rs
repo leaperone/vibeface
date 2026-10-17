@@ -928,6 +928,101 @@ impl Store {
         }).transpose()
     }
 
+    pub fn prepare_execution_dispatch_observation(
+        &self,
+        identity: &LocalIdentity,
+        request: &vibeface_secure::authorization::Signed<
+            vibeface_secure::authorization::execution_observation::ExecutionObservationRequest,
+        >,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<vibeface_secure::authorization::execution_observation::SignedExecutionObservation>
+    {
+        use vibeface_secure::{
+            Identity,
+            authorization::{Actor, DeviceId, execution_handoff::SignedExecutionHandoff},
+        };
+        let _signatures =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let invocation = &request.payload.request;
+        ensure!(
+            matches!(transport, TransportEvidence::DirectNoise { device }
+                if device == &invocation.device && device == &invocation.presenter)
+                && matches!(invocation.actor, Actor::Account(_))
+                && invocation.context.sdk_session.is_none(),
+            "execution observation requires the actual Account device Noise origin"
+        );
+        let target = &request.payload.intent.target;
+        let space = target.source.project.space.as_str();
+        let operation = &target.source.operation_id;
+        let tx = self.connection.unchecked_transaction()?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        let encoded: String = tx.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![space, format!("project-execution-handoff:{operation}")],
+            |row| row.get(0),
+        )?;
+        let original: SignedExecutionHandoff = serde_json::from_str(&encoded)?;
+        let encoded: String = tx.query_row(
+            "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
+            params![space, operation],
+            |row| row.get(0),
+        )?;
+        let operation: OperationRequest = serde_json::from_str(&encoded)?;
+        let accepted =
+            super::admission::admission_for_operation_from(&tx, space, &operation.operation_id)?;
+        let dispatch: crate::model::Event =
+            serde_json::from_str(&original.handoff.project_dispatch.canonical_body)?;
+        let saved: String = tx.query_row(
+            "SELECT envelope FROM events WHERE space_id=? AND hash=? AND status='ready'",
+            params![space, original.handoff.project_dispatch.hash],
+            |row| row.get(0),
+        )?;
+        let source = original
+            .handoff
+            .source_attestation
+            .as_ref()
+            .context("observed handoff has no durable Project source checkpoint")?;
+        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        ensure!(
+            source.issuer == local
+                && original.invocation.issuer == local
+                && invocation.audience.device == DeviceId::from_key(&local)
+                && accepted.invocation.payload.resource == target.source.project
+                && accepted.invocation.payload.audience == invocation.audience
+                && serde_json::from_value::<OperationRequest>(
+                    accepted.source_body["request"].clone()
+                )? == operation
+                && serde_json::from_str::<crate::model::SignedEvent>(&saved)?
+                    == original.handoff.project_dispatch
+                && matches!(&dispatch.cause, crate::model::EventCause::Invocation { admission }
+                    if admission == &accepted)
+                && dispatch.network_id == space
+                && dispatch.resource_id == target.source.project.resource
+                && dispatch.scope_id == operation.conversation_id
+                && matches!(&dispatch.body, crate::model::EventBody::DispatchRecorded {operation_id,action,..}
+                    if operation_id == &operation.operation_id
+                        && *action == serde_json::to_value(&operation)?),
+            "observation differs from the original locally admitted dispatch"
+        );
+        let verified = current
+            .verified()
+            .verify_execution_observation_request(request, &original, now_ms)?;
+        check_destination_heads_in(&tx, verified.heads())?;
+        let signer =
+            Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
+        let wire = current.verified().sign_execution_observation(
+            request,
+            &original,
+            &signer,
+            now_ms,
+            verified.expires_at_ms(),
+        )?;
+        check_destination_heads_in(&tx, &wire.invocation.payload.expected_policies)?;
+        tx.commit()?;
+        Ok(wire)
+    }
+
     pub fn prepare_execution_dispatch_handoff(
         &mut self,
         identity: &LocalIdentity,
