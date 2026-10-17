@@ -19,4 +19,4 @@ metadata="$(cargo metadata --no-deps --format-version 1 --locked)"
 target="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' <<< "$metadata")"
 mkdir -p "$out"
 "$bindgen" "$target/wasm32-unknown-unknown/release/vibeface_secure.wasm" \
-  --target web --out-dir "$out" --no-typescript
+  --target web --out-dir "$out"

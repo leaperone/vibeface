@@ -19,13 +19,18 @@ flowchart LR
 
 所有设备运行同一种 Node。公网 Server 是 Node 的一种部署方式，可以同时调度和执行。每个人拥有独立的设备网络，不做团队共享设备池，也没有固定的工单调度负责人。
 
+网页使用 React 和 TanStack Start 构建静态 SPA，随 Rust 程序内嵌分发，生产运行不需要 Node.js Web 服务。可信网页通过设备密钥和 Noise 通道连接指定 Node。
+
 Rust 核心负责认证、路由、DAG 同步、SQLite 存储、执行去重和通知。Cursor SDK 管理 Agent 通过原生自定义工具回调操作 Node，不需要 MCP。Codex 执行器通过 App Server 协议接收指令并上报事件。
 
 ## 在本机开始
 
-从源码构建需要 Rust 1.89+。运行编码任务前，安装并登录需要的执行器。
+从源码构建需要 Rust 1.89+、Node.js 22.12+、pnpm 11.9.0 和 wasm-bindgen-cli 0.2.129。运行编码任务前，安装并登录需要的执行器。
 
 ```sh
+rustup target add wasm32-unknown-unknown
+bash scripts/build-web-crypto.sh
+bash scripts/build-web.sh
 cargo build --release -p vibeface-node --locked
 ./target/release/vibeface-node init \
 	--data-dir "$HOME/.vibeface" \

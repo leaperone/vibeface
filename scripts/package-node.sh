@@ -42,6 +42,10 @@ crypto="$repo/crates/node/web/generated"
   echo 'Browser cryptography is missing. Run scripts/build-web-crypto.sh before building a package.' >&2
   exit 1
 }
+[[ -s "$repo/crates/node/web/dist/client/_shell.html" ]] || {
+  echo 'Web client is missing. Run scripts/build-web.sh before building a package.' >&2
+  exit 1
+}
 if "$build"; then cargo "${build_args[@]}"; fi
 [[ -x "$binary" ]] || { printf 'Release binary is missing: %s\n' "$binary" >&2; exit 1; }
 [[ -d "$repo/crates/node/sdk" ]] || { echo 'Node SDK sidecar sources are missing.' >&2; exit 1; }

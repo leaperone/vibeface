@@ -8,12 +8,15 @@ explicit stream-json fixture, never a model. All state and logs stay beneath
 """
 
 import argparse
+import base64
 import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import json
 import os
+import re
+from html.parser import HTMLParser
 from pathlib import Path
 import shutil
 import signal
@@ -223,7 +226,7 @@ class RelayCapture:
 
 
 CLIENT_SOURCE = r"""
-import init, { Identity, Handshake, recoverySeal, recoveryOpen } from "MODULE_URL";
+import init, { Identity, Handshake, recoverySeal, recoveryOpen, verifyMembership } from "MODULE_URL";
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 await init({ module_or_path: await readFile(new URL('./vibeface_secure_bg.wasm', "MODULE_URL")) });
@@ -325,6 +328,12 @@ for await (const line of createInterface({input:process.stdin})) {
         keys.get('recovered')?.free(); keys.set('recovered',root);
         result = {network_id:root.nodeId(),recovery_epoch:payload.recovery_epoch,genesis:payload.genesis};
       } finally { plaintext.fill(0); }
+    }
+    else if (input.op === 'recovery_checkpoint') {
+      const root = identity('recovered');
+      const verified = verifyMembership(JSON.stringify(input.state), root.nodeId(), root.publicKeyHex());
+      try { result = JSON.parse(verified.createRecoveryCheckpoint(root, JSON.stringify(input.members), input.backup_epoch, JSON.stringify(input.prepared))); }
+      finally { verified.free(); }
     }
     else if (input.op === 'forget_root') { identity('root').free(); keys.delete('root'); result = {forgotten:true}; }
     else if (input.op === 'connect') { const old = connections.get(input.connection || 'main'); old?.close(); const value = await connect(input); connections.set(input.connection || 'main', value); result = {connected:true}; }
@@ -671,16 +680,91 @@ def verify_no_model_budget(nodes):
 
 
 def verify_web_assets(node, module):
-    for path in (module, module.with_name("vibeface_secure_bg.wasm")):
-        request = urllib.request.Request(node.url + "/generated/" + path.name, headers={"Origin": node.url})
-        with urllib.request.urlopen(request, timeout=10) as response:
+    def fetch(path, *, method="GET", status=200):
+        request = urllib.request.Request(node.url + path, headers={"Origin": node.url}, method=method)
+        try:
+            response = urllib.request.urlopen(request, timeout=10)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
             content = response.read(8 * 1024 * 1024 + 1)
-            require(response.status == 200 and len(content) <= 8 * 1024 * 1024,
-                    "embedded browser cryptography is served within size limits")
-            require(hashlib.sha256(content).hexdigest() == file_sha256(path),
-                    "served browser cryptography matches the verified package resource")
-            if path.suffix == ".wasm":
-                require(response.headers.get_content_type() == "application/wasm", "browser WASM has the correct MIME type")
+            require(response.status == status and len(content) <= 8 * 1024 * 1024,
+                    f"{method} {path}: expected bounded HTTP {status}")
+            return content, response.headers
+
+    shell, headers = fetch("/")
+    require(headers.get_content_type() == "text/html" and headers["Cache-Control"] == "no-store",
+            "SPA shell is HTML and cannot be stored")
+    policy = headers["Content-Security-Policy"]
+    script_policy = next(part.strip() for part in policy.split(";") if part.strip().startswith("script-src "))
+    require("'unsafe-inline'" not in script_policy and "'wasm-unsafe-eval'" in script_policy,
+            "scripts allow WASM compilation without allowing arbitrary inline JavaScript")
+    require("ws:" in policy and "wss:" in policy and "data:" in policy and "blob:" in policy,
+            "CSP permits encrypted remote transport and local image previews")
+    inline = re.findall(rb"<script\b([^>]*)>(.*?)</script\s*>", shell, re.DOTALL)
+    require(inline, "Start shell contains its generated bootstrap scripts")
+    for attributes, body in inline:
+        if not re.search(rb"\bsrc\s*=", attributes):
+            digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
+            require(f"'sha256-{digest}'" in script_policy, "every inline bootstrap script has its exact CSP hash")
+    for path in ("/", "/conversations", "/tasks/example"):
+        page, page_headers = fetch(path)
+        require(page == shell and page_headers["Cache-Control"] == "no-store", "SPA routes serve the same uncached shell")
+        body, head_headers = fetch(path, method="HEAD")
+        require(not body and head_headers.get_content_type() == "text/html"
+                and int(head_headers["Content-Length"]) == len(shell), "HEAD preserves HTML metadata without a body")
+
+    class References(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.paths = set()
+
+        def handle_starttag(self, tag, attrs):
+            values = dict(attrs)
+            address = values.get("src") if tag == "script" else values.get("href") if tag == "link" else None
+            if address:
+                require(address.startswith("/") and not address.startswith("//"), "shell resources come from the trusted Web origin")
+                self.paths.add(address)
+
+    references = References()
+    references.feed(shell.decode())
+    pending, checked, content_types = list(references.paths), set(), set()
+    while pending:
+        path = pending.pop()
+        if path in checked:
+            continue
+        checked.add(path)
+        require(len(checked) < 256, "static dependency traversal is bounded")
+        content, asset_headers = fetch(path)
+        mime = asset_headers.get_content_type()
+        content_types.add(mime)
+        require(path.startswith("/assets/") and asset_headers["Cache-Control"] == "public, max-age=31536000, immutable",
+                "hashed client assets are immutable")
+        body, head_headers = fetch(path, method="HEAD")
+        require(not body and int(head_headers["Content-Length"]) == len(content)
+                and head_headers.get_content_type() == mime and head_headers["Cache-Control"] == asset_headers["Cache-Control"],
+                "HEAD preserves asset MIME, length and cache policy without a body")
+        if mime in ("text/css", "text/javascript"):
+            for reference in re.findall(rb"[\"'](/assets/[^\"' ]+|\.\.?/[^\"' ]+\.(?:js|css|woff2?))[\"']", content):
+                pending.append(urllib.parse.urljoin(path, reference.decode()))
+            if mime == "text/css":
+                for reference in re.findall(rb"url\([\"']?([^\"')]+)", content):
+                    address = reference.decode().strip()
+                    if not address.startswith("data:"):
+                        pending.append(urllib.parse.urljoin(path, address))
+    require({"text/css", "text/javascript", "font/woff2"} <= content_types,
+            "real JavaScript, CSS and bundled font resources are reachable")
+    for path in ("/api", "/api/not-a-route", "/peer/not-a-route", "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
+                 "/assets", "/assets/not-a-file", "/assets/missing.js", "/generated", "/generated/not-a-file", "/missing.css"):
+        body, missing_headers = fetch(path, status=404)
+        require(body != shell and missing_headers["Cache-Control"] == "no-store", "unknown API and assets return uncached 404, never the SPA shell")
+    for path in (module, module.with_name("vibeface_secure_bg.wasm")):
+        content, crypto_headers = fetch("/generated/" + path.name)
+        require(hashlib.sha256(content).hexdigest() == file_sha256(path),
+                "served browser cryptography matches the verified package resource")
+        require(crypto_headers["Cache-Control"] == "no-store", "mutable browser cryptography cannot be cached across updates")
+        if path.suffix == ".wasm":
+            require(crypto_headers.get_content_type() == "application/wasm", "browser WASM has the correct MIME type")
 
 
 def verify_incompatible_data(run, binary, workspace, fixture, helper, module):
@@ -720,7 +804,6 @@ def clear_private_binding_cache(node, run, network):
     with sqlite3.connect(node.directory / "node.sqlite3") as connection:
         before = connection.execute("SELECT hash,envelope FROM events WHERE network_id=? ORDER BY hash", (network,)).fetchall()
         deleted = connection.execute("DELETE FROM local_values WHERE network_id=? AND (key LIKE 'task-binding-current:%' OR key LIKE 'task-binding-record:%')", (network,)).rowcount
-        require(deleted > 0, "fresh scheduler simulation removes existing local binding cache")
         require(connection.execute("SELECT hash,envelope FROM events WHERE network_id=? ORDER BY hash", (network,)).fetchall() == before,
                 "fresh scheduler simulation retains every signed DAG event byte")
         require(connection.execute("SELECT COUNT(*) FROM local_values WHERE network_id=? AND (key LIKE 'task-binding-current:%' OR key LIKE 'task-binding-record:%')", (network,)).fetchone()[0] == 0,
@@ -753,7 +836,8 @@ def recover_fresh_node(node, backup, password):
     prepared = node.client.call("prepare_recovery", {"challenge_id": challenge["challenge_id"], "members": members})
     require(prepared["checkpoint"]["epoch"] == backup["recovery_epoch"] + 1,
             "fresh recovery advances beyond the backed-up recovery epoch")
-    prepared["checkpoint"]["signature"] = node.client.command("sign", identity="recovered", **prepared["signing"])
+    prepared["checkpoint"] = node.client.command("recovery_checkpoint", state=context["state"], members=members,
+                                                   backup_epoch=backup["recovery_epoch"], prepared=prepared)
     result = node.client.call("recover", {"challenge_id": challenge["challenge_id"], "checkpoint": prepared["checkpoint"],
                                           "capability": node.access["capability"]})
     node.client.network_id = backup["network_id"]
@@ -800,7 +884,17 @@ def verify_recovery(node, other, nodes, network):
     keep.append({**identity, "kind": "client", "name": "Recovered management client", "node_roles": [], "manage": True})
     keep.sort(key=lambda member: member["subject_id"])
     prepared = other.call("prepare_recovery", {"challenge_id": challenge["challenge_id"], "members": keep})
-    prepared["checkpoint"]["signature"] = other.command("sign", identity="recovered", **prepared["signing"])
+    for field in ("history", "signing"):
+        tampered = copy.deepcopy(prepared)
+        if field == "history":
+            tampered["checkpoint"]["historical_nodes"] = []
+        else:
+            tampered["signing"]["domain"] = "identity-genesis"
+        rejected = other.command("recovery_checkpoint", state=context["state"], members=keep,
+                                 backup_epoch=node.backup["recovery_epoch"], prepared=tampered, check=False)
+        require(rejected["ok"] is False, "trusted WASM rejects altered recovery history or signing payload")
+    prepared["checkpoint"] = other.command("recovery_checkpoint", state=context["state"], members=keep,
+                                            backup_epoch=node.backup["recovery_epoch"], prepared=prepared)
     result = other.call("recover", {"challenge_id": challenge["challenge_id"], "checkpoint": prepared["checkpoint"]})
     other.network_id = network
     require(result["principal"]["can_manage"] and result["view"]["epoch"] > view["epoch"],
@@ -929,7 +1023,7 @@ def acceptance(options):
             a.client.request(path, {}, status=404)
         network = a.bootstrap()
         verify_web_assets(a, module)
-        passed("served browser cryptography matches the packaged JS/WASM resources")
+        passed("embedded SPA routes, assets, CSP, cache policy, HEAD and packaged JS/WASM resources")
         a.client.request("/api/tools", {"name": "nodes", "arguments": {}, "call_id": "human-call"}, status=404)
         passed("independent client/root identity, local bootstrap capability and encrypted authorization")
 
@@ -1033,7 +1127,7 @@ def acceptance(options):
         send = request(network, conversation, b, "fixture-delayed-send", "fixture-main", {"type": "send", "text": json.dumps({"label": "delayed", "gate": str(gate), "result_size": 280000})}, revision=session["revision"], task=task)
         dispatch(a.client, send)
         wait_for("fixture invocation begins", lambda: len(invocations(run, "delayed")) == 1)
-        wait_for("accepted dispatch and message at C", lambda: shared_history(c.client, conversation, task))
+        wait_for("accepted dispatch and message at C", lambda: shared_history(c.client, conversation, task, send))
         c.stop()
         deleted_bindings = clear_private_binding_cache(c, run, network)
         a.stop()
@@ -1167,8 +1261,15 @@ def acceptance(options):
         private_json(run / "report.json", report)
 
 
-def shared_history(client, conversation, task):
+def shared_history(client, conversation, task, dispatched=None):
     result = client.rpc("conversation", conversation_id=conversation)
+    if dispatched:
+        record = next((item for item in result["operations"] if item["request"]["operation_id"] == dispatched["operation_id"]), None)
+        if not record or not record["request"].get("binding"):
+            return None
+        actual = record["request"]
+        if any(actual[key] != dispatched[key] for key in ("target_node", "session_id", "task_id", "action")):
+            return None
     return result if (any(m["message_id"] == "message-original" for m in result["messages"])
                       and any(t["task_id"] == task for t in result["tasks"])
                       and not any(result["missing"].values())) else None

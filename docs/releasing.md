@@ -28,16 +28,19 @@ cd vibeface-node-<version>-<target>
 
 ## CI 验证范围
 
-`crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。检查和四个平台的打包任务下载同一份资源，缺少资源时构建失败，不用空模块替代。
+`crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。`web` 下载这份资源及其真实 TypeScript 声明，以锁定的 pnpm 依赖生成 TanStack Start 静态 SPA。检查和三个平台的打包任务下载同一份密码学资源和 SPA，再由 Rust 构建脚本内嵌。缺少资源时构建失败，不用空模块替代。
 
-质量检查包含 Rust fmt、workspace tests、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch，再启动解包后的程序运行无账号网络验收。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
+质量检查包含 Rust fmt、workspace tests、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch，再启动解包后的程序运行无账号网络验收。网页验收检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
 
-源码打包前先生成浏览器资源。安装 Rust 的 `wasm32-unknown-unknown` target 和 `wasm-bindgen-cli 0.2.129`，然后执行：
+源码打包前先生成密码学资源，再构建网页。安装 Node.js 22.12+、pnpm 11.9.0、Rust 的 `wasm32-unknown-unknown` target 和 `wasm-bindgen-cli 0.2.129`，然后执行：
 
 ```sh
 bash scripts/build-web-crypto.sh
+bash scripts/build-web.sh
 bash scripts/package-node.sh
 ```
+
+`build-web.sh` 校验生成资源、按 lockfile 安装依赖、生成路由、检查类型，再构建 `crates/node/web/dist/client`。Rust 只内嵌这个目录，不运行 Start 的 SSR 输出。页面和密码学资源使用 `no-store`，成功命中的 `/assets/` 内容使用 immutable 缓存。CSP 根据最终 HTML 生成脚本 hash，并允许 WASM、WebSocket 和 Radix 所需的动态样式。
 
 验收失败时只上传报告和四个测试进程日志，不上传测试目录或数据库。正常制品保留 14 天，诊断保留 7 天。CI 不验证真实模型调用、实体手机、物理局域网、公网反向代理或用户后台服务安装。
 
