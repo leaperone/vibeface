@@ -125,7 +125,7 @@ fn source_matches(auth: &VerifiedAuthorization, source_body: &Value) -> Result<(
 
 pub(crate) fn consume_authorization_in(
     tx: &Transaction<'_>,
-    state: &VerifiedPolicySet,
+    policy: &PolicyState,
     auth: &VerifiedAuthorization,
     proof: &FreshnessProof,
     transport: &TransportEvidence,
@@ -133,7 +133,11 @@ pub(crate) fn consume_authorization_in(
     operation_id: Option<&str>,
     now_ms: u64,
 ) -> Result<AdmissionProof> {
+    let state = policy.verified();
     source_matches(auth, source_body)?;
+    if source_body["method"] != "agent_start" {
+        check_manager_tool_in(tx, policy, auth, transport, now_ms)?;
+    }
     let signed = auth.signed_invocation();
     let facts = request_facts_from(tx, state, source_body, auth.audience())?;
     let checked = state.verify_invocation(signed, &facts, transport, now_ms)?;
@@ -768,6 +772,103 @@ fn manager_lease_from(
     verify_lease_record(connection, policy, &stored, &lease)
 }
 
+fn manager_authorization_from(
+    connection: &Connection,
+    policy: &PolicyState,
+    space: &str,
+    manager_id: &str,
+    now_ms: u64,
+) -> Result<VerifiedAuthorization> {
+    let (_, stored, _) = load_manager_from(connection, space, manager_id)?;
+    let facts = request_facts_from(
+        connection,
+        policy.verified(),
+        &stored.proof.source_body,
+        &stored.proof.invocation.payload.audience,
+    )?;
+    let admitted = reconstruct_admission(policy, &stored.proof, &facts, &stored.transport)?;
+    let auth = policy.verified().verify_operation_authorization(
+        &admitted,
+        &facts,
+        &stored.transport,
+        now_ms,
+    )?;
+    check_policy_heads_in(connection, policy.verified(), &auth, now_ms)?;
+    check_manager_parent(connection, policy, &auth, &stored.proof.source_body, now_ms)?;
+    Ok(auth)
+}
+
+fn manager_tool_authorization_from(
+    connection: &Connection,
+    policy: &PolicyState,
+    space: &str,
+    manager_id: &str,
+    now_ms: u64,
+) -> Result<VerifiedAuthorization> {
+    let auth = manager_authorization_from(connection, policy, space, manager_id, now_ms)?;
+    let (claim, stored, invocation) = load_manager_from(connection, space, manager_id)?;
+    ensure!(
+        invocation.state == InvocationState::Running,
+        "manager is no longer running"
+    );
+    let session: LocalSession = local_from(
+        connection,
+        space,
+        &scheduler::key("session", &claim.conversation_id, ""),
+    )?
+    .context("manager session is missing")?;
+    ensure!(
+        session
+            .active
+            .as_ref()
+            .is_some_and(|active| active.trigger == invocation.trigger
+                && active.boot == invocation.boot
+                && active.message_id == invocation.message_id
+                && active.state == InvocationState::Running)
+            && session.sdk_config.as_deref()
+                == Some(manager_field(&stored.proof.source_body, "sdk_config")?),
+        "manager execution session changed before tool authorization"
+    );
+    ensure!(
+        now_ms < manager_lease_from(connection, policy, space, manager_id)?,
+        "manager lease already expired"
+    );
+    Ok(auth)
+}
+
+fn check_manager_tool_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    auth: &VerifiedAuthorization,
+    transport: &TransportEvidence,
+    now_ms: u64,
+) -> Result<()> {
+    let TransportEvidence::LocalAgentAdapter { service, session } = transport else {
+        return Ok(());
+    };
+    let manager = manager_tool_authorization_from(
+        connection,
+        policy,
+        auth.resource().space.as_str(),
+        &format!("manager:{}", session.session_id),
+        now_ms,
+    )?;
+    ensure!(
+        manager.actor() == &Actor::Service(service.clone())
+            && manager.resource() == auth.resource()
+            && manager
+                .signed_invocation()
+                .payload
+                .context
+                .sdk_session
+                .as_ref()
+                == Some(session)
+            && manager.initiator() == auth.initiator(),
+        "tool invocation differs from its admitted manager"
+    );
+    Ok(())
+}
+
 impl Store {
     pub(crate) fn claim_authorized_manager(
         &mut self,
@@ -885,7 +986,7 @@ impl Store {
         }
         consume_authorization_in(
             &tx,
-            self.policy.verified(),
+            &self.policy,
             auth,
             proof,
             transport,
@@ -934,27 +1035,16 @@ impl Store {
         manager_id: &str,
         now_ms: u64,
     ) -> Result<VerifiedAuthorization> {
-        let (_, stored, _) = load_manager_from(&self.connection, space, manager_id)?;
-        let facts = self.request_facts(
-            &stored.proof.source_body,
-            &stored.proof.invocation.payload.audience,
-        )?;
-        let admitted =
-            reconstruct_admission(&self.policy, &stored.proof, &facts, &stored.transport)?;
-        let auth = self.policy.verified().verify_operation_authorization(
-            &admitted,
-            &facts,
-            &stored.transport,
-            now_ms,
-        )?;
-        check_manager_parent(
-            &self.connection,
-            &self.policy,
-            &auth,
-            &stored.proof.source_body,
-            now_ms,
-        )?;
-        Ok(auth)
+        manager_authorization_from(&self.connection, &self.policy, space, manager_id, now_ms)
+    }
+
+    pub(crate) fn manager_tool_authorization(
+        &self,
+        space: &str,
+        manager_id: &str,
+        now_ms: u64,
+    ) -> Result<VerifiedAuthorization> {
+        manager_tool_authorization_from(&self.connection, &self.policy, space, manager_id, now_ms)
     }
 
     pub(crate) fn renew_authorized_manager(
@@ -1013,6 +1103,7 @@ impl Store {
         &self,
         auth: &VerifiedAuthorization,
         proof: &FreshnessProof,
+        transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<()> {
         ensure!(
@@ -1020,6 +1111,7 @@ impl Store {
             "read requires remote-read freshness"
         );
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        check_manager_tool_in(&tx, &self.policy, auth, transport, now_ms)?;
         check_policy_heads_in(&tx, self.policy.verified(), auth, now_ms)?;
         self.policy
             .verified()
@@ -1192,7 +1284,7 @@ impl Store {
         );
         let admission = consume_authorization_in(
             &tx,
-            self.policy.verified(),
+            &self.policy,
             auth,
             proof,
             transport,
@@ -1681,7 +1773,7 @@ pub(crate) mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let admitted = consume_authorization_in(
             &tx,
-            &fixture.state,
+            &fixture.policy,
             &fixture.auth,
             &proof,
             &fixture.transport,
@@ -1725,7 +1817,7 @@ pub(crate) mod tests {
             assert!(
                 consume_authorization_in(
                     &tx,
-                    &fixture.state,
+                    &fixture.policy,
                     &fixture.auth,
                     &proof,
                     &fixture.transport,
@@ -1747,7 +1839,7 @@ pub(crate) mod tests {
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             consume_authorization_in(
                 &tx,
-                &fixture.state,
+                &fixture.policy,
                 &fixture.auth,
                 &proof,
                 &fixture.transport,
@@ -1764,7 +1856,7 @@ pub(crate) mod tests {
             assert!(
                 consume_authorization_in(
                     &tx,
-                    &fixture.state,
+                    &fixture.policy,
                     &fixture.auth,
                     &proof,
                     &fixture.transport,
@@ -1808,7 +1900,7 @@ pub(crate) mod tests {
             assert!(
                 consume_authorization_in(
                     &tx,
-                    &fixture.state,
+                    &fixture.policy,
                     &fixture.auth,
                     &proof,
                     &fixture.transport,
@@ -1845,7 +1937,7 @@ pub(crate) mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let admitted = consume_authorization_in(
             &tx,
-            &fixture.state,
+            &fixture.policy,
             &fixture.auth,
             &proof,
             &fixture.transport,
@@ -1898,7 +1990,7 @@ pub(crate) mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let admitted = consume_authorization_in(
             &tx,
-            &fixture.state,
+            &fixture.policy,
             &fixture.auth,
             &proof,
             &fixture.transport,
@@ -2034,8 +2126,8 @@ pub(crate) mod tests {
             connection: fixture.connection,
             policy: fixture.policy,
         };
-        store.authorize_read(&auth, &proof, NOW)?;
-        store.authorize_read(&auth, &proof, NOW + 1)?;
+        store.authorize_read(&auth, &proof, &fixture.transport, NOW)?;
+        store.authorize_read(&auth, &proof, &fixture.transport, NOW + 1)?;
         assert_eq!(
             store
                 .connection
@@ -2052,11 +2144,19 @@ pub(crate) mod tests {
         )?);
         let mut wrong_stage = proof.clone();
         wrong_stage.challenge.stage = CheckStage::Admit;
-        assert!(store.authorize_read(&auth, &wrong_stage, NOW).is_err());
+        assert!(
+            store
+                .authorize_read(&auth, &wrong_stage, &fixture.transport, NOW)
+                .is_err()
+        );
         store
             .connection
             .execute("UPDATE current_policy_heads SET sequence=sequence+1", [])?;
-        assert!(store.authorize_read(&auth, &proof, NOW + 1).is_err());
+        assert!(
+            store
+                .authorize_read(&auth, &proof, &fixture.transport, NOW + 1)
+                .is_err()
+        );
         Ok(())
     }
 }
@@ -2098,7 +2198,7 @@ mod manager_tests {
                 .clone();
             child.parent = Some(network.bundle.grant_leaf.clone());
             child.grantee = Grantee::Actor(Actor::Service(service.clone()));
-            child.actions = vec![Action::AgentStart];
+            child.actions = vec![Action::ConversationRead, Action::AgentStart];
             child.remaining_delegations -= 1;
             child.issued_under = store
                 .authorization_state()
@@ -2142,6 +2242,7 @@ mod manager_tests {
                 &trigger.hash,
                 now(),
             )?;
+            let service_grant = descriptor.grant_leaf.clone();
             let sdk_config = crate::crypto::digest(b"actual manager configuration");
             let mut body = network.body("agent_start", "conversation");
             body["authorization_id"] = json!(format!("manager:{}", trigger.hash));
@@ -2208,6 +2309,130 @@ mod manager_tests {
                 now(),
             )
         }
+    }
+
+    #[test]
+    fn manager_tools_require_running_matching_session_and_unexpired_lease() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let first = fixture.claim("boot")?;
+        let space = fixture.network.space.as_str();
+        fixture
+            .store
+            .manager_tool_authorization(space, &first.manager_id, now())?;
+        assert!(
+            fixture
+                .store
+                .manager_tool_authorization(space, &first.manager_id, first.lease_expires_at_ms)
+                .is_err()
+        );
+        let key = scheduler::key("session", "conversation", "");
+        let mut session: LocalSession =
+            local_from(&fixture.store.connection, space, &key)?.unwrap();
+        session.sdk_config = Some("different-configuration".into());
+        fixture
+            .store
+            .local_set(space, &key, &serde_json::to_value(&session)?)?;
+        assert!(
+            fixture
+                .store
+                .manager_tool_authorization(space, &first.manager_id, now())
+                .is_err()
+        );
+        session.sdk_config = Some(fixture.sdk_config.clone());
+        session.active.as_mut().unwrap().state = InvocationState::Unknown;
+        fixture
+            .store
+            .local_set(space, &key, &serde_json::to_value(&session)?)?;
+        assert!(
+            fixture
+                .store
+                .manager_tool_authorization(space, &first.manager_id, now())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manager_expiry_blocks_inflight_read_and_atomic_write_with_valid_freshness() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let first = fixture.claim("boot")?;
+        let mut proofs = Vec::new();
+        for (method, stage) in [
+            ("agent_result", CheckStage::Admit),
+            ("conversation", CheckStage::RemoteRead),
+        ] {
+            let mut body = fixture.body.clone();
+            body["method"] = json!(method);
+            body["authorization_id"] = json!(format!("tool:{}", Nonce::random()?));
+            let facts = fixture
+                .store
+                .request_facts(&body, fixture.auth.audience())?;
+            let mut invocation = fixture.auth.signed_invocation().payload.clone();
+            invocation.operation_id = facts.operation_id.clone();
+            invocation.action = facts.action;
+            invocation.body_hash = facts.body_hash.clone();
+            invocation.context = facts.context.clone();
+            invocation.nonce = Nonce::random()?;
+            invocation.expires_at_ms = now() + 60_000;
+            let signer = Identity::from_secret_hex(&fixture.network.node.secret_key_hex)
+                .map_err(anyhow::Error::msg)?;
+            let signed = Signed::sign(invocation, &signer)?;
+            let auth =
+                fixture
+                    .store
+                    .authorize_request(&signed, &facts, &fixture.transport, now())?;
+            let proof = fixture
+                .network
+                .freshness(&mut fixture.store, &auth, stage, now())?;
+            proofs.push((body, auth, proof));
+        }
+        let (_, read, proof) = &proofs[1];
+        fixture
+            .store
+            .authorize_read(read, proof, &fixture.transport, now())?;
+        assert!(
+            fixture
+                .store
+                .authorize_read(read, proof, &fixture.transport, first.lease_expires_at_ms)
+                .is_err()
+        );
+        let (body, auth, proof) = &proofs[0];
+        {
+            let tx = fixture
+                .store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            assert!(
+                consume_authorization_in(
+                    &tx,
+                    &fixture.store.policy,
+                    auth,
+                    proof,
+                    &fixture.transport,
+                    body,
+                    None,
+                    first.lease_expires_at_ms
+                )
+                .is_err()
+            );
+        }
+        assert!(!fixture.store.connection.query_row(
+            "SELECT consumed FROM authorization_challenges WHERE space_id=? AND nonce=?",
+            params![
+                fixture.network.space.as_str(),
+                proof.challenge.nonce.as_str()
+            ],
+            |row| row.get::<_, bool>(0)
+        )?);
+        assert_eq!(
+            fixture.store.connection.query_row(
+                "SELECT count(*) FROM accepted_authorizations WHERE authorization_id=?",
+                [auth.operation_id()],
+                |row| row.get::<_, u64>(0)
+            )?,
+            0
+        );
+        Ok(())
     }
 
     #[test]
