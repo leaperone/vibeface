@@ -32,6 +32,9 @@ pub struct PreparedAccountCreation {
     space_genesis: Signed<SpaceDocument>,
     client_certificate: Signed<DeviceCertificate>,
     node_certificate: DeviceCertificate,
+    resource_id: ResourceId,
+    resource_nonce: Nonce,
+    grant_nonce: Nonce,
 }
 
 #[derive(Clone, Debug)]
@@ -260,6 +263,9 @@ pub fn prepare_account_creation(
             space_genesis,
             client_certificate,
             node_certificate,
+            resource_id: ResourceId::random()?,
+            resource_nonce: Nonce::random()?,
+            grant_nonce: Nonce::random()?,
         })
     };
     prepare().map_err(|e| e.to_string())
@@ -374,11 +380,11 @@ pub fn finish_account_creation(
             ResourceRecord {
                 version: AUTH_VERSION,
                 space: space.clone(),
-                resource: ResourceId::random()?,
+                resource: prepared.resource_id.clone(),
                 kind: ResourceKind::Project,
                 host: ServiceId::from_key(&prepared.node_certificate.public_key),
                 issued_under: space_head.clone(),
-                nonce: Nonce::random()?,
+                nonce: prepared.resource_nonce.clone(),
             },
             root,
         )?;
@@ -431,7 +437,7 @@ pub fn finish_account_creation(
                 issued_under: space_head.clone(),
                 not_before_ms: prepared.client_certificate.payload.not_before_ms,
                 expires_at_ms: prepared.client_certificate.payload.expires_at_ms,
-                nonce: Nonce::random()?,
+                nonce: prepared.grant_nonce.clone(),
             },
             root,
         )?;
@@ -555,6 +561,10 @@ mod tests {
         let prepared = prepared();
         let created =
             finish_account_creation(&prepared, &key(1), &possession(&prepared), NOW).unwrap();
+        let retry =
+            finish_account_creation(&prepared, &key(1), &possession(&prepared), NOW + 1.0).unwrap();
+        assert_eq!(created.bundle_json().unwrap(), retry.bundle_json().unwrap());
+        assert_eq!(created.pins_json().unwrap(), retry.pins_json().unwrap());
         let scope: ClientScope = serde_json::from_str(&created.scope_json().unwrap()).unwrap();
         assert_eq!(
             scope.account_id,
