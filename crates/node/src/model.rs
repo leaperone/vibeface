@@ -10,6 +10,7 @@ pub type ScopeId = String;
 #[serde(deny_unknown_fields)]
 pub struct AgentSession {
     pub space_id: vibeface_secure::authorization::SpaceId,
+    pub resource_id: vibeface_secure::authorization::ResourceId,
     pub service: vibeface_secure::authorization::ServiceId,
     pub device: vibeface_secure::authorization::DeviceId,
     pub conversation_id: String,
@@ -356,6 +357,7 @@ pub fn authorization_action(
         Some("replica_inventory" | "replica_event" | "replica_blob") => Action::ReplicaRead,
         Some("message") => Action::MessageAppend,
         Some("create_task") => Action::TaskCreate,
+        Some("agent_start" | "agent_result" | "agent_notification") => Action::AgentStart,
         Some("update_task") => match body["status"].as_str() {
             Some("accepted") => Action::TaskAccept,
             Some("cancelled") => Action::TaskCancel,
