@@ -4,6 +4,7 @@ export type ConversationScreenProps = {
   missing: boolean
   schedulerOnline: boolean
   managerReady: boolean
+  session?: { account?: { network_id?: string }; network_id?: string } | null
 }
 
 export type TranscriptMessage = {

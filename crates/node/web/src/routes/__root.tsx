@@ -33,7 +33,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
         <HeadContent />
       </head>
       <body>
-        <p data-testid="vibeface-shell">网页壳已加载。</p>
+        <p data-testid="vibeface-shell" hidden>网页壳已加载。</p>
         {children}
         <Scripts />
       </body>

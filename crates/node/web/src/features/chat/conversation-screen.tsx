@@ -1,4 +1,4 @@
-import { rpc, type Session } from '@/lib/node'
+import { rpc } from '@/lib/node'
 import { useEffect, useRef, useState } from 'react'
 
 import './chat.css'
@@ -22,21 +22,20 @@ import {
 } from './protocol.ts'
 import type { ConversationPayload, ConversationScreenProps, PendingMessage } from './types.ts'
 
-const signedIn: Session | null = null
-
 export function ConversationScreen({
   conversationId,
   schedulerNodeId,
   missing,
   schedulerOnline,
   managerReady,
+  session = null,
 }: ConversationScreenProps) {
   const [payload, setPayload] = useState<ConversationPayload | null>(null)
   const [loadedId, setLoadedId] = useState<string | null>(null)
   const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
   const [pending, setPending] = useState<Map<string, PendingMessage>>(() => {
     const store = browserStore()
-    return store ? readPending(store, signedIn) : new Map()
+    return store ? readPending(store, session) : new Map()
   })
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
@@ -69,7 +68,7 @@ export function ConversationScreen({
     const store = browserStore()
     void rpc('conversation', {
       conversation_id: id,
-      basis_heads: store ? readFrontier(store, signedIn, id) : [],
+      basis_heads: store ? readFrontier(store, session, id) : [],
     })
       .then((data: unknown) => {
         if (cancelled) return
@@ -77,14 +76,14 @@ export function ConversationScreen({
         setPayload(next)
         setLoadedId(id)
         setError('')
-        if (store && !isIncomplete(next.missing)) writeFrontier(store, signedIn, id, next.heads)
+        if (store && !isIncomplete(next.missing)) writeFrontier(store, session, id, next.heads)
         const confirmed = pendingRef.current.get(id)
         if (!confirmed || !next.messages.some((message) => message.message_id === confirmed.message_id)) return
         setPending((current) => {
           const copy = new Map(current)
           copy.delete(id)
           const target = browserStore()
-          if (target) writePending(target, signedIn, copy)
+          if (target) writePending(target, session, copy)
           return copy
         })
         setDrafts((current) => {
@@ -136,7 +135,7 @@ export function ConversationScreen({
     const store = browserStore()
     if (!store) throw new Error('浏览器无法保存操作编号。请允许此站点使用本地存储后重试。')
     try {
-      writePending(store, signedIn, next)
+      writePending(store, session, next)
     } catch {
       throw new Error('浏览器无法保存操作编号。请允许此站点使用本地存储后重试。')
     }
@@ -175,7 +174,7 @@ export function ConversationScreen({
           copy.delete(prepared.pending.conversation_id)
         }
         const store = browserStore()
-        if (store) writePending(store, signedIn, copy)
+        if (store) writePending(store, session, copy)
         pendingRef.current = copy
         return copy
       })
@@ -197,7 +196,7 @@ export function ConversationScreen({
             copy.delete(prepared.pending.conversation_id)
           }
           const store = browserStore()
-          if (store) writePending(store, signedIn, copy)
+          if (store) writePending(store, session, copy)
           pendingRef.current = copy
           return copy
         })
