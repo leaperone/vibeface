@@ -1909,6 +1909,10 @@ impl Runtime {
     }
     async fn sync_from(&self, network: &str, target: &str) -> Result<()> {
         self.require_role(network, NodeRole::Replica).await?;
+        self.store
+            .lock()
+            .await
+            .authorize_node(network, target, Some(NodeRole::Replica))?;
         let inventory = self
             .read_peer(network, target, json!({"type":"inventory"}))
             .await?;
@@ -1941,6 +1945,11 @@ impl Runtime {
         Ok(())
     }
     async fn fetch_closure(&self, network: &str, target: &str, wanted: &[String]) -> Result<()> {
+        self.membership_state().await?;
+        self.store
+            .lock()
+            .await
+            .authorize_node(network, target, Some(NodeRole::Replica))?;
         let mut pending: Vec<String> = wanted.to_vec();
         let mut seen = BTreeSet::new();
         while let Some(hash) = pending.pop() {
@@ -1979,7 +1988,9 @@ impl Runtime {
                     self.store.lock().await.put_blob(network, blob, &bytes)?;
                 }
             }
-            self.store.lock().await.ingest_event(network, &envelope)?;
+            let mut store = self.store.lock().await;
+            store.authorize_node(network, target, Some(NodeRole::Replica))?;
+            store.ingest_event(network, &envelope)?;
         }
         Ok(())
     }

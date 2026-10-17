@@ -377,6 +377,7 @@ impl Store {
                 .collect(),
         })
     }
+    /// Import a trusted local archive; network callers authenticate the supplying Node.
     pub fn import_snapshot(
         &mut self,
         network_id: &str,
