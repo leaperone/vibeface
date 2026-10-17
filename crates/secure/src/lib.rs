@@ -157,11 +157,12 @@ impl Handshake {
         })
     }
 
-    /// Message two precedes initiator authorization and must contain only public application data.
+    /// Application data is accepted only after the remote identity is authenticated.
     pub fn write(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         let result = self.write_inner(payload);
         if result.is_err() {
             self.inner = None;
+            self.remote_public_key = None;
         }
         result
     }
@@ -218,11 +219,13 @@ impl Handshake {
 
 impl Handshake {
     fn write_inner(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        if self.remote_public_key.is_none() && !payload.is_empty() {
+            return Err(
+                "Noise identity must be authenticated before sending application data".into(),
+            );
+        }
         let inner = self.inner.as_mut().ok_or("Noise handshake closed")?;
         let payload = if self.first_write {
-            if !payload.is_empty() {
-                return Err("first Noise message cannot carry private data".into());
-            }
             Vec::new()
         } else {
             serde_json::to_vec(&Proof {
@@ -431,10 +434,7 @@ mod tests {
     fn connected() -> (Channel, Channel) {
         let (_, _, mut a, mut b) = endpoints();
         assert!(b.read(&a.write(&[]).unwrap()).unwrap().is_empty());
-        assert_eq!(
-            a.read(&b.write(b"server-private").unwrap()).unwrap(),
-            b"server-private"
-        );
+        assert!(a.read(&b.write(&[]).unwrap()).unwrap().is_empty());
         assert_eq!(
             b.read(&a.write(b"client-private").unwrap()).unwrap(),
             b"client-private"
@@ -544,5 +544,25 @@ mod tests {
             Handshake::new(false, &remote.secret_hex(), None, b"another-service").unwrap();
         responder.read(&initiator.write(&[]).unwrap()).unwrap();
         assert!(initiator.read(&responder.write(&[]).unwrap()).is_err());
+    }
+    #[test]
+    fn responder_cannot_send_application_data_before_authentication() {
+        let (_, _, mut a, mut b) = endpoints();
+        b.read(&a.write(&[]).unwrap()).unwrap();
+        assert!(b.write(b"private server data").is_err());
+        assert!(b.finish().is_err());
+        assert!(b.remote_id().is_none());
+    }
+
+    #[test]
+    fn write_failure_discards_authenticated_identity() {
+        let (_, _, mut a, mut b) = endpoints();
+        b.read(&a.write(&[]).unwrap()).unwrap();
+        a.read(&b.write(&[]).unwrap()).unwrap();
+        assert!(a.remote_id().is_some());
+        a.write(&[]).unwrap();
+        assert!(a.write(&[]).is_err());
+        assert!(a.remote_id().is_none());
+        assert!(a.finish().is_err());
     }
 }

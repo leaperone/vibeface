@@ -67,9 +67,9 @@ async function selfTest() {
     await call(b, { op: 'handshake', initiator: false, expected_peer_id: ai.node_id, context: 'vibeface:client:v1' });
     assert.equal(await call(a, { op: 'remote' }), null);
     assert.equal(await call(b, { op: 'read', data: await call(a, { op: 'write', data: '' }) }), '');
-    const message2 = await call(b, { op: 'write', data: hex(Buffer.from('native private hello')) });
+    const message2 = await call(b, { op: 'write', data: '' });
     if (wrongIdentity) { assert.equal((await a({ op: 'read', data: message2 })).ok, false); assert.equal((await a({ op: 'finish' })).ok, false); return; }
-    assert.equal(await call(a, { op: 'read', data: message2 }), hex(Buffer.from('native private hello')));
+    assert.equal(await call(a, { op: 'read', data: message2 }), '');
     assert.equal(await call(b, { op: 'read', data: await call(a, { op: 'write', data: hex(Buffer.from('browser private hello')) }) }), hex(Buffer.from('browser private hello')));
     assert.equal(await call(a, { op: 'remote' }), bi.node_id);
     assert.equal(await call(b, { op: 'remote' }), ai.node_id);
