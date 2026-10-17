@@ -1263,9 +1263,10 @@ impl crate::runtime::Runtime {
                 })?
             };
             let proof = self
-                .collect_freshness_challenge(
+                .collect_freshness_challenge_with_verification(
                     request.intent.payload.source_project.space.as_str(),
                     &challenge,
+                    &verification,
                 )
                 .await?;
             let mut store = self.store.lock().await;
@@ -1281,6 +1282,8 @@ impl crate::runtime::Runtime {
             });
         }
         let mut store = self.store.lock().await;
+        let _verification =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let now_ms = crate::runtime::now_ms() as u64;
         match method {
             "status" => Ok(

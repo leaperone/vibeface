@@ -22,9 +22,9 @@ use vibeface_secure::{
         execution_handoff::{
             ExecutionHandoffResolution, ExecutionHandoffResolutionResult, ExecutionHandoffResult,
             ExecutionHandoffTerminalReconciliationResult, ExecutionResolutionPurpose,
-            SignedExecutionHandoff, SignedExecutionHandoffResolution,
-            execution_resolution_account_facts, execution_resolution_facts,
-            verify_execution_handoff_receipt_signature,
+            SignedExecutionHandoff, SignedExecutionHandoffResolution, VerifiedExecutionResolution,
+            VerifiedExecutionTerminalReconciliation, execution_resolution_account_facts,
+            execution_resolution_facts, verify_execution_handoff_receipt_signature,
         },
     },
 };
@@ -441,7 +441,7 @@ impl Store {
             "resolution acknowledgement targets another Project host"
         );
         let resolver = resolution_resolver_from(&current, current.verified(), wire, now_ms)?;
-        let dependencies = match result {
+        let verified = match result {
             ResolutionResult::Unknown(result) => {
                 let verified = current
                     .verified()
@@ -451,36 +451,44 @@ impl Store {
                     &result.freshness,
                     now_ms,
                 )?;
-                verified.dependencies().to_vec()
+                VerifiedProjectResolution::Unknown(result, verified)
             }
-            ResolutionResult::Terminal(result) => current
-                .verified()
-                .verify_execution_terminal_reconciliation(result, &resolver, now_ms)?
-                .dependencies()
-                .to_vec(),
+            ResolutionResult::Terminal(result) => {
+                let verified = current
+                    .verified()
+                    .verify_execution_terminal_reconciliation(result, &resolver, now_ms)?;
+                VerifiedProjectResolution::Terminal(result, verified)
+            }
         };
-        check_destination_heads_in(&tx, &dependencies)?;
+        let dependencies = match &verified {
+            VerifiedProjectResolution::Unknown(_, verified) => verified.dependencies(),
+            VerifiedProjectResolution::Terminal(_, verified) => verified.dependencies(),
+        };
+        check_destination_heads_in(&tx, dependencies)?;
         let state: OperationState = serde_json::from_value(account.source_body["outcome"].clone())?;
         ensure!(state.terminal(), "resolution requires a terminal state");
         ensure!(tx.execute(
             "UPDATE operations SET state=?,result=? WHERE space_id=? AND operation_id=? AND state='\"unknown\"'",
             params![serde_json::to_string(&state)?, serde_json::to_string(&wrapper)?, space, operation],
         )? == 1, "Project operation changed before resolution");
-        match result {
-            ResolutionResult::Unknown(result) => {
+        match verified {
+            VerifiedProjectResolution::Unknown(result, verified) => {
                 super::event_authorization::append_execution_resolution_observation_in(
                     &tx,
                     &current,
                     identity,
                     &wire.resolution.observation.handoff.handoff.project_dispatch,
                     result,
+                    &verified,
                     now_ms,
                 )?;
             }
-            ResolutionResult::Terminal(result) => {
+            VerifiedProjectResolution::Terminal(result, verified) => {
                 super::event_authorization::append_execution_terminal_reconciliation_observation_in(
-                &tx, &current, identity, &wire.resolution.observation.handoff.handoff.project_dispatch, result, now_ms,
-            )?;
+                    &tx, &current, identity,
+                    &wire.resolution.observation.handoff.handoff.project_dispatch,
+                    result, &verified, now_ms,
+                )?;
             }
         }
         tx.execute(
@@ -503,6 +511,17 @@ impl Store {
             result: wrapper,
         })
     }
+}
+
+enum VerifiedProjectResolution<'a> {
+    Unknown(
+        &'a ExecutionHandoffResolutionResult,
+        VerifiedExecutionResolution,
+    ),
+    Terminal(
+        &'a ExecutionHandoffTerminalReconciliationResult,
+        VerifiedExecutionTerminalReconciliation,
+    ),
 }
 
 #[derive(Clone, Copy)]
