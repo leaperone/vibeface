@@ -8,6 +8,7 @@ pub(crate) mod event_authorization;
 pub(crate) mod journal;
 pub mod local;
 pub(crate) mod operation_control;
+pub(crate) mod passkey_rpc;
 pub(crate) mod passkey_store;
 pub mod policy;
 pub(crate) mod recovery;

@@ -1173,6 +1173,21 @@ impl crate::runtime::Runtime {
             | "account_device_commit" => {
                 store.enrollment_command(&self.identity, noise_public_key, method, params, now_ms)
             }
+            "passkey_prepare_registration"
+            | "passkey_prepare_device"
+            | "passkey_prepare_management"
+            | "passkey_verify_device"
+            | "passkey_verify_management"
+            | "passkey_complete_registration"
+            | "passkey_complete_device"
+            | "passkey_complete_management" => store.passkey_command(
+                &self.config,
+                &self.identity,
+                noise_public_key,
+                method,
+                params,
+                now_ms,
+            ),
             _ => anyhow::bail!("unknown identity method"),
         }
     }
