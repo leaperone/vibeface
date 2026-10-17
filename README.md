@@ -33,9 +33,15 @@ cargo build --release -p vibeface-node --locked
 ./target/release/vibeface-node serve --data-dir "$HOME/.vibeface"
 ```
 
-打开 `http://127.0.0.1:4790`，创建账户并登录。可以创建会话、工单，查看设备和执行记录。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。Node 默认尝试启动私有 Codex App Server；未安装 Codex 时，网页可用不代表执行器可用。
+`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、`identity.sqlite3`、一次性 `bootstrap.json` 和 `data-epoch.json`（当前数据格式 epoch 为 2），不注册网站账号，也不保存个人根私钥。业务历史在进程打开后写入同目录的 `node.sqlite3`。同一目录同时只运行一个进程。
 
-第二台设备先初始化，再使用首台设备网页生成的配对信息加入原网络。不要在第二台设备重新注册一个账户来代替配对，注册会创建另一个个人网络。操作步骤见 [连接自己的设备](docs/node.md#连接自己的设备)。
+```sh
+./target/release/vibeface-node access --data-dir "$HOME/.vibeface"
+```
+
+在自己信任的浏览器打开 `access` 打印的链接，核对设备指纹，为个人设备网络命名并保存加密恢复包。保存密钥的页面需要安全上下文，推荐 `http://localhost:4790`。之后自动核验设备指纹和成员授权，不使用账号密码。可以创建会话、工单，查看设备和执行记录。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。Node 默认尝试启动私有 Codex App Server；未安装 Codex 时，网页可用不代表执行器可用。
+
+另一台 Node 使用独立的空数据目录先 `init`，再保存已授权管理客户端发出的一次性邀请，执行 `pair --invite-file`。不要用新建个人网络代替配对。操作步骤见 [添加自己的设备](docs/node.md#添加自己的设备)。
 
 ## 接续工作与通知
 
@@ -49,7 +55,7 @@ A 把任务派发到 B 后，B 在接单前取得所需上下文。A 离线时�
 
 - [部署与使用 Node](docs/node.md) 包括局域网、公网中继、SDK、后台运行和制品安装。
 - [Node 协议参考](docs/node-protocol.md) 包括 HTTP、事件 DAG、操作状态和通知确认。
-- [构建与发布](docs/releasing.md) 说明三个平台的包、SHA256、Stable 与 Nightly 更新渠道，以及 stable/nightly/rc tag 规则。PR 与 `main` 的 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 只生成 Actions 制品；公开版本见 [Releases](https://github.com/leaperone/vibeface/releases)，nightly 与 rc 为预发布。
+- [构建与发布](docs/releasing.md) 说明 Linux x64（`x86_64-unknown-linux-gnu`）、Linux ARM64（`aarch64-unknown-linux-gnu`）和 macOS Apple Silicon（`aarch64-apple-darwin`）三个包、SHA256、Stable 与 Nightly 更新渠道，以及 stable/nightly/rc tag 规则。PR 与 `main` 的 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 只生成 Actions 制品；公开版本见 [Releases](https://github.com/leaperone/vibeface/releases)，nightly 与 rc 为预发布。
 - [选择更新渠道](docs/node.md#选择更新渠道) 可开启空闲时的后台升级；默认 Stable，自动更新默认关闭。
 - `scripts/package-node.sh` 生成当前平台的压缩包和 SHA256 文件，默认输出到 `.artifacts/packages/`。
 
@@ -57,8 +63,8 @@ A 把任务派发到 B 后，B 在接单前取得所需上下文。A 离线时�
 
 ```sh
 cargo fmt --all -- --check
-cargo test -p vibeface-node --locked
-cargo clippy -p vibeface-node --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 当前没有原生手机 App。Claude Code 和 Cursor CLI 执行器只支持打开及发送消息，不能代替 Codex 的完整会话控制。模型额度和计费由各 Provider 决定，每日决策次数限制不是 token 或费用上限。
