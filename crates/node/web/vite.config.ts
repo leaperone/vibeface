@@ -15,7 +15,7 @@ const config = defineConfig({
       enforce: 'pre',
       resolveId(source, importer) {
         if (source === '/generated/vibeface_secure.js' || source === cryptoModule || (importer && resolve(dirname(importer), source) === cryptoModule)) {
-          return { id: this.environment.name === 'client' ? '/generated/vibeface_secure.js' : cryptoModule, external: true }
+          return { id: this.environment.name === 'client' ? '/generated/vibeface_secure.js' : cryptoModule, external: 'absolute' }
         }
       },
     },
