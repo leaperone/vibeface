@@ -145,6 +145,7 @@ struct Pair {
 struct Invitation {
     url: String,
     node_id: String,
+    relay: bool,
     invite: InviteSecret,
 }
 
@@ -160,6 +161,7 @@ struct InviteSecret {
 struct PendingPair {
     url: String,
     node_id: String,
+    relay: bool,
     invite_id: String,
     request_id: String,
     name: String,
@@ -480,6 +482,7 @@ async fn pair(options: Pair) -> Result<()> {
         ensure!(
             pending.url == url
                 && pending.node_id == invitation.node_id
+                && pending.relay == invitation.relay
                 && pending.invite_id == payload.invite_id
                 && pending.name == options.name,
             "finish the pending pairing with its original invitation and device name"
@@ -489,6 +492,7 @@ async fn pair(options: Pair) -> Result<()> {
         let pending = PendingPair {
             url: url.clone(),
             node_id: invitation.node_id.clone(),
+            relay: invitation.relay,
             invite_id: payload.invite_id.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),
             name: options.name.clone(),
@@ -497,7 +501,7 @@ async fn pair(options: Pair) -> Result<()> {
         create_private(&pending_path, &serde_json::to_vec(&pending)?)?;
         pending
     };
-    let mut client = Client::connect(&url, identity, &invitation.node_id).await?;
+    let mut client = Client::connect(&url, identity, &invitation.node_id, invitation.relay).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(660);
     let mut accepted = false;
     loop {
@@ -823,6 +827,26 @@ mod tests {
             nonce: "request nonce".into(),
             proof: String::new(),
         };
+        for relay in [false, true] {
+            let mut envelope = json!({
+                "url":"ws://127.0.0.1:4790/api/network/ws",
+                "node_id":device.node_id().unwrap(),
+                "relay":relay,
+                "invite":{"invite":&invite,"capability":"fixture capability"}
+            });
+            let mut options = Pair {
+                data: DataDir {
+                    data_dir: PathBuf::new(),
+                },
+                invite_file: None,
+                invite: Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap())),
+                name: "Build Node".into(),
+            };
+            assert_eq!(super::invitation(&options).unwrap().relay, relay);
+            envelope.as_object_mut().unwrap().remove("relay");
+            options.invite = Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap()));
+            assert!(super::invitation(&options).is_err());
+        }
         let request_hash = digest(&request.signing_bytes().unwrap());
         let mut review = PairReview {
             version: 1,

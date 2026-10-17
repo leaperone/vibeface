@@ -75,14 +75,18 @@ pub struct Client {
     channel: Channel,
 }
 impl Client {
-    pub async fn connect(url: &str, identity: &LocalIdentity, target: &str) -> Result<Self> {
+    pub async fn connect(
+        url: &str,
+        identity: &LocalIdentity,
+        target: &str,
+        relay: bool,
+    ) -> Result<Self> {
         let endpoint = client_endpoint(url)?;
-        if let Ok(socket) = crate::network::connect_direct(&endpoint, Service::Client).await
-            && let Ok(client) = Self::from_socket(socket, identity, target).await
-        {
-            return Ok(client);
-        }
-        let socket = crate::network::connect_relay(&endpoint, target, Service::Client).await?;
+        let socket = if relay {
+            crate::network::connect_relay(&endpoint, target, Service::Client).await?
+        } else {
+            crate::network::connect_direct(&endpoint, Service::Client).await?
+        };
         Self::from_socket(socket, identity, target).await
     }
     async fn from_socket(
@@ -1038,6 +1042,74 @@ async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn client_route_is_explicit_and_pins_the_destination() -> Result<()> {
+        use tokio_tungstenite::tungstenite::Message as NativeMessage;
+        for relay in [false, true] {
+            for correct_target in [false, true] {
+                let destination = LocalIdentity::generate();
+                let target = if correct_target {
+                    destination.node_id()?
+                } else {
+                    LocalIdentity::generate().node_id()?
+                };
+                let expected_target = target.clone();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                let url = format!("ws://{}/api/network/ws", listener.local_addr()?);
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await?;
+                    let mut socket = tokio_tungstenite::accept_async(stream).await?;
+                    socket
+                        .send(NativeMessage::Text(
+                            json!({"type":"welcome","nonce":"ab".repeat(32)})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await?;
+                    let control: Value = serde_json::from_str(
+                        socket.next().await.context("missing route")??.to_text()?,
+                    )?;
+                    assert_eq!(
+                        control,
+                        if relay {
+                            json!({"type":"dial","target":expected_target,"service":"client"})
+                        } else {
+                            json!({"type":"direct","service":"client"})
+                        }
+                    );
+                    socket
+                        .send(NativeMessage::Text(
+                            json!({"type":"ready"}).to_string().into(),
+                        ))
+                        .await?;
+                    let mut handshake = secure(Handshake::new(
+                        false,
+                        &destination.secret_key_hex,
+                        None,
+                        b"vibeface:client:v1",
+                    ))?;
+                    let first = socket.next().await.context("missing first handshake")??;
+                    assert!(secure(handshake.read(&first.into_data()))?.is_empty());
+                    socket
+                        .send(NativeMessage::Binary(secure(handshake.write(&[]))?.into()))
+                        .await?;
+                    if correct_target {
+                        let third = socket.next().await.context("missing final handshake")??;
+                        assert!(secure(handshake.read(&third.into_data()))?.is_empty());
+                        secure(handshake.finish())?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                });
+                let client =
+                    Client::connect(&url, &LocalIdentity::generate(), &target, relay).await;
+                assert_eq!(client.is_ok(), correct_target);
+                server.await??;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn recovery_keeps_old_node_keys_and_covers_the_new_local_node() -> Result<()> {
         let root = LocalIdentity::generate();
