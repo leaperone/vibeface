@@ -423,12 +423,16 @@ fn request_facts_impl(
                 .flatten()
         });
     if let Some(workspace) = workspace {
-        let root = resource_root_from(connection, space.as_str(), &resource)?;
-        let canonical = std::fs::canonicalize(workspace)?;
-        ensure!(
-            canonical.to_str() == Some(workspace) && canonical.starts_with(&root),
-            "workspace is outside the registered project root"
-        );
+        if destination.is_some() {
+            super::execution_dispatch::validate_remote_resource_path(workspace)?;
+        } else {
+            let root = resource_root_from(connection, space.as_str(), &resource)?;
+            let canonical = std::fs::canonicalize(workspace)?;
+            ensure!(
+                canonical.to_str() == Some(workspace) && canonical.starts_with(&root),
+                "workspace is outside the registered project root"
+            );
+        }
     }
     Ok(RequestFacts {
         resource: ResourceRef { space, resource },

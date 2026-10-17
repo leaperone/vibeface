@@ -8,7 +8,7 @@ use crate::{
     crypto::LocalIdentity,
     engine::EngineAction,
     model::{MAX_EVENT_BYTES, OperationRecord, OperationRequest, OperationState},
-    store::{Store, canonical_resource, validate_operation_binding_from},
+    store::{Store, validate_operation_binding_from},
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -57,6 +57,22 @@ fn text<'a>(body: &'a Value, field: &str) -> Result<&'a str> {
     body[field]
         .as_str()
         .with_context(|| format!("{field} is required"))
+}
+
+pub(crate) fn validate_remote_resource_path(value: &str) -> Result<&str> {
+    use std::path::{Component, Path, PathBuf};
+    let path = Path::new(value);
+    ensure!(
+        value.len() <= 4096
+            && !value.contains('\0')
+            && path.is_absolute()
+            && path.components().all(|component| {
+                matches!(component, Component::RootDir | Component::Normal(_))
+            })
+            && path.components().collect::<PathBuf>().to_str() == Some(value),
+        "remote resource path must be absolute and lexically normalized"
+    );
+    Ok(value)
 }
 
 fn check_destination_heads_in(connection: &Connection, heads: &[PolicyStamp]) -> Result<()> {
@@ -179,7 +195,7 @@ impl Store {
                 && source.payload.operation_id == operation,
             "metadata evidence differs from the durable handoff"
         );
-        let context = self
+        let mut context = self
             .policy
             .verified()
             .verify_execution_dispatch_metadata(project, audience, &source, &binding, now_ms)?;
@@ -210,6 +226,80 @@ impl Store {
             );
         }
         super::admission::validate_persisted_admission(&self.connection, &original)?;
+        if !body["sdk_session"].is_null() {
+            use vibeface_secure::authorization::{Actor, SessionRef};
+            let session: SessionRef = serde_json::from_value(body["sdk_session"].clone())?;
+            let encoded: String = self.connection.query_row(
+                "SELECT value FROM local_values WHERE space_id=? AND key=?",
+                params![space, format!("agent-session:{}", session.session_id)],
+                |row| row.get(0),
+            )?;
+            let saved: crate::model::AgentSession = serde_json::from_str(&encoded)?;
+            ensure!(
+                saved.space_id == project.space
+                    && saved.resource_id == project.resource
+                    && saved.sdk_session == session
+                    && saved.sdk_session.target == saved.device
+                    && saved.device == audience.device
+                    && saved.service == audience.service
+                    && saved.conversation_id == stored.request.conversation_id
+                    && body["parent_invocation"].as_str() == Some(saved.parent_invocation.as_str())
+                    && now_ms < saved.expires_at_ms
+                    && original.invocation.payload.actor == Actor::Service(saved.service.clone())
+                    && original.invocation.payload.device == saved.device
+                    && original.invocation.payload.initiator == saved.initiator,
+                "remote metadata differs from the current SDK delegation"
+            );
+            let origin = self.agent_origin(&saved, now_ms)?;
+            if let Some((task_id, task_ref)) = &origin.task {
+                let execution = origin
+                    .execution
+                    .as_ref()
+                    .context("SDK task has no execution origin")?;
+                ensure!(
+                    stored.request.task_id.as_ref() == Some(task_id)
+                        && binding.binding.task_ref == task_ref.as_str()
+                        && stored.request.target_node == execution.target_node
+                        && stored.request.session_id == execution.session_id
+                        && stored.request.binding == execution.binding,
+                    "SDK metadata escaped its current task or execution binding"
+                );
+            } else {
+                ensure!(
+                    original.invocation.payload.context.sdk_session.as_ref() == Some(&session)
+                        && original.source_body["parent_invocation"].as_str()
+                            == Some(saved.parent_invocation.as_str()),
+                    "initial SDK metadata can inspect only its own accepted operation"
+                );
+            }
+            context.context.sdk_session = Some(session);
+            let facts = RequestFacts {
+                resource: project.clone(),
+                action: crate::model::authorization_action(body)?,
+                audience: audience.clone(),
+                operation_id: text(body, "authorization_id")?.into(),
+                body_hash: ObjectHash::body(body)?,
+                context: context.context,
+            };
+            let delegated = self.policy.verified().verify_service_delegation(
+                &origin.parent,
+                &saved.service,
+                &saved.grant_leaf,
+                &facts,
+                now_ms,
+            )?;
+            ensure!(
+                delegated.device() == &saved.device
+                    && delegated.initiator() == &saved.initiator
+                    && delegated.initiating_grant() == saved.initiating_grant.as_ref(),
+                "SDK metadata has no current parent delegation"
+            );
+            return Ok(Some(facts));
+        }
+        ensure!(
+            body["parent_invocation"].is_null(),
+            "Account metadata cannot claim an SDK parent"
+        );
         Ok(Some(RequestFacts {
             resource: project.clone(),
             action: crate::model::authorization_action(body)?,
@@ -442,7 +532,7 @@ impl Store {
         let resources = request
             .resources
             .iter()
-            .map(|resource| canonical_resource(resource))
+            .map(|resource| validate_remote_resource_path(resource).map(str::to_owned))
             .collect::<Result<Vec<_>>>()?;
         ensure!(
             resources == request.resources
@@ -1151,6 +1241,10 @@ mod tests {
         }
 
         fn bind(&mut self) -> Result<SignedBinding> {
+            self.bind_at(self.project.project.to_str().unwrap().to_owned())
+        }
+
+        fn bind_at(&mut self, cwd: String) -> Result<SignedBinding> {
             let mut body = self.selection("bind_execution", "bind-remote")?;
             for (field, value) in [
                 ("conversation_id", json!("conversation")),
@@ -1159,7 +1253,7 @@ mod tests {
                 ("target_node", json!(self.executor.node.node_id()?)),
                 ("session_id", json!("remote-session")),
                 ("executor", json!("codex")),
-                ("cwd", json!(self.project.project)),
+                ("cwd", json!(cwd)),
             ] {
                 body[field] = value;
             }
@@ -1186,7 +1280,7 @@ mod tests {
                 expected_revision: 0,
                 basis_heads: vec![self.task.hash.clone()],
                 action: binding.binding.open_spec.clone(),
-                resources: vec![self.project.project.to_str().unwrap().into()],
+                resources: vec![binding.binding.open_spec["cwd"].as_str().unwrap().into()],
                 binding: Some(binding),
             };
             let mut body = self.selection("operate", id)?;
@@ -1458,7 +1552,9 @@ mod tests {
             PrepareContext, PrepareIntent, verify_remote_execution,
         };
         let mut f = Fixture::new()?;
-        let binding = f.bind()?;
+        let remote_cwd = "/vibeface-remote-only/nonexistent-project";
+        assert!(!std::path::Path::new(remote_cwd).exists());
+        let binding = f.bind_at(remote_cwd.into())?;
         let (body, _) = f.operation(binding, "remote-client-open")?;
         let dispatch = f
             .store
@@ -1466,7 +1562,7 @@ mod tests {
         let raw = PrepareContext {
             context: dispatch.facts().context.clone(),
             binding_generation: Some(1),
-            canonical_cwd: Some(f.project.project.to_str().unwrap().into()),
+            canonical_cwd: Some(remote_cwd.into()),
             execution_target_public_key: Some(PublicKey::parse(
                 &f.executor.node.public_key_hex()?,
             )?),
