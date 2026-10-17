@@ -862,6 +862,7 @@ fn validate_execution_context(
         let (session, previous_binding) = existing.context("executor session is not open")?;
         ensure!(
             previous_binding == *binding
+                && session.state != "resolved"
                 && session.revision == operation.expected_revision
                 && session.cwd == cwd
                 && binding.binding.open_spec["executor"].as_str()
@@ -1699,6 +1700,519 @@ impl Store {
     }
 }
 
+struct StoredResolution {
+    wire: SignedExecutionHandoffResolution,
+    transport: TransportEvidence,
+    freshness: ExecutionHandoffResolutionFreshness,
+    resolved_at_ms: u64,
+    result: ExecutionHandoffResolutionResult,
+}
+
+pub(super) fn resolution_resolver_from(
+    policy: &PolicyState,
+    current: &VerifiedPolicySet,
+    wire: &SignedExecutionHandoffResolution,
+    now_ms: u64,
+) -> Result<VerifiedAuthorization> {
+    let facts = execution_resolution_account_facts(&wire.resolution)?;
+    let proof = &wire.resolution.account_admission;
+    let admitted = verify_capsule_admission(policy, proof, &facts, None)?;
+    Ok(current.verify_operation_authorization(
+        &admitted,
+        &facts,
+        &proof.transport.clone().into_evidence(),
+        now_ms,
+    )?)
+}
+
+fn stored_resolution_from(
+    connection: &Connection,
+    wire: &SignedExecutionHandoffResolution,
+) -> Result<Option<StoredResolution>> {
+    let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
+    let row = connection.query_row(
+        "SELECT request,admission_transport,freshness,resolved_at_ms,result_receipt,resolution_id,resolution_hash,resolver_device,resolver_nonce,resolver_invocation_hash,resolver_body_hash,submission_device,submission_nonce,submission_invocation_hash,submission_body_hash FROM execution_handoff_resolutions WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",
+        params![execution, original, operation], |row| {
+            Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?,
+                row.get::<_,u64>(3)?, row.get::<_,String>(4)?,
+                (5..15).map(|index|row.get::<_,String>(index)).collect::<rusqlite::Result<Vec<_>>>()?))
+        }).optional()?;
+    let Some((request, transport, freshness, resolved_at_ms, result, metadata)) = row else {
+        return Ok(None);
+    };
+    let saved: SignedExecutionHandoffResolution = serde_json::from_str(&request)?;
+    ensure!(
+        saved == *wire,
+        "original operation already has another resolution request"
+    );
+    let account = &saved.resolution.account_admission.invocation;
+    let submission = &saved.invocation;
+    let expected = vec![
+        account.payload.operation_id.clone(),
+        saved.hash()?.to_string(),
+        account.payload.device.to_string(),
+        account.payload.nonce.to_string(),
+        account.hash()?.to_string(),
+        account.payload.body_hash.to_string(),
+        submission.payload.device.to_string(),
+        submission.payload.nonce.to_string(),
+        submission.hash()?.to_string(),
+        submission.payload.body_hash.to_string(),
+    ];
+    ensure!(
+        metadata == expected,
+        "stored resolution nonce, scope or request hash changed"
+    );
+    let result: ExecutionHandoffResolutionResult = serde_json::from_str(&result)?;
+    verify_execution_resolution_receipt_signature(&result)?;
+    ensure!(
+        result.resolution == saved && result.receipt.payload.issued_at_ms == resolved_at_ms,
+        "stored resolution receipt differs from its request or acceptance clock"
+    );
+    Ok(Some(StoredResolution {
+        wire: saved,
+        transport: serde_json::from_str::<StoredTransport>(&transport)?.into_evidence(),
+        freshness: serde_json::from_str(&freshness)?,
+        resolved_at_ms,
+        result,
+    }))
+}
+
+fn verify_resolution_challenge_record(
+    connection: &Connection,
+    wire: &SignedExecutionHandoffResolution,
+    proof: &ExecutionHandoffResolutionFreshness,
+    consumed: bool,
+) -> Result<()> {
+    let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
+    let saved: (String,String,String,String,String,u64,bool) = connection.query_row(
+        "SELECT original_space_id,operation_id,resolution_id,resolution_hash,challenge,expires_at_ms,consumed FROM execution_handoff_resolution_challenges WHERE execution_space_id=? AND nonce=?",
+        params![execution, proof.challenge.nonce.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)))
+        .context("resolution challenge was not issued by this executor")?;
+    ensure!(
+        saved.0 == original
+            && saved.1 == operation
+            && saved.2
+                == wire
+                    .resolution
+                    .account_admission
+                    .invocation
+                    .payload
+                    .operation_id
+            && saved.3 == wire.hash()?.as_str()
+            && serde_json::from_str::<ExecutionHandoffResolutionChallenge>(&saved.4)?
+                == proof.challenge
+            && saved.5 == proof.challenge.expires_at_ms
+            && saved.6 == consumed,
+        "resolution challenge is consumed or differs from its durable purpose"
+    );
+    Ok(())
+}
+
+fn reconstruct_resolution(
+    connection: &Connection,
+    policy: &PolicyState,
+    saved: &StoredResolution,
+) -> Result<VerifiedExecutionResolutionAdmission> {
+    verify_resolution_challenge_record(connection, &saved.wire, &saved.freshness, true)?;
+    let historical =
+        policy.historical(&saved.freshness.challenge.policies, saved.resolved_at_ms)?;
+    let resolver =
+        resolution_resolver_from(policy, &historical, &saved.wire, saved.resolved_at_ms)?;
+    let verified = historical.verify_execution_resolution(
+        &saved.wire,
+        &resolver,
+        &saved.transport,
+        None,
+        saved.resolved_at_ms,
+    )?;
+    Ok(historical.admit_execution_resolution(&verified, &saved.freshness, saved.resolved_at_ms)?)
+}
+
+fn resolution_original_observation_from(
+    connection: &Connection,
+    policy: &PolicyState,
+    wire: &SignedExecutionHandoffResolution,
+) -> Result<StoredHandoff> {
+    let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
+    let stored = stored_from(connection, &execution, &original, &operation)?
+        .context("resolution has no executor acceptance")?;
+    ensure!(
+        stored.wire == wire.resolution.observation.handoff,
+        "resolution changed the executor's accepted carrier"
+    );
+    reconstruct_handoff(connection, policy, &stored)?;
+    ensure!(
+        (match wire.resolution.purpose {
+            ExecutionResolutionPurpose::ResolveUnknown => stored.state == OperationState::Unknown,
+            ExecutionResolutionPurpose::ReconcileTerminal =>
+                stored.state.terminal()
+                    && serde_json::to_value(&stored.state)?
+                        == serde_json::to_value(wire.resolution.observation.receipt.payload.state)?,
+        }) && stored.result == wire.resolution.observation.result
+            && wire.resolution.observation.receipt.payload.issued_at_ms >= stored.admitted_at_ms,
+        "resolution does not match the executor's current unknown state"
+    );
+    let dispatch: Event =
+        serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
+    let (session, binding) = session_from(
+        connection,
+        &execution,
+        &original,
+        dispatch.resource_id.as_str(),
+        &stored.request.target_node,
+        &stored.request.session_id,
+    )?
+    .context("unknown execution session disappeared")?;
+    let snapshot = wire
+        .resolution
+        .observation
+        .receipt
+        .payload
+        .session
+        .as_ref()
+        .context("unknown receipt has no signed session state")?;
+    ensure!(
+        stored.request.binding.as_ref() == Some(&binding)
+            && snapshot.revision == session.revision
+            && snapshot.session_id == session.session_id
+            && snapshot.target == stored.wire.handoff.execution_audience.device
+            && snapshot.cwd == session.cwd
+            && snapshot.executor == session.executor
+            && snapshot.state == session.state,
+        "unknown receipt differs from the executor's current session revision or binding"
+    );
+    Ok(stored)
+}
+
+impl Store {
+    pub fn execution_handoff_resolution_authorization(
+        &self,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionResolution> {
+        let resolver =
+            resolution_resolver_from(&self.policy, self.policy.verified(), wire, now_ms)?;
+        let admission = if wire.resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal
+        {
+            resolution_original_observation_from(&self.connection, &self.policy, wire)?;
+            None
+        } else if let Some(saved) = stored_resolution_from(&self.connection, wire)? {
+            ensure!(
+                saved.transport == *transport,
+                "resolution retry changed its authenticated transport"
+            );
+            Some(reconstruct_resolution(
+                &self.connection,
+                &self.policy,
+                &saved,
+            )?)
+        } else {
+            resolution_original_observation_from(&self.connection, &self.policy, wire)?;
+            None
+        };
+        Ok(self.policy.verified().verify_execution_resolution(
+            wire,
+            &resolver,
+            transport,
+            admission.as_ref(),
+            now_ms,
+        )?)
+    }
+
+    pub fn execution_handoff_resolution_status(
+        &self,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<Option<ExecutionHandoffResolutionResult>> {
+        if wire.resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal {
+            return Ok(None);
+        }
+        let Some(saved) = stored_resolution_from(&self.connection, wire)? else {
+            return Ok(None);
+        };
+        let auth = self.execution_handoff_resolution_authorization(wire, transport, now_ms)?;
+        check_policy_heads_in(
+            &self.connection,
+            self.policy.verified(),
+            auth.resolver(),
+            now_ms,
+        )?;
+        check_policy_heads_in(
+            &self.connection,
+            self.policy.verified(),
+            auth.submission(),
+            now_ms,
+        )?;
+        let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
+        let original = stored_from(&self.connection, &execution, &original, &operation)?
+            .context("resolved handoff disappeared")?;
+        ensure!(
+            original.state.terminal()
+                && original.result == saved.result.result
+                && original.receipt.as_ref() == Some(&saved.result.handoff_receipt),
+            "resolved handoff differs from its immutable resolution receipt"
+        );
+        Ok(Some(saved.result))
+    }
+
+    pub fn issue_execution_handoff_resolution_challenge(
+        &mut self,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<ExecutionHandoffResolutionChallenge> {
+        ensure!(
+            wire.resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal
+                || stored_resolution_from(&self.connection, wire)?.is_none(),
+            "resolution is already committed"
+        );
+        let auth = self.execution_handoff_resolution_authorization(wire, transport, now_ms)?;
+        let challenge = ExecutionHandoffResolutionChallenge::new(
+            &auth,
+            Nonce::random()?,
+            now_ms,
+            now_ms
+                .checked_add(vibeface_secure::authorization::EXECUTION_LEASE_MS)
+                .context("resolution clock overflow")?
+                .min(auth.expires_at_ms()),
+        )?;
+        let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_policy_heads_in(&tx, self.policy.verified(), auth.resolver(), now_ms)?;
+        check_policy_heads_in(&tx, self.policy.verified(), auth.submission(), now_ms)?;
+        resolution_original_observation_from(&tx, &self.policy, wire)?;
+        tx.execute("INSERT INTO execution_handoff_resolution_challenges(execution_space_id,nonce,original_space_id,operation_id,resolution_id,resolution_hash,challenge,expires_at_ms) VALUES(?,?,?,?,?,?,?,?)",
+            params![execution,challenge.nonce.as_str(),original,operation,auth.resolver().operation_id(),auth.hash().as_str(),serde_json::to_string(&challenge)?,challenge.expires_at_ms])?;
+        tx.commit()?;
+        Ok(challenge)
+    }
+
+    pub fn sign_execution_handoff_resolution_receipts(
+        &self,
+        challenge: &ExecutionHandoffResolutionChallenge,
+        identity: &LocalIdentity,
+        now_ms: u64,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        ensure!(
+            challenge.version == AUTH_VERSION
+                && challenge.issued_at_ms <= now_ms
+                && now_ms < challenge.expires_at_ms
+                && challenge.expires_at_ms - challenge.issued_at_ms
+                    <= vibeface_secure::authorization::EXECUTION_LEASE_MS
+                && !challenge.policies.is_empty()
+                && challenge.policies.len() <= vibeface_secure::authorization::MAX_POLICY_DOMAINS
+                && challenge
+                    .policies
+                    .windows(2)
+                    .all(|p| p[0].domain < p[1].domain),
+            "invalid resolution freshness challenge"
+        );
+        let key = PublicKey::parse(&identity.public_key_hex()?)?;
+        let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let mut receipts = Vec::new();
+        for stamp in &challenge.policies {
+            ensure!(
+                self.policy.verified().head(&stamp.domain) == Some(stamp),
+                "resolution freshness policy changed"
+            );
+            let authority = match &stamp.domain {
+                PolicyDomain::Account(id) => {
+                    &self
+                        .policy
+                        .verified()
+                        .account(id)
+                        .context("missing resolution account")?
+                        .authority
+                }
+                PolicyDomain::Space(id) => {
+                    &self
+                        .policy
+                        .verified()
+                        .space(id)
+                        .context("missing resolution space")?
+                        .authority
+                }
+            };
+            if authority.public_key == key {
+                ensure!(
+                    authority.device == DeviceId::from_key(&key)
+                        && authority.service == ServiceId::from_key(&key),
+                    "resolution authority mismatch"
+                );
+                receipts.push(Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: stamp.clone(),
+                        challenge_hash: challenge.hash()?,
+                        issued_at_ms: now_ms,
+                        expires_at_ms: challenge.expires_at_ms,
+                    },
+                    &signer,
+                )?);
+            }
+        }
+        Ok(receipts)
+    }
+
+    pub fn authorize_execution_handoff_terminal_reconciliation(
+        &self,
+        auth: &VerifiedExecutionResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+        now_ms: u64,
+    ) -> Result<ExecutionHandoffTerminalReconciliationResult> {
+        ensure!(
+            auth.wire().resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal,
+            "terminal reconciliation cannot resolve an unknown executor operation"
+        );
+        resolution_original_observation_from(&self.connection, &self.policy, auth.wire())?;
+        check_policy_heads_in(
+            &self.connection,
+            self.policy.verified(),
+            auth.resolver(),
+            now_ms,
+        )?;
+        check_policy_heads_in(
+            &self.connection,
+            self.policy.verified(),
+            auth.submission(),
+            now_ms,
+        )?;
+        self.policy
+            .verified()
+            .verify_execution_resolution_freshness(auth, proof, now_ms)?;
+        verify_resolution_challenge_record(&self.connection, auth.wire(), proof, false)?;
+        Ok(ExecutionHandoffTerminalReconciliationResult {
+            reconciliation: auth.wire().clone(),
+            freshness: proof.clone(),
+        })
+    }
+
+    pub(crate) fn resolve_execution_handoff(
+        &mut self,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionHandoffResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+        transport: &TransportEvidence,
+        stopped: &crate::engine::StoppedExecution,
+        now_ms: u64,
+    ) -> Result<ExecutionHandoffResolutionResult> {
+        ensure!(
+            wire.resolution.purpose == ExecutionResolutionPurpose::ResolveUnknown,
+            "terminal reconciliation cannot mutate executor state"
+        );
+        if let Some(result) = self.execution_handoff_resolution_status(wire, transport, now_ms)? {
+            return Ok(result);
+        }
+        let auth = self.execution_handoff_resolution_authorization(wire, transport, now_ms)?;
+        self.policy
+            .verified()
+            .admit_execution_resolution(&auth, proof, now_ms)?;
+        let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut stored = resolution_original_observation_from(&tx, &self.policy, wire)?;
+        ensure!(
+            identity.public_key_hex()? == stored.wire.handoff.target_public_key.as_str(),
+            "resolution signer is not this executor"
+        );
+        let dispatch: Event =
+            serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
+        ensure!(
+            stopped.matches_context(&crate::engine::ExecutionContext {
+                space_id: SpaceId::parse(&original)?,
+                resource_id: dispatch.resource_id.clone(),
+                operation_id: operation.clone(),
+                shared: true,
+                lease_expires_at_ms: now_ms,
+            }),
+            "resolution has no matching confirmed execution fence"
+        );
+        check_policy_heads_in(&tx, self.policy.verified(), auth.resolver(), now_ms)?;
+        check_policy_heads_in(&tx, self.policy.verified(), auth.submission(), now_ms)?;
+        self.policy
+            .verified()
+            .verify_execution_resolution_freshness(&auth, proof, now_ms)?;
+        verify_resolution_challenge_record(&tx, wire, proof, false)?;
+        ensure!(tx.execute("UPDATE execution_handoff_resolution_challenges SET consumed=1 WHERE execution_space_id=? AND nonce=? AND consumed=0",
+            params![execution,proof.challenge.nonce.as_str()])?==1,"resolution challenge was already consumed");
+        let reused:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM execution_handoff_nonces WHERE execution_space_id=? AND device_id=? AND nonce=?)",
+            params![execution,wire.invocation.payload.device.as_str(),wire.invocation.payload.nonce.as_str()],|row|row.get(0))?;
+        ensure!(
+            !reused,
+            "resolution reused a prior executor invocation nonce"
+        );
+        stored.state = serde_json::from_value(
+            wire.resolution.account_admission.source_body["outcome"].clone(),
+        )?;
+        stored.result = execution_resolution_result(&wire.resolution)?;
+        ensure!(tx.execute("UPDATE execution_handoffs SET state=?,result=? WHERE execution_space_id=? AND original_space_id=? AND operation_id=? AND state='unknown' AND handoff_hash=?",
+            params![state_text(&stored.state)?,serde_json::to_string(&stored.result)?,execution,original,operation,stored.wire.hash()?.as_str()])?==1,
+            "unknown handoff changed before the explicit resolution");
+        let (mut session, binding) = session_from(
+            &tx,
+            &execution,
+            &original,
+            dispatch.resource_id.as_str(),
+            &stored.request.target_node,
+            &stored.request.session_id,
+        )?
+        .context("resolved session disappeared")?;
+        ensure!(
+            stored.request.binding.as_ref() == Some(&binding),
+            "resolved session binding changed"
+        );
+        session.revision = session.revision.max(
+            stored
+                .request
+                .expected_revision
+                .checked_add(1)
+                .context("resolved session revision overflow")?,
+        );
+        session.native_session_id = None;
+        session.state = "resolved".into();
+        tx.execute("UPDATE execution_handoff_sessions SET revision=?,record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=?",
+            params![session.revision,serde_json::to_string(&session)?,execution,original,dispatch.resource_id.as_str(),session.target_node,session.session_id])?;
+        let handoff_receipt = signed_receipt(&tx, identity, &stored, now_ms)?;
+        let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let receipt = Signed::sign(
+            ExecutionHandoffResolutionReceipt {
+                version: AUTH_VERSION,
+                resolution_hash: wire.hash()?,
+                freshness_hash: ObjectHash::body(proof)?,
+                handoff_receipt_hash: handoff_receipt.hash()?,
+                issued_at_ms: now_ms,
+            },
+            &signer,
+        )?;
+        let result = ExecutionHandoffResolutionResult {
+            resolution: wire.clone(),
+            freshness: proof.clone(),
+            handoff_receipt,
+            result: stored.result.clone(),
+            receipt,
+        };
+        verify_execution_resolution_receipt_signature(&result)?;
+        let account = &wire.resolution.account_admission.invocation;
+        let submission = &wire.invocation;
+        tx.execute("INSERT INTO execution_handoff_resolutions(execution_space_id,original_space_id,operation_id,resolution_id,resolution_hash,resolver_device,resolver_nonce,resolver_invocation_hash,resolver_body_hash,submission_device,submission_nonce,submission_invocation_hash,submission_body_hash,request,admission_transport,freshness,resolved_at_ms,result_receipt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![execution,original,operation,account.payload.operation_id,wire.hash()?.as_str(),account.payload.device.as_str(),account.payload.nonce.as_str(),account.hash()?.as_str(),account.payload.body_hash.as_str(),
+                submission.payload.device.as_str(),submission.payload.nonce.as_str(),submission.hash()?.as_str(),submission.payload.body_hash.as_str(),serde_json::to_string(wire)?,serde_json::to_string(&StoredTransport::from(transport))?,serde_json::to_string(proof)?,now_ms,serde_json::to_string(&result)?])?;
+        tx.execute("UPDATE execution_handoffs SET result_receipt=? WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",
+            params![serde_json::to_string(&result.handoff_receipt)?,execution,original,operation])?;
+        tx.execute("DELETE FROM execution_handoff_reservations WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",params![execution,original,operation])?;
+        tx.commit()?;
+        Ok(result)
+    }
+}
+
 fn save_lease_in(
     tx: &Transaction<'_>,
     execution: &str,
@@ -1822,6 +2336,24 @@ pub(crate) fn validate_execution_handoff_storage(
         ensure!(
             actual == expected,
             "stored handoff resource reservation set changed"
+        );
+    }
+    let requests = connection.prepare("SELECT request FROM execution_handoff_resolutions ORDER BY execution_space_id,original_space_id,operation_id")?
+        .query_map([], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for request in requests {
+        let wire: SignedExecutionHandoffResolution = serde_json::from_str(&request)?;
+        let saved =
+            stored_resolution_from(connection, &wire)?.context("stored resolution disappeared")?;
+        reconstruct_resolution(connection, policy, &saved)?;
+        let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
+        let handoff = stored_from(connection, &execution, &original, &operation)?
+            .context("resolved handoff disappeared")?;
+        ensure!(
+            handoff.wire == wire.resolution.observation.handoff
+                && handoff.state.terminal()
+                && handoff.result == saved.result.result
+                && handoff.receipt.as_ref() == Some(&saved.result.handoff_receipt),
+            "resolution audit differs from its terminal execution ledger"
         );
     }
     Ok(())

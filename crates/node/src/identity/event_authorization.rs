@@ -192,7 +192,7 @@ fn expected_events(
             );
             let status = text(body, "outcome")?;
             ensure!(
-                matches!(status, "succeeded" | "failed"),
+                matches!(status, "succeeded" | "failed" | "rejected"),
                 "invalid operation resolution outcome"
             );
             let task_id: Option<String> = serde_json::from_value(
@@ -631,7 +631,12 @@ fn validate_sdk_parent(
     Ok(())
 }
 
-fn validate_derived(connection: &Connection, event: &Event, source: &StoredEvent) -> Result<()> {
+fn validate_derived(
+    policy: &PolicyState,
+    connection: &Connection,
+    event: &Event,
+    source: &StoredEvent,
+) -> Result<()> {
     let source_envelope = &source.envelope;
     let source = &source.event;
     ensure!(
@@ -687,22 +692,51 @@ fn validate_derived(connection: &Connection, event: &Event, source: &StoredEvent
                 } else {
                     detail.clone()
                 };
-                let signed: ExecutionHandoffResult = serde_json::from_value(result)?;
+                let (handoff, receipt) = if result.get("reconciliation").is_some() {
+                    use vibeface_secure::authorization::execution_handoff::ExecutionHandoffTerminalReconciliationResult;
+                    let signed: ExecutionHandoffTerminalReconciliationResult =
+                        serde_json::from_value(result)?;
+                    verify_terminal_reconciliation_in(
+                        policy,
+                        connection,
+                        &signed,
+                        event.created_at_ms.try_into()?,
+                    )?;
+                    (
+                        signed.reconciliation.resolution.observation.handoff,
+                        signed.reconciliation.resolution.observation.receipt,
+                    )
+                } else if result.get("resolution").is_some() {
+                    use vibeface_secure::authorization::execution_handoff::{
+                        ExecutionHandoffResolutionResult,
+                        verify_execution_resolution_receipt_signature,
+                    };
+                    let signed: ExecutionHandoffResolutionResult = serde_json::from_value(result)?;
+                    verify_execution_resolution_receipt_signature(&signed)?;
+                    verify_resolution_observation_in(policy, connection, &signed)?;
+                    (
+                        signed.resolution.resolution.observation.handoff,
+                        signed.handoff_receipt,
+                    )
+                } else {
+                    let signed: ExecutionHandoffResult = serde_json::from_value(result)?;
+                    verify_execution_handoff_receipt_signature(
+                        &signed.handoff,
+                        &signed.receipt,
+                        &signed.result,
+                    )?;
+                    (signed.handoff, signed.receipt)
+                };
                 ensure!(
-                    signed.handoff.handoff.project_dispatch == *source_envelope
-                        && crypto::fingerprint(signed.handoff.handoff.target_public_key.as_str())?
+                    handoff.handoff.project_dispatch == *source_envelope
+                        && crypto::fingerprint(handoff.handoff.target_public_key.as_str())?
                             == *target_node
-                        && serde_json::to_value(signed.receipt.payload.state)?.as_str()
+                        && serde_json::to_value(receipt.payload.state)?.as_str()
                             == Some(status.as_str())
-                        && signed.receipt.payload.issued_at_ms <= event.created_at_ms as u64
-                        && signed.receipt.payload.issued_at_ms >= admission(source).admitted_at_ms,
+                        && receipt.payload.issued_at_ms <= event.created_at_ms as u64
+                        && receipt.payload.issued_at_ms >= admission(source).admitted_at_ms,
                     "delegated execution result differs from its admitted source or state"
                 );
-                verify_execution_handoff_receipt_signature(
-                    &signed.handoff,
-                    &signed.receipt,
-                    &signed.result,
-                )?;
             }
             ensure!(
                 !(detail.get("resolver").is_some() && detail.get("invocation_hash").is_some()),
@@ -798,7 +832,7 @@ pub(crate) fn validate_event_evidence(
                     return Ok(EventEvidenceStatus::Pending);
                 }
             }
-            validate_derived(connection, event, source)?;
+            validate_derived(policy, connection, event, source)?;
         }
     }
     let invocation_hash = proof.invocation.hash()?;
@@ -1226,11 +1260,133 @@ pub(crate) fn append_execution_handoff_observation_in(
         "handoff acknowledgement belongs to another dispatch"
     );
     verify_execution_handoff_receipt_signature(&result.handoff, &result.receipt, &result.result)?;
-    let source_event = verify_event_envelope(
+    append_signed_execution_observation_in(
+        connection,
         policy,
-        result.receipt.payload.original_space_id.as_str(),
+        identity,
         source,
+        &serde_json::to_value(result)?,
+        result.receipt.payload.state,
+        now_ms,
+    )
+}
+
+fn verify_resolution_observation_in(
+    policy: &PolicyState,
+    _connection: &Connection,
+    result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffResolutionResult,
+) -> Result<()> {
+    let at = result.receipt.payload.issued_at_ms;
+    let historical = policy.historical(&result.freshness.challenge.policies, at)?;
+    let resolver = super::execution_handoff::resolution_resolver_from(
+        policy,
+        &historical,
+        &result.resolution,
+        at,
     )?;
+    let auth = historical.verify_execution_resolution_ack(result, &resolver, at)?;
+    historical.verify_execution_resolution_freshness(&auth, &result.freshness, at)?;
+    Ok(())
+}
+
+fn verify_terminal_reconciliation_in(
+    policy: &PolicyState,
+    _connection: &Connection,
+    result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffTerminalReconciliationResult,
+    now_ms: u64,
+) -> Result<()> {
+    let historical = policy.historical(&result.freshness.challenge.policies, now_ms)?;
+    let resolver = super::execution_handoff::resolution_resolver_from(
+        policy,
+        &historical,
+        &result.reconciliation,
+        now_ms,
+    )?;
+    historical.verify_execution_terminal_reconciliation(result, &resolver, now_ms)?;
+    Ok(())
+}
+
+pub(crate) fn append_execution_terminal_reconciliation_observation_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    identity: &LocalIdentity,
+    source: &SignedEvent,
+    result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffTerminalReconciliationResult,
+    now_ms: u64,
+) -> Result<SignedEvent> {
+    ensure!(
+        result
+            .reconciliation
+            .resolution
+            .observation
+            .handoff
+            .handoff
+            .project_dispatch
+            == *source,
+        "terminal reconciliation belongs to another dispatch"
+    );
+    verify_terminal_reconciliation_in(policy, connection, result, now_ms)?;
+    append_signed_execution_observation_in(
+        connection,
+        policy,
+        identity,
+        source,
+        &serde_json::to_value(result)?,
+        result
+            .reconciliation
+            .resolution
+            .observation
+            .receipt
+            .payload
+            .state,
+        now_ms,
+    )
+}
+
+pub(crate) fn append_execution_resolution_observation_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    identity: &LocalIdentity,
+    source: &SignedEvent,
+    result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffResolutionResult,
+    now_ms: u64,
+) -> Result<SignedEvent> {
+    use vibeface_secure::authorization::execution_handoff::verify_execution_resolution_receipt_signature;
+    ensure!(
+        result
+            .resolution
+            .resolution
+            .observation
+            .handoff
+            .handoff
+            .project_dispatch
+            == *source,
+        "resolution acknowledgement belongs to another dispatch"
+    );
+    verify_execution_resolution_receipt_signature(result)?;
+    verify_resolution_observation_in(policy, connection, result)?;
+    append_signed_execution_observation_in(
+        connection,
+        policy,
+        identity,
+        source,
+        &serde_json::to_value(result)?,
+        result.handoff_receipt.payload.state,
+        now_ms,
+    )
+}
+
+fn append_signed_execution_observation_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    identity: &LocalIdentity,
+    source: &SignedEvent,
+    result: &Value,
+    state: vibeface_secure::authorization::execution_handoff::ExecutionHandoffState,
+    now_ms: u64,
+) -> Result<SignedEvent> {
+    let source_network: String = serde_json::from_str::<Event>(&source.canonical_body)?.network_id;
+    let source_event = verify_event_envelope(policy, source_network.as_str(), source)?;
     let EventBody::DispatchRecorded {
         operation_id,
         task_id,
@@ -1241,8 +1397,7 @@ pub(crate) fn append_execution_handoff_observation_in(
     else {
         bail!("handoff acknowledgement source is not a dispatch")
     };
-    let state: OperationState =
-        serde_json::from_value(serde_json::to_value(result.receipt.payload.state)?)?;
+    let state: OperationState = serde_json::from_value(serde_json::to_value(state)?)?;
     ensure!(
         state != OperationState::Accepted,
         "accepted handoff has no execution observation"
@@ -1254,7 +1409,7 @@ pub(crate) fn append_execution_handoff_observation_in(
     )?;
     ensure!(
         serde_json::from_str::<OperationState>(&stored_state)? == state
-            && serde_json::from_str::<Value>(&stored_result)? == serde_json::to_value(result)?,
+            && serde_json::from_str::<Value>(&stored_result)? == *result,
         "handoff observation differs from its durable signed acknowledgement"
     );
     let bytes = serde_json::to_vec(result)?;
