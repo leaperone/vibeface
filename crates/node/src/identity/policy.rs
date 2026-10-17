@@ -321,6 +321,37 @@ pub(crate) fn request_facts_from(
                 && saved["conversation_id"].as_str() == conversation.as_deref(),
             "agent session context mismatch"
         );
+        let trigger: String = connection.query_row(
+            "SELECT envelope FROM events WHERE space_id=? AND hash=? AND status='ready'",
+            params![space.as_str(), session.session_id],
+            |row| row.get(0),
+        )?;
+        let trigger: crate::model::SignedEvent = serde_json::from_str(&trigger)?;
+        let trigger: crate::model::Event = serde_json::from_str(&trigger.canonical_body)?;
+        if matches!(
+            &trigger.body,
+            crate::model::EventBody::ExecutionObserved { .. }
+        ) {
+            let source = match &trigger.cause {
+                crate::model::EventCause::Derived { admission, .. } => admission,
+                _ => anyhow::bail!("continuation has no original execution admission"),
+            };
+            ensure!(
+                context.task.is_some()
+                    && context.task == source.invocation.payload.context.task
+                    && method != "create_task",
+                "continuation request escaped its original task"
+            );
+            if method == "session" {
+                let original: crate::model::OperationRequest =
+                    serde_json::from_value(source.source_body["request"].clone())?;
+                ensure!(
+                    body["target_node"].as_str() == Some(original.target_node.as_str())
+                        && body["session_id"].as_str() == Some(original.session_id.as_str()),
+                    "continuation cannot read another execution session"
+                );
+            }
+        }
         context.sdk_session = Some(session);
     }
     let workspace = request

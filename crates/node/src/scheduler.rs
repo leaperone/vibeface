@@ -55,7 +55,7 @@ pub(crate) struct LocalSession {
     pub(crate) active: Option<Invocation>,
 }
 
-fn boot_id() -> &'static str {
+pub(crate) fn boot_id() -> &'static str {
     static BOOT: OnceLock<String> = OnceLock::new();
     BOOT.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
@@ -102,7 +102,7 @@ fn save_invocation(
     )
 }
 
-fn finish(
+pub(crate) fn finish(
     store: &mut Store,
     network: &str,
     conversation: &str,
@@ -174,6 +174,25 @@ pub async fn run(
     conversation: String,
     trigger: String,
 ) -> Result<Value> {
+    run_admitted(node, access, conversation, trigger, None).await
+}
+
+#[derive(Debug)]
+pub(crate) struct ManagerBusy;
+impl std::fmt::Display for ManagerBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a manager invocation requires completion or reconciliation")
+    }
+}
+impl std::error::Error for ManagerBusy {}
+
+pub(crate) async fn run_admitted(
+    node: Arc<Runtime>,
+    access: crate::model::AgentSession,
+    conversation: String,
+    trigger: String,
+    admitted: Option<crate::identity::admission::ManagerAdmission>,
+) -> Result<Value> {
     let _work = node.maintenance.enter()?;
     let access = node
         .store
@@ -212,9 +231,13 @@ pub async fn run(
         );
         (context, store.resource_root(network, &access.resource_id)?)
     };
-    let admission = node
-        .claim_manager(&access, &trigger, boot_id(), &sdk_config)
-        .await?;
+    let admission = match admitted {
+        Some(admission) => admission,
+        None => {
+            node.claim_manager(&access, &trigger, boot_id(), &sdk_config)
+                .await?
+        }
+    };
     let mut invocation = admission.invocation;
     let _previous_native_id = admission.previous_native_id;
     if !admission.fresh {

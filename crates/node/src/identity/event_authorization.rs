@@ -503,9 +503,14 @@ fn historical_facts(
             "SDK session does not have an observed service adapter"
         );
         let parent_hash = ObjectHash::parse(text(body, "parent_invocation")?)?;
-        let Some(parent) = events.get(&session.session_id) else {
+        let Some(trigger) = events.get(&session.session_id) else {
             return Ok(None);
         };
+        let parent = super::services::agent_account_message(events, &session.session_id)?;
+        ensure!(
+            ancestors.contains(&trigger.envelope.hash),
+            "SDK trigger is not causal to this event"
+        );
         ensure!(
             ancestors.contains(&parent.envelope.hash)
                 && parent.event.scope_id == scope
@@ -554,6 +559,7 @@ fn event_slot(body: &EventBody) -> String {
 
 fn validate_sdk_parent(
     policy: &PolicyState,
+    connection: &Connection,
     state: &VerifiedPolicySet,
     event: &Event,
     events: &BTreeMap<String, StoredEvent>,
@@ -566,43 +572,33 @@ fn validate_sdk_parent(
     let Actor::Service(service) = &proof.invocation.payload.actor else {
         bail!("SDK session requires a service actor")
     };
-    let parent = events
-        .get(&session.session_id)
-        .context("SDK parent event is missing")?;
-    ensure!(
-        verify_event_envelope(policy, &event.network_id, &parent.envelope)? == parent.event,
-        "SDK parent event differs from signed envelope"
-    );
-    let parent_proof = admission(&parent.event);
-    ensure!(
-        u64::try_from(parent.event.created_at_ms)? == parent_proof.admitted_at_ms
-            && expected_events(
-                &parent_proof.source_body,
-                &parent_proof.invocation,
-                &parent_proof.transport.clone().into_evidence()
-            )?
-            .iter()
-            .any(|(body, blobs)| body == &parent.event.body && blobs == &parent.event.blobs),
-        "SDK parent content differs from the admitted account request"
-    );
-    let parent_state = policy.historical(
-        &parent_proof.challenge.policies,
-        parent_proof.admitted_at_ms,
-    )?;
-    let parent_ancestors =
-        dependency_closure(&parent.event, events)?.context("SDK parent history is incomplete")?;
-    let parent_facts = historical_facts(&parent_state, &parent.event, events, &parent_ancestors)?
-        .context("SDK parent resource history is incomplete")?;
-    let transport = parent_proof.transport.clone().into_evidence();
-    let admitted = reconstruct_admission(policy, parent_proof, &parent_facts, &transport)?;
-    let current_parent = state.verify_operation_authorization(
-        &admitted,
-        &parent_facts,
-        &transport,
+    let heads = if proof.source_body["basis_heads"].is_null() {
+        vec![session.session_id.clone()]
+    } else {
+        serde_json::from_value(proof.source_body["basis_heads"].clone())?
+    };
+    let origin = super::services::resolve_agent_origin(
+        policy,
+        connection,
+        state,
+        events,
+        &session.session_id,
+        &heads,
         proof.admitted_at_ms,
     )?;
+    ensure!(
+        origin.parent.invocation_hash().as_str() == text(&proof.source_body, "parent_invocation")?,
+        "SDK parent invocation differs from its causal account origin"
+    );
+    if let Some((_, task)) = &origin.task {
+        ensure!(
+            facts.context.task.as_ref() == Some(task)
+                && proof.source_body["method"] != "create_task",
+            "continuation SDK invocation escaped its original task"
+        );
+    }
     let delegated = state.verify_service_delegation(
-        &current_parent,
+        &origin.parent,
         service,
         &proof.invocation.payload.grant_leaf,
         facts,
@@ -612,7 +608,7 @@ fn validate_sdk_parent(
         delegated.device() == &proof.invocation.payload.device
             && delegated.initiator() == &proof.invocation.payload.initiator
             && delegated.initiating_grant() == proof.invocation.payload.initiating_grant.as_ref(),
-        "SDK service invocation differs from the admitted account delegation"
+        "SDK service invocation differs from its admitted account delegation"
     );
     Ok(())
 }
@@ -727,7 +723,7 @@ pub(crate) fn validate_event_evidence(
     };
     let transport = proof.transport.clone().into_evidence();
     reconstruct_admission(policy, proof, &facts, &transport)?;
-    validate_sdk_parent(policy, &state, event, events, &facts)?;
+    validate_sdk_parent(policy, connection, &state, event, events, &facts)?;
     match &event.cause {
         EventCause::Invocation { .. } => {
             ensure!(
@@ -795,6 +791,17 @@ pub(crate) fn current_event_authorization(
     events: &BTreeMap<String, StoredEvent>,
     now_ms: u64,
 ) -> Result<VerifiedAuthorization> {
+    event_authorization_in_view(policy, connection, policy.verified(), event, events, now_ms)
+}
+
+pub(crate) fn event_authorization_in_view(
+    policy: &PolicyState,
+    connection: &Connection,
+    state: &VerifiedPolicySet,
+    event: &Event,
+    events: &BTreeMap<String, StoredEvent>,
+    now_ms: u64,
+) -> Result<VerifiedAuthorization> {
     ensure!(
         validate_event_evidence(policy, connection, event, events)? == EventEvidenceStatus::Valid,
         "event has incomplete authorization evidence"
@@ -806,9 +813,7 @@ pub(crate) fn current_event_authorization(
         .context("event resource history is incomplete")?;
     let transport = proof.transport.clone().into_evidence();
     let admitted = reconstruct_admission(policy, proof, &facts, &transport)?;
-    Ok(policy
-        .verified()
-        .verify_operation_authorization(&admitted, &facts, &transport, now_ms)?)
+    Ok(state.verify_operation_authorization(&admitted, &facts, &transport, now_ms)?)
 }
 
 pub(crate) fn persisted_admission_facts(
@@ -844,7 +849,7 @@ pub(crate) fn persisted_admission_facts(
             .context("accepted event causal history is missing")?;
         let current = historical_facts(&state, &stored.event, &events, &ancestors)?
             .context("accepted event resource history is missing")?;
-        validate_sdk_parent(policy, &state, &stored.event, &events, &current)?;
+        validate_sdk_parent(policy, connection, &state, &stored.event, &events, &current)?;
         ensure!(
             facts.as_ref().is_none_or(|facts| facts == &current),
             "accepted events disagree about original request facts"

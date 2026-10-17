@@ -1,17 +1,246 @@
-use super::event_authorization::{current_event_authorization, verify_event_envelope};
+use super::{event_authorization::event_authorization_in_view, journal::PolicyState};
 use crate::{
-    model::{AgentSession, EventBody, SignedEvent},
-    store::{Store, load_events_from},
+    model::{AgentSession, EventBody, EventCause, OperationRequest},
+    store::{Store, StoredEvent, closure_hashes, heads_from_events, load_events_from},
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use vibeface_secure::authorization::{
-    AUTH_VERSION, Action, Actor, Audience, Grantee, Invocation, InvocationContext, Nonce,
+    AUTH_VERSION, Action, Actor, Audience, EventRef, Grantee, Invocation, InvocationContext, Nonce,
     ObjectHash, PolicyDomain, PolicyStamp, RequestFacts, ResourceId, ResourceRef, ResourceScope,
-    ServiceId, SessionRef, SpaceId,
+    ServiceId, SessionRef, SpaceId, VerifiedAuthorization, VerifiedPolicySet,
 };
+
+pub(crate) struct AgentOrigin {
+    pub parent: VerifiedAuthorization,
+    pub task: Option<(String, EventRef)>,
+    pub execution: Option<OperationRequest>,
+}
+
+pub(crate) fn agent_account_message<'a>(
+    events: &'a BTreeMap<String, StoredEvent>,
+    trigger: &str,
+) -> Result<&'a StoredEvent> {
+    let source = events.get(trigger).context("SDK trigger is missing")?;
+    if matches!(&source.event.body, EventBody::MessagePosted { role, text, .. } if role == "user" && !text.trim().is_empty())
+    {
+        return Ok(source);
+    }
+    ensure!(
+        matches!(&source.event.body, EventBody::ExecutionObserved { .. }),
+        "SDK trigger is not a message or execution result"
+    );
+    let EventCause::Derived {
+        source: dispatch, ..
+    } = &source.event.cause
+    else {
+        anyhow::bail!("SDK execution result has no dispatch");
+    };
+    let dispatch = events
+        .get(dispatch)
+        .context("SDK execution dispatch is missing")?;
+    let EventCause::Invocation { admission } = &dispatch.event.cause else {
+        anyhow::bail!("SDK dispatch has no original invocation");
+    };
+    ensure!(
+        matches!(admission.invocation.payload.actor, Actor::Service(_)),
+        "SDK result was not service-dispatched"
+    );
+    let parent = ObjectHash::parse(
+        admission.source_body["parent_invocation"]
+            .as_str()
+            .context("SDK dispatch has no account parent")?,
+    )?;
+    let causal = closure_hashes(events, &[trigger.to_owned()]);
+    let mut messages = causal.iter().filter_map(|hash| {
+        let stored = events.get(hash)?;
+        let EventCause::Invocation { admission } = &stored.event.cause else { return None; };
+        (matches!(&stored.event.body, EventBody::MessagePosted { role, text, .. } if role == "user" && !text.trim().is_empty())
+            && matches!(admission.invocation.payload.actor, Actor::Account(_))
+            && admission.invocation.hash().ok().as_ref() == Some(&parent)).then_some(stored)
+    });
+    let message = messages
+        .next()
+        .context("SDK result has no causal account message")?;
+    ensure!(
+        messages.next().is_none(),
+        "SDK result has ambiguous account messages"
+    );
+    Ok(message)
+}
+
+pub(crate) fn resolve_agent_origin(
+    policy: &PolicyState,
+    connection: &Connection,
+    state: &VerifiedPolicySet,
+    events: &BTreeMap<String, StoredEvent>,
+    trigger: &str,
+    basis_heads: &[String],
+    now_ms: u64,
+) -> Result<AgentOrigin> {
+    let source = events.get(trigger).context("agent trigger is missing")?;
+    let event = &source.event;
+    ensure!(source.status == "ready", "agent trigger is not ready");
+    if matches!(&event.body, EventBody::MessagePosted { role, text, .. } if role == "user" && !text.trim().is_empty())
+    {
+        let parent = event_authorization_in_view(policy, connection, state, event, events, now_ms)?;
+        ensure!(
+            matches!(parent.actor(), Actor::Account(_)),
+            "agent message has no account authority"
+        );
+        return Ok(AgentOrigin {
+            parent,
+            task: None,
+            execution: None,
+        });
+    }
+    let EventBody::ExecutionObserved {
+        operation_id,
+        task_id: Some(task_id),
+        target_node,
+        session_id,
+        status,
+        ..
+    } = &event.body
+    else {
+        anyhow::bail!("agent trigger is neither an account message nor a task execution result");
+    };
+    ensure!(
+        matches!(status.as_str(), "succeeded" | "failed" | "rejected"),
+        "automatic continuation requires a terminal execution result"
+    );
+    let EventCause::Derived {
+        source: dispatch_hash,
+        ..
+    } = &event.cause
+    else {
+        anyhow::bail!("continuation result is not derived from a dispatch");
+    };
+    let dispatch = events
+        .get(dispatch_hash)
+        .context("continuation dispatch is missing")?;
+    let EventCause::Invocation { admission } = &dispatch.event.cause else {
+        anyhow::bail!("continuation dispatch has no original service invocation");
+    };
+    let request: OperationRequest =
+        serde_json::from_value(admission.source_body["request"].clone())?;
+    ensure!(
+        matches!(admission.invocation.payload.actor, Actor::Service(_))
+            && request.action["type"] == "send"
+            && request.operation_id == *operation_id
+            && request.task_id.as_ref() == Some(task_id)
+            && request.target_node == *target_node
+            && request.session_id == *session_id
+            && dispatch.event.scope_id == event.scope_id
+            && dispatch.event.resource_id == event.resource_id,
+        "continuation result differs from its service-dispatched task"
+    );
+    let authorized = event_authorization_in_view(policy, connection, state, event, events, now_ms)?;
+    ensure!(
+        authorized.action() == Action::ExecutionSend,
+        "continuation has no execution-send authority"
+    );
+    let causal = closure_hashes(events, &[trigger.to_owned()]);
+    let closure = closure_hashes(events, basis_heads);
+    ensure!(
+        closure.contains(trigger)
+            && closure
+                .iter()
+                .all(|hash| events
+                    .get(hash)
+                    .is_some_and(|stored| stored.status == "ready"
+                        && stored.event.network_id == event.network_id
+                        && stored.event.scope_id == event.scope_id
+                        && stored.event.resource_id == event.resource_id)),
+        "continuation snapshot is incomplete or crosses its resource"
+    );
+    let parent_hash = ObjectHash::parse(
+        admission.source_body["parent_invocation"]
+            .as_str()
+            .context("continuation dispatch has no account parent")?,
+    )?;
+    let mut parents = causal.iter().filter_map(|hash| {
+        let stored = events.get(hash)?;
+        let EventCause::Invocation { admission } = &stored.event.cause else { return None; };
+        (matches!(&stored.event.body, EventBody::MessagePosted { role, text, .. } if role == "user" && !text.trim().is_empty())
+            && matches!(admission.invocation.payload.actor, Actor::Account(_))
+            && admission.invocation.hash().ok().as_ref() == Some(&parent_hash)).then_some(stored)
+    });
+    let message = parents
+        .next()
+        .context("continuation has no causal account message")?;
+    ensure!(
+        parents.next().is_none(),
+        "continuation has ambiguous account messages"
+    );
+    let parent =
+        event_authorization_in_view(policy, connection, state, &message.event, events, now_ms)?;
+    ensure!(
+        parent.actor() == authorized.initiator() && parent.resource() == authorized.resource(),
+        "continuation changed its initiating account or project"
+    );
+    let binding = request
+        .binding
+        .as_ref()
+        .context("continuation has no confirmed task binding")?;
+    let creation = events
+        .get(&binding.binding.task_ref)
+        .context("continuation task creation is missing")?;
+    let EventBody::TaskCreated {
+        task_id: created_task,
+        title,
+        goal,
+        acceptance,
+    } = &creation.event.body
+    else {
+        anyhow::bail!("continuation binding does not identify a task creation");
+    };
+    ensure!(
+        created_task == task_id && causal.contains(&creation.envelope.hash),
+        "continuation task is not causal to its result"
+    );
+    ensure!(!closure.iter().any(|hash| matches!(&events[hash].event.body,
+        EventBody::TaskChanged { task_id: changed, status, .. } if changed == task_id && matches!(status.as_str(), "accepted" | "cancelled"))),
+        "continuation task was finalized in its snapshot");
+    let mut permission = false;
+    for hash in &closure {
+        let decision = &events[hash].event;
+        let EventCause::Invocation { admission } = &decision.cause else {
+            continue;
+        };
+        let body = &admission.source_body;
+        if body["method"] != "create_task"
+            || body["auto_followup"] != true
+            || body["task_id"] != *task_id
+            || body["title"] != *title
+            || body["goal"] != *goal
+            || body["acceptance"] != *acceptance
+            || !matches!(&decision.body, EventBody::DecisionRecorded { decision_id, effective_constraints, tool_configuration, .. }
+                if decision_id == &format!("auto:{task_id}") && effective_constraints.contains(&format!("auto_followup:{task_id}")) && tool_configuration["auto_followup"] == *task_id)
+        {
+            continue;
+        }
+        if event_authorization_in_view(policy, connection, state, decision, events, now_ms)
+            .is_ok_and(|grant| {
+                matches!(grant.actor(), Actor::Account(_)) && grant.actor() == parent.actor()
+            })
+        {
+            permission = true;
+            break;
+        }
+    }
+    ensure!(
+        permission,
+        "continuation has no current account authorization for this task"
+    );
+    Ok(AgentOrigin {
+        parent,
+        task: Some((task_id.clone(), EventRef::parse(&creation.envelope.hash)?)),
+        execution: Some(request),
+    })
+}
 
 fn session_key(session: &SessionRef) -> String {
     format!("agent-session:{}", session.session_id)
@@ -36,6 +265,26 @@ fn check_heads(connection: &Connection, heads: &[PolicyStamp]) -> Result<()> {
 }
 
 impl Store {
+    pub(crate) fn agent_origin(&self, session: &AgentSession, now_ms: u64) -> Result<AgentOrigin> {
+        let events = load_events_from(&self.connection, session.space_id.as_str())?;
+        let heads = heads_from_events(&events, &session.conversation_id);
+        let origin = resolve_agent_origin(
+            &self.policy,
+            &self.connection,
+            self.policy.verified(),
+            &events,
+            &session.sdk_session.session_id,
+            &heads,
+            now_ms,
+        )?;
+        ensure!(
+            origin.parent.invocation_hash() == &session.parent_invocation
+                && origin.parent.actor() == &session.initiator,
+            "agent origin differs from its persisted account delegation"
+        );
+        Ok(origin)
+    }
+
     fn saved_agent_session(
         &self,
         space: &str,
@@ -69,34 +318,29 @@ impl Store {
             "agent session does not identify its triggering event"
         );
         let space_id = SpaceId::parse(space)?;
-        let encoded: String = self
-            .connection
-            .query_row(
-                "SELECT envelope FROM events WHERE space_id=? AND hash=? AND status='ready'",
-                params![space, trigger],
-                |row| row.get(0),
-            )
-            .context("agent trigger is not a ready event")?;
-        let envelope: SignedEvent = serde_json::from_str(&encoded)?;
-        ensure!(
-            envelope.hash == trigger,
-            "agent trigger envelope differs from its stored key"
-        );
-        let event = verify_event_envelope(&self.policy, space, &envelope)?;
+        let events = load_events_from(&self.connection, space)?;
+        let source = events.get(trigger).context("agent trigger is missing")?;
+        let event = &source.event;
         ensure!(
             event.network_id == space && event.scope_id == conversation,
             "agent trigger belongs to another space or conversation"
         );
+        let heads = heads_from_events(&events, conversation);
+        let origin = resolve_agent_origin(
+            &self.policy,
+            &self.connection,
+            self.policy.verified(),
+            &events,
+            trigger,
+            &heads,
+            now_ms,
+        )?;
+        if let Some(request) = &origin.execution {
+            crate::store::validate_operation_binding_from(&self.connection, request)?;
+        }
+        let parent = origin.parent;
         ensure!(
-            matches!(&event.body, EventBody::MessagePosted { role, text, .. } if role == "user" && !text.trim().is_empty()),
-            "agent trigger is not an admitted user message"
-        );
-        let events = load_events_from(&self.connection, space)?;
-        let parent =
-            current_event_authorization(&self.policy, &self.connection, &event, &events, now_ms)?;
-        ensure!(
-            matches!(parent.actor(), Actor::Account(_))
-                && parent.resource().resource == event.resource_id,
+            parent.resource().resource == event.resource_id,
             "agent trigger has no matching account resource authorization"
         );
         let facts = RequestFacts {
@@ -107,10 +351,11 @@ impl Store {
             action: Action::AgentStart,
             audience: parent.audience().clone(),
             operation_id: format!("agent:{trigger}"),
-            body_hash: ObjectHash::body(&envelope)?,
+            body_hash: ObjectHash::body(&source.envelope)?,
             context: InvocationContext {
                 conversation: Some(conversation.into()),
                 sdk_session: Some(session.clone()),
+                task: origin.task.as_ref().map(|(_, reference)| reference.clone()),
                 workspace_resource: Some(event.resource_id.clone()),
                 ..Default::default()
             },
@@ -138,7 +383,7 @@ impl Store {
             return Ok((
                 AgentSession {
                     space_id,
-                    resource_id: event.resource_id,
+                    resource_id: event.resource_id.clone(),
                     service: service.clone(),
                     device: proof.device().clone(),
                     conversation_id: conversation.into(),

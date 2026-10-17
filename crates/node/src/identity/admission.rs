@@ -1,5 +1,5 @@
 use super::{
-    event_authorization::{append_admitted_dispatch_in, current_event_authorization},
+    event_authorization::append_admitted_dispatch_in,
     journal::PolicyState,
     policy::{FreshnessProof, request_facts_from},
 };
@@ -417,18 +417,27 @@ fn persisted_admission_facts(
         ..Default::default()
     };
     if method == "agent_start" {
-        let EventCause::Invocation { admission: parent } = &source.event.cause else {
-            anyhow::bail!("manager trigger is not an original account invocation");
+        let heads: Vec<String> = if body["basis_heads"].is_null() {
+            vec![reference.to_owned()]
+        } else {
+            serde_json::from_value(body["basis_heads"].clone())?
         };
+        let origin = super::services::resolve_agent_origin(
+            policy,
+            connection,
+            &state,
+            &events,
+            reference,
+            &heads,
+            proof.admitted_at_ms,
+        )?;
         ensure!(
-            matches!(&source.event.body, EventBody::MessagePosted {role,text,..}
-            if role == "user" && !text.trim().is_empty())
-                && matches!(parent.invocation.payload.actor, Actor::Account(_))
-                && parent.invocation.hash()?.as_str() == manager_field(body, "parent_invocation")?
-                && parent.invocation.payload.actor == proof.invocation.payload.initiator
+            origin.parent.invocation_hash().as_str() == manager_field(body, "parent_invocation")?
+                && origin.parent.actor() == &proof.invocation.payload.initiator
                 && proof.invocation.payload.operation_id == format!("manager:{reference}"),
-            "historical manager delegation differs from its account trigger"
+            "historical manager delegation differs from its account origin"
         );
+        context.task = origin.task.as_ref().map(|(_, reference)| reference.clone());
         let session: SessionRef = serde_json::from_value(body["sdk_session"].clone())?;
         ensure!(
             session.session_id == reference && session.target == proof.invocation.payload.device,
@@ -500,32 +509,32 @@ fn persisted_admission_facts(
         let Actor::Service(service) = &proof.invocation.payload.actor else {
             anyhow::bail!("historical SDK session requires a service actor");
         };
-        let trigger = events
-            .get(&session.session_id)
-            .context("historical SDK trigger is missing")?;
-        let EventCause::Invocation { admission: parent } = &trigger.event.cause else {
-            anyhow::bail!("historical SDK trigger is not an original account invocation");
+        let heads: Vec<String> = if body["basis_heads"].is_null() {
+            vec![session.session_id.clone()]
+        } else {
+            serde_json::from_value(body["basis_heads"].clone())?
         };
-        ensure!(
-            trigger.event.scope_id == scope
-                && trigger.event.resource_id == facts.resource.resource
-                && matches!(&trigger.event.body,EventBody::MessagePosted {role,text,..} if role == "user" && !text.trim().is_empty())
-                && parent.invocation.hash()?.as_str() == manager_field(body, "parent_invocation")?,
-            "historical SDK source differs from its account trigger"
-        );
-        let parent_facts =
-            super::event_authorization::persisted_admission_facts(connection, policy, parent)?
-                .context("historical SDK parent has no original event")?;
-        let transport = parent.transport.clone().into_evidence();
-        let admitted = reconstruct_admission(policy, parent, &parent_facts, &transport)?;
-        let current = state.verify_operation_authorization(
-            &admitted,
-            &parent_facts,
-            &transport,
+        let origin = super::services::resolve_agent_origin(
+            policy,
+            connection,
+            &state,
+            &events,
+            &session.session_id,
+            &heads,
             proof.admitted_at_ms,
         )?;
+        ensure!(
+            origin.parent.invocation_hash().as_str() == manager_field(body, "parent_invocation")?,
+            "historical SDK source differs from its causal account origin"
+        );
+        if let Some((_, task)) = &origin.task {
+            ensure!(
+                facts.context.task.as_ref() == Some(task),
+                "historical SDK escaped its original task"
+            );
+        }
         let delegated = state.verify_service_delegation(
-            &current,
+            &origin.parent,
             service,
             &proof.invocation.payload.grant_leaf,
             &facts,
@@ -1044,15 +1053,20 @@ fn check_manager_parent(
         "manager invocation differs from its persisted delegation"
     );
     let events = load_events_from(connection, space)?;
-    let event = events.get(trigger).context("manager trigger is missing")?;
-    ensure!(
-        event.status == "ready"
-            && event.event.scope_id == conversation
-            && event.event.resource_id == auth.resource().resource
-            && matches!(&event.event.body, crate::model::EventBody::MessagePosted { role, text, .. } if role == "user" && !text.trim().is_empty()),
-        "manager trigger is not a ready account message in its resource"
-    );
-    let parent = current_event_authorization(policy, connection, &event.event, &events, now_ms)?;
+    let heads = crate::store::heads_from_events(&events, conversation);
+    let origin = super::services::resolve_agent_origin(
+        policy,
+        connection,
+        policy.verified(),
+        &events,
+        trigger,
+        &heads,
+        now_ms,
+    )?;
+    if let Some(request) = &origin.execution {
+        crate::store::validate_operation_binding_from(connection, request)?;
+    }
+    let parent = origin.parent;
     ensure!(
         matches!(parent.actor(), Actor::Account(_))
             && parent.resource() == auth.resource()
@@ -1060,8 +1074,10 @@ fn check_manager_parent(
             && parent.invocation_hash() == &descriptor.parent_invocation
             && auth
                 .grant_path()
-                .contains(&parent.signed_invocation().payload.grant_leaf),
-        "manager delegation differs from its current account parent"
+                .contains(&parent.signed_invocation().payload.grant_leaf)
+            && auth.signed_invocation().payload.context.task
+                == origin.task.as_ref().map(|(_, reference)| reference.clone()),
+        "manager delegation differs from its current account origin or task"
     );
     Ok(())
 }
@@ -1222,6 +1238,13 @@ fn check_manager_tool_in(
             && manager.initiator() == auth.initiator(),
         "tool invocation differs from its admitted manager"
     );
+    if let Some(task) = &manager.signed_invocation().payload.context.task {
+        ensure!(
+            auth.signed_invocation().payload.context.task.as_ref() == Some(task)
+                && auth.action() != Action::TaskCreate,
+            "continuation tool invocation escaped its original task"
+        );
+    }
     Ok(())
 }
 
@@ -1316,6 +1339,19 @@ impl Store {
             "manager trigger exists without admitted authorization"
         );
         let mut session: LocalSession = local_from(&tx, space, &session_key)?.unwrap_or_default();
+        if auth.signed_invocation().payload.context.task.is_some()
+            && let Some(active) = &session.active
+        {
+            let (_, _, old) =
+                load_manager_from(&tx, space, &format!("manager:{}", active.trigger))?;
+            ensure!(
+                !matches!(
+                    old.state,
+                    InvocationState::Running | InvocationState::Unknown
+                ),
+                scheduler::ManagerBusy
+            );
+        }
         if let Some(active) = session.active.take() {
             let old_id = format!("manager:{}", active.trigger);
             let (_, _, mut old) = load_manager_from(&tx, space, &old_id)?;
@@ -1375,6 +1411,30 @@ impl Store {
         )?;
         let deadline = freshness.expires_at_ms().min(auth.expires_at_ms());
         save_lease_in(&tx, space, auth.operation_id(), proof, now_ms, deadline)?;
+        if auth.signed_invocation().payload.context.task.is_some() {
+            let scheduler_node = manager_field(source_body, "scheduler_node")?;
+            let public_key: String = tx.query_row(
+                "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
+                params![space, scheduler_node],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                vibeface_secure::authorization::DeviceId::from_key(
+                    &vibeface_secure::authorization::PublicKey::parse(&public_key)?
+                ) == *auth.device(),
+                "continuation scheduler differs from its admitted service device"
+            );
+            let continuation = crate::model::ContinuationClaim {
+                result_event_hash: trigger.into(),
+                policy_version: "v2".into(),
+                scheduler_node: scheduler_node.into(),
+                state: "running".into(),
+                result: Value::Null,
+            };
+            ensure!(tx.execute("INSERT OR IGNORE INTO continuation_claims(space_id,result_event_hash,policy_version,record) VALUES(?,?,?,?)",
+                params![space, trigger, "v2", serde_json::to_string(&continuation)?])? == 1,
+                "continuation already has an admitted attempt; reconcile it");
+        }
         tx.commit()?;
         Ok(ManagerAdmission {
             manager_id: auth.operation_id().into(),

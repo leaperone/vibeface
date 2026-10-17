@@ -174,6 +174,16 @@ pub(crate) mod tests {
         name: &str,
         executor: &str,
     ) -> Result<OperationRequest> {
+        queued_with_manager(network, node, name, executor, None).await
+    }
+
+    async fn queued_with_manager(
+        network: &TestNetwork,
+        node: &Arc<Runtime>,
+        name: &str,
+        executor: &str,
+        manager: Option<&AgentSession>,
+    ) -> Result<OperationRequest> {
         task(network, node, name, false).await?;
         let creation =
             node.store
@@ -188,35 +198,62 @@ pub(crate) mod tests {
         bind["executor"] = json!(executor);
         bind["cwd"] = json!(network.project);
         let binding = serde_json::from_value(rpc(network, node, bind).await?["binding"].clone())?;
-        let mut store = node.store.lock().await;
-        store.upsert_session(
-            network.space.as_str(),
-            &ExecutionSession {
-                network_id: network.space.to_string(),
-                target_node: node.identity.node_id()?,
-                session_id: name.into(),
-                revision: 0,
-                state: "idle".into(),
-                executor: executor.into(),
-                cwd: network.project.to_string_lossy().into_owned(),
-                native_session_id: Some("native-test".into()),
-            },
-        )?;
-        let request = OperationRequest {
-            operation_id: name.into(),
+        let mut open = OperationRequest {
+            operation_id: format!("open:{name}"),
             network_id: network.space.to_string(),
             conversation_id: "conversation".into(),
             task_id: Some(name.into()),
             target_node: node.identity.node_id()?,
             session_id: name.into(),
             expected_revision: 0,
-            basis_heads: store.heads(network.space.as_str(), "conversation")?,
-            action: json!({"type":"send","text":"test"}),
+            basis_heads: node
+                .store
+                .lock()
+                .await
+                .heads(network.space.as_str(), "conversation")?,
+            action: json!({"type":"open","executor":executor,"cwd":network.project}),
             resources: vec![network.project.to_string_lossy().into_owned()],
             binding: Some(binding),
         };
+        admit(network, node, &open).await?;
+        claim(network, node, &open).await?;
+        node.finish(
+            &open,
+            OperationState::Succeeded,
+            json!({"native_session_id":"native-test"}),
+        )
+        .await?;
+        let mut store = node.store.lock().await;
+        let mut session = store
+            .session(network.space.as_str(), &open.target_node, &open.session_id)?
+            .context("open did not persist its session")?;
+        session.native_session_id = Some("native-test".into());
+        store.upsert_session(network.space.as_str(), &session)?;
+        open.operation_id = name.into();
+        open.expected_revision = session.revision;
+        open.basis_heads = store.heads(network.space.as_str(), "conversation")?;
+        open.action = json!({"type":"send","text":"test"});
+        let request = open;
         drop(store);
-        admit(network, node, &request).await?;
+        if let Some(manager) = manager {
+            let mut body = network.body("operate", "conversation");
+            body["authorization_id"] = json!(request.operation_id);
+            body["request"] = json!(request);
+            body["sdk_session"] = json!(manager.sdk_session);
+            body["parent_invocation"] = json!(manager.parent_invocation);
+            let access = node.authorize_agent(manager, body).await?;
+            node.store.lock().await.accept_authorized_operation(
+                &node.identity,
+                &access.authorization,
+                &access.freshness,
+                &access.transport,
+                &access.body,
+                &request,
+                now_ms() as u64,
+            )?;
+        } else {
+            admit(network, node, &request).await?;
+        }
         Ok(request)
     }
 
@@ -399,7 +436,7 @@ pub(crate) mod tests {
         )
         .await?;
         let mut store = node.store.lock().await;
-        let result=store.context(network.space.as_str(),"conversation",&[])?.events.into_iter().find(|event|matches!(&event.body,EventBody::ExecutionObserved{status,..} if status=="succeeded")).context("result missing")?;
+        let result=store.context(network.space.as_str(),"conversation",&[])?.events.into_iter().find(|event|matches!(&event.body,EventBody::ExecutionObserved{operation_id,status,..} if operation_id=="work" && status=="succeeded")).context("result missing")?;
         let hash = crypto::digest(&serde_json::to_vec(&result)?);
         require_executor_followup(
             &store,
@@ -465,8 +502,31 @@ pub(crate) mod tests {
     async fn unstarted_followup_survives_reopen_and_claimed_attempt_is_not_repeated() -> Result<()>
     {
         let (network, node) = runtime_fixture().await?;
-        let request = queued(&network, &node, "followup", "codex").await?;
+        let manager = agent(&network, &node).await?;
+        let request =
+            queued_with_manager(&network, &node, "followup", "codex", Some(&manager)).await?;
         task(&network, &node, "followup", true).await?;
+        {
+            let mut store = node.store.lock().await;
+            let value = store
+                .local_value(
+                    network.space.as_str(),
+                    &crate::scheduler::key(
+                        "invocation",
+                        "conversation",
+                        &manager.sdk_session.session_id,
+                    ),
+                )?
+                .unwrap();
+            let mut invocation: crate::scheduler::Invocation = serde_json::from_value(value)?;
+            invocation.state = crate::scheduler::InvocationState::Completed;
+            crate::scheduler::finish(
+                &mut store,
+                network.space.as_str(),
+                "conversation",
+                &invocation,
+            )?;
+        }
         claim(&network, &node, &request).await?;
         node.finish(
             &request,
@@ -474,7 +534,7 @@ pub(crate) mod tests {
             json!({"result":"done"}),
         )
         .await?;
-        let result=node.store.lock().await.context(network.space.as_str(),"conversation",&[])?.events.into_iter().find(|event|matches!(&event.body,EventBody::ExecutionObserved{status,..} if status=="succeeded")).unwrap();
+        let result=node.store.lock().await.context(network.space.as_str(),"conversation",&[])?.events.into_iter().find(|event|matches!(&event.body,EventBody::ExecutionObserved{operation_id,status,..} if operation_id=="followup" && status=="succeeded")).unwrap();
         let hash = crypto::digest(&serde_json::to_vec(&result)?);
         assert!(
             node.store
@@ -1450,6 +1510,7 @@ fn require_executor_followup(
     );
     let events = crate::store::load_events_from(&store.connection, network)?;
     let context = store.context(network, scope, &[trigger.to_owned()])?;
+    let events = crate::store::load_events_from(&store.connection, network)?;
     ensure!(
         context.events.iter().any(|dispatch| {
             let EventBody::DispatchRecorded {
@@ -3230,14 +3291,50 @@ impl Runtime {
         }
         let body = self.normalize_request_body(&session.space_id, body).await?;
         let access = self.authorize_agent(&session, body.clone()).await?;
+        let body = access.body.clone();
         self.rpc(access, body).await
     }
 
-    async fn authorize_agent(&self, session: &AgentSession, body: Value) -> Result<Access> {
+    async fn authorize_agent(&self, session: &AgentSession, mut body: Value) -> Result<Access> {
         let now = now_ms() as u64;
         let (session, facts) = {
             let mut store = self.store.lock().await;
             let session = store.refresh_agent_session(session, now)?;
+            let origin = store.agent_origin(&session, now)?;
+            if let Some((task, reference)) = origin.task {
+                ensure!(
+                    body["method"] != "create_task",
+                    "automatic continuation cannot create another task"
+                );
+                for claimed in [
+                    body["task_id"].as_str(),
+                    body["request"]["task_id"].as_str(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    ensure!(
+                        claimed == task,
+                        "automatic continuation cannot switch tasks"
+                    );
+                }
+                body["task_id"] = json!(task);
+                body["task_ref"] = json!(reference);
+                let saved: Option<String> = if body["method"] == "agent_start" {
+                    use rusqlite::OptionalExtension;
+                    store.connection.query_row("SELECT source_body FROM accepted_authorizations WHERE space_id=? AND authorization_id=?",
+                        rusqlite::params![session.space_id.as_str(), body["authorization_id"].as_str().context("agent start has no operation ID")?],
+                        |row| row.get(0)).optional()?
+                } else {
+                    None
+                };
+                body["basis_heads"] = match saved {
+                    Some(saved) => serde_json::from_str::<Value>(&saved)?["basis_heads"].clone(),
+                    None => {
+                        json!(store.heads(session.space_id.as_str(), &session.conversation_id)?)
+                    }
+                };
+            }
             let facts = store.request_facts(&body, &self.audience()?)?;
             (session, facts)
         };
@@ -3295,6 +3392,7 @@ impl Runtime {
         let body = json!({"method":"agent_start","space_id":session.space_id,
             "resource_id":session.resource_id,"authorization_id":format!("manager:{trigger}"),
             "conversation_id":session.conversation_id,"trigger":trigger,
+            "scheduler_node":self.identity.node_id()?,
             "sdk_session":session.sdk_session,"parent_invocation":session.parent_invocation,
             "sdk_config":sdk_config});
         let access = self.authorize_agent(session, body.clone()).await?;
@@ -3302,7 +3400,7 @@ impl Runtime {
             &access.authorization,
             &access.freshness,
             &access.transport,
-            &body,
+            &access.body,
             boot,
             sdk_config,
             now_ms() as u64,
@@ -3339,6 +3437,7 @@ impl Runtime {
         body["sdk_session"] = json!(session.sdk_session);
         body["parent_invocation"] = json!(session.parent_invocation);
         let access = self.authorize_agent(session, body.clone()).await?;
+        let body = access.body.clone();
         self.rpc(access, body).await
     }
 
@@ -3355,6 +3454,7 @@ impl Runtime {
             "authorization_id":id,"notification_id":id,"kind":kind,"text":text,
         });
         let access = self.authorize_agent(session, body.clone()).await?;
+        let body = access.body.clone();
         self.rpc(access, body).await
     }
 
@@ -4600,6 +4700,9 @@ impl Runtime {
         result_hash: &'a str,
     ) -> futures_util::future::BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
+            if request.action["type"] != "send" {
+                return Ok(true);
+            }
             let Some(task) = &request.task_id else {
                 return Ok(true);
             };
@@ -4610,6 +4713,18 @@ impl Runtime {
                 task,
             )? {
                 return Ok(true);
+            }
+            {
+                let store = self.store.lock().await;
+                let result = store
+                    .event(&request.network_id, result_hash)?
+                    .context("continuation result is missing")?;
+                let result = store.verify_event(&request.network_id, &result)?;
+                if !matches!(&result.cause, EventCause::Derived { admission, .. }
+                    if matches!(admission.invocation.payload.actor, Actor::Service(_)))
+                {
+                    return Ok(true);
+                }
             }
             if self.config.manager.is_none() || !self.config.roles.contains(&NodeRole::Scheduler) {
                 return Ok(false);
@@ -4641,13 +4756,28 @@ impl Runtime {
                     result_hash,
                     now_ms() as u64,
                 )?;
-                store.claim_continuation(
-                    &request.network_id,
-                    result_hash,
-                    "v2",
-                    &self.identity.node_id()?,
-                )?;
                 access
+            };
+            let sdk_config =
+                crypto::digest(&serde_json::to_vec(self.config.manager.as_ref().unwrap())?);
+            let admission = match self
+                .claim_manager(
+                    &access,
+                    result_hash,
+                    crate::scheduler::boot_id(),
+                    &sdk_config,
+                )
+                .await
+            {
+                Ok(admission) => admission,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::scheduler::ManagerBusy>()
+                        .is_some() =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
             };
             let work = self.maintenance.enter()?;
             let node = self.clone();
@@ -4655,11 +4785,12 @@ impl Runtime {
             let source = result_hash.to_owned();
             tokio::spawn(async move {
                 let _work = work;
-                let outcome = crate::scheduler::run(
+                let outcome = crate::scheduler::run_admitted(
                     node.clone(),
                     access,
                     request.conversation_id.clone(),
                     source.clone(),
+                    Some(admission),
                 )
                 .await;
                 let (state, value) = match outcome {
