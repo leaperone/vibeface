@@ -3068,6 +3068,24 @@ impl Runtime {
             self.require_scope(&access, scope).await?;
         }
         match method {
+            "execution_share_request" => {
+                ensure!(access.account_actor(), "execution sharing requires the user");
+                let store = self.store.lock().await;
+                access.verification.run(|| {
+                    store.authorize_read(
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        now_ms() as u64,
+                    )?;
+                    store.execution_share_request(
+                        &self.identity,
+                        &access.authorization,
+                        &input,
+                        now_ms() as u64,
+                    )
+                })
+            }
             "nodes" => {
                 let mut store = self.store.lock().await;
                 let _verification = access.verification.enter();
