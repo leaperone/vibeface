@@ -28,7 +28,6 @@
 | `allow_insecure_lan` | 明确允许可信 LAN 上的明文 HTTP |
 | `roles` | 本机启用的 Node 角色 |
 | `roots` | 编码执行允许使用的绝对目录列表 |
-| `peers` | 已知私网连接路径 |
 | `network` | 公共发现、候选直连地址、mDNS 与公共中继配置 |
 | `manager` | 管理 SDK 配置，未启用时为 `null` |
 | `codex_socket` | 已有 Codex App Server socket，`null` 时尝试启动私有实例 |
