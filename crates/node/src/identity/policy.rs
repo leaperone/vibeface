@@ -1206,15 +1206,19 @@ impl crate::runtime::Runtime {
     ) -> Result<Value> {
         PublicKey::parse(noise_public_key)?;
         if method == "execution_service_register" {
+            let verification =
+                vibeface_secure::signature_verification::SignatureVerification::new();
             let initial = {
                 let mut store = self.store.lock().await;
-                store.governance_command(
-                    &self.identity,
-                    noise_public_key,
-                    method,
-                    params,
-                    crate::runtime::now_ms() as u64,
-                )
+                verification.run(|| {
+                    store.governance_command(
+                        &self.identity,
+                        noise_public_key,
+                        method,
+                        params,
+                        crate::runtime::now_ms() as u64,
+                    )
+                })
             };
             match initial {
                 Ok(response) => return Ok(response),
@@ -1231,12 +1235,14 @@ impl crate::runtime::Runtime {
                 serde_json::from_value(params.clone())?;
             let challenge = {
                 let mut store = self.store.lock().await;
-                store.execution_service_registration_challenge(
-                    &self.identity,
-                    noise_public_key,
-                    params,
-                    crate::runtime::now_ms() as u64,
-                )?
+                verification.run(|| {
+                    store.execution_service_registration_challenge(
+                        &self.identity,
+                        noise_public_key,
+                        params,
+                        crate::runtime::now_ms() as u64,
+                    )
+                })?
             };
             let proof = self
                 .collect_freshness_challenge(
@@ -1245,14 +1251,16 @@ impl crate::runtime::Runtime {
                 )
                 .await?;
             let mut store = self.store.lock().await;
-            return store.governance_command_with_registration_freshness(
-                &self.identity,
-                noise_public_key,
-                method,
-                params,
-                crate::runtime::now_ms() as u64,
-                Some(&proof),
-            );
+            return verification.run(|| {
+                store.governance_command_with_registration_freshness(
+                    &self.identity,
+                    noise_public_key,
+                    method,
+                    params,
+                    crate::runtime::now_ms() as u64,
+                    Some(&proof),
+                )
+            });
         }
         let mut store = self.store.lock().await;
         let now_ms = crate::runtime::now_ms() as u64;
