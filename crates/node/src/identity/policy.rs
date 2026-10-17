@@ -191,7 +191,7 @@ pub(crate) fn request_facts_from(
         }
     }
     if let Some(request) = &request {
-        context.sdk_session = Some(SessionRef {
+        context.execution_session = Some(SessionRef {
             target: audience.device.clone(),
             session_id: request.session_id.clone(),
         });
@@ -220,13 +220,34 @@ pub(crate) fn request_facts_from(
             DeviceId::from_key(&PublicKey::parse(&key)?) == audience.device,
             "operation targets another device"
         );
-    } else if method == "bind_execution" {
-        context.sdk_session = Some(SessionRef {
-            target: audience.device.clone(),
+    } else if matches!(method, "bind_execution" | "rebind_execution") {
+        let target_key: String = connection.query_row(
+            "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
+            params![space.as_str(), text("target_node")?],
+            |row| row.get(0),
+        )?;
+        context.execution_session = Some(SessionRef {
+            target: DeviceId::from_key(&PublicKey::parse(&target_key)?),
             session_id: text("session_id")?.to_owned(),
         });
         context.executor_kind = Some(text("executor")?.to_owned());
-    } else if !body["sdk_session"].is_null() {
+    } else if method == "seal_execution" {
+        let binding: crate::binding::SignedBinding =
+            serde_json::from_value(body["binding"].clone())?;
+        let target_key: String = connection.query_row(
+            "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
+            params![space.as_str(), binding.binding.target_node],
+            |row| row.get(0),
+        )?;
+        context.execution_session = Some(SessionRef {
+            target: DeviceId::from_key(&PublicKey::parse(&target_key)?),
+            session_id: binding.binding.session_id,
+        });
+        context.executor_kind = binding.binding.open_spec["executor"]
+            .as_str()
+            .map(str::to_owned);
+    }
+    if !body["sdk_session"].is_null() {
         let session: SessionRef = serde_json::from_value(body["sdk_session"].clone())?;
         let encoded: String = connection.query_row(
             "SELECT value FROM local_values WHERE space_id=? AND key=?",
@@ -249,7 +270,7 @@ pub(crate) fn request_facts_from(
         .as_ref()
         .and_then(|request| request.action["cwd"].as_str())
         .or_else(|| {
-            (method == "bind_execution")
+            matches!(method, "bind_execution" | "rebind_execution")
                 .then(|| body["cwd"].as_str())
                 .flatten()
         });

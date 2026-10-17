@@ -6,6 +6,7 @@ pub(crate) mod admission;
 pub(crate) mod event_authorization;
 pub(crate) mod journal;
 pub mod local;
+pub(crate) mod operation_control;
 pub mod policy;
 pub(crate) mod recovery;
 pub mod services;
