@@ -1359,7 +1359,7 @@ mod tests {
             })
             .cloned()
             .collect();
-        let mut remote = Store::initialize(":memory:")?;
+        let mut remote = Store::initialize(std::path::Path::new(":memory:"))?;
         let update = remote
             .policy
             .prepare_bootstrap(&remote_pins, &remote_journal, now())?;
