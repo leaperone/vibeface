@@ -1377,6 +1377,9 @@ impl crate::runtime::Runtime {
             "team_create" | "space_policy_commit" => {
                 store.governance_command(&self.identity, noise_public_key, method, params, now_ms)
             }
+            "execution_service_select" => {
+                store.execution_service_select(&self.identity, noise_public_key, params, now_ms)
+            }
             "passkey_prepare_registration"
             | "passkey_prepare_device"
             | "passkey_prepare_management"
