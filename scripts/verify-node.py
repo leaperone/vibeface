@@ -1311,7 +1311,9 @@ def phase1_acceptance(options):
 
     try:
         for name in ("A", "B", "C"):
-            nodes.append(Node(run, name, binary, workspace, fixture, helper, module))
+            node = Node(run, name, binary, workspace, fixture, helper, module)
+            node.configure(timeout_secs=600)
+            nodes.append(node)
         a, b, c = nodes
         a.configure(manager=manager, codex_bin=sys.executable, daily_decision_limit=100)
         a.start()
