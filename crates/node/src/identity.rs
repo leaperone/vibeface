@@ -12,71 +12,49 @@ pub mod services;
 pub mod webauthn;
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::crypto::{self, LocalIdentity};
+    use crate::{identity::test_support::TestNetwork, store::Store};
     use anyhow::Result;
 
     #[test]
-    fn historical_author_signature_survives_recovery_without_online_authority() -> Result<()> {
-        let root = LocalIdentity::generate();
-        let admin = LocalIdentity::generate();
-        let mut state = NetworkState::new(Genesis::create(
-            &root,
-            vec![Member::client(&admin, "admin", true)?],
-        )?)?;
-        let old_node = LocalIdentity::generate();
-        state.append(GovernanceEvent::grant(
-            &admin,
-            &state.project()?,
-            Member::node(&old_node, "retired", vec![NodeRole::Replica])?,
-        )?)?;
-        let event = old_node.sign_event(crate::model::Event {
-            version: 1,
-            network_id: state.genesis.network_id.clone(),
-            scope_id: "archive".into(),
-            author: old_node.node_id()?,
-            sequence: 1,
-            previous: None,
-            parents: vec![],
-            created_at_ms: 1,
-            body: crate::model::EventBody::ConversationCreated {
-                title: "old context".into(),
-            },
-            blobs: vec![],
-        })?;
-        state.append(GovernanceEvent::revoke(
-            &admin,
-            &state.project()?,
-            &old_node.node_id()?,
-        )?)?;
-        let original = state.clone();
-        let retained = state.historical_nodes()?;
-        state.recover(RootCheckpoint::create_with_history(
-            &root,
-            2,
-            vec![Member::client(&admin, "admin", true)?],
-            retained.clone(),
-        )?)?;
-        assert!(state.events.is_empty());
-        let fresh: NetworkState = serde_json::from_slice(&serde_json::to_vec(&state)?)?;
-        let author = fresh
-            .historical_nodes()?
-            .into_iter()
-            .find(|node| node.subject_id == old_node.node_id().unwrap())
-            .unwrap();
+    fn revoked_service_history_keeps_its_original_admission_after_reopen() -> Result<()> {
+        let network = TestNetwork::new()?;
+        let path = network.directory.join("history.sqlite3");
+        let mut store = network.at(&path)?;
+        let creation = network.conversation(&mut store, "archive")?;
+        let message = network.message(&mut store, "archive", "original context")?;
+        network.revoke_node(&mut store)?;
+        assert!(
+            store
+                .authorize_node(network.space.as_str(), &network.node.node_id()?, None)
+                .is_err()
+        );
         assert_eq!(
-            crypto::verify_signed_event(&fresh.genesis.network_id, &event, &author.public_key)?
+            store
+                .verify_event(network.space.as_str(), &message)?
+                .scope_id,
+            "archive"
+        );
+        drop(store);
+        let reopened = Store::open(&path)?;
+        assert_eq!(
+            reopened.event(network.space.as_str(), &creation.hash)?,
+            Some(creation)
+        );
+        assert_eq!(
+            reopened
+                .verify_event(network.space.as_str(), &message)?
                 .scope_id,
             "archive"
         );
         assert!(
-            fresh
-                .project()?
-                .authorize_node(&old_node.node_id()?, None)
+            reopened
+                .authorize_node(network.space.as_str(), &network.node.node_id()?, None)
                 .is_err()
         );
-        assert_eq!(retained, original.historical_nodes()?);
         Ok(())
     }
 }
