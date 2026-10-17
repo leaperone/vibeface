@@ -145,6 +145,16 @@ impl LocalIdentity {
         Ok(state)
     }
 }
+impl vibeface_secure::membership::MembershipSigner for LocalIdentity {
+    fn public_key_hex(&self) -> Result<String> {
+        LocalIdentity::public_key_hex(self)
+    }
+
+    fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String> {
+        LocalIdentity::sign_payload(self, domain, payload)
+    }
+}
+
 pub fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
