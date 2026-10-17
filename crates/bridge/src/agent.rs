@@ -799,9 +799,8 @@ struct RunState {
     usage: Option<Value>,
     done: bool,
     ended: bool,
-    text_item: u64,
-    text_snapshot: bool,
-    native_text_item: Option<String>,
+    text_deltas: bool,
+    assistant_text: String,
 }
 impl RunState {
     fn identity(&mut self, message: &Value, expected_agent: &str, required: bool) -> Result<()> {
@@ -910,6 +909,7 @@ impl RunState {
                 "Cursor SDK result is too large"
             );
             self.output = Some(text.into());
+            progress(json!({"type":"text_snapshot","item_id":"assistant-0","text":safe_text(&json!(text)).unwrap_or_default()})).await?;
             self.usage = result
                 .get("usage")
                 .filter(|value| !value.is_null())
@@ -958,19 +958,18 @@ impl RunState {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if kind == "assistant" {
-                let native = event.get("uuid").and_then(Value::as_str);
-                if self.text_snapshot
-                    && native.is_none_or(|id| self.native_text_item.as_deref() != Some(id))
+                // The bridge can mirror each text fragment in both envelopes.
+                if !self.text_deltas
+                    && let Some(mut progress_event) = safe_progress_event(kind, event)
                 {
-                    self.text_item += 1;
+                    self.assistant_text
+                        .push_str(progress_event["text"].as_str().unwrap_or_default());
+                    self.assistant_text = self.assistant_text.chars().take(16_384).collect();
+                    progress_event["item_id"] = json!("assistant-0");
+                    progress_event["text"] = json!(self.assistant_text);
+                    progress(progress_event).await?;
                 }
-                self.native_text_item = native.map(str::to_owned);
-                self.text_snapshot = true;
-            }
-            if let Some(mut progress_event) = safe_progress_event(kind, event) {
-                if kind == "assistant" {
-                    progress_event["item_id"] = json!(format!("assistant-{}", self.text_item));
-                }
+            } else if let Some(progress_event) = safe_progress_event(kind, event) {
                 progress(progress_event).await?;
             }
         } else if let Some(envelope) = message.get("interactionUpdate") {
@@ -982,13 +981,19 @@ impl RunState {
                 && let Some(event) = envelope.get("update")
             {
                 self.identity(event, expected_agent, false)?;
-                if self.text_snapshot {
-                    self.text_item += 1;
-                    self.text_snapshot = false;
-                    self.native_text_item = None;
-                }
                 if let Some(text) = event.get("text").and_then(safe_text) {
-                    progress(json!({"type":"text_delta","item_id":format!("assistant-{}",self.text_item),"text":text})).await?;
+                    if !self.text_deltas {
+                        self.text_deltas = true;
+                        if !self.assistant_text.is_empty() {
+                            progress(
+                                json!({"type":"text_snapshot","item_id":"assistant-0","text":""}),
+                            )
+                            .await?;
+                            self.assistant_text.clear();
+                        }
+                    }
+                    progress(json!({"type":"text_delta","item_id":"assistant-0","text":text}))
+                        .await?;
                 }
             }
         }
@@ -1383,7 +1388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursor_text_deltas_and_assistant_snapshots_share_an_item_and_keep_newlines() {
+    async fn cursor_text_deltas_ignore_mirrored_assistant_content_and_keep_newlines() {
         let mut state = RunState::default();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = captured.clone();
@@ -1392,7 +1397,7 @@ mod tests {
             async { Ok(()) }
         };
         state.accept(0,json!({"interactionUpdate":{"type":"text-delta","update":{"type":"text-delta","text":"first\n\tsecond\u{0000}"}}}),"a",&mut progress).await.unwrap();
-        state.accept(0,json!({"sdkMessage":{"type":"assistant","message":{"uuid":"message-1","message":{"content":[{"type":"text","text":"first\n\tsecond"},{"type":"tool_use","input":{"secret":"hidden"}},{"type":"text","text":"!"}]}}}}),"a",&mut progress).await.unwrap();
+        state.accept(0,json!({"sdkMessage":{"type":"assistant","message":{"message":{"content":[{"type":"text","text":"first\n\tsecond"},{"type":"tool_use","input":{"secret":"hidden"}}]}}}}),"a",&mut progress).await.unwrap();
         state
             .accept(
                 0,
@@ -1403,14 +1408,10 @@ mod tests {
             .await
             .unwrap();
         let events = captured.lock().unwrap();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert_eq!(
             events[0],
             json!({"type":"text_delta","item_id":"assistant-0","text":"first\n\tsecond"})
-        );
-        assert_eq!(
-            events[1],
-            json!({"type":"text_snapshot","item_id":"assistant-0","text":"first\n\tsecond!"})
         );
         assert!(
             !events
@@ -1419,6 +1420,88 @@ mod tests {
         );
         assert!(cancelled(Some(&json!(5))));
         assert!(!cancelled(Some(&json!(3))));
+    }
+
+    #[tokio::test]
+    async fn cursor_unkeyed_assistant_fragments_and_deltas_render_exactly_once() {
+        for deltas in [false, true] {
+            for assistant_first in [false, true] {
+                let mut state = RunState::default();
+                let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let sink = captured.clone();
+                let mut progress = move |value| {
+                    sink.lock().unwrap().push(value);
+                    async { Ok(()) }
+                };
+                for text in ["first\n", "\tsecond", "!"] {
+                    let assistant = json!({"sdkMessage":{"type":"assistant","message":{"type":"assistant","agent_id":"a","run_id":"r","message":{"role":"assistant","content":[{"type":"text","text":text}]}}}});
+                    let delta = json!({"interactionUpdate":{"type":"text-delta","update":{"type":"text-delta","text":text}}});
+                    let messages = if !deltas {
+                        vec![assistant]
+                    } else if assistant_first {
+                        vec![assistant, delta]
+                    } else {
+                        vec![delta, assistant]
+                    };
+                    for message in messages {
+                        state.accept(0, message, "a", &mut progress).await.unwrap();
+                    }
+                }
+                let mut preview = String::new();
+                for event in captured.lock().unwrap().iter() {
+                    assert_eq!(event["item_id"], "assistant-0");
+                    let text = event["text"].as_str().unwrap();
+                    match event["type"].as_str().unwrap() {
+                        "text_snapshot" => preview = text.to_owned(),
+                        "text_delta" => preview.push_str(text),
+                        kind => panic!("unexpected text event {kind}"),
+                    }
+                }
+                assert_eq!(
+                    preview, "first\n\tsecond!",
+                    "deltas={deltas},assistant_first={assistant_first}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_final_snapshot_restores_safe_secret_prefix_tail() {
+        for (text, expected) in [("yes", "yes"), ("sk-secret", "[redacted]")] {
+            let mut state = RunState::default();
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = captured.clone();
+            let mut pending = BTreeMap::new();
+            let mut progress = move |value| {
+                sink.lock().unwrap().push(redact_stream_progress(
+                    value,
+                    &["sk-secret"],
+                    &mut pending,
+                ));
+                async { Ok(()) }
+            };
+            state
+                .accept(
+                    0,
+                    json!({"interactionUpdate":{"type":"text-delta","update":{"text":text}}}),
+                    "a",
+                    &mut progress,
+                )
+                .await
+                .unwrap();
+            let mut terminal = result(json!(3));
+            terminal["result"]["result"]["result"] = json!(text);
+            state.accept(0, terminal, "a", &mut progress).await.unwrap();
+            let mut preview = String::new();
+            for event in captured.lock().unwrap().iter() {
+                match event["type"].as_str().unwrap() {
+                    "text_snapshot" => preview = event["text"].as_str().unwrap().to_owned(),
+                    "text_delta" => preview.push_str(event["text"].as_str().unwrap()),
+                    _ => {}
+                }
+            }
+            assert_eq!(preview, expected);
+        }
     }
 
     #[test]
