@@ -102,8 +102,12 @@ def verify_maintenance(node):
     marker = node.directory / "update-pending.json"
     private_json(marker, {"protocol": 1})
     node.start()
-    node.client.connect()
-    node.client.call("authenticate", {"network_id": node.client.network_id}, status=503)
+    opened = node.client.command("connect", url=node.url, node_id=node.node_id, check=False)
+    if opened["ok"]:
+        denied = node.client.command("request", method="authenticate",
+                                     params={"network_id": node.client.network_id}, check=False)
+        require(not denied["ok"] or (denied["result"].get("error") and not denied["result"].get("result")),
+                "pending startup cannot authorize a business channel")
     commit, value = maintenance(node, "commit")
     commit.close()
     require(value["status"] == "error", "pending marker prevents premature commit")
@@ -111,6 +115,7 @@ def verify_maintenance(node):
     commit, value = maintenance(node, "commit")
     commit.close()
     require(value["status"] == "committed", "verified startup opens only after explicit commit")
+    node.client.connect()
     node.client.authenticate()
     node.client.rpc("nodes")
     result = subprocess.run([str(node.binary), "update", "status", "--data-dir", str(node.directory)],
@@ -374,7 +379,7 @@ class Client:
         if status == 200:
             require(not error, f"encrypted {method} rejected: {error}")
             return response.get("result")
-        require(error is not None, f"encrypted {method} expected rejection")
+        require(bool(error), f"encrypted {method} expected rejection")
         if isinstance(error, dict) and error.get("status"):
             require(error["status"] == status, f"encrypted {method} rejection status")
         return response
@@ -514,6 +519,7 @@ class Node:
             self.log = None
 
     def pair(self, owner, network):
+        network_config = json.loads((self.directory / "config.json").read_text())["network"]
         invitation = owner.client.invite("node", ["gateway", "relay", "replica", "scheduler", "executor"])
         path = self.directory / "pair-invitation.json"
         private_json(path, {"url": owner.url, "node_id": owner.node_id, "invite": invitation})
@@ -539,7 +545,7 @@ class Node:
         self.client.pair_client(owner.client, network, f"{self.name} independent client")
         self.client.url = self.url
         self.client.node_id = self.node_id
-        self.configure(peers=[])
+        self.configure(peers=[], network=network_config)
 
     def bootstrap(self):
         self.client.connect(self.node_id)
@@ -704,6 +710,14 @@ def verify_recovery(node, other, nodes, network):
     require(material["network_id"] == network, "recovered root retains the original personal fingerprint")
     other.url = node.url
     other.connect(node.node_id)
+    wrong_challenge = other.call("recovery_challenge", {"network_id": network,
+                                 "owner_public_key": material["genesis"]["owner_public_key"],
+                                 "genesis": material["genesis"]})
+    wrong_signature = other.command("sign", **wrong_challenge["signing"])
+    response = other.call("recovery_context", {"challenge_id": wrong_challenge["challenge_id"],
+                                              "signature": wrong_signature}, status=403)
+    require(not response.get("result") and "state" not in response and "view" not in response,
+            "wrong root proof reveals no private membership")
     challenge = other.call("recovery_challenge", {"network_id": network,
                            "owner_public_key": material["genesis"]["owner_public_key"],
                            "genesis": material["genesis"]})
@@ -721,6 +735,13 @@ def verify_recovery(node, other, nodes, network):
     require(result["principal"]["can_manage"] and result["view"]["epoch"] > view["epoch"],
             "root recovery establishes an independent manager in a higher epoch")
     require(other.rpc("conversations")["conversations"], "recovering identity preserves stored business history")
+    rejected = node.client.command("request", method="directory", check=False)
+    if rejected["ok"]:
+        require(rejected["result"].get("error") and not rejected["result"].get("result"),
+                "recovered epoch rejects the old client's already-open channel")
+    else:
+        require("closed" in rejected.get("error", "").lower(),
+                "old authorization is explicitly rejected or disconnected")
     node.client.connect()
     node.client.call("authenticate", {"network_id": network}, status=403)
     for peer in nodes:
@@ -826,6 +847,7 @@ def acceptance(options):
         a.start()
         a.client.connect(a.node_id)
         a.client.call("rpc", {"method": "nodes"}, status=401)
+        a.client.call("directory", status=401)
         for path in ("/api/register", "/api/login", "/api/rpc"):
             a.client.request(path, {}, status=404)
         network = a.bootstrap()
