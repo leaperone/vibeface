@@ -184,9 +184,9 @@ impl NetworkSocket {
     pub fn server(socket: WebSocket) -> Self {
         Self::Server(socket)
     }
-    fn route(&self) -> Option<&str> {
+    pub fn route(&self) -> Option<String> {
         match self {
-            Self::Routed(_, route) => Some(route),
+            Self::Routed(_, route) => Some(route.clone()),
             Self::Limited(socket, _) => socket.route(),
             _ => None,
         }
@@ -414,6 +414,25 @@ impl NetworkHub {
         }
     }
 
+    async fn open(&self, url: &str) -> Result<(NetworkSocket, String)> {
+        let permit = self
+            .sockets
+            .clone()
+            .try_acquire_owned()
+            .context("network socket capacity reached")?;
+        let (socket, nonce) = open_control(url).await?;
+        Ok((NetworkSocket::Limited(Box::new(socket), permit), nonce))
+    }
+    async fn connect_path(&self, url: &str, control: Control) -> Result<NetworkSocket> {
+        let (mut socket, _) = self.open(url).await?;
+        send_control(&mut socket, &control).await?;
+        ensure!(
+            matches!(receive_control(&mut socket).await?, Control::Ready),
+            "network path was not ready"
+        );
+        Ok(socket)
+    }
+
     async fn lookup_local(&self, target: &str) -> Result<Option<Reachability>> {
         if target == self.identity.node_id()? {
             return Ok(Some(self.local_record().await?));
@@ -474,7 +493,7 @@ impl NetworkHub {
             records.push(record);
         }
         let queries = self.config.bootstrap_urls.iter().map(|url| async move {
-            let mut socket = open_control(url).await?.0;
+            let mut socket = self.open(url).await?.0;
             send_control(
                 &mut socket,
                 &Control::Lookup {
@@ -520,7 +539,8 @@ impl NetworkHub {
             (urls, state.failed_routes.clone())
         };
         let mut seen = HashSet::new();
-        if let Some(socket) = dial_direct(cached, target, service, &failures, &mut seen).await {
+        if let Some(socket) = dial_direct(self, cached, target, service, &failures, &mut seen).await
+        {
             return Ok(socket);
         }
         let records = self.resolve(target).await?;
@@ -528,7 +548,8 @@ impl NetworkHub {
             .iter()
             .flat_map(|record| record.direct_urls.clone())
             .collect();
-        if let Some(socket) = dial_direct(direct, target, service, &failures, &mut seen).await {
+        if let Some(socket) = dial_direct(self, direct, target, service, &failures, &mut seen).await
+        {
             return Ok(socket);
         }
         let mut seen = HashSet::new();
@@ -542,22 +563,23 @@ impl NetworkHub {
             if failures.contains_key(&(target.to_owned(), route.clone())) {
                 continue;
             }
-            if let Ok(socket) = connect_service(
-                url,
-                Control::Dial {
-                    target: target.to_owned(),
-                    service,
-                },
-            )
-            .await
+            if let Ok(socket) = self
+                .connect_path(
+                    url,
+                    Control::Dial {
+                        target: target.to_owned(),
+                        service,
+                    },
+                )
+                .await
             {
                 return Ok(NetworkSocket::Routed(Box::new(socket), route));
             }
         }
         bail!("node has no reachable direct or relay path")
     }
-    pub async fn report_failure(&self, target: &str, socket: &NetworkSocket) {
-        if let Some(route) = socket.route() {
+    pub async fn report_failure(&self, target: &str, route: Option<String>) {
+        if let Some(route) = route {
             let mut state = self.state.lock().await;
             state
                 .failed_routes
@@ -565,7 +587,7 @@ impl NetworkHub {
             if state.failed_routes.len() < 1024 {
                 state
                     .failed_routes
-                    .insert((target.to_owned(), route.to_owned()), Instant::now());
+                    .insert((target.to_owned(), route), Instant::now());
             }
         }
     }
@@ -720,7 +742,7 @@ impl NetworkHub {
     async fn maintain_relay(self: Arc<Self>, url: &str) -> Result<()> {
         // Publication works even when the chosen rendezvous declines public relay service.
         self.publish_at(url).await?;
-        let (mut socket, nonce) = open_control(url).await?;
+        let (mut socket, nonce) = self.open(url).await?;
         let node_id = self.identity.node_id()?;
         let signature = self.identity.sign_payload(
             "relay-reserve",
@@ -774,8 +796,7 @@ impl NetworkHub {
                                 let hub = self.clone();
                                 let url = url.to_owned();
                                 tokio::spawn(async move {
-                                    let _permit = permit;
-                                    if let Err(error) = hub.attach(&url, token, service).await { tracing::debug!(%error, "relay attachment failed"); }
+                                    if let Err(error) = hub.attach(&url, token, service, permit).await { tracing::debug!(%error, "relay attachment failed"); }
                                 });
                             }
                             _ => bail!("invalid relay reservation message"),
@@ -788,7 +809,7 @@ impl NetworkHub {
         result
     }
     async fn publish_at(&self, url: &str) -> Result<()> {
-        let (mut socket, _) = open_control(url).await?;
+        let (mut socket, _) = self.open(url).await?;
         send_control(
             &mut socket,
             &Control::Publish {
@@ -802,8 +823,15 @@ impl NetworkHub {
         );
         Ok(())
     }
-    async fn attach(&self, url: &str, token: String, service: Service) -> Result<()> {
-        let (mut socket, nonce) = open_control(url).await?;
+    async fn attach(
+        &self,
+        url: &str,
+        token: String,
+        service: Service,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<()> {
+        let (socket, nonce) = open_control(url).await?;
+        let mut socket = NetworkSocket::Limited(Box::new(socket), permit);
         let signature = self.identity.sign_payload(
             "relay-attach",
             &serde_json::to_vec(&AttachmentProof {
@@ -971,6 +999,7 @@ async fn relay_frame(
     }
 }
 async fn dial_direct(
+    hub: &NetworkHub,
     urls: Vec<String>,
     target: &str,
     service: Service,
@@ -986,7 +1015,7 @@ async fn dial_direct(
         if failures.contains_key(&(target.to_owned(), route.clone())) {
             continue;
         }
-        if let Ok(socket) = connect_service(&url, Control::Direct { service }).await {
+        if let Ok(socket) = hub.connect_path(&url, Control::Direct { service }).await {
             return Some(NetworkSocket::Routed(Box::new(socket), route));
         }
     }
@@ -1247,11 +1276,15 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert_eq!(target.sockets.available_permits(), MAX_SOCKETS - 1);
         let mut caller_socket = caller.dial(&target_id, Service::Client).await?;
         let mut incoming = target_incoming
             .recv()
             .await
             .context("missing reverse relay socket")?;
+        tokio::task::yield_now().await;
+        assert_eq!(target.sockets.available_permits(), MAX_SOCKETS - 2);
+        assert_eq!(caller.sockets.available_permits(), MAX_SOCKETS - 1);
         assert_eq!(incoming.service, Service::Client);
         assert_ne!(relay_identity.node_id()?, target_id);
         assert_ne!(relay_identity.node_id()?, caller_identity.node_id()?);
@@ -1320,6 +1353,27 @@ mod tests {
                 .unwrap(),
             b"complete"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_socket_capacity_is_held_until_the_application_channel_drops() -> Result<()> {
+        let mut tasks = JoinSet::new();
+        let (mut hub, mut incoming) =
+            NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        Arc::get_mut(&mut hub)
+            .context("test hub was shared")?
+            .sockets = Arc::new(Semaphore::new(1));
+        let url = serve(hub.clone(), &mut tasks).await?;
+        let first = connect_direct(&url, Service::Client).await?;
+        let held = incoming.recv().await.context("missing accepted channel")?;
+        assert_eq!(hub.sockets.available_permits(), 0);
+        assert!(connect_direct(&url, Service::Client).await.is_err());
+        drop(held);
+        drop(first);
+        assert_eq!(hub.sockets.available_permits(), 1);
+        let _next = connect_direct(&url, Service::Client).await?;
+        assert!(incoming.recv().await.is_some());
         Ok(())
     }
 

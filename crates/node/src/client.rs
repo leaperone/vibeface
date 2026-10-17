@@ -342,7 +342,7 @@ async fn dispatch(
             let view = manager_view(node, session).await?;
             let capability = random_hex();
             let kind: IdentityKind = from_field(&params, "kind")?;
-            let mut roles = params
+            let mut roles: Vec<crate::model::NodeRole> = params
                 .get("node_roles")
                 .map(|v| serde_json::from_value(v.clone()))
                 .transpose()?

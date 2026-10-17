@@ -395,7 +395,7 @@ impl PeerHub {
                 Ok(Ok((peer, channel))) => {
                     return self.connected(socket, network, peer, true, channel).await;
                 }
-                _ => transport.report_failure(&target, &socket).await,
+                _ => transport.report_failure(&target, socket.route()).await,
             }
         }
         bail!("no authenticated peer path available")
