@@ -1114,7 +1114,7 @@ table "execution_handoff_challenges" {
     ref_columns = [table.spaces.column.space_id]
   }
   check {
-    expr = "(stage IN ('admit','start','renew'))"
+    expr = "(stage IN ('admit','start','renew','remote_read'))"
   }
   check {
     expr = "(expires_at_ms >= 0)"
