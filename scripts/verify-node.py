@@ -686,9 +686,9 @@ def fixture_executor(arguments):
     gate = request.get("gate")
     if gate:
         while not Path(gate).exists():
-            print(json.dumps({"type": "assistant", "session_id": native,
-                              "message": {"role": "assistant", "content": [
-                                  {"type": "text", "text": request["label"] + ":working"}]}}), flush=True)
+            print(json.dumps({"type": "stream_event", "session_id": native,
+                              "event": {"type": "content_block_delta", "index": 0, "delta": {
+                                  "type": "text_delta", "text": request["label"] + ":working"}}}), flush=True)
             time.sleep(0.2)
     result = "x" * request.get("result_size", 0) or "fixture terminal result"
     print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
