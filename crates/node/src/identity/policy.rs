@@ -25,6 +25,34 @@ pub(crate) fn request_facts_from(
     body: &Value,
     audience: &Audience,
 ) -> Result<RequestFacts> {
+    ensure!(
+        ["execution_resource", "target_public_key", "execution_grant"]
+            .iter()
+            .all(|field| body.get(*field).is_none()),
+        "remote execution requires a verified destination"
+    );
+    request_facts_impl(connection, policies, body, audience, None)
+}
+
+pub(crate) fn request_execution_dispatch_facts_from(
+    connection: &Connection,
+    policies: &VerifiedPolicySet,
+    body: &Value,
+    audience: &Audience,
+    destination: &vibeface_secure::authorization::prepare::VerifiedExecutionDestination,
+) -> Result<RequestFacts> {
+    let facts = request_facts_impl(connection, policies, body, audience, Some(destination))?;
+    destination.check_facts(&facts)?;
+    Ok(facts)
+}
+
+fn request_facts_impl(
+    connection: &Connection,
+    policies: &VerifiedPolicySet,
+    body: &Value,
+    audience: &Audience,
+    destination: Option<&vibeface_secure::authorization::prepare::VerifiedExecutionDestination>,
+) -> Result<RequestFacts> {
     let text = |field: &str| -> Result<&str> {
         let value = body[field]
             .as_str()
@@ -249,10 +277,19 @@ pub(crate) fn request_facts_from(
     }
     if let Some(request) = &request {
         context.execution_session = Some(SessionRef {
-            target: audience.device.clone(),
+            target: destination
+                .map_or(&audience.device, |value| &value.audience().device)
+                .clone(),
             session_id: request.session_id.clone(),
         });
         context.executor_kind = request.action["executor"].as_str().map(str::to_owned);
+        if context.executor_kind.is_none() && destination.is_some() {
+            context.executor_kind = request
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.binding.open_spec["executor"].as_str())
+                .map(str::to_owned);
+        }
         if context.executor_kind.is_none() {
             let encoded: Option<String> = connection.query_row(
                 "SELECT record FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",
@@ -268,21 +305,38 @@ pub(crate) fn request_facts_from(
                 context.executor_kind = Some(session.executor);
             }
         }
-        let key: String = connection.query_row(
-            "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
-            params![space.as_str(), request.target_node],
-            |row| row.get(0),
-        )?;
-        ensure!(
-            DeviceId::from_key(&PublicKey::parse(&key)?) == audience.device,
-            "operation targets another device"
-        );
+        if let Some(destination) = destination {
+            ensure!(
+                crate::crypto::fingerprint(destination.public_key().as_str())?
+                    == request.target_node,
+                "operation targets another execution destination"
+            );
+        } else {
+            let key: String = connection.query_row(
+                "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
+                params![space.as_str(), request.target_node],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                DeviceId::from_key(&PublicKey::parse(&key)?) == audience.device,
+                "operation targets another device"
+            );
+        }
     } else if matches!(method, "bind_execution" | "rebind_execution") {
-        let target_key: String = connection.query_row(
-            "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
-            params![space.as_str(), text("target_node")?],
-            |row| row.get(0),
-        )?;
+        let target_key: String = if let Some(destination) = destination {
+            ensure!(
+                crate::crypto::fingerprint(destination.public_key().as_str())?
+                    == text("target_node")?,
+                "binding targets another execution destination"
+            );
+            destination.public_key().to_string()
+        } else {
+            connection.query_row(
+                "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
+                params![space.as_str(), text("target_node")?],
+                |row| row.get(0),
+            )?
+        };
         context.execution_session = Some(SessionRef {
             target: DeviceId::from_key(&PublicKey::parse(&target_key)?),
             session_id: text("session_id")?.to_owned(),
@@ -357,6 +411,12 @@ pub(crate) fn request_facts_from(
     let workspace = request
         .as_ref()
         .and_then(|request| request.action["cwd"].as_str())
+        .or_else(|| {
+            destination
+                .and(request.as_ref())
+                .and_then(|request| request.binding.as_ref())
+                .and_then(|binding| binding.binding.open_spec["cwd"].as_str())
+        })
         .or_else(|| {
             matches!(method, "bind_execution" | "rebind_execution")
                 .then(|| body["cwd"].as_str())

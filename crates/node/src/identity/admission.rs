@@ -135,13 +135,62 @@ pub(crate) fn consume_authorization_in(
     operation_id: Option<&str>,
     now_ms: u64,
 ) -> Result<AdmissionProof> {
+    let facts = request_facts_from(tx, policy.verified(), source_body, auth.audience())?;
+    consume_authorization_with_facts_in(
+        tx,
+        policy,
+        auth,
+        proof,
+        transport,
+        source_body,
+        operation_id,
+        now_ms,
+        &facts,
+    )
+}
+
+pub(crate) fn consume_execution_dispatch_in(
+    tx: &Transaction<'_>,
+    policy: &PolicyState,
+    auth: &VerifiedAuthorization,
+    proof: &FreshnessProof,
+    transport: &TransportEvidence,
+    source_body: &Value,
+    operation_id: Option<&str>,
+    now_ms: u64,
+    dispatch: &super::execution_dispatch::VerifiedDispatchFacts,
+) -> Result<AdmissionProof> {
+    let facts = dispatch.revalidate(tx, policy, source_body, auth.audience(), now_ms)?;
+    consume_authorization_with_facts_in(
+        tx,
+        policy,
+        auth,
+        proof,
+        transport,
+        source_body,
+        operation_id,
+        now_ms,
+        &facts,
+    )
+}
+
+fn consume_authorization_with_facts_in(
+    tx: &Transaction<'_>,
+    policy: &PolicyState,
+    auth: &VerifiedAuthorization,
+    proof: &FreshnessProof,
+    transport: &TransportEvidence,
+    source_body: &Value,
+    operation_id: Option<&str>,
+    now_ms: u64,
+    facts: &RequestFacts,
+) -> Result<AdmissionProof> {
     let state = policy.verified();
     source_matches(auth, source_body)?;
     if source_body["method"] != "agent_start" {
         check_manager_tool_in(tx, policy, auth, transport, now_ms)?;
     }
     let signed = auth.signed_invocation();
-    let facts = request_facts_from(tx, state, source_body, auth.audience())?;
     let checked = state.verify_invocation(signed, &facts, transport, now_ms)?;
     ensure!(
         checked.invocation_hash() == auth.invocation_hash(),
@@ -749,7 +798,7 @@ fn operation_from(
     .transpose()
 }
 
-fn validate_basis_in(connection: &Connection, request: &OperationRequest) -> Result<()> {
+pub(crate) fn validate_basis_in(connection: &Connection, request: &OperationRequest) -> Result<()> {
     validate_operation_binding_from(connection, request)?;
     let events = load_events_from(connection, &request.network_id)?;
     let heads = if request.basis_heads.is_empty() {

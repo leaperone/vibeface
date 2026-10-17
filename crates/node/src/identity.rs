@@ -5,6 +5,7 @@ pub use vibeface_secure::membership::*;
 pub(crate) mod admission;
 pub(crate) mod enrollment_store;
 pub(crate) mod event_authorization;
+pub(crate) mod execution_dispatch;
 pub mod execution_handoff;
 pub(crate) mod governance_store;
 pub(crate) mod journal;
