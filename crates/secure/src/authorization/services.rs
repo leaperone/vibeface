@@ -98,6 +98,21 @@ impl VerifiedPolicySet {
             &mut dependencies,
             &mut BTreeSet::new(),
         )?;
+        if let Some(session) = &facts.context.execution_session {
+            let target = self.find_device(&session.target)?;
+            require(
+                matches!(target.payload.subject, Actor::Service(_))
+                    && target.payload.uses.contains(&DeviceUse::Noise),
+                "execution target is not a service",
+            )?;
+            self.validate_certificate(
+                target,
+                now_ms,
+                &mut budget,
+                &mut dependencies,
+                &mut BTreeSet::new(),
+            )?;
+        }
         let path = self.grant_chain(Some(grant_leaf))?;
         let (initiating, _) =
             self.verify_grant_path(&path, now_ms, &mut budget, &mut dependencies, true)?;
@@ -209,10 +224,14 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = key(1);
-            let user = key(3);
-            let node = key(4);
-            let nonce = Nonce::from_bytes([5; 32]);
+            Self::with_keys(0, NOW + 1_000_000)
+        }
+
+        fn with_keys(offset: u8, expires_at_ms: u64) -> Self {
+            let root = key(1 + offset);
+            let user = key(3 + offset);
+            let node = key(4 + offset);
+            let nonce = Nonce::from_bytes([5 + offset; 32]);
             let claim = bootstrap::create_node_claim(
                 &node,
                 nonce.as_str(),
@@ -229,10 +248,10 @@ mod tests {
             .unwrap();
             let prepared = bootstrap::prepare_account_creation(
                 &root,
-                &key(2),
+                &key(2 + offset),
                 &user,
                 &claim,
-                (NOW + 1_000_000) as f64,
+                expires_at_ms as f64,
                 NOW as f64,
             )
             .unwrap();
@@ -424,6 +443,114 @@ mod tests {
         assert_eq!(proof.initiating_grant(), Some(&fixture.service_grant));
         assert_eq!(proof.account_grant.as_ref(), Some(&fixture.owner_grant));
         assert!(proof.expires_at_ms() > NOW + 100_000);
+    }
+
+    #[test]
+    fn remote_execution_target_closes_service_descriptor_dependencies() {
+        let mut fixture = Fixture::new();
+        let remote = Fixture::with_keys(20, NOW + 1_000);
+        assert_ne!(fixture.account, remote.account);
+        let remote_domain = PolicyDomain::Account(remote.account.clone());
+        let remote_head = remote.state.head(&remote_domain).unwrap().clone();
+        fixture.state.accounts.extend(remote.state.accounts);
+        fixture.state.devices.extend(remote.state.devices);
+        fixture.state.roots.extend(remote.state.roots);
+        let parent = fixture.parent(&fixture.owner_grant, NOW);
+        let mut facts = fixture.agent_facts();
+        facts.context.execution_session = Some(SessionRef {
+            target: DeviceId::from_key(&PublicKey::of(&remote.node)),
+            session_id: "remote-execution".into(),
+        });
+        let proof = fixture
+            .state
+            .verify_service_grant(
+                &fixture.audience().service,
+                &fixture.service_grant,
+                &facts,
+                NOW,
+            )
+            .unwrap();
+        assert!(proof.heads().contains(&remote_head));
+        assert_eq!(proof.expires_at_ms(), NOW + 1_000);
+        let delegated = fixture
+            .state
+            .verify_service_delegation(
+                &parent,
+                &fixture.audience().service,
+                &fixture.service_grant,
+                &facts,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(delegated.heads(), proof.heads());
+        let invocation = Signed::sign(
+            Invocation {
+                version: AUTH_VERSION,
+                actor: Actor::Service(proof.service().clone()),
+                device: proof.device().clone(),
+                initiator: proof.initiator().clone(),
+                initiating_grant: proof.initiating_grant().cloned(),
+                resource: facts.resource.clone(),
+                action: facts.action,
+                audience: facts.audience.clone(),
+                presenter: proof.device().clone(),
+                operation_id: facts.operation_id.clone(),
+                body_hash: facts.body_hash.clone(),
+                grant_leaf: proof.grant_leaf().clone(),
+                expected_policies: proof.heads().to_vec(),
+                context: facts.context.clone(),
+                nonce: Nonce::from_bytes([33; 32]),
+                not_before_ms: NOW,
+                expires_at_ms: proof.expires_at_ms(),
+            },
+            &fixture.node,
+        )
+        .unwrap();
+        let transport = TransportEvidence::LocalAgentAdapter {
+            service: proof.service().clone(),
+            session: facts.context.sdk_session.clone().unwrap(),
+        };
+        let verified = fixture
+            .state
+            .verify_invocation(&invocation, &facts, &transport, NOW)
+            .unwrap();
+        assert_eq!(verified.dependencies(), proof.heads());
+        assert_eq!(
+            fixture
+                .state
+                .verify_service_grant(
+                    &fixture.audience().service,
+                    &fixture.service_grant,
+                    &facts,
+                    NOW + 1_000,
+                )
+                .unwrap_err(),
+            AuthorizationError::Expired
+        );
+        for (target, error) in [
+            (
+                DeviceId::from_key(&PublicKey::of(&remote.user)),
+                AuthorizationError::InvalidProof("execution target is not a service"),
+            ),
+            (
+                DeviceId::from_key(&PublicKey::of(&key(80))),
+                AuthorizationError::Revoked,
+            ),
+        ] {
+            facts.context.execution_session.as_mut().unwrap().target = target;
+            assert_eq!(
+                fixture
+                    .state
+                    .verify_service_grant(
+                        &fixture.audience().service,
+                        &fixture.service_grant,
+                        &facts,
+                        NOW,
+                    )
+                    .unwrap_err(),
+                error
+            );
+        }
     }
 
     #[test]
