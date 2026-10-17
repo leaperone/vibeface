@@ -441,14 +441,17 @@ pub fn prepare_remote_execution_share(
                             | Action::OperationResolve
                     )
                 })
-                && actions.contains(&Action::ExecutionResolve)
-                    == actions.contains(&Action::OperationResolve)
-                && actions
-                    .iter()
-                    .any(|action| *action != Action::ExecutionSubmit),
-            "execution sharing actions must be concrete and resolution capabilities must be paired",
+                && (actions == [Action::ExecutionResolve, Action::OperationResolve]
+                    || (!actions.contains(&Action::ExecutionResolve)
+                        && !actions.contains(&Action::OperationResolve)
+                        && actions
+                            .iter()
+                            .any(|action| *action != Action::ExecutionSubmit))),
+            "execution sharing needs execution actions or the exact resolution pair",
         )?;
-        if !actions.contains(&Action::ExecutionSubmit) {
+        if !actions.contains(&Action::ExecutionResolve)
+            && !actions.contains(&Action::ExecutionSubmit)
+        {
             actions.push(Action::ExecutionSubmit);
             actions.sort();
         }
@@ -871,6 +874,49 @@ mod tests {
     ) -> serde_json::Value {
         serde_json::json!({"requestJson":encode(envelope).unwrap(),"executionResourceId":resource.resource,"canonicalCwd":"/configured/workspace","actions":["execution_send"],"expiresAt":END})
     }
+    fn commit_share(
+        prepared: &PreparedRemoteExecutionShare,
+        pins: &[PolicyPin],
+        bundle: &ClientAuthorizationBundle,
+    ) -> String {
+        let challenge_json = issue_space_governance_challenge(
+            &prepared.request_json().unwrap(),
+            &key(14),
+            &encode(&pins).unwrap(),
+            &encode(&bundle).unwrap(),
+            NOW as f64,
+        )
+        .unwrap();
+        let challenge: Signed<PolicyCommit> = serde_json::from_str(&challenge_json).unwrap();
+        let receipts: Vec<_> = challenge
+            .payload
+            .dependencies
+            .iter()
+            .map(|head| {
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: head.clone(),
+                        challenge_hash: challenge.challenge_hash().unwrap(),
+                        issued_at_ms: NOW,
+                        expires_at_ms: challenge.payload.expires_at_ms,
+                    },
+                    &key(14),
+                )
+                .unwrap()
+            })
+            .collect();
+        accept_space_governance_change(
+            &prepared.request_json().unwrap(),
+            &challenge_json,
+            &encode(&receipts).unwrap(),
+            &key(14),
+            &encode(&pins).unwrap(),
+            &encode(&bundle).unwrap(),
+            NOW as f64,
+        )
+        .unwrap()
+    }
     #[test]
     fn signed_task_request_produces_a_current_exact_non_delegable_share_and_keeps_management_leaf()
     {
@@ -945,43 +991,7 @@ mod tests {
                 .unwrap()
                 .contains("/configured/workspace")
         );
-        let challenge_json = issue_space_governance_challenge(
-            &prepared.request_json().unwrap(),
-            &key(14),
-            &encode(&pins).unwrap(),
-            &encode(&bundle).unwrap(),
-            NOW as f64,
-        )
-        .unwrap();
-        let challenge: Signed<PolicyCommit> = serde_json::from_str(&challenge_json).unwrap();
-        let receipts: Vec<_> = challenge
-            .payload
-            .dependencies
-            .iter()
-            .map(|head| {
-                Signed::sign(
-                    FreshnessReceipt {
-                        version: AUTH_VERSION,
-                        current: head.clone(),
-                        challenge_hash: challenge.challenge_hash().unwrap(),
-                        issued_at_ms: NOW,
-                        expires_at_ms: challenge.payload.expires_at_ms,
-                    },
-                    &key(14),
-                )
-                .unwrap()
-            })
-            .collect();
-        let committed = accept_space_governance_change(
-            &prepared.request_json().unwrap(),
-            &challenge_json,
-            &encode(&receipts).unwrap(),
-            &key(14),
-            &encode(&pins).unwrap(),
-            &encode(&bundle).unwrap(),
-            NOW as f64,
-        )
-        .unwrap();
+        let committed = commit_share(&prepared, &pins, &bundle);
         let finished = finish_remote_execution_share(&prepared, &committed, NOW as f64).unwrap();
         let management: ClientAuthorizationBundle =
             serde_json::from_str(&finished.bundle_json().unwrap()).unwrap();
@@ -1010,6 +1020,41 @@ mod tests {
             std::fs::write(path,encode(&serde_json::json!({"source_pins":source_pins,"source_bundle":source_bundle,"request":envelope,
             "pins":pins,"bundle":bundle,"resource":resource,"intent":input,"prepared":request,"committed":serde_json::from_str::<serde_json::Value>(&committed).unwrap(),"share":share,"now":NOW,"end":END})).unwrap()).unwrap();
         }
+    }
+    #[test]
+    fn exact_resolution_pair_commits_and_finishes_without_execution_submission() {
+        let (source_pins, source_bundle, envelope) = request();
+        let (pins, bundle, resource) = execution();
+        let mut input = intent(&envelope, &resource);
+        input["actions"] = serde_json::json!(["operation_resolve", "execution_resolve"]);
+        let prepared = prepare_remote_execution_share(
+            &input.to_string(),
+            &key(13),
+            &encode(&pins).unwrap(),
+            &encode(&bundle).unwrap(),
+            &encode(&source_pins).unwrap(),
+            &encode(&source_bundle).unwrap(),
+            NOW as f64,
+        )
+        .unwrap();
+        let request: SpaceGovernanceRequest =
+            serde_json::from_str(&prepared.request_json().unwrap()).unwrap();
+        let [JournalEntry::Grant(grant)] = request.new_objects.as_slice() else {
+            panic!("one exact resolver grant");
+        };
+        assert_eq!(
+            grant.payload.actions,
+            [Action::ExecutionResolve, Action::OperationResolve]
+        );
+        assert_eq!(grant.payload.remaining_delegations, 0);
+        assert_eq!(grant.payload.scope, ResourceScope::Exact(resource));
+        assert_eq!(grant.payload.expires_at_ms, END);
+        let committed = commit_share(&prepared, &pins, &bundle);
+        let finished = finish_remote_execution_share(&prepared, &committed, NOW as f64).unwrap();
+        let share: serde_json::Value =
+            serde_json::from_str(&finished.share_json().unwrap()).unwrap();
+        assert_eq!(share["selection"]["execution_grant"], prepared.grant_hash());
+        assert_eq!(share["authorization"]["grant_leaf"], prepared.grant_hash());
     }
     #[test]
     fn request_and_producer_reject_untrusted_sources_forgery_scope_substitution_and_permission_expansion()
@@ -1081,6 +1126,13 @@ mod tests {
             serde_json::json!(["execution_resolve"]),
             serde_json::json!(["operation_resolve"]),
             serde_json::json!(["execution_submit"]),
+            serde_json::json!(["execution_resolve", "operation_resolve", "execution_submit"]),
+            serde_json::json!(["execution_resolve", "operation_resolve", "execution_send"]),
+            serde_json::json!([
+                "execution_resolve",
+                "operation_resolve",
+                "operation_status_read"
+            ]),
             serde_json::json!(["execution_send", "execution_send"]),
         ] {
             let mut input = intent(&envelope, &resource);
