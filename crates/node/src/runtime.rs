@@ -1162,16 +1162,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn completion_requires_the_exact_persisted_turn_even_after_unknown() -> Result<()> {
+    async fn completion_requires_the_exact_persisted_turn_and_preserves_unknown() -> Result<()> {
         let (network, node) = runtime_fixture().await?;
         let request = queued(&network, &node, "uncertain", "codex").await?;
         claim(&network, &node, &request).await?;
-        node.finish(
-            &request,
-            OperationState::Unknown,
-            json!({"error":"start response lost"}),
-        )
-        .await?;
         node.observe_engine(derived_result(
             network.space.as_str(),
             &network.resource,
@@ -1181,7 +1175,7 @@ pub(crate) mod tests {
         .await?;
         assert_eq!(
             operation(&network, &node, "uncertain").await?.state,
-            OperationState::Unknown
+            OperationState::Running
         );
         node.store.lock().await.local_set(
             network.space.as_str(),
@@ -1197,7 +1191,7 @@ pub(crate) mod tests {
         .await?;
         assert_eq!(
             operation(&network, &node, "uncertain").await?.state,
-            OperationState::Unknown
+            OperationState::Running
         );
         let mut wrong = derived_result(
             network.space.as_str(),
@@ -1209,7 +1203,7 @@ pub(crate) mod tests {
         assert!(node.observe_engine(wrong).await.is_err());
         assert_eq!(
             operation(&network, &node, "uncertain").await?.state,
-            OperationState::Unknown
+            OperationState::Running
         );
         node.observe_engine(derived_result(
             network.space.as_str(),
@@ -1222,6 +1216,29 @@ pub(crate) mod tests {
             operation(&network, &node, "uncertain").await?.state,
             OperationState::Succeeded
         );
+        let request = queued(&network, &node, "late-result", "codex").await?;
+        claim(&network, &node, &request).await?;
+        node.finish(
+            &request,
+            OperationState::Unknown,
+            json!({"error":"start response lost"}),
+        ).await?;
+        node.store.lock().await.local_set(
+            network.space.as_str(),
+            "turn:late-result",
+            &json!({"turn":{"id":"late-turn"}}),
+        )?;
+        let before = operation(&network, &node, "late-result").await?;
+        let changes = node.store.lock().await.connection.total_changes();
+        node.observe_engine(derived_result(
+            network.space.as_str(),
+            &network.resource,
+            &request,
+            "late-turn",
+        )).await?;
+        node.finish(&request, OperationState::Succeeded, json!({"late":true})).await?;
+        assert_eq!(operation(&network, &node, "late-result").await?, before);
+        assert_eq!(node.store.lock().await.connection.total_changes(), changes);
         Ok(())
     }
 
@@ -4172,6 +4189,9 @@ impl Runtime {
             .await
             .operation(&request.network_id, &request.operation_id)?
             .context("completed operation is missing")?;
+        if current.state == OperationState::Unknown && state.terminal() {
+            return Ok(());
+        }
         if state.terminal() && !current.state.terminal() {
             let context = execution_context(&*self.store.lock().await, request, 0)?;
             let affected = self.engine.affected_operations(&context).await;
@@ -4617,7 +4637,7 @@ impl Runtime {
                 "session_id":request.session_id,"event":event,
             }),
         });
-        if method == "turn/completed" {
+        if method == "turn/completed" && operation.state == OperationState::Running {
             let turn = field(&event["params"]["turn"], "id")?;
             let known = self
                 .store
