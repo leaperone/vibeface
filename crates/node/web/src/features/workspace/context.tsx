@@ -1,7 +1,7 @@
 "use client"
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
-import type { ReadyConnection } from "@/lib/node"
+import type { ReadyConnection, RpcFacts } from "@/lib/node"
 import { same } from "@/lib/node"
 import { nodeFingerprint } from "../../../generated/vibeface_secure.js"
 import { verifyExecutionBinding, verifyTaskCreation } from "@/lib/task-proof"
@@ -278,10 +278,34 @@ function useWorkspaceState(connection: ReadyConnection) {
     inFlight.current.add(key)
     try { return await work() } finally { inFlight.current.delete(key) }
   }
+  const executionScope = (task: TaskRecord, request: Pick<OperationRequest, "conversation_id" | "task_id" | "target_node" | "session_id">, open: Extract<OperateAction, { type: "open" }>, proof: unknown) => {
+    const { taskRef } = verifyTask(task, request.conversation_id)
+    const binding = verifyExecutionBinding(connection, task, request, open, proof)
+    return {
+      params: {
+        conversation_id: request.conversation_id, task_id: task.task_id, task_ref: taskRef,
+        target_node: request.target_node, session_id: request.session_id, binding,
+        executor: open.executor, cwd: open.cwd, binding_generation: 1,
+      },
+      facts: { taskRef, execution: { sessionId: request.session_id, executorKind: open.executor, canonicalCwd: open.cwd, bindingGeneration: 1 } } satisfies RpcFacts,
+    }
+  }
+  const operationScope = (request: OperationRequest) => {
+    const context = requireContext(request.conversation_id)
+    if (request.space_id !== spaceId) throw new Error("原操作属于其他空间，已保留待核对记录。")
+    const task = context.tasks.find(item => item.task_id === request.task_id)
+    if (!task) throw new Error("原操作缺少已验证的工单，请先读取原会话。")
+    if (request.action.type === "open") return executionScope(task, request, request.action, request.binding)
+    const session = context.sessions.find(item => item.target_node === request.target_node && item.session_id === request.session_id && item.task_id === task.task_id)
+    if (!session) throw new Error("原操作缺少已验证的执行会话，请先读取原会话。")
+    const scope = executionScope(task, request, { type: "open", executor: session.executor, cwd: session.cwd }, request.binding)
+    if (!same(scope.params.binding, session.binding)) throw new Error("原操作绑定与当前执行会话不同，已保留待核对记录。")
+    return scope
+  }
   const sendOperation = async (request: OperationRequest, pendingBindingId?: string) => {
-    requireContext(request.conversation_id)
+    const scope = operationScope(request)
     replacePending([...pendingRef.current, { space_id: request.space_id, operation_id: request.operation_id, target_node: request.target_node, session_id: request.session_id, conversation_id: request.conversation_id, request }])
-    const result = parseOperation(record(await connection.rpc("operate", { request })).operation)
+    const result = parseOperation(record(await connection.rpc("operate", { request, task_ref: scope.params.task_ref }, scope.facts)).operation)
     requireCurrent()
     if (!same(record(result.raw).request, request)) throw new Error("响应操作与原请求不一致，请核对原操作。")
     if (pendingBindingId && result.state !== "unknown") replaceBindings(bindingsRef.current.filter(item => item.request.operation_id !== pendingBindingId))
@@ -296,6 +320,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     if (!currentTask || !same(currentTask.task_creation, task.task_creation)) throw new Error("原工单创建证明已变化，请保留待核对绑定并核查。")
     if (["accepted", "cancelled"].includes(currentTask.status)) throw new Error("工单已结束，已保留原绑定记录，请先核对工单状态。")
     const creation = verifyTask(task, request.conversation_id)
+    if (request.target_node !== nodeFingerprint(connection.audiencePublicKey)) throw new Error("执行目标与已验证的项目设备不同。请连接目标设备后再操作。")
     let proof: unknown = currentTask.binding
     if (proof === null) {
       const reply = await connection.rpcWithProof("bind_execution", {
@@ -305,7 +330,7 @@ function useWorkspaceState(connection: ReadyConnection) {
         if (pendingBinding.attempt && !same(pendingBinding.attempt.body, attempt.body)) throw new Error("绑定重试的签名内容与原请求不同，请先核对。")
         const next = { ...pendingBinding, attempt }
         replaceBindings(bindingsRef.current.map(item => item.request.operation_id === request.operation_id ? next : item))
-      })
+      }, { taskRef: creation.taskRef, execution: { sessionId: request.session_id, executorKind: request.action.executor, canonicalCwd: request.action.cwd } })
       requireContext(request.conversation_id)
       proof = record(reply.result).binding
     }
@@ -384,8 +409,10 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (activeId.current === id) await refreshRef.current()
     }),
     updateTask: (id: string, taskId: string, status: string, detail: string) => withMutation(`update-task:${taskId}`, async () => {
-      requireContext(id)
-      await connection.rpc("update_task", { conversation_id: id, task_id: taskId, status, detail })
+      const context = requireContext(id), task = context.tasks.find(item => item.task_id === taskId)
+      if (!task) throw new Error("先选择已创建并验证的工单。")
+      const { taskRef } = verifyTask(task, id)
+      await connection.rpc("update_task", { conversation_id: id, task_id: taskId, task_ref: taskRef, status, detail }, { taskRef })
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),
@@ -425,6 +452,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     }),
     operate: (target: { target_node: string; session_id: string; task_id: string; revision?: number }, action: OperateAction, id: string) => withMutation(`operate:${target.target_node}:${target.session_id}`, async () => {
       const context = requireContext(id)
+      if (target.target_node !== nodeFingerprint(connection.audiencePublicKey)) throw new Error("执行目标与已验证的项目设备不同。请连接目标设备后再操作。")
       if (pendingRef.current.some((item) => item.conversation_id === id && item.target_node === target.target_node && (action.type === "open" || item.session_id === target.session_id))) throw new Error("此设备有尚未确认的操作，请先核对原操作。")
       const session = context.sessions.find((item) => item.target_node === target.target_node && item.session_id === target.session_id)
       const task = context.tasks.find(item => item.task_id === target.task_id)
@@ -455,13 +483,16 @@ function useWorkspaceState(connection: ReadyConnection) {
     },
     reconcile: async (operation: PendingOperation): Promise<ReconcileRecord> => {
       requireCurrent()
-      const result = parseReconcile(await connection.rpc("reconcile", { target_node: operation.target_node, operation_id: operation.operation_id }))
+      const original = pendingRef.current.find(item => item.operation_id === operation.operation_id)
+      if (!original || !same(original, operation)) throw new Error("原待核对记录已变化，请重新读取并核对。")
+      const scope = operationScope(original.request)
+      const result = parseReconcile(await connection.rpc("reconcile", { ...scope.params, operation_id: original.operation_id }, scope.facts))
       requireCurrent()
-      if (result.operation && !same(record(result.operation.raw).request, operation.request)) throw new Error("执行设备返回的完整请求与原操作不同，已保留待核对记录。")
-      if (reconcileDecision(result, operation) === "settled" && writer.current) {
-        removePending(operation.operation_id)
-        replaceBindings(bindingsRef.current.filter(item => item.request.operation_id !== operation.operation_id))
-        if (activeId.current === operation.conversation_id) await refreshRef.current()
+      if (result.operation && !same(record(result.operation.raw).request, original.request)) throw new Error("执行设备返回的完整请求与原操作不同，已保留待核对记录。")
+      if (reconcileDecision(result, original) === "settled" && writer.current) {
+        removePending(original.operation_id)
+        replaceBindings(bindingsRef.current.filter(item => item.request.operation_id !== original.operation_id))
+        if (activeId.current === original.conversation_id) await refreshRef.current()
       }
       return result
     },
@@ -471,8 +502,10 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (!operation || operation.conversation_id !== activeId.current) throw new Error("请先回到原操作的会话。")
       return withMutation(`operate:${operation.target_node}:${operation.session_id}`, async () => {
         if (nodeFingerprint(connection.audiencePublicKey) !== operation.target_node) throw new Error("请连接原执行设备，再读取完整会话并核对原操作。")
-        const result = parseReconcile(await connection.rpc("reconcile", { target_node: operation.target_node, operation_id: operation.operation_id }))
+        const scope = operationScope(operation.request)
+        const result = parseReconcile(await connection.rpc("reconcile", { ...scope.params, operation_id: operation.operation_id }, scope.facts))
         requireCurrent()
+        if (result.operation && !same(record(result.operation.raw).request, operation.request)) throw new Error("执行设备返回的完整请求与原操作不同，已保留待核对记录。")
         if (reconcileDecision(result, operation) !== "missing") throw new Error("原执行设备没有确认该操作缺失，已保留待核对记录。")
         const complete = await readConversation(operation.conversation_id)
         requireContext(operation.conversation_id)
@@ -485,21 +518,27 @@ function useWorkspaceState(connection: ReadyConnection) {
       const id = activeId.current
       const context = requireContext(id), task = context.tasks.find(task => task.task_id === item.task_id)
       if (!task) throw new Error("执行会话缺少对应工单。")
-      verifyTask(task, id)
-      const binding = verifyExecutionBinding(connection, task, { ...item, conversation_id: id }, { type: "open", executor: item.executor, cwd: item.cwd }, item.binding)
-      const result = record(await connection.rpc("session", { target_node: item.target_node, session_id: item.session_id }))
+      const scope = executionScope(task, { ...item, conversation_id: id }, { type: "open", executor: item.executor, cwd: item.cwd }, item.binding)
+      const result = record(await connection.rpc("session", scope.params, scope.facts))
       const parsed = parseSession(result.session)
       requireCurrent()
       if (activeId.current !== id) return
-      if (parsed.target_node !== item.target_node || parsed.session_id !== item.session_id || parsed.task_id !== task.task_id || parsed.executor !== item.executor || parsed.cwd !== item.cwd || parsed.authority_public_key !== connection.audiencePublicKey || !same(parsed.task_creation, task.task_creation) || !same(parsed.binding, binding)) throw new Error("执行设备返回了其他会话或工单绑定。")
+      if (parsed.target_node !== item.target_node || parsed.session_id !== item.session_id || parsed.task_id !== task.task_id || parsed.executor !== item.executor || parsed.cwd !== item.cwd || parsed.authority_public_key !== connection.audiencePublicKey || !same(parsed.task_creation, task.task_creation) || !same(parsed.binding, scope.params.binding)) throw new Error("执行设备返回了其他会话或工单绑定。")
       setActual((previous) => ({ ...previous, [`${item.target_node}:${item.session_id}`]: result.actual }))
     },
     clearActual: (item: SessionRecord) => { setActual((previous) => { const next = { ...previous }; delete next[`${item.target_node}:${item.session_id}`]; return next }) },
     resolveUnknown: (targetNode: string, operationId: string, outcome: string, evidence: string) => withMutation(`resolve:${operationId}`, async () => {
       const id = activeId.current
-      requireContext(id)
+      const context = requireContext(id)
       if (evidence.trim().length < 12 || !["succeeded", "failed"].includes(outcome)) throw new Error("请填写本人核查证据与明确结果。")
-      await connection.rpc("resolve_unknown", { target_node: targetNode, operation_id: operationId, outcome, evidence })
+      const pendingOperation = pendingRef.current.find(item => item.operation_id === operationId && item.target_node === targetNode && item.conversation_id === id)
+      const recorded = context.operations.find(item => item.request.operation_id === operationId && item.request.target_node === targetNode)
+      if (recorded && recorded.state !== "unknown") throw new Error("原操作已不处于结果未知状态，请重新核对。")
+      if (pendingOperation && recorded && !same(pendingOperation.request, record(recorded.raw).request)) throw new Error("执行设备返回的完整请求与原操作不同，已保留待核对记录。")
+      const request = pendingOperation?.request ?? recorded?.request
+      if (!request) throw new Error("未找到原操作的完整请求，请先回到原会话读取并核对。")
+      const scope = operationScope(request)
+      await connection.rpc("resolve_unknown", { ...scope.params, operation_id: operationId, outcome, evidence }, scope.facts)
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),

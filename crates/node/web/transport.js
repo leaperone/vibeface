@@ -1,4 +1,4 @@
-import init, { Identity, Handshake, signClientInvocation, signForwardedClientInvocation, prepareAccountCreation, prepareAccountRecovery, buildRecoveryContextRequest } from "/generated/vibeface_secure.js";
+import init, { Identity, Handshake, signClientInvocation, signForwardedClientInvocation, signClientPrepareIntent, prepareAccountCreation, prepareAccountRecovery, buildRecoveryContextRequest, createDeviceEnrollmentOffer, createDeviceEnrollmentIntentFromOffer, signDeviceEnrollmentIntent, signDeviceEnrollmentPossession, prepareAccountDeviceEnrollment, prepareAccountDeviceRevocation, signPasskeyEnrollmentIntentFromOffer, signPasskeyEnrollmentPossession, preparePasskeyDeviceEnrollmentFromOffer, buildFirstAuthenticatorEnrollmentIntent, prepareFirstAuthenticatorRegistration } from "/generated/vibeface_secure.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -34,7 +34,7 @@ export function readInvitation(value) {
   if (/^https?:\/\//.test(input)) {
     const url = new URL(input);
     const fragment = new URLSearchParams(url.hash.slice(1));
-    content = fragment.get("invite") || fragment.get("bootstrap") || "";
+    content = fragment.get("enroll") || fragment.get("invite") || fragment.get("bootstrap") || "";
   }
   if (!content) throw new Error("邀请链接缺少配对信息。请从管理设备重新复制完整链接。");
   let invitation;
@@ -190,40 +190,50 @@ export async function passkeyVaultUnlockOptions(profileId) {
   return { credentialId: profile.passkey.credential_id, salt, options: { publicKey: { challenge: base64url(crypto.getRandomValues(new Uint8Array(32))), rpId: profile.passkey.rp_id, userVerification: "required", allowCredentials: [{ type: "public-key", id: profile.passkey.credential_id }] } } };
 }
 
-export async function protectClientVaultWithPrf(options) {
+export async function protectClientVaultWithPrf(options, signal) {
   try {
+    signal?.throwIfAborted();
     requireSecureClient();
     if (!identity || !activeProfileId) throw new Error("请先使用独立口令解锁本地设备配置，再启用 Passkey 保护。");
     if (!globalThis.navigator?.locks?.request) throw new Error("此浏览器不支持安全保存本地 Passkey 保护。独立口令仓库保持可用。");
     const profileId = activeProfileId, generation = identityGeneration, own = identity;
-    await navigator.locks.request(`${vaultFormat}:${profileId}:writer`, async () => {
+    const write = async () => {
+      signal?.throwIfAborted();
       const previous = parseProfile(await vaultRecords(profileId));
+      signal?.throwIfAborted();
       if (generation !== identityGeneration || identity !== own || previous.id !== profileId || previous.public_key !== own.publicKeyHex()) throw new Error("设备配置已改变，未保存本地 Passkey 保护。");
       const profile = { ...previous, passkey: await sealPrfVault(previous, own.secretHex(), options) };
+      signal?.throwIfAborted();
       parseProfile(profile);
       const db = await database();
       try {
+        signal?.throwIfAborted();
         await new Promise((resolve, reject) => {
           const transaction = db.transaction("keys", "readwrite"), keys = transaction.objectStore("keys");
+          const cancel = () => { try { transaction.abort(); } catch {} };
+          signal?.addEventListener("abort", cancel, { once: true });
           pendingVaultWrites.add(transaction);
           const request = keys.get(profileId);
           request.onsuccess = () => {
             try {
               const current = parseProfile(request.result);
-              if (generation !== identityGeneration || identity !== own || activeProfileId !== profileId || current.id !== profileId || JSON.stringify(current) !== JSON.stringify(previous)) throw new Error("设备配置已改变。");
+              if (signal?.aborted || generation !== identityGeneration || identity !== own || activeProfileId !== profileId || current.id !== profileId || JSON.stringify(current) !== JSON.stringify(previous)) throw new Error("设备配置已改变。");
               keys.put(profile, profileId);
             } catch { transaction.abort(); }
           };
           transaction.oncomplete = () => {
+            signal?.removeEventListener("abort", cancel);
             pendingVaultWrites.delete(transaction);
-            if (generation !== identityGeneration || identity !== own || activeProfileId !== profileId) reject(new Error("设备配置已改变，保存操作已取消。"));
+            if (signal?.aborted || generation !== identityGeneration || identity !== own || activeProfileId !== profileId) reject(new Error("设备配置已改变，保存操作已取消。"));
             else resolve();
           };
-          transaction.onerror = () => { pendingVaultWrites.delete(transaction); reject(new Error("无法保存本地 Passkey 保护。独立口令仓库保持可用。")); };
+          transaction.onerror = () => { signal?.removeEventListener("abort", cancel); pendingVaultWrites.delete(transaction); reject(new Error("无法保存本地 Passkey 保护。独立口令仓库保持可用。")); };
           transaction.onabort = transaction.onerror;
         });
       } finally { db.close(); }
-    });
+    };
+    if (signal) await navigator.locks.request(`${vaultFormat}:${profileId}:writer`, { signal }, write);
+    else await navigator.locks.request(`${vaultFormat}:${profileId}:writer`, write);
   } finally { if (options?.prf instanceof Uint8Array) options.prf.fill(0); }
 }
 
@@ -328,6 +338,11 @@ export function signAuthorizedClientInvocation(authorization, templateJson, body
   return signClientInvocation(authorization, templateJson, bodyJson, expectedAction, operationId, identity, Date.now());
 }
 
+export function signAuthorizedClientPrepare(authorization, bodyJson, contextJson, expectedAction, operationId, gatewayPublicKey) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return signClientPrepareIntent(authorization, bodyJson, contextJson, expectedAction, operationId, gatewayPublicKey, identity, Date.now());
+}
+
 export function prepareClientAccountCreation(root, recovery, claim, certificateExpiresAt) {
   if (!identity) throw new Error("请先解锁当前账户的设备配置。");
   return prepareAccountCreation(root, recovery, identity, claim, certificateExpiresAt, Date.now());
@@ -342,6 +357,61 @@ export function prepareClientRecoveryContext(materialJson, expectedNodePublicKey
   if (!identity) throw new Error("请先解锁新的独立设备配置。");
   const now = Date.now();
   return buildRecoveryContextRequest(materialJson, identity, expectedNodePublicKey, now, now + 120000);
+}
+
+export function createClientEnrollmentOffer(accountId, endpoint, nodePublicKey, requestedRightsJson, certificateExpiresAt, pinsJson, bundleJson) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return createDeviceEnrollmentOffer(identity, accountId, endpoint, nodePublicKey, requestedRightsJson, certificateExpiresAt, pinsJson, bundleJson, Date.now());
+}
+
+export function createClientEnrollmentIntent(offer) {
+  if (!identity) throw new Error("请先解锁新设备配置。");
+  return createDeviceEnrollmentIntentFromOffer(offer, identity, Date.now());
+}
+
+export function approveClientEnrollmentIntent(intentJson, pinsJson, bundleJson) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return signDeviceEnrollmentIntent(intentJson, identity, pinsJson, bundleJson, Date.now());
+}
+
+export function signClientEnrollmentPossession(qualified, pendingNonce) {
+  if (!identity) throw new Error("请先解锁新设备配置。");
+  return signDeviceEnrollmentPossession(qualified, identity, pendingNonce, Date.now());
+}
+
+export function prepareClientDeviceEnrollment(qualified, possessionJson, pinsJson, bundleJson) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return prepareAccountDeviceEnrollment(qualified, possessionJson, identity, pinsJson, bundleJson, Date.now());
+}
+
+export function prepareClientDeviceRevocation(accountId, deviceId, pinsJson, bundleJson) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return prepareAccountDeviceRevocation(accountId, deviceId, identity, pinsJson, bundleJson, Date.now());
+}
+
+export function signClientPasskeyEnrollmentIntent(intentJson, offer) {
+  if (!identity) throw new Error("请先解锁新设备配置。");
+  return signPasskeyEnrollmentIntentFromOffer(intentJson, identity, offer, Date.now());
+}
+
+export function signClientPasskeyEnrollmentPossession(qualified, pendingNonce) {
+  if (!identity) throw new Error("请先解锁新设备配置。");
+  return signPasskeyEnrollmentPossession(qualified, identity, pendingNonce, Date.now());
+}
+
+export function prepareClientPasskeyDeviceEnrollment(intentJson, certificateJson, proofJson, offer) {
+  if (!identity) throw new Error("请先解锁新设备配置。");
+  return preparePasskeyDeviceEnrollmentFromOffer(intentJson, certificateJson, proofJson, identity, offer, Date.now());
+}
+
+export function prepareClientFirstAuthenticatorIntent(materialJson, pinsJson, bundleJson, credentialExpiresAt) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return buildFirstAuthenticatorEnrollmentIntent(materialJson, pinsJson, bundleJson, identity, Date.now(), credentialExpiresAt);
+}
+
+export function prepareClientFirstAuthenticatorRegistration(materialJson, pinsJson, bundleJson, intentJson, registration) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return prepareFirstAuthenticatorRegistration(materialJson, pinsJson, bundleJson, intentJson, registration, Date.now());
 }
 
 export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {

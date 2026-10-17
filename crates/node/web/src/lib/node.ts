@@ -11,6 +11,10 @@ export type AccountDevice = { device_id: string; public_key: string; subject: { 
 export type AccountDeviceDirectory = { account_id: string; devices: AccountDevice[] }
 export type AuthorizedRequest = { body: Record<string, unknown>; invocation: unknown }
 export type AuthorizedReply = AuthorizedRequest & { result: unknown }
+export type RpcFacts = {
+  taskRef?: string
+  execution?: { sessionId: string; executorKind: string; canonicalCwd: string; bindingGeneration?: number }
+}
 export type ReadyConnection = {
   readonly generation: number
   readonly scope: IdentityScope
@@ -22,8 +26,8 @@ export type ReadyConnection = {
   authorization: { enrollmentRights: string[]; actions: string[]; authorityEpoch: number }
   info: EntryInfo
   request(method: string, params?: Record<string, unknown>): Promise<unknown>
-  rpc(method: string, params?: Record<string, unknown>): Promise<unknown>
-  rpcWithProof(method: string, params: Record<string, unknown>, beforeSend?: (proof: AuthorizedRequest) => void): Promise<AuthorizedReply>
+  rpc(method: string, params?: Record<string, unknown>, facts?: RpcFacts): Promise<unknown>
+  rpcWithProof(method: string, params: Record<string, unknown>, beforeSend?: (proof: AuthorizedRequest) => void, facts?: RpcFacts): Promise<AuthorizedReply>
   subscribe(listener: () => void): () => void
   isCurrent(): boolean
 }

@@ -22,7 +22,7 @@ export function verifyTaskCreation(connection: TaskScope, conversationId: string
       || !same(payload.resource, { space: connection.scope.space_id, resource: connection.project.id })) throw new Error('工单创建证明与所选会话、项目或目标不一致。')
     // shortcut: historical tasks without local attempts trust the pinned author; verify their full Admission chain when a historical policy verifier is available.
     if (attempts && !attempts.some(attempt => same(attempt.body, source) && same(attempt.invocation, invocation))) throw new Error('工单回执未对应任何已保存的本地签名请求，请保留待核对记录。')
-    return { taskRef: verified.hash, contextHash: verified.envelopeContextHash(), authorityNode: nodeFingerprint(connection.audiencePublicKey) }
+    return { taskRef: verified.hash, authorityNode: nodeFingerprint(connection.audiencePublicKey) }
   } finally { verified.free() }
 }
 

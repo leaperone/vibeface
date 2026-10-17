@@ -1,4 +1,4 @@
-import { signAuthorizedClientInvocation } from '../../transport.js'
+import { signAuthorizedClientInvocation, signAuthorizedClientPrepare } from '../../transport.js'
 import { verifyAccountDeviceDirectory, verifyClientAuthorization } from '../../generated/vibeface_secure.js'
 import { array, record, strings, text } from './node'
 import { parseIdentityScope, sameScope } from './scope'
@@ -111,6 +111,14 @@ export function verifyScopedAuthentication(value: unknown, own: PublicIdentity, 
     const pins = trust.pins.map(pin => ({ ...pin, minimum_head: heads.find(head => head.domain.kind === pin.domain.kind && head.domain.id === pin.domain.id) ?? pin.minimum_head }))
     return {
       scope, audience, projects, actions, policy, enrollmentRights, authorityEpoch, trust: { ...trust, pins },
+      enrollmentMaterial() {
+        if (released) throw new Error('账户授权已释放，请重新连接。')
+        return { pins, bundle: record(auth.authorization), expiresAt: policy.account_enrollment_expires_at_ms === null ? null : counter(policy.account_enrollment_expires_at_ms) }
+      },
+      prepare(bodyJson: string, contextJson: string, action: string, operationId: string) {
+        if (released) throw new Error('账户授权已释放，请重新连接。')
+        return signAuthorizedClientPrepare(verified, bodyJson, contextJson, action, operationId, gatewayPublicKey)
+      },
       sign(templateJson: string, bodyJson: string, action: string, operationId: string) {
         if (released) throw new Error('账户授权已释放，请重新连接。')
         return signAuthorizedClientInvocation(verified, templateJson, bodyJson, action, operationId, policy.audience_public_key === gatewayPublicKey ? undefined : gatewayPublicKey)
