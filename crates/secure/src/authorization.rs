@@ -2226,8 +2226,29 @@ impl VerifiedPolicySet {
                     self.matches_grantee(&parent.grantee, &signer, now_ms, budget, dependencies)?,
                     "grant issuer is not parent grantee",
                 )?;
+                let permitted_grantee = match &g.grantee {
+                    Grantee::Actor(_) => true,
+                    Grantee::MembersOf(selector) => {
+                        let genesis = self
+                            .spaces
+                            .get(&g.owner_space)
+                            .and_then(|space| space.history.first())
+                            .ok_or(AuthorizationError::PolicyConflict)?
+                            .hash()?;
+                        matches!(signer, Actor::Account(_))
+                            && matches!(space.root, SpaceRoot::Team { .. })
+                            && selector.space == g.owner_space
+                            && selector.kind == MemberKind::Account
+                            && selector.pinned_genesis == genesis
+                            && !selector.roles_any.is_empty()
+                            && selector.roles_any.len() <= 4
+                            && sorted_unique(&selector.roles_any)
+                            && matches!(g.scope, ResourceScope::Exact(_))
+                            && g.remaining_delegations == 0
+                    }
+                };
                 require(
-                    matches!(g.grantee, Grantee::Actor(_))
+                    permitted_grantee
                         && scope_tighter(&parent.scope, &g.scope)
                         && g.actions.iter().all(|a| parent.actions.contains(a))
                         && g.audience == parent.audience
@@ -5581,10 +5602,21 @@ pub struct VerifiedClientAuthorization {
     constraints: GrantConstraints,
     account_enrollment_rights: Vec<AccountRight>,
     account_enrollment_expires_at_ms: Option<u64>,
+    account_recovery: RecoveryPolicy,
+    space_genesis_hash: ObjectHash,
     resources: Vec<Signed<ResourceRecord>>,
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedClientAuthorization {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = accountRecoveryPolicyJson))]
+    pub fn account_recovery_policy_json(&self) -> crate::Result<String> {
+        serde_json::to_string(&self.account_recovery)
+            .map_err(|_| "recovery policy encoding failed".to_owned())
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = spaceGenesisHash))]
+    pub fn space_genesis_hash_string(&self) -> String {
+        self.space_genesis_hash.to_string()
+    }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = scopeJson))]
     pub fn scope_json(&self) -> crate::Result<String> {
         serde_json::to_string(&self.scope).map_err(|_| "scope encoding failed".to_owned())
@@ -5746,6 +5778,17 @@ pub fn verify_client_authorization(
                 })
                 .map(|e| e.expires_at_ms.min(certificate.payload.expires_at_ms))
         };
+        let account_recovery = state
+            .account(&account)
+            .ok_or(AuthorizationError::Revoked)?
+            .recovery
+            .clone();
+        let space_genesis_hash = state
+            .spaces
+            .get(&space)
+            .and_then(|space| space.history.first())
+            .ok_or(AuthorizationError::PolicyConflict)?
+            .hash()?;
         Ok(VerifiedClientAuthorization {
             scope: ClientScope {
                 account_id: account,
@@ -5761,6 +5804,8 @@ pub fn verify_client_authorization(
             constraints: leaf.constraints.clone(),
             account_enrollment_rights,
             account_enrollment_expires_at_ms,
+            account_recovery,
+            space_genesis_hash,
             resources,
         })
     }

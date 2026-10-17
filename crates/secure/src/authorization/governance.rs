@@ -1620,6 +1620,157 @@ mod tests {
     }
 
     #[test]
+    fn bounded_member_selector_builders_follow_current_roles_and_both_policy_domains() {
+        let (team, result) = Fixture::personal().team();
+        let space = result.scope.space_id.clone();
+        let owner = verify_client_authorization(
+            &team.bundle_json(),
+            &team.pins_json(),
+            team.account.as_str(),
+            space.as_str(),
+            &key(3).public_key_hex(),
+            NOW as f64,
+        )
+        .unwrap();
+        let recovery: RecoveryPolicy =
+            parse(&owner.account_recovery_policy_json().unwrap()).unwrap();
+        assert_eq!(recovery.keys, [PublicKey::of(&key(2))]);
+        let genesis = ObjectHash::parse(&owner.space_genesis_hash_string()).unwrap();
+        let intent = DirectionalGrantIntent {
+            space: space.clone(),
+            grantee: Grantee::MembersOf(MembersOf {
+                space: space.clone(),
+                pinned_genesis: genesis,
+                kind: MemberKind::Account,
+                roles_any: vec![SpaceRole::Viewer],
+            }),
+            scope: ResourceScope::Exact(ResourceRef {
+                space: space.clone(),
+                resource: team.project.clone(),
+            }),
+            actions: vec![Action::ConversationRead],
+            audience_node_public_key: PublicKey::of(&key(4)),
+            constraints: GrantConstraints::default(),
+            remaining_delegations: 0,
+            expires_at_ms: END,
+        };
+        for field in 0..6 {
+            let mut bad = intent.clone();
+            let Grantee::MembersOf(selector) = &mut bad.grantee else {
+                unreachable!()
+            };
+            match field {
+                0 => selector.kind = MemberKind::Service,
+                1 => selector.space = SpaceId::personal(&team.account),
+                2 => selector.pinned_genesis = ObjectHash::body(&"another team genesis").unwrap(),
+                3 => selector.roles_any.clear(),
+                4 => bad.scope = ResourceScope::WholeSpace(space.clone()),
+                _ => bad.remaining_delegations = 1,
+            }
+            assert!(
+                prepare_directional_grant(
+                    &json(&bad).unwrap(),
+                    &key(3),
+                    &team.pins_json(),
+                    &team.bundle_json(),
+                    NOW as f64
+                )
+                .is_err()
+            );
+        }
+        // The administrator need not be a Viewer to issue the bounded Viewer template.
+        let prepared = prepare_directional_grant(
+            &json(&intent).unwrap(),
+            &key(3),
+            &team.pins_json(),
+            &team.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let JournalEntry::Grant(grant) = &prepared.request.new_objects[0] else {
+            panic!("missing selector grant")
+        };
+        let child = grant.hash().unwrap();
+        let team = team.commit(&prepared);
+        let mut recipient = team.bundle.clone();
+        recipient.grant_leaf = child.clone();
+        assert!(
+            verify_client_authorization(
+                &json(&recipient).unwrap(),
+                &team.pins_json(),
+                team.account.as_str(),
+                space.as_str(),
+                &key(3).public_key_hex(),
+                NOW as f64
+            )
+            .is_err()
+        );
+        let membership = SpaceMembershipIntent {
+            space: space.clone(),
+            subject_account: team.account.clone(),
+            roles: vec![SpaceRole::Viewer, SpaceRole::SpaceAdmin],
+            expires_at_ms: END,
+        };
+        let prepared = prepare_space_membership_change(
+            &json(&membership).unwrap(),
+            &key(3),
+            &team.pins_json(),
+            &team.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let team = team.commit(&prepared);
+        let mut recipient = team.bundle.clone();
+        recipient.grant_leaf = child.clone();
+        let auth = verify_client_authorization(
+            &json(&recipient).unwrap(),
+            &team.pins_json(),
+            team.account.as_str(),
+            space.as_str(),
+            &key(3).public_key_hex(),
+            NOW as f64,
+        )
+        .unwrap();
+        assert_eq!(auth.heads().len(), 2);
+        assert!(
+            auth.heads()
+                .iter()
+                .any(|head| head.domain == PolicyDomain::Account(team.account.clone()))
+        );
+        assert!(
+            auth.heads()
+                .iter()
+                .any(|head| head.domain == PolicyDomain::Space(space.clone()))
+        );
+        let membership = SpaceMembershipIntent {
+            roles: vec![SpaceRole::SpaceAdmin],
+            ..membership
+        };
+        let prepared = prepare_space_membership_change(
+            &json(&membership).unwrap(),
+            &key(3),
+            &team.pins_json(),
+            &team.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let team = team.commit(&prepared);
+        let mut recipient = team.bundle.clone();
+        recipient.grant_leaf = child;
+        assert!(
+            verify_client_authorization(
+                &json(&recipient).unwrap(),
+                &team.pins_json(),
+                team.account.as_str(),
+                space.as_str(),
+                &key(3).public_key_hex(),
+                NOW as f64
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn creation_and_daily_changes_reject_root_reuse_wrong_nodes_and_widened_scope() {
         let personal = Fixture::personal();
         for byte in [1, 2, 3, 4] {
