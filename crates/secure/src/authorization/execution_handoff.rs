@@ -985,11 +985,19 @@ pub fn verify_execution_session_snapshot<'a>(
     Ok(session)
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionResolutionPurpose {
+    ResolveUnknown,
+    ReconcileTerminal,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionHandoffResolution {
     pub version: u16,
-    pub unknown: ExecutionHandoffResult,
+    pub purpose: ExecutionResolutionPurpose,
+    pub observation: ExecutionHandoffResult,
     pub account_admission: AdmissionProof,
 }
 
@@ -1017,7 +1025,7 @@ pub fn execution_resolution_account_facts(
         value.version == AUTH_VERSION,
         "invalid execution resolution version",
     )?;
-    let unknown = &value.unknown;
+    let unknown = &value.observation;
     verify_execution_handoff_receipt_signature(
         &unknown.handoff,
         &unknown.receipt,
@@ -1051,6 +1059,7 @@ pub fn execution_resolution_account_facts(
                     | "original_handoff_hash"
                     | "original_body_hash"
                     | "unknown_receipt_hash"
+                    | "resolution_purpose"
             )
         }),
         "resolution cannot disclose unrelated fields",
@@ -1058,7 +1067,21 @@ pub fn execution_resolution_account_facts(
     let outcome = body["outcome"].as_str().unwrap_or_default();
     let evidence = body["evidence"].as_str().unwrap_or_default();
     require(
-        unknown.receipt.payload.state == ExecutionHandoffState::Unknown
+        (match value.purpose {
+            ExecutionResolutionPurpose::ResolveUnknown => {
+                unknown.receipt.payload.state == ExecutionHandoffState::Unknown
+            }
+            ExecutionResolutionPurpose::ReconcileTerminal => {
+                matches!(
+                    unknown.receipt.payload.state,
+                    ExecutionHandoffState::Succeeded
+                        | ExecutionHandoffState::Failed
+                        | ExecutionHandoffState::Rejected
+                ) && serde_json::to_value(unknown.receipt.payload.state).map_err(invalid_shape)?
+                    == body["outcome"]
+            }
+        }) && body["resolution_purpose"]
+            == serde_json::to_value(value.purpose).map_err(invalid_shape)?
             && unknown.receipt.payload.issued_at_ms <= proof.admitted_at_ms
             && matches!(proof.invocation.payload.actor, Actor::Account(_))
             && proof.invocation.payload.context.sdk_session.is_none()
@@ -1131,9 +1154,9 @@ pub fn execution_resolution_facts(
         "execution resolution has another Account authorization",
     )?;
     Ok(RequestFacts {
-        resource: value.unknown.handoff.handoff.execution_resource.clone(),
+        resource: value.observation.handoff.handoff.execution_resource.clone(),
         action: Action::ExecutionResolve,
-        audience: value.unknown.handoff.handoff.execution_audience.clone(),
+        audience: value.observation.handoff.handoff.execution_audience.clone(),
         operation_id: account.operation_id,
         body_hash: ObjectHash::body(value)?,
         context: account.context,
@@ -1142,7 +1165,7 @@ pub fn execution_resolution_facts(
 
 pub fn execution_resolution_result(value: &ExecutionHandoffResolution) -> Result<Value> {
     execution_resolution_account_facts(value)?;
-    let (_, original, _, _) = original_dispatch(&value.unknown.handoff.handoff)?;
+    let (_, original, _, _) = original_dispatch(&value.observation.handoff.handoff)?;
     Ok(serde_json::json!({
         "resolver": value.account_admission.invocation.payload.actor,
         "invocation_hash": value.account_admission.invocation.hash()?,
@@ -1150,7 +1173,7 @@ pub fn execution_resolution_result(value: &ExecutionHandoffResolution) -> Result
         "resolution_id": value.account_admission.invocation.payload.operation_id,
         "original_actor": original.invocation.payload.actor,
         "original_invocation_hash": original.invocation.hash()?,
-        "unknown_receipt_hash": value.unknown.receipt.hash()?,
+        "unknown_receipt_hash": value.observation.receipt.hash()?,
     }))
 }
 
@@ -1264,6 +1287,7 @@ pub struct ExecutionHandoffResolutionFreshness {
 pub struct ExecutionHandoffResolutionReceipt {
     pub version: u16,
     pub resolution_hash: ObjectHash,
+    pub freshness_hash: ObjectHash,
     pub handoff_receipt_hash: ObjectHash,
     pub issued_at_ms: u64,
 }
@@ -1276,6 +1300,7 @@ impl SignedObject for ExecutionHandoffResolutionReceipt {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionHandoffResolutionResult {
     pub resolution: SignedExecutionHandoffResolution,
+    pub freshness: ExecutionHandoffResolutionFreshness,
     pub handoff_receipt: Signed<ExecutionHandoffReceipt>,
     pub result: Value,
     pub receipt: Signed<ExecutionHandoffResolutionReceipt>,
@@ -1287,20 +1312,25 @@ pub fn verify_execution_resolution_receipt_signature(
     value.receipt.verify_signature()?;
     let resolution = &value.resolution;
     verify_execution_handoff_receipt_signature(
-        &resolution.resolution.unknown.handoff,
+        &resolution.resolution.observation.handoff,
         &value.handoff_receipt,
         &value.result,
     )?;
     require(
-        value.receipt.issuer
-            == resolution
-                .resolution
-                .unknown
-                .handoff
-                .handoff
-                .target_public_key
+        resolution.resolution.purpose == ExecutionResolutionPurpose::ResolveUnknown
+            && value.receipt.issuer
+                == resolution
+                    .resolution
+                    .observation
+                    .handoff
+                    .handoff
+                    .target_public_key
             && value.receipt.payload.version == AUTH_VERSION
             && value.receipt.payload.resolution_hash == resolution.hash()?
+            && value.receipt.payload.freshness_hash == ObjectHash::body(&value.freshness)?
+            && value.freshness.challenge.resolution_hash == resolution.hash()?
+            && value.freshness.challenge.issued_at_ms <= value.receipt.payload.issued_at_ms
+            && value.receipt.payload.issued_at_ms < value.freshness.challenge.expires_at_ms
             && value.receipt.payload.handoff_receipt_hash == value.handoff_receipt.hash()?
             && value.receipt.payload.issued_at_ms == value.handoff_receipt.payload.issued_at_ms
             && value.receipt.payload.issued_at_ms
@@ -1355,7 +1385,12 @@ impl VerifiedPolicySet {
                     .uses
                     .contains(&DeviceUse::ServiceInvocation)
                 && target.payload.public_key
-                    == wire.resolution.unknown.handoff.handoff.target_public_key
+                    == wire
+                        .resolution
+                        .observation
+                        .handoff
+                        .handoff
+                        .target_public_key
                 && target.payload.subject == Actor::Service(facts.audience.service.clone())
                 && matches!(transport, TransportEvidence::VerifiedPeer{origin} if origin == &resolver.audience().device),
             "resolution requires the current Project host and actual peer origin",
@@ -1532,5 +1567,56 @@ impl VerifiedPolicySet {
             Some(&admission),
             now_ms,
         )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionHandoffTerminalReconciliationResult {
+    pub reconciliation: SignedExecutionHandoffResolution,
+    pub freshness: ExecutionHandoffResolutionFreshness,
+}
+
+pub struct VerifiedExecutionTerminalReconciliation {
+    authorization: VerifiedExecutionResolution,
+}
+impl VerifiedExecutionTerminalReconciliation {
+    pub fn resolver(&self) -> &VerifiedAuthorization {
+        self.authorization.resolver()
+    }
+    pub fn submission(&self) -> &VerifiedAuthorization {
+        self.authorization.submission()
+    }
+    pub fn dependencies(&self) -> &[PolicyStamp] {
+        self.authorization.dependencies()
+    }
+    pub fn wire(&self) -> &SignedExecutionHandoffResolution {
+        self.authorization.wire()
+    }
+}
+
+impl VerifiedPolicySet {
+    pub fn verify_execution_terminal_reconciliation(
+        &self,
+        result: &ExecutionHandoffTerminalReconciliationResult,
+        resolver: &VerifiedAuthorization,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionTerminalReconciliation> {
+        require(
+            result.reconciliation.resolution.purpose
+                == ExecutionResolutionPurpose::ReconcileTerminal,
+            "terminal reconciliation requires its independent purpose",
+        )?;
+        let authorization = self.verify_execution_resolution(
+            &result.reconciliation,
+            resolver,
+            &TransportEvidence::VerifiedPeer {
+                origin: result.reconciliation.invocation.payload.presenter.clone(),
+            },
+            None,
+            now_ms,
+        )?;
+        self.verify_execution_resolution_freshness(&authorization, &result.freshness, now_ms)?;
+        Ok(VerifiedExecutionTerminalReconciliation { authorization })
     }
 }
