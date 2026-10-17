@@ -5,6 +5,7 @@ pub mod binding;
 pub mod config;
 pub mod crypto;
 pub mod engine;
+pub mod identity;
 pub mod maintenance;
 pub mod manager;
 pub mod model;
