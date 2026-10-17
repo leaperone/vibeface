@@ -36,6 +36,8 @@ pub struct VerifiedExecutionDestination {
     heads: Vec<PolicyStamp>,
     initiator: Actor,
     initiating_grant: Option<ObjectHash>,
+    budget: Budget,
+    grant_depth: usize,
 }
 impl VerifiedExecutionDestination {
     pub fn resource(&self) -> &ResourceRef {
@@ -210,6 +212,8 @@ impl VerifiedPolicySet {
             heads: dependencies.into_values().collect(),
             initiator,
             initiating_grant,
+            budget,
+            grant_depth: path.len(),
         })
     }
 }
@@ -377,6 +381,7 @@ pub fn verify_remote_execution(
     now_ms: f64,
 ) -> crate::Result<VerifiedRemoteExecution> {
     (|| -> Result<VerifiedRemoteExecution> {
+        let _signatures = crate::signature_verification::ScopedSignatureVerification::new();
         let now = client_time(now_ms)?;
         require(
             project_bundle_json.len() <= 1_048_576
@@ -395,75 +400,9 @@ pub fn verify_remote_execution(
             .map_err(|_| AuthorizationError::InvalidProof("invalid Project pins"))?;
         let execution_pins: Vec<PolicyPin> = serde_json::from_str(execution_pins_json)
             .map_err(|_| AuthorizationError::InvalidProof("invalid independent execution pins"))?;
-        let project_state = replay_policies(&project_pins, &project.journal)?;
-        let source_key = &project_state
-            .find_device(&auth.scope.device_id)?
-            .payload
-            .public_key;
-        let baseline = verify_client_authorization(
-            project_bundle_json,
-            project_pins_json,
-            auth.scope.account_id.as_str(),
-            auth.scope.space_id.as_str(),
-            source_key.as_str(),
-            now_ms,
-        )
-        .map_err(|_| {
-            AuthorizationError::InvalidProof("Project policy does not match client authorization")
-        })?;
-        require(
-            baseline.scope == auth.scope
-                && baseline.heads == auth.heads
-                && baseline.grant_leaf == auth.grant_leaf
-                && baseline.audience == auth.audience
-                && baseline.audience_public_key == auth.audience_public_key,
-            "remote execution changed the verified Project authorization",
-        )?;
-        let mut pins = BTreeMap::<PolicyDomain, PolicyPin>::new();
-        for pin in project_pins
-            .into_iter()
-            .chain(execution_pins.iter().cloned())
-        {
-            if let Some(saved) = pins.get_mut(&pin.domain) {
-                require(
-                    saved.genesis_root == pin.genesis_root,
-                    "independent policy roots conflict",
-                )?;
-                if let Some(candidate) = pin.minimum_head {
-                    match &saved.minimum_head {
-                        Some(current)
-                            if (current.authority_epoch, current.sequence)
-                                == (candidate.authority_epoch, candidate.sequence) =>
-                        {
-                            require(current == &candidate, "independent policy heads conflict")?
-                        }
-                        Some(current)
-                            if (current.authority_epoch, current.sequence)
-                                > (candidate.authority_epoch, candidate.sequence) =>
-                        {
-                            ()
-                        }
-                        _ => saved.minimum_head = Some(candidate),
-                    }
-                }
-            } else {
-                pins.insert(pin.domain.clone(), pin);
-            }
-        }
-        let mut seen = BTreeSet::new();
-        let mut journal = Vec::new();
-        for entry in project.journal.into_iter().chain(execution.journal) {
-            if seen.insert(ObjectHash::body(&entry)?) {
-                journal.push(entry);
-            }
-        }
-        let state = replay_policies(&pins.into_values().collect::<Vec<_>>(), &journal)?;
-        for head in &auth.heads {
-            require(
-                state.head(&head.domain) == Some(head),
-                "remote proof changed the Project head",
-            )?;
-        }
+        let (pins, tail) = client_policy_tail(auth, &project, &project_pins, &execution, &execution_pins)?;
+        let state = replay_policy_tail(auth.policy_snapshot.clone(), &pins, &tail)?;
+        let baseline = revalidate_client_policy(auth, state.clone(), &project, &pins, now)?;
         let selection: RemoteExecutionSelection = serde_json::from_str(selection_json)
             .map_err(|_| AuthorizationError::InvalidProof("invalid remote execution selection"))?;
         require(
@@ -482,12 +421,16 @@ pub fn verify_remote_execution(
         };
         require(
             scope_covers(&auth.grant_scope, &project)
-                && auth.actions.contains(&action)
+                && baseline.actions.contains(&action)
+                && context_tighter(&baseline.constraints.context, &context.context)
                 && context.execution_target_public_key.as_ref()
                     == Some(&selection.target_public_key),
             "remote selection differs from the verified client scope",
         )?;
-        state.verify_execution_destination(
+        if baseline.constraints.require_webauthn_uv {
+            return Err(AuthorizationError::UserPresenceRequired);
+        }
+        let destination = state.verify_execution_destination(
             &project,
             &auth.audience,
             &selection.execution_resource,
@@ -499,7 +442,7 @@ pub fn verify_remote_execution(
         )?;
         let target = state.find_device(&DeviceId::from_key(&selection.target_public_key))?;
         let mut budget = Budget::default();
-        let mut dependencies = auth
+        let mut dependencies = baseline
             .heads
             .iter()
             .cloned()
@@ -513,6 +456,16 @@ pub fn verify_remote_execution(
             &mut BTreeSet::new(),
         )?;
         state.expand_authorities(now, &mut budget, &mut dependencies)?;
+        let mut usage = execution_handoff::ExecutionProofUsage::default();
+        usage.record_budget(&baseline.budget)?;
+        usage.record_budget(&destination.budget)?;
+        usage.record_chain_depth(destination.grant_depth);
+        usage.record_chain_depth(state.grant_chain(Some(&baseline.grant_leaf))?.len());
+        usage.record_budget(&budget)?;
+        usage.record_metadata(&selection)?;
+        usage.record_metadata(&context)?;
+        usage.record_actual_signature_counts(_signatures.counts());
+        usage.enforce_limits()?;
         let execution_pins = execution_pins
             .into_iter()
             .map(|mut pin| {

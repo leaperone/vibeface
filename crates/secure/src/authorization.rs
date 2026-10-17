@@ -5680,6 +5680,9 @@ pub struct VerifiedClientAuthorization {
     space_kind: &'static str,
     resources: Vec<Signed<ResourceRecord>>,
     budget: Budget,
+    policy_snapshot: VerifiedPolicySet,
+    policy_journal: Vec<JournalEntry>,
+    policy_pins: Vec<PolicyPin>,
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedClientAuthorization {
@@ -5708,6 +5711,306 @@ impl VerifiedClientAuthorization {
         .map_err(|_| "policy encoding failed".to_owned())
     }
 }
+fn verify_client_policy_state(
+    state: VerifiedPolicySet,
+    bundle: &ClientAuthorizationBundle,
+    pins: &[PolicyPin],
+    account: AccountId,
+    space: SpaceId,
+    key: PublicKey,
+    now_ms: u64,
+) -> Result<VerifiedClientAuthorization> {
+    let certificate = state.find_device(&DeviceId::from_key(&key))?;
+    require(
+        certificate.payload.public_key == key
+            && certificate.payload.subject == Actor::Account(account.clone()),
+        "client device belongs to another account",
+    )?;
+    let mut budget = Budget::default();
+    let mut dependencies = BTreeMap::new();
+    state.validate_certificate(
+        certificate,
+        now_ms,
+        &mut budget,
+        &mut dependencies,
+        &mut BTreeSet::new(),
+    )?;
+    let path = state.grant_chain(Some(&bundle.grant_leaf))?;
+    state.verify_grant_path(&path, now_ms, &mut budget, &mut dependencies, true)?;
+    let leaf = &path
+        .last()
+        .ok_or(AuthorizationError::InvalidProof("missing client grant"))?
+        .payload;
+    require(
+        leaf.owner_space == space
+            && state.matches_grantee(
+                &leaf.grantee,
+                &Actor::Account(account.clone()),
+                now_ms,
+                &mut budget,
+                &mut dependencies,
+            )?,
+        "client grant does not authorize this account and space",
+    )?;
+    if let ResourceScope::Exact(resource) = &leaf.scope {
+        let record = state.resource(&resource.space, &resource.resource).ok_or(
+            AuthorizationError::InvalidProof("missing client resource record"),
+        )?;
+        budget.verify(record)?;
+        require(
+            record.payload.host == leaf.audience.service,
+            "client resource audience mismatch",
+        )?;
+    }
+    let target = state.find_device(&leaf.audience.device)?;
+    require(
+        target.payload.subject == Actor::Service(leaf.audience.service.clone()),
+        "client target service mismatch",
+    )?;
+    state.validate_service_reference(&space, target)?;
+    state.validate_certificate(
+        target,
+        now_ms,
+        &mut budget,
+        &mut dependencies,
+        &mut BTreeSet::new(),
+    )?;
+    state.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
+    let mut resources = Vec::new();
+    if let Some(document) = state.space(&space) {
+        for hash in &document.resources {
+            let Some(record) = state.resources.get(hash) else {
+                continue;
+            };
+            if record.payload.kind == ResourceKind::Project
+                && record.payload.host == leaf.audience.service
+                && scope_covers(
+                    &leaf.scope,
+                    &ResourceRef {
+                        space: record.payload.space.clone(),
+                        resource: record.payload.resource.clone(),
+                    },
+                )
+            {
+                budget.verify(record)?;
+                resources.push(record.clone());
+            }
+        }
+    }
+    let account_enrollment_rights: Vec<AccountRight> = state
+        .account(&account)
+        .and_then(|a| {
+            a.enrollment
+                .iter()
+                .find(|e| e.device == certificate.payload.device && now_ms < e.expires_at_ms)
+        })
+        .map(|e| {
+            e.rights
+                .iter()
+                .filter(|r| {
+                    **r != AccountRight::EnrollDevice
+                        || certificate.payload.uses.contains(&DeviceUse::EnrollDevice)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let account_enrollment_expires_at_ms = if account_enrollment_rights.is_empty() {
+        None
+    } else {
+        state
+            .account(&account)
+            .and_then(|a| {
+                a.enrollment
+                    .iter()
+                    .find(|e| e.device == certificate.payload.device)
+            })
+            .map(|e| e.expires_at_ms.min(certificate.payload.expires_at_ms))
+    };
+    let account_recovery = state
+        .account(&account)
+        .ok_or(AuthorizationError::Revoked)?
+        .recovery
+        .clone();
+    let space_genesis_hash = state
+        .spaces
+        .get(&space)
+        .and_then(|space| space.history.first())
+        .ok_or(AuthorizationError::PolicyConflict)?
+        .hash()?;
+    let space_kind = match &state.space(&space).ok_or(AuthorizationError::Revoked)?.root {
+        SpaceRoot::Personal { .. } => "personal",
+        SpaceRoot::Team { .. } => "team",
+    };
+    Ok(VerifiedClientAuthorization {
+        scope: ClientScope {
+            account_id: account,
+            space_id: space,
+            device_id: DeviceId::from_key(&key),
+        },
+        heads: dependencies.into_values().collect(),
+        grant_leaf: bundle.grant_leaf.clone(),
+        actions: leaf.actions.clone(),
+        grant_scope: leaf.scope.clone(),
+        audience: leaf.audience.clone(),
+        audience_public_key: target.payload.public_key.clone(),
+        constraints: leaf.constraints.clone(),
+        account_enrollment_rights,
+        account_enrollment_expires_at_ms,
+        account_recovery,
+        space_genesis_hash,
+        space_kind,
+        resources,
+        budget,
+        policy_snapshot: state,
+        policy_journal: bundle.journal.clone(),
+        policy_pins: pins.to_vec(),
+    })
+}
+
+fn client_policy_tail(
+    reader: &VerifiedClientAuthorization,
+    project: &ClientAuthorizationBundle,
+    project_pins: &[PolicyPin],
+    execution: &ClientAuthorizationBundle,
+    execution_pins: &[PolicyPin],
+) -> Result<(Vec<PolicyPin>, Vec<JournalEntry>)> {
+    require(
+        project_pins.len() <= MAX_POLICY_DOMAINS && execution_pins.len() <= MAX_POLICY_DOMAINS
+            && project_pins.windows(2).all(|pins| pins[0].domain < pins[1].domain)
+            && execution_pins.windows(2).all(|pins| pins[0].domain < pins[1].domain),
+        "invalid independent policy pin bounds",
+    )?;
+    require(
+        project.grant_leaf == reader.grant_leaf
+            && project.journal.starts_with(&reader.policy_journal),
+        "historical Project journal changed its verified prefix",
+    )?;
+    for saved in &reader.policy_pins {
+        let pin = project_pins
+            .iter()
+            .find(|pin| pin.domain == saved.domain)
+            .ok_or(AuthorizationError::InvalidProof(
+                "historical Project pin was removed",
+            ))?;
+        require(
+            pin.genesis_root == saved.genesis_root,
+            "historical Project root changed",
+        )?;
+        if let Some(minimum) = &saved.minimum_head {
+            let current = pin
+                .minimum_head
+                .as_ref()
+                .ok_or(AuthorizationError::InvalidProof(
+                    "historical Project watermark was removed",
+                ))?;
+            require(
+                (current.authority_epoch, current.sequence)
+                    >= (minimum.authority_epoch, minimum.sequence)
+                    && ((current.authority_epoch, current.sequence)
+                        != (minimum.authority_epoch, minimum.sequence)
+                        || current == minimum),
+                "historical Project watermark moved backwards",
+            )?;
+        }
+    }
+    for pin in project_pins {
+        if !reader.policy_pins.iter().any(|saved| saved.domain == pin.domain) {
+            require(
+                execution_pins.iter().any(|saved| saved.domain == pin.domain
+                    && saved.genesis_root == pin.genesis_root),
+                "additional execution policy requires its independent saved pin",
+            )?;
+        }
+    }
+    let mut pins = BTreeMap::<PolicyDomain, PolicyPin>::new();
+    for pin in project_pins.iter().cloned().chain(execution_pins.iter().cloned()) {
+        if let Some(saved) = pins.get_mut(&pin.domain) {
+            require(
+                saved.genesis_root == pin.genesis_root,
+                "historical policy roots conflict",
+            )?;
+            if let Some(candidate) = pin.minimum_head {
+                match &saved.minimum_head {
+                    Some(existing)
+                        if (existing.authority_epoch, existing.sequence)
+                            == (candidate.authority_epoch, candidate.sequence) =>
+                    {
+                        require(
+                            existing == &candidate,
+                            "historical policy watermarks conflict",
+                        )?
+                    }
+                    Some(existing)
+                        if (existing.authority_epoch, existing.sequence)
+                            > (candidate.authority_epoch, candidate.sequence) => {}
+                    _ => saved.minimum_head = Some(candidate),
+                }
+            }
+        } else {
+            pins.insert(pin.domain.clone(), pin);
+        }
+    }
+    let mut seen = reader
+        .policy_journal
+        .iter()
+        .map(ObjectHash::body)
+        .collect::<Result<BTreeSet<_>>>()?;
+    let tail = project
+        .journal
+        .iter()
+        .skip(reader.policy_journal.len())
+        .chain(&execution.journal)
+        .filter_map(|entry| match ObjectHash::body(entry) {
+            Ok(hash) if seen.insert(hash.clone()) => Some(Ok(entry.clone())),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    require(
+        project
+            .journal
+            .len()
+            .saturating_add(execution.journal.len())
+            <= MAX_POLICY_HISTORY * MAX_POLICY_DOMAINS,
+        "historical journal has too many entries",
+    )?;
+    let pins = pins.into_values().collect::<Vec<_>>();
+    Ok((pins, tail))
+}
+
+fn revalidate_client_policy(
+    reader: &VerifiedClientAuthorization,
+    state: VerifiedPolicySet,
+    project: &ClientAuthorizationBundle,
+    pins: &[PolicyPin],
+    now: u64,
+) -> Result<VerifiedClientAuthorization> {
+    let key = reader
+        .policy_snapshot
+        .find_device(&reader.scope.device_id)?
+        .payload
+        .public_key
+        .clone();
+    let baseline = verify_client_policy_state(
+        state,
+        project,
+        pins,
+        reader.scope.account_id.clone(),
+        reader.scope.space_id.clone(),
+        key,
+        now,
+    )?;
+    require(
+        baseline.scope == reader.scope
+            && baseline.grant_leaf == reader.grant_leaf
+            && baseline.audience == reader.audience
+            && baseline.audience_public_key == reader.audience_public_key,
+        "Project policy changed the verified client scope or Grant",
+    )?;
+    Ok(baseline)
+}
+
 /// Pins come from the saved verified entry, not from this untrusted bundle.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyClientAuthorization))]
 pub fn verify_client_authorization(
@@ -5750,149 +6053,7 @@ pub fn verify_client_authorization(
         let space = SpaceId::parse(space)?;
         let key = PublicKey::parse(key)?;
         let state = replay_policies(&pins, &bundle.journal)?;
-        let certificate = state.find_device(&DeviceId::from_key(&key))?;
-        require(
-            certificate.payload.public_key == key
-                && certificate.payload.subject == Actor::Account(account.clone()),
-            "client device belongs to another account",
-        )?;
-        let mut budget = Budget::default();
-        let mut dependencies = BTreeMap::new();
-        state.validate_certificate(
-            certificate,
-            now_ms,
-            &mut budget,
-            &mut dependencies,
-            &mut BTreeSet::new(),
-        )?;
-        let path = state.grant_chain(Some(&bundle.grant_leaf))?;
-        state.verify_grant_path(&path, now_ms, &mut budget, &mut dependencies, true)?;
-        let leaf = &path
-            .last()
-            .ok_or(AuthorizationError::InvalidProof("missing client grant"))?
-            .payload;
-        require(
-            leaf.owner_space == space
-                && state.matches_grantee(
-                    &leaf.grantee,
-                    &Actor::Account(account.clone()),
-                    now_ms,
-                    &mut budget,
-                    &mut dependencies,
-                )?,
-            "client grant does not authorize this account and space",
-        )?;
-        if let ResourceScope::Exact(resource) = &leaf.scope {
-            let record = state.resource(&resource.space, &resource.resource).ok_or(
-                AuthorizationError::InvalidProof("missing client resource record"),
-            )?;
-            budget.verify(record)?;
-            require(
-                record.payload.host == leaf.audience.service,
-                "client resource audience mismatch",
-            )?;
-        }
-        let target = state.find_device(&leaf.audience.device)?;
-        require(
-            target.payload.subject == Actor::Service(leaf.audience.service.clone()),
-            "client target service mismatch",
-        )?;
-        state.validate_service_reference(&space, target)?;
-        state.validate_certificate(
-            target,
-            now_ms,
-            &mut budget,
-            &mut dependencies,
-            &mut BTreeSet::new(),
-        )?;
-        state.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
-        let mut resources = Vec::new();
-        if let Some(document) = state.space(&space) {
-            for hash in &document.resources {
-                let Some(record) = state.resources.get(hash) else {
-                    continue;
-                };
-                if record.payload.kind == ResourceKind::Project
-                    && record.payload.host == leaf.audience.service
-                    && scope_covers(
-                        &leaf.scope,
-                        &ResourceRef {
-                            space: record.payload.space.clone(),
-                            resource: record.payload.resource.clone(),
-                        },
-                    )
-                {
-                    budget.verify(record)?;
-                    resources.push(record.clone());
-                }
-            }
-        }
-        let account_enrollment_rights: Vec<AccountRight> = state
-            .account(&account)
-            .and_then(|a| {
-                a.enrollment
-                    .iter()
-                    .find(|e| e.device == certificate.payload.device && now_ms < e.expires_at_ms)
-            })
-            .map(|e| {
-                e.rights
-                    .iter()
-                    .filter(|r| {
-                        **r != AccountRight::EnrollDevice
-                            || certificate.payload.uses.contains(&DeviceUse::EnrollDevice)
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        let account_enrollment_expires_at_ms = if account_enrollment_rights.is_empty() {
-            None
-        } else {
-            state
-                .account(&account)
-                .and_then(|a| {
-                    a.enrollment
-                        .iter()
-                        .find(|e| e.device == certificate.payload.device)
-                })
-                .map(|e| e.expires_at_ms.min(certificate.payload.expires_at_ms))
-        };
-        let account_recovery = state
-            .account(&account)
-            .ok_or(AuthorizationError::Revoked)?
-            .recovery
-            .clone();
-        let space_genesis_hash = state
-            .spaces
-            .get(&space)
-            .and_then(|space| space.history.first())
-            .ok_or(AuthorizationError::PolicyConflict)?
-            .hash()?;
-        let space_kind = match &state.space(&space).ok_or(AuthorizationError::Revoked)?.root {
-            SpaceRoot::Personal { .. } => "personal",
-            SpaceRoot::Team { .. } => "team",
-        };
-        Ok(VerifiedClientAuthorization {
-            scope: ClientScope {
-                account_id: account,
-                space_id: space,
-                device_id: DeviceId::from_key(&key),
-            },
-            heads: dependencies.into_values().collect(),
-            grant_leaf: bundle.grant_leaf,
-            actions: leaf.actions.clone(),
-            grant_scope: leaf.scope.clone(),
-            audience: leaf.audience.clone(),
-            audience_public_key: target.payload.public_key.clone(),
-            constraints: leaf.constraints.clone(),
-            account_enrollment_rights,
-            account_enrollment_expires_at_ms,
-            account_recovery,
-            space_genesis_hash,
-            space_kind,
-            resources,
-            budget,
-        })
+        verify_client_policy_state(state, &bundle, &pins, account, space, key, now_ms)
     }
     verify(
         bundle_json,
@@ -6333,14 +6494,14 @@ impl VerifiedClientAuthorization {
 }
 /// Reconstruct signed history from independent local pins. It grants no fresh write lease.
 pub fn replay_policies(pins: &[PolicyPin], journal: &[JournalEntry]) -> Result<VerifiedPolicySet> {
-    require(
-        pins.len() <= MAX_POLICY_DOMAINS
-            && pins.windows(2).all(|p| p[0].domain < p[1].domain)
-            && journal.len() <= MAX_POLICY_HISTORY * MAX_POLICY_DOMAINS,
-        "invalid policy history bounds",
-    )?;
-    let mut state = VerifiedPolicySet::new();
-    for entry in journal.iter().cloned() {
+    replay_policy_tail(VerifiedPolicySet::new(), pins, journal)
+}
+
+fn apply_policy_entry(
+    state: &mut VerifiedPolicySet,
+    pins: &[PolicyPin],
+    entry: JournalEntry,
+) -> Result<()> {
         match entry {
             JournalEntry::AccountGenesis(signed) => {
                 let domain = PolicyDomain::Account(signed.payload.account.clone());
@@ -6388,6 +6549,22 @@ pub fn replay_policies(pins: &[PolicyPin], journal: &[JournalEntry]) -> Result<V
                 state.replay_space_committed(change)?;
             }
         }
+    Ok(())
+}
+
+fn replay_policy_tail(
+    mut state: VerifiedPolicySet,
+    pins: &[PolicyPin],
+    journal: &[JournalEntry],
+) -> Result<VerifiedPolicySet> {
+    require(
+        pins.len() <= MAX_POLICY_DOMAINS
+            && pins.windows(2).all(|p| p[0].domain < p[1].domain)
+            && journal.len() <= MAX_POLICY_HISTORY * MAX_POLICY_DOMAINS,
+        "invalid policy history bounds",
+    )?;
+    for entry in journal.iter().cloned() {
+        apply_policy_entry(&mut state, pins, entry)?;
     }
     for pin in pins {
         if let Some(minimum) = &pin.minimum_head {
