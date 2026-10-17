@@ -29,6 +29,14 @@ fn main() -> Result<()> {
                     }
                     json!({"public_key":identity.public_key_hex(),"node_id":identity.node_id()})
                 }
+                "recovery_seal" => json!(hex::encode(vibeface_secure::recovery_seal(
+                    &bytes(&input)?,
+                    text(&input, "password")?
+                )?)),
+                "recovery_open" => json!(hex::encode(vibeface_secure::recovery_open(
+                    &bytes(&input)?,
+                    text(&input, "password")?
+                )?)),
                 "sign" => json!(identity.sign(text(&input, "domain")?, &bytes(&input)?)?),
                 "handshake" => {
                     handshake = Some(Handshake::new(

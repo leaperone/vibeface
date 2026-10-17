@@ -24,6 +24,8 @@ function endpoint() {
         case 'identity':
           if (input.secret_hex) { identity.free(); identity = crypto.Identity.fromSecretHex(input.secret_hex); }
           result = { public_key: identity.publicKeyHex(), node_id: identity.nodeId() }; break;
+        case 'recovery_seal': result = hex(crypto.recoverySeal(bytes(input.data), input.password)); break;
+        case 'recovery_open': result = hex(crypto.recoveryOpen(bytes(input.data), input.password)); break;
         case 'sign': result = identity.sign(input.domain, bytes(input.data)); break;
         case 'handshake':
           handshake = new crypto.Handshake(input.initiator, identity.secretHex(), input.expected_peer_id, new TextEncoder().encode(input.context)); break;
@@ -45,6 +47,7 @@ function endpoint() {
 async function selfTest() {
   const nativePath = argument('--native-probe');
   const children = [];
+  const timeout = setTimeout(() => { for (const child of children) child.kill(); process.stderr.write('crypto self-test timed out\n'); process.exit(1); }, 60_000);
   function native() {
     if (!nativePath) return endpoint();
     const child = spawn(resolve(nativePath), [], { stdio: ['pipe', 'pipe', 'inherit'] });
@@ -77,6 +80,13 @@ async function selfTest() {
   }
   try {
     const { a, b } = await pair();
+    const recovery = hex(Buffer.from(JSON.stringify({ private: 'recovery fixture only' })));
+    const password = 'correct horse battery staple';
+    const packageFromBrowser = await call(a, { op: 'recovery_seal', data: recovery, password });
+    assert.equal(await call(b, { op: 'recovery_open', data: packageFromBrowser, password }), recovery);
+    const packageFromNative = await call(b, { op: 'recovery_seal', data: recovery, password });
+    assert.equal(await call(a, { op: 'recovery_open', data: packageFromNative, password }), recovery);
+    assert.equal((await a({ op: 'recovery_open', data: packageFromNative, password: 'incorrect fixture password' })).ok, false);
     for (const payload of [Buffer.alloc(0), Buffer.alloc(150_000, 0x5a)]) {
       const records = await call(a, { op: 'seal_message', data: hex(payload) });
       for (let i = 0; i < records.length; i++) {
@@ -92,8 +102,8 @@ async function selfTest() {
     const cipher = bytes(await call(tamper.a, { op: 'seal', data: '010203' })); cipher[0] ^= 1;
     assert.equal((await tamper.b({ op: 'open', data: hex(cipher) })).ok, false);
     assert.equal((await tamper.b({ op: 'open', data: await call(tamper.a, { op: 'seal', data: '04' }) })).ok, false);
-    process.stdout.write(`${JSON.stringify({ ok: true, peer: nativePath ? 'native-rust' : 'wasm', checks: ['identity-binding', 'private-handshake', 'fragmented-message', 'domain-signature', 'wrong-identity', 'tamper', 'replay', 'fail-closed'] })}\n`);
-  } finally { for (const child of children) child.stdin.end(); }
+    process.stdout.write(`${JSON.stringify({ ok: true, peer: nativePath ? 'native-rust' : 'wasm', checks: ['identity-binding', 'private-handshake', 'fragmented-message', 'domain-signature', 'wrong-identity', 'tamper', 'replay', 'fail-closed', 'recovery-native-wasm', 'recovery-wrong-password'] })}\n`);
+  } finally { clearTimeout(timeout); for (const child of children) child.stdin.end(); }
 }
 
 if (args.includes('--self-test')) await selfTest();

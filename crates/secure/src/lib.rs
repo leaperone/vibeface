@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
+mod recovery;
+pub use recovery::{recovery_open, recovery_seal};
+
 type Result<T> = std::result::Result<T, String>;
 const NOISE: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 const MAX_MESSAGE: usize = 65_535;
@@ -154,6 +157,7 @@ impl Handshake {
         })
     }
 
+    /// Message two precedes initiator authorization and must contain only public application data.
     pub fn write(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         let result = self.write_inner(payload);
         if result.is_err() {
