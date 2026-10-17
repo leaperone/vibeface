@@ -95,6 +95,14 @@ struct IsolatedScope {
     stopped: bool,
 }
 
+pub(super) struct StoppedScope {
+    node: String,
+    key: String,
+    name: String,
+    id: Option<String>,
+    network_id: Option<String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct IsolatedProcess {
     config: ExecutionIsolationConfig,
@@ -461,8 +469,42 @@ impl DockerIsolation {
     }
 
     pub async fn cancel(&self, context: &ExecutionContext) -> Result<Vec<String>> {
-        let key = self.key(context);
         let mut scopes = self.scopes.lock().await;
+        Ok(self.stop(context, &mut scopes).await?.1)
+    }
+
+    pub(super) async fn fence(
+        &self,
+        context: &ExecutionContext,
+    ) -> Result<(StoppedScope, Vec<String>)> {
+        let mut scopes = self.scopes.lock().await;
+        let (mut stopped, affected) = self.stop(context, &mut scopes).await?;
+        if self.config.egress.is_some() {
+            stopped.network_id = self
+                .inspect_network(&stopped.name)
+                .await?
+                .map(|network| {
+                    ensure!(
+                        network["Labels"]["vibeface.node"] == stopped.node
+                            && network["Labels"]["vibeface.scope"] == stopped.key,
+                        "refuse to fence an unrelated model network"
+                    );
+                    Ok(network["Id"]
+                        .as_str()
+                        .context("isolated model network ID missing")?
+                        .to_owned())
+                })
+                .transpose()?;
+        }
+        Ok((stopped, affected))
+    }
+
+    async fn stop(
+        &self,
+        context: &ExecutionContext,
+        scopes: &mut BTreeMap<String, IsolatedScope>,
+    ) -> Result<(StoppedScope, Vec<String>)> {
+        let key = self.key(context);
         let node = hash(
             self.data_dir
                 .canonicalize()?
@@ -483,51 +525,144 @@ impl DockerIsolation {
                 &scope.handle.control.join("deadline"),
                 vibeface_protocol::now_ms().to_string().as_bytes(),
             );
-            scope.handle.id.clone()
+            Some(scope.handle.id.clone())
         } else {
-            let Some(container) = self.inspect(&name).await? else {
-                return Ok(affected.into_iter().collect());
-            };
-            let control = self
-                .data_dir
-                .canonicalize()?
-                .join("execution")
-                .join(&key)
-                .join("control");
-            crate::config::verify_private_dir(&control)?;
-            let operations: BTreeMap<String, u64> =
-                serde_json::from_slice(&std::fs::read(control.join("operations.json"))?)?;
-            ensure!(
-                operations.contains_key(&context.operation_id),
-                "stale operation cannot cancel a different persisted generation"
-            );
-            affected.extend(operations.into_keys());
-            container["Id"]
-                .as_str()
-                .context("isolated container ID missing")?
-                .to_owned()
-        };
-        if let Some(container) = self.inspect(&id).await? {
-            ensure!(
-                container["Config"]["Labels"]["vibeface.node"] == node
-                    && container["Config"]["Labels"]["vibeface.scope"] == key,
-                "refuse to stop an unrelated container"
-            );
-            if container["State"]["Running"] == true {
-                let mut command = self.docker();
-                command.args(["stop", "--time", "2", &id]);
-                checked_output(command, "stop isolated resource container").await?;
+            if let Some(container) = self.inspect(&name).await? {
+                let control = self
+                    .data_dir
+                    .canonicalize()?
+                    .join("execution")
+                    .join(&key)
+                    .join("control");
+                crate::config::verify_private_dir(&control)?;
+                let operations: BTreeMap<String, u64> =
+                    serde_json::from_slice(&std::fs::read(control.join("operations.json"))?)?;
+                ensure!(
+                    operations.contains_key(&context.operation_id),
+                    "stale operation cannot cancel a different persisted generation"
+                );
+                affected.extend(operations.into_keys());
+                Some(
+                    container["Id"]
+                        .as_str()
+                        .context("isolated container ID missing")?
+                        .to_owned(),
+                )
+            } else {
+                None
             }
-            let stopped = self
-                .inspect(&id)
-                .await?
-                .context("container disappeared before stop could be confirmed")?;
+        };
+        if let Some(id) = &id {
+            if let Some(container) = self.inspect(id).await? {
+                ensure!(
+                    container["Config"]["Labels"]["vibeface.node"] == node
+                        && container["Config"]["Labels"]["vibeface.scope"] == key,
+                    "refuse to stop an unrelated container"
+                );
+                if container["State"]["Running"] == true {
+                    let mut command = self.docker();
+                    command.args(["stop", "--time", "2", id]);
+                    checked_output(command, "stop isolated resource container").await?;
+                }
+                let stopped = self
+                    .inspect(id)
+                    .await?
+                    .context("container disappeared before stop could be confirmed")?;
+                ensure!(
+                    stopped["State"]["Running"] == false && stopped["State"]["Pid"] == 0,
+                    "isolated execution stop could not be confirmed"
+                );
+            }
+        }
+        Ok((
+            StoppedScope {
+                node,
+                key,
+                name,
+                id,
+                network_id: None,
+            },
+            affected.into_iter().collect(),
+        ))
+    }
+
+    pub(super) async fn complete_fenced(&self, stopped: &StoppedScope) -> Result<()> {
+        let mut scopes = self.scopes.lock().await;
+        if let Some(scope) = scopes.get(&stopped.key) {
             ensure!(
-                stopped["State"]["Running"] == false && stopped["State"]["Pid"] == 0,
-                "isolated execution stop could not be confirmed"
+                scope.stopped && stopped.id.as_deref() == Some(scope.handle.id.as_str()),
+                "stopped execution cannot clean a different scope generation"
             );
         }
-        Ok(affected.into_iter().collect())
+        if let Some(container) = self.inspect(&stopped.name).await? {
+            ensure!(
+                container["Id"].as_str() == stopped.id.as_deref(),
+                "stopped execution container name belongs to a different generation"
+            );
+        }
+        if let Some(id) = &stopped.id {
+            if let Some(container) = self.inspect(id).await? {
+                ensure!(
+                    container["Config"]["Labels"]["vibeface.node"] == stopped.node
+                        && container["Config"]["Labels"]["vibeface.scope"] == stopped.key
+                        && container["State"]["Running"] == false
+                        && container["State"]["Pid"] == 0,
+                    "fenced execution is no longer confirmed stopped"
+                );
+                let mut command = self.docker();
+                command.args(["rm", id]);
+                checked_output(command, "remove fenced isolated container").await?;
+                ensure!(
+                    self.inspect(id).await?.is_none(),
+                    "fenced container still exists after cleanup"
+                );
+            }
+        }
+        if let Some(egress) = &self.config.egress {
+            if let Some(network) = self.inspect_network(&stopped.name).await? {
+                ensure!(
+                    network["Id"].as_str() == stopped.network_id.as_deref(),
+                    "stopped execution cannot clean a different model network generation"
+                );
+            }
+            if let Some(id) = &stopped.network_id {
+                if let Some(network) = self.inspect_network(id).await? {
+                    ensure!(
+                        network["Labels"]["vibeface.node"] == stopped.node
+                            && network["Labels"]["vibeface.scope"] == stopped.key,
+                        "refuse to clean an unrelated model network"
+                    );
+                    let gateway = self.inspect(&egress.gateway_container).await?;
+                    let gateway_id = gateway
+                        .as_ref()
+                        .map(|gateway| gateway["Id"].as_str().context("model gateway ID missing"))
+                        .transpose()?;
+                    let peers = network["Containers"]
+                        .as_object()
+                        .context("model network peers unavailable")?;
+                    ensure!(
+                        peers.keys().all(|peer| Some(peer.as_str()) == gateway_id),
+                        "fenced model network has another execution endpoint"
+                    );
+                    if let Some(gateway_id) = gateway_id {
+                        if peers.contains_key(gateway_id) {
+                            let mut command = self.docker();
+                            command.args(["network", "disconnect", id, &egress.gateway_container]);
+                            checked_output(command, "disconnect fenced model network").await?;
+                        }
+                    }
+                    let mut command = self.docker();
+                    command.args(["network", "rm", id]);
+                    checked_output(command, "remove fenced model network").await?;
+                    ensure!(
+                        self.inspect_network(id).await?.is_none(),
+                        "fenced model network still exists after cleanup"
+                    );
+                }
+            }
+        }
+        scopes.remove(&stopped.key);
+        Ok(())
     }
 
     fn docker(&self) -> Command {
@@ -549,6 +684,26 @@ impl DockerIsolation {
         ensure!(
             error.contains("no such container") || error.contains("no such object"),
             "Docker could not inspect isolated execution"
+        );
+        Ok(None)
+    }
+
+    async fn inspect_network(&self, name: &str) -> Result<Option<Value>> {
+        let mut command = self.docker();
+        command.args(["network", "inspect", name]);
+        let output = timed_output(command)
+            .await
+            .context("inspect isolated model network")?;
+        if output.status.success() {
+            let values: Vec<Value> = serde_json::from_slice(&output.stdout)?;
+            ensure!(values.len() == 1, "invalid network inspect response");
+            return Ok(values.into_iter().next());
+        }
+        let error = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+        ensure!(
+            error.contains("no such network")
+                || (error.contains("network ") && error.contains(" not found")),
+            "Docker could not inspect isolated model network"
         );
         Ok(None)
     }
@@ -951,6 +1106,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_fencing_cleans_only_its_stopped_container_and_network_generation()
+    -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("vfc-{}", uuid::Uuid::new_v4()));
+        let data = root.join("node");
+        let control = root.join("control");
+        crate::config::private_dir(&data)?;
+        crate::config::private_dir(&control)?;
+        let docker = root.join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                r##"#!/bin/sh
+fixture='{}'
+case "$1 $2" in
+  'container inspect')
+    if [ "$3" = models ]; then cat "$fixture/gateway.json"; exit; fi
+    if [ -f "$fixture/container.json" ]; then cat "$fixture/container.json"; exit; fi
+    printf 'No such container\n' >&2; exit 1;;
+  'rm old-container')
+    if [ -f "$fixture/fail-container" ]; then exit 1; fi
+    if [ ! -f "$fixture/keep-container" ]; then rm "$fixture/container.json"; fi;;
+  'network inspect')
+    if [ -f "$fixture/network.json" ]; then cat "$fixture/network.json"; exit; fi
+    printf 'No such network\n' >&2; exit 1;;
+  'network disconnect')
+    [ "$3" = old-network ] && [ "$4" = models ] || exit 2
+    cp "$fixture/detached-network.json" "$fixture/network.json";;
+  'network rm')
+    [ "$3" = old-network ] || exit 2
+    if [ -f "$fixture/fail-network" ]; then exit 1; fi
+    rm "$fixture/network.json";;
+  *) exit 2;;
+esac
+"##,
+                root.display()
+            ),
+        )?;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700))?;
+        let settings = ExecutionIsolationConfig {
+            image: format!("sha256:{}", "a".repeat(64)),
+            docker_bin: docker,
+            egress: Some(ExecutionEgressConfig {
+                gateway_container: "models".into(),
+                gateway_port: 8080,
+                codex_model: "fixture".into(),
+            }),
+        };
+        let (events, _) = mpsc::unbounded_channel();
+        let engine = Engine::new(
+            ExecutorConfig {
+                execution_isolation: Some(settings.clone()),
+                data_dir: Some(data.clone()),
+                ..ExecutorConfig::default()
+            },
+            events,
+        );
+        let context = ExecutionContext {
+            space_id: SpaceId::parse(&format!("spc2_{}", "1".repeat(64)))?,
+            resource_id: ResourceId::from_bytes([2; 32]),
+            operation_id: "expired-operation".into(),
+            shared: true,
+            lease_expires_at_ms: 0,
+        };
+        let isolation = engine.isolation.as_ref().unwrap();
+        let node = hash(data.canonicalize()?.to_str().unwrap());
+        let key = isolation.key(&context);
+        let name = format!("vibeface-{}-{}", &node[..16], &key[..32]);
+        let labels = serde_json::json!({"vibeface.node":node,"vibeface.scope":key});
+        let container = serde_json::json!([{"Id":"old-container", "Config":{"Labels":labels}, "State":{"Running":false,"Pid":0}}]);
+        let network = serde_json::json!({"Id":"old-network","Labels":labels,"Containers":{"gateway-id":{"Name":"models"}}});
+        std::fs::write(root.join("container.json"), serde_json::to_vec(&container)?)?;
+        std::fs::write(
+            root.join("network.json"),
+            serde_json::to_vec(&serde_json::json!([network]))?,
+        )?;
+        std::fs::write(
+            root.join("detached-network.json"),
+            serde_json::to_vec(
+                &serde_json::json!([{"Id":"old-network","Labels":labels,"Containers":{}}]),
+            )?,
+        )?;
+        std::fs::write(root.join("gateway.json"), br#"[{"Id":"gateway-id"}]"#)?;
+        let handle = IsolatedProcess {
+            config: settings,
+            name,
+            id: "old-container".into(),
+            control,
+            gateway_url: None,
+        };
+        isolation.scopes.lock().await.insert(
+            key.clone(),
+            IsolatedScope {
+                handle: handle.clone(),
+                operations: BTreeMap::from([
+                    (context.operation_id.clone(), 0),
+                    ("also-stopped".into(), 0),
+                ]),
+                codex: None,
+                stopped: false,
+            },
+        );
+        let (stopped, affected) = engine.fence_operation(&context).await?;
+        assert_eq!(affected, vec!["also-stopped", "expired-operation"]);
+        std::fs::write(root.join("fail-container"), b"")?;
+        assert!(engine.complete_fenced_operation(&stopped).await.is_err());
+        assert!(root.join("container.json").exists());
+        std::fs::remove_file(root.join("fail-container"))?;
+        std::fs::write(root.join("keep-container"), b"")?;
+        assert!(engine.complete_fenced_operation(&stopped).await.is_err());
+        assert!(isolation.scopes.lock().await.contains_key(&key));
+        std::fs::remove_file(root.join("keep-container"))?;
+        std::fs::write(root.join("fail-network"), b"")?;
+        assert!(engine.complete_fenced_operation(&stopped).await.is_err());
+        assert!(!root.join("container.json").exists());
+        assert!(root.join("network.json").exists());
+        assert!(isolation.scopes.lock().await.contains_key(&key));
+        std::fs::remove_file(root.join("fail-network"))?;
+        engine.complete_fenced_operation(&stopped).await?;
+        engine.complete_fenced_operation(&stopped).await?;
+        assert!(!root.join("network.json").exists());
+        assert!(!isolation.scopes.lock().await.contains_key(&key));
+        assert!(engine.fenced_operations.lock().await.contains(&(
+            context.space_id.clone(),
+            context.resource_id.clone(),
+            "also-stopped".into()
+        )));
+
+        let mut new_handle = handle;
+        new_handle.id = "new-container".into();
+        isolation.scopes.lock().await.insert(
+            key.clone(),
+            IsolatedScope {
+                handle: new_handle,
+                operations: BTreeMap::from([("new-operation".into(), 0)]),
+                codex: None,
+                stopped: false,
+            },
+        );
+        assert!(engine.complete_fenced_operation(&stopped).await.is_err());
+        assert_eq!(
+            isolation.scopes.lock().await[&key].handle.id,
+            "new-container"
+        );
+        isolation.scopes.lock().await.remove(&key);
+        let mut new_container = container;
+        new_container[0]["Id"] = "new-container".into();
+        std::fs::write(
+            root.join("container.json"),
+            serde_json::to_vec(&new_container)?,
+        )?;
+        assert!(engine.complete_fenced_operation(&stopped).await.is_err());
+        assert!(root.join("container.json").exists());
+        std::fs::remove_file(root.join("container.json"))?;
+        std::fs::write(root.join("network.json"), br#"[{"Id":"new-network"}]"#)?;
+        assert!(engine.complete_fenced_operation(&stopped).await.is_err());
+        assert!(root.join("network.json").exists());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     #[ignore = "requires the pinned isolation fixture image and a local Docker daemon"]
     async fn production_engine_isolates_files_environment_and_cancels_the_container() -> Result<()>
     {
@@ -1032,12 +1349,20 @@ mod tests {
             ensure!(containers[0]["State"]["Running"] == false && containers[0]["State"]["Pid"] == 0, "cancel did not stop the actual container");
             tokio::time::sleep(Duration::from_millis(3_200)).await;
             ensure!(!session.cwd.join("background-write").exists(), "completed Provider left a background process running");
-            println!("isolation-proof={}", serde_json::json!({"file_and_environment":proof,"cancel_affected":affected,"cancel_confirmed":true,"interrupted_result_unknown":failure.uncertain,"stopped_operation_not_restarted":true,"stale_exec_rejected":true,"stale_cancel_rejected":true,"terminal_background_write_absent":true}));
+            let (stopped, _) = engine.fence_operation(&waiting).await?;
+            engine.complete_fenced_operation(&stopped).await?;
+            let mut replacement = waiting.clone();
+            replacement.operation_id = "replacement-operation".into();
+            replacement.lease_expires_at_ms = vibeface_protocol::now_ms() + 30_000;
+            let prepared = engine.isolation.as_ref().unwrap().prepare(&replacement, &session.cwd).await?;
+            ensure!(prepared.id != stale.id, "replacement reused the stopped container generation");
+            ensure!(engine.complete_fenced_operation(&stopped).await.is_err(), "old stopped token cleaned the replacement generation");
+            let (replaced, _) = engine.fence_operation(&replacement).await?;
+            engine.complete_fenced_operation(&replaced).await?;
+            println!("isolation-proof={}", serde_json::json!({"file_and_environment":proof,"cancel_affected":affected,"cancel_confirmed":true,"interrupted_result_unknown":failure.uncertain,"stopped_operation_not_restarted":true,"stale_exec_rejected":true,"stale_cancel_rejected":true,"terminal_background_write_absent":true,"fenced_cleanup_allows_new_generation":true}));
             Ok::<_, anyhow::Error>(())
         }.await;
-        let mut cleanup = Command::new(&docker_bin);
-        cleanup.args(["rm", "--force", &name]);
-        let cleaned = checked_output(cleanup, "remove test container").await;
+        let cleaned = cleanup_test_container(&docker_bin, &name).await;
         std::fs::remove_dir_all(&root)?;
         outcome?;
         cleaned?;

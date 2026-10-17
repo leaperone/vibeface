@@ -137,6 +137,8 @@ impl EngineError {
 
 pub(crate) struct StoppedExecution {
     context: ExecutionContext,
+    owner: Arc<Mutex<BTreeSet<ExecutionGeneration>>>,
+    scope: isolation::StoppedScope,
 }
 
 impl StoppedExecution {
@@ -399,7 +401,12 @@ impl Engine {
         vibeface_protocol::validate_id(&context.operation_id).map_err(anyhow::Error::msg)?;
         let mut fenced = self.fenced_operations.lock().await;
         fenced.insert(execution_generation(context));
-        let affected = self.cancel_operation(context).await?;
+        let (scope, affected) = self
+            .isolation
+            .as_ref()
+            .context("shared execution isolation is not configured")?
+            .fence(context)
+            .await?;
         for operation in &affected {
             fenced.insert((
                 context.space_id.clone(),
@@ -410,6 +417,8 @@ impl Engine {
         Ok((
             StoppedExecution {
                 context: context.clone(),
+                owner: self.fenced_operations.clone(),
+                scope,
             },
             affected,
         ))
@@ -426,6 +435,30 @@ impl Engine {
         if let Some(isolation) = &self.isolation {
             isolation.complete(context).await?;
         }
+        self.forget_operation(context).await;
+        Ok(())
+    }
+
+    pub(crate) async fn complete_fenced_operation(&self, stopped: &StoppedExecution) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.fenced_operations, &stopped.owner),
+            "stopped execution belongs to a different Engine"
+        );
+        let fenced = self.fenced_operations.lock().await;
+        ensure!(
+            fenced.contains(&execution_generation(&stopped.context)),
+            "stopped execution generation is not fenced"
+        );
+        self.isolation
+            .as_ref()
+            .context("shared execution isolation is not configured")?
+            .complete_fenced(&stopped.scope)
+            .await?;
+        self.forget_operation(&stopped.context).await;
+        Ok(())
+    }
+
+    async fn forget_operation(&self, context: &ExecutionContext) {
         self.codex_contexts.lock().await.retain(|_, bound| {
             bound.space_id != context.space_id
                 || bound.resource_id != context.resource_id
@@ -435,7 +468,6 @@ impl Engine {
             .lock()
             .await
             .remove(&personal_turn_key(context));
-        Ok(())
     }
 
     pub async fn cancel_personal_turn(
@@ -1010,7 +1042,29 @@ mod tests {
             .expect_err("a late execution generation must be rejected");
         assert!(!failure.uncertain);
         assert!(failure.message.contains("generation was fenced"));
-        assert_eq!(std::fs::read_to_string(marker)?, "inspect\n");
+        assert_eq!(std::fs::read_to_string(&marker)?, "inspect\n");
+        let (events, _) = mpsc::unbounded_channel();
+        let other_engine = Engine::new(engine.config.clone(), events);
+        assert!(
+            other_engine
+                .complete_fenced_operation(&token)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&marker)?, "inspect\n");
+        engine.clone().complete_fenced_operation(&token).await?;
+        engine.complete_fenced_operation(&token).await?;
+        assert_eq!(
+            std::fs::read_to_string(&marker)?,
+            "inspect\ninspect\ninspect\n"
+        );
+        assert!(
+            engine
+                .fenced_operations
+                .lock()
+                .await
+                .contains(&execution_generation(&context))
+        );
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
