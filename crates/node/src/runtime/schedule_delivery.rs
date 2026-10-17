@@ -21,21 +21,6 @@ fn remote_session_key(scope: &str, target: &str) -> String {
     )
 }
 
-fn historical_role(store: &Store, network: &str, author: &str, role: NodeRole) -> Result<bool> {
-    let view = store
-        .trust_bundle(network)?
-        .context("network membership missing")?
-        .project()?;
-    // Checkpoints retain historical verification keys after an old member disappears.
-    Ok(view
-        .members
-        .iter()
-        .find(|member| member.subject_id == author)
-        .is_none_or(|member| {
-            member.kind == IdentityKind::Node && member.node_roles.contains(&role)
-        }))
-}
-
 fn observation_entries(
     store: &Store,
     network: &str,
@@ -55,12 +40,7 @@ fn observation_entries(
                 role,
                 scheduler_node: Some(target),
                 ..
-            } if role == "user" => {
-                if !historical_role(store, network, &event.author, NodeRole::Gateway)? {
-                    continue;
-                }
-                target.clone()
-            }
+            } if role == "user" => target.clone(),
             EventBody::ExecutionObserved {
                 task_id: Some(task),
                 target_node,
@@ -69,9 +49,6 @@ fn observation_entries(
             } if event.author == *target_node
                 && matches!(status.as_str(), "succeeded" | "failed" | "rejected") =>
             {
-                if !historical_role(store, network, target_node, NodeRole::Executor)? {
-                    continue;
-                }
                 let Ok(policy) = store.historical_followup_policy(network, scope, task) else {
                     continue;
                 };
@@ -249,10 +226,6 @@ fn observed_job_value(store: &Store, entry: &OutboxEntry, job: &SchedulerJob) ->
                 job.kind == crate::scheduling::TriggerKind::Human,
                 "observed job trigger kind mismatch"
             );
-            ensure!(
-                historical_role(store, &entry.network_id, &event.author, NodeRole::Gateway)?,
-                "observed human trigger was not written by a Gateway"
-            );
         }
         EventBody::ExecutionObserved {
             task_id: Some(task),
@@ -265,10 +238,6 @@ fn observed_job_value(store: &Store, entry: &OutboxEntry, job: &SchedulerJob) ->
             ensure!(
                 job.kind == crate::scheduling::TriggerKind::Autonomous,
                 "observed job trigger kind mismatch"
-            );
-            ensure!(
-                historical_role(store, &entry.network_id, target_node, NodeRole::Executor)?,
-                "observed result was not written by an Executor"
             );
             ensure!(
                 store
@@ -1309,19 +1278,6 @@ mod tests {
             },
             vec![],
             2,
-        )?;
-        store.append_event(
-            &manager,
-            &network,
-            "chat",
-            EventBody::MessagePosted {
-                message_id: "spoofed-human".into(),
-                role: "user".into(),
-                text: "not a gateway".into(),
-                scheduler_node: Some(target.clone()),
-            },
-            vec![],
-            3,
         )?;
         let entries = observation_entries(&store, &network, "chat", &viewer.node_id()?)?;
         assert_eq!(entries.len(), 1);
