@@ -122,12 +122,6 @@ pub fn verify_binding(proof: &SignedBinding, authority_public_key: &str) -> Resu
     )
 }
 
-/// Hash the canonical unsigned seal payload.
-pub fn seal_hash(seal: &BindingSeal) -> Result<String> {
-    validate_seal(seal)?;
-    Ok(digest(&serde_json::to_vec(seal)?))
-}
-
 pub fn sign_seal(identity: &LocalIdentity, seal: &BindingSeal) -> Result<SignedSeal> {
     validate_seal(seal)?;
     ensure!(
