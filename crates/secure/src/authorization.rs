@@ -5604,10 +5604,15 @@ pub struct VerifiedClientAuthorization {
     account_enrollment_expires_at_ms: Option<u64>,
     account_recovery: RecoveryPolicy,
     space_genesis_hash: ObjectHash,
+    space_kind: &'static str,
     resources: Vec<Signed<ResourceRecord>>,
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedClientAuthorization {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = spaceKind))]
+    pub fn space_kind_string(&self) -> String {
+        self.space_kind.to_owned()
+    }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = accountRecoveryPolicyJson))]
     pub fn account_recovery_policy_json(&self) -> crate::Result<String> {
         serde_json::to_string(&self.account_recovery)
@@ -5789,6 +5794,10 @@ pub fn verify_client_authorization(
             .and_then(|space| space.history.first())
             .ok_or(AuthorizationError::PolicyConflict)?
             .hash()?;
+        let space_kind = match &state.space(&space).ok_or(AuthorizationError::Revoked)?.root {
+            SpaceRoot::Personal { .. } => "personal",
+            SpaceRoot::Team { .. } => "team",
+        };
         Ok(VerifiedClientAuthorization {
             scope: ClientScope {
                 account_id: account,
@@ -5806,6 +5815,7 @@ pub fn verify_client_authorization(
             account_enrollment_expires_at_ms,
             account_recovery,
             space_genesis_hash,
+            space_kind,
             resources,
         })
     }

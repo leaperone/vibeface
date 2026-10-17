@@ -522,7 +522,10 @@ fn finish(
     )?;
     state.install_device(certificate.clone(), committed.commit.payload.accepted_at_ms)?;
     let head = state.replay_account_committed(committed.clone())?;
-    state.verify_transport_device(&certificate.payload.device, now)?;
+    state.verify_transport_device(
+        &certificate.payload.device,
+        committed.commit.payload.accepted_at_ms,
+    )?;
     let mut pins = prepared.pins.clone();
     let pin = pins
         .iter_mut()
@@ -590,7 +593,11 @@ pub fn verify_account_node_installation(
             pins: installation.pins,
             bundle: installation.bundle,
         };
-        finish(&prepared, delta, timestamp(now_ms)?)
+        let now = timestamp(now_ms)?;
+        let completed = finish(&prepared, delta, now)?;
+        let current = replay_policies(completed.pins(), completed.journal())?;
+        current.verify_transport_device(&DeviceId::from_key(&PublicKey::of(node)), now)?;
+        Ok(completed)
     };
     verify().map_err(|e| e.to_string())
 }

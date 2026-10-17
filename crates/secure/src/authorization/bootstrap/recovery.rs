@@ -1505,6 +1505,20 @@ mod tests {
             after.account(result.account()).unwrap().enrollment
         );
         assert_eq!(result.bundle().grant_leaf, original.bundle.grant_leaf);
+        let expired_proof = finish_account_node_enrollment(&commit, &delta, END + 1.0).unwrap();
+        assert_eq!(
+            expired_proof.pins_json().unwrap(),
+            result.pins_json().unwrap()
+        );
+        assert!(
+            verify_account_node_installation(
+                &expired_proof.installation_json().unwrap(),
+                &key(7),
+                &nonce(44),
+                END + 1.0
+            )
+            .is_err()
+        );
         let installation = result.installation_json().unwrap();
         assert!(!installation.contains("secret_hex"));
         let installed =

@@ -546,11 +546,14 @@ pub fn finish_space_governance_change(
 ) -> crate::Result<VerifiedSpaceGovernanceChange> {
     let finish = || -> Result<_> {
         let now = time(now_ms)?;
+        let change: Committed<SpaceDocument> = parse(committed_json)?;
+        let accepted = change.commit.payload.accepted_at_ms;
+        require(accepted <= now, "space receipt is from the future")?;
         let mut state = replay_policies(&prepared.pins, &prepared.bundle.journal)?;
-        verify_space_governance_request(&state, &prepared.request, now)?;
+        verify_space_governance_request(&state, &prepared.request, accepted)?;
         let actor = state.actor_for_signer(
             &prepared.request.proposal.issuer,
-            now,
+            accepted,
             &mut Budget::default(),
             &mut BTreeMap::new(),
         )?;
@@ -559,14 +562,13 @@ pub fn finish_space_governance_change(
                 "governance client must be an account",
             ));
         };
-        let change: Committed<SpaceDocument> = parse(committed_json)?;
         require(
             change.proposal == prepared.request.proposal
                 && change.commit.payload.nonce == prepared.request.nonce,
             "space commit belongs to another prepared change",
         )?;
-        install_objects(&mut state, &prepared.request, now)?;
-        let head = state.install_space_committed(change.clone(), now)?;
+        install_objects(&mut state, &prepared.request, accepted)?;
+        let head = state.replay_space_committed(change.clone())?;
         let mut bundle = prepared.bundle.clone();
         bundle.journal.extend(prepared.request.new_objects.clone());
         bundle.journal.push(JournalEntry::SpaceCommit(change));
@@ -1127,6 +1129,35 @@ pub fn prepare_team_creation(
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl PreparedTeamCreation {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = recoveryMaterialJson))]
+    pub fn recovery_material_json(&self) -> crate::Result<String> {
+        let state =
+            replay_policies(&self.pins, &self.bundle.journal).map_err(|error| error.to_string())?;
+        let verified = verify_team_creation_request(
+            &state,
+            &self.bundle,
+            &self.pins,
+            &self.request,
+            self.request.payload.issued_at_ms,
+        )
+        .map_err(|error| error.to_string())?;
+        let request = &self.request.payload;
+        let Some(JournalEntry::SpaceGenesis(genesis)) = request.journal_delta.first() else {
+            return Err("missing prepared team genesis".to_owned());
+        };
+        json(&TeamRecoveryMaterial {
+            status: "pending",
+            pending_request: Some(&self.request),
+            format: "vibeface-team-recovery",
+            version: AUTH_VERSION,
+            root_secret_hex: &self.root_secret_hex,
+            owner_account: &request.owner_account,
+            team: &request.team_project.space,
+            recovery_public_key: &genesis.payload.recovery.keys[0],
+            pins: &verified.pins,
+            bundle: &verified.bundle,
+        })
+    }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = requestJson))]
     pub fn request_json(&self) -> crate::Result<String> {
         json(&self.request)
@@ -1174,6 +1205,8 @@ pub fn accept_team_creation(
 
 #[derive(Serialize)]
 struct TeamRecoveryMaterial<'a> {
+    status: &'static str,
+    pending_request: Option<&'a Signed<TeamCreationRequest>>,
     format: &'static str,
     version: u16,
     root_secret_hex: &'a str,
@@ -1187,7 +1220,7 @@ struct TeamRecoveryMaterial<'a> {
 pub struct VerifiedTeamCreation {
     pins: Vec<PolicyPin>,
     bundle: ClientAuthorizationBundle,
-    scope: ClientScope,
+    scope: Option<ClientScope>,
     project: ResourceId,
     recovery_material: String,
 }
@@ -1205,17 +1238,19 @@ pub fn finish_team_creation(
 ) -> crate::Result<VerifiedTeamCreation> {
     let finish = || -> Result<_> {
         let now = time(now_ms)?;
+        let accepted: Signed<TeamCreationAcceptance> = decode_signed(acceptance_json.as_bytes())?;
+        accepted.verify_signature()?;
+        let accepted_at = accepted.payload.accepted_at_ms;
+        require(accepted_at <= now, "team acceptance is from the future")?;
         let state = replay_policies(&prepared.pins, &prepared.bundle.journal)?;
         let verified = verify_team_creation_request(
             &state,
             &prepared.bundle,
             &prepared.pins,
             &prepared.request,
-            now,
+            accepted_at,
         )?;
         let request = &prepared.request.payload;
-        let accepted: Signed<TeamCreationAcceptance> = decode_signed(acceptance_json.as_bytes())?;
-        accepted.verify_signature()?;
         let value = &accepted.payload;
         require(
             value.version == AUTH_VERSION
@@ -1231,7 +1266,7 @@ pub fn finish_team_creation(
                 && value.expires_at_ms == request.expires_at_ms,
             "team acceptance differs from its exact prepared request",
         )?;
-        validate_window(value.accepted_at_ms, value.expires_at_ms, now)?;
+        validate_window(value.accepted_at_ms, value.expires_at_ms, accepted_at)?;
         Ok(verified)
     };
     let verified = finish().map_err(|error| error.to_string())?;
@@ -1243,13 +1278,15 @@ pub fn finish_team_creation(
         request.team_project.space.as_str(),
         request.governor_device_public_key.as_str(),
         now_ms,
-    )?
-    .scope()
-    .clone();
+    )
+    .ok()
+    .map(|verified| verified.scope().clone());
     let JournalEntry::SpaceGenesis(genesis) = &request.journal_delta[0] else {
         return Err("missing verified team genesis".to_owned());
     };
     let recovery_material = json(&TeamRecoveryMaterial {
+        status: "committed",
+        pending_request: None,
         format: "vibeface-team-recovery",
         version: AUTH_VERSION,
         root_secret_hex: &prepared.root_secret_hex,
@@ -1378,7 +1415,25 @@ mod tests {
                 NOW as f64,
             )
             .unwrap();
+            let pending = prepared.recovery_material_json().unwrap();
+            let pending_value: serde_json::Value = parse(&pending).unwrap();
+            assert_eq!(pending_value["status"], "pending");
+            assert_eq!(
+                pending_value["pending_request"],
+                serde_json::to_value(&prepared.request).unwrap()
+            );
             let result = finish_team_creation(&prepared, &acceptance, NOW as f64).unwrap();
+            let delayed = finish_team_creation(
+                &prepared,
+                &acceptance,
+                (NOW + INVOCATION_MAX_AGE_MS + 1) as f64,
+            )
+            .unwrap();
+            assert_eq!(delayed.pins_json().unwrap(), result.pins_json().unwrap());
+            let expired = finish_team_creation(&prepared, &acceptance, (END + 1) as f64).unwrap();
+            assert_eq!(expired.pins_json().unwrap(), result.pins_json().unwrap());
+            assert_eq!(expired.scope_json().unwrap(), "null");
+            assert!(finish_team_creation(&prepared, &acceptance, (NOW - 1) as f64).is_err());
             (
                 Self {
                     pins: result.pins.clone(),
@@ -1441,6 +1496,20 @@ mod tests {
             )
             .unwrap();
             let result = finish_space_governance_change(prepared, &committed, NOW as f64).unwrap();
+            let delayed = finish_space_governance_change(
+                prepared,
+                &committed,
+                (NOW + INVOCATION_MAX_AGE_MS + 1) as f64,
+            )
+            .unwrap();
+            assert_eq!(delayed.pins_json().unwrap(), result.pins_json().unwrap());
+            let expired =
+                finish_space_governance_change(prepared, &committed, (END + 1) as f64).unwrap();
+            assert_eq!(expired.pins_json().unwrap(), result.pins_json().unwrap());
+            assert_eq!(expired.scope_json().unwrap(), "null");
+            assert!(
+                finish_space_governance_change(prepared, &committed, (NOW - 1) as f64).is_err()
+            );
             let next = Self {
                 pins: result.pins,
                 bundle: result.bundle,
@@ -1457,7 +1526,7 @@ mod tests {
         let personal = Fixture::personal();
         let (team, result) = personal.team();
         let state = team.state();
-        let space = &result.scope.space_id;
+        let space = &result.scope.as_ref().unwrap().space_id;
         let document = state.space(space).unwrap();
         assert_eq!(document.current_root, PublicKey::of(&key(11)));
         assert_eq!(document.recovery.keys, [PublicKey::of(&key(2))]);
@@ -1486,7 +1555,7 @@ mod tests {
     #[test]
     fn daily_membership_directional_grant_resource_and_revocation_use_real_commits() {
         let (team, result) = Fixture::personal().team();
-        let space = result.scope.space_id.clone();
+        let space = result.scope.as_ref().unwrap().space_id.clone();
         let guest = AccountId::from_root(&PublicKey::of(&key(12)));
         let member = SpaceMembershipIntent {
             space: space.clone(),
@@ -1622,7 +1691,7 @@ mod tests {
     #[test]
     fn bounded_member_selector_builders_follow_current_roles_and_both_policy_domains() {
         let (team, result) = Fixture::personal().team();
-        let space = result.scope.space_id.clone();
+        let space = result.scope.as_ref().unwrap().space_id.clone();
         let owner = verify_client_authorization(
             &team.bundle_json(),
             &team.pins_json(),
@@ -1808,7 +1877,7 @@ mod tests {
         }
         let (team, result) = personal.team();
         let intent = SpaceMembershipIntent {
-            space: result.scope.space_id.clone(),
+            space: result.scope.as_ref().unwrap().space_id.clone(),
             subject_account: team.account.clone(),
             roles: vec![SpaceRole::Viewer],
             expires_at_ms: END,
@@ -1824,9 +1893,9 @@ mod tests {
             .is_err()
         );
         let grant = DirectionalGrantIntent {
-            space: result.scope.space_id.clone(),
+            space: result.scope.as_ref().unwrap().space_id.clone(),
             grantee: Grantee::Actor(Actor::Account(team.account.clone())),
-            scope: ResourceScope::WholeSpace(result.scope.space_id.clone()),
+            scope: ResourceScope::WholeSpace(result.scope.as_ref().unwrap().space_id.clone()),
             actions: vec![Action::ConversationRead],
             audience_node_public_key: PublicKey::of(&key(4)),
             constraints: GrantConstraints::default(),
@@ -1883,7 +1952,7 @@ mod tests {
             .unwrap();
         assert!(
             state
-                .verify_service_device(&result.scope.space_id, &old, NOW)
+                .verify_service_device(&result.scope.as_ref().unwrap().space_id, &old, NOW)
                 .is_err()
         );
     }
