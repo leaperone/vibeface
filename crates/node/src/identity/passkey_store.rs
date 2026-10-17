@@ -7,15 +7,17 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use vibeface_secure::{
+    Identity,
     authorization::{
         AUTH_VERSION, AccountDocument, AccountId, AccountRight, AuthenticatorManagementIntent,
         AuthenticatorRecord, DeviceId, JournalEntry, Nonce, ObjectHash, PolicyDomain, PolicyStamp,
         PublicKey, Signed, VerifiedPolicySet,
+        authenticator_management::authenticator_proposal_hash,
         enrollment::{
             AuthenticatorEnrollmentIntent, DeviceEnrollmentIntent, verify_authenticator_enrollment,
             verify_passkey_device_enrollment, verify_passkey_enrollment_request,
         },
-        passkey_node::NodePasskeyState,
+        passkey_node::{NodePasskeyState, commit_passkey_policy_at_authority},
     },
     membership::canonical_json,
     webauthn::{
@@ -73,6 +75,16 @@ pub struct PasskeyRegistrationCompletion {
     pub response: RegistrationResponse,
     pub journal: Vec<JournalEntry>,
 }
+impl PasskeyRegistrationCompletion {
+    fn hash(&self) -> Result<ObjectHash> {
+        completion_hash(
+            &self.intent,
+            &self.pending_id,
+            &self.response,
+            &self.journal,
+        )
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +93,11 @@ pub struct PasskeyDeviceCompletion {
     pub pending_id: ObjectHash,
     pub journal: Vec<JournalEntry>,
 }
+impl PasskeyDeviceCompletion {
+    fn hash(&self) -> Result<ObjectHash> {
+        completion_hash(&self.intent, &self.pending_id, &(), &self.journal)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +105,11 @@ pub struct PasskeyManagementCompletion {
     pub intent: Signed<AuthenticatorManagementIntent>,
     pub pending_id: ObjectHash,
     pub journal: Vec<JournalEntry>,
+}
+impl PasskeyManagementCompletion {
+    fn hash(&self) -> Result<ObjectHash> {
+        completion_hash(&self.intent, &self.pending_id, &(), &self.journal)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -123,6 +145,7 @@ pub(crate) struct VerifiedPasskeyResponse {
     proof: PasskeyAssertionProof,
     verified: VerifiedPasskeyAssertion,
     ledger: Option<LedgerSnapshot>,
+    trusted_state: AuthenticatorState,
 }
 impl VerifiedPasskeyResponse {
     pub(crate) fn proof(&self) -> &PasskeyAssertionProof {
@@ -298,14 +321,18 @@ fn read_ledger(
     .transpose()
 }
 
-fn ledger_state(snapshot: &Option<LedgerSnapshot>) -> AuthenticatorState {
-    snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.state)
-        .unwrap_or(AuthenticatorState {
-            sign_count: 0,
-            backup_state: false,
-        })
+fn effective_state(
+    snapshot: &Option<LedgerSnapshot>,
+    floor: AuthenticatorState,
+) -> AuthenticatorState {
+    AuthenticatorState {
+        sign_count: snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.state.sign_count)
+            .unwrap_or(0)
+            .max(floor.sign_count),
+        backup_state: floor.backup_state,
+    }
 }
 
 fn write_ledger_in(
@@ -567,15 +594,27 @@ fn registration_delta<'a>(
     Ok(record)
 }
 
-fn completion_hash<T: Serialize>(completion: &T) -> Result<ObjectHash> {
+fn completion_hash<I: Serialize, R: Serialize>(
+    intent: &I,
+    pending_id: &ObjectHash,
+    response: &R,
+    journal: &[JournalEntry],
+) -> Result<ObjectHash> {
+    let journal: Vec<_> = journal
+        .iter()
+        .map(|entry| match entry {
+            JournalEntry::AccountCommit(committed) => {
+                JournalEntry::Account(committed.proposal.clone())
+            }
+            other => other.clone(),
+        })
+        .collect();
+    let identity = (intent, pending_id, response, journal);
     ensure!(
-        canonical_json(completion)
-            .map_err(anyhow::Error::msg)?
-            .len()
-            <= 262_144,
+        canonical_json(&identity).map_err(anyhow::Error::msg)?.len() <= 262_144,
         "passkey completion is too large"
     );
-    Ok(ObjectHash::body(completion)?)
+    Ok(ObjectHash::body(&identity)?)
 }
 
 fn completion_deadline(journal: &[JournalEntry], qualification: u64) -> u64 {
@@ -612,7 +651,8 @@ fn assertion_ledger(
 ) -> Result<(LedgerMutation, PasskeyCredentialReceipt)> {
     let verified = response.verified();
     ensure!(
-        verified.previous_state() == ledger_state(&response.ledger),
+        verified.previous_state() == response.trusted_state
+            && response.proof.state == response.trusted_state,
         "passkey assertion did not use the current ledger"
     );
     let state = AuthenticatorState {
@@ -637,6 +677,151 @@ fn assertion_ledger(
 }
 
 impl Store {
+    fn passkey_authority_journal(
+        &self,
+        identity: &Identity,
+        journal: &[JournalEntry],
+        pending: &PendingPasskey,
+        context: &PasskeyContext,
+        now_ms: u64,
+    ) -> Result<Vec<JournalEntry>> {
+        ensure!(
+            DeviceId::from_key(&PublicKey::of(identity)) == context.target,
+            "passkey completion is not at its pinned node"
+        );
+        let (last, prefix) = journal
+            .split_last()
+            .context("passkey completion has no account proposal")?;
+        let proposal = match last {
+            JournalEntry::Account(proposal) => proposal,
+            JournalEntry::AccountCommit(committed) => &committed.proposal,
+            _ => bail!("passkey completion must end with its signed account proposal"),
+        };
+        ensure!(
+            proposal.payload.account == pending.envelope().account,
+            "passkey proposal belongs to another account"
+        );
+        let mut policies = self.policy.verified().clone();
+        for entry in prefix {
+            let JournalEntry::Authenticator(record) = entry else {
+                bail!("passkey completion contains an unrelated policy object");
+            };
+            policies.install_authenticator(record.clone(), now_ms)?;
+        }
+        let committed = commit_passkey_policy_at_authority(
+            &policies,
+            proposal.clone(),
+            identity,
+            pending.envelope().expires_at_ms,
+            now_ms,
+        )?;
+        let mut result = prefix.to_vec();
+        result.push(JournalEntry::AccountCommit(committed));
+        Ok(result)
+    }
+
+    pub(crate) fn complete_passkey_registration_at_authority(
+        &mut self,
+        identity: &Identity,
+        completion: &PasskeyRegistrationCompletion,
+        context: &PasskeyContext,
+        now_ms: u64,
+    ) -> Result<PasskeyReceipt> {
+        completion.intent.verify_signature()?;
+        let pending = completion_pending(
+            &self.connection,
+            &completion.intent.payload.account,
+            &completion.pending_id,
+            context,
+            PasskeyPurpose::RegisterAuthenticator,
+        )?;
+        if let Some(receipt) = read_receipt(
+            &self.connection,
+            &completion.intent.payload.account,
+            &completion.pending_id,
+            Some(&completion.hash()?),
+        )? {
+            return Ok(receipt);
+        }
+        let mut completion = completion.clone();
+        completion.journal = self.passkey_authority_journal(
+            identity,
+            &completion.journal,
+            &pending,
+            context,
+            now_ms,
+        )?;
+        self.complete_passkey_registration(&completion, context, now_ms)
+    }
+
+    pub(crate) fn complete_passkey_device_at_authority(
+        &mut self,
+        identity: &Identity,
+        completion: &PasskeyDeviceCompletion,
+        context: &PasskeyContext,
+        now_ms: u64,
+    ) -> Result<PasskeyReceipt> {
+        completion.intent.verify_signature()?;
+        let pending = completion_pending(
+            &self.connection,
+            &completion.intent.payload.account,
+            &completion.pending_id,
+            context,
+            PasskeyPurpose::EnrollDevice,
+        )?;
+        if let Some(receipt) = read_receipt(
+            &self.connection,
+            &completion.intent.payload.account,
+            &completion.pending_id,
+            Some(&completion.hash()?),
+        )? {
+            return Ok(receipt);
+        }
+        let mut completion = completion.clone();
+        completion.journal = self.passkey_authority_journal(
+            identity,
+            &completion.journal,
+            &pending,
+            context,
+            now_ms,
+        )?;
+        self.complete_passkey_device(&completion, context, now_ms)
+    }
+
+    pub(crate) fn complete_passkey_management_at_authority(
+        &mut self,
+        identity: &Identity,
+        completion: &PasskeyManagementCompletion,
+        context: &PasskeyContext,
+        now_ms: u64,
+    ) -> Result<PasskeyReceipt> {
+        completion.intent.verify_signature()?;
+        let pending = completion_pending(
+            &self.connection,
+            &completion.intent.payload.account,
+            &completion.pending_id,
+            context,
+            PasskeyPurpose::ManageAuthenticators,
+        )?;
+        if let Some(receipt) = read_receipt(
+            &self.connection,
+            &completion.intent.payload.account,
+            &completion.pending_id,
+            Some(&completion.hash()?),
+        )? {
+            return Ok(receipt);
+        }
+        let mut completion = completion.clone();
+        completion.journal = self.passkey_authority_journal(
+            identity,
+            &completion.journal,
+            &pending,
+            context,
+            now_ms,
+        )?;
+        self.complete_passkey_management(&completion, context, now_ms)
+    }
+
     pub(crate) fn reject_passkey_policy_bypass(
         &self,
         entries: &[JournalEntry],
@@ -868,6 +1053,22 @@ impl Store {
             pending == approval.assertion.pending,
             "authenticator management changed its trusted pending"
         );
+        let intent = qualification.intent();
+        let envelope = pending.envelope();
+        ensure!(
+            qualification.issuer() == &proposal.issuer
+                && intent.account == proposal.payload.account
+                && intent.proposal_hash == authenticator_proposal_hash(&proposal.payload)?
+                && envelope.enrollment_hash == *qualification.intent_hash()
+                && envelope.account == intent.account
+                && envelope.device_public_key == intent.device_public_key
+                && envelope.rights == vec![AccountRight::ManageAuthenticators]
+                && envelope.target == intent.target
+                && envelope.expected_heads == intent.expected_heads
+                && envelope.not_before_ms >= intent.issued_at_ms
+                && envelope.expires_at_ms <= intent.expires_at_ms,
+            "authenticator management changed its complete approved policy intent"
+        );
         let response = self.verify_passkey_response(
             &proposal.payload.account,
             &id,
@@ -898,7 +1099,7 @@ impl Store {
     ) -> Result<PasskeyReceipt> {
         completion.intent.verify_signature()?;
         let account = &completion.intent.payload.account;
-        let hash = completion_hash(completion)?;
+        let hash = completion.hash()?;
         completion_pending(
             &self.connection,
             account,
@@ -1038,7 +1239,7 @@ impl Store {
     ) -> Result<PasskeyReceipt> {
         completion.intent.verify_signature()?;
         let account = &completion.intent.payload.account;
-        let hash = completion_hash(completion)?;
+        let hash = completion.hash()?;
         completion_pending(
             &self.connection,
             account,
@@ -1180,7 +1381,7 @@ impl Store {
                 "passkey ledger RP mismatch"
             );
         }
-        let state = ledger_state(&ledger);
+        let state = effective_state(&ledger, authorized.state_floor());
         let verified = super::webauthn::verify_device_approval(
             &pending,
             response_json,
@@ -1198,6 +1399,7 @@ impl Store {
             proof,
             verified,
             ledger,
+            trusted_state: state,
         })
     }
 
@@ -1209,7 +1411,7 @@ impl Store {
     ) -> Result<PasskeyReceipt> {
         completion.intent.verify_signature()?;
         let account = &completion.intent.payload.account;
-        let hash = completion_hash(completion)?;
+        let hash = completion.hash()?;
         completion_pending(
             &self.connection,
             account,
@@ -1274,7 +1476,7 @@ impl Store {
         );
         let qualified = verify_passkey_device_enrollment(self.policy.verified(), proof, now_ms)?;
         ensure!(
-            qualified.verified_assertion().previous_state() == ledger_state(&response.ledger),
+            qualified.verified_assertion().previous_state() == response.trusted_state,
             "passkey enrollment used another credential state"
         );
         let update = self
@@ -1522,7 +1724,7 @@ mod tests {
                     nonce: Nonce::from_bytes([nonce; 32]),
                     dependencies: vec![previous.clone()],
                     issued_at_ms: NOW,
-                    expires_at_ms: NOW + 100_000,
+                    expires_at_ms: NOW + 10_000,
                     accepted_at_ms: NOW,
                 },
                 &self.authority,
@@ -1534,7 +1736,7 @@ mod tests {
                     current: previous,
                     challenge_hash: commit.challenge_hash().unwrap(),
                     issued_at_ms: NOW,
-                    expires_at_ms: NOW + 100_000,
+                    expires_at_ms: NOW + 10_000,
                 },
                 &self.authority,
             )
@@ -1654,6 +1856,10 @@ mod tests {
                     user_handle: pending.user_handle().to_owned(),
                     backup_eligible: false,
                     client_enrollment: PasskeyClientEnrollment::AccountClient,
+                    initial_state: AuthenticatorState {
+                        sign_count: registration.sign_count(),
+                        backup_state: registration.backup_state(),
+                    },
                     issued_under: self.head(),
                     nonce: pending.envelope().nonce.clone(),
                     enrollment_hash: pending_id.clone(),
@@ -1753,6 +1959,64 @@ mod tests {
             }
         }
 
+        fn export_browser_fixture(&self, completion: &PasskeyDeviceCompletion) {
+            let Some(path) = std::env::var_os("VIBEFACE_PASSKEY_FIXTURE_PATH") else {
+                return;
+            };
+            let proposal = match &completion.journal[0] {
+                JournalEntry::Account(proposal) => proposal,
+                JournalEntry::AccountCommit(committed) => &committed.proposal,
+                _ => panic!("account proposal expected"),
+            };
+            let proof = &proposal
+                .payload
+                .device_enrollment
+                .as_ref()
+                .unwrap()
+                .assertion;
+            let verified = self
+                .store
+                .verify_passkey_response(
+                    &self.account,
+                    &completion.pending_id,
+                    &serde_json::to_string(&proof.response).unwrap(),
+                    &self.context,
+                    NOW,
+                )
+                .unwrap();
+            let pending = Signed::sign(
+                vibeface_secure::authorization::passkey_node::NodePasskeyPending {
+                    version: AUTH_VERSION,
+                    pending: proof.pending.clone(),
+                    issued_at_ms: NOW,
+                    expires_at_ms: proof.pending.envelope().expires_at_ms,
+                },
+                &self.authority,
+            )
+            .unwrap();
+            let state = Signed::sign(verified.node_state(NOW).unwrap(), &self.authority).unwrap();
+            let mut statement = self
+                .store
+                .connection
+                .prepare("SELECT entry FROM policy_journal ORDER BY ordinal")
+                .unwrap();
+            let journal = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|row| serde_json::from_str::<JournalEntry>(&row.unwrap()).unwrap())
+                .collect::<Vec<_>>();
+            let fixture = serde_json::json!({
+                "signed_pending":pending, "signed_state":state, "proof":proof,
+                "intent":completion.intent, "node_public_key":PublicKey::of(&self.authority),
+                "pins":self.store.policy.pins(), "journal":journal,
+                "expected_response":proof.response, "now_ms":NOW,
+                "rp_id":self.context.relying_party.rp_id(), "origin":self.context.relying_party.origin(),
+                "pending_id":completion.pending_id,
+                "sql_state":read_ledger(&self.store.connection, &self.account, &proof.response.raw_id).unwrap().unwrap().state,
+            });
+            std::fs::write(path, serde_json::to_vec_pretty(&fixture).unwrap()).unwrap();
+        }
+
         fn counts(&self) -> (u64, u64, u64) {
             self.store.connection.query_row("SELECT (SELECT count(*) FROM policy_journal),
                 (SELECT count(*) FROM passkey_authenticators),(SELECT count(*) FROM passkey_receipts)",
@@ -1763,7 +2027,9 @@ mod tests {
     #[test]
     fn real_store_registration_and_device_enrollment_replay_the_original_receipts() {
         let mut f = Fixture::new();
-        let registration = f.registration();
+        let mut registration = f.registration();
+        let proposal = account_proposal(&registration.journal[1]).unwrap().clone();
+        registration.journal[1] = JournalEntry::Account(proposal);
         let original_pending =
             read_pending(&f.store.connection, &f.account, &registration.pending_id).unwrap();
         let retried = f
@@ -1776,7 +2042,12 @@ mod tests {
         assert_eq!(pending, original_pending);
         let receipt = f
             .store
-            .complete_passkey_registration(&registration, &f.context, NOW)
+            .complete_passkey_registration_at_authority(
+                &f.authority,
+                &registration,
+                &f.context,
+                NOW,
+            )
             .unwrap();
         assert!(matches!(
             receipt.kind,
@@ -1796,7 +2067,12 @@ mod tests {
         );
         assert_eq!(
             f.store
-                .complete_passkey_registration(&registration, &f.context, NOW + 600_000)
+                .complete_passkey_registration_at_authority(
+                    &f.authority,
+                    &registration,
+                    &f.context,
+                    NOW + 600_000
+                )
                 .unwrap(),
             receipt
         );
@@ -1812,12 +2088,15 @@ mod tests {
         altered.response.client_extension_results = serde_json::json!({"different":true});
         assert!(
             f.store
-                .complete_passkey_registration(&altered, &f.context, NOW)
+                .complete_passkey_registration_at_authority(&f.authority, &altered, &f.context, NOW)
                 .is_err()
         );
         assert_eq!(f.counts(), counts);
         let device = key(5);
-        let completion = f.enroll_device(&device, 2);
+        let mut completion = f.enroll_device(&device, 2);
+        let proposal = account_proposal(&completion.journal[0]).unwrap().clone();
+        completion.journal[0] = JournalEntry::Account(proposal);
+        f.export_browser_fixture(&completion);
         assert!(
             f.store
                 .reject_passkey_policy_bypass(&completion.journal, &f.context.target)
@@ -1825,7 +2104,7 @@ mod tests {
         );
         let receipt = f
             .store
-            .complete_passkey_device(&completion, &f.context, NOW)
+            .complete_passkey_device_at_authority(&f.authority, &completion, &f.context, NOW)
             .unwrap();
         assert!(matches!(
             receipt.kind,
@@ -1846,7 +2125,12 @@ mod tests {
         f.store.policy = PolicyState::load(&f.store.connection).unwrap();
         assert_eq!(
             f.store
-                .complete_passkey_device(&completion, &f.context, NOW + 600_000)
+                .complete_passkey_device_at_authority(
+                    &f.authority,
+                    &completion,
+                    &f.context,
+                    NOW + 600_000
+                )
                 .unwrap(),
             receipt
         );
@@ -1860,7 +2144,9 @@ mod tests {
     #[test]
     fn expiry_does_not_regenerate_an_intent_and_a_failed_receipt_rolls_back_every_write() {
         let mut f = Fixture::new();
-        let registration = f.registration();
+        let mut registration = f.registration();
+        let proposal = account_proposal(&registration.journal[1]).unwrap().clone();
+        registration.journal[1] = JournalEntry::Account(proposal);
         let before = f.counts();
         assert!(
             f.store
@@ -1886,7 +2172,12 @@ mod tests {
         let head = f.head();
         assert!(
             f.store
-                .complete_passkey_registration(&registration, &f.context, NOW)
+                .complete_passkey_registration_at_authority(
+                    &f.authority,
+                    &registration,
+                    &f.context,
+                    NOW
+                )
                 .is_err()
         );
         assert_eq!(f.counts(), before);
@@ -1903,16 +2194,23 @@ mod tests {
             .execute_batch("DROP TRIGGER reject_passkey_receipt")
             .unwrap();
         f.store
-            .complete_passkey_registration(&registration, &f.context, NOW)
+            .complete_passkey_registration_at_authority(
+                &f.authority,
+                &registration,
+                &f.context,
+                NOW,
+            )
             .unwrap();
         let device = key(5);
-        let completion = f.enroll_device(&device, 2);
+        let mut completion = f.enroll_device(&device, 2);
+        let proposal = account_proposal(&completion.journal[0]).unwrap().clone();
+        completion.journal[0] = JournalEntry::Account(proposal);
         let before = f.counts();
         let head = f.head();
         f.store.connection.execute_batch("CREATE TEMP TRIGGER reject_passkey_receipt BEFORE INSERT ON passkey_receipts BEGIN SELECT RAISE(ABORT,'receipt rejected'); END").unwrap();
         assert!(
             f.store
-                .complete_passkey_device(&completion, &f.context, NOW)
+                .complete_passkey_device_at_authority(&f.authority, &completion, &f.context, NOW)
                 .is_err()
         );
         assert_eq!(f.counts(), before);
@@ -1940,7 +2238,7 @@ mod tests {
             .unwrap();
         let device = key(5);
         let completion = f.enroll_device(&device, 2);
-        let hash = completion_hash(&completion).unwrap();
+        let hash = completion.hash().unwrap();
         let mut forged_document = account_proposal(&completion.journal[0])
             .unwrap()
             .payload
@@ -2005,5 +2303,65 @@ mod tests {
                 .complete_passkey_device(&completion, &f.context, NOW)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn accepted_policy_floor_supplies_missing_and_stale_local_ledger_state() {
+        let mut f = Fixture::new();
+        let registration = f.registration();
+        f.store
+            .complete_passkey_registration(&registration, &f.context, NOW)
+            .unwrap();
+        f.store
+            .connection
+            .execute("DELETE FROM passkey_authenticators", [])
+            .unwrap();
+        let mut first = f.enroll_device(&key(5), 2);
+        let proposal = account_proposal(&first.journal[0]).unwrap().clone();
+        assert_eq!(
+            proposal
+                .payload
+                .device_enrollment
+                .as_ref()
+                .unwrap()
+                .assertion
+                .state
+                .sign_count,
+            1
+        );
+        first.journal[0] = JournalEntry::Account(proposal);
+        f.store
+            .complete_passkey_device_at_authority(&f.authority, &first, &f.context, NOW)
+            .unwrap();
+        f.store
+            .connection
+            .execute("UPDATE passkey_authenticators SET sign_count=1", [])
+            .unwrap();
+        let mut second = f.enroll_device(&key(6), 3);
+        let proposal = account_proposal(&second.journal[0]).unwrap().clone();
+        assert_eq!(
+            proposal
+                .payload
+                .device_enrollment
+                .as_ref()
+                .unwrap()
+                .assertion
+                .state
+                .sign_count,
+            2
+        );
+        second.journal[0] = JournalEntry::Account(proposal);
+        f.store
+            .complete_passkey_device_at_authority(&f.authority, &second, &f.context, NOW)
+            .unwrap();
+        let ledger = read_ledger(
+            &f.store.connection,
+            &f.account,
+            &URL_SAFE_NO_PAD.encode([42; 32]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ledger.state.sign_count, 3);
+        assert_eq!(f.counts().2, 3);
     }
 }
