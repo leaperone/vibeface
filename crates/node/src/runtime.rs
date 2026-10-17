@@ -1496,7 +1496,10 @@ pub(crate) mod tests {
 
         impl Remote {
             async fn new() -> Result<Self> {
-                let mut fixture = Fixture::new()?;
+                Self::from_fixture(Fixture::new()?).await
+            }
+
+            async fn from_fixture(mut fixture: Fixture) -> Result<Self> {
                 let binding = fixture.bind_at(
                     fixture
                         .executor
@@ -1906,27 +1909,32 @@ pub(crate) mod tests {
                         )
                         .is_err()
                 );
-                drop(store);
-                let (other, other_node) = runtime_fixture().await?;
-                let other_sdk = agent(&other, &other_node).await?;
-                assert!(
-                    remote
-                        .node
-                        .store
-                        .lock()
-                        .await
-                        .execution_dispatch_targets(
-                            &other_sdk,
-                            "remote-task",
-                            "codex",
-                            Action::ExecutionSend,
-                            now_ms() as u64
-                        )
-                        .is_err()
-                );
                 Ok(())
             }
             .await;
+            remote.close().await;
+            outcome
+        }
+
+        #[tokio::test]
+        async fn initial_sdk_rejects_a_foreign_accounts_bound_task() -> Result<()> {
+            let mut remote =
+                Remote::from_fixture(Fixture::new_with_foreign_account_task()?).await?;
+            let outcome: Result<()> = async {
+                let sdk = agent(&remote.project, &remote.node).await?;
+                let store = remote.node.store.lock().await;
+                let creation = store.task_creation(remote.project.space.as_str(), "conversation", "remote-task")?;
+                let event = store.verify_event(remote.project.space.as_str(), &creation)?;
+                let EventCause::Invocation { admission } = event.cause else {
+                    bail!("foreign Task has no actual Account admission");
+                };
+                assert_eq!(admission.invocation.payload.actor, Actor::Account(remote.executor.account.clone()));
+                assert_ne!(admission.invocation.payload.actor, sdk.initiator);
+                assert!(store.task_binding(remote.project.space.as_str(), &creation.hash)?.is_some());
+                let error = store.execution_dispatch_targets(&sdk, "remote-task", "codex", Action::ExecutionSend, now_ms() as u64).unwrap_err();
+                assert_eq!(error.to_string(), "initial SDK discovery requires its own task or its initiator's confirmed binding");
+                Ok(())
+            }.await;
             remote.close().await;
             outcome
         }
