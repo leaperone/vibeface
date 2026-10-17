@@ -368,12 +368,11 @@ impl Runtime {
                     .flatten()
                     .and_then(|value| value["status_revision"].as_u64())
                     .unwrap_or(0);
-                if let Err(error) = self.refresh_remote_schedule(&entry, false, true).await {
-                    if let Err(cache_error) =
+                if let Err(error) = self.refresh_remote_schedule(&entry, false, true).await
+                    && let Err(cache_error) =
                         self.cache_observation_error(&entry, &error, baseline).await
-                    {
-                        tracing::debug!(%cache_error,"cannot retain scheduler observation");
-                    }
+                {
+                    tracing::debug!(%cache_error,"cannot retain scheduler observation");
                 }
             })
             .await;
@@ -407,12 +406,12 @@ impl Runtime {
                 changed = true;
             }
         }
-        if let Some(mut session) = session {
-            if session["freshness"] != "unknown" {
-                session["freshness"] = json!("unknown");
-                store.local_set(&entry.network_id, &session_key, &session)?;
-                changed = true;
-            }
+        if let Some(mut session) = session
+            && session["freshness"] != "unknown"
+        {
+            session["freshness"] = json!("unknown");
+            store.local_set(&entry.network_id, &session_key, &session)?;
+            changed = true;
         }
         if changed {
             drop(store);

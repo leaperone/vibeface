@@ -232,6 +232,10 @@ impl Store {
         tx.commit()?;
         Ok(envelope)
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the transaction binds its full authorization and durable record identity"
+    )]
     pub fn accept_message(
         &mut self,
         identity: &LocalIdentity,
@@ -504,10 +508,10 @@ impl Store {
             };
             let envelope: SignedEvent = serde_json::from_str(&event)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
-            if let EventBody::MessagePosted { scheduler_node, .. } = &event.body {
-                if scheduler_node.as_deref() != Some(target) {
-                    continue;
-                }
+            if let EventBody::MessagePosted { scheduler_node, .. } = &event.body
+                && scheduler_node.as_deref() != Some(target)
+            {
+                continue;
             }
             import_legacy_scheduler_job(&tx, network, &event.scope_id, trigger, target)?;
         }
@@ -798,6 +802,10 @@ impl Store {
             && (!write || (!attempt.read_only && session.unresolved.is_empty())))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the transaction binds its full authorization and durable record identity"
+    )]
     pub fn finish_job(
         &mut self,
         identity: &LocalIdentity,

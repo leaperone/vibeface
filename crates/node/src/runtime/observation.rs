@@ -290,15 +290,15 @@ impl Runtime {
         if let Ok(mut state) = self.observation.lock() {
             state.prune();
             let key = (network.to_owned(), scope.to_owned());
-            if !state.progress.contains_key(&key) && state.progress.len() >= MAX_SCOPES {
-                if let Some(oldest) = state
+            if !state.progress.contains_key(&key)
+                && state.progress.len() >= MAX_SCOPES
+                && let Some(oldest) = state
                     .progress
                     .iter()
                     .min_by_key(|(_, progress)| progress.touched)
                     .map(|(key, _)| key.clone())
-                {
-                    state.progress.remove(&oldest);
-                }
+            {
+                state.progress.remove(&oldest);
             }
             state
                 .progress

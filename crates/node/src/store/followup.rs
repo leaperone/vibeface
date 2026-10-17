@@ -225,6 +225,10 @@ pub(super) fn report_intent_head_from(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the transaction binds its full authorization and durable record identity"
+)]
 pub(super) fn append_report_intent_from(
     connection: &Connection,
     identity: &LocalIdentity,
@@ -648,6 +652,10 @@ impl Store {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the transaction binds its full authorization and durable record identity"
+    )]
     pub fn set_task_followup(
         &mut self,
         identity: &LocalIdentity,

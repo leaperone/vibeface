@@ -225,6 +225,8 @@ Agent 向已关联工单的执行会话提交新工作时，必须显式提供�
 
 `OperationRequest.binding` 是 Rust 派发时取得的 `SignedBinding`。调用方可省略，由 Node 填写。执行端实际接单时必须验证该凭据，不能只依靠请求中的目标字段。
 
+自主继续派发还包含 Node 生成的 `manager_authority`，固定 `scheduler_node`、结果 `trigger` 和 `followup_version`。它与完整请求一起进入签名派发事件。执行端核对原签名记录，在首次接单事务内重新检查当前授权版本。已经持久接单的原操作仍按原账本继续，撤权后的旧在途请求不能新接单。
+
 绑定正文包含 `network_id`、`conversation_id`、`task_ref`、`task_id`、`authority_node`、`generation`、`target_node`、`session_id`、`open_spec`、`previous_binding_hash` 和 `previous_seal`。`task_ref` 固定到真实 `TaskCreated` 事件 hash。该创建事件的作者 Node 对首个执行位置执行持久 CAS，两个调度器向不同目标并发派发也只能取得一份绑定。这个 Node 只负责该绑定的唯一确认，不是会话调度负责人。
 
 已有绑定的会话可在创建 Node 离线后继续向原执行 Node 提交操作。新绑定无法取得唯一确认时拒绝派发，不能在另一台设备自行建立替代。没有显式 `task_id` 的新执行会话由 Rust 创建稳定的内部任务，控制及后续操作继承已有绑定。
