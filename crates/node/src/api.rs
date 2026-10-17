@@ -187,9 +187,6 @@ fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
         attempts: Arc::new(Mutex::new(HashMap::new())),
     };
     Router::new()
-        .route("/", get(index))
-        .route("/app.js", get(javascript))
-        .route("/style.css", get(stylesheet))
         .route("/api/info", get(info))
         .route("/api/register", post(register))
         .route("/api/login", post(login))
@@ -204,6 +201,7 @@ fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
         )
         .route("/api/events", get(events))
         .route("/peer", get(peer))
+        .fallback(frontend)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(app.clone(), boundary))
         .with_state(app)
@@ -215,6 +213,7 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         .get::<ConnectInfo<SocketAddr>>()
         .map(|peer| peer.0.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let path = request.uri().path().to_owned();
     let mut response = match check_boundary(
         &app,
         request.headers(),
@@ -245,7 +244,10 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         Err(error) => error.into_response(),
     };
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control(&path)),
+    );
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -255,7 +257,10 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(web_assets::CONTENT_SECURITY_POLICY),
+    );
     response
 }
 
@@ -626,25 +631,41 @@ async fn peer(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
         })
 }
 
-async fn index() -> impl IntoResponse {
+mod web_assets {
+    include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
+}
+
+fn cache_control(path: &str) -> &'static str {
+    if path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-store"
+    }
+}
+
+fn web_response(method: &Method, path: &str) -> Response {
+    if path == "/api" || path.starts_with("/api/") || path == "/peer" || path == CALLBACK {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    }
+    if *method != Method::GET && *method != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    if let Some(file) = web_assets::get(path) {
+        return ([(header::CONTENT_TYPE, file.content_type)], file.body).into_response();
+    }
+    let name = path.rsplit('/').next().unwrap_or("");
+    if name.contains('.') {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("../web/index.html"),
+        web_assets::get("/_shell.html").expect("shell").body,
     )
+        .into_response()
 }
 
-async fn javascript() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../web/app.js"),
-    )
-}
-
-async fn stylesheet() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../web/style.css"),
-    )
+async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
+    web_response(&method, uri.path())
 }
 
 #[cfg(test)]
@@ -748,5 +769,52 @@ mod tests {
         assert!(bearer(&headers).is_none());
         assert!(validate_tool_call("dispatch", "stable-call-id").is_ok());
         assert!(validate_tool_call("dispatch", "").is_err());
+    }
+
+    #[tokio::test]
+    async fn shell_routes_stay_html_and_unknown_api_stays_json() {
+        let shell = web_response(&Method::GET, "/");
+        assert_eq!(shell.status(), StatusCode::OK);
+        let shell_body = axum::body::to_bytes(shell.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let shell_text = String::from_utf8(shell_body.to_vec()).unwrap();
+        assert!(shell_text.contains("data-testid=\"vibeface-shell\""));
+
+        let tasks = web_response(&Method::GET, "/tasks");
+        let tasks_body = axum::body::to_bytes(tasks.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(tasks_body.to_vec())
+                .unwrap()
+                .contains("data-testid=\"vibeface-shell\"")
+        );
+
+        let asset = web_assets::paths()
+            .iter()
+            .find(|path| path.starts_with("/assets/"))
+            .expect("hashed asset");
+        let asset_response = web_response(&Method::GET, asset);
+        assert_eq!(asset_response.status(), StatusCode::OK);
+        let asset_body = axum::body::to_bytes(asset_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            asset_body.as_ref(),
+            web_assets::get(asset).expect("asset").body
+        );
+        assert_eq!(cache_control(asset), "public, max-age=31536000, immutable");
+        assert_eq!(cache_control("/"), "no-store");
+
+        let missing = web_response(&Method::GET, "/api/not-a-route");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let missing_body = axum::body::to_bytes(missing.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let missing_text = String::from_utf8(missing_body.to_vec()).unwrap();
+        assert!(missing_text.contains("\"error\""));
+        assert!(!missing_text.contains("vibeface-shell"));
+        assert!(web_assets::CONTENT_SECURITY_POLICY.contains("script-src 'self' 'sha256-"));
     }
 }

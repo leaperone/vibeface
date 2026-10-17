@@ -4,22 +4,22 @@ base_branch = "main"
 prefix = ""
 name = "Rust workspace"
 check = "cargo fmt --all -- --check"
-build = "cargo test --workspace --locked"
+build = "bash scripts/build-web.sh && cargo test --workspace --locked"
 
 [[domain_check]]
 name = "Rust diagnostics"
 trigger_paths = ["crates/**", "Cargo.toml", "Cargo.lock"]
-command = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+command = "bash scripts/build-web.sh && cargo clippy --workspace --all-targets --locked -- -D warnings"
 
 [[domain_check]]
 name = "JavaScript syntax"
 trigger_paths = ["crates/node/sdk/**", "crates/node/web/**"]
-command = "node --check crates/node/sdk/codex-manager.mjs && node --check crates/node/web/app.js"
+command = "node --check crates/node/sdk/codex-manager.mjs && bash scripts/build-web.sh"
 
 [[domain_check]]
 name = "Delivery scripts and workflow"
 trigger_paths = ["scripts/*.sh", ".github/workflows/**"]
-command = "bash -n scripts/package-node.sh scripts/install-node-service.sh && shellcheck scripts/package-node.sh scripts/install-node-service.sh && actionlint .github/workflows/ci.yml"
+command = "bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web.sh && shellcheck scripts/package-node.sh scripts/install-node-service.sh scripts/build-web.sh && actionlint .github/workflows/ci.yml"
 
 [[domain_check]]
 name = "Migration integrity"

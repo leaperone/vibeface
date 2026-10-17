@@ -37,7 +37,10 @@ else
   target="$(rustc -vV | sed -n 's/^host: //p')"
   binary="$target_dir/release/vibeface-node"
 fi
-if "$build"; then cargo "${build_args[@]}"; fi
+if "$build"; then
+  bash "$repo/scripts/build-web.sh"
+  cargo "${build_args[@]}"
+fi
 [[ -x "$binary" ]] || { printf 'Release binary is missing: %s\n' "$binary" >&2; exit 1; }
 [[ -d "$repo/crates/node/sdk" ]] || { echo 'Node SDK sidecar sources are missing.' >&2; exit 1; }
 version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$repo/Cargo.toml" | head -n 1)"

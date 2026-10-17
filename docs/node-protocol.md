@@ -56,7 +56,7 @@
 
 | 路径 | 方法 | 用途 |
 |---|---|---|
-| `/`、`/app.js`、`/style.css` | GET | 内置网页 |
+| `/`、`/_shell.html`、`/assets/*` | GET | 内置网页。文档路径回退到 shell，`/api` 与 `/peer` 不回退 |
 | `/api/info` | GET | Node ID、版本、角色和管理 SDK 配置状态 |
 | `/api/register` | POST | 创建本地账户和新的个人网络 |
 | `/api/login` | POST | 登录，设置会话 cookie，返回 CSRF token |

@@ -29,3 +29,6 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 vibeface-protocol.workspace = true
 vibeface-bridge.workspace = true
+
+[build-dependencies]
+sha2 = { workspace = true }
