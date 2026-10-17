@@ -1,6 +1,7 @@
 //! Account recovery preserves identity and replaces device authorization atomically.
 
 pub mod context;
+pub mod node_enrollment;
 pub mod registration;
 
 use super::*;
@@ -145,6 +146,51 @@ fn validate_material(material: &RecoveryMaterial) -> Result<Identity> {
         "recovery entry pin mismatch",
     )?;
     Ok(recovery)
+}
+
+pub(super) fn current_root_material_context(
+    material_json: &str,
+    pins_json: &str,
+    bundle_json: &str,
+) -> Result<(
+    AccountId,
+    Identity,
+    VerifiedPolicySet,
+    Vec<PolicyPin>,
+    ClientAuthorizationBundle,
+)> {
+    require(
+        pins_json.len() <= MAX_PROOF_BYTES,
+        "registration pins too large",
+    )?;
+    let material = read_material(material_json)?;
+    validate_material(&material)?;
+    let root = Identity::from_secret_hex(&material.root_secret_hex)
+        .map_err(|_| AuthorizationError::InvalidProof("invalid first registration root"))?;
+    let pins: Vec<PolicyPin> = serde_json::from_str(pins_json)
+        .map_err(|_| AuthorizationError::InvalidProof("invalid first registration pins"))?;
+    let bundle = read_bundle(bundle_json)?;
+    let state = replay_policies(&pins, &bundle.journal)?;
+    for saved in &material.pins {
+        require(
+            pins.iter()
+                .any(|pin| pin.domain == saved.domain && pin.genesis_root == saved.genesis_root)
+                && saved
+                    .minimum_head
+                    .as_ref()
+                    .is_none_or(|head| state.roots.contains_key(head)),
+            "first registration changed saved recovery pins",
+        )?;
+    }
+    let account = state
+        .account(&material.scope.account_id)
+        .ok_or(AuthorizationError::Revoked)?;
+    require(
+        account.current_root == PublicKey::of(&root)
+            && account.authority.public_key == material.entry.node_public_key,
+        "first registration changed current root or saved node",
+    )?;
+    Ok((material.scope.account_id.clone(), root, state, pins, bundle))
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = inspectAccountRecoveryMaterial))]
@@ -1377,6 +1423,148 @@ mod tests {
         );
         if let Ok(path) = std::env::var("VIBEFACE_FIRST_REGISTRATION_VECTOR") {
             std::fs::write(path, serde_json::to_vec(&serde_json::json!({"now":NOW,"end":END,"material":backup,"pins":created.pins,"bundle":created.bundle,"intent":intent,"pending":pending,"response":response,"request":wire,"committed_journal":delta,"updated_pins":updated_pins,"updated_bundle":updated_bundle})).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn additional_node_keeps_the_account_and_needs_root_possession_and_authority() {
+        use node_enrollment::*;
+        let original = account();
+        let backup = material(&original);
+        let pins = original.pins_json().unwrap();
+        let bundle = original.bundle_json().unwrap();
+        let new_claim = claim(7, 44, NOW);
+        let prepared =
+            prepare_account_node_enrollment(&backup, &pins, &bundle, &new_claim, END, NOW).unwrap();
+        let request = prepared.request_json().unwrap();
+        assert!(!request.contains("secret_hex"));
+        let signed: Signed<AccountNodeEnrollmentIntent> = serde_json::from_str(&request).unwrap();
+        assert_eq!(
+            signed.payload.certificate.owner,
+            PolicyDomain::Account(original.authorization.scope.account_id.clone())
+        );
+        assert_eq!(
+            signed.payload.certificate.uses,
+            [DeviceUse::Noise, DeviceUse::ServiceInvocation]
+        );
+        assert!(
+            sign_account_node_enrollment_possession(
+                &request,
+                &key(8),
+                &nonce(44),
+                &pins,
+                &bundle,
+                NOW
+            )
+            .is_err()
+        );
+        assert!(
+            sign_account_node_enrollment_possession(
+                &request,
+                &key(7),
+                &nonce(43),
+                &pins,
+                &bundle,
+                NOW
+            )
+            .is_err()
+        );
+        assert!(
+            sign_account_node_enrollment_possession(
+                &request,
+                &key(7),
+                &nonce(44),
+                &pins,
+                &bundle,
+                NOW + 100_000.0
+            )
+            .is_err()
+        );
+        let possession = sign_account_node_enrollment_possession(
+            &request,
+            &key(7),
+            &nonce(44),
+            &pins,
+            &bundle,
+            NOW,
+        )
+        .unwrap();
+        assert!(
+            prepare_account_node_enrollment_commit(&prepared, &backup, &"00".repeat(64), NOW)
+                .is_err()
+        );
+        let commit =
+            prepare_account_node_enrollment_commit(&prepared, &backup, &possession, NOW).unwrap();
+        let public = commit.request_json().unwrap();
+        assert!(commit_account_node_enrollment(&public, &key(1), &pins, &bundle, NOW).is_err());
+        let delta = commit_account_node_enrollment(&public, &key(4), &pins, &bundle, NOW).unwrap();
+        let result = finish_account_node_enrollment(&commit, &delta, NOW).unwrap();
+        let delayed = finish_account_node_enrollment(&commit, &delta, NOW + 200_000.0).unwrap();
+        assert_eq!(delayed.pins_json().unwrap(), result.pins_json().unwrap());
+        assert_eq!(result.account(), &original.authorization.scope.account_id);
+        let before = replay_policies(&original.pins, &original.bundle.journal).unwrap();
+        let after = replay_policies(result.pins(), result.journal()).unwrap();
+        let cert = after
+            .verify_transport_device(&DeviceId::from_key(&PublicKey::of(&key(7))), NOW as u64)
+            .unwrap();
+        assert_eq!(
+            cert.payload.owner,
+            PolicyDomain::Account(result.account().clone())
+        );
+        assert_eq!(before.grants.len(), after.grants.len());
+        assert_eq!(
+            before.account(result.account()).unwrap().enrollment,
+            after.account(result.account()).unwrap().enrollment
+        );
+        assert_eq!(result.bundle().grant_leaf, original.bundle.grant_leaf);
+        let installation = result.installation_json().unwrap();
+        assert!(!installation.contains("secret_hex"));
+        let installed =
+            verify_account_node_installation(&installation, &key(7), &nonce(44), NOW + 200_000.0)
+                .unwrap();
+        assert_eq!(
+            installed.bundle_json().unwrap(),
+            result.bundle_json().unwrap()
+        );
+        assert!(verify_account_node_installation(&installation, &key(8), &nonce(44), NOW).is_err());
+        assert!(verify_account_node_installation(&installation, &key(7), &nonce(43), NOW).is_err());
+        assert!(
+            finish_account_node_enrollment(
+                &commit,
+                &commit.completion_journal_json().unwrap(),
+                NOW
+            )
+            .is_err()
+        );
+        let mut wrong = signed.payload;
+        wrong.certificate.uses.push(DeviceUse::AccountInvocation);
+        let wrong = Signed::sign(wrong, &key(1)).unwrap();
+        assert!(
+            sign_account_node_enrollment_possession(
+                &encode(&wrong).unwrap(),
+                &key(7),
+                &nonce(44),
+                &pins,
+                &bundle,
+                NOW
+            )
+            .is_err()
+        );
+        for reused in 1..=4 {
+            assert!(
+                prepare_account_node_enrollment(
+                    &backup,
+                    &pins,
+                    &bundle,
+                    &claim(reused, 44, NOW),
+                    END,
+                    NOW
+                )
+                .is_err()
+            );
+        }
+        if let Ok(path) = std::env::var("VIBEFACE_NODE_ENROLLMENT_VECTOR") {
+            std::fs::write(path, serde_json::to_vec(&serde_json::json!({"now":NOW,"end":END,"material":backup,"pins":original.pins,"bundle":original.bundle,"claim":new_claim.claim,"request":serde_json::from_str::<serde_json::Value>(&request).unwrap(),"possession":possession,"commit_request":serde_json::from_str::<serde_json::Value>(&public).unwrap(),"delta":serde_json::from_str::<serde_json::Value>(&delta).unwrap(),"installation":serde_json::from_str::<serde_json::Value>(&installation).unwrap(),"updated_pins":result.pins(),"updated_bundle":result.bundle()})).unwrap()).unwrap();
         }
     }
 }

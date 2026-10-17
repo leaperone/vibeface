@@ -39,37 +39,11 @@ fn context(
     Vec<PolicyPin>,
     ClientAuthorizationBundle,
 )> {
-    require(
-        pins_json.len() <= MAX_PROOF_BYTES,
-        "registration pins too large",
-    )?;
-    let material = read_material(material_json)?;
-    validate_material(&material)?;
-    let root = Identity::from_secret_hex(&material.root_secret_hex)
-        .map_err(|_| AuthorizationError::InvalidProof("invalid first registration root"))?;
-    let pins: Vec<PolicyPin> = serde_json::from_str(pins_json)
-        .map_err(|_| AuthorizationError::InvalidProof("invalid first registration pins"))?;
-    let bundle = read_bundle(bundle_json)?;
-    let state = replay_policies(&pins, &bundle.journal)?;
-    for saved in &material.pins {
-        require(
-            pins.iter()
-                .any(|pin| pin.domain == saved.domain && pin.genesis_root == saved.genesis_root)
-                && saved
-                    .minimum_head
-                    .as_ref()
-                    .is_none_or(|head| state.roots.contains_key(head)),
-            "first registration changed saved recovery pins",
-        )?;
-    }
+    let result = current_root_material_context(material_json, pins_json, bundle_json)?;
+    let (account_id, _, state, _, _) = &result;
     let account = state
-        .account(&material.scope.account_id)
+        .account(account_id)
         .ok_or(AuthorizationError::Revoked)?;
-    require(
-        account.current_root == PublicKey::of(&root)
-            && account.authority.public_key == material.entry.node_public_key,
-        "first registration changed current root or saved node",
-    )?;
     let history = &state
         .accounts
         .get(&account.account)
@@ -82,7 +56,7 @@ fn context(
             .all(|doc| doc.payload.authenticators.is_empty()),
         "recovery material is only used for the first authenticator of this root generation",
     )?;
-    Ok((material.scope.account_id.clone(), root, state, pins, bundle))
+    Ok(result)
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = buildFirstAuthenticatorEnrollmentIntent))]
