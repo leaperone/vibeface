@@ -200,11 +200,26 @@ fn load_admission_from(
     space: &str,
     operation_id: &str,
 ) -> Result<StoredAdmission> {
+    let ids = connection.prepare("SELECT authorization_id FROM accepted_authorizations WHERE space_id=? AND operation_id=?")?
+        .query_map(params![space, operation_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(
+        ids.len() == 1,
+        "operation must have exactly one accepted authorization"
+    );
+    load_authorization_from(connection, space, &ids[0])
+}
+
+fn load_authorization_from(
+    connection: &Connection,
+    space: &str,
+    authorization_id: &str,
+) -> Result<StoredAdmission> {
     let mut statement = connection.prepare(
-        "SELECT authorization_id,invocation_hash,invocation_body_hash,actor_kind,actor_id,device_id,resource_id,action,grant_leaf,signed_invocation,source_body,transport,admission_challenge,admission_receipts,admitted_at_ms FROM accepted_authorizations WHERE space_id=? AND operation_id=?",
+        "SELECT authorization_id,invocation_hash,invocation_body_hash,actor_kind,actor_id,device_id,resource_id,action,grant_leaf,signed_invocation,source_body,transport,admission_challenge,admission_receipts,admitted_at_ms FROM accepted_authorizations WHERE space_id=? AND authorization_id=?",
     )?;
     let rows = statement
-        .query_map(params![space, operation_id], |row| {
+        .query_map(params![space, authorization_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -301,6 +316,22 @@ fn load_admission_from(
         proof,
         transport: transport.into_evidence(),
     })
+}
+
+pub(crate) fn validate_persisted_admission(
+    connection: &Connection,
+    proof: &AdmissionProof,
+) -> Result<()> {
+    let stored = load_authorization_from(
+        connection,
+        proof.invocation.payload.resource.space.as_str(),
+        &proof.invocation.payload.operation_id,
+    )?;
+    ensure!(
+        stored.proof == *proof,
+        "persisted admission differs from event authorization"
+    );
+    Ok(())
 }
 
 fn operation_from(
@@ -1196,11 +1227,13 @@ pub(crate) mod tests {
             load_admission_from(&fixture.connection, &space, "operation_1")?.proof,
             admitted
         );
+        validate_persisted_admission(&fixture.connection, &admitted)?;
         fixture.connection.execute(
             "UPDATE authorization_nonces SET body_hash=?",
             [ObjectHash::body(&"tampered")?.as_str()],
         )?;
         assert!(load_admission_from(&fixture.connection, &space, "operation_1").is_err());
+        assert!(validate_persisted_admission(&fixture.connection, &admitted).is_err());
         fixture.connection.execute(
             "UPDATE authorization_nonces SET body_hash=?",
             [fixture.auth.body_hash().as_str()],
@@ -1362,6 +1395,7 @@ pub(crate) mod tests {
         )?;
         let historical =
             reconstruct_admission(&fixture.policy, &admitted, &facts, &fixture.transport)?;
+        validate_persisted_admission(&fixture.connection, &admitted)?;
         assert_eq!(
             historical.signed_invocation(),
             fixture.auth.signed_invocation()
