@@ -124,6 +124,102 @@ fn dispatch_facts_from(
 }
 
 impl Store {
+    pub fn execution_dispatch_metadata_facts(
+        &self,
+        body: &Value,
+        audience: &Audience,
+        now_ms: u64,
+    ) -> Result<Option<RequestFacts>> {
+        use vibeface_secure::authorization::{Signed, execution_handoff::ProjectExecutionSource};
+        if !matches!(
+            body["method"].as_str(),
+            Some("operation" | "session" | "reconcile")
+        ) {
+            return Ok(None);
+        }
+        let Some(operation) = body["operation_id"].as_str() else {
+            ensure!(
+                body.get("execution_source").is_none(),
+                "metadata source needs an original operation ID"
+            );
+            return Ok(None);
+        };
+        let space = text(body, "space_id")?;
+        let Some(wire) = self.execution_dispatch_handoff(space, operation)? else {
+            ensure!(
+                body.get("execution_source").is_none(),
+                "metadata operation has no durable remote handoff"
+            );
+            return Ok(None);
+        };
+        let stored = self
+            .operation(space, operation)?
+            .context("remote metadata operation is missing")?;
+        let original = self.operation_admission_proof(space, operation)?;
+        ensure!(
+            original.source_body["method"] == "operate"
+                && serde_json::from_value::<OperationRequest>(
+                    original.source_body["request"].clone()
+                )? == stored.request,
+            "remote metadata differs from its original accepted operation"
+        );
+        let project = &original.invocation.payload.resource;
+        ensure!(
+            project.space.as_str() == space
+                && project.resource.as_str() == text(body, "resource_id")?
+                && original.invocation.payload.audience == *audience,
+            "metadata request targets another Project"
+        );
+        let source: Signed<ProjectExecutionSource> =
+            serde_json::from_value(body["execution_source"].clone())?;
+        let binding: SignedBinding = serde_json::from_value(body["binding"].clone())?;
+        ensure!(
+            wire.handoff.source_attestation.as_ref() == Some(&source)
+                && stored.request.binding.as_ref() == Some(&binding)
+                && source.payload.operation_id == operation,
+            "metadata evidence differs from the durable handoff"
+        );
+        let context = self
+            .policy
+            .verified()
+            .verify_execution_dispatch_metadata(project, audience, &source, &binding, now_ms)?;
+        for (field, expected) in [
+            ("conversation_id", stored.request.conversation_id.as_str()),
+            ("target_node", stored.request.target_node.as_str()),
+            ("session_id", stored.request.session_id.as_str()),
+            ("task_ref", binding.binding.task_ref.as_str()),
+        ] {
+            if let Some(actual) = body[field].as_str() {
+                ensure!(
+                    actual == expected,
+                    "metadata request changed the admitted operation context"
+                );
+            }
+        }
+        if let Some(task) = body.get("task_id") {
+            ensure!(
+                *task == serde_json::to_value(&stored.request.task_id)?,
+                "metadata request changed its task"
+            );
+        }
+        if body["method"] == "session" {
+            ensure!(
+                text(body, "target_node")? == stored.request.target_node
+                    && text(body, "session_id")? == stored.request.session_id,
+                "session metadata requires its actual admitted target and session"
+            );
+        }
+        super::admission::validate_persisted_admission(&self.connection, &original)?;
+        Ok(Some(RequestFacts {
+            resource: project.clone(),
+            action: crate::model::authorization_action(body)?,
+            audience: audience.clone(),
+            operation_id: text(body, "authorization_id")?.into(),
+            body_hash: ObjectHash::body(body)?,
+            context: context.context,
+        }))
+    }
+
     pub fn execution_dispatch_facts(
         &self,
         body: &Value,
@@ -250,17 +346,17 @@ fn check_remote_session(
     body: &Value,
     request: &OperationRequest,
     dispatch: &VerifiedDispatchFacts,
+    project_key: &PublicKey,
     now_ms: u64,
 ) -> Result<()> {
     use vibeface_secure::authorization::{
-        AUTH_VERSION, EXECUTION_LEASE_MS, EventRef, Signed,
-        execution_handoff::ExecutionHandoffReceipt,
+        Signed,
+        execution_handoff::{ExecutionHandoffReceipt, verify_execution_session_snapshot},
     };
-    let binding = &request
+    let binding = request
         .binding
         .as_ref()
-        .context("execution binding is missing")?
-        .binding;
+        .context("execution binding is missing")?;
     if request.action["type"] == "open" {
         ensure!(
             request.expected_revision == 0 && body.get("execution_session_receipt").is_none(),
@@ -270,37 +366,19 @@ fn check_remote_session(
     }
     let receipt: Signed<ExecutionHandoffReceipt> =
         serde_json::from_value(body["execution_session_receipt"].clone())?;
-    receipt.verify_signature()?;
-    let value = &receipt.payload;
-    let session = value
-        .session
-        .as_ref()
-        .context("remote session snapshot is missing")?;
+    let session = verify_execution_session_snapshot(
+        &receipt,
+        &dispatch.facts.resource,
+        dispatch.destination.resource(),
+        dispatch.destination.public_key(),
+        binding,
+        project_key,
+        now_ms,
+    )?;
     ensure!(
-        receipt.issuer == *dispatch.destination.public_key()
-            && value.version == AUTH_VERSION
-            && value.original_space_id == dispatch.facts.resource.space
-            && value.execution_space_id == dispatch.destination.resource().space
-            && value.target == dispatch.destination.audience().device
-            && value.session_id == request.session_id
-            && value.issued_at_ms <= now_ms
-            && now_ms < session.expires_at_ms
-            && session
-                .expires_at_ms
-                .checked_sub(value.issued_at_ms)
-                .is_some_and(|lifetime| lifetime <= EXECUTION_LEASE_MS)
-            && session.original_project == dispatch.facts.resource
-            && session.execution_resource == *dispatch.destination.resource()
-            && session.task == EventRef::parse(&binding.task_ref)?
-            && session.binding_hash == crate::binding::binding_hash(binding)?
-            && session.binding_generation == binding.generation
-            && session.target == dispatch.destination.audience().device
-            && session.session_id == request.session_id
-            && session.revision == request.expected_revision
-            && session.executor == text(&binding.open_spec, "executor")?
-            && session.cwd == text(&binding.open_spec, "cwd")?
+        session.revision == request.expected_revision
             && !matches!(session.state.as_str(), "unknown" | "closed" | "opening"),
-        "remote session snapshot differs from its signed task binding or is stale"
+        "remote session revision differs or its execution state is unavailable"
     );
     Ok(())
 }
@@ -415,7 +493,13 @@ impl Store {
             });
         }
         validate_basis_in(&tx, request)?;
-        check_remote_session(body, request, dispatch, now_ms)?;
+        check_remote_session(
+            body,
+            request,
+            dispatch,
+            &PublicKey::parse(&identity.public_key_hex()?)?,
+            now_ms,
+        )?;
         if action == "open" {
             let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE space_id=? AND target_node=? AND session_id=?)",
                 params![request.network_id,request.target_node,request.session_id], |row| row.get(0))?;
@@ -639,6 +723,59 @@ impl Store {
         Ok(())
     }
 
+    pub fn verify_execution_dispatch_receipt(
+        &self,
+        identity: &LocalIdentity,
+        result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffResult,
+        now_ms: u64,
+    ) -> Result<()> {
+        let receipt = &result.receipt.payload;
+        let space = receipt.original_space_id.as_str();
+        let operation = &receipt.operation_id;
+        let (source, original) =
+            dispatch_authorization_from(&self.connection, &self.policy, space, operation, now_ms)?;
+        ensure!(
+            result.handoff.handoff.project_dispatch == source
+                && vibeface_secure::authorization::DeviceId::from_key(&PublicKey::parse(
+                    &identity.public_key_hex()?
+                )?) == original.audience().device,
+            "handoff observation belongs to another Project dispatch or host"
+        );
+        ensure!(
+            self.execution_dispatch_handoff(space, operation)?.as_ref() == Some(&result.handoff),
+            "handoff observation differs from its durable submitted carrier"
+        );
+        let verified = self.policy.verified().verify_execution_handoff_ack(
+            &result.handoff,
+            &original,
+            &result.receipt,
+            &result.result,
+            now_ms,
+        )?;
+        check_policy_heads_in(
+            &self.connection,
+            self.policy.verified(),
+            verified.original(),
+            now_ms,
+        )?;
+        check_policy_heads_in(
+            &self.connection,
+            self.policy.verified(),
+            verified.submission(),
+            now_ms,
+        )?;
+        let stored = self
+            .operation(space, operation)?
+            .context("observed operation is missing")?;
+        let event: crate::model::Event = serde_json::from_str(&source.canonical_body)?;
+        ensure!(
+            matches!(&event.body,crate::model::EventBody::DispatchRecorded {action,..}
+            if *action == serde_json::to_value(&stored.request)?),
+            "observed operation differs from its accepted dispatch"
+        );
+        Ok(())
+    }
+
     pub fn apply_execution_handoff_receipt(
         &mut self,
         identity: &LocalIdentity,
@@ -691,6 +828,10 @@ impl Store {
         )?;
         let request: OperationRequest = serde_json::from_str(&request)?;
         let old_state: OperationState = serde_json::from_str(&old_state)?;
+        ensure!(
+            old_state != OperationState::Unknown,
+            "an uncertain Project operation requires explicit Account resolution"
+        );
         let old_result: Value = serde_json::from_str(&old_result)?;
         let source_event: crate::model::Event = serde_json::from_str(&source.canonical_body)?;
         ensure!(
@@ -1052,6 +1193,263 @@ mod tests {
             body["request"] = serde_json::to_value(&request)?;
             Ok((body, request))
         }
+    }
+
+    #[test]
+    fn signed_remote_results_and_metadata_keep_project_and_executor_state_separate() -> Result<()> {
+        use vibeface_secure::authorization::{execution_handoff::*, prepare::*};
+        let mut f = Fixture::new()?;
+        let binding = f.bind()?;
+        let (body, request) = f.operation(binding.clone(), "remote-result")?;
+        let (dispatch, auth, proof, transport) = f.authorize(&body)?;
+        f.store.accept_execution_dispatch(
+            &f.project.node,
+            &dispatch,
+            &auth,
+            &proof,
+            &transport,
+            &body,
+            &request,
+            now(),
+        )?;
+        let (wire, fresh) = f.store.prepare_execution_dispatch_handoff(
+            &f.project.node,
+            f.project.space.as_str(),
+            &request.operation_id,
+            now(),
+        )?;
+        assert!(fresh);
+        let (same, fresh) = f.store.prepare_execution_dispatch_handoff(
+            &f.project.node,
+            f.project.space.as_str(),
+            &request.operation_id,
+            now(),
+        )?;
+        assert!(!fresh);
+        assert_eq!(same, wire);
+        let mut c = f.executor.memory()?;
+        f.project.install(&mut c)?;
+        c.install_policy_journal(&f.journal, now())?;
+        c.local_set(
+            f.executor.space.as_str(),
+            &format!("resource-root:{}", f.execution.resource),
+            &json!(f.project.project),
+        )?;
+        let peer = TransportEvidence::VerifiedPeer {
+            origin: f.audience.device.clone(),
+        };
+        let challenge =
+            c.issue_execution_handoff_challenge(&wire, &peer, CheckStage::Admit, now())?;
+        let mut receipts = c.sign_execution_handoff_receipts(&challenge, &f.project.node, now())?;
+        receipts.extend(c.sign_execution_handoff_receipts(&challenge, &f.executor.node, now())?);
+        let admit = ExecutionHandoffFreshness {
+            challenge,
+            receipts,
+        };
+        c.accept_execution_handoff(&f.executor.node, &wire, &admit, &peer, now())?;
+        let current = c.execution_handoff_authorization(
+            f.execution.space.as_str(),
+            f.project.space.as_str(),
+            &request.operation_id,
+            now(),
+        )?;
+        let challenge =
+            c.issue_execution_handoff_challenge(&wire, &peer, CheckStage::Start, now() + 1)?;
+        let mut receipts =
+            c.sign_execution_handoff_receipts(&challenge, &f.project.node, now() + 1)?;
+        receipts.extend(c.sign_execution_handoff_receipts(
+            &challenge,
+            &f.executor.node,
+            now() + 1,
+        )?);
+        let (running, fresh, _) = c.claim_execution_handoff(
+            &f.executor.node,
+            &current,
+            &ExecutionHandoffFreshness {
+                challenge,
+                receipts,
+            },
+            now() + 1,
+        )?;
+        assert!(fresh);
+        let mut session = running.execution_session.context("C session is missing")?;
+        session.state = "idle".into();
+        let done = c.finish_execution_handoff(
+            &f.executor.node,
+            f.execution.space.as_str(),
+            f.project.space.as_str(),
+            &request.operation_id,
+            OperationState::Succeeded,
+            json!({"opened":true}),
+            Some(&session),
+            now() + 2,
+        )?;
+        let receipt = done.receipt.context("C result receipt is missing")?;
+        let result = ExecutionHandoffResult {
+            handoff: wire.clone(),
+            receipt: receipt.clone(),
+            result: done.result,
+        };
+        f.store
+            .verify_execution_dispatch_receipt(&f.project.node, &result, now() + 2)?;
+        let count: u64 =
+            f.store
+                .connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        let mut wrong = result.clone();
+        wrong.result = json!({"opened":false});
+        assert!(
+            f.store
+                .apply_execution_handoff_receipt(&f.project.node, &wrong, now() + 2)
+                .is_err()
+        );
+        assert_eq!(
+            f.store
+                .operation(f.project.space.as_str(), &request.operation_id)?
+                .unwrap()
+                .state,
+            OperationState::Running
+        );
+        f.store
+            .apply_execution_handoff_receipt(&f.project.node, &result, now() + 2)?;
+        assert_eq!(
+            f.store.connection.query_row(
+                "SELECT COUNT(*) FROM resource_reservations",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            0
+        );
+        assert_eq!(
+            f.store
+                .connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, u64>(0))?,
+            count + 1
+        );
+        f.store
+            .apply_execution_handoff_receipt(&f.project.node, &result, now() + 2)?;
+        assert_eq!(
+            f.store
+                .connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row
+                    .get::<_, u64>(0))?,
+            count + 1
+        );
+        assert!(
+            f.store
+                .session(
+                    f.project.space.as_str(),
+                    &request.target_node,
+                    &request.session_id
+                )?
+                .is_none()
+        );
+        let client = verify_client_authorization(
+            &serde_json::to_string(&f.project.bundle)?,
+            &serde_json::to_string(&f.project.pins)?,
+            f.project.account.as_str(),
+            f.project.space.as_str(),
+            PublicKey::of(&f.project.client).as_str(),
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let raw = PrepareContext {
+            context: dispatch.facts.context.clone(),
+            binding_generation: Some(1),
+            canonical_cwd: Some(f.project.project.to_str().unwrap().into()),
+            execution_target_public_key: Some(PublicKey::parse(
+                &f.executor.node.public_key_hex()?,
+            )?),
+        };
+        let mut cb = f.executor.bundle.clone();
+        cb.journal.extend(f.journal.clone());
+        cb.grant_leaf = f.grant.clone();
+        let selection = json!({"execution_resource":f.execution,"execution_grant":f.grant,"target_public_key":f.executor.node.public_key_hex()?});
+        let handle = verify_remote_execution(
+            &client,
+            &serde_json::to_string(&f.project.bundle)?,
+            &serde_json::to_string(&f.project.pins)?,
+            &serde_json::to_string(&cb)?,
+            &serde_json::to_string(&f.executor.pins)?,
+            &selection.to_string(),
+            &serde_json::to_string(&raw)?,
+            "execution_open",
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let snapshot: Value = serde_json::from_str(
+            &handle
+                .session_json(
+                    &serde_json::to_string(&receipt)?,
+                    &serde_json::to_string(&binding)?,
+                    (now() + 2) as f64,
+                )
+                .map_err(anyhow::Error::msg)?,
+        )?;
+        assert_eq!(snapshot["revision"], 1);
+        assert!(snapshot.get("native_session_id").is_none());
+        assert!(
+            handle
+                .session_json(
+                    &serde_json::to_string(&receipt)?,
+                    &serde_json::to_string(&binding)?,
+                    (now() + 100_000) as f64
+                )
+                .is_err()
+        );
+        let source = wire.handoff.source_attestation.as_ref().unwrap();
+        let read = json!({"method":"operation","space_id":f.project.space,"resource_id":f.project.resource,
+            "authorization_id":"read-remote","operation_id":request.operation_id,"execution_source":source,"binding":binding});
+        f.executor.revoke_node(&mut f.store)?;
+        let facts = f
+            .store
+            .execution_dispatch_metadata_facts(&read, &f.audience, now() + 3)?
+            .unwrap();
+        assert!(facts.context.execution_session.is_none());
+        assert!(facts.context.executor_kind.is_none());
+        let context = verify_project_execution_metadata(
+            &client,
+            &serde_json::to_string(source)?,
+            &serde_json::to_string(&binding)?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let signed = sign_client_prepare_intent(
+            &client,
+            &read.to_string(),
+            &context,
+            "operation_status_read",
+            "read-remote",
+            &f.project.node.public_key_hex()?,
+            &f.project.client,
+            (now() + 3) as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let signed: Signed<PrepareIntent> = serde_json::from_str(&signed)?;
+        assert!(
+            signed
+                .payload
+                .request
+                .expected_policies
+                .iter()
+                .all(|head| head.domain != PolicyDomain::Account(f.executor.account.clone()))
+        );
+        f.store.policy.verified().verify_prepare_intent(
+            &signed,
+            &read,
+            Action::OperationStatusRead,
+            &f.audience,
+            &transport,
+            now() + 3,
+        )?;
+        let mut forged = read;
+        forged["operation_id"] = json!("unknown-operation");
+        assert!(
+            f.store
+                .execution_dispatch_metadata_facts(&forged, &f.audience, now() + 3)
+                .is_err()
+        );
+        Ok(())
     }
 
     #[test]
