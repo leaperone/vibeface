@@ -287,6 +287,9 @@ fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = options.open(path).context("create new private node file")?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -340,6 +343,11 @@ fn network_url(value: &str) -> Result<String> {
 
 fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
+    let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
+    ensure!(
+        epoch == json!({"data_epoch":2}),
+        "data directory uses another format; existing data was preserved"
+    );
     let configuration = Config::load(dir)?;
     let identity = config::identity(dir)?;
     let identities = IdentityStore::open(&dir.join("identity.sqlite3"))?;
@@ -770,6 +778,75 @@ mod tests {
         ] {
             assert!(network_url(value).is_err());
         }
+    }
+
+    #[test]
+    fn pairing_review_binds_the_exact_local_request() {
+        use vibeface_node::{identity::local::InvitePayload, model::NodeRole};
+        let device = LocalIdentity::generate();
+        let member = Member::node(&device, "Build Node", vec![NodeRole::Replica]).unwrap();
+        let invite = InviteEnvelope {
+            payload: InvitePayload {
+                version: 1,
+                invite_id: "invite".into(),
+                request_id: "invite-request".into(),
+                network_id: "ab".repeat(32),
+                inviter_subject_id: "cd".repeat(32),
+                capability_hash: digest(b"fixture capability"),
+                new_kind: IdentityKind::Node,
+                node_roles: vec![NodeRole::Replica],
+                manage: false,
+                epoch: 1,
+                expires_at_ms: 42,
+                nonce: "invite nonce".into(),
+            },
+            inviter_signature: String::new(),
+        };
+        let request = PairRequest {
+            request_id: "request".into(),
+            invite_id: "invite".into(),
+            capability: "fixture capability".into(),
+            member: member.clone(),
+            nonce: "request nonce".into(),
+            proof: String::new(),
+        };
+        let request_hash = digest(&request.signing_bytes().unwrap());
+        let mut review = PairReview {
+            version: 1,
+            invite_id: "invite".into(),
+            network_id: "ab".repeat(32),
+            inviter_subject_id: "cd".repeat(32),
+            new_member: member.clone(),
+            proposal_hash: request_hash.clone(),
+            parents: vec![],
+            epoch: 1,
+            expires_at_ms: 42,
+        };
+        verify_review(&review, &invite, &member, &request_hash).unwrap();
+        review.proposal_hash = invite.payload.hash().unwrap();
+        assert!(verify_review(&review, &invite, &member, &request_hash).is_err());
+        review.proposal_hash = request_hash.clone();
+        review.new_member.name = "Another Node".into();
+        assert!(verify_review(&review, &invite, &member, &request_hash).is_err());
+    }
+
+    #[test]
+    fn initialization_preserves_nonempty_data_directories() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-cli-existing-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("existing-data"), b"original").unwrap();
+        let parsed =
+            Cli::try_parse_from(["vibeface-node", "init", "--data-dir", dir.to_str().unwrap()])
+                .unwrap();
+        let Action::Init(options) = parsed.command else {
+            panic!("expected init")
+        };
+        assert!(init(*options).is_err());
+        assert_eq!(fs::read(dir.join("existing-data")).unwrap(), b"original");
+        assert!(!dir.join("identity.json").exists());
+        assert!(!dir.join("config.json").exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
