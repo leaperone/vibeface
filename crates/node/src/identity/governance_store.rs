@@ -1372,7 +1372,12 @@ mod tests {
         remote.policy = state;
         assert!(remote.policy.verified().space(&network.space).is_none());
         let prepared =
-            prepare_execution_registration(&network, &source, local.policy.pins(), &bundle)?;
+            prepare_execution_registration(&network, &source, local.policy.pins(), &bundle)
+                .context("prepare remote Team source registration")?;
+        eprintln!(
+            "execution registration source=remote_team phase=prepare usage={}",
+            prepared.proof_usage_json().map_err(anyhow::Error::msg)?
+        );
         let params: Value =
             serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
         let counts = row_counts(&local)?;
@@ -1445,20 +1450,31 @@ mod tests {
             challenge,
             receipts: [own_receipts, remote_receipts].concat(),
         };
-        let result = local.governance_command_with_registration_freshness(
-            &network.node,
-            &network.client.public_key_hex(),
-            "execution_service_register",
-            &params,
-            now(),
-            Some(&proof),
-        )?;
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        let result = verification.run(|| {
+            local.governance_command_with_registration_freshness(
+                &network.node,
+                &network.client.public_key_hex(),
+                "execution_service_register",
+                &params,
+                now(),
+                Some(&proof),
+            )
+        });
+        let actual = verification.counts();
+        eprintln!(
+            "execution registration source=remote_team phase=store_commit actual_verifications={} cache_hits={}",
+            actual.actual_verifications, actual.cache_hits
+        );
+        let result = result
+            .context("commit remote Team source registration with complete authority freshness")?;
         let verified = execution_service::finish_execution_service_registration(
             &prepared,
             &serde_json::to_string(&result["committed"])?,
             now() as f64,
         )
-        .map_err(anyhow::Error::msg)?;
+        .map_err(anyhow::Error::msg)
+        .context("finish remote Team registered PersonalSpace proof")?;
         let execution = ResourceRef {
             space: SpaceId::parse(&verified.space_id())?,
             resource: ResourceId::parse(&verified.resource_id())?,
