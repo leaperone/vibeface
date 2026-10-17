@@ -498,160 +498,6 @@ table "identity_meta" {
   }
 }
 
-table "identity_requests" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "request_id" {
-    type = text
-  }
-  column "subject_id" {
-    type = text
-  }
-  column "kind" {
-    type = text
-  }
-  column "response" {
-    type = text
-  }
-  column "created_at_ms" {
-    type = integer
-  }
-  primary_key {
-    columns = [column.space_id, column.request_id]
-  }
-  foreign_key "identity_requests_space" {
-    columns = [column.space_id]
-    ref_columns = [table.spaces.column.space_id]
-  }
-}
-
-table "identity_invites" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "invite_id" {
-    type = text
-  }
-  column "request_id" {
-    type = text
-  }
-  column "inviter_subject_id" {
-    type = text
-  }
-  column "payload" {
-    type = text
-  }
-  column "payload_hash" {
-    type = text
-  }
-  column "capability_hash" {
-    type = text
-  }
-  column "inviter_signature" {
-    type = text
-  }
-  column "epoch" {
-    type = integer
-  }
-  column "expires_at_ms" {
-    type = integer
-  }
-  column "used" {
-    type = integer
-    default = 0
-  }
-  primary_key {
-    columns = [column.space_id, column.invite_id]
-  }
-  foreign_key "identity_invites_space" {
-    columns = [column.space_id]
-    ref_columns = [table.spaces.column.space_id]
-  }
-  index "identity_invites_request" {
-    unique = true
-    columns = [column.space_id, column.request_id]
-  }
-
-  check "identity_invites_used" {
-    expr = "used IN (0,1)"
-  }
-  check "identity_invites_epoch" {
-    expr = "epoch > 0"
-  }
-}
-
-table "identity_pair_requests" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "request_id" {
-    type = text
-  }
-  column "invite_id" {
-    type = text
-  }
-  column "subject_id" {
-    type = text
-  }
-  column "review" {
-    type = text
-  }
-  column "review_hash" {
-    type = text
-  }
-  column "new_subject_signature" {
-    type = text
-    default = ""
-  }
-  primary_key {
-    columns = [column.space_id, column.request_id]
-  }
-  foreign_key "pair_requests_invite" {
-    columns = [column.space_id, column.invite_id]
-    ref_columns = [table.identity_invites.column.space_id, table.identity_invites.column.invite_id]
-  }
-  index "pair_requests_invite_once" {
-    unique = true
-    columns = [column.space_id, column.invite_id]
-  }
-}
-
-table "identity_pair_reviews" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "invite_id" {
-    type = text
-  }
-  column "review" {
-    type = text
-  }
-  column "review_hash" {
-    type = text
-  }
-  column "inviter_signature" {
-    type = text
-  }
-  column "new_subject_signature" {
-    type = text
-  }
-  column "created_at_ms" {
-    type = integer
-  }
-  primary_key {
-    columns = [column.space_id, column.invite_id]
-  }
-  foreign_key "pair_reviews_request" {
-    columns = [column.space_id, column.invite_id]
-    ref_columns = [table.identity_pair_requests.column.space_id, table.identity_pair_requests.column.invite_id]
-  }
-}
-
 table "event_dependencies" {
   schema = schema.main
   column "space_id" {
@@ -1109,5 +955,275 @@ table "passkey_receipts" {
   }
   check "passkey_receipts_accepted_at" {
     expr = "accepted_at_ms >= 0"
+  }
+}
+
+table "execution_handoffs" {
+  schema = schema.main
+  column "execution_space_id" {
+    type = text
+  }
+  column "original_space_id" {
+    type = text
+  }
+  column "operation_id" {
+    type = text
+  }
+  column "target_node" {
+    type = text
+  }
+  column "session_id" {
+    type = text
+  }
+  column "original_request" {
+    type = text
+  }
+  column "handoff" {
+    type = text
+  }
+  column "handoff_hash" {
+    type = text
+  }
+  column "invocation_hash" {
+    type = text
+  }
+  column "body_hash" {
+    type = text
+  }
+  column "admission_transport" {
+    type = text
+  }
+  column "admission_challenge" {
+    type = text
+  }
+  column "admission_receipts" {
+    type = text
+  }
+  column "admitted_at_ms" {
+    type = integer
+  }
+  column "state" {
+    type = text
+  }
+  column "control" {
+    type = integer
+  }
+  column "result" {
+    type = text
+  }
+  column "lease_challenge" {
+    null = true
+    type = text
+  }
+  column "lease_receipts" {
+    null = true
+    type = text
+  }
+  column "lease_verified_at_ms" {
+    null = true
+    type = integer
+  }
+  column "lease_deadline_ms" {
+    null = true
+    type = integer
+  }
+  column "result_receipt" {
+    null = true
+    type = text
+  }
+  primary_key {
+    columns = [column.execution_space_id, column.original_space_id, column.operation_id]
+  }
+  foreign_key "execution_handoffs_fk_0" {
+    columns     = [column.execution_space_id, column.target_node]
+    ref_columns = [table.node_certificates.column.space_id, table.node_certificates.column.node_id]
+  }
+  foreign_key "execution_handoffs_fk_1" {
+    columns     = [column.original_space_id]
+    ref_columns = [table.spaces.column.space_id]
+  }
+  foreign_key "execution_handoffs_fk_2" {
+    columns     = [column.execution_space_id]
+    ref_columns = [table.spaces.column.space_id]
+  }
+  index "handoffs_dispatch_once" {
+    unique  = true
+    columns = [column.execution_space_id, column.handoff_hash]
+  }
+  index "handoffs_invocation_once" {
+    unique  = true
+    columns = [column.execution_space_id, column.invocation_hash]
+  }
+  check {
+    expr = "(admitted_at_ms >= 0)"
+  }
+  check {
+    expr = "(state IN ('accepted','running','unknown','succeeded','failed','rejected'))"
+  }
+  check {
+    expr = "(control IN (0,1))"
+  }
+  check {
+    expr = "((lease_challenge IS NULL AND lease_receipts IS NULL AND lease_verified_at_ms IS NULL AND lease_deadline_ms IS NULL)\n     OR (lease_challenge IS NOT NULL AND lease_receipts IS NOT NULL\n         AND lease_verified_at_ms IS NOT NULL AND lease_deadline_ms IS NOT NULL\n         AND lease_verified_at_ms >= 0 AND lease_deadline_ms > lease_verified_at_ms))"
+  }
+}
+
+table "execution_handoff_challenges" {
+  schema = schema.main
+  column "execution_space_id" {
+    type = text
+  }
+  column "nonce" {
+    type = text
+  }
+  column "original_space_id" {
+    type = text
+  }
+  column "operation_id" {
+    type = text
+  }
+  column "handoff_hash" {
+    type = text
+  }
+  column "stage" {
+    type = text
+  }
+  column "challenge" {
+    type = text
+  }
+  column "expires_at_ms" {
+    type = integer
+  }
+  column "consumed" {
+    type    = integer
+    default = 0
+  }
+  primary_key {
+    columns = [column.execution_space_id, column.nonce]
+  }
+  foreign_key "execution_handoff_challenges_fk_0" {
+    columns     = [column.original_space_id]
+    ref_columns = [table.spaces.column.space_id]
+  }
+  foreign_key "execution_handoff_challenges_fk_1" {
+    columns     = [column.execution_space_id]
+    ref_columns = [table.spaces.column.space_id]
+  }
+  check {
+    expr = "(stage IN ('admit','start','renew'))"
+  }
+  check {
+    expr = "(expires_at_ms >= 0)"
+  }
+  check {
+    expr = "(consumed IN (0,1))"
+  }
+}
+
+table "execution_handoff_nonces" {
+  schema = schema.main
+  column "execution_space_id" {
+    type = text
+  }
+  column "device_id" {
+    type = text
+  }
+  column "nonce" {
+    type = text
+  }
+  column "original_space_id" {
+    type = text
+  }
+  column "operation_id" {
+    type = text
+  }
+  column "invocation_hash" {
+    type = text
+  }
+  column "body_hash" {
+    type = text
+  }
+  primary_key {
+    columns = [column.execution_space_id, column.device_id, column.nonce]
+  }
+  foreign_key "execution_handoff_nonces_fk_0" {
+    columns     = [column.execution_space_id, column.original_space_id, column.operation_id]
+    ref_columns = [table.execution_handoffs.column.execution_space_id, table.execution_handoffs.column.original_space_id, table.execution_handoffs.column.operation_id]
+  }
+  index "handoff_nonce_operation_once" {
+    unique  = true
+    columns = [column.execution_space_id, column.original_space_id, column.operation_id]
+  }
+}
+
+table "execution_handoff_reservations" {
+  schema = schema.main
+  column "execution_space_id" {
+    type = text
+  }
+  column "original_space_id" {
+    type = text
+  }
+  column "operation_id" {
+    type = text
+  }
+  column "target_node" {
+    type = text
+  }
+  column "resource" {
+    type = text
+  }
+  primary_key {
+    columns = [column.execution_space_id, column.original_space_id, column.operation_id, column.resource]
+  }
+  foreign_key "execution_handoff_reservations_fk_0" {
+    columns     = [column.execution_space_id, column.original_space_id, column.operation_id]
+    ref_columns = [table.execution_handoffs.column.execution_space_id, table.execution_handoffs.column.original_space_id, table.execution_handoffs.column.operation_id]
+  }
+}
+
+table "execution_handoff_sessions" {
+  schema = schema.main
+  column "execution_space_id" {
+    type = text
+  }
+  column "original_space_id" {
+    type = text
+  }
+  column "original_resource_id" {
+    type = text
+  }
+  column "target_node" {
+    type = text
+  }
+  column "session_id" {
+    type = text
+  }
+  column "revision" {
+    type = integer
+  }
+  column "binding" {
+    type = text
+  }
+  column "record" {
+    type = text
+  }
+  primary_key {
+    columns = [column.execution_space_id, column.original_space_id, column.original_resource_id, column.target_node, column.session_id]
+  }
+  foreign_key "execution_handoff_sessions_fk_0" {
+    columns     = [column.execution_space_id, column.target_node]
+    ref_columns = [table.node_certificates.column.space_id, table.node_certificates.column.node_id]
+  }
+  foreign_key "execution_handoff_sessions_fk_1" {
+    columns     = [column.original_space_id, column.original_resource_id]
+    ref_columns = [table.resource_records.column.space_id, table.resource_records.column.resource_id]
+  }
+  foreign_key "execution_handoff_sessions_fk_2" {
+    columns     = [column.original_space_id]
+    ref_columns = [table.spaces.column.space_id]
+  }
+  check {
+    expr = "(revision >= 0)"
   }
 }
