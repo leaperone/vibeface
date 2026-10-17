@@ -2,6 +2,8 @@
 
 use super::*;
 
+pub mod offer;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceEnrollmentIntent {
@@ -1183,6 +1185,7 @@ pub fn sign_passkey_enrollment_possession(
 
 #[cfg(test)]
 mod tests {
+    use super::offer::*;
     use super::*;
     use crate::authorization::bootstrap::*;
     use crate::webauthn::{
@@ -1464,6 +1467,168 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn public_offer_transfers_only_account_proof_and_constructs_the_bound_intent() {
+        let f = Fixture::new();
+        let json = create_device_enrollment_offer(
+            &key(3),
+            f.account().as_str(),
+            "https://node.example",
+            &key(4).public_key_hex(),
+            "[]",
+            END as f64,
+            &f.pins_json(),
+            &f.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let signed: Signed<EnrollmentOffer> = parse(&json).unwrap();
+        assert!(signed.payload.manager_journal.iter().all(|entry| matches!(
+            entry,
+            JournalEntry::AccountGenesis(_)
+                | JournalEntry::Account(_)
+                | JournalEntry::AccountCommit(_)
+                | JournalEntry::Device(_)
+                | JournalEntry::Authenticator(_)
+        )));
+        assert!(!json.contains("secret_hex"));
+        assert!(!json.contains("grant_leaf"));
+        assert_eq!(signed.payload.pins.len(), 2);
+        let verified = verify_device_enrollment_offer(&json, NOW as f64).unwrap();
+        let intent_json =
+            create_device_enrollment_intent_from_offer(&verified, &key(5), NOW as f64).unwrap();
+        let intent: DeviceEnrollmentIntent = parse(&intent_json).unwrap();
+        assert_eq!(intent, f.intent(5, vec![]));
+        assert!(
+            sign_device_enrollment_intent(
+                &intent_json,
+                &key(3),
+                &f.pins_json(),
+                &f.bundle_json(),
+                NOW as f64
+            )
+            .is_ok()
+        );
+        assert!(
+            create_device_enrollment_intent_from_offer(
+                &verified,
+                &key(5),
+                verified.expires_at_ms()
+            )
+            .is_err()
+        );
+        assert!(
+            create_device_enrollment_intent_from_offer(&verified, &key(1), NOW as f64).is_err()
+        );
+        assert!(
+            create_device_enrollment_offer(
+                &key(1),
+                f.account().as_str(),
+                "https://node.example",
+                &key(4).public_key_hex(),
+                "[]",
+                END as f64,
+                &f.pins_json(),
+                &f.bundle_json(),
+                NOW as f64
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn offer_rejects_changed_pins_target_expiry_and_nonmanager_signatures() {
+        let f = Fixture::new();
+        let json = create_device_enrollment_offer(
+            &key(3),
+            f.account().as_str(),
+            "https://node.example",
+            &key(4).public_key_hex(),
+            "[]",
+            END as f64,
+            &f.pins_json(),
+            &f.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let signed: Signed<EnrollmentOffer> = parse(&json).unwrap();
+        for field in 0..5 {
+            let mut offer = signed.payload.clone();
+            match field {
+                0 => {
+                    offer
+                        .pins
+                        .iter_mut()
+                        .find(|pin| matches!(pin.domain, PolicyDomain::Space(_)))
+                        .unwrap()
+                        .genesis_root = PublicKey::of(&key(19))
+                }
+                1 => offer.entry.node_public_key = PublicKey::of(&key(19)),
+                2 => offer.certificate_expires_at_ms = 1_000_001,
+                3 => offer.expires_at_ms = NOW + INVOCATION_MAX_AGE_MS + 1,
+                _ => offer.entry.endpoint = "https://user:password@node.example".to_owned(),
+            }
+            assert!(verify_enrollment_offer(&Signed::sign(offer, &key(3)).unwrap(), NOW).is_err());
+        }
+        assert!(
+            verify_enrollment_offer(&Signed::sign(signed.payload, &key(2)).unwrap(), NOW).is_err()
+        );
+    }
+
+    #[test]
+    fn historical_root_and_recovery_keys_cannot_be_enrolled_as_daily_devices() {
+        let f = Fixture::new();
+        let mut state = f.state();
+        let mut document = next_document(&state, &f.account()).unwrap();
+        document.authority_epoch += 1;
+        document.sequence = 0;
+        document.root_generation += 1;
+        document.current_root = PublicKey::of(&key(12));
+        document.accept_root(&key(12)).unwrap();
+        document.approve_recovery(&key(2)).unwrap();
+        state
+            .install_account(Signed::sign(document, &key(2)).unwrap())
+            .unwrap();
+        let mut document = next_document(&state, &f.account()).unwrap();
+        document.recovery.generation += 1;
+        document.recovery.keys = vec![PublicKey::of(&key(13))];
+        document.approve_recovery(&key(2)).unwrap();
+        state
+            .install_account(Signed::sign(document, &key(12)).unwrap())
+            .unwrap();
+        for child in [1, 2] {
+            let mut intent = f.intent(child, vec![]);
+            intent.expected_heads = vec![
+                state
+                    .head(&PolicyDomain::Account(f.account()))
+                    .unwrap()
+                    .clone(),
+            ];
+            assert_eq!(
+                verify_account_enrollment(
+                    &state,
+                    &Signed::sign(intent.clone(), &key(12)).unwrap(),
+                    NOW
+                )
+                .unwrap_err(),
+                AuthorizationError::InvalidProof(
+                    "enrollment requires an independent new device key"
+                )
+            );
+            assert_eq!(
+                verify_passkey_enrollment_request(
+                    &state,
+                    &Signed::sign(intent, &key(child)).unwrap(),
+                    NOW
+                )
+                .unwrap_err(),
+                AuthorizationError::InvalidProof(
+                    "enrollment requires an independent new device key"
+                )
+            );
+        }
     }
 
     #[test]
