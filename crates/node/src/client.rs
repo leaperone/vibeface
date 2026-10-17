@@ -55,6 +55,12 @@ struct Session {
     public_key: String,
     authorization: Option<VerifiedClientAuthorization>,
     subscription: Option<Access>,
+    remote_subscription: Option<RemoteSubscription>,
+}
+struct RemoteSubscription {
+    body: Value,
+    invocation: Signed<Invocation>,
+    cursor: String,
 }
 
 pub struct Client {
@@ -157,10 +163,13 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
         public_key,
         authorization: None,
         subscription: None,
+        remote_subscription: None,
     };
     let mut events = node.events.subscribe();
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut subscription_tick = tokio::time::interval(Duration::from_secs(5));
+    subscription_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut received = Instant::now();
     let mut partial_started: Option<Instant> = None;
     loop {
@@ -199,6 +208,33 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                         send_value(&mut socket, &mut channel, &json!({"type":"subscription_expired"})).await?;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+            _ = subscription_tick.tick() => {
+                let mut expired = false;
+                if let Some(remote) = session.remote_subscription.as_mut() {
+                    let client = session.authorization.as_ref().context("subscription authorization missing")?;
+                    let result = tokio::time::timeout(Duration::from_secs(5), node.remote_subscription_cursor(
+                        client, &remote.body, &remote.invocation, &session.public_key,
+                    )).await;
+                    match result {
+                        Ok(Ok(cursor)) if cursor != remote.cursor => {
+                            remote.cursor = cursor;
+                            send_value(&mut socket, &mut channel, &json!({"type":"changed"})).await?;
+                        }
+                        Ok(Ok(_)) => {},
+                        _ => expired = true,
+                    }
+                } else if let Some(access) = &session.subscription {
+                    match node.refresh_subscription(access).await {
+                        Ok(current) => session.subscription = Some(current),
+                        Err(_) => expired = true,
+                    }
+                }
+                if expired {
+                    session.subscription = None;
+                    session.remote_subscription = None;
+                    send_value(&mut socket, &mut channel, &json!({"type":"subscription_expired"})).await?;
                 }
             }
             _ = heartbeat.tick() => {
@@ -271,6 +307,7 @@ async fn dispatch_request(
                 }
             }
             session.subscription = None;
+            session.remote_subscription = None;
             session.authorization = Some(verified);
             Ok(
                 json!({"scope":input.scope,"authorization":input.authorization,"pins":input.pins,"resources":input.resources}),
@@ -300,10 +337,23 @@ async fn dispatch_request(
                 "request uses another grant"
             );
             if client.audience() != &node.local_audience()? {
-                ensure!(
-                    method == "rpc",
-                    "subscribe directly to the selected resource host"
-                );
+                if method == "subscribe" {
+                    let cursor = node
+                        .remote_subscription_cursor(
+                            client,
+                            &params,
+                            &invocation,
+                            &session.public_key,
+                        )
+                        .await?;
+                    session.subscription = None;
+                    session.remote_subscription = Some(RemoteSubscription {
+                        body: params,
+                        invocation,
+                        cursor,
+                    });
+                    return Ok(json!({"subscribed":true}));
+                }
                 return node
                     .forward_client_request(client, &params, &invocation, &session.public_key)
                     .await;
@@ -324,6 +374,7 @@ async fn dispatch_request(
                 .await?;
             if method == "subscribe" {
                 node.validate_subscription(&access).await?;
+                session.remote_subscription = None;
                 session.subscription = Some(access);
                 Ok(json!({"subscribed":true}))
             } else {

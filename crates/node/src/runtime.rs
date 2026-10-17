@@ -1569,6 +1569,35 @@ impl Runtime {
         invocation: &Signed<Invocation>,
         noise_public_key: &str,
     ) -> Result<Value> {
+        self.forward_client_request_kind(client, body, invocation, noise_public_key, "rpc")
+            .await
+    }
+
+    pub async fn remote_subscription_cursor(
+        &self,
+        client: &VerifiedClientAuthorization,
+        body: &Value,
+        invocation: &Signed<Invocation>,
+        noise_public_key: &str,
+    ) -> Result<String> {
+        ensure!(
+            authorization_action(body)?.is_read(),
+            "subscription requires read permission"
+        );
+        let result = self
+            .forward_client_request_kind(client, body, invocation, noise_public_key, "subscription")
+            .await?;
+        Ok(field(&result, "cursor")?.to_owned())
+    }
+
+    async fn forward_client_request_kind(
+        &self,
+        client: &VerifiedClientAuthorization,
+        body: &Value,
+        invocation: &Signed<Invocation>,
+        noise_public_key: &str,
+        kind: &str,
+    ) -> Result<Value> {
         let now = now_ms() as u64;
         let value = &invocation.payload;
         let device = DeviceId::from_key(&PublicKey::parse(noise_public_key)?);
@@ -1636,7 +1665,7 @@ impl Runtime {
             client.scope().space_id.as_str(),
             &target,
             json!({
-                "type":"rpc","authorization_body":body,"invocation":invocation,
+                "type":kind,"authorization_body":body,"invocation":invocation,
             }),
         )
         .await
@@ -1872,8 +1901,9 @@ impl Runtime {
             facts.resource == *prepared.resource()
                 && facts.action == prepared.action()
                 && facts.operation_id == prepared.operation_id()
-                && facts.audience == *prepared.audience(),
-            "normalization changed authorized prepare target"
+                && facts.audience == *prepared.audience()
+                && facts.context == original.context,
+            "normalization changed authorized prepare target or context"
         );
         let mut invocation = original.clone();
         invocation.resource = facts.resource;
@@ -1961,16 +1991,39 @@ impl Runtime {
         transport: TransportEvidence,
     ) -> Result<Access> {
         let space = SpaceId::parse(field(&body, "space_id")?)?;
+        let audience = self.audience()?;
         let authorization = {
             let store = self.store.lock().await;
-            let facts = store.request_facts(&body, &self.request_audience(&store, &body)?)?;
+            let raw = vibeface_secure::authorization::RequestFacts {
+                resource: vibeface_secure::authorization::ResourceRef {
+                    space: space.clone(),
+                    resource: vibeface_secure::authorization::ResourceId::parse(field(
+                        &body,
+                        "resource_id",
+                    )?)?,
+                },
+                action: authorization_action(&body)?,
+                audience: audience.clone(),
+                operation_id: field(&body, "authorization_id")?.to_owned(),
+                body_hash: ObjectHash::body(&body)?,
+                context: invocation.payload.context.clone(),
+            };
+            store.authorization_state().verify_invocation(
+                &invocation,
+                &raw,
+                &transport,
+                now_ms() as u64,
+            )?;
+            let facts = store
+                .request_facts(&body, &audience)
+                .map_err(|_| anyhow::anyhow!("request facts do not match authorization"))?;
             store.authorize_request(&invocation, &facts, &transport, now_ms() as u64)?
         };
         ensure!(
             authorization.resource().space == space,
             "wrong authorization space"
         );
-        let stage = if authorization.action().is_read() {
+        let stage = if body["method"] != "operate" && authorization.action().is_read() {
             CheckStage::RemoteRead
         } else {
             CheckStage::Admit
@@ -1988,8 +2041,8 @@ impl Runtime {
 
     pub async fn validate_subscription(&self, access: &Access) -> Result<()> {
         ensure!(
-            access.authorization.action().is_read(),
-            "subscription requires read permission"
+            access.authorization.action().is_read() && access.body["method"] != "operate",
+            "subscription requires a read-only request"
         );
         let mut store = self.store.lock().await;
         store.authorize_read(
@@ -1998,6 +2051,18 @@ impl Runtime {
             &access.transport,
             now_ms() as u64,
         )
+    }
+
+    pub async fn refresh_subscription(&self, access: &Access) -> Result<Access> {
+        let current = self
+            .authorize_rpc(
+                access.body.clone(),
+                access.authorization.signed_invocation().clone(),
+                access.transport.clone(),
+            )
+            .await?;
+        self.validate_subscription(&current).await?;
+        Ok(current)
     }
 
     pub async fn subscription_allows(&self, access: &Access, update: &Update) -> Result<bool> {
@@ -3582,7 +3647,16 @@ impl Runtime {
                 old.request == request,
                 "operation ID reused with different body"
             );
-            return Ok(json!({"operation":old}));
+            let operation = store.accept_authorized_operation(
+                &self.identity,
+                &access.authorization,
+                &access.freshness,
+                &access.transport,
+                &access.body,
+                &request,
+                now_ms() as u64,
+            )?;
+            return Ok(json!({"operation":operation}));
         }
         let operation = store.accept_authorized_operation(
             &self.identity,
@@ -3897,7 +3971,11 @@ impl Runtime {
             native_session_id: session.native_session_id.clone(),
         };
         if !context.shared && native.executor == ExecutorKind::Codex {
-            self.ensure_personal_provider().await?;
+            if let Err(error) = self.ensure_personal_provider().await {
+                self.finish(&request, OperationState::Failed,
+                    json!({"error":format!("private Provider could not prepare before dispatch: {error:#}")})).await?;
+                return Err(error);
+            }
         }
         self.supervise_execution(context.clone()).await;
         let store = self.store.clone();
@@ -4284,7 +4362,7 @@ impl Runtime {
         ensure!(
             matches!(
                 kind,
-                "prepare" | "rpc" | "execute" | "inventory" | "event" | "blob"
+                "prepare" | "subscription" | "rpc" | "execute" | "inventory" | "event" | "blob"
             ),
             "unsupported peer operation"
         );
@@ -4341,6 +4419,25 @@ impl Runtime {
             *access.authorization.audience() == self.audience()?,
             "peer request reached another service"
         );
+        if kind == "subscription" {
+            ensure!(
+                access.authorization.action().is_read(),
+                "subscription requires read permission"
+            );
+            let store = self.store.lock().await;
+            store.authorize_read(
+                &access.authorization,
+                &access.freshness,
+                &access.transport,
+                now_ms() as u64,
+            )?;
+            let mut heads = vec![];
+            for scope in store.authorized_conversation_ids(&access.authorization)? {
+                heads.push((scope.clone(), store.heads(&access.network_id, &scope)?));
+            }
+            heads.sort_by(|left, right| left.0.cmp(&right.0));
+            return Ok(json!({"cursor":ObjectHash::body(&heads)?}));
+        }
         if matches!(kind, "inventory" | "event" | "blob") {
             self.require_role(&message.network_id, NodeRole::Replica)
                 .await?;
@@ -4589,6 +4686,14 @@ impl Runtime {
             let Some(task) = &request.task_id else {
                 return Ok(true);
             };
+            if !followup_authorized(
+                &*self.store.lock().await,
+                &request.network_id,
+                &request.conversation_id,
+                task,
+            )? {
+                return Ok(true);
+            }
             if self.config.manager.is_none() || !self.config.roles.contains(&NodeRole::Scheduler) {
                 return Ok(false);
             }
