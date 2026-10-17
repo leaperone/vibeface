@@ -1764,8 +1764,33 @@ impl VerifiedPolicySet {
             let Some(certificate) = self.devices.get(hash) else {
                 continue;
             };
+            let owner_matches = match domain {
+                PolicyDomain::Account(_) => &certificate.payload.owner == domain,
+                PolicyDomain::Space(space) => {
+                    let PolicyDomain::Account(owner) = &certificate.payload.owner else {
+                        return Err(AuthorizationError::InvalidProof(
+                            "space devices must reference personal account services",
+                        ));
+                    };
+                    let account = self.account(owner).ok_or(AuthorizationError::Revoked)?;
+                    let personal_owner_matches =
+                        self.space(space)
+                            .is_some_and(|document| match &document.root {
+                                SpaceRoot::Personal {
+                                    owner: expected, ..
+                                } => expected == owner,
+                                SpaceRoot::Team { .. } => true,
+                            });
+                    personal_owner_matches
+                        && matches!(certificate.payload.subject, Actor::Service(_))
+                        && account.devices.contains(hash)
+                        && !account
+                            .revoked_devices
+                            .contains(&certificate.payload.device)
+                }
+            };
             require(
-                &certificate.payload.owner == domain
+                owner_matches
                     && &certificate.payload.public_key != root
                     && !revoked.contains(&certificate.payload.device)
                     && devices.insert(&certificate.payload.device),
@@ -2429,6 +2454,7 @@ impl VerifiedPolicySet {
             target.payload.subject == Actor::Service(i.audience.service.clone()),
             "audience service device mismatch",
         )?;
+        self.validate_service_reference(&i.resource.space, target)?;
         self.validate_certificate(
             target,
             now_ms,
@@ -2533,17 +2559,7 @@ impl VerifiedPolicySet {
                 && certificate.payload.uses.contains(&DeviceUse::Noise),
             "device is not a Noise service",
         )?;
-        match &document.root {
-            SpaceRoot::Personal { owner, .. } => require(
-                certificate.payload.owner == PolicyDomain::Account(owner.clone()),
-                "service belongs to another personal account",
-            )?,
-            SpaceRoot::Team { .. } => require(
-                certificate.payload.owner == PolicyDomain::Space(space.clone())
-                    && document.devices.contains(&certificate.hash()?),
-                "service is not registered in team space",
-            )?,
-        }
+        self.validate_service_reference(space, certificate)?;
         let mut budget = Budget::default();
         let mut dependencies = BTreeMap::new();
         self.dependency(&PolicyDomain::Space(space.clone()), &mut dependencies)?;
@@ -2556,6 +2572,28 @@ impl VerifiedPolicySet {
         )?;
         self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
         Ok(certificate)
+    }
+    fn validate_service_reference(
+        &self,
+        space: &SpaceId,
+        certificate: &Signed<DeviceCertificate>,
+    ) -> Result<()> {
+        let document = self.space(space).ok_or(AuthorizationError::Revoked)?;
+        match &document.root {
+            SpaceRoot::Personal { owner, .. } => require(
+                certificate.payload.owner == PolicyDomain::Account(owner.clone()),
+                "service belongs to another personal account",
+            )?,
+            SpaceRoot::Team { .. } => require(
+                matches!(certificate.payload.owner, PolicyDomain::Account(_))
+                    && document.devices.contains(&certificate.hash()?)
+                    && !document
+                        .revoked_devices
+                        .contains(&certificate.payload.device),
+                "service is not registered in team space",
+            )?,
+        }
+        Ok(())
     }
     /// Authenticates a transport service; it grants no space membership or operation rights.
     pub fn verify_transport_device(
@@ -4408,14 +4446,18 @@ mod tests {
             .unwrap();
         let mut certificate = DeviceCertificate {
             version: AUTH_VERSION,
-            owner: PolicyDomain::Space(team.clone()),
+            owner: PolicyDomain::Account(f.account.clone()),
             subject: Actor::Service(ServiceId::from_key(&PublicKey::of(&node))),
             device: DeviceId::from_key(&PublicKey::of(&node)),
             public_key: PublicKey::of(&node),
             uses: vec![DeviceUse::Noise, DeviceUse::ServiceInvocation],
             possession: None,
-            enrollment_grant: Some(hash.clone()),
-            issued_under: head.clone(),
+            enrollment_grant: None,
+            issued_under: f
+                .state
+                .head(&PolicyDomain::Account(f.account.clone()))
+                .unwrap()
+                .clone(),
             nonce: Nonce::from_bytes([71; 32]),
             not_before_ms: 0,
             expires_at_ms: 1_000_000,
@@ -4423,7 +4465,18 @@ mod tests {
         certificate.prove_possession(&node).unwrap();
         let certificate_hash = f
             .state
-            .install_device(Signed::sign(certificate, &f.user).unwrap(), NOW)
+            .install_device(Signed::sign(certificate, &f.root).unwrap(), NOW)
+            .unwrap();
+        let mut account = f.state.account(&f.account).unwrap().clone();
+        account.previous = f
+            .state
+            .head(&PolicyDomain::Account(f.account.clone()))
+            .cloned();
+        account.sequence += 1;
+        account.devices.push(certificate_hash.clone());
+        account.devices.sort();
+        f.state
+            .install_account(Signed::sign(account, &f.root).unwrap())
             .unwrap();
         d.previous = Some(head.clone());
         d.sequence = 2;
@@ -4545,7 +4598,7 @@ mod tests {
             head,
         ];
         assert_eq!(
-            f.check(invocation, &node, NOW)
+            f.check(invocation.clone(), &node, NOW)
                 .unwrap()
                 .dependencies()
                 .len(),
@@ -4557,8 +4610,47 @@ mod tests {
                 .unwrap()
                 .payload
                 .owner,
-            PolicyDomain::Space(team)
+            PolicyDomain::Account(f.account.clone())
         );
+        let mut owner_revoked = f.state.clone();
+        let mut account = owner_revoked.account(&f.account).unwrap().clone();
+        account.previous = owner_revoked
+            .head(&PolicyDomain::Account(f.account.clone()))
+            .cloned();
+        account.sequence += 1;
+        let node_id = DeviceId::from_key(&PublicKey::of(&node));
+        account
+            .devices
+            .retain(|h| owner_revoked.device(h).unwrap().payload.device != node_id);
+        account.revoked_devices.push(node_id.clone());
+        account.revoked_devices.sort();
+        owner_revoked
+            .install_account(Signed::sign(account, &f.root).unwrap())
+            .unwrap();
+        assert!(
+            owner_revoked
+                .verify_service_device(&team, &node_id, NOW)
+                .is_err()
+        );
+        let mut revoked = f.state.space(&team).unwrap().clone();
+        revoked.previous = f.state.head(&PolicyDomain::Space(team.clone())).cloned();
+        revoked.sequence += 1;
+        revoked.devices.clear();
+        revoked.revoked_devices.push(node_id.clone());
+        revoked.revoked_devices.sort();
+        f.state
+            .install_space(Signed::sign(revoked, &team_root).unwrap())
+            .unwrap();
+        assert!(f.state.verify_service_device(&team, &node_id, NOW).is_err());
+        assert!(f.state.verify_transport_device(&node_id, NOW).is_ok());
+        invocation.expected_policies = vec![
+            f.state
+                .head(&PolicyDomain::Account(f.account.clone()))
+                .unwrap()
+                .clone(),
+            f.state.head(&PolicyDomain::Space(team)).unwrap().clone(),
+        ];
+        assert!(f.check(invocation, &node, NOW).is_err());
     }
     #[test]
     fn prepared_signing_matches_native_typed_signature() {
@@ -5566,6 +5658,7 @@ pub fn verify_client_authorization(
             target.payload.subject == Actor::Service(leaf.audience.service.clone()),
             "client target service mismatch",
         )?;
+        state.validate_service_reference(&space, target)?;
         state.validate_certificate(
             target,
             now_ms,
