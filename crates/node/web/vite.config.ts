@@ -12,9 +12,10 @@ const config = defineConfig({
   plugins: [
     {
       name: 'vibeface-crypto',
+      enforce: 'pre',
       resolveId(source, importer) {
-        if (source === '/generated/vibeface_secure.js' || (importer && resolve(dirname(importer), source) === cryptoModule)) {
-          return { id: '/generated/vibeface_secure.js', external: true }
+        if (source === '/generated/vibeface_secure.js' || source === cryptoModule || (importer && resolve(dirname(importer), source) === cryptoModule)) {
+          return { id: this.environment.name === 'client' ? '/generated/vibeface_secure.js' : cryptoModule, external: true }
         }
       },
     },

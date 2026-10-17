@@ -679,6 +679,12 @@ def verify_no_model_budget(nodes):
             connection.close()
 
 
+def javascript_dependencies(content):
+    static = rb"\b(?:import|export)\s*(?:[^;\"'`]*?\bfrom\s*)?[\"'`]([^\"'`]+)[\"'`]"
+    dynamic = rb"\bimport\s*\(\s*[\"'`]([^\"'`]+)[\"'`]"
+    return [address.decode() for pattern in (static, dynamic) for address in re.findall(pattern, content)]
+
+
 def verify_web_assets(node, module):
     def fetch(path, *, method="GET", status=200):
         request = urllib.request.Request(node.url + path, headers={"Origin": node.url}, method=method)
@@ -729,6 +735,7 @@ def verify_web_assets(node, module):
     references = References()
     references.feed(shell.decode())
     pending, checked, content_types = list(references.paths), set(), set()
+    uses_external_crypto = False
     while pending:
         path = pending.pop()
         if path in checked:
@@ -744,14 +751,21 @@ def verify_web_assets(node, module):
         require(not body and int(head_headers["Content-Length"]) == len(content)
                 and head_headers.get_content_type() == mime and head_headers["Cache-Control"] == asset_headers["Cache-Control"],
                 "HEAD preserves asset MIME, length and cache policy without a body")
-        if mime in ("text/css", "text/javascript"):
-            for reference in re.findall(rb"[\"'](/assets/[^\"' ]+|\.\.?/[^\"' ]+\.(?:js|css|woff2?))[\"']", content):
-                pending.append(urllib.parse.urljoin(path, reference.decode()))
-            if mime == "text/css":
-                for reference in re.findall(rb"url\([\"']?([^\"')]+)", content):
-                    address = reference.decode().strip()
-                    if not address.startswith("data:"):
-                        pending.append(urllib.parse.urljoin(path, address))
+        if mime == "text/javascript":
+            require(b"__wbindgen_" not in content and b"vibeface_secure_bg" not in content,
+                    "client chunks do not duplicate generated cryptography or embed a second WASM instance")
+            for address in javascript_dependencies(content):
+                if address == "/generated/vibeface_secure.js":
+                    uses_external_crypto = True
+                else:
+                    require(address.startswith(("./", "../", "/assets/")), "client imports only trusted local modules")
+                    pending.append(urllib.parse.urljoin(path, address))
+        elif mime == "text/css":
+            for reference in re.findall(rb"url\([\"']?([^\"')]+)", content):
+                address = reference.decode().strip()
+                if not address.startswith("data:"):
+                    pending.append(urllib.parse.urljoin(path, address))
+    require(uses_external_crypto, "client chunks import the single same-origin generated cryptography module")
     require({"text/css", "text/javascript", "font/woff2"} <= content_types,
             "real JavaScript, CSS and bundled font resources are reachable")
     for path in ("/api", "/api/not-a-route", "/peer/not-a-route", "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
