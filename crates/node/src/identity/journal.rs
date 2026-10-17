@@ -20,7 +20,7 @@ pub(crate) struct PolicyState {
 #[derive(Clone, PartialEq, Eq)]
 struct AcceptedEntry {
     entry: JournalEntry,
-    at_ms: u64,
+    received_at_ms: u64,
 }
 
 pub(crate) struct PreparedPolicyUpdate {
@@ -89,6 +89,29 @@ fn same_entry(a: &JournalEntry, b: &JournalEntry) -> bool {
     }
 }
 
+fn replay_at_ms(entry: &JournalEntry) -> Option<u64> {
+    match entry {
+        JournalEntry::Device(value) => Some(value.payload.not_before_ms),
+        JournalEntry::Authenticator(value) => Some(value.payload.not_before_ms),
+        JournalEntry::Membership(value) => Some(value.payload.not_before_ms),
+        JournalEntry::Grant(value) => Some(value.payload.not_before_ms),
+        JournalEntry::AccountCommit(value) => Some(value.commit.payload.accepted_at_ms),
+        JournalEntry::SpaceCommit(value) => Some(value.commit.payload.accepted_at_ms),
+        _ => None,
+    }
+}
+
+fn issued_under(entry: &JournalEntry) -> Option<&PolicyStamp> {
+    match entry {
+        JournalEntry::Device(value) => Some(&value.payload.issued_under),
+        JournalEntry::Authenticator(value) => Some(&value.payload.issued_under),
+        JournalEntry::Membership(value) => Some(&value.payload.issued_under),
+        JournalEntry::Grant(value) => Some(&value.payload.issued_under),
+        JournalEntry::Resource(value) => Some(&value.payload.issued_under),
+        _ => None,
+    }
+}
+
 fn apply_entry(
     state: &mut VerifiedPolicySet,
     pins: &[PolicyPin],
@@ -96,6 +119,11 @@ fn apply_entry(
     at_ms: u64,
     replay: bool,
 ) -> Result<()> {
+    let at_ms = if replay {
+        replay_at_ms(entry).unwrap_or(at_ms)
+    } else {
+        at_ms
+    };
     match entry {
         JournalEntry::AccountGenesis(value) => {
             let domain = PolicyDomain::Account(value.payload.account.clone());
@@ -231,16 +259,28 @@ impl PolicyState {
             ))
         })?;
         for row in rows {
-            let (hash, encoded, at_ms) = row?;
+            let (hash, encoded, received_at_ms) = row?;
             let hash = ObjectHash::parse(&hash)?;
             let entry: JournalEntry = serde_json::from_str(&encoded)?;
             ensure!(
                 entry_hash(&entry)? == hash,
                 "stored policy entry hash mismatch"
             );
-            apply_entry(&mut result.state, &result.pins, &entry, at_ms, true)?;
+            apply_entry(
+                &mut result.state,
+                &result.pins,
+                &entry,
+                received_at_ms,
+                true,
+            )?;
             result.order.push(hash.clone());
-            result.accepted.insert(hash, AcceptedEntry { entry, at_ms });
+            result.accepted.insert(
+                hash,
+                AcceptedEntry {
+                    entry,
+                    received_at_ms,
+                },
+            );
         }
         result.check_minimum_heads()?;
         result.check_heads(connection)?;
@@ -356,7 +396,7 @@ impl PolicyState {
         journal: &[JournalEntry],
         now_ms: u64,
     ) -> Result<PreparedPolicyUpdate> {
-        self.prepare(&[], journal, now_ms)
+        self.prepare(&[], journal, now_ms, false)
     }
 
     pub(crate) fn historical(
@@ -370,30 +410,121 @@ impl PolicyState {
             domains.len() == expected.len(),
             "duplicate historical policy domain"
         );
-        let mut state = VerifiedPolicySet::new();
-        let mut matching = None;
-        for hash in &self.order {
-            let accepted = &self.accepted[hash];
-            if accepted.at_ms > admitted_at_ms {
-                break;
+        let mut policies: Vec<_> = expected.iter().map(|head| head.head.clone()).collect();
+        let mut policy_hashes = BTreeSet::new();
+        let mut objects = Vec::new();
+        while let Some(hash) = policies.pop() {
+            if !policy_hashes.insert(hash.clone()) {
+                continue;
             }
+            let entry = &self
+                .accepted
+                .get(&hash)
+                .context("historical policy head is missing")?
+                .entry;
+            let account = match entry {
+                JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => Some(value),
+                JournalEntry::AccountCommit(value) => Some(&value.proposal),
+                _ => None,
+            };
+            let space = match entry {
+                JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => Some(value),
+                JournalEntry::SpaceCommit(value) => Some(&value.proposal),
+                _ => None,
+            };
+            ensure!(
+                account.is_some() || space.is_some(),
+                "historical head is not a policy"
+            );
+            if let Some(value) = account {
+                policies.extend(value.payload.previous.iter().map(|head| head.head.clone()));
+                objects.extend(value.payload.devices.iter().cloned());
+                objects.extend(value.payload.authenticators.iter().cloned());
+                if let Some(proof) = &value.payload.device_enrollment {
+                    policies.extend(
+                        proof
+                            .intent
+                            .payload
+                            .expected_heads
+                            .iter()
+                            .map(|head| head.head.clone()),
+                    );
+                }
+                if let Some(proof) = &value.payload.authenticator_approval {
+                    policies.extend(
+                        proof
+                            .intent
+                            .payload
+                            .expected_heads
+                            .iter()
+                            .map(|head| head.head.clone()),
+                    );
+                }
+            }
+            if let Some(value) = space {
+                policies.extend(value.payload.previous.iter().map(|head| head.head.clone()));
+                objects.extend(value.payload.devices.iter().cloned());
+                objects.extend(value.payload.memberships.iter().cloned());
+                objects.extend(value.payload.grants.iter().cloned());
+                objects.extend(value.payload.resources.iter().cloned());
+                objects.extend(value.payload.governance_grant.iter().cloned());
+            }
+            if let Some(commit) = commit(entry) {
+                ensure!(
+                    commit.payload.accepted_at_ms <= admitted_at_ms,
+                    "historical policy commit is in the future"
+                );
+                policies.extend(
+                    commit
+                        .payload
+                        .dependencies
+                        .iter()
+                        .map(|head| head.head.clone()),
+                );
+            }
+        }
+        let mut selected = policy_hashes.clone();
+        while let Some(hash) = objects.pop() {
+            if selected.contains(&hash) {
+                continue;
+            }
+            let Some(accepted) = self.accepted.get(&hash) else {
+                continue;
+            };
+            let Some(stamp) = issued_under(&accepted.entry) else {
+                continue;
+            };
+            if !policy_hashes.contains(&stamp.head)
+                || replay_at_ms(&accepted.entry).is_some_and(|at| at > admitted_at_ms)
+            {
+                continue;
+            }
+            selected.insert(hash);
+            match &accepted.entry {
+                JournalEntry::Device(value) => {
+                    objects.extend(value.payload.enrollment_grant.iter().cloned())
+                }
+                JournalEntry::Grant(value) => objects.extend(value.payload.parent.iter().cloned()),
+                _ => {}
+            }
+        }
+        let mut state = VerifiedPolicySet::new();
+        for hash in self.order.iter().filter(|hash| selected.contains(*hash)) {
             apply_entry(
                 &mut state,
                 &self.pins,
-                &accepted.entry,
-                accepted.at_ms,
+                &self.accepted[hash].entry,
+                admitted_at_ms,
                 true,
             )?;
-            if expected
-                .iter()
-                .all(|head| state.head(&head.domain) == Some(head))
-            {
-                matching = Some(state.clone());
-            } else if matching.is_some() {
-                break;
-            }
         }
-        matching.context("historical policy heads do not identify an accepted journal prefix")
+        ensure!(
+            expected
+                .iter()
+                .all(|head| state.head(&head.domain) == Some(head)),
+            "historical policy heads do not identify the verified history"
+        );
+        Ok(state)
     }
 
     pub(crate) fn prepare_bootstrap(
@@ -402,7 +533,7 @@ impl PolicyState {
         journal: &[JournalEntry],
         now_ms: u64,
     ) -> Result<PreparedPolicyUpdate> {
-        self.prepare(pins, journal, now_ms)
+        self.prepare(pins, journal, now_ms, true)
     }
 
     fn prepare(
@@ -410,6 +541,7 @@ impl PolicyState {
         pins: &[PolicyPin],
         journal: &[JournalEntry],
         now_ms: u64,
+        replay: bool,
     ) -> Result<PreparedPolicyUpdate> {
         ensure!(
             journal.len() <= MAX_UPDATE_ENTRIES,
@@ -444,10 +576,14 @@ impl PolicyState {
                 );
                 continue;
             }
-            apply_entry(&mut after.state, &after.pins, entry, now_ms, false)?;
+            ensure!(
+                !replay || replay_at_ms(entry).is_none_or(|at| at <= now_ms),
+                "policy history begins after its receipt"
+            );
+            apply_entry(&mut after.state, &after.pins, entry, now_ms, replay)?;
             let accepted = AcceptedEntry {
                 entry: entry.clone(),
-                at_ms: now_ms,
+                received_at_ms: now_ms,
             };
             after.order.push(hash.clone());
             after.accepted.insert(hash.clone(), accepted.clone());
@@ -480,7 +616,7 @@ fn check_snapshot(connection: &Connection, state: &PolicyState) -> Result<()> {
     })?;
     let mut count = 0;
     for row in rows {
-        let (hash, entry, at_ms) = row?;
+        let (hash, entry, received_at_ms) = row?;
         let hash = ObjectHash::parse(&hash)?;
         ensure!(
             state.order.get(count) == Some(&hash),
@@ -488,7 +624,11 @@ fn check_snapshot(connection: &Connection, state: &PolicyState) -> Result<()> {
         );
         let entry = serde_json::from_str(&entry)?;
         ensure!(
-            state.accepted.get(&hash) == Some(&AcceptedEntry { entry, at_ms }),
+            state.accepted.get(&hash)
+                == Some(&AcceptedEntry {
+                    entry,
+                    received_at_ms
+                }),
             "accepted policy journal changed concurrently"
         );
         count += 1;
@@ -516,7 +656,7 @@ pub(crate) fn commit_in(
                 params![
                     hash.as_str(),
                     serde_json::to_string(&accepted.entry)?,
-                    accepted.at_ms
+                    accepted.received_at_ms
                 ],
             )?;
             if let Some(commit) = commit(&accepted.entry) {
@@ -594,7 +734,11 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = key(1);
+            Self::with_root(1)
+        }
+
+        fn with_root(seed: u8) -> Self {
+            let root = key(seed);
             let authority = key(2);
             let root_key = PublicKey::of(&root);
             let account = AccountId::from_root(&root_key);
@@ -902,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn load_uses_original_acceptance_time_for_expired_certificates() {
+    fn historical_import_preserves_receipt_time_for_expired_certificates() {
         let mut fixture = Fixture::new();
         let device = key(4);
         let mut certificate = DeviceCertificate {
@@ -964,6 +1108,79 @@ mod tests {
             replayed.verified().device(&signed.hash().unwrap()),
             Some(&signed)
         );
+        let unregistered = key(6);
+        let mut certificate = signed.payload.clone();
+        certificate.device = DeviceId::from_key(&PublicKey::of(&unregistered));
+        certificate.public_key = PublicKey::of(&unregistered);
+        certificate.nonce = Nonce::from_bytes([6; 32]);
+        certificate.prove_possession(&unregistered).unwrap();
+        let unregistered = Signed::sign(certificate, &fixture.root).unwrap();
+        fixture
+            .accept(&[JournalEntry::Device(unregistered.clone())], NOW)
+            .unwrap();
+        assert_eq!(
+            fixture
+                .state
+                .verified()
+                .device(&unregistered.hash().unwrap()),
+            Some(&unregistered)
+        );
+        let journal: Vec<_> = fixture
+            .state
+            .order
+            .iter()
+            .map(|hash| fixture.state.accepted[hash].entry.clone())
+            .collect();
+        assert!(
+            PolicyState::default()
+                .prepare_bootstrap(fixture.state.pins(), &journal, NOW - 2)
+                .is_err()
+        );
+        let update = PolicyState::default()
+            .prepare_bootstrap(fixture.state.pins(), &journal, NOW + 100_000)
+            .unwrap();
+        let mut imported = database();
+        let transaction = imported.transaction().unwrap();
+        let imported_state = commit_in(&transaction, &update).unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(
+            imported
+                .query_row(
+                    "SELECT min(accepted_at_ms) FROM policy_journal",
+                    [],
+                    |row| { row.get::<_, u64>(0) }
+                )
+                .unwrap(),
+            NOW + 100_000
+        );
+        assert_eq!(
+            imported_state
+                .historical(&heads, NOW)
+                .unwrap()
+                .device(&signed.hash().unwrap()),
+            Some(&signed)
+        );
+        assert!(
+            imported_state
+                .historical(&heads, NOW)
+                .unwrap()
+                .device(&unregistered.hash().unwrap())
+                .is_none()
+        );
+        assert!(
+            imported_state
+                .historical(&heads, NOW - 2)
+                .unwrap()
+                .device(&signed.hash().unwrap())
+                .is_none()
+        );
+        assert_eq!(
+            PolicyState::load(&imported)
+                .unwrap()
+                .verified()
+                .device(&signed.hash().unwrap()),
+            Some(&signed)
+        );
         assert_eq!(
             replayed
                 .state
@@ -971,6 +1188,80 @@ mod tests {
                 .install_device(signed, NOW + 100_000)
                 .unwrap_err(),
             vibeface_secure::authorization::AuthorizationError::Expired
+        );
+    }
+
+    #[test]
+    fn historical_import_replays_expired_commits_without_advancing_live_updates() {
+        let mut fixture = Fixture::new();
+        let change = fixture.space_commit(7);
+        assert!(
+            fixture
+                .state
+                .prepare_network_update(&[change.clone()], NOW + 100_000)
+                .is_err()
+        );
+        fixture.accept(&[change], NOW).unwrap();
+        let heads: Vec<_> = fixture.state.heads().into_values().collect();
+        let journal: Vec<_> = fixture
+            .state
+            .order
+            .iter()
+            .map(|hash| fixture.state.accepted[hash].entry.clone())
+            .collect();
+        let mut pins = fixture.state.pins().to_vec();
+        for pin in &mut pins {
+            pin.minimum_head = fixture.state.verified().head(&pin.domain).cloned();
+        }
+        assert!(
+            PolicyState::default()
+                .prepare_bootstrap(&pins, &journal, NOW - 1)
+                .is_err()
+        );
+        let mut forged = journal.clone();
+        if let JournalEntry::SpaceCommit(change) = &mut forged[2] {
+            change.commit.signature = Signed::sign(change.commit.payload.clone(), &key(9))
+                .unwrap()
+                .signature;
+        }
+        assert!(
+            PolicyState::default()
+                .prepare_bootstrap(&pins, &forged, NOW + 100_000)
+                .is_err()
+        );
+        let mut forged = journal.clone();
+        if let JournalEntry::SpaceCommit(change) = &mut forged[2] {
+            change.receipts[0].signature =
+                Signed::sign(change.receipts[0].payload.clone(), &key(9))
+                    .unwrap()
+                    .signature;
+        }
+        assert!(
+            PolicyState::default()
+                .prepare_bootstrap(&pins, &forged, NOW + 100_000)
+                .is_err()
+        );
+        let imported = PolicyState::default()
+            .prepare_bootstrap(&pins, &journal, NOW + 100_000)
+            .unwrap()
+            .after;
+        for head in &heads {
+            assert_eq!(
+                imported.historical(&heads, NOW).unwrap().head(&head.domain),
+                Some(head)
+            );
+        }
+        assert!(imported.historical(&heads, NOW - 1).is_err());
+        let mut wrong = heads.clone();
+        wrong[0].sequence += 1;
+        assert!(imported.historical(&wrong, NOW).is_err());
+        assert_eq!(
+            imported
+                .prepare_bootstrap(&pins, &journal[..2], NOW + 100_000)
+                .unwrap()
+                .after
+                .heads(),
+            fixture.state.heads()
         );
     }
 
@@ -1021,6 +1312,29 @@ mod tests {
                 .historical(&[first[0].clone(), first[0].clone()], NOW)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn historical_import_ignores_an_unrelated_future_commit() {
+        let mut first = Fixture::new();
+        first.accept(&[first.space_commit(7)], NOW).unwrap();
+        let second = Fixture::with_root(8);
+        let expected: Vec<_> = second.state.heads().into_values().collect();
+        let journal: Vec<_> = second
+            .state
+            .order
+            .iter()
+            .map(|hash| second.state.accepted[hash].entry.clone())
+            .collect();
+        let imported = first
+            .state
+            .prepare_bootstrap(second.state.pins(), &journal, NOW + 1)
+            .unwrap()
+            .after;
+        let historical = imported.historical(&expected, NOW - 1).unwrap();
+        for head in &expected {
+            assert_eq!(historical.head(&head.domain), Some(head));
+        }
     }
 
     #[test]
