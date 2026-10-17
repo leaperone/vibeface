@@ -404,6 +404,14 @@ impl Store {
     }
 
     pub fn scheduler_outbox(&self, network: &str) -> Result<Vec<OutboxEntry>> {
+        Ok(self
+            .scheduler_outbox_all(network)?
+            .into_iter()
+            .filter(|entry| !entry.delivered)
+            .collect())
+    }
+
+    pub fn scheduler_outbox_all(&self, network: &str) -> Result<Vec<OutboxEntry>> {
         let mut statement = self.connection.prepare("SELECT value FROM local_values WHERE network_id=? AND key LIKE 'scheduler:v1:outbox:%'")?;
         let rows = statement.query_map([network], |r| r.get::<_, String>(0))?;
         let mut entries = Vec::new();
@@ -413,9 +421,7 @@ impl Store {
                 entry.version == SCHEDULING_VERSION,
                 "unsupported scheduler outbox version"
             );
-            if !entry.delivered {
-                entries.push(entry);
-            }
+            entries.push(entry);
         }
         Ok(entries)
     }
@@ -928,12 +934,18 @@ impl Store {
     pub fn scheduler_maintenance_idle(&self, network: &str) -> Result<()> {
         for session in scheduler_sessions(&self.connection, network)? {
             ensure!(
-                session.active.is_none() && session.unresolved.is_empty(),
+                session.pending.is_empty()
+                    && session.active.is_none()
+                    && session.unresolved.is_empty(),
                 crate::maintenance::Busy(
                     "scheduler invocation requires completion or reconciliation".into()
                 )
             );
         }
+        ensure!(
+            self.scheduler_outbox(network)?.is_empty(),
+            crate::maintenance::Busy("scheduler delivery is pending".into())
+        );
         Ok(())
     }
 
@@ -3088,6 +3100,7 @@ mod tests {
             first.hash
         );
         assert_eq!(store.messages(&network, "conversation")?.len(), 1);
+        assert!(store.scheduler_maintenance_idle(&network).is_err());
         let claimed = store
             .claim_next(&network, "conversation", &target, "boot", "sdk")?
             .unwrap();
@@ -3372,6 +3385,7 @@ mod tests {
         conversation(&mut source, &owner)?;
         let event = admitted_message(&mut source, &owner, "remote", &target)?;
         assert_eq!(source.scheduler_outbox(&network)?.len(), 1);
+        assert!(source.scheduler_maintenance_idle(&network).is_err());
         assert!(
             source
                 .scheduler_jobs(&network, "conversation", &target)?
@@ -3387,6 +3401,10 @@ mod tests {
         source.acknowledge_outbox(&network, &receipt)?;
         source.acknowledge_outbox(&network, &receipt)?;
         assert!(source.scheduler_outbox(&network)?.is_empty());
+        let deliveries = source.scheduler_outbox_all(&network)?;
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].delivered);
+        assert_eq!(deliveries[0].trigger, event.hash);
         assert_eq!(
             source
                 .enqueue_trigger(&network, "conversation", &event.hash, &target)?
