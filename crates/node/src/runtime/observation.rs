@@ -3,8 +3,8 @@ use serde::Deserialize;
 use vibeface_secure::authorization::{
     execution_handoff::{ExecutionHandoffResult, verify_execution_handoff_receipt_signature},
     execution_observation::{
-        ExecutionObservationChallenge, ExecutionObservationFreshness, ExecutionObservationRequest,
-        SignedExecutionObservation,
+        ExecutionObservationChallenge, ExecutionObservationFreshness, ExecutionObservationPurpose,
+        ExecutionObservationRequest, SignedExecutionObservation,
     },
 };
 
@@ -16,10 +16,129 @@ struct ClientObservation {
 }
 
 impl Runtime {
+    pub async fn forward_client_execution_observation(
+        &self,
+        client: &VerifiedClientAuthorization,
+        body: &Value,
+        noise_public_key: &str,
+    ) -> Result<Value> {
+        let request: ClientObservation = serde_json::from_value(body.clone())?;
+        ensure!(
+            request.method == "execution_observation",
+            "invalid observation method"
+        );
+        let signed = &request.observation_request;
+        let value = &signed.payload.request;
+        let intent = &signed.payload.intent;
+        let device = DeviceId::from_key(&PublicKey::parse(noise_public_key)?);
+        ensure!(
+            signed.issuer.as_str() == noise_public_key
+                && device == client.scope().device_id
+                && value.device == device
+                && value.actor == Actor::Account(client.scope().account_id.clone())
+                && value.initiator == value.actor
+                && value.initiating_grant.is_none()
+                && value.context.sdk_session.is_none(),
+            "forwarded observation actor differs from the authenticated client"
+        );
+        ensure!(
+            value.version == AUTH_VERSION
+                && value.audience == *client.audience()
+                && value.presenter == self.audience()?.device
+                && value.presenter != value.device
+                && value.action == Action::OperationResolve,
+            "forwarded observation authorization targets another route"
+        );
+        ensure!(
+            value.resource == intent.target.source.project
+                && value.resource.space == client.scope().space_id
+                && client
+                    .resources()
+                    .iter()
+                    .any(|record| record.payload.resource == value.resource.resource),
+            "forwarded observation resource is outside the verified projection"
+        );
+        ensure!(
+            intent.version == AUTH_VERSION
+                && intent.purpose == ExecutionObservationPurpose::Observe
+                && value.operation_id == intent.authorization_id
+                && value.body_hash == ObjectHash::body(intent)?,
+            "forwarded observation differs from signed intent"
+        );
+        ensure!(
+            value.expected_policies.len() <= vibeface_secure::authorization::MAX_POLICY_DOMAINS
+                && value
+                    .expected_policies
+                    .windows(2)
+                    .all(|pair| pair[0].domain < pair[1].domain)
+                && client
+                    .heads()
+                    .iter()
+                    .all(|stamp| value.expected_policies.contains(stamp)),
+            "forwarded observation omitted its verified client policy heads"
+        );
+        let now = now_ms() as u64;
+        ensure!(
+            value.not_before_ms <= now
+                && now < value.expires_at_ms
+                && value.expires_at_ms - value.not_before_ms <= INVOCATION_MAX_AGE_MS,
+            "forwarded observation expired"
+        );
+        let verification = SignatureVerification::new();
+        verification.run(|| signed.verify_signature())?;
+        let target = {
+            let store = self.store.lock().await;
+            verification.run(|| -> Result<_> {
+                for stamp in client.heads() {
+                    ensure!(
+                        store.authorization_state().head(&stamp.domain) == Some(stamp),
+                        "forwarded observation client policy needs synchronization"
+                    );
+                }
+                for stamp in &value.expected_policies {
+                    if let Some(current) = store.authorization_state().head(&stamp.domain) {
+                        ensure!(
+                            current == stamp,
+                            "forwarded observation policy needs synchronization"
+                        );
+                    }
+                }
+                let certificate = store.authorization_state().verify_service_device(
+                    &client.scope().space_id,
+                    &value.audience.device,
+                    now,
+                )?;
+                ensure!(
+                    certificate.payload.subject == Actor::Service(value.audience.service.clone())
+                        && certificate.payload.public_key == *client.audience_public_key(),
+                    "forwarded observation target differs from the verified service pin"
+                );
+                crypto::fingerprint(certificate.payload.public_key.as_str())
+            })?
+        };
+        self.peer_request(
+            client.scope().space_id.as_str(),
+            &target,
+            json!({"type":"execution_observation","authorization_body":body}),
+        )
+        .await
+    }
+
     pub async fn observe_client_execution(
         self: &Arc<Self>,
         body: Value,
         transport: TransportEvidence,
+    ) -> Result<Value> {
+        let verification = SignatureVerification::new();
+        self.observe_execution_with_verification(body, transport, &verification)
+            .await
+    }
+
+    async fn observe_execution_with_verification(
+        self: &Arc<Self>,
+        body: Value,
+        transport: TransportEvidence,
+        verification: &SignatureVerification,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         let request: ClientObservation = serde_json::from_value(body)?;
@@ -36,11 +155,13 @@ impl Runtime {
                 TransportEvidence::GatewayNoise { device, gateway } => {
                     device == &invocation.device && gateway == &invocation.presenter
                 }
-                _ => false,
+                TransportEvidence::VerifiedPeer { origin } => {
+                    origin == &invocation.presenter && origin != &invocation.device
+                }
+                TransportEvidence::LocalAgentAdapter { .. } => false,
             },
             "observation presenter differs from the authenticated client transport"
         );
-        let verification = SignatureVerification::new();
         let (wire, original, target) = {
             let store = self.store.lock().await;
             verification.run(|| -> Result<_> {
@@ -133,6 +254,28 @@ impl Runtime {
         origin: DeviceId,
         verification: &SignatureVerification,
     ) -> Result<Value> {
+        if message.payload["type"] == "execution_observation" {
+            let body = message.payload["authorization_body"].clone();
+            let request: ClientObservation = serde_json::from_value(body.clone())?;
+            ensure!(
+                request
+                    .observation_request
+                    .payload
+                    .request
+                    .resource
+                    .space
+                    .as_str()
+                    == message.network_id,
+                "observation route differs from its signed Project"
+            );
+            return self
+                .observe_execution_with_verification(
+                    body,
+                    TransportEvidence::VerifiedPeer { origin },
+                    verification,
+                )
+                .await;
+        }
         if message.payload["type"] == "execution_handoff_observation_receipts" {
             let challenge: ExecutionObservationChallenge =
                 serde_json::from_value(message.payload["challenge"].clone())?;

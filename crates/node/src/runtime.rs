@@ -5498,7 +5498,7 @@ impl Runtime {
         Ok(json!({"sessions":sessions,"operations":records,"facts":facts}))
     }
     async fn handle_peer(self: &Arc<Self>, message: &Inbound) -> Result<Value> {
-        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        let verification = message.verification.clone();
         let envelope = &message.payload;
         let kind = field(envelope, "type")?;
         let certificate = {
@@ -5507,7 +5507,9 @@ impl Runtime {
         };
         if matches!(
             kind,
-            "execution_handoff_observe" | "execution_handoff_observation_receipts"
+            "execution_observation"
+                | "execution_handoff_observe"
+                | "execution_handoff_observation_receipts"
         ) {
             let origin = DeviceId::from_key(&PublicKey::parse(&certificate.public_key)?);
             return self
