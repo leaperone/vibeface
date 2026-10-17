@@ -1387,4 +1387,92 @@ pub(crate) mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn persisted_execution_lease_cannot_outlive_its_signed_receipts() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let proof = fixture.proof()?;
+        let tx = fixture
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let admitted = consume_authorization_in(
+            &tx,
+            &fixture.state,
+            &fixture.auth,
+            &proof,
+            &fixture.transport,
+            &fixture.body,
+            Some("operation_1"),
+            NOW,
+        )?;
+        tx.commit()?;
+        let facts = request_facts_from(
+            &fixture.connection,
+            &fixture.state,
+            &fixture.body,
+            fixture.auth.audience(),
+        )?;
+        let admission =
+            reconstruct_admission(&fixture.policy, &admitted, &facts, &fixture.transport)?;
+        let auth = fixture.state.verify_operation_authorization(
+            &admission,
+            &facts,
+            &fixture.transport,
+            NOW + 1,
+        )?;
+        let challenge = FreshnessChallenge::new(
+            &auth,
+            CheckStage::Start,
+            Nonce::random()?,
+            NOW + 1,
+            NOW + 20_000,
+        )?;
+        let receipts = auth
+            .dependencies()
+            .iter()
+            .map(|current| {
+                Ok(Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: current.clone(),
+                        challenge_hash: challenge.hash()?,
+                        issued_at_ms: NOW + 1,
+                        expires_at_ms: NOW + 15_000,
+                    },
+                    &fixture.authority,
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let proof = FreshnessProof {
+            challenge,
+            receipts,
+        };
+        let space = auth.resource().space.as_str();
+        fixture.connection.execute("INSERT INTO authorization_challenges(space_id,nonce,invocation_hash,stage,challenge,expires_at_ms) VALUES(?,?,?,'start',?,?)",
+            params![space, proof.challenge.nonce.as_str(), auth.invocation_hash().as_str(), serde_json::to_string(&proof.challenge)?, proof.challenge.expires_at_ms])?;
+        let tx = fixture
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deadline = consume_challenge_in(
+            &tx,
+            &fixture.state,
+            &auth,
+            &proof,
+            CheckStage::Start,
+            NOW + 1,
+        )?;
+        assert_eq!(deadline, NOW + 15_000);
+        save_lease_in(&tx, space, "operation_1", &proof, NOW + 1, deadline)?;
+        tx.commit()?;
+        assert_eq!(
+            lease_deadline_from(&fixture.connection, &fixture.policy, space, "operation_1")?,
+            NOW + 15_000
+        );
+        fixture.connection.execute("UPDATE local_values SET value=json_set(value,'$.deadline',?) WHERE space_id=? AND key='lease:operation_1'", params![NOW + 20_000, space])?;
+        assert!(
+            lease_deadline_from(&fixture.connection, &fixture.policy, space, "operation_1")
+                .is_err()
+        );
+        Ok(())
+    }
 }
