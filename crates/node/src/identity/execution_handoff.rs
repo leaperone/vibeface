@@ -171,6 +171,46 @@ fn capsule_facts(
         Actor, EventRef, InvocationContext, RequestFacts, SessionRef,
     };
     let body = &proof.source_body;
+    let fields = body
+        .as_object()
+        .context("capsule source must be an object")?;
+    ensure!(
+        fields.keys().all(|key| if operation.is_some() {
+            matches!(
+                key.as_str(),
+                "method"
+                    | "space_id"
+                    | "resource_id"
+                    | "authorization_id"
+                    | "conversation_id"
+                    | "request"
+                    | "sdk_session"
+                    | "parent_invocation"
+                    | "task_ref"
+                    | "execution_resource"
+                    | "target_public_key"
+                    | "execution_grant"
+                    | "execution_session_receipt"
+            )
+        } else {
+            matches!(
+                key.as_str(),
+                "method"
+                    | "space_id"
+                    | "resource_id"
+                    | "authorization_id"
+                    | "conversation_id"
+                    | "task_id"
+                    | "title"
+                    | "goal"
+                    | "acceptance"
+                    | "auto_followup"
+                    | "sdk_session"
+                    | "parent_invocation"
+            )
+        }),
+        "task capsule cannot disclose unrelated source fields"
+    );
     ensure!(
         body["space_id"].as_str() == Some(project.space.as_str())
             && body["resource_id"].as_str() == Some(project.resource.as_str()),
@@ -183,7 +223,63 @@ fn capsule_facts(
     };
     if let Some((request, handoff)) = operation {
         ensure!(
+            serde_json::from_value::<ResourceRef>(body["execution_resource"].clone())?
+                == handoff.execution_resource
+                && serde_json::from_value::<PublicKey>(body["target_public_key"].clone())?
+                    == handoff.target_public_key,
+            "original request selected another execution destination"
+        );
+        ObjectHash::parse(
+            body["execution_grant"]
+                .as_str()
+                .context("original execution grant is missing")?,
+        )?;
+        if !body["execution_session_receipt"].is_null() {
+            let receipt: Signed<ExecutionHandoffReceipt> =
+                serde_json::from_value(body["execution_session_receipt"].clone())?;
+            receipt.verify_signature()?;
+            let snapshot = receipt
+                .payload
+                .session
+                .as_ref()
+                .context("execution state receipt has no signed snapshot")?;
+            let confirmed = request
+                .binding
+                .as_ref()
+                .context("execution state has no task binding")?;
+            ensure!(
+                receipt.issuer == handoff.target_public_key
+                    && snapshot.original_project == *project
+                    && snapshot.execution_resource == handoff.execution_resource
+                    && snapshot.target == handoff.execution_audience.device
+                    && snapshot.session_id == request.session_id
+                    && snapshot.revision == request.expected_revision
+                    && snapshot.task.as_str() == confirmed.binding.task_ref
+                    && snapshot.binding_hash == crate::binding::binding_hash(&confirmed.binding)?
+                    && snapshot.binding_generation == confirmed.binding.generation
+                    && confirmed.binding.open_spec["executor"].as_str()
+                        == Some(snapshot.executor.as_str())
+                    && confirmed.binding.open_spec["cwd"].as_str() == Some(snapshot.cwd.as_str())
+                    && receipt.payload.original_space_id == project.space
+                    && receipt.payload.execution_space_id == handoff.execution_resource.space
+                    && receipt.payload.target == handoff.execution_audience.device
+                    && receipt.payload.session_id == request.session_id
+                    && receipt.payload.issued_at_ms <= proof.admitted_at_ms
+                    && proof.admitted_at_ms < snapshot.expires_at_ms
+                    && snapshot.expires_at_ms - receipt.payload.issued_at_ms
+                        <= vibeface_secure::authorization::EXECUTION_LEASE_MS,
+                "original execution state receipt belongs to another session"
+            );
+        } else {
+            ensure!(
+                request.action["type"] == "open",
+                "non-open operation requires signed executor session state"
+            );
+        }
+        ensure!(
             request.conversation_id == conversation
+                && (body["conversation_id"].is_null()
+                    || body["conversation_id"].as_str() == Some(conversation))
                 && request.network_id == project.space.as_str()
                 && body["method"] == "operate",
             "capsule operation scope changed"
@@ -192,6 +288,11 @@ fn capsule_facts(
             .binding
             .as_ref()
             .context("capsule operation has no binding")?;
+        ensure!(
+            body["task_ref"].is_null()
+                || body["task_ref"].as_str() == Some(handoff.task_creation.hash.as_str()),
+            "capsule references another task"
+        );
         context.task = Some(EventRef::parse(&handoff.task_creation.hash)?);
         context.execution_session = Some(SessionRef {
             target: handoff.execution_audience.device.clone(),
@@ -780,6 +881,7 @@ fn validate_execution_context(
 }
 
 fn signed_receipt(
+    connection: &Connection,
     identity: &LocalIdentity,
     stored: &StoredHandoff,
     now_ms: u64,
@@ -795,7 +897,39 @@ fn signed_receipt(
         .context("handoff binding is missing")?;
     let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
         .map_err(anyhow::Error::msg)?;
-    Ok(Signed::sign(
+    let dispatch: Event =
+        serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
+    let session = session_from(
+        connection,
+        stored.wire.handoff.execution_resource.space.as_str(),
+        &stored.request.network_id,
+        dispatch.resource_id.as_str(),
+        &stored.request.target_node,
+        &stored.request.session_id,
+    )?
+    .map(|(session, _)| -> Result<ExecutionSessionSnapshot> {
+        Ok(ExecutionSessionSnapshot {
+            original_project: ResourceRef {
+                space: SpaceId::parse(&stored.request.network_id)?,
+                resource: dispatch.resource_id.clone(),
+            },
+            execution_resource: stored.wire.handoff.execution_resource.clone(),
+            task: vibeface_secure::authorization::EventRef::parse(&binding.binding.task_ref)?,
+            binding_hash: crate::binding::binding_hash(&binding.binding)?,
+            binding_generation: binding.binding.generation,
+            target: stored.wire.handoff.execution_audience.device.clone(),
+            session_id: session.session_id,
+            revision: session.revision,
+            executor: session.executor,
+            cwd: session.cwd,
+            state: session.state,
+            expires_at_ms: now_ms
+                .checked_add(vibeface_secure::authorization::EXECUTION_LEASE_MS)
+                .context("session snapshot expiry overflow")?,
+        })
+    })
+    .transpose()?;
+    let receipt = Signed::sign(
         ExecutionHandoffReceipt {
             version: AUTH_VERSION,
             operation_id: stored.request.operation_id.clone(),
@@ -807,10 +941,13 @@ fn signed_receipt(
             binding_generation: binding.binding.generation,
             state: serde_json::from_value(serde_json::to_value(&stored.state)?)?,
             result_hash: ObjectHash::body(&stored.result)?,
+            session,
             issued_at_ms: now_ms,
         },
         &signer,
-    )?)
+    )?;
+    verify_execution_handoff_receipt_signature(&stored.wire, &receipt, &stored.result)?;
+    Ok(receipt)
 }
 
 fn dto(
@@ -844,10 +981,7 @@ fn dto(
         .map(|session| session.0),
         state: stored.state.clone(),
         result: stored.result.clone(),
-        receipt: Some(match &stored.receipt {
-            Some(receipt) => receipt.clone(),
-            None => signed_receipt(identity, stored, now_ms)?,
-        }),
+        receipt: Some(signed_receipt(connection, identity, stored, now_ms)?),
     })
 }
 
@@ -1515,7 +1649,7 @@ impl Store {
         }
         stored.state = state;
         stored.result = result;
-        let receipt = signed_receipt(identity, &stored, now_ms)?;
+        let receipt = signed_receipt(&tx, identity, &stored, now_ms)?;
         tx.execute("UPDATE execution_handoffs SET state=?,result=?,result_receipt=? WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",
             params![state_text(&stored.state)?, serde_json::to_string(&stored.result)?, serde_json::to_string(&receipt)?, execution, original, operation])?;
         if stored.state.terminal() {
@@ -1820,10 +1954,11 @@ mod tests {
                     .policy
                     .verified()
                     .verify_freshness(&auth, &challenge, &receipts, now())?;
-            store
-                .policy
-                .verified()
-                .admit_operation(&auth, &fresh, now())?;
+            let original_admitted =
+                store
+                    .policy
+                    .verified()
+                    .admit_operation(&auth, &fresh, now())?;
             let proof = AdmissionProof {
                 invocation,
                 source_body: body,
@@ -1870,17 +2005,12 @@ mod tests {
             let project_signer = Identity::from_secret_hex(&project.node.secret_key_hex)
                 .map_err(anyhow::Error::msg)?;
             handoff.attest_source(&project_signer)?;
-            let original_auth = original_authorization_from(
-                &store.connection,
-                &store.policy,
-                store.policy.verified(),
-                &SignedExecutionHandoff {
-                    handoff: handoff.clone(),
-                    invocation: auth.signed_invocation().clone(),
-                },
+            let original_auth = store.policy.verified().verify_operation_authorization(
+                &original_admitted,
+                &facts,
+                &source_transport,
                 now(),
-            )
-            .context("original dispatch history")?;
+            )?;
             let submission_facts = execution_submission_facts(&handoff, &original_auth)?;
             let stamp = store
                 .policy
@@ -1981,6 +2111,58 @@ mod tests {
                 &format!("resource-root:{}", execution_resource.resource),
                 &json!(executor.project),
             )?;
+            let mut event: Event = serde_json::from_str(&handoff.project_dispatch.canonical_body)?;
+            let mut proof = capsule_admission(&event)?;
+            proof.source_body["execution_resource"] = serde_json::to_value(&execution_resource)?;
+            proof.source_body["target_public_key"] =
+                serde_json::to_value(&handoff.target_public_key)?;
+            proof.source_body["execution_grant"] = json!(leaf.hash()?);
+            let mut payload = proof.invocation.payload.clone();
+            payload.body_hash = ObjectHash::body(&proof.source_body)?;
+            payload.nonce = Nonce::random()?;
+            proof.invocation = Signed::sign(payload, &project.client)?;
+            let mut final_facts = facts.clone();
+            final_facts.body_hash = ObjectHash::body(&proof.source_body)?;
+            let final_auth = store.policy.verified().verify_invocation(
+                &proof.invocation,
+                &final_facts,
+                &source_transport,
+                now(),
+            )?;
+            proof.challenge = FreshnessChallenge::new(
+                &final_auth,
+                CheckStage::Admit,
+                Nonce::random()?,
+                now(),
+                now() + 10_000,
+            )?;
+            proof.receipts = store.sign_current_receipts(&proof.challenge, &project.node, now())?;
+            proof.receipts.extend(store.sign_current_receipts(
+                &proof.challenge,
+                &executor.node,
+                now(),
+            )?);
+            let final_fresh = store.policy.verified().verify_freshness(
+                &final_auth,
+                &proof.challenge,
+                &proof.receipts,
+                now(),
+            )?;
+            let final_admitted =
+                store
+                    .policy
+                    .verified()
+                    .admit_operation(&final_auth, &final_fresh, now())?;
+            let original_auth = store.policy.verified().verify_operation_authorization(
+                &final_admitted,
+                &final_facts,
+                &source_transport,
+                now(),
+            )?;
+            event.cause = EventCause::Invocation { admission: proof };
+            handoff.project_dispatch = project.node.sign_event(event)?;
+            handoff.attest_source(&project_signer)?;
+            let submission_facts = execution_submission_facts(&handoff, &original_auth)?;
             let service = store
                 .policy
                 .verified()
@@ -2031,6 +2213,185 @@ mod tests {
             })
         }
 
+        fn sdk() -> Result<Self> {
+            let mut fixture = Self::new()?;
+            let message = fixture.project.message(
+                &mut fixture.store,
+                "conversation",
+                "private-user-message-DO-NOT-DISCLOSE",
+            )?;
+            let parent_event: Event = serde_json::from_str(&message.canonical_body)?;
+            let parent = capsule_admission(&parent_event)?;
+            let project_key = PublicKey::parse(&fixture.project.node.public_key_hex()?)?;
+            let service = ServiceId::from_key(&project_key);
+            let session = SessionRef {
+                target: DeviceId::from_key(&project_key),
+                session_id: message.hash.clone(),
+            };
+            let descriptor = fixture.store.agent_grant(
+                fixture.project.space.as_str(),
+                "conversation",
+                &service,
+                &session,
+                &message.hash,
+                now(),
+            )?;
+            let mut dispatch: Event =
+                serde_json::from_str(&fixture.wire.handoff.project_dispatch.canonical_body)?;
+            let mut proof = capsule_admission(&dispatch)?;
+            proof.source_body["conversation_id"] = json!("conversation");
+            proof.source_body["sdk_session"] = serde_json::to_value(&session)?;
+            proof.source_body["parent_invocation"] = json!(parent.invocation.hash()?);
+            let mut invocation = proof.invocation.payload.clone();
+            invocation.actor = Actor::Service(service.clone());
+            invocation.device = descriptor.device.clone();
+            invocation.presenter = descriptor.device;
+            invocation.initiator = descriptor.initiator;
+            invocation.initiating_grant = descriptor.initiating_grant;
+            invocation.grant_leaf = descriptor.grant_leaf;
+            invocation.context.sdk_session = Some(session.clone());
+            invocation.body_hash = ObjectHash::body(&proof.source_body)?;
+            invocation.nonce = Nonce::random()?;
+            invocation.expected_policies = descriptor.expected_policies;
+            invocation.expected_policies.push(
+                fixture
+                    .store
+                    .policy
+                    .verified()
+                    .head(&PolicyDomain::Account(fixture.executor.account.clone()))
+                    .unwrap()
+                    .clone(),
+            );
+            invocation
+                .expected_policies
+                .sort_by(|a, b| a.domain.cmp(&b.domain));
+            invocation
+                .expected_policies
+                .dedup_by(|a, b| a.domain == b.domain);
+            let signer = Identity::from_secret_hex(&fixture.project.node.secret_key_hex)
+                .map_err(anyhow::Error::msg)?;
+            proof.invocation = Signed::sign(invocation.clone(), &signer)?;
+            let transport = TransportEvidence::LocalAgentAdapter { service, session };
+            proof.transport = StoredTransport::from(&transport);
+            let facts = RequestFacts {
+                resource: invocation.resource,
+                action: invocation.action,
+                audience: invocation.audience,
+                operation_id: invocation.operation_id,
+                body_hash: invocation.body_hash,
+                context: invocation.context,
+            };
+            let auth = fixture.store.policy.verified().verify_invocation(
+                &proof.invocation,
+                &facts,
+                &transport,
+                now(),
+            )?;
+            proof.challenge = FreshnessChallenge::new(
+                &auth,
+                CheckStage::Admit,
+                Nonce::random()?,
+                now(),
+                now() + 10_000,
+            )?;
+            proof.receipts = fixture.store.sign_current_receipts(
+                &proof.challenge,
+                &fixture.project.node,
+                now(),
+            )?;
+            proof.receipts.extend(fixture.store.sign_current_receipts(
+                &proof.challenge,
+                &fixture.executor.node,
+                now(),
+            )?);
+            dispatch.cause = EventCause::Invocation { admission: proof };
+            dispatch.sequence = parent_event.sequence + 1;
+            dispatch.previous = Some(message.hash.clone());
+            dispatch.parents = vec![message.hash.clone()];
+            fixture.wire.handoff.project_dispatch = fixture.project.node.sign_event(dispatch)?;
+            fixture.wire.handoff.sdk_origin = Some(CompactSdkOrigin {
+                message_event: EventRef::parse(&message.hash)?,
+                invocation: parent.invocation,
+                challenge: parent.challenge,
+                receipts: parent.receipts,
+                admitted_at_ms: parent.admitted_at_ms,
+                transport: parent.transport,
+            });
+            fixture.wire.handoff.attest_source(&signer)?;
+            let original = original_authorization_from(
+                &fixture.store.connection,
+                &fixture.store.policy,
+                fixture.store.policy.verified(),
+                &fixture.wire,
+                now(),
+            )?;
+            let facts = execution_submission_facts(&fixture.wire.handoff, &original)?;
+            let mut carrier = fixture.wire.invocation.payload.clone();
+            carrier.body_hash = facts.body_hash;
+            carrier.context = facts.context;
+            carrier.nonce = Nonce::random()?;
+            fixture.wire.invocation = Signed::sign(carrier, &signer)?;
+            Ok(fixture)
+        }
+
+        fn verify_builder_and_isolate_executor(&mut self) -> Result<()> {
+            let outcome = self.store.ingest_event(
+                self.project.space.as_str(),
+                &self.wire.handoff.project_dispatch,
+            )?;
+            assert_eq!(outcome.status, "ready");
+            let built = self.store.execution_handoff_payload(
+                &self.project.node,
+                self.project.space.as_str(),
+                "original-operation",
+                self.wire.handoff.execution_resource.clone(),
+                self.wire.handoff.execution_audience.clone(),
+                self.wire.handoff.target_public_key.clone(),
+                now(),
+            )?;
+            assert_eq!(built, self.wire.handoff);
+            let bytes = serde_json::to_string(&built)?;
+            assert!(!bytes.contains("other-task-secret-DO-NOT-DISCLOSE"));
+            assert!(!bytes.contains("private-user-message-DO-NOT-DISCLOSE"));
+            let journal = self
+                .store
+                .connection
+                .prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|entry| serde_json::from_str::<JournalEntry>(&entry))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let pins = self.store.policy.pins().to_vec();
+            let mut executor = Store::initialize(std::path::Path::new(":memory:"))?;
+            let update = executor.policy.prepare_bootstrap(&pins, &journal, now())?;
+            let tx = executor
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let state = super::super::journal::commit_in(&tx, &update)?;
+            super::super::policy::project_policy_in(&tx, &state)?;
+            tx.commit()?;
+            executor.policy = state;
+            executor.save_local_device(self.executor.space.as_str(), &self.executor.node)?;
+            for resource in [
+                &self.executor.resource,
+                &self.wire.handoff.execution_resource.resource,
+            ] {
+                executor.local_set(
+                    self.executor.space.as_str(),
+                    &format!("resource-root:{resource}"),
+                    &json!(self.executor.project),
+                )?;
+            }
+            self.store = executor;
+            let events: u64 =
+                self.store
+                    .connection
+                    .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+            assert_eq!(events, 0);
+            Ok(())
+        }
+
         fn freshness(&mut self, stage: CheckStage, at: u64) -> Result<ExecutionHandoffFreshness> {
             let challenge = self.store.issue_execution_handoff_challenge(
                 &self.wire,
@@ -2068,6 +2429,7 @@ mod tests {
     #[test]
     fn independent_executor_keeps_original_scope_and_never_restarts_unknown() -> Result<()> {
         let mut fixture = Fixture::new()?;
+        fixture.verify_builder_and_isolate_executor()?;
         assert!(
             !serde_json::to_string(&fixture.wire)?.contains("other-task-secret-DO-NOT-DISCLOSE")
         );
@@ -2200,6 +2562,223 @@ mod tests {
     }
 
     #[test]
+    fn sdk_capsule_preserves_account_origin_without_replicating_private_messages() -> Result<()> {
+        let mut fixture = Fixture::sdk()?;
+        fixture.verify_builder_and_isolate_executor()?;
+        let bytes = serde_json::to_string(&fixture.wire)?;
+        assert!(!bytes.contains("private-user-message-DO-NOT-DISCLOSE"));
+        assert!(!bytes.contains("other-task-secret-DO-NOT-DISCLOSE"));
+        fixture.accept()?;
+        let proof = fixture.freshness(CheckStage::Start, now() + 3)?;
+        let auth = fixture.store.execution_handoff_authorization(
+            fixture.executor.space.as_str(),
+            fixture.project.space.as_str(),
+            "original-operation",
+            now() + 4,
+        )?;
+        assert!(matches!(auth.original().actor(), Actor::Service(_)));
+        assert_eq!(
+            auth.original().initiator(),
+            &Actor::Account(fixture.project.account.clone())
+        );
+        assert_eq!(
+            auth.submission().initiator(),
+            &Actor::Account(fixture.executor.account.clone())
+        );
+        fixture
+            .store
+            .claim_execution_handoff(&fixture.executor.node, &auth, &proof, now() + 4)?;
+        let project = auth.original().resource().clone();
+        fixture.store.persist_execution_handoff_native(
+            fixture.executor.space.as_str(),
+            &project,
+            "original-operation",
+            "native-stable",
+            now() + 5,
+        )?;
+        assert_eq!(
+            fixture
+                .store
+                .execution_handoff_session(
+                    fixture.executor.space.as_str(),
+                    &project,
+                    &fixture.executor.node.node_id()?,
+                    "same-session"
+                )?
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("native-stable")
+        );
+        let renewal = fixture.freshness(CheckStage::Renew, now() + 6)?;
+        fixture.store.connection.execute(
+            "UPDATE execution_handoffs SET lease_deadline_ms=lease_deadline_ms+1",
+            [],
+        )?;
+        assert!(
+            fixture
+                .store
+                .renew_execution_handoff(&auth, &renewal, now() + 7)
+                .is_err()
+        );
+        fixture.store.connection.execute(
+            "UPDATE execution_handoffs SET lease_deadline_ms=lease_deadline_ms-1",
+            [],
+        )?;
+        fixture
+            .store
+            .renew_execution_handoff(&auth, &renewal, now() + 7)?;
+        validate_execution_handoff_storage(&fixture.store.connection, &fixture.store.policy)?;
+        Ok(())
+    }
+
+    #[test]
+    fn task_capsule_rejects_cross_task_missing_origin_and_changed_inputs() -> Result<()> {
+        let mut fixture = Fixture::sdk()?;
+        let signer = Identity::from_secret_hex(&fixture.project.node.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let resign_carrier = |wire: &mut SignedExecutionHandoff| -> Result<()> {
+            let mut carrier = wire.invocation.payload.clone();
+            carrier.body_hash = ObjectHash::body(&wire.handoff)?;
+            wire.invocation = Signed::sign(carrier, &signer)?;
+            Ok(())
+        };
+        let mut altered = fixture.wire.clone();
+        altered.handoff.task_creation = fixture.store.task_creation(
+            fixture.project.space.as_str(),
+            "conversation",
+            "other-task-secret-DO-NOT-DISCLOSE",
+        )?;
+        altered.handoff.attest_source(&signer)?;
+        let mut carrier = altered.invocation.payload.clone();
+        carrier.body_hash = ObjectHash::body(&altered.handoff)?;
+        altered.invocation = Signed::sign(carrier, &signer)?;
+        assert!(
+            fixture
+                .store
+                .issue_execution_handoff_challenge(
+                    &altered,
+                    &fixture.transport,
+                    CheckStage::Admit,
+                    now()
+                )
+                .is_err()
+        );
+        let mut altered = fixture.wire.clone();
+        altered.handoff.sdk_origin = None;
+        altered.handoff.attest_source(&signer)?;
+        resign_carrier(&mut altered)?;
+        assert!(
+            fixture
+                .store
+                .issue_execution_handoff_challenge(
+                    &altered,
+                    &fixture.transport,
+                    CheckStage::Admit,
+                    now()
+                )
+                .is_err()
+        );
+        let mut altered = fixture.wire.clone();
+        altered.handoff.source_attestation = None;
+        resign_carrier(&mut altered)?;
+        assert!(
+            fixture
+                .store
+                .issue_execution_handoff_challenge(
+                    &altered,
+                    &fixture.transport,
+                    CheckStage::Admit,
+                    now()
+                )
+                .is_err()
+        );
+        let mut altered = fixture.wire.clone();
+        let mut task: Event = serde_json::from_str(&altered.handoff.task_creation.canonical_body)?;
+        if let EventBody::TaskCreated { goal, .. } = &mut task.body {
+            *goal = "changed task input".into();
+        }
+        altered.handoff.task_creation = fixture.project.node.sign_event(task)?;
+        altered.handoff.attest_source(&signer)?;
+        resign_carrier(&mut altered)?;
+        assert!(
+            fixture
+                .store
+                .issue_execution_handoff_challenge(
+                    &altered,
+                    &fixture.transport,
+                    CheckStage::Admit,
+                    now()
+                )
+                .is_err()
+        );
+        let mut altered = fixture.wire.clone();
+        altered.handoff.sdk_origin.as_mut().unwrap().receipts[0]
+            .payload
+            .expires_at_ms += 1;
+        altered.handoff.attest_source(&signer)?;
+        resign_carrier(&mut altered)?;
+        assert!(
+            fixture
+                .store
+                .issue_execution_handoff_challenge(
+                    &altered,
+                    &fixture.transport,
+                    CheckStage::Admit,
+                    now()
+                )
+                .is_err()
+        );
+        let mut altered = fixture.wire.clone();
+        altered.handoff.attest_source(&fixture.project.client)?;
+        resign_carrier(&mut altered)?;
+        assert!(
+            fixture
+                .store
+                .issue_execution_handoff_challenge(
+                    &altered,
+                    &fixture.transport,
+                    CheckStage::Admit,
+                    now()
+                )
+                .is_err()
+        );
+        let mut altered = fixture.wire.clone();
+        let mut event: Event =
+            serde_json::from_str(&altered.handoff.project_dispatch.canonical_body)?;
+        let EventCause::Invocation { admission } = &mut event.cause else {
+            unreachable!()
+        };
+        admission.source_body["request"]["resources"] = json!([]);
+        let EventBody::DispatchRecorded { action, .. } = &mut event.body else {
+            unreachable!()
+        };
+        *action = admission.source_body["request"].clone();
+        altered.handoff.project_dispatch = fixture.project.node.sign_event(event)?;
+        altered.handoff.attest_source(&signer)?;
+        resign_carrier(&mut altered)?;
+        altered.invocation.verify_signature()?;
+        altered
+            .handoff
+            .source_attestation
+            .as_ref()
+            .unwrap()
+            .verify_signature()?;
+        assert!(
+            fixture
+                .store
+                .issue_execution_handoff_challenge(
+                    &altered,
+                    &fixture.transport,
+                    CheckStage::Admit,
+                    now()
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn direct_locks_block_handoff_and_signed_completion_releases_only_its_locks() -> Result<()> {
         let mut fixture = Fixture::new()?;
         fixture
@@ -2290,6 +2869,80 @@ mod tests {
             )
             .is_err()
         );
+        let wrapper = ExecutionHandoffResult {
+            handoff: fixture.wire.clone(),
+            receipt: completed.receipt.clone().unwrap(),
+            result: result.clone(),
+        };
+        let source_event: Event =
+            serde_json::from_str(&fixture.wire.handoff.project_dispatch.canonical_body)?;
+        let mut events =
+            load_events_from(&fixture.store.connection, fixture.project.space.as_str())?;
+        events.insert(
+            fixture.wire.handoff.project_dispatch.hash.clone(),
+            StoredEvent {
+                envelope: fixture.wire.handoff.project_dispatch.clone(),
+                event: source_event.clone(),
+                status: "ready".into(),
+            },
+        );
+        let observation = Event {
+            version: WIRE_VERSION,
+            network_id: fixture.project.space.to_string(),
+            resource_id: fixture.project.resource.clone(),
+            cause: EventCause::Derived {
+                admission: capsule_admission(&source_event)?,
+                source: fixture.wire.handoff.project_dispatch.hash.clone(),
+            },
+            scope_id: "conversation".into(),
+            author: fixture.project.node.node_id()?,
+            sequence: source_event.sequence + 1,
+            previous: Some(fixture.wire.handoff.project_dispatch.hash.clone()),
+            parents: vec![fixture.wire.handoff.project_dispatch.hash.clone()],
+            blobs: vec![],
+            created_at_ms: (now() + 7) as i64,
+            body: EventBody::ExecutionObserved {
+                operation_id: "original-operation".into(),
+                task_id: Some("task-handoff".into()),
+                target_node: fixture.executor.node.node_id()?,
+                session_id: "same-session".into(),
+                status: "succeeded".into(),
+                detail: serde_json::to_value(&wrapper)?,
+            },
+        };
+        assert_eq!(
+            super::super::event_authorization::validate_event_evidence(
+                &fixture.store.policy,
+                &fixture.store.connection,
+                &observation,
+                &events
+            )?,
+            super::super::event_authorization::EventEvidenceStatus::Valid
+        );
+        let mut altered = observation.clone();
+        if let EventBody::ExecutionObserved { detail, .. } = &mut altered.body {
+            detail["result"] = json!({"forged":"result"});
+        }
+        assert!(
+            super::super::event_authorization::validate_event_evidence(
+                &fixture.store.policy,
+                &fixture.store.connection,
+                &altered,
+                &events
+            )
+            .is_err()
+        );
+        fixture
+            .store
+            .policy
+            .verified()
+            .verify_execution_handoff_ack(
+                &fixture.wire,
+                auth.original(),
+                completed.receipt.as_ref().unwrap(),
+                &result,
+                now() + 7,
+            )?;
         validate_execution_handoff_storage(&fixture.store.connection, &fixture.store.policy)?;
         let locks: u64 = fixture.store.connection.query_row(
             "SELECT COUNT(*) FROM execution_handoff_reservations",

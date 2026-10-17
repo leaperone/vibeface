@@ -631,7 +631,9 @@ fn validate_sdk_parent(
     Ok(())
 }
 
-fn validate_derived(event: &Event, source: &Event) -> Result<()> {
+fn validate_derived(connection: &Connection, event: &Event, source: &StoredEvent) -> Result<()> {
+    let source_envelope = &source.envelope;
+    let source = &source.event;
     ensure!(
         event.scope_id == source.scope_id
             && event.resource_id == source.resource_id
@@ -670,10 +672,38 @@ fn validate_derived(event: &Event, source: &Event) -> Result<()> {
                 ),
                 "execution observation has no durable result state"
             );
-            ensure!(
-                target_node == &event.author,
-                "execution result must be signed by its target"
-            );
+            if target_node != &event.author {
+                use vibeface_secure::authorization::execution_handoff::{
+                    ExecutionHandoffResult, verify_execution_handoff_receipt_signature,
+                };
+                let result = if detail.get("result_blob").is_some() {
+                    let blob: BlobRef = serde_json::from_value(detail["result_blob"].clone())?;
+                    let bytes: Vec<u8> = connection.query_row(
+                        "SELECT content FROM blobs WHERE space_id=? AND hash=?",
+                        params![event.network_id, blob.hash],
+                        |row| row.get(0),
+                    )?;
+                    serde_json::from_slice::<Value>(&bytes)?
+                } else {
+                    detail.clone()
+                };
+                let signed: ExecutionHandoffResult = serde_json::from_value(result)?;
+                ensure!(
+                    signed.handoff.handoff.project_dispatch == *source_envelope
+                        && crypto::fingerprint(signed.handoff.handoff.target_public_key.as_str())?
+                            == *target_node
+                        && serde_json::to_value(signed.receipt.payload.state)?.as_str()
+                            == Some(status.as_str())
+                        && signed.receipt.payload.issued_at_ms <= event.created_at_ms as u64
+                        && signed.receipt.payload.issued_at_ms >= admission(source).admitted_at_ms,
+                    "delegated execution result differs from its admitted source or state"
+                );
+                verify_execution_handoff_receipt_signature(
+                    &signed.handoff,
+                    &signed.receipt,
+                    &signed.result,
+                )?;
+            }
             ensure!(
                 !(detail.get("resolver").is_some() && detail.get("invocation_hash").is_some()),
                 "resolution result requires the current resolver admission"
@@ -763,7 +793,12 @@ pub(crate) fn validate_event_evidence(
                 ancestors.contains(&source.envelope.hash),
                 "derived source is not a causal dependency"
             );
-            validate_derived(event, &source.event)?;
+            for blob in &event.blobs {
+                if !has_blob_from(connection, &event.network_id, blob)? {
+                    return Ok(EventEvidenceStatus::Pending);
+                }
+            }
+            validate_derived(connection, event, source)?;
         }
     }
     let invocation_hash = proof.invocation.hash()?;
@@ -1175,6 +1210,98 @@ pub(crate) fn append_admitted_resolution_in(
         now_ms,
     )?
     .remove(0))
+}
+
+pub(crate) fn append_execution_handoff_observation_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    identity: &LocalIdentity,
+    source: &SignedEvent,
+    result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffResult,
+    now_ms: u64,
+) -> Result<SignedEvent> {
+    use vibeface_secure::authorization::execution_handoff::verify_execution_handoff_receipt_signature;
+    ensure!(
+        result.handoff.handoff.project_dispatch == *source,
+        "handoff acknowledgement belongs to another dispatch"
+    );
+    verify_execution_handoff_receipt_signature(&result.handoff, &result.receipt, &result.result)?;
+    let source_event = verify_event_envelope(
+        policy,
+        result.receipt.payload.original_space_id.as_str(),
+        source,
+    )?;
+    let EventBody::DispatchRecorded {
+        operation_id,
+        task_id,
+        target_node,
+        session_id,
+        ..
+    } = &source_event.body
+    else {
+        bail!("handoff acknowledgement source is not a dispatch")
+    };
+    let state: OperationState =
+        serde_json::from_value(serde_json::to_value(result.receipt.payload.state)?)?;
+    ensure!(
+        state != OperationState::Accepted,
+        "accepted handoff has no execution observation"
+    );
+    let (stored_state, stored_result): (String, String) = connection.query_row(
+        "SELECT state,result FROM operations WHERE space_id=? AND operation_id=?",
+        params![source_event.network_id, operation_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        serde_json::from_str::<OperationState>(&stored_state)? == state
+            && serde_json::from_str::<Value>(&stored_result)? == serde_json::to_value(result)?,
+        "handoff observation differs from its durable signed acknowledgement"
+    );
+    let bytes = serde_json::to_vec(result)?;
+    ensure!(
+        bytes.len() <= crate::model::MAX_BLOB_BYTES,
+        "handoff result proof is too large"
+    );
+    let blob = BlobRef {
+        hash: crypto::digest(&bytes),
+        size: bytes.len() as u64,
+    };
+    connection.execute(
+        "INSERT OR IGNORE INTO blobs(space_id,hash,size,content) VALUES(?,?,?,?)",
+        params![source_event.network_id, blob.hash, blob.size, bytes],
+    )?;
+    ensure!(
+        has_blob_from(connection, &source_event.network_id, &blob)?,
+        "handoff result proof blob conflicts with stored bytes"
+    );
+    let proof = admission(&source_event);
+    super::admission::validate_persisted_admission(connection, proof)?;
+    let signed = append_event_in(
+        connection,
+        policy,
+        identity,
+        proof,
+        &source_event.scope_id,
+        EventCause::Derived {
+            admission: proof.clone(),
+            source: source.hash.clone(),
+        },
+        EventBody::ExecutionObserved {
+            operation_id: operation_id.clone(),
+            task_id: task_id.clone(),
+            target_node: target_node.clone(),
+            session_id: session_id.clone(),
+            status: serde_json::to_value(&state)?
+                .as_str()
+                .context("invalid execution observation state")?
+                .to_owned(),
+            detail: json!({"result_blob":blob}),
+        },
+        vec![blob],
+        now_ms,
+    )?;
+    rebuild_projections_from(connection, &source_event.network_id)?;
+    Ok(signed)
 }
 
 impl Store {
