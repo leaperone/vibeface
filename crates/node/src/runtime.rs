@@ -2145,10 +2145,24 @@ impl Runtime {
         stage: CheckStage,
     ) -> Result<FreshnessProof> {
         let now = now_ms() as u64;
-        let (challenge, mut receipts, authorities) = {
-            let mut store = self.store.lock().await;
-            let challenge = store.issue_freshness(authorization, stage, now)?;
-            let receipts = store.sign_current_receipts(&challenge, &self.identity, now)?;
+        let challenge = self
+            .store
+            .lock()
+            .await
+            .issue_freshness(authorization, stage, now)?;
+        self.collect_freshness_challenge(authorization.resource().space.as_str(), &challenge)
+            .await
+    }
+
+    pub(crate) async fn collect_freshness_challenge(
+        &self,
+        space: &str,
+        challenge: &FreshnessChallenge,
+    ) -> Result<FreshnessProof> {
+        let (mut receipts, authorities) = {
+            let store = self.store.lock().await;
+            let receipts =
+                store.sign_current_receipts(challenge, &self.identity, now_ms() as u64)?;
             let mut authorities = BTreeSet::new();
             for stamp in &challenge.policies {
                 if receipts
@@ -2175,12 +2189,12 @@ impl Runtime {
                 };
                 authorities.insert(crypto::fingerprint(authority.public_key.as_str())?);
             }
-            (challenge, receipts, authorities)
+            (receipts, authorities)
         };
         for target in authorities {
             let reply = self
                 .peer_request(
-                    authorization.resource().space.as_str(),
+                    space,
                     &target,
                     json!({"type":"freshness_receipt","challenge":challenge}),
                 )
@@ -2200,7 +2214,7 @@ impl Runtime {
             "current policy authority is unavailable"
         );
         Ok(FreshnessProof {
-            challenge,
+            challenge: challenge.clone(),
             receipts,
         })
     }
