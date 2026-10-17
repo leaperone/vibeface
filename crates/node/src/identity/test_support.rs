@@ -1,5 +1,6 @@
 use super::{
     journal,
+    local::BootstrapCapability,
     policy::{FreshnessProof, project_policy_in},
 };
 use crate::{crypto::LocalIdentity, model::*, store::Store};
@@ -9,7 +10,13 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use vibeface_secure::{
     Identity,
-    authorization::{bootstrap, *},
+    authorization::{
+        bootstrap::{
+            self,
+            recovery::{self, node_enrollment},
+        },
+        *,
+    },
 };
 
 pub(crate) fn now() -> u64 {
@@ -119,6 +126,123 @@ impl TestNetwork {
             directory,
             project,
         })
+    }
+
+    pub fn same_account_node(&self) -> Result<Self> {
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/store-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        crate::config::private_dir(&directory)?;
+        let directory = directory.canonicalize()?;
+        crate::config::private_dir(&directory.join("project"))?;
+        let project = directory.join("project").canonicalize()?;
+        let mut network = Self {
+            created: self.created.clone(),
+            root: Identity::from_secret_hex(&self.root.secret_hex()).map_err(anyhow::Error::msg)?,
+            recovery: Identity::from_secret_hex(&self.recovery.secret_hex())
+                .map_err(anyhow::Error::msg)?,
+            client: Identity::from_secret_hex(&self.client.secret_hex())
+                .map_err(anyhow::Error::msg)?,
+            node: LocalIdentity::generate(),
+            account: self.account.clone(),
+            space: self.space.clone(),
+            resource: self.resource.clone(),
+            bundle: self.bundle.clone(),
+            pins: self.pins.clone(),
+            directory,
+            project,
+        };
+        let mut authority = self.at(&network.directory.join("authority.sqlite3"))?;
+        let mut fresh = Store::initialize(&network.directory.join("enrolled.sqlite3"))?;
+        let capability = BootstrapCapability::generate();
+        fresh.install_bootstrap_capability(&capability)?;
+        let signer =
+            Identity::from_secret_hex(&network.node.secret_key_hex).map_err(anyhow::Error::msg)?;
+        let claim_json = bootstrap::create_node_claim(
+            &signer,
+            &capability.capability,
+            now() as f64,
+            (now() + 100_000) as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        fresh.connection.execute(
+            "INSERT INTO identity_meta(key,value) VALUES('node_claim',?)",
+            [&claim_json],
+        )?;
+        let claim = bootstrap::verify_node_claim(
+            &claim_json,
+            &network.node.public_key_hex()?,
+            &capability.capability,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let material = recovery::build_account_recovery_material(
+            &self.created,
+            &self.root,
+            &self.recovery,
+            "https://authority.example",
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let prepared = node_enrollment::prepare_account_node_enrollment(
+            &material,
+            &serde_json::to_string(&self.pins)?,
+            &serde_json::to_string(&self.bundle)?,
+            &self.client,
+            &claim,
+            (now() + CERT_END) as f64,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let principal = self.client.public_key_hex();
+        let proof = fresh.node_enrollment_command(
+            &network.node,
+            &principal,
+            "account_node_possession",
+            &serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?,
+            now(),
+        )?;
+        let commit = node_enrollment::prepare_account_node_enrollment_commit(
+            &prepared,
+            &material,
+            proof["proof"]
+                .as_str()
+                .context("Node possession proof missing")?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let response = authority.node_enrollment_command(
+            &self.node,
+            &principal,
+            "account_node_commit",
+            &serde_json::from_str(&commit.request_json().map_err(anyhow::Error::msg)?)?,
+            now(),
+        )?;
+        let verified = node_enrollment::finish_account_node_enrollment(
+            &commit,
+            &serde_json::to_string(&response["journal_delta"])?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let installed = fresh.node_enrollment_command(
+            &network.node,
+            &principal,
+            "account_node_install",
+            &serde_json::from_str(&verified.installation_json().map_err(anyhow::Error::msg)?)?,
+            now(),
+        )?;
+        assert_eq!(installed["account_id"], self.account.as_str());
+        assert_eq!(installed["node_public_key"], network.node.public_key_hex()?);
+        assert_ne!(network.node.public_key_hex()?, self.node.public_key_hex()?);
+        assert!(
+            fresh
+                .verify_bootstrap_capability(&capability.capability)
+                .is_err()
+        );
+        network.bundle = verified.bundle().clone();
+        network.pins = verified.pins().to_vec();
+        network.install(&mut fresh)?;
+        Ok(network)
     }
 
     pub fn install(&self, store: &mut Store) -> Result<()> {

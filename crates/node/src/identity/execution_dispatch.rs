@@ -1358,11 +1358,23 @@ pub(crate) mod tests {
             Self::with_task_creator(true)
         }
 
-        fn with_task_creator(foreign: bool) -> Result<Self> {
+        pub(crate) fn new_same_account_nodes() -> Result<Self> {
             let project = TestNetwork::new()?;
-            let executor = TestNetwork::new()?;
+            let executor = project.same_account_node()?;
+            Self::from_networks(project, executor, false)
+        }
+
+        fn with_task_creator(foreign: bool) -> Result<Self> {
+            Self::from_networks(TestNetwork::new()?, TestNetwork::new()?, foreign)
+        }
+
+        fn from_networks(project: TestNetwork, executor: TestNetwork, foreign: bool) -> Result<Self> {
             let mut store = project.at(&project.directory.join("project.sqlite3"))?;
-            executor.install(&mut store)?;
+            if project.account == executor.account {
+                store.install_policy_journal(&executor.bundle.journal, now())?;
+            } else {
+                executor.install(&mut store)?;
+            }
             project.conversation(&mut store, "conversation")?;
             let (task, mut task_policies) = if foreign {
                 Self::foreign_account_task(&project, &executor, &mut store)?
@@ -1572,6 +1584,7 @@ pub(crate) mod tests {
             .map(|domain| store.policy.verified().head(domain).unwrap().clone())
             .collect::<Vec<_>>();
             heads.sort_by(|left, right| left.domain.cmp(&right.domain));
+            heads.dedup();
             let invocation = Signed::sign(
                 Invocation {
                     version: AUTH_VERSION,
@@ -1693,11 +1706,45 @@ pub(crate) mod tests {
             FreshnessProof,
             TransportEvidence,
         )> {
+            self.authorize_at(body, now())
+        }
+
+        fn authorize_at(
+            &mut self,
+            body: &Value,
+            at: u64,
+        ) -> Result<(
+            VerifiedDispatchFacts,
+            VerifiedAuthorization,
+            FreshnessProof,
+            TransportEvidence,
+        )> {
+            let signer =
+                vibeface_secure::Identity::from_secret_hex(&self.project.client.secret_hex())
+                    .map_err(anyhow::Error::msg)?;
+            let account = self.project.account.clone();
+            let leaf = self.project.bundle.grant_leaf.clone();
+            self.authorize_as(body, at, &signer, &account, &leaf)
+        }
+
+        fn authorize_as(
+            &mut self,
+            body: &Value,
+            at: u64,
+            signer: &vibeface_secure::Identity,
+            account: &AccountId,
+            leaf: &ObjectHash,
+        ) -> Result<(
+            VerifiedDispatchFacts,
+            VerifiedAuthorization,
+            FreshnessProof,
+            TransportEvidence,
+        )> {
             let dispatch = self
                 .store
-                .execution_dispatch_facts(body, &self.audience, now())?;
+                .execution_dispatch_facts(body, &self.audience, at)?;
             let facts = dispatch.facts();
-            let device = DeviceId::from_key(&PublicKey::of(&self.project.client));
+            let device = DeviceId::from_key(&PublicKey::of(signer));
             let mut heads = vec![
                 self.store
                     .policy
@@ -1719,12 +1766,13 @@ pub(crate) mod tests {
                     .clone(),
             ];
             heads.sort_by(|left, right| left.domain.cmp(&right.domain));
+            heads.dedup();
             let invocation = Signed::sign(
                 Invocation {
                     version: AUTH_VERSION,
-                    actor: Actor::Account(self.project.account.clone()),
+                    actor: Actor::Account(account.clone()),
                     device: device.clone(),
-                    initiator: Actor::Account(self.project.account.clone()),
+                    initiator: Actor::Account(account.clone()),
                     initiating_grant: None,
                     resource: facts.resource.clone(),
                     action: facts.action,
@@ -1732,29 +1780,27 @@ pub(crate) mod tests {
                     presenter: device.clone(),
                     operation_id: facts.operation_id.clone(),
                     body_hash: facts.body_hash.clone(),
-                    grant_leaf: self.project.bundle.grant_leaf.clone(),
+                    grant_leaf: leaf.clone(),
                     expected_policies: heads,
                     context: facts.context.clone(),
                     nonce: Nonce::random()?,
-                    not_before_ms: now(),
-                    expires_at_ms: now() + 100_000,
+                    not_before_ms: at,
+                    expires_at_ms: at + 100_000,
                 },
-                &self.project.client,
+                signer,
             )?;
             let transport = TransportEvidence::DirectNoise { device };
             let auth = self
                 .store
-                .authorize_request(&invocation, facts, &transport, now())?;
-            let challenge = self
-                .store
-                .issue_freshness(&auth, CheckStage::Admit, now())?;
+                .authorize_request(&invocation, facts, &transport, at)?;
+            let challenge = self.store.issue_freshness(&auth, CheckStage::Admit, at)?;
             let mut receipts =
                 self.store
-                    .sign_current_receipts(&challenge, &self.project.node, now())?;
+                    .sign_current_receipts(&challenge, &self.project.node, at)?;
             receipts.extend(self.store.sign_current_receipts(
                 &challenge,
                 &self.executor.node,
-                now(),
+                at,
             )?);
             Ok((
                 dispatch,
@@ -1814,6 +1860,49 @@ pub(crate) mod tests {
             body["request"] = serde_json::to_value(&request)?;
             Ok((body, request))
         }
+    }
+
+    #[test]
+    fn same_account_nodes_keep_independent_execution_keys_and_native_proofs() -> Result<()> {
+        use vibeface_secure::authorization::prepare::*;
+        let mut f = Fixture::new_same_account_nodes()?;
+        assert_eq!(f.project.account, f.executor.account);
+        assert_ne!(f.project.node.public_key_hex()?, f.executor.node.public_key_hex()?);
+        let binding = f.bind_at(f.executor.project.to_str().unwrap().to_owned())?;
+        let principal = PublicKey::of(&f.project.client);
+        let project = f.store.authenticate_account(principal.as_str(), &json!({
+            "account_id":f.project.account,"space_id":f.project.space,"resource_id":f.project.resource,
+            "device_public_key":principal,"audience":f.audience,
+        }), now()+1)?;
+        let client = verify_client_authorization(&project["authorization"].to_string(),
+            &project["pins"].to_string(), f.project.account.as_str(), f.project.space.as_str(),
+            principal.as_str(), (now()+1) as f64).map_err(anyhow::Error::msg)?;
+        let mut execution = f.executor.bundle.clone();
+        execution.journal.extend(f.journal.clone());
+        execution.grant_leaf = f.grant.clone();
+        let selection = json!({"execution_resource":f.execution,"target_public_key":f.executor.node.public_key_hex()?,"execution_grant":f.grant});
+        let context = PrepareContext {
+            context: f.store.policy.verified().grant(&f.grant).unwrap().payload.constraints.context.clone(),
+            binding_generation: Some(1),canonical_cwd: binding.binding.open_spec["cwd"].as_str().map(str::to_owned),
+            execution_target_public_key:Some(PublicKey::parse(&f.executor.node.public_key_hex()?)?),
+        };
+        let mut context = context;
+        context.context.workspace_resource = Some(f.project.resource.clone());
+        let handle = verify_remote_execution(&client, &project["authorization"].to_string(),
+            &project["pins"].to_string(), &serde_json::to_string(&execution)?,
+            &serde_json::to_string(f.store.trusted_policy_pins())?, &selection.to_string(),
+            &serde_json::to_string(&context)?, "execution_open",(now()+1) as f64)
+            .map_err(anyhow::Error::msg)?;
+        let (body,request) = f.operation(binding.clone(),"same-account-remote-open")?;
+        let prepared: Value = serde_json::from_str(&handle.prepare(&client, &body.to_string(),
+            &serde_json::to_string(&context)?, "execution_open", "same-account-remote-open",
+            &f.project.node.public_key_hex()?, &f.project.client, (now()+1) as f64).map_err(anyhow::Error::msg)?)?;
+        assert_eq!(prepared["payload"]["request"]["context"]["execution_session"]["target"],serde_json::to_value(DeviceId::from_key(&PublicKey::parse(&f.executor.node.public_key_hex()?)?))?);
+        let (facts, auth, fresh, transport) = f.authorize_at(&body, now()+1)?;
+        f.store.accept_execution_dispatch(&f.project.node,&facts,&auth,&fresh,&transport,&body,&request,now()+1)?;
+        let (wire,_) = f.store.prepare_execution_dispatch_handoff(&f.project.node,f.project.space.as_str(),&request.operation_id,now()+1)?;
+        assert_eq!(wire.handoff.target_public_key.as_str(),f.executor.node.public_key_hex()?);
+        Ok(())
     }
 
     #[test]
