@@ -65,7 +65,7 @@ name="vibeface-$version-$target"
 package="$staging/$name"
 mkdir -p "$package/sidecars" "$package/scripts" "$package/web"
 cp "$binary" "$package/vibeface"
-printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":2,"data_epoch":2}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
+printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":2,"data_epoch":3}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
 cp "$crypto/vibeface_secure.js" "$crypto/vibeface_secure_bg.wasm" "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
 cp "$repo/README.md" "$package/"
@@ -87,7 +87,7 @@ The archive contains the Rust node binary and SDK sidecar sources. Install the p
 
 Use absolute provider and sidecar paths in `config.json` when running a background service. No credentials, provider runtimes, or npm dependencies are included.
 REQUIREMENTS
-tar -czf "$output/$name.tar.gz" -C "$staging" "$name"
+COPYFILE_DISABLE=1 tar -czf "$output/$name.tar.gz" -C "$staging" "$name"
 cd "$output"
 if command -v sha256sum >/dev/null; then
   sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"

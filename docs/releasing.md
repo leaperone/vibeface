@@ -30,7 +30,7 @@ cd vibeface-<version>-<target>
 
 `crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。`web` 下载这份资源及其真实 TypeScript 声明，以锁定的 pnpm 依赖生成 TanStack Start 静态 SPA。检查和三个平台的打包任务下载同一份密码学资源和 SPA，再由 Rust 构建脚本内嵌。缺少资源时构建失败，不用空模块替代。
 
-质量检查包含 Rust fmt、workspace tests、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch，再启动解包后的程序运行无账号网络验收。网页验收检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
+质量检查包含 Rust fmt、workspace tests、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 初始 SQL 的 checksum、空库应用和声明差异检查。`scripts/verify-schema.sh` 在任务内新建私有 SQLite 库；`--database` 另以 `mode=ro&immutable=1` 比较已停止节点的数据库，避免创建 WAL 或 SHM。CI 复用制品验收中由 Rust 初始化的测试库，再与 Atlas 声明对照，不打开用户数据库。打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch，再启动解包后的程序运行无账号网络验收。网页验收检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
 
 源码打包前先生成密码学资源，再构建网页。安装 Node.js 22.12+、pnpm 11.9.0、Rust 的 `wasm32-unknown-unknown` target 和 `wasm-bindgen-cli 0.2.129`，然后执行：
 
@@ -77,7 +77,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序和随包 sidecar，不覆盖身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。使用 Codex SDK 时，更新器在停服务前按新包的 lock 安装 sidecar 依赖，需要可用的 npm；安装失败保留现版，不复制旧 `node_modules`。Cursor SDK 不需要这一步。
 
-`BUILD-INFO.json` 声明 `update_protocol=2` 和 `data_epoch=2`。包协议 2 要求同名 `vibeface` 程序和制品，不接受旧包布局；数据格式与 HTTP、DAG 协议没有因此变化。更新器只安装与本机存储 epoch 一致的包。账号数据库格式不属于 epoch 2，不能让自动更新覆盖该数据目录，也不在启动时隐式转换或清空。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
+`BUILD-INFO.json` 声明 `update_protocol=2` 和 `data_epoch=3`。包协议 2 要求同名 `vibeface` 程序和制品，不接受旧包布局。新数据库采用 `vibeface-node` 格式和 layout version 1，身份授权与业务状态共用 `node.sqlite3`。更新器只安装与本机存储 epoch 一致的包。epoch 2 及更早的数据目录不兼容，不在启动或更新时导入、转换或清空。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
 
 ## 首次安装
 
@@ -89,16 +89,16 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 ## 手动建立受管安装或更换程序
 
-包协议 1 的旧预览版不能自动升级到包协议 2，新更新器也不接管旧包布局。下面的一次性操作保留数据和身份，不在程序中提供旧命令别名或旧包兼容层。
+包协议 1 的旧预览版不能自动升级到包协议 2，新更新器也不接管旧包布局。数据 epoch 2 及更早版本不能切换到本版继续使用原目录。保留旧程序和完整旧备份，在独立空目录初始化新节点。下面的安装布局操作不导入旧数据。
 
 先停用旧更新定时服务，备份 `current` 目标、用户服务定义和私有启动脚本。确认维护状态空闲且无结果未知操作后，再停止 Node 用户服务并等待目录锁释放，然后备份完整数据目录。备份包括身份和历史，应保持私密。不要强行结束任务，也不要让新旧程序同时使用同一数据目录。
 
 校验并解压新包到受管安装根目录下的独立目录，通过 `current` 符号链接选择程序。例如，先将解压后的包移动到 `$HOME/.local/share/vibeface/releases/<version>`，再创建指向它的 `$HOME/.local/share/vibeface/current`。保留整个包，不单独复制 Rust binary；更新器需要同包的脚本、sidecar 和 `BUILD-INFO.json`。
 
-原子切换 `current` 后，建立 `~/.local/bin/vibeface` 到 `current/vibeface` 的链接。旧 CLI 链接只有在确认属于该受管安装时才可移除，不覆盖用户自有文件。使用原数据目录前台启动并核对设备身份和历史，随后按 [后台运行说明](node.md#作为后台应用运行) 配置指向这一固定路径的用户服务。Linux 服务名是 `vibeface.service`，先卸载旧服务定义，避免双进程。停止前台进程后再启动用户服务，不更改原数据目录。
+原子切换 `current` 后，建立 `~/.local/bin/vibeface` 到 `current/vibeface` 的链接。旧 CLI 链接只有在确认属于该受管安装时才可移除，不覆盖用户自有文件。使用当前格式的数据目录前台启动并核对设备身份和历史。旧格式数据保留在原目录，使用独立空目录初始化新节点。随后按 [后台运行说明](node.md#作为后台应用运行) 配置指向这一固定路径的用户服务。Linux 服务名是 `vibeface.service`，先卸载旧服务定义，避免双进程。停止前台进程后再启动用户服务，确认服务使用已核对的数据目录。
 
 已有私有凭证启动脚本时，保留内容和私有权限，仅将末端启动路径改为 `current/vibeface`。不要用 `service install` 覆盖凭证脚本。核对新服务的 PID、版本、设备身份、历史及本机健康状态，再恢复原更新渠道和自动更新策略。
 
 确认新程序可用后，再执行 `update configure` 设置渠道和自动更新。普通 `cargo install` 或直接复制 binary 不构成受管安装，更新器会要求先建立完整包与 `current` 链接。
 
-若版本改变存储格式且不声明兼容，应按该版本说明手动处理。需要数据恢复时，停止程序并恢复对应版本的完整备份，不直接让旧程序打开已经升级的数据。
+需要恢复完整目录备份时，停止程序并使用对应格式版本的程序。新程序拒绝旧目录，不通过替换格式标记绕过检查，也不让旧程序打开新数据库。
