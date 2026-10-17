@@ -2367,9 +2367,56 @@ impl VerifiedPolicySet {
         &self,
         signed: &Signed<Invocation>,
         invocation_hash: ObjectHash,
-        mut budget: Budget,
+        budget: Budget,
         facts: &RequestFacts,
         transport: &TransportEvidence,
+        now_ms: u64,
+        phase: AuthorizationPhase,
+    ) -> Result<VerifiedAuthorization> {
+        self.verify_authorized_invocation_body(
+            signed,
+            invocation_hash,
+            budget,
+            facts,
+            Some(transport),
+            now_ms,
+            phase,
+        )
+    }
+
+    fn verify_portable_signed_intent_body(
+        &self,
+        signed: &Signed<Invocation>,
+        intent_hash: ObjectHash,
+        budget: Budget,
+        facts: &RequestFacts,
+        now_ms: u64,
+    ) -> Result<VerifiedAuthorization> {
+        require(
+            matches!(signed.payload.actor, Actor::Account(_))
+                && signed.payload.action == Action::OperationResolve
+                && signed.payload.presenter == signed.payload.device
+                && signed.payload.context.sdk_session.is_none(),
+            "portable intent requires a self-presenting Account signer",
+        )?;
+        self.verify_authorized_invocation_body(
+            signed,
+            intent_hash,
+            budget,
+            facts,
+            None,
+            now_ms,
+            AuthorizationPhase::Admission,
+        )
+    }
+
+    fn verify_authorized_invocation_body(
+        &self,
+        signed: &Signed<Invocation>,
+        invocation_hash: ObjectHash,
+        mut budget: Budget,
+        facts: &RequestFacts,
+        transport: Option<&TransportEvidence>,
         now_ms: u64,
         phase: AuthorizationPhase,
     ) -> Result<VerifiedAuthorization> {
@@ -2448,28 +2495,40 @@ impl VerifiedPolicySet {
         )?;
         let mut transport_dependencies = BTreeMap::new();
         let prior_budget_dependencies = budget.dependencies.clone();
-        match transport {
-            TransportEvidence::DirectNoise { device } => require(
-                device == &i.device && i.presenter == *device,
-                "direct transport device mismatch",
-            )?,
-            TransportEvidence::GatewayNoise { device, gateway } => {
-                require(
-                    device == &i.device && gateway == &i.presenter,
-                    "gateway transport device mismatch",
-                )?;
-                self.validate_presenter(gateway, now_ms, &mut budget, &mut transport_dependencies)?;
+        if let Some(transport) = transport {
+            match transport {
+                TransportEvidence::DirectNoise { device } => require(
+                    device == &i.device && i.presenter == *device,
+                    "direct transport device mismatch",
+                )?,
+                TransportEvidence::GatewayNoise { device, gateway } => {
+                    require(
+                        device == &i.device && gateway == &i.presenter,
+                        "gateway transport device mismatch",
+                    )?;
+                    self.validate_presenter(
+                        gateway,
+                        now_ms,
+                        &mut budget,
+                        &mut transport_dependencies,
+                    )?;
+                }
+                TransportEvidence::VerifiedPeer { origin } => {
+                    require(origin == &i.presenter, "peer presenter mismatch")?;
+                    self.validate_presenter(
+                        origin,
+                        now_ms,
+                        &mut budget,
+                        &mut transport_dependencies,
+                    )?;
+                }
+                TransportEvidence::LocalAgentAdapter { service, session } => require(
+                    i.actor == Actor::Service(service.clone())
+                        && i.presenter == i.device
+                        && i.context.sdk_session.as_ref() == Some(session),
+                    "agent session mismatch",
+                )?,
             }
-            TransportEvidence::VerifiedPeer { origin } => {
-                require(origin == &i.presenter, "peer presenter mismatch")?;
-                self.validate_presenter(origin, now_ms, &mut budget, &mut transport_dependencies)?;
-            }
-            TransportEvidence::LocalAgentAdapter { service, session } => require(
-                i.actor == Actor::Service(service.clone())
-                    && i.presenter == i.device
-                    && i.context.sdk_session.as_ref() == Some(session),
-                "agent session mismatch",
-            )?,
         }
         transport_dependencies.extend(budget.dependencies.clone());
         budget.dependencies = prior_budget_dependencies;
