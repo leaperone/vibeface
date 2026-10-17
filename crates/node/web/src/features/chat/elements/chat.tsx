@@ -39,7 +39,7 @@ export function Chat({
 
   return (
     <MessageScrollerProvider autoScroll>
-      <MessageScroller className="h-auto flex-1">
+      <MessageScroller className="h-auto min-h-24 flex-1">
         <MessageScrollerViewport aria-label="聊天记录">
           <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-6 px-4 py-6 sm:px-6">
             {messages.map((message) => (
