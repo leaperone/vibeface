@@ -89,6 +89,18 @@ def maintenance(node, command):
         raise
 
 
+def verify_cli_status(node, running):
+    result = subprocess.run([str(node.binary), "status", "--json", "--data-dir", str(node.directory)],
+                            capture_output=True, text=True, timeout=10)
+    require((result.returncode == 0) == running, "CLI status exit code reflects node reachability")
+    status = json.loads(result.stdout)
+    require(set(status) == {"status", "node_id", "data_dir", "listen", "roles", "version", "cli_version", "error"},
+            "CLI status returns only public node health and local paths")
+    require(status["status"] == ("running" if running else "stopped") and status["node_id"] == node.node_id,
+            "CLI status pins the initialized local node in both running and stopped states")
+    require(node.access["capability"] not in result.stdout, "CLI status never exposes bootstrap capability")
+
+
 def verify_maintenance(node):
     stream, value = maintenance(node, "acquire")
     try:
@@ -1030,6 +1042,14 @@ def acceptance(options):
             node.configure(network={"bootstrap_urls": [capture.url.replace("http:", "ws:") + "/api/network/ws"],
                                     "advertise_urls": [], "mdns": False, "relay_enabled": False})
         a.start()
+        verify_cli_status(a, True)
+        a.stop()
+        verify_cli_status(a, False)
+        missing = subprocess.run([str(binary), "status", "--json", "--data-dir", str(run / "not-initialized")],
+                                 capture_output=True, timeout=10)
+        require(missing.returncode != 0 and not missing.stdout, "CLI status rejects uninitialized directories")
+        a.start()
+        passed("binary CLI status reports running and stopped nodes without exposing pairing secrets")
         a.client.connect(a.node_id)
         a.client.call("rpc", {"method": "nodes"}, status=401)
         a.client.call("directory", status=401)
