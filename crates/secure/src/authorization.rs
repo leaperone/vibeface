@@ -5479,3 +5479,6 @@ pub fn replay_policies(pins: &[PolicyPin], journal: &[JournalEntry]) -> Result<V
     }
     Ok(state)
 }
+
+pub mod task_binding;
+pub use task_binding::verify_task_binding;
