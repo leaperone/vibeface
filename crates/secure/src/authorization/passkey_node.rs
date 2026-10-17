@@ -329,6 +329,10 @@ mod tests {
                     user_handle: pending.user_handle().to_owned(),
                     backup_eligible: true,
                     client_enrollment: PasskeyClientEnrollment::AccountClient,
+                    initial_state: AuthenticatorState {
+                        sign_count: 1,
+                        backup_state: false,
+                    },
                     issued_under: head,
                     nonce: Nonce::from_bytes([3; 32]),
                     enrollment_hash: ObjectHash::body(&"registration envelope").unwrap(),
