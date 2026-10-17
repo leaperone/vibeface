@@ -11,6 +11,12 @@ if (($#)); then
   database="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 fi
 cd "$repo"
+shopt -s nullglob
+migrations=(crates/node/migrations/*.sql)
+if [[ ${#migrations[@]} != 1 || "${migrations[0]:-}" != crates/node/migrations/202610180001_initial.sql ]]; then
+  echo 'The fresh format requires exactly one initial Atlas SQL file.' >&2
+  exit 1
+fi
 umask 077
 mkdir -p "$repo/.artifacts"
 scratch="$(mktemp -d "$repo/.artifacts/schema-check.XXXXXX")"
