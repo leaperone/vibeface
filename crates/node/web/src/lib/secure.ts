@@ -1,5 +1,6 @@
 import { Identity, recoveryOpen, recoverySeal, verifyMembership } from '../../generated/vibeface_secure.js'
-import { integer, parseView, record, text } from './node'
+import { integer, parsePrincipal, parseView, record, same, text } from './node'
+import type { Member, PublicIdentity } from './node'
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
@@ -10,6 +11,26 @@ export function verifyState(state: unknown, networkId: string, owner: string) {
 export function verifiedView(state: unknown, networkId: string, owner: string) {
   const verified = verifyState(state, networkId, owner)
   try { return parseView(JSON.parse(verified.viewJson())) } finally { verified.free() }
+}
+export type AuthenticationTrust = { kind: 'network'; networkId: string } | { kind: 'root'; networkId: string; ownerPublicKey: string; genesis: unknown; checkpoint?: unknown }
+export function verifyAuthentication(value: unknown, own: PublicIdentity, expected: AuthenticationTrust | null) {
+  const auth = record(value)
+  const principal = parsePrincipal(auth.principal)
+  const state = record(auth.state)
+  if (principal.subject_id !== own.nodeId || expected && principal.network_id !== expected.networkId) throw new Error('认证返回的个人网络或浏览器身份不一致。')
+  if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !same(state.checkpoint, expected.checkpoint))) throw new Error('认证返回的根授权与本地确认的记录不一致。')
+  const owner = expected?.kind === 'root' ? expected.ownerPublicKey : text(record(state.genesis).owner_public_key)
+  const view = verifiedView(state, expected?.networkId ?? principal.network_id, owner)
+  const member = view.members.find(item => item.subject_id === own.nodeId)
+  if (!member || view.revoked.includes(own.nodeId) || member.public_key !== own.publicKey || member.kind !== 'client' || principal.epoch !== view.epoch || principal.can_manage !== member.manage || !same(auth.view, view)) throw new Error('设备授权与已签名的成员记录不一致。')
+  return { auth, principal, view }
+}
+export function verifyRecoveryResult(value: unknown, expected: { networkId: string; ownerPublicKey: string; genesis: unknown; checkpoint: unknown; manager: Member }) {
+  const epoch = integer(record(expected.checkpoint).epoch)
+  const { auth, principal, view } = verifyAuthentication(value, { nodeId: expected.manager.subject_id, publicKey: expected.manager.public_key }, { kind: 'root', ...expected })
+  const manager = view.members.find(member => member.subject_id === expected.manager.subject_id)
+  if (principal.epoch !== epoch || !principal.can_manage || !manager || !same(manager, expected.manager)) throw new Error('恢复响应的管理身份或授权版本不一致，未生成新的恢复包。')
+  return { auth, epoch }
 }
 export function passphrase(password: string, confirmation: string): string {
   if ([...password].length < 12 || encoder.encode(password).length > 1024) throw new Error('恢复包口令需要至少 12 个字符，且不超过 1024 字节。')

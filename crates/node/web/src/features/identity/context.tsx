@@ -4,10 +4,11 @@ import { connectDevice, initClient, readInvitation, signClient } from '../../../
 import type { DeviceChannel } from '../../../transport.js'
 import {
   array, boolean, deviceName, digest, entryKey, integer, messageOf, parseEntry, parseInfo, parseInvitation,
-  parseMember, parsePairReceipt, parsePrincipal, parseReview, parseSigning, parseView, record, same, signingPayload, text,
+  parseMember, parsePairReceipt, parseReview, parseSigning, parseView, record, same, signingPayload, text,
 } from '@/lib/node'
 import type { ConnectionEntry, EntryInfo, Member, MembershipView, NodeRole, PairReceipt, PublicIdentity, ReadyConnection, WaitingPair } from '@/lib/node'
-import { Identity, downloadPackage, openPackage, sealPackage, verifiedView, verifyState } from '@/lib/secure'
+import type { AuthenticationTrust } from '@/lib/secure'
+import { Identity, downloadPackage, openPackage, sealPackage, verifiedView, verifyAuthentication, verifyRecoveryResult, verifyState } from '@/lib/secure'
 
 type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'unpaired' | 'ready'
 type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
@@ -96,15 +97,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     return result
   }
   function scoped(active = current()) { return (method: string, params: Record<string, unknown> = {}) => callSession(active, method, params) }
-  async function authenticate(authValue: unknown, active = current()) {
+  async function authenticate(authValue: unknown, active = current(), expected: AuthenticationTrust | null = null) {
     const request = scoped(active)
-    const auth = record(authValue)
-    const principal = parsePrincipal(auth.principal)
     const own = identityRef.current
-    if (!own || principal.subject_id !== own.nodeId) throw new Error('认证返回的浏览器身份不一致。')
-    const view = verifiedView(auth.state, principal.network_id, ownerOf(auth.state))
-    const member = view.members.find(item => item.subject_id === own.nodeId)
-    if (!member || view.revoked.includes(own.nodeId) || member.public_key !== own.publicKey || member.kind !== 'client' || principal.epoch !== view.epoch || principal.can_manage !== member.manage || !same(auth.view, view)) throw new Error('设备授权与已签名的成员记录不一致。')
+    if (!own) throw new Error('浏览器密钥尚未初始化。')
+    const { principal, view } = verifyAuthentication(authValue, own, expected)
     if (session.current !== active) throw changed()
     const pinnedNetwork = load(`network-for.${active.entry.node_id}`)
     if (pinnedNetwork && pinnedNetwork !== principal.network_id) throw new Error('此设备返回了不同的个人网络。请先核对原授权。')
@@ -245,7 +242,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           try {
             const auth = await request('bootstrap', { capability: invitation.capability, state: prepared.state })
             if (cancelled) throw new Error('初始化已提交，但本地确认已取消。请重新连接核对网络状态。')
-            await authenticate(auth, active)
+            const state = record(prepared.state)
+            await authenticate(auth, active, { kind: 'root', networkId, ownerPublicKey: ownerOf(state), genesis: state.genesis })
           }
           finally { if (sensitive.current === flow) cancelSensitive(); else flow.cancel() }
         },
@@ -282,7 +280,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (!pending?.accepted) return
     const response = record(await request('pair_status', { request_id: pending.request_id }))
     if (waitingRef.current !== pending) return
-    if (response.status === 'granted') await authenticate(await request('authenticate', { network_id: pending.network_id }))
+    if (response.status === 'granted') await authenticate(await request('authenticate', { network_id: pending.network_id }), current(), { kind: 'network', networkId: pending.network_id })
     else if (response.status !== 'pending') throw new Error('配对请求未完成。请在管理设备上核对，或创建新邀请。')
   }
   function cancelPair() { waitingRef.current = null; setWaiting(null); store('waiting-pair', null) }
@@ -337,11 +335,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
             const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, JSON.stringify(selected), opened.epoch, JSON.stringify(prepared)))
             const authValue = await request('recover', { challenge_id: challenge.challenge_id, checkpoint, ...(!active.info.initialized ? { state: result.state, capability } : {}) })
             if (released) throw new Error('恢复授权已提交，但本地恢复已取消。请重新连接核对授权，并使用原恢复包。')
-            const auth = record(authValue); const principal = parsePrincipal(auth.principal)
-            opened.payload.recovery_epoch = principal.epoch
+            const { auth, epoch } = verifyRecoveryResult(authValue, { networkId: opened.networkId, ownerPublicKey: opened.root.publicKeyHex(), genesis: opened.payload.genesis, checkpoint, manager: newManager })
+            opened.payload.recovery_epoch = epoch
             const bytes = sealPackage(opened.payload, password)
             try { downloadPackage(bytes, opened.networkId) } finally { bytes.fill(0) }
-            await authenticate(auth, active)
+            await authenticate(auth, active, { kind: 'root', networkId: opened.networkId, ownerPublicKey: opened.root.publicKeyHex(), genesis: opened.payload.genesis, checkpoint })
           } finally { if (sensitive.current === flow) cancelSensitive(); else release() }
         },
       }
