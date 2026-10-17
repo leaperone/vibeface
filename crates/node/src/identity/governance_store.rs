@@ -262,6 +262,10 @@ impl Store {
         params: &Value,
         now_ms: u64,
     ) -> Result<FreshnessChallenge> {
+        ensure!(
+            serde_json::to_vec(params)?.len() <= MAX_PROOF_BYTES,
+            "governance request too large"
+        );
         let request: ExecutionServiceRegistrationRequest = serde_json::from_value(params.clone())?;
         ensure!(
             request.intent.issuer.as_str() == principal,
@@ -580,6 +584,17 @@ impl Store {
                     commit: Signed::sign(accepted, &signer)?,
                     receipts,
                 };
+                if let Some(registration) = &registration {
+                    execution_service::verify_execution_service_registration_commit(
+                        state,
+                        registration,
+                        &committed,
+                        registration_freshness
+                            .map(|proof| (&proof.challenge, proof.receipts.as_slice())),
+                        &node,
+                        now_ms,
+                    )?;
+                }
                 let mut journal_delta = request.new_objects;
                 journal_delta.push(JournalEntry::SpaceCommit(committed.clone()));
                 let update = policy.prepare_network_update(&journal_delta, now_ms)?;
@@ -825,6 +840,11 @@ mod tests {
                 )
             };
             let prepared = prepare_execution_registration(&network, &source, &pins, &bundle)?;
+            eprintln!(
+                "execution registration source={} phase=prepare usage={}",
+                if team_source { "team" } else { "personal" },
+                prepared.proof_usage_json().map_err(anyhow::Error::msg)?
+            );
             let params: Value =
                 serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
             let execution = ResourceRef {
@@ -858,6 +878,11 @@ mod tests {
                 (now() + 200_000) as f64,
             )
             .map_err(anyhow::Error::msg)?;
+            eprintln!(
+                "execution registration source={} phase=commit usage={}",
+                if team_source { "team" } else { "personal" },
+                verified.proof_usage_json().map_err(anyhow::Error::msg)?
+            );
             assert_eq!(verified.resource_id(), execution.resource.as_str());
             assert_eq!(verified.space_id(), execution.space.as_str());
             let result_bundle: ClientAuthorizationBundle =

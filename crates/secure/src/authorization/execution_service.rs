@@ -45,6 +45,8 @@ pub struct VerifiedExecutionServiceRegistrationRequest {
     expected_heads: Vec<PolicyStamp>,
     commit_heads: Vec<PolicyStamp>,
     expires: u64,
+    budget: Budget,
+    max_depth: usize,
 }
 impl VerifiedExecutionServiceRegistrationRequest {
     pub fn expected_heads(&self) -> &[PolicyStamp] {
@@ -56,6 +58,26 @@ impl VerifiedExecutionServiceRegistrationRequest {
     pub fn expires_at_ms(&self) -> u64 {
         self.expires
     }
+    pub fn proof_usage_json(&self) -> crate::Result<String> {
+        json(&self.proof_counts())
+    }
+    pub fn proof_counts(&self) -> RegistrationProofCounts {
+        RegistrationProofCounts {
+            objects: self.budget.objects.len(),
+            bytes: self.budget.bytes,
+            signatures: self.budget.signatures.len() + self.budget.external_signatures.len(),
+            max_depth: self.max_depth,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationProofCounts {
+    pub objects: usize,
+    pub bytes: usize,
+    pub signatures: usize,
+    pub max_depth: usize,
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T> {
@@ -93,13 +115,20 @@ fn authorization(
     source_grant: &ObjectHash,
     node: &PublicKey,
     now: u64,
+    budget: &mut Budget,
 ) -> Result<VerifiedExecutionServiceRegistrationRequest> {
     let personal = SpaceId::personal(account);
-    state.verify_account_client_device(account, &DeviceId::from_key(signer), now)?;
-    let mut budget = Budget::default();
+    let client = state.find_device(&DeviceId::from_key(signer))?;
+    require(
+        client.payload.owner == PolicyDomain::Account(account.clone())
+            && client.payload.subject == Actor::Account(account.clone())
+            && client.payload.uses.contains(&DeviceUse::Noise)
+            && client.payload.uses.contains(&DeviceUse::AccountInvocation),
+        "execution registration requires a current account client",
+    )?;
     let mut dependencies = BTreeMap::new();
     require(
-        state.actor_for_signer(signer, now, &mut budget, &mut dependencies)?
+        state.actor_for_signer(signer, now, budget, &mut dependencies)?
             == Actor::Account(account.clone()),
         "execution registration requires the current physical device owner's account client",
     )?;
@@ -110,16 +139,22 @@ fn authorization(
         Some(Action::ResourceManage),
         Some(&source.resource),
         now,
-        &mut budget,
+        budget,
     )?;
-    let target = state.verify_service_device(&personal, &DeviceId::from_key(node), now)?;
-    let source_target =
-        state.verify_service_device(&source.space, &DeviceId::from_key(node), now)?;
+    let target = state.find_device(&DeviceId::from_key(node))?;
+    for space in [&personal, &source.space] {
+        state.ensure_personal_current(
+            state
+                .space(space)
+                .ok_or(AuthorizationError::PolicyConflict)?,
+        )?;
+        state.validate_service_reference(space, target)?;
+    }
     require(
         target.payload.public_key == *node
             && target.payload.owner == PolicyDomain::Account(account.clone())
-            && source_target.payload.public_key == *node
-            && source_target.payload.owner == PolicyDomain::Account(account.clone()),
+            && target.payload.subject == Actor::Service(ServiceId::from_key(node))
+            && target.payload.uses.contains(&DeviceUse::Noise),
         "execution registration cannot configure another account's physical node",
     )?;
     let record =
@@ -133,35 +168,27 @@ fn authorization(
             && record.payload.host == ServiceId::from_key(node),
         "execution source must be a project hosted by the selected node",
     )?;
-    state.validate_certificate(
-        target,
-        now,
-        &mut budget,
-        &mut dependencies,
-        &mut BTreeSet::new(),
-    )?;
-    state.validate_certificate(
-        source_target,
-        now,
-        &mut budget,
-        &mut dependencies,
-        &mut BTreeSet::new(),
-    )?;
+    budget.verify(record)?;
+    state.validate_certificate(target, now, budget, &mut dependencies, &mut BTreeSet::new())?;
     dependencies.extend(budget.dependencies.clone());
     state.dependency(
         &PolicyDomain::Space(source.space.clone()),
         &mut dependencies,
     )?;
     state.dependency(&PolicyDomain::Space(personal.clone()), &mut dependencies)?;
-    state.expand_authorities(now, &mut budget, &mut dependencies)?;
-    let mut commit_budget = Budget::default();
+    state.expand_authorities(now, budget, &mut dependencies)?;
+    let all_dependencies = budget.dependencies.clone();
+    budget.dependencies.clear();
     let mut commit_heads = BTreeMap::new();
     state.dependency(&PolicyDomain::Space(personal), &mut commit_heads)?;
-    state.expand_authorities(now, &mut commit_budget, &mut commit_heads)?;
+    state.expand_authorities(now, budget, &mut commit_heads)?;
+    budget.dependencies = all_dependencies;
     Ok(VerifiedExecutionServiceRegistrationRequest {
         expected_heads: dependencies.into_values().collect(),
         commit_heads: commit_heads.into_values().collect(),
-        expires: budget.expires_at_ms.min(commit_budget.expires_at_ms),
+        expires: budget.expires_at_ms,
+        budget: budget.clone(),
+        max_depth: state.grant_chain(Some(source_grant))?.len(),
     })
 }
 
@@ -175,8 +202,9 @@ pub fn verify_execution_service_registration(
         canonical(signed)?.len() <= MAX_PROOF_BYTES,
         "execution registration too large",
     )?;
-    signed.intent.verify_signature()?;
-    signed.root_approval.verify_signature()?;
+    let mut budget = Budget::default();
+    budget.verify(&signed.intent)?;
+    budget.verify(&signed.root_approval)?;
     let intent = &signed.intent.payload;
     let request = &signed.request;
     validate_window(intent.issued_at_ms, intent.expires_at_ms, now)?;
@@ -263,7 +291,9 @@ pub fn verify_execution_service_registration(
         request.proposal.payload == expected,
         "execution registration changed unrelated space policy",
     )?;
-    request.proposal.verify_signature()?;
+    budget.verify(&request.proposal)?;
+    budget.verify(resource)?;
+    budget.verify(parent)?;
     let verified = authorization(
         state,
         &intent.account,
@@ -272,6 +302,7 @@ pub fn verify_execution_service_registration(
         &intent.source_grant,
         local_node,
         now,
+        &mut budget,
     )?;
     require(
         intent.expected_heads == verified.expected_heads
@@ -322,8 +353,29 @@ pub fn verify_execution_service_registration_freshness(
     receipts: &[Signed<FreshnessReceipt>],
     local_node: &PublicKey,
     now: u64,
+) -> Result<VerifiedExecutionServiceRegistrationRequest> {
+    let mut verified = verify_execution_service_registration(state, request, local_node, now)?;
+    check_registration_freshness(
+        state,
+        request,
+        challenge,
+        receipts,
+        local_node,
+        now,
+        &mut verified,
+    )?;
+    Ok(verified)
+}
+
+fn check_registration_freshness(
+    state: &VerifiedPolicySet,
+    request: &ExecutionServiceRegistrationRequest,
+    challenge: &FreshnessChallenge,
+    receipts: &[Signed<FreshnessReceipt>],
+    local_node: &PublicKey,
+    now: u64,
+    verified: &mut VerifiedExecutionServiceRegistrationRequest,
 ) -> Result<()> {
-    let verified = verify_execution_service_registration(state, request, local_node, now)?;
     let intent = &request.intent;
     require(
         challenge.version == AUTH_VERSION
@@ -354,9 +406,19 @@ pub fn verify_execution_service_registration_freshness(
         "execution registration is missing authority freshness",
     )?;
     let hash = challenge.hash()?;
+    if verified.budget.objects.insert(hash.clone()) {
+        let bytes = canonical(challenge)?.len();
+        verified.budget.object_bytes.insert(hash.clone(), bytes);
+        verified.budget.bytes += bytes;
+        if verified.budget.objects.len() > MAX_PROOF_OBJECTS
+            || verified.budget.bytes > MAX_PROOF_BYTES
+        {
+            return Err(AuthorizationError::BudgetExceeded);
+        }
+    }
     let mut seen = BTreeSet::new();
     for receipt in receipts {
-        receipt.verify_signature()?;
+        verified.budget.verify(receipt)?;
         let value = &receipt.payload;
         let authority = match &value.current.domain {
             PolicyDomain::Account(id) => state.account(id).map(|account| &account.authority),
@@ -377,6 +439,53 @@ pub fn verify_execution_service_registration_freshness(
         validate_window(value.issued_at_ms, value.expires_at_ms, now)?;
     }
     Ok(())
+}
+
+pub fn verify_execution_service_registration_commit(
+    state: &VerifiedPolicySet,
+    request: &ExecutionServiceRegistrationRequest,
+    committed: &Committed<SpaceDocument>,
+    freshness: Option<(&FreshnessChallenge, &[Signed<FreshnessReceipt>])>,
+    local_node: &PublicKey,
+    now: u64,
+) -> Result<VerifiedExecutionServiceRegistrationRequest> {
+    let mut verified = verify_execution_service_registration(state, request, local_node, now)?;
+    if let Some((challenge, receipts)) = freshness {
+        check_registration_freshness(
+            state,
+            request,
+            challenge,
+            receipts,
+            local_node,
+            now,
+            &mut verified,
+        )?;
+    }
+    require(
+        committed.proposal == request.request.proposal
+            && committed.commit.payload.nonce == request.request.nonce
+            && committed.commit.payload.dependencies == verified.commit_heads,
+        "execution registration commit belongs to another root-approved request",
+    )?;
+    verified.budget.verify(&committed.proposal)?;
+    verified.budget.verify(&committed.commit)?;
+    for receipt in &committed.receipts {
+        verified.budget.verify(receipt)?;
+    }
+    let [
+        JournalEntry::Resource(resource),
+        JournalEntry::Grant(parent),
+    ] = request.request.new_objects.as_slice()
+    else {
+        return Err(AuthorizationError::InvalidProof(
+            "missing execution registration objects",
+        ));
+    };
+    let mut candidate = state.clone();
+    candidate.install_resource(resource.clone())?;
+    candidate.install_grant(parent.clone(), now)?;
+    candidate.install_space_committed(committed.clone(), now)?;
+    Ok(verified)
 }
 
 fn merged_context(
@@ -456,6 +565,7 @@ pub struct PreparedExecutionServiceRegistration {
     pins: Vec<PolicyPin>,
     bundle: ClientAuthorizationBundle,
     material: RecoveryMaterial,
+    proof_counts: RegistrationProofCounts,
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = prepareExecutionServiceRegistration))]
@@ -499,6 +609,7 @@ pub fn prepare_execution_service_registration(
             &bundle.grant_leaf,
             &target,
             now,
+            &mut Budget::default(),
         )?;
         let personal = SpaceId::personal(&account);
         let execution_resource = ResourceRef {
@@ -594,12 +705,14 @@ pub fn prepare_execution_service_registration(
             root_approval,
             request,
         };
-        verify_execution_service_registration(&state, &request, &target, now)?;
+        let proof_counts =
+            verify_execution_service_registration(&state, &request, &target, now)?.proof_counts();
         Ok(PreparedExecutionServiceRegistration {
             request,
             pins,
             bundle,
             material,
+            proof_counts,
         })
     };
     prepare().map_err(|error| error.to_string())
@@ -607,6 +720,10 @@ pub fn prepare_execution_service_registration(
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl PreparedExecutionServiceRegistration {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = proofUsageJson))]
+    pub fn proof_usage_json(&self) -> crate::Result<String> {
+        json(&self.proof_counts)
+    }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = requestJson))]
     pub fn request_json(&self) -> crate::Result<String> {
         json(&self.request)
@@ -664,6 +781,7 @@ pub struct VerifiedExecutionServiceRegistration {
     bundle: ClientAuthorizationBundle,
     scope: ClientScope,
     material_json: zeroize::Zeroizing<String>,
+    proof_counts: RegistrationProofCounts,
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = finishExecutionServiceRegistration))]
@@ -681,9 +799,11 @@ pub fn finish_execution_service_registration(
             "execution registration receipt is from the future",
         )?;
         let mut state = replay_policies(&prepared.pins, &prepared.bundle.journal)?;
-        let verified = verify_execution_service_registration(
+        let verified = verify_execution_service_registration_commit(
             &state,
             &prepared.request,
+            &committed,
+            None,
             &prepared.request.intent.payload.target_node_public_key,
             accepted,
         )?;
@@ -763,6 +883,7 @@ pub fn finish_execution_service_registration(
             bundle,
             scope,
             material_json,
+            proof_counts: verified.proof_counts(),
         })
     };
     finish().map_err(|error| error.to_string())
@@ -770,6 +891,10 @@ pub fn finish_execution_service_registration(
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedExecutionServiceRegistration {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = proofUsageJson))]
+    pub fn proof_usage_json(&self) -> crate::Result<String> {
+        json(&self.proof_counts)
+    }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = resourceId))]
     pub fn resource_id(&self) -> String {
         self.resource.resource.to_string()
@@ -793,5 +918,233 @@ impl VerifiedExecutionServiceRegistration {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = recoveryMaterialJson))]
     pub fn recovery_material_json(&self) -> String {
         self.material_json.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const NOW: f64 = 10_000.0;
+    fn key(byte: u8) -> Identity {
+        Identity::from_secret_hex(&hex::encode([byte; 32])).unwrap()
+    }
+    fn registration() -> (VerifiedPolicySet, PreparedExecutionServiceRegistration) {
+        let nonce = Nonce::from_bytes([9; 32]).to_string();
+        let claim = bootstrap::verify_node_claim(
+            &bootstrap::create_node_claim(&key(4), &nonce, NOW, NOW + 100_000.0).unwrap(),
+            &key(4).public_key_hex(),
+            &nonce,
+            NOW,
+        )
+        .unwrap();
+        let prepared = bootstrap::prepare_account_creation(
+            &key(1),
+            &key(2),
+            &key(3),
+            &claim,
+            1_000_000.0,
+            NOW,
+        )
+        .unwrap();
+        let possession = bootstrap::sign_node_possession(
+            &prepared.node_request_json().unwrap(),
+            &key(4),
+            &nonce,
+            NOW,
+        )
+        .unwrap();
+        let created =
+            bootstrap::finish_account_creation(&prepared, &key(1), &possession, NOW).unwrap();
+        let material = bootstrap::recovery::build_account_recovery_material(
+            &created,
+            &key(1),
+            &key(2),
+            "https://node.example",
+            NOW,
+        )
+        .unwrap();
+        let pins: Vec<PolicyPin> = parse(&created.pins_json().unwrap()).unwrap();
+        let bundle: ClientAuthorizationBundle = parse(&created.bundle_json().unwrap()).unwrap();
+        let state = replay_policies(&pins, &bundle.journal).unwrap();
+        let source = bundle
+            .journal
+            .iter()
+            .find_map(|entry| match entry {
+                JournalEntry::Resource(record) => Some(ResourceRef {
+                    space: record.payload.space.clone(),
+                    resource: record.payload.resource.clone(),
+                }),
+                _ => None,
+            })
+            .unwrap();
+        let registration = prepare_execution_service_registration(
+            &json(&source).unwrap(),
+            &material,
+            &key(3),
+            &json(&pins).unwrap(),
+            &json(&bundle).unwrap(),
+            &key(4).public_key_hex(),
+            NOW,
+            NOW + 60_000.0,
+        )
+        .unwrap();
+        (state, registration)
+    }
+    fn committed(
+        state: &VerifiedPolicySet,
+        prepared: &PreparedExecutionServiceRegistration,
+    ) -> Committed<SpaceDocument> {
+        let verified = verify_execution_service_registration(
+            state,
+            &prepared.request,
+            &PublicKey::of(&key(4)),
+            NOW as u64,
+        )
+        .unwrap();
+        let challenge = Signed::sign(
+            PolicyCommit {
+                version: AUTH_VERSION,
+                previous: state
+                    .head(&PolicyDomain::Space(
+                        prepared
+                            .request
+                            .intent
+                            .payload
+                            .execution_resource
+                            .space
+                            .clone(),
+                    ))
+                    .unwrap()
+                    .clone(),
+                proposal_hash: prepared.request.request.proposal.hash().unwrap(),
+                accepted_at_ms: 0,
+                issued_at_ms: NOW as u64,
+                expires_at_ms: NOW as u64 + EXECUTION_LEASE_MS,
+                nonce: prepared.request.request.nonce.clone(),
+                dependencies: verified.commit_heads,
+            },
+            &key(4),
+        )
+        .unwrap();
+        let receipts = challenge
+            .payload
+            .dependencies
+            .iter()
+            .map(|head| {
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: head.clone(),
+                        challenge_hash: challenge.challenge_hash().unwrap(),
+                        issued_at_ms: NOW as u64,
+                        expires_at_ms: challenge.payload.expires_at_ms,
+                    },
+                    &key(4),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut accepted = challenge.payload;
+        accepted.accepted_at_ms = NOW as u64;
+        Committed {
+            proposal: prepared.request.request.proposal.clone(),
+            commit: Signed::sign(accepted, &key(4)).unwrap(),
+            receipts,
+        }
+    }
+
+    #[test]
+    fn registration_commit_counts_root_source_and_receipt_objects_in_one_budget() {
+        let (state, prepared) = registration();
+        let main = verify_execution_service_registration(
+            &state,
+            &prepared.request,
+            &PublicKey::of(&key(4)),
+            NOW as u64,
+        )
+        .unwrap();
+        let commit = committed(&state, &prepared);
+        let final_proof = verify_execution_service_registration_commit(
+            &state,
+            &prepared.request,
+            &commit,
+            None,
+            &PublicKey::of(&key(4)),
+            NOW as u64,
+        )
+        .unwrap();
+        assert_eq!(
+            final_proof.proof_counts().objects,
+            main.proof_counts().objects + 1 + commit.receipts.len()
+        );
+        assert_eq!(
+            final_proof.proof_counts().signatures,
+            main.proof_counts().signatures + 1 + commit.receipts.len()
+        );
+        let mut at_limit = final_proof.budget;
+        let mut serial = 0;
+        while at_limit.objects.len() < MAX_PROOF_OBJECTS
+            && at_limit.signatures.len() + at_limit.external_signatures.len() < MAX_PROOF_SIGNATURES
+        {
+            let approval = Signed::sign(
+                ExecutionServiceRootApproval {
+                    version: AUTH_VERSION,
+                    intent_hash: ObjectHash::body(&serial).unwrap(),
+                },
+                &key(1),
+            )
+            .unwrap();
+            at_limit.verify(&approval).unwrap();
+            serial += 1;
+        }
+        assert_eq!(
+            at_limit.signatures.len() + at_limit.external_signatures.len(),
+            MAX_PROOF_SIGNATURES
+        );
+        let overflow = Signed::sign(
+            ExecutionServiceRootApproval {
+                version: AUTH_VERSION,
+                intent_hash: ObjectHash::body(&serial).unwrap(),
+            },
+            &key(1),
+        )
+        .unwrap();
+        assert_eq!(
+            at_limit.verify(&overflow),
+            Err(AuthorizationError::BudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn registration_cost_gate_accepts_exact_byte_limit_and_rejects_one_more_byte() {
+        let (state, prepared) = registration();
+        let main = verify_execution_service_registration(
+            &state,
+            &prepared.request,
+            &PublicKey::of(&key(4)),
+            NOW as u64,
+        )
+        .unwrap();
+        let mut challenge = execution_service_registration_challenge(
+            &state,
+            &prepared.request,
+            &PublicKey::of(&key(4)),
+            NOW as u64,
+        )
+        .unwrap();
+        challenge.operation_id.clear();
+        let empty = Signed::sign(challenge.clone(), &key(4)).unwrap();
+        challenge.operation_id =
+            "x".repeat(MAX_PROOF_BYTES - main.budget.bytes - canonical(&empty).unwrap().len());
+        let boundary = Signed::sign(challenge.clone(), &key(4)).unwrap();
+        let mut at_limit = main.budget.clone();
+        at_limit.verify(&boundary).unwrap();
+        assert_eq!(at_limit.bytes, MAX_PROOF_BYTES);
+        challenge.operation_id.push('x');
+        let oversized = Signed::sign(challenge, &key(4)).unwrap();
+        assert_eq!(
+            main.budget.clone().verify(&oversized),
+            Err(AuthorizationError::BudgetExceeded)
+        );
     }
 }
