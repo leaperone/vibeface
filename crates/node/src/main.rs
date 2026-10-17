@@ -457,6 +457,14 @@ async fn pair(options: Pair) -> Result<()> {
     let mut configuration = runtime.config.clone();
     let identity = &runtime.identity;
     let payload = &invitation.invite.invite.payload;
+    let pending_path = options.data.data_dir.join("pairing.pending.json");
+    if runtime.has_membership().await? {
+        ensure!(
+            pending_path.exists()
+                && runtime.membership_state().await?.genesis.network_id == payload.network_id,
+            "this Node already belongs to a personal network; existing membership was preserved"
+        );
+    }
     ensure!(
         !payload.manage
             && payload
@@ -466,7 +474,6 @@ async fn pair(options: Pair) -> Result<()> {
         "invitation exceeds this Node's configured capabilities"
     );
     let member = Member::node(identity, &options.name, payload.node_roles.clone())?;
-    let pending_path = options.data.data_dir.join("pairing.pending.json");
     let mut pending = if pending_path.exists() {
         let pending: PendingPair = serde_json::from_slice(&read_bounded(&pending_path, 8192)?)?;
         ensure!(
@@ -526,8 +533,13 @@ async fn pair(options: Pair) -> Result<()> {
                             .all(|role| configuration.roles.contains(role)),
                     "paired network grants unexpected local permissions"
                 );
-                configuration.roles = authorized.node_roles.clone();
-                runtime.install_membership(state).await?;
+                let installed = runtime.install_membership(state).await?;
+                let current = installed.authorize_node(&identity.node_id()?, None)?;
+                ensure!(
+                    current == member,
+                    "installed network no longer grants the requested local membership"
+                );
+                configuration.roles = current.node_roles;
                 if !configuration.network.bootstrap_urls.contains(&url) {
                     configuration.network.bootstrap_urls.push(url.clone());
                 }
