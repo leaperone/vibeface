@@ -60,25 +60,27 @@ fn schema_objects(connection: &Connection) -> Result<Vec<(String, String, String
 }
 
 fn validate_persisted_state(connection: &Connection) -> Result<()> {
-    crate::identity::journal::PolicyState::load(connection)?;
+    let policy = crate::identity::journal::PolicyState::load(connection)?;
     let mut statement = connection.prepare("SELECT space_id,revision,bundle FROM spaces")?;
     let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, u64>(1)?,
-            row.get::<_, String>(2)?,
-        ))
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, String>(2)?))
     })?;
+    let mut seen = BTreeSet::new();
     for row in rows {
         let (space, revision, encoded) = row?;
-        let state: NetworkState = serde_json::from_str(&encoded)?;
-        state.project()?;
-        ensure!(
-            state.genesis.network_id == space && state.epoch() == revision,
-            "stored policy identity or revision mismatch"
-        );
+        let id = vibeface_secure::authorization::SpaceId::parse(&space)?;
+        let current = policy.verified().space_history(&id).and_then(|history| history.last())
+            .context("stored space has no pinned policy")?;
+        ensure!(serde_json::to_string(current)? == encoded && current.payload.sequence == revision,
+            "stored space projection differs from verified policy");
+        seen.insert(id);
         load_events_from(connection, &space)?;
     }
+    let expected: BTreeSet<_> = policy.pins().iter().filter_map(|pin| match &pin.domain {
+        vibeface_secure::authorization::PolicyDomain::Space(space) => Some(space.clone()), _ => None,
+    }).collect();
+    ensure!(seen == expected, "stored space projection is incomplete");
+    crate::identity::policy::validate_resource_projections(connection)?;
     Ok(())
 }
 
@@ -425,7 +427,7 @@ impl Store {
         if let Some(old) = old {
             ensure!(old == encoded, "conflicting envelope for event hash");
         } else {
-            tx.execute("INSERT INTO events(space_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'pending')",params![network_id,envelope.hash,event.scope_id,event.author,event.sequence,encoded])?;
+            tx.execute("INSERT INTO events(space_id,resource_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?,'pending')",params![network_id,event.resource_id.as_str(),envelope.hash,event.scope_id,event.author,event.sequence,encoded])?;
         }
         rebuild_projections_from(&tx, network_id)?;
         tx.commit()?;
@@ -442,61 +444,14 @@ impl Store {
     }
     pub fn append_event(
         &mut self,
-        identity: &LocalIdentity,
-        network_id: &str,
-        scope_id: &str,
-        body: EventBody,
-        blobs: Vec<BlobRef>,
-        created_at_ms: i64,
+        _identity: &LocalIdentity,
+        _network_id: &str,
+        _scope_id: &str,
+        _body: EventBody,
+        _blobs: Vec<BlobRef>,
+        _created_at_ms: i64,
     ) -> Result<SignedEvent> {
-        let author = identity.node_id()?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authorize_node_from(&tx, network_id, &author, None)?;
-        let events = load_events_from(&tx, network_id)?;
-        let heads = heads_from_events(&events, scope_id);
-        for hash in closure_hashes(&events, &heads) {
-            let stored = events.get(&hash).context("scope has missing history")?;
-            ensure!(
-                stored.status == "ready",
-                "scope has incomplete or conflicting history"
-            );
-            for blob in &stored.event.blobs {
-                ensure!(
-                    has_blob_from(&tx, network_id, blob)?,
-                    "scope has missing blob content"
-                );
-            }
-        }
-        let sequence:u64=tx.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM events WHERE space_id=? AND scope_id=? AND author=?",params![network_id,scope_id,author],|r|r.get(0))?;
-        let previous: Option<String> = if sequence == 1 {
-            None
-        } else {
-            Some(tx.query_row("SELECT hash FROM events WHERE space_id=? AND scope_id=? AND author=? AND sequence=? AND status='ready'",params![network_id,scope_id,author,sequence-1],|r|r.get(0))?)
-        };
-        for blob in &blobs {
-            ensure!(
-                has_blob_from(&tx, network_id, blob)?,
-                "required blob missing"
-            );
-        }
-        let envelope = identity.sign_event(Event {
-            version: WIRE_VERSION,
-            network_id: network_id.into(),
-            scope_id: scope_id.into(),
-            author: author.clone(),
-            sequence,
-            previous,
-            parents: heads,
-            created_at_ms,
-            body,
-            blobs,
-        })?;
-        tx.execute("INSERT INTO events(space_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'ready')",params![network_id,envelope.hash,scope_id,author,sequence,serde_json::to_string(&envelope)?])?;
-        rebuild_projections_from(&tx, network_id)?;
-        tx.commit()?;
-        Ok(envelope)
+        anyhow::bail!("events require a signed invocation and current admission proof")
     }
     fn load_events(&self, network_id: &str) -> Result<BTreeMap<String, StoredEvent>> {
         load_events_from(&self.connection, network_id)
@@ -1706,7 +1661,7 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
-fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result<()> {
+pub(crate) fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result<()> {
     let mut events = load_events_from(connection, network_id)?;
     let mut author_sequences: BTreeMap<(String, String, u64), Vec<String>> = BTreeMap::new();
     for (hash, e) in &events {
@@ -1789,7 +1744,7 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
         let event = &stored.event;
         match &event.body {
             EventBody::ConversationCreated { title } => {
-                connection.execute("INSERT OR IGNORE INTO conversations(space_id,conversation_id,title) VALUES(?,?,?)",params![network_id,event.scope_id,title])?;
+                connection.execute("INSERT OR IGNORE INTO conversations(space_id,resource_id,conversation_id,title) VALUES(?,?,?,?)",params![network_id,event.resource_id.as_str(),event.scope_id,title])?;
             }
             EventBody::MessagePosted {
                 message_id,
@@ -1845,24 +1800,23 @@ fn authorize_node_from(
     connection: &Connection,
     network_id: &str,
     node_id: &str,
-    role: Option<NodeRole>,
+    _role: Option<NodeRole>,
 ) -> Result<NodeCertificate> {
-    let encoded: String = connection
-        .query_row(
-            "SELECT bundle FROM spaces WHERE space_id=?",
-            [network_id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .context("unknown network")?;
-    let state: NetworkState = serde_json::from_str(&encoded)?;
-    let view = state.project()?;
-    ensure!(
-        view.network_id == network_id,
-        "stored membership network mismatch"
-    );
-    view.authorize_node(node_id, role)?.certificate()
+    use vibeface_secure::authorization::{DeviceId, PublicKey, SpaceId};
+    let key: String = connection.query_row(
+        "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
+        params![network_id,node_id], |row| row.get(0),
+    )?;
+    ensure!(crate::crypto::fingerprint(&key)? == node_id, "Node certificate projection mismatch");
+    let policy = crate::identity::journal::PolicyState::load(connection)?;
+    let public_key = PublicKey::parse(&key)?;
+    let certificate = policy.verified().verify_service_device(
+        &SpaceId::parse(network_id)?, &DeviceId::from_key(&public_key), crate::runtime::now_ms() as u64,
+    )?;
+    ensure!(certificate.payload.public_key == public_key, "Node certificate key mismatch");
+    Ok(NodeCertificate { node_id:node_id.to_owned(), public_key:key, roles:vec![], revoked:false })
 }
+
 pub(crate) fn validate_operation_binding_from(
     connection: &Connection,
     request: &OperationRequest,

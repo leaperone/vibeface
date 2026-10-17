@@ -683,7 +683,7 @@ fn access(options: Access) -> Result<()> {
         };
         url = origin(&format!("http://{host}:{}", configuration.listen.port()))?;
     }
-    let entry = json!({"url":url.origin().ascii_serialization(),"node_id":identity.node_id()?,"capability":capability});
+    let entry = json!({"url":url.origin().ascii_serialization(),"node_id":identity.node_id()?,"node_public_key":identity.public_key_hex()?,"relay":false,"claim_nonce":capability,"capability":capability});
     if options.json {
         println!("{}", serde_json::to_string(&entry)?);
     } else {

@@ -2,7 +2,9 @@
 
 pub use vibeface_secure::membership::*;
 
+pub(crate) mod journal;
 pub mod local;
+pub mod policy;
 pub mod webauthn;
 
 #[cfg(test)]
