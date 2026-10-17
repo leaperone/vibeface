@@ -29,6 +29,12 @@ pub(crate) struct PreparedPolicyUpdate {
     additions: Vec<(ObjectHash, AcceptedEntry)>,
 }
 
+impl PreparedPolicyUpdate {
+    pub(crate) fn verified_after(&self) -> &VerifiedPolicySet {
+        &self.after.state
+    }
+}
+
 fn domain_key(domain: &PolicyDomain) -> (&'static str, &str) {
     match domain {
         PolicyDomain::Account(id) => ("account", id.as_str()),
