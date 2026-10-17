@@ -847,9 +847,21 @@ mod tests {
         let challenge = f
             .source
             .issue_freshness(&auth, CheckStage::RemoteRead, now())?;
+        let old_source_receipts =
+            f.source
+                .sign_current_receipts(&challenge, &f.network.node, now())?;
+        assert!(old_source_receipts.is_empty());
         assert!(
             f.source
-                .sign_current_receipts(&challenge, &f.network.node, now())
+                .authorize_read(
+                    &auth,
+                    &FreshnessProof {
+                        challenge: challenge.clone(),
+                        receipts: old_source_receipts,
+                    },
+                    &transport,
+                    now()
+                )
                 .is_err()
         );
         let receipts = f
