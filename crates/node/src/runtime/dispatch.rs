@@ -284,6 +284,7 @@ impl Runtime {
             space: session.space_id.clone(),
             resource: session.resource_id.clone(),
         };
+        let project_key = PublicKey::parse(&self.identity.public_key_hex()?)?;
         let snapshot = verification.run(|| {
             vibeface_secure::authorization::execution_handoff::verify_execution_session_snapshot(
                 &actual.receipt,
@@ -291,7 +292,7 @@ impl Runtime {
                 &wire.handoff.execution_resource,
                 &wire.handoff.target_public_key,
                 &binding,
-                &PublicKey::parse(&self.identity.public_key_hex()?)?,
+                &project_key,
                 now_ms() as u64,
             )
         })?;
@@ -587,7 +588,8 @@ impl Runtime {
                 drop(store);
                 self.publish_changed(space, &operation.request.conversation_id, "");
                 if operation.state.terminal() {
-                    self.complete_execution_dispatch(&operation).await?;
+                    self.complete_execution_dispatch(&operation, verification)
+                        .await?;
                 }
                 Ok(())
             }

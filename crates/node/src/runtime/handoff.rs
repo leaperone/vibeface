@@ -92,6 +92,7 @@ impl Runtime {
     pub(super) async fn complete_execution_dispatch(
         self: &Arc<Self>,
         operation: &OperationRecord,
+        verification: &SignatureVerification,
     ) -> Result<()> {
         ensure!(
             operation.state.terminal()
@@ -134,10 +135,11 @@ impl Runtime {
                 "delegated completion does not match its durable carrier"
             );
         }
-        self.finish(
+        self.finish_with_verification(
             &operation.request,
             operation.state.clone(),
             operation.result.clone(),
+            verification,
         )
         .await
     }
@@ -210,14 +212,18 @@ impl Runtime {
         wire: &SignedExecutionHandoff,
         transport: &TransportEvidence,
         stage: CheckStage,
+        verification: &SignatureVerification,
     ) -> Result<ExecutionHandoffFreshness> {
         let (challenge, receipts) = {
             let mut store = self.store.lock().await;
-            let now = now_ms() as u64;
-            let challenge = store.issue_execution_handoff_challenge(wire, transport, stage, now)?;
-            let receipts =
-                store.sign_execution_handoff_receipts(&challenge, &self.identity, now)?;
-            (challenge, receipts)
+            verification.run(|| {
+                let now = now_ms() as u64;
+                let challenge =
+                    store.issue_execution_handoff_challenge(wire, transport, stage, now)?;
+                let receipts =
+                    store.sign_execution_handoff_receipts(&challenge, &self.identity, now)?;
+                Ok::<_, anyhow::Error>((challenge, receipts))
+            })?
         };
         let (project, _) = original(wire)?;
         let receipts = self
@@ -394,7 +400,7 @@ impl Runtime {
             affected,
             "execution stopped for an explicit unknown-result resolution",
             stopped.is_ok(),
-            Some(verification),
+            verification,
         )
         .await?;
         let (stopped, _) = stopped?;
@@ -417,17 +423,15 @@ impl Runtime {
         if envelope["type"] == "execution_handoff_resolution_receipts" {
             let challenge: ExecutionHandoffResolutionChallenge =
                 serde_json::from_value(envelope["challenge"].clone())?;
-            return Ok(json!({"receipts":self.store.lock().await
-                .sign_execution_handoff_resolution_receipts(
-                    &challenge, &self.identity, now_ms() as u64,
-                )?}));
+            let store = self.store.lock().await;
+            return verification.run(|| Ok(json!({"receipts":store
+                .sign_execution_handoff_resolution_receipts(&challenge, &self.identity, now_ms() as u64)?})));
         }
         if envelope["type"] == "execution_handoff_receipts" {
             let challenge: ExecutionHandoffChallenge =
                 serde_json::from_value(envelope["challenge"].clone())?;
-            return Ok(
-                json!({"receipts":self.store.lock().await.sign_execution_handoff_receipts(&challenge, &self.identity, now_ms() as u64)?}),
-            );
+            let store = self.store.lock().await;
+            return verification.run(|| Ok(json!({"receipts":store.sign_execution_handoff_receipts(&challenge, &self.identity, now_ms() as u64)?})));
         }
         let _work = self.maintenance.enter()?;
         let wire: SignedExecutionHandoff = serde_json::from_value(envelope["handoff"].clone())?;
@@ -447,50 +451,55 @@ impl Runtime {
         );
         let execution = wire.handoff.execution_resource.space.as_str();
         let transport = TransportEvidence::VerifiedPeer { origin };
-        let existing = self
-            .store
-            .lock()
-            .await
-            .find_execution_handoff_by_original(&project, &operation)?
-            .is_some();
+        let existing = {
+            let store = self.store.lock().await;
+            verification
+                .run(|| store.find_execution_handoff_by_original(&project, &operation))?
+                .is_some()
+        };
         let value = if existing || envelope["type"] == "execution_handoff_status" {
             let proof = self
-                .handoff_freshness(&wire, &transport, CheckStage::RemoteRead)
+                .handoff_freshness(&wire, &transport, CheckStage::RemoteRead, verification)
                 .await?;
             let store = self.store.lock().await;
-            let admitted = store.execution_handoff_authorization(
-                execution,
-                project.space.as_str(),
-                &operation,
-                now_ms() as u64,
-            )?;
-            ensure!(
-                admitted.wire() == &wire,
-                "handoff status changed its original signed request"
-            );
-            store.authorize_execution_handoff_read(&admitted, &proof, now_ms() as u64)?;
-            store.execution_handoff_status(
-                &self.identity,
-                execution,
-                project.space.as_str(),
-                &operation,
-                now_ms() as u64,
-            )?
+            verification.run(|| {
+                let admitted = store.execution_handoff_authorization(
+                    execution,
+                    project.space.as_str(),
+                    &operation,
+                    now_ms() as u64,
+                )?;
+                ensure!(
+                    admitted.wire() == &wire,
+                    "handoff status changed its original signed request"
+                );
+                store.authorize_execution_handoff_read(&admitted, &proof, now_ms() as u64)?;
+                store.execution_handoff_status(
+                    &self.identity,
+                    execution,
+                    project.space.as_str(),
+                    &operation,
+                    now_ms() as u64,
+                )
+            })?
         } else {
             ensure!(
                 envelope["type"] == "execution_handoff_submit",
                 "unsupported execution handoff operation"
             );
             let proof = self
-                .handoff_freshness(&wire, &transport, CheckStage::Admit)
+                .handoff_freshness(&wire, &transport, CheckStage::Admit, verification)
                 .await?;
-            self.store.lock().await.accept_execution_handoff(
-                &self.identity,
-                &wire,
-                &proof,
-                &transport,
-                now_ms() as u64,
-            )?
+            let mut store = self.store.lock().await;
+            verification.run(|| {
+                store.accept_execution_handoff(
+                    &self.identity,
+                    &wire,
+                    &proof,
+                    &transport,
+                    now_ms() as u64,
+                )
+            })?
         };
         if envelope["type"] == "execution_handoff_submit" && value.state == OperationState::Accepted
         {
@@ -510,9 +519,9 @@ impl Runtime {
         value: &AdmittedExecutionHandoff,
         mut state: OperationState,
         mut result: Value,
+        verification: &SignatureVerification,
     ) -> Result<()> {
         let _completion = self.handoff_resolution_lock.lock().await;
-        let verification = SignatureVerification::new();
         let current = {
             let store = self.store.lock().await;
             verification.run(|| {
@@ -541,7 +550,7 @@ impl Runtime {
                 cleanup_affected = affected;
             }
         }
-        self.persist_handoff_result(&current, state.clone(), result, &verification)
+        self.persist_handoff_result(&current, state.clone(), result, verification)
             .await?;
         if state == OperationState::Unknown {
             let mut affected = cleanup_affected;
@@ -555,7 +564,7 @@ impl Runtime {
                 affected,
                 "execution outcome requires reconciliation",
                 stopped.is_ok(),
-                Some(&verification),
+                verification,
             )
             .await?;
             stopped?;
@@ -598,22 +607,28 @@ impl Runtime {
 
     async fn execute_handoff(self: Arc<Self>, accepted: AdmittedExecutionHandoff) -> Result<()> {
         let _work = self.maintenance.enter()?;
+        let verification = SignatureVerification::new();
         let preparation = async {
             ensure!(
                 self.config.roles.contains(&NodeRole::Executor),
                 "executor capability is disabled"
             );
-            let auth = self.store.lock().await.execution_handoff_authorization(
-                accepted.execution_context.execution_space_id.as_str(),
-                accepted.execution_context.space_id.as_str(),
-                &accepted.original_request.operation_id,
-                now_ms() as u64,
-            )?;
+            let auth = {
+                let store = self.store.lock().await;
+                verification.run(|| {
+                    store.execution_handoff_authorization(
+                        accepted.execution_context.execution_space_id.as_str(),
+                        accepted.execution_context.space_id.as_str(),
+                        &accepted.original_request.operation_id,
+                        now_ms() as u64,
+                    )
+                })?
+            };
             let transport = TransportEvidence::VerifiedPeer {
                 origin: auth.wire().invocation.payload.device.clone(),
             };
             let proof = self
-                .handoff_freshness(auth.wire(), &transport, CheckStage::Start)
+                .handoff_freshness(auth.wire(), &transport, CheckStage::Start, &verification)
                 .await?;
             let session = accepted
                 .execution_session
@@ -625,30 +640,36 @@ impl Runtime {
             for resource in &accepted.original_request.resources {
                 self.allowed_path(resource)?;
             }
-            let (value, fresh, _) = self.store.lock().await.claim_execution_handoff(
-                &self.identity,
-                &auth,
-                &proof,
-                now_ms() as u64,
-            )?;
+            let (value, fresh, _) = {
+                let mut store = self.store.lock().await;
+                verification.run(|| {
+                    store.claim_execution_handoff(&self.identity, &auth, &proof, now_ms() as u64)
+                })?
+            };
             Ok::<_, anyhow::Error>((value, fresh, kind, action))
         }
         .await;
         let (value, fresh, kind, action) = match preparation {
             Ok(value) => value,
             Err(error) => {
-                let current = self.store.lock().await.execution_handoff_status(
-                    &self.identity,
-                    accepted.execution_context.execution_space_id.as_str(),
-                    accepted.execution_context.space_id.as_str(),
-                    &accepted.original_request.operation_id,
-                    now_ms() as u64,
-                )?;
+                let current = {
+                    let store = self.store.lock().await;
+                    verification.run(|| {
+                        store.execution_handoff_status(
+                            &self.identity,
+                            accepted.execution_context.execution_space_id.as_str(),
+                            accepted.execution_context.space_id.as_str(),
+                            &accepted.original_request.operation_id,
+                            now_ms() as u64,
+                        )
+                    })?
+                };
                 if current.state == OperationState::Accepted {
                     self.finish_handoff(
                         &current,
                         OperationState::Rejected,
                         json!({"error":format!("{error:#}")}),
+                        &verification,
                     )
                     .await?;
                 }
@@ -676,19 +697,24 @@ impl Runtime {
             resource: context.resource_id.clone(),
         };
         let operation = context.operation_id.clone();
+        let native_verification = verification.clone();
         let result = self
             .engine
             .execute_authorized(&context, &native, action.clone(), move |id| async move {
-                store.lock().await.persist_execution_handoff_native(
-                    execution.as_str(),
-                    &project,
-                    &operation,
-                    &id,
-                    now_ms() as u64,
-                )?;
+                let mut store = store.lock().await;
+                native_verification.run(|| {
+                    store.persist_execution_handoff_native(
+                        execution.as_str(),
+                        &project,
+                        &operation,
+                        &id,
+                        now_ms() as u64,
+                    )
+                })?;
                 Ok(())
             })
             .await;
+        let completion_verification = SignatureVerification::new();
         match result {
             Ok(result)
                 if native.executor == ExecutorKind::Codex
@@ -721,6 +747,7 @@ impl Runtime {
                                 &value,
                                 state,
                                 provider_result(observed, Some(native)),
+                                &completion_verification,
                             )
                             .await?;
                         }
@@ -732,6 +759,7 @@ impl Runtime {
                     &value,
                     OperationState::Succeeded,
                     provider_result(result.result, result.native_session_id.as_deref()),
+                    &completion_verification,
                 )
                 .await?
             }
@@ -747,6 +775,7 @@ impl Runtime {
                         json!({"error":error.message}),
                         error.native_session_id.as_deref(),
                     ),
+                    &completion_verification,
                 )
                 .await?
             }
@@ -764,42 +793,67 @@ impl Runtime {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                let status = node.store.lock().await.execution_handoff_status(
-                    &node.identity,
-                    value.execution_context.execution_space_id.as_str(),
-                    context.space_id.as_str(),
-                    &context.operation_id,
-                    now_ms() as u64,
-                );
+                let verification = SignatureVerification::new();
+                let status = {
+                    let store = node.store.lock().await;
+                    verification.run(|| {
+                        store.execution_handoff_status(
+                            &node.identity,
+                            value.execution_context.execution_space_id.as_str(),
+                            context.space_id.as_str(),
+                            &context.operation_id,
+                            now_ms() as u64,
+                        )
+                    })
+                };
                 match status {
                     Ok(current) if current.state.terminal() => break,
                     Ok(current) if current.state == OperationState::Running => {}
                     _ => {
                         let _ = node
-                            .stop_handoff(&value, "execution outcome requires reconciliation")
+                            .stop_handoff(
+                                &value,
+                                "execution outcome requires reconciliation",
+                                &verification,
+                            )
                             .await;
                         break;
                     }
                 }
                 let renewal = async {
-                    let auth = node.store.lock().await.execution_handoff_authorization(
-                        value.execution_context.execution_space_id.as_str(),
-                        context.space_id.as_str(),
-                        &context.operation_id,
-                        now_ms() as u64,
-                    )?;
+                    let auth = {
+                        let store = node.store.lock().await;
+                        verification.run(|| {
+                            store.execution_handoff_authorization(
+                                value.execution_context.execution_space_id.as_str(),
+                                context.space_id.as_str(),
+                                &context.operation_id,
+                                now_ms() as u64,
+                            )
+                        })?
+                    };
                     let transport = TransportEvidence::VerifiedPeer {
                         origin: auth.wire().invocation.payload.device.clone(),
                     };
                     let proof = node
-                        .handoff_freshness(auth.wire(), &transport, CheckStage::Renew)
+                        .handoff_freshness(
+                            auth.wire(),
+                            &transport,
+                            CheckStage::Renew,
+                            &verification,
+                        )
                         .await?;
-                    let deadline = node.store.lock().await.renew_execution_handoff(
-                        &node.identity,
-                        &auth,
-                        &proof,
-                        now_ms() as u64,
-                    )?;
+                    let deadline = {
+                        let mut store = node.store.lock().await;
+                        verification.run(|| {
+                            store.renew_execution_handoff(
+                                &node.identity,
+                                &auth,
+                                &proof,
+                                now_ms() as u64,
+                            )
+                        })?
+                    };
                     node.engine.renew_operation(&context, deadline).await?;
                     Ok::<_, anyhow::Error>(deadline)
                 }
@@ -811,6 +865,7 @@ impl Runtime {
                             .stop_handoff(
                                 &value,
                                 &format!("authorization lease could not renew: {error:#}"),
+                                &verification,
                             )
                             .await;
                         break;
@@ -825,6 +880,7 @@ impl Runtime {
         self: &Arc<Self>,
         value: &AdmittedExecutionHandoff,
         reason: &str,
+        verification: &SignatureVerification,
     ) -> Result<()> {
         let _completion = self.handoff_resolution_lock.lock().await;
         let context = context(value);
@@ -834,7 +890,7 @@ impl Runtime {
             affected.extend(operations.iter().cloned());
         }
         affected.push(context.operation_id.clone());
-        self.mark_fenced_operations(&context, affected, reason, stopped.is_ok(), None)
+        self.mark_fenced_operations(&context, affected, reason, stopped.is_ok(), verification)
             .await?;
         stopped.map(|_| ())
     }
@@ -845,9 +901,8 @@ impl Runtime {
         mut affected: Vec<String>,
         reason: &str,
         confirmed: bool,
-        verification: Option<&SignatureVerification>,
+        verification: &SignatureVerification,
     ) -> Result<()> {
-        let verification = verification.cloned().unwrap_or_default();
         let project = ResourceRef {
             space: context.space_id.clone(),
             resource: context.resource_id.clone(),
@@ -878,7 +933,7 @@ impl Runtime {
                         &current,
                         OperationState::Unknown,
                         json!({"error":reason,"cancellation_confirmed":confirmed}),
-                        &verification,
+                        verification,
                     )
                     .await?;
                 }
@@ -905,10 +960,11 @@ impl Runtime {
                 direct
             };
             if let Some(direct) = direct {
-                self.finish(
+                self.finish_with_verification(
                     &direct.request,
                     OperationState::Unknown,
                     json!({"error":reason,"cancellation_confirmed":confirmed}),
+                    verification,
                 )
                 .await?;
             }
@@ -922,21 +978,26 @@ impl Runtime {
         project: ResourceRef,
         operation: &str,
     ) -> Result<()> {
-        let scope = self
-            .store
-            .lock()
-            .await
-            .find_execution_handoff_by_original(&project, operation)?;
+        let verification = SignatureVerification::new();
+        let scope = {
+            let store = self.store.lock().await;
+            verification.run(|| store.find_execution_handoff_by_original(&project, operation))?
+        };
         let Some(scope) = scope else {
             return Ok(());
         };
-        let value = self.store.lock().await.execution_handoff_status(
-            &self.identity,
-            scope.execution_space_id.as_str(),
-            project.space.as_str(),
-            operation,
-            now_ms() as u64,
-        )?;
+        let value = {
+            let store = self.store.lock().await;
+            verification.run(|| {
+                store.execution_handoff_status(
+                    &self.identity,
+                    scope.execution_space_id.as_str(),
+                    project.space.as_str(),
+                    operation,
+                    now_ms() as u64,
+                )
+            })?
+        };
         if value.state != OperationState::Running || value.original_request.action["type"] != "send"
         {
             return Ok(());
@@ -950,7 +1011,11 @@ impl Runtime {
         let event = &envelope["event"];
         if event["method"] == "bridge.codex_disconnected" {
             return self
-                .stop_handoff(&value, "executor disconnected; reconcile before retrying")
+                .stop_handoff(
+                    &value,
+                    "executor disconnected; reconcile before retrying",
+                    &verification,
+                )
                 .await;
         }
         let session = value
@@ -986,6 +1051,7 @@ impl Runtime {
                 &value,
                 state,
                 provider_result(event["params"]["turn"].clone(), native),
+                &verification,
             )
             .await?;
         }
@@ -999,9 +1065,10 @@ impl Runtime {
             .await
             .load_execution_handoffs_for_recovery(&self.identity, now_ms() as u64)?;
         for value in values {
+            let verification = SignatureVerification::new();
             if value.state == OperationState::Unknown {
                 if let Err(error) = self
-                    .stop_handoff(&value, "unresolved execution after restart")
+                    .stop_handoff(&value, "unresolved execution after restart", &verification)
                     .await
                 {
                     tracing::warn!(%error, "unresolved handoff could not be fenced after restart");
