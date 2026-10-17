@@ -1,6 +1,6 @@
-//! Node-local storage and shared signed personal-network membership.
+//! Node-local account, space and authorization storage.
 
-pub use vibeface_secure::membership::*;
+pub use vibeface_secure::membership::{NodeCertificate, NodeRole};
 
 pub(crate) mod admission;
 pub(crate) mod enrollment_store;

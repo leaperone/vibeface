@@ -32,17 +32,6 @@ impl LocalIdentity {
     pub fn node_id(&self) -> Result<NodeId> {
         fingerprint(&self.public_key_hex()?)
     }
-    pub fn network_id(&self) -> Result<NetworkId> {
-        self.node_id()
-    }
-    pub fn certificate(&self, roles: Vec<NodeRole>) -> Result<NodeCertificate> {
-        Ok(NodeCertificate {
-            node_id: self.node_id()?,
-            public_key: self.public_key_hex()?,
-            roles,
-            revoked: false,
-        })
-    }
     pub fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String> {
         let message = payload_message(domain, payload)?;
         Ok(hex::encode(self.key()?.sign(&message).to_bytes()))
@@ -71,88 +60,6 @@ impl LocalIdentity {
             signature,
         })
     }
-    #[cfg(test)]
-    fn fixture_root(&self) -> Self {
-        Self {
-            secret_key_hex: digest(
-                format!("vibeface:network-fixture-root:v1:{}", self.secret_key_hex).as_bytes(),
-            ),
-        }
-    }
-    #[cfg(test)]
-    pub fn fixture_network_id(&self) -> Result<String> {
-        self.fixture_root().network_id()
-    }
-    #[cfg(test)]
-    pub fn sign_network_fixture(
-        &self,
-        revision: u64,
-        nodes: Vec<NodeCertificate>,
-    ) -> Result<crate::identity::NetworkState> {
-        use crate::identity::{
-            Genesis, HistoricalNode, IdentityKind, Member, NetworkState, RootCheckpoint,
-        };
-
-        let mut admin_seed = b"vibeface:network-fixture-admin:v1:".to_vec();
-        admin_seed.extend_from_slice(self.secret_key_hex.as_bytes());
-        let admin_secret = Sha256::digest(admin_seed);
-        let admin = LocalIdentity {
-            secret_key_hex: hex::encode(admin_secret),
-        };
-        let admin_member = Member::client(&admin, "fixture-admin", true)?;
-        let root = self.fixture_root();
-        let genesis = Genesis::create(&root, vec![admin_member.clone()])?;
-        let history = nodes
-            .iter()
-            .map(|node| HistoricalNode {
-                subject_id: node.node_id.clone(),
-                public_key: node.public_key.clone(),
-            })
-            .collect();
-        let mut members = vec![admin_member];
-        for certificate in nodes.into_iter().filter(|certificate| !certificate.revoked) {
-            let node_id = certificate.node_id;
-            let public_key = certificate.public_key;
-            let mut roles = certificate.roles;
-            if roles.iter().any(|role| {
-                matches!(
-                    role,
-                    NodeRole::Gateway | NodeRole::Scheduler | NodeRole::Executor
-                )
-            }) && !roles.contains(&NodeRole::Replica)
-            {
-                roles.push(NodeRole::Replica);
-            }
-            roles.sort_by_key(node_role_key);
-            let member = Member {
-                subject_id: node_id.clone(),
-                public_key,
-                kind: IdentityKind::Node,
-                name: format!("node-{node_id}"),
-                node_roles: roles,
-                manage: false,
-            };
-            member.validate()?;
-            members.push(member);
-        }
-        let mut state = NetworkState::new(genesis)?;
-        let epoch = revision
-            .checked_add(1)
-            .context("network fixture revision overflow")?;
-        state.recover(RootCheckpoint::create_with_history(
-            &root, epoch, members, history,
-        )?)?;
-        Ok(state)
-    }
-}
-impl vibeface_secure::membership::MembershipSigner for LocalIdentity {
-    fn public_key_hex(&self) -> Result<String> {
-        LocalIdentity::public_key_hex(self)
-    }
-
-    fn sign_payload(&self, domain: &str, payload: &[u8]) -> Result<String> {
-        LocalIdentity::sign_payload(self, domain, payload)
-    }
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -175,16 +82,6 @@ fn verify(public_key: &str, signature: &str, message: &[u8]) -> Result<()> {
     let signature = Signature::from_slice(&hex::decode(signature)?)?;
     key.verify_strict(message, &signature)
         .context("invalid signature")
-}
-#[cfg(test)]
-fn node_role_key(role: &NodeRole) -> &'static str {
-    match role {
-        NodeRole::Gateway => "gateway",
-        NodeRole::Relay => "relay",
-        NodeRole::Replica => "replica",
-        NodeRole::Scheduler => "scheduler",
-        NodeRole::Executor => "executor",
-    }
 }
 pub fn verify_signed_event(
     network_id: &str,
@@ -312,39 +209,6 @@ mod tests {
     #[test]
     fn signatures_pin_identity_and_original_bytes() -> Result<()> {
         let owner = LocalIdentity::generate();
-        let revoked = LocalIdentity::generate();
-        let mut revoked_certificate = revoked.certificate(vec![NodeRole::Relay])?;
-        revoked_certificate.revoked = true;
-        let state = owner.sign_network_fixture(
-            1,
-            vec![
-                owner.certificate(vec![NodeRole::Gateway])?,
-                revoked_certificate,
-            ],
-        )?;
-        let view = state.project()?;
-        assert_eq!(view.network_id, owner.fixture_network_id()?);
-        assert!(
-            view.authorize_node(&owner.node_id()?, Some(NodeRole::Replica))
-                .is_ok()
-        );
-        assert!(view.authorize_node(&revoked.node_id()?, None).is_err());
-        let all = owner.sign_network_fixture(
-            1,
-            vec![owner.certificate(vec![
-                NodeRole::Scheduler,
-                NodeRole::Executor,
-                NodeRole::Relay,
-                NodeRole::Gateway,
-            ])?],
-        )?;
-        assert!(
-            all.project()?
-                .authorize_node(&owner.node_id()?, Some(NodeRole::Executor))
-                .is_ok()
-        );
-        let later = owner.sign_network_fixture(2, vec![])?;
-        assert_eq!(state.genesis, later.genesis);
         let signed = owner.sign_payload("peer-request", b"challenge")?;
         verify_payload(
             &owner.public_key_hex()?,
@@ -362,7 +226,7 @@ mod tests {
             .is_err()
         );
         assert!(owner.sign_payload("bad:domain", b"challenge").is_err());
-        let space_id = format!("spc2_{}", owner.fixture_network_id()?);
+        let space_id = format!("spc2_{}", owner.node_id()?);
         let resource_id = vibeface_secure::authorization::ResourceId::from_bytes([7; 32]);
         let body = Event {
             version: WIRE_VERSION,
@@ -386,7 +250,7 @@ mod tests {
         old_body.version = 1;
         assert!(owner.sign_event(old_body).is_err());
         let mut old_space = body.clone();
-        old_space.network_id = owner.fixture_network_id()?;
+        old_space.network_id = owner.node_id()?;
         assert!(owner.sign_event(old_space).is_err());
         let mut encoded = serde_json::to_value(&body)?;
         assert_eq!(encoded["space_id"], space_id);
