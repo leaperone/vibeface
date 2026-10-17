@@ -503,97 +503,217 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn unstarted_followup_survives_reopen_and_claimed_attempt_is_not_repeated() -> Result<()>
     {
-        let (network, node) = runtime_fixture().await?;
-        let manager = agent(&network, &node).await?;
-        let request =
-            queued_with_manager(&network, &node, "followup", "codex", Some(&manager)).await?;
-        task(&network, &node, "followup", true).await?;
-        {
-            let mut store = node.store.lock().await;
-            let value = store
-                .local_value(
-                    network.space.as_str(),
-                    &crate::scheduler::key(
-                        "invocation",
-                        "conversation",
-                        &manager.sdk_session.session_id,
-                    ),
-                )?
-                .unwrap();
-            let mut invocation: crate::scheduler::Invocation = serde_json::from_value(value)?;
-            invocation.state = crate::scheduler::InvocationState::Completed;
-            crate::scheduler::finish(
-                &mut store,
-                network.space.as_str(),
-                "conversation",
-                &invocation,
-            )?;
-        }
-        claim(&network, &node, &request).await?;
-        node.finish(
-            &request,
-            OperationState::Succeeded,
-            json!({"result":"done"}),
-        )
-        .await?;
-        let result=node.store.lock().await.context(network.space.as_str(),"conversation",&[])?.events.into_iter().find(|event|matches!(&event.body,EventBody::ExecutionObserved{operation_id,status,..} if operation_id=="followup" && status=="succeeded")).unwrap();
-        let hash = crypto::digest(&serde_json::to_vec(&result)?);
-        assert!(
-            node.store
+        let mut phase = "create fixture";
+        let outcome: Result<()> = async {
+            let (network, mut node) = runtime_fixture().await?;
+            phase = "admit the original Manager";
+            let manager = agent(&network, &node).await?;
+            phase = "queue the Service execution";
+            let request =
+                queued_with_manager(&network, &node, "followup", "codex", Some(&manager)).await?;
+            task(&network, &node, "followup", true).await?;
+            let settings = config::ManagerSettings {
+                provider: "codex_sdk".into(),
+                model: "unused".into(),
+            };
+            Arc::get_mut(&mut node)
+                .context("fixture unexpectedly shares Runtime")?
+                .config
+                .manager = Some(settings.clone());
+            phase = "claim the original execution";
+            claim(&network, &node, &request).await?;
+            phase = "record result while original Manager is busy";
+            node.finish(
+                &request,
+                OperationState::Succeeded,
+                json!({"result":"done"}),
+            )
+            .await?;
+            let result = node
+                .store
                 .lock()
                 .await
-                .local_value(network.space.as_str(), "completion:followup")?
-                .is_some()
-        );
-        drop(node);
-        let mut cfg = Config::load(&network.directory)?;
-        cfg.manager = Some(config::ManagerSettings {
-            provider: "codex_sdk".into(),
-            model: "unused".into(),
-        });
-        cfg.save(&network.directory)?;
-        let node = Arc::new(Runtime::open(&network.directory).await?);
-        node.flush_completions(network.space.as_str()).await?;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if node
-                    .store
-                    .lock()
-                    .await
-                    .continuation(network.space.as_str(), &hash, "v2")
-                    .unwrap()
-                    .is_some_and(|record| record.state != "claimed")
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
+                .context(network.space.as_str(), "conversation", &[])?
+                .events
+                .into_iter()
+                .find(|event| {
+                    matches!(&event.body, EventBody::ExecutionObserved { operation_id, status, .. }
+                if operation_id == "followup" && status == "succeeded")
+                })
+                .context("followup result is missing")?;
+            let hash = crypto::digest(&serde_json::to_vec(&result)?);
+            {
+                let mut store = node.store.lock().await;
+                assert!(
+                    store
+                        .continuation(network.space.as_str(), &hash, "v2")?
+                        .is_none(),
+                    "busy Manager consumed a continuation"
+                );
+                assert!(
+                    store
+                        .local_value(network.space.as_str(), "completion:followup")?
+                        .is_some()
+                );
+                let value = store
+                    .local_value(
+                        network.space.as_str(),
+                        &crate::scheduler::key(
+                            "invocation",
+                            "conversation",
+                            &manager.sdk_session.session_id,
+                        ),
+                    )?
+                    .context("original Manager claim is missing")?;
+                let mut invocation: crate::scheduler::Invocation = serde_json::from_value(value)?;
+                assert!(invocation.state == crate::scheduler::InvocationState::Running);
+                invocation.state = crate::scheduler::InvocationState::Completed;
+                crate::scheduler::finish(
+                    &mut store,
+                    network.space.as_str(),
+                    "conversation",
+                    &invocation,
+                )?;
             }
-        })
-        .await?;
-        let first = node
-            .store
-            .lock()
-            .await
-            .continuation(network.space.as_str(), &hash, "v2")?
-            .context("followup claim missing")?;
-        node.flush_completions(network.space.as_str()).await?;
-        assert_eq!(
-            node.store
+            drop(node);
+            let mut cfg = Config::load(&network.directory)?;
+            cfg.manager = Some(settings.clone());
+            cfg.save(&network.directory)?;
+            phase = "reopen before continuation";
+            let node = Arc::new(Runtime::open(&network.directory).await?);
+            phase = "admit and drain the continuation";
+            node.flush_completions(network.space.as_str()).await?;
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if node
+                        .store
+                        .lock()
+                        .await
+                        .continuation(network.space.as_str(), &hash, "v2")
+                        .unwrap()
+                        .is_some_and(|record| {
+                            matches!(record.state.as_str(), "completed" | "failed" | "unknown")
+                        })
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            let first = node
+                .store
                 .lock()
                 .await
                 .continuation(network.space.as_str(), &hash, "v2")?
-                .unwrap(),
-            first
-        );
-        assert!(
-            node.store
-                .lock()
-                .await
-                .local_value(network.space.as_str(), "completion:followup")?
-                .is_none()
-        );
-        assert!(node._codex_process.lock().await.is_none());
-        Ok(())
+                .context("followup claim missing")?;
+            assert_eq!(
+                first.state, "failed",
+                "a pre-SDK failure became an uncertain execution"
+            );
+            assert_eq!(
+                crate::scheduler::status(&node, network.space.as_str(), "conversation", &hash)
+                    .await?["state"],
+                "failed"
+            );
+            node.flush_completions(network.space.as_str()).await?;
+            assert_eq!(
+                node.store
+                    .lock()
+                    .await
+                    .continuation(network.space.as_str(), &hash, "v2")?
+                    .unwrap(),
+                first
+            );
+            let session = {
+                let mut store = node.store.lock().await;
+                assert!(
+                    store
+                        .local_value(network.space.as_str(), "completion:followup")?
+                        .is_none()
+                );
+                assert_eq!(
+                    store.connection.query_row(
+                        "SELECT count(*) FROM accepted_authorizations WHERE action='agent_start'",
+                        [],
+                        |row| row.get::<_, u64>(0)
+                    )?,
+                    2
+                );
+                network.message(
+                    &mut store,
+                    "conversation",
+                    "new context after the admitted continuation",
+                )?;
+                store.agent_grant(
+                    network.space.as_str(),
+                    "conversation",
+                    &manager.service,
+                    &SessionRef {
+                        target: manager.device.clone(),
+                        session_id: hash.clone(),
+                    },
+                    &hash,
+                    now_ms() as u64,
+                )?
+            };
+            phase = "retry the original signed Manager snapshot";
+            let retried = node
+                .claim_manager(
+                    &session,
+                    &hash,
+                    crate::scheduler::boot_id(),
+                    &crypto::digest(&serde_json::to_vec(&settings)?),
+                )
+                .await?;
+            assert!(
+                !retried.fresh,
+                "the original continuation was admitted again after context advanced"
+            );
+            assert!(retried.invocation.state != crate::scheduler::InvocationState::Running);
+            let mut another_task = network.body("create_task", "conversation");
+            another_task["task_id"] = json!("unrelated");
+            assert!(node.authorize_agent(&session, another_task).await.is_err());
+            phase = "create the other legitimate task session";
+            let other = queued(&network, &node, "another-task", "codex").await?;
+            let mut another_session = network.body("session", "conversation");
+            another_session["target_node"] = json!(request.target_node);
+            another_session["session_id"] = json!(other.session_id);
+            another_session["sdk_session"] = json!(session.sdk_session);
+            another_session["parent_invocation"] = json!(session.parent_invocation);
+            assert!(
+                node.authorize_agent(&session, another_session)
+                    .await
+                    .is_err()
+            );
+            phase = "cancel the task";
+            change_task(&network, &node, "followup", "cancelled").await?;
+            assert!(
+                node.store
+                    .lock()
+                    .await
+                    .refresh_agent_session(&session, now_ms() as u64)
+                    .is_err()
+            );
+            phase = "revoke the original account grant";
+            network.revoke_client(&mut *node.store.lock().await)?;
+            drop(node);
+            phase = "reopen signed history after revocation";
+            let reopened = Runtime::open(&network.directory).await?;
+            assert_eq!(
+                reopened
+                    .store
+                    .lock()
+                    .await
+                    .continuation(network.space.as_str(), &hash, "v2")?
+                    .unwrap(),
+                first
+            );
+            assert!(reopened._codex_process.lock().await.is_none());
+            Ok(())
+        }
+        .await;
+        outcome.with_context(|| format!("continuation regression failed during: {phase}"))
     }
 
     #[tokio::test]
@@ -4964,7 +5084,24 @@ impl Runtime {
                     Ok(value) if value["state"] == "completed" => ("completed", value),
                     Ok(value) if value["state"] == "failed" => ("failed", value),
                     Ok(value) => ("unknown", value),
-                    Err(error) => ("unknown", json!({"error":format!("{error:#}")})),
+                    Err(error) => {
+                        let state = crate::scheduler::status(
+                            &node,
+                            &request.network_id,
+                            &request.conversation_id,
+                            &source,
+                        )
+                        .await;
+                        let confirmed_failed = state.is_ok_and(|value| value["state"] == "failed");
+                        (
+                            if confirmed_failed {
+                                "failed"
+                            } else {
+                                "unknown"
+                            },
+                            json!({"error":format!("{error:#}")}),
+                        )
+                    }
                 };
                 if let Ok(target) = node.identity.node_id() {
                     let _ = node.store.lock().await.finish_continuation(

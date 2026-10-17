@@ -193,44 +193,73 @@ pub(crate) async fn run_admitted(
     trigger: String,
     admitted: Option<crate::identity::admission::ManagerAdmission>,
 ) -> Result<Value> {
-    let _work = node.maintenance.enter()?;
-    let access = node
-        .store
-        .lock()
-        .await
-        .refresh_agent_session(&access, crate::runtime::now_ms() as u64)?;
-    ensure!(
-        access.conversation_id == conversation,
-        "conversation access denied"
-    );
-    let settings = node
-        .config
-        .manager
-        .clone()
-        .context("this Node has no configured management SDK")?;
-    let kind = match settings.provider.as_str() {
-        "cursor_sdk" => ManagerKind::CursorSdk,
-        "codex_sdk" => ManagerKind::CodexSdk,
-        _ => anyhow::bail!("unknown management SDK"),
+    let prepared = async {
+        let work = node.maintenance.enter()?;
+        let access = node
+            .store
+            .lock()
+            .await
+            .refresh_agent_session(&access, crate::runtime::now_ms() as u64)?;
+        ensure!(
+            access.conversation_id == conversation,
+            "conversation access denied"
+        );
+        let settings = node
+            .config
+            .manager
+            .clone()
+            .context("this Node has no configured management SDK")?;
+        let kind = match settings.provider.as_str() {
+            "cursor_sdk" => ManagerKind::CursorSdk,
+            "codex_sdk" => ManagerKind::CodexSdk,
+            _ => anyhow::bail!("unknown management SDK"),
+        };
+        let sdk_config = digest(&serde_json::to_vec(&settings)?);
+        let network = access.space_id.as_str();
+        let (context, project_root) = {
+            let store = node.store.lock().await;
+            let context = store.context(network, &conversation, &[])?;
+            ensure!(
+                context.missing.is_complete(),
+                "conversation has missing or conflicting history"
+            );
+            ensure!(
+                context
+                    .events
+                    .iter()
+                    .all(|event| event.resource_id == access.resource_id),
+                "manager context contains another resource"
+            );
+            (context, store.resource_root(network, &access.resource_id)?)
+        };
+        Ok::<_, anyhow::Error>((
+            work,
+            access,
+            settings,
+            kind,
+            sdk_config,
+            context,
+            project_root,
+        ))
+    }
+    .await;
+    let (_work, access, settings, kind, sdk_config, context, project_root) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(admission) = admitted.as_ref().filter(|admission| admission.fresh) {
+                let mut invocation = admission.invocation.clone();
+                invocation.state = InvocationState::Failed;
+                finish(
+                    &mut *node.store.lock().await,
+                    access.space_id.as_str(),
+                    &conversation,
+                    &invocation,
+                )?;
+            }
+            return Err(error);
+        }
     };
-    let sdk_config = digest(&serde_json::to_vec(&settings)?);
     let network = &access.space_id.to_string();
-    let (context, project_root) = {
-        let store = node.store.lock().await;
-        let context = store.context(network, &conversation, &[])?;
-        ensure!(
-            context.missing.is_complete(),
-            "conversation has missing or conflicting history"
-        );
-        ensure!(
-            context
-                .events
-                .iter()
-                .all(|event| event.resource_id == access.resource_id),
-            "manager context contains another resource"
-        );
-        (context, store.resource_root(network, &access.resource_id)?)
-    };
     let admission = match admitted {
         Some(admission) => admission,
         None => {
@@ -625,6 +654,47 @@ mod tests {
             &trigger.hash,
             crate::runtime::now_ms() as u64,
         )
+    }
+
+    #[tokio::test]
+    async fn admitted_manager_preflight_failure_is_terminal_before_sdk_start() -> Result<()> {
+        let (network, node) = runtime_fixture().await?;
+        let access = descriptor(&network, &node, "conversation").await?;
+        let trigger = access.sdk_session.session_id.clone();
+        let claim = node
+            .claim_manager(
+                &access,
+                &trigger,
+                boot_id(),
+                &digest(b"missing SDK configuration"),
+            )
+            .await?;
+        assert!(claim.fresh);
+        assert!(
+            run_admitted(
+                node.clone(),
+                access,
+                "conversation".into(),
+                trigger.clone(),
+                Some(claim)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            status(&node, network.space.as_str(), "conversation", &trigger).await?["state"],
+            "failed"
+        );
+        assert!(
+            load_session(
+                &*node.store.lock().await,
+                network.space.as_str(),
+                "conversation"
+            )?
+            .active
+            .is_none()
+        );
+        Ok(())
     }
 
     #[tokio::test]
