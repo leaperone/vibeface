@@ -19,7 +19,8 @@ pub struct Config {
     pub allow_insecure_lan: bool,
     pub roles: Vec<NodeRole>,
     pub roots: Vec<PathBuf>,
-    pub peers: Vec<PeerConfig>,
+    #[serde(default)]
+    pub network: crate::network::NetworkConfig,
     pub manager: Option<ManagerSettings>,
     pub codex_socket: Option<PathBuf>,
     pub codex_bin: PathBuf,
@@ -27,12 +28,6 @@ pub struct Config {
     pub cursor_bin: PathBuf,
     pub timeout_secs: u64,
     pub daily_decision_limit: u64,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PeerConfig {
-    pub network_id: String,
-    pub url: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,7 +54,7 @@ impl Config {
                 NodeRole::Executor,
             ],
             roots,
-            peers: vec![],
+            network: crate::network::NetworkConfig::default(),
             manager: None,
             codex_socket: None,
             codex_bin: "codex".into(),
@@ -203,6 +198,9 @@ pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     std::fs::rename(temp, path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 pub fn identity(dir: &Path) -> Result<LocalIdentity> {

@@ -4,10 +4,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
 
 const EVENT_DOMAIN: &[u8] = b"vibeface:event:v1:";
-const TRUST_DOMAIN: &[u8] = b"vibeface:trust:v1:";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,30 +71,78 @@ impl LocalIdentity {
             signature,
         })
     }
-    pub fn sign_trust_bundle(
+    #[cfg(test)]
+    fn fixture_root(&self) -> Self {
+        Self {
+            secret_key_hex: digest(
+                format!("vibeface:network-fixture-root:v1:{}", self.secret_key_hex).as_bytes(),
+            ),
+        }
+    }
+    #[cfg(test)]
+    pub fn fixture_network_id(&self) -> Result<String> {
+        self.fixture_root().network_id()
+    }
+    #[cfg(test)]
+    pub fn sign_network_fixture(
         &self,
         revision: u64,
-        mut nodes: Vec<NodeCertificate>,
-    ) -> Result<TrustBundle> {
-        nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-        let mut bundle = TrustBundle {
-            version: WIRE_VERSION,
-            network_id: self.network_id()?,
-            owner_public_key: self.public_key_hex()?,
-            revision,
-            nodes,
-            signature: String::new(),
+        nodes: Vec<NodeCertificate>,
+    ) -> Result<crate::identity::NetworkState> {
+        use crate::identity::{
+            Genesis, HistoricalNode, IdentityKind, Member, NetworkState, RootCheckpoint,
         };
-        validate_bundle_shape(&bundle)?;
-        bundle.signature = hex::encode(
-            self.key()?
-                .sign(&domain_message(
-                    TRUST_DOMAIN,
-                    &digest(&unsigned_bundle(&bundle)?),
-                ))
-                .to_bytes(),
-        );
-        Ok(bundle)
+
+        let mut admin_seed = b"vibeface:network-fixture-admin:v1:".to_vec();
+        admin_seed.extend_from_slice(self.secret_key_hex.as_bytes());
+        let admin_secret = Sha256::digest(admin_seed);
+        let admin = LocalIdentity {
+            secret_key_hex: hex::encode(admin_secret),
+        };
+        let admin_member = Member::client(&admin, "fixture-admin", true)?;
+        let root = self.fixture_root();
+        let genesis = Genesis::create(&root, vec![admin_member.clone()])?;
+        let history = nodes
+            .iter()
+            .map(|node| HistoricalNode {
+                subject_id: node.node_id.clone(),
+                public_key: node.public_key.clone(),
+            })
+            .collect();
+        let mut members = vec![admin_member];
+        for certificate in nodes.into_iter().filter(|certificate| !certificate.revoked) {
+            let node_id = certificate.node_id;
+            let public_key = certificate.public_key;
+            let mut roles = certificate.roles;
+            if roles.iter().any(|role| {
+                matches!(
+                    role,
+                    NodeRole::Gateway | NodeRole::Scheduler | NodeRole::Executor
+                )
+            }) && !roles.contains(&NodeRole::Replica)
+            {
+                roles.push(NodeRole::Replica);
+            }
+            roles.sort_by_key(node_role_key);
+            let member = Member {
+                subject_id: node_id.clone(),
+                public_key,
+                kind: IdentityKind::Node,
+                name: format!("node-{node_id}"),
+                node_roles: roles,
+                manage: false,
+            };
+            member.validate()?;
+            members.push(member);
+        }
+        let mut state = NetworkState::new(genesis)?;
+        let epoch = revision
+            .checked_add(1)
+            .context("network fixture revision overflow")?;
+        state.recover(RootCheckpoint::create_with_history(
+            &root, epoch, members, history,
+        )?)?;
+        Ok(state)
     }
 }
 pub fn digest(bytes: &[u8]) -> String {
@@ -120,46 +166,15 @@ fn verify(public_key: &str, signature: &str, message: &[u8]) -> Result<()> {
     key.verify_strict(message, &signature)
         .context("invalid signature")
 }
-fn unsigned_bundle(bundle: &TrustBundle) -> Result<Vec<u8>> {
-    let mut b = bundle.clone();
-    b.signature.clear();
-    Ok(serde_json::to_vec(&b)?)
-}
-fn validate_bundle_shape(bundle: &TrustBundle) -> Result<()> {
-    ensure!(
-        bundle.version == WIRE_VERSION,
-        "unsupported trust bundle version"
-    );
-    ensure!(bundle.revision > 0, "trust revision must be positive");
-    ensure!(
-        bundle.network_id == fingerprint(&bundle.owner_public_key)?,
-        "network owner fingerprint mismatch"
-    );
-    ensure!(bundle.nodes.len() <= 4096, "too many node certificates");
-    let mut previous = None;
-    for node in &bundle.nodes {
-        ensure!(
-            node.node_id == fingerprint(&node.public_key)?,
-            "node fingerprint mismatch"
-        );
-        ensure!(
-            previous.as_ref().is_none_or(|p: &String| p < &node.node_id),
-            "duplicate or unsorted certificates"
-        );
-        ensure!(!node.roles.is_empty(), "node must have a role");
-        let roles: BTreeSet<String> = node.roles.iter().map(|r| format!("{r:?}")).collect();
-        ensure!(roles.len() == node.roles.len(), "duplicate role");
-        previous = Some(node.node_id.clone());
+#[cfg(test)]
+fn node_role_key(role: &NodeRole) -> &'static str {
+    match role {
+        NodeRole::Gateway => "gateway",
+        NodeRole::Relay => "relay",
+        NodeRole::Replica => "replica",
+        NodeRole::Scheduler => "scheduler",
+        NodeRole::Executor => "executor",
     }
-    Ok(())
-}
-pub fn verify_trust_bundle(bundle: &TrustBundle) -> Result<()> {
-    validate_bundle_shape(bundle)?;
-    verify(
-        &bundle.owner_public_key,
-        &bundle.signature,
-        &domain_message(TRUST_DOMAIN, &digest(&unsigned_bundle(bundle)?)),
-    )
 }
 pub fn verify_signed_event(
     network_id: &str,
@@ -266,9 +281,39 @@ mod tests {
     #[test]
     fn signatures_pin_identity_and_original_bytes() -> Result<()> {
         let owner = LocalIdentity::generate();
-        let bundle =
-            owner.sign_trust_bundle(1, vec![owner.certificate(vec![NodeRole::Replica])?])?;
-        verify_trust_bundle(&bundle)?;
+        let revoked = LocalIdentity::generate();
+        let mut revoked_certificate = revoked.certificate(vec![NodeRole::Relay])?;
+        revoked_certificate.revoked = true;
+        let state = owner.sign_network_fixture(
+            1,
+            vec![
+                owner.certificate(vec![NodeRole::Gateway])?,
+                revoked_certificate,
+            ],
+        )?;
+        let view = state.project()?;
+        assert_eq!(view.network_id, owner.fixture_network_id()?);
+        assert!(
+            view.authorize_node(&owner.node_id()?, Some(NodeRole::Replica))
+                .is_ok()
+        );
+        assert!(view.authorize_node(&revoked.node_id()?, None).is_err());
+        let all = owner.sign_network_fixture(
+            1,
+            vec![owner.certificate(vec![
+                NodeRole::Scheduler,
+                NodeRole::Executor,
+                NodeRole::Relay,
+                NodeRole::Gateway,
+            ])?],
+        )?;
+        assert!(
+            all.project()?
+                .authorize_node(&owner.node_id()?, Some(NodeRole::Executor))
+                .is_ok()
+        );
+        let later = owner.sign_network_fixture(2, vec![])?;
+        assert_eq!(state.genesis, later.genesis);
         let signed = owner.sign_payload("peer-request", b"challenge")?;
         verify_payload(
             &owner.public_key_hex()?,
@@ -288,7 +333,7 @@ mod tests {
         assert!(owner.sign_payload("bad:domain", b"challenge").is_err());
         let body = Event {
             version: 1,
-            network_id: owner.network_id()?,
+            network_id: owner.fixture_network_id()?,
             scope_id: "c".into(),
             author: owner.node_id()?,
             sequence: 1,
@@ -301,13 +346,13 @@ mod tests {
             blobs: vec![],
         };
         let event = owner.sign_event(body)?;
-        verify_signed_event(&bundle.network_id, &event, &owner.public_key_hex()?)?;
+        verify_signed_event(&view.network_id, &event, &owner.public_key_hex()?)?;
         let mut bad = event.clone();
         bad.canonical_body.push(' ');
-        assert!(verify_signed_event(&bundle.network_id, &bad, &owner.public_key_hex()?).is_err());
+        assert!(verify_signed_event(&view.network_id, &bad, &owner.public_key_hex()?).is_err());
         assert!(verify_signed_event(&"0".repeat(64), &event, &owner.public_key_hex()?).is_err());
         let other = LocalIdentity::generate();
-        assert!(verify_signed_event(&bundle.network_id, &event, &other.public_key_hex()?).is_err());
+        assert!(verify_signed_event(&view.network_id, &event, &other.public_key_hex()?).is_err());
         Ok(())
     }
 }

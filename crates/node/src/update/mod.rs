@@ -282,7 +282,7 @@ fn manifest(package: &Path) -> Result<Manifest> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
         .context("this package needs a manual bootstrap to the updater-enabled release")?;
     ensure!(
-        manifest.update_protocol == 1 && manifest.data_epoch == 1,
+        manifest.update_protocol == 1 && manifest.data_epoch == 2,
         "package does not support the current updater and data compatibility epoch; manual upgrade required"
     );
     ensure!(
@@ -869,7 +869,7 @@ mod tests {
         fs::write(directory.join("scripts/install-node-service.sh"), b"script").unwrap();
         fs::write(
             directory.join("BUILD-INFO.json"),
-            format!(r#"{{"version":"{version}","update_protocol":1,"data_epoch":1}}"#),
+            format!(r#"{{"version":"{version}","update_protocol":1,"data_epoch":2}}"#),
         )
         .unwrap();
         directory

@@ -37,6 +37,11 @@ else
   target="$(rustc -vV | sed -n 's/^host: //p')"
   binary="$target_dir/release/vibeface-node"
 fi
+crypto="$repo/crates/node/web/generated"
+[[ -s "$crypto/vibeface_secure.js" && -s "$crypto/vibeface_secure_bg.wasm" ]] || {
+  echo 'Browser cryptography is missing. Run scripts/build-web-crypto.sh before building a package.' >&2
+  exit 1
+}
 if "$build"; then cargo "${build_args[@]}"; fi
 [[ -x "$binary" ]] || { printf 'Release binary is missing: %s\n' "$binary" >&2; exit 1; }
 [[ -d "$repo/crates/node/sdk" ]] || { echo 'Node SDK sidecar sources are missing.' >&2; exit 1; }
@@ -54,9 +59,10 @@ staging="$(mktemp -d "$output/.vibeface-package.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 name="vibeface-node-$version-$target"
 package="$staging/$name"
-mkdir -p "$package/sidecars" "$package/scripts"
+mkdir -p "$package/sidecars" "$package/scripts" "$package/web"
 cp "$binary" "$package/vibeface-node"
-printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":1,"data_epoch":1}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
+printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":1,"data_epoch":2}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
+cp "$crypto/vibeface_secure.js" "$crypto/vibeface_secure_bg.wasm" "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
 cp "$repo/README.md" "$package/"
 cp -R "$repo/docs" "$package/docs"

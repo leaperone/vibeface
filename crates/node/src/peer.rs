@@ -3,26 +3,23 @@
 use crate::{
     crypto::{LocalIdentity, digest, verify_payload},
     model::{NetworkId, NodeId, NodeRole, WIRE_VERSION},
+    network::{NetworkHub, NetworkSocket, Service},
     store::Store,
 };
 use anyhow::{Context, Result, bail, ensure};
 use axum::extract::ws::{Message as AxumMessage, WebSocket};
-use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use rand::{RngCore, rngs::OsRng};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeSet, HashMap},
-    error::Error,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
-use tokio_tungstenite::{
-    connect_async_with_config,
-    tungstenite::{Message as ClientMessage, protocol::WebSocketConfig},
-};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
 use uuid::Uuid;
+use vibeface_secure::{Channel, Handshake};
 
 pub const MAX_PACKET_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
@@ -87,23 +84,6 @@ struct Hello {
     version: u32,
     network_id: NetworkId,
     node_id: NodeId,
-    nonce: String,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Challenge {
-    hello: Hello,
-    signature: String,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Proof {
-    signature: String,
-}
-#[derive(Serialize)]
-struct Transcript<'a> {
-    initiator: &'a Hello,
-    responder: &'a Hello,
 }
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -156,17 +136,21 @@ impl PeerHub {
     }
 
     /// The upgrade handler must also set its frame and message limits to MAX_PACKET_BYTES.
-    pub async fn accept(self: Arc<Self>, mut socket: WebSocket) -> Result<()> {
+    pub async fn accept(self: Arc<Self>, socket: WebSocket) -> Result<()> {
+        self.accept_transport(NetworkSocket::server(socket)).await
+    }
+
+    pub async fn accept_transport(self: Arc<Self>, mut socket: NetworkSocket) -> Result<()> {
         let _permit = self
             .sockets
             .clone()
             .try_acquire_owned()
             .context("too many peer sockets")?;
-        let (network, peer) =
+        let (network, peer, channel) =
             tokio::time::timeout(HANDSHAKE_TIMEOUT, self.server_handshake(&mut socket))
                 .await
                 .context("peer handshake timed out")??;
-        self.connected(socket, network, peer, false).await
+        self.connected(socket, network, peer, false, channel).await
     }
 
     /// Runs until disconnected. Reconnection policy belongs to the runtime.
@@ -185,20 +169,22 @@ impl PeerHub {
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_PACKET_BYTES))
             .max_frame_size(Some(MAX_PACKET_BYTES));
-        let (mut socket, _) = tokio::time::timeout(
+        let (socket, _) = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
             connect_async_with_config(&url, Some(config), false),
         )
         .await
         .context("peer connection timed out")?
         .map_err(|_| anyhow::anyhow!("peer connection failed"))?;
-        let peer = tokio::time::timeout(
+        let mut socket = NetworkSocket::Client(Box::new(socket));
+        let (peer, channel) = tokio::time::timeout(
             HANDSHAKE_TIMEOUT,
-            self.client_handshake(&mut socket, &network_id),
+            self.client_handshake(&mut socket, &network_id, None),
         )
         .await
         .context("peer handshake timed out")??;
-        self.connected(socket, network_id, peer, true).await
+        self.connected(socket, network_id, peer, true, channel)
+            .await
     }
 
     pub async fn request(&self, network: &str, target: &str, payload: Value) -> Result<Value> {
@@ -298,13 +284,10 @@ impl PeerHub {
     }
 
     fn hello(&self, network: &str) -> Result<Hello> {
-        let mut nonce = [0u8; 32];
-        OsRng.fill_bytes(&mut nonce);
         Ok(Hello {
             version: WIRE_VERSION,
             network_id: network.to_owned(),
             node_id: self.identity.node_id()?,
-            nonce: hex::encode(nonce),
         })
     }
 
@@ -312,7 +295,6 @@ impl PeerHub {
         ensure!(hello.version == WIRE_VERSION, "unsupported peer version");
         check_hex_id(&hello.network_id)?;
         check_hex_id(&hello.node_id)?;
-        check_hex_id(&hello.nonce)?;
         ensure!(
             network.is_none_or(|n| n == hello.network_id),
             "peer belongs to another network"
@@ -323,80 +305,110 @@ impl PeerHub {
         self.authorize(&hello.network_id, &hello.node_id).await
     }
 
-    async fn server_handshake<S, M, E>(&self, socket: &mut S) -> Result<(String, String)>
-    where
-        S: Stream<Item = std::result::Result<M, E>> + Sink<M, Error = E> + Unpin,
-        M: WireMessage,
-        E: Error + Send + Sync + 'static,
-    {
-        let initiator: Hello = receive_json(socket, MAX_HANDSHAKE_BYTES).await?;
-        let key = self.check_hello(&initiator, None).await?;
+    async fn server_handshake(
+        &self,
+        socket: &mut NetworkSocket,
+    ) -> Result<(String, String, Channel)> {
+        let mut handshake = secure(Handshake::new(
+            false,
+            &self.identity.secret_key_hex,
+            None,
+            b"vibeface:peer:v1",
+        ))?;
+        let first = receive_binary(socket, MAX_HANDSHAKE_BYTES).await?;
+        ensure!(
+            secure(handshake.read(&first))?.is_empty(),
+            "unexpected first peer payload"
+        );
+        let response = secure(handshake.write(&[]))?;
+        send_binary(socket, response).await?;
+        let third = receive_binary(socket, MAX_HANDSHAKE_BYTES).await?;
+        let plaintext = secure(handshake.read(&third))?;
+        let initiator: Hello = serde_json::from_slice(&plaintext)?;
+        self.check_hello(&initiator, None).await?;
+        ensure!(
+            handshake.remote_id().as_deref() == Some(&initiator.node_id),
+            "peer Noise identity mismatch"
+        );
+        let mut channel = secure(handshake.finish())?;
         let responder = self.hello(&initiator.network_id)?;
-        let transcript = serde_json::to_vec(&Transcript {
-            initiator: &initiator,
-            responder: &responder,
-        })?;
-        send_json(
-            socket,
-            &Challenge {
-                hello: responder,
-                signature: self.identity.sign_payload("peer-server", &transcript)?,
-            },
-        )
-        .await?;
-        let proof: Proof = receive_json(socket, MAX_HANDSHAKE_BYTES).await?;
-        verify_payload(&key, "peer-client", &transcript, &proof.signature)?;
-        self.authorize(&initiator.network_id, &initiator.node_id)
-            .await?;
-        send_json(
-            socket,
-            &Proof {
-                signature: self.identity.sign_payload("peer-ready", &transcript)?,
-            },
-        )
-        .await?;
-        Ok((initiator.network_id, initiator.node_id))
+        send_secure(socket, &mut channel, &serde_json::to_vec(&responder)?).await?;
+        Ok((initiator.network_id, initiator.node_id, channel))
     }
 
-    async fn client_handshake<S, M, E>(&self, socket: &mut S, network: &str) -> Result<NodeId>
-    where
-        S: Stream<Item = std::result::Result<M, E>> + Sink<M, Error = E> + Unpin,
-        M: WireMessage,
-        E: Error + Send + Sync + 'static,
-    {
-        let initiator = self.hello(network)?;
-        send_json(socket, &initiator).await?;
-        let challenge: Challenge = receive_json(socket, MAX_HANDSHAKE_BYTES).await?;
-        let key = self.check_hello(&challenge.hello, Some(network)).await?;
-        let transcript = serde_json::to_vec(&Transcript {
-            initiator: &initiator,
-            responder: &challenge.hello,
-        })?;
-        verify_payload(&key, "peer-server", &transcript, &challenge.signature)?;
-        send_json(
+    async fn client_handshake(
+        &self,
+        socket: &mut NetworkSocket,
+        network: &str,
+        target: Option<String>,
+    ) -> Result<(NodeId, Channel)> {
+        let mut handshake = secure(Handshake::new(
+            true,
+            &self.identity.secret_key_hex,
+            target,
+            b"vibeface:peer:v1",
+        ))?;
+        send_binary(socket, secure(handshake.write(&[]))?).await?;
+        let second = receive_binary(socket, MAX_HANDSHAKE_BYTES).await?;
+        ensure!(
+            secure(handshake.read(&second))?.is_empty(),
+            "unexpected peer responder payload"
+        );
+        let remote = handshake.remote_id().context("peer omitted its identity")?;
+        self.authorize(network, &remote).await?;
+        let hello = self.hello(network)?;
+        send_binary(
             socket,
-            &Proof {
-                signature: self.identity.sign_payload("peer-client", &transcript)?,
-            },
+            secure(handshake.write(&serde_json::to_vec(&hello)?))?,
         )
         .await?;
-        let ready: Proof = receive_json(socket, MAX_HANDSHAKE_BYTES).await?;
-        verify_payload(&key, "peer-ready", &transcript, &ready.signature)?;
-        Ok(challenge.hello.node_id)
+        let mut channel = secure(handshake.finish())?;
+        let responder: Hello = serde_json::from_slice(
+            &receive_secure(socket, &mut channel, MAX_HANDSHAKE_BYTES).await?,
+        )?;
+        self.check_hello(&responder, Some(network)).await?;
+        ensure!(remote == responder.node_id, "peer Noise identity mismatch");
+        Ok((responder.node_id, channel))
     }
 
-    async fn connected<S, M, E>(
+    pub async fn connect_target(
         self: Arc<Self>,
-        socket: S,
+        network: String,
+        target: String,
+        transport: Arc<NetworkHub>,
+    ) -> Result<()> {
+        let _permit = self
+            .sockets
+            .clone()
+            .try_acquire_owned()
+            .context("too many peer sockets")?;
+        self.authorize(&network, &self.identity.node_id()?).await?;
+        self.authorize(&network, &target).await?;
+        for _ in 0..24 {
+            let mut socket = transport.dial(&target, Service::Peer).await?;
+            match tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                self.client_handshake(&mut socket, &network, Some(target.clone())),
+            )
+            .await
+            {
+                Ok(Ok((peer, channel))) => {
+                    return self.connected(socket, network, peer, true, channel).await;
+                }
+                _ => transport.report_failure(&target, socket.route()).await,
+            }
+        }
+        bail!("no authenticated peer path available")
+    }
+
+    async fn connected(
+        self: Arc<Self>,
+        socket: NetworkSocket,
         network: String,
         peer: String,
         outbound: bool,
-    ) -> Result<()>
-    where
-        S: Stream<Item = std::result::Result<M, E>> + Sink<M, Error = E> + Unpin,
-        M: WireMessage,
-        E: Error + Send + Sync + 'static,
-    {
+        channel: Channel,
+    ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let (send, receive) = mpsc::channel(QUEUE_CAPACITY);
         let link_key = (network.clone(), peer.clone());
@@ -430,7 +442,7 @@ impl PeerHub {
                 },
             );
         }
-        let result = self.drive(socket, &network, &peer, receive).await;
+        let result = self.drive(socket, &network, &peer, receive, channel).await;
         let mut state = self.state.lock().await;
         if state.links.get(&link_key).is_some_and(|link| link.id == id) {
             state.links.remove(&link_key);
@@ -438,21 +450,18 @@ impl PeerHub {
         result
     }
 
-    async fn drive<S, M, E>(
+    async fn drive(
         &self,
-        mut socket: S,
+        mut socket: NetworkSocket,
         network: &str,
         peer: &str,
         mut outbound: mpsc::Receiver<Arc<Queued>>,
-    ) -> Result<()>
-    where
-        S: Stream<Item = std::result::Result<M, E>> + Sink<M, Error = E> + Unpin,
-        M: WireMessage,
-        E: Error + Send + Sync + 'static,
-    {
+        mut channel: Channel,
+    ) -> Result<()> {
         let mut heartbeat = tokio::time::interval(HEARTBEAT);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut received = Instant::now();
+        let mut partial_started: Option<Instant> = None;
         loop {
             tokio::select! {
                 frame = socket.next() => {
@@ -460,23 +469,33 @@ impl PeerHub {
                     self.authorize(network, peer).await?;
                     self.authorize(network, &self.identity.node_id()?).await?;
                     received = Instant::now();
-                    if let Some(text) = frame.into_text()? {
-                        ensure!(text.len() <= MAX_PACKET_BYTES, "peer packet too large");
-                        let packet: Packet = serde_json::from_str(&text).context("invalid peer packet")?;
-                        self.receive_packet(network, peer, packet).await?;
+                    match frame {
+                        AxumMessage::Binary(bytes) => {
+                            if let Some(plaintext) = secure(channel.open_record(&bytes))? {
+                                partial_started = None;
+                                ensure!(plaintext.len() <= MAX_PACKET_BYTES, "peer packet too large");
+                                let packet: Packet = serde_json::from_slice(&plaintext).context("invalid peer packet")?;
+                                self.receive_packet(network, peer, packet).await?;
+                            } else {
+                                partial_started.get_or_insert_with(Instant::now);
+                            }
+                        }
+                        AxumMessage::Ping(_) | AxumMessage::Pong(_) => {},
+                        _ => bail!("peer accepts only encrypted binary frames"),
                     }
                 }
                 queued = outbound.recv() => {
                     let text = queued.context("peer connection replaced")?;
                     self.authorize(network, peer).await?;
                     self.authorize(network, &self.identity.node_id()?).await?;
-                    tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.send(M::text(text.text.clone()))).await.context("peer send timed out")??;
+                    send_secure(&mut socket, &mut channel, text.text.as_bytes()).await?;
                 }
                 _ = heartbeat.tick() => {
                     ensure!(received.elapsed() < IDLE_TIMEOUT, "peer heartbeat timed out");
+                    ensure!(partial_started.is_none_or(|start| start.elapsed() < IDLE_TIMEOUT), "peer fragmented message timed out");
                     self.authorize(network, peer).await?;
                     self.authorize(network, &self.identity.node_id()?).await?;
-                    tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.send(M::ping())).await.context("peer send timed out")??;
+                    tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.send(AxumMessage::Ping(Vec::new().into()))).await.context("peer send timed out")??;
                     self.presence(network).await?;
                 }
             }
@@ -562,16 +581,25 @@ impl PeerHub {
         );
         ensure!(packet.hops_remaining <= MAX_HOPS, "invalid peer hop limit");
         validate_body(&packet.body, now_ms()?)?;
-        let key = self.authorize(network, &packet.body.origin).await?;
+        let key = match self.authorize(network, &packet.body.origin).await {
+            Ok(key) => key,
+            Err(error) => {
+                tracing::debug!(%error, origin=%packet.body.origin, network, "dropping peer packet from an unknown member");
+                return Ok(());
+            }
+        };
+        if let Some(target) = &packet.body.target
+            && let Err(error) = self.authorize(network, target).await
+        {
+            tracing::debug!(%error, target, network, "dropping peer packet for an unknown member");
+            return Ok(());
+        }
         verify_payload(
             &key,
             "peer-packet",
             &serde_json::to_vec(&packet.body)?,
             &packet.signature,
         )?;
-        if let Some(target) = &packet.body.target {
-            self.authorize(network, target).await?;
-        }
         if !self.remember(&packet).await? {
             return Ok(());
         }
@@ -724,72 +752,53 @@ fn validate_body(body: &Body, now: i64) -> Result<()> {
     Ok(())
 }
 
-trait WireMessage {
-    fn text(value: String) -> Self;
-    fn ping() -> Self;
-    fn into_text(self) -> Result<Option<String>>;
+fn secure<T>(result: std::result::Result<T, String>) -> Result<T> {
+    result.map_err(anyhow::Error::msg)
 }
-impl WireMessage for AxumMessage {
-    fn text(value: String) -> Self {
-        Self::Text(value.into())
-    }
-    fn ping() -> Self {
-        Self::Ping(Vec::new().into())
-    }
-    fn into_text(self) -> Result<Option<String>> {
-        match self {
-            Self::Text(value) => Ok(Some(value.to_string())),
-            Self::Ping(_) | Self::Pong(_) => Ok(None),
-            Self::Close(_) => bail!("peer closed connection"),
-            Self::Binary(_) => bail!("binary peer messages are not supported"),
+async fn send_binary(socket: &mut NetworkSocket, bytes: Vec<u8>) -> Result<()> {
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        socket.send(AxumMessage::Binary(bytes.into())),
+    )
+    .await
+    .context("peer send timed out")?
+}
+async fn receive_binary(socket: &mut NetworkSocket, limit: usize) -> Result<Vec<u8>> {
+    while let Some(frame) = socket.next().await {
+        match frame? {
+            AxumMessage::Binary(bytes) => {
+                ensure!(bytes.len() <= limit, "peer frame too large");
+                return Ok(bytes.to_vec());
+            }
+            AxumMessage::Ping(_) | AxumMessage::Pong(_) => {}
+            _ => bail!("peer accepts only encrypted binary frames"),
         }
     }
+    bail!("peer disconnected")
 }
-impl WireMessage for ClientMessage {
-    fn text(value: String) -> Self {
-        Self::Text(value.into())
+async fn send_secure(
+    socket: &mut NetworkSocket,
+    channel: &mut Channel,
+    value: &[u8],
+) -> Result<()> {
+    for record in secure(channel.seal_message(value))? {
+        send_binary(socket, record).await?;
     }
-    fn ping() -> Self {
-        Self::Ping(Vec::new().into())
-    }
-    fn into_text(self) -> Result<Option<String>> {
-        match self {
-            Self::Text(value) => Ok(Some(value.to_string())),
-            Self::Ping(_) | Self::Pong(_) => Ok(None),
-            Self::Close(_) => bail!("peer closed connection"),
-            _ => bail!("unsupported peer message"),
-        }
-    }
-}
-async fn send_json<S, M, E, T>(socket: &mut S, value: &T) -> Result<()>
-where
-    S: Sink<M, Error = E> + Unpin,
-    M: WireMessage,
-    E: Error + Send + Sync + 'static,
-    T: Serialize,
-{
-    let text = serde_json::to_string(value)?;
-    ensure!(
-        text.len() <= MAX_HANDSHAKE_BYTES,
-        "peer handshake too large"
-    );
-    socket.send(M::text(text)).await?;
     Ok(())
 }
-async fn receive_json<S, M, E, T>(socket: &mut S, limit: usize) -> Result<T>
-where
-    S: Stream<Item = std::result::Result<M, E>> + Unpin,
-    M: WireMessage,
-    E: Error + Send + Sync + 'static,
-    T: DeserializeOwned,
-{
-    while let Some(frame) = socket.next().await {
-        if let Some(text) = frame?.into_text()? {
-            ensure!(text.len() <= limit, "peer handshake too large");
-            return serde_json::from_str(&text).context("invalid peer handshake");
+async fn receive_secure(
+    socket: &mut NetworkSocket,
+    channel: &mut Channel,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    loop {
+        if let Some(value) =
+            secure(channel.open_record(&receive_binary(socket, MAX_PACKET_BYTES).await?))?
+        {
+            ensure!(value.len() <= limit, "peer message too large");
+            return Ok(value);
         }
     }
-    bail!("peer disconnected during handshake")
 }
 
 #[cfg(test)]
@@ -817,13 +826,13 @@ mod tests {
         identity: &LocalIdentity,
         nodes: &[&LocalIdentity],
     ) -> Result<(Arc<PeerHub>, mpsc::Receiver<Inbound>)> {
-        let network = owner.network_id()?;
+        let network = owner.fixture_network_id()?;
         let mut store = Store::open(":memory:")?;
         let certificates = nodes
             .iter()
             .map(|node| node.certificate(roles()))
             .collect::<Result<Vec<_>>>()?;
-        store.install_trust_bundle(&network, &owner.sign_trust_bundle(1, certificates)?)?;
+        store.install_trust_bundle(&network, &owner.sign_network_fixture(1, certificates)?)?;
         Ok(PeerHub::new(
             identity.clone(),
             Arc::new(Mutex::new(store)),
@@ -836,7 +845,7 @@ mod tests {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let c = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let (sender, _) = hub(&a, &a, &[&a, &b, &c])?;
         let (enabled, _) = hub(&a, &b, &[&a, &b, &c])?;
         let (disabled, mut inbound) =
@@ -883,7 +892,7 @@ mod tests {
         restricted.roles.retain(|r| r != &NodeRole::Relay);
         enabled.store.lock().await.install_trust_bundle(
             &network,
-            &a.sign_trust_bundle(
+            &a.sign_network_fixture(
                 2,
                 vec![a.certificate(roles())?, restricted, c.certificate(roles())?],
             )?,
@@ -906,7 +915,7 @@ mod tests {
     async fn signed_packets_are_network_bound_deduped_and_revocation_checked() -> Result<()> {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let (sender, _) = hub(&a, &a, &[&a, &b])?;
         let (receiver, mut inbound) = hub(&a, &b, &[&a, &b])?;
         let packet = sender.packet(
@@ -927,7 +936,7 @@ mod tests {
         assert!(inbound.try_recv().is_err());
         assert!(
             receiver
-                .receive_packet(&b.network_id()?, &a.node_id()?, packet.clone())
+                .receive_packet(&b.fixture_network_id()?, &a.node_id()?, packet.clone())
                 .await
                 .is_err()
         );
@@ -945,7 +954,7 @@ mod tests {
         revoked.revoked = true;
         receiver.store.lock().await.install_trust_bundle(
             &network,
-            &a.sign_trust_bundle(2, vec![revoked, b.certificate(roles())?])?,
+            &a.sign_network_fixture(2, vec![revoked, b.certificate(roles())?])?,
         )?;
         let packet = sender.packet(
             &network,
@@ -954,13 +963,49 @@ mod tests {
             Value::Null,
             None,
         )?;
+        receiver
+            .receive_packet(&network, &a.node_id()?, packet)
+            .await?;
+        assert!(inbound.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_member_packet_is_dropped_without_closing_trusted_link() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let known = LocalIdentity::generate();
+        let unknown = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let (receiver, mut inbound) = hub(&owner, &known, &[&owner, &known])?;
+        let (sender, _) = hub(&owner, &unknown, &[&owner, &known, &unknown])?;
+        let (send, _) = mpsc::channel(1);
+        receiver.state.lock().await.links.insert(
+            (network.clone(), owner.node_id()?),
+            Link {
+                id: "trusted".into(),
+                outbound: true,
+                send,
+            },
+        );
+        let packet = sender.packet(
+            &network,
+            Some(known.node_id()?),
+            Kind::Request,
+            json!({"unknown":true}),
+            None,
+        )?;
+        receiver
+            .receive_packet(&network, &owner.node_id()?, packet)
+            .await?;
+        assert!(inbound.try_recv().is_err());
         assert!(
             receiver
-                .receive_packet(&network, &a.node_id()?, packet)
+                .state
+                .lock()
                 .await
-                .is_err()
+                .links
+                .contains_key(&(network, owner.node_id()?))
         );
-        assert!(inbound.try_recv().is_err());
         Ok(())
     }
 
@@ -969,7 +1014,7 @@ mod tests {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let c = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let (requester, _) = hub(&a, &a, &[&a, &b, &c])?;
         let (expected, _) = hub(&a, &b, &[&a, &b, &c])?;
         let (other, _) = hub(&a, &c, &[&a, &b, &c])?;
@@ -1017,7 +1062,7 @@ mod tests {
         let b = LocalIdentity::generate();
         let (hub, _) = hub(&a, &a, &[&a, &b])?;
         let packet = hub.packet(
-            &a.network_id()?,
+            &a.fixture_network_id()?,
             Some(b.node_id()?),
             Kind::Request,
             json!("ok"),
@@ -1045,36 +1090,13 @@ mod tests {
         );
         assert!(
             hub.packet(
-                &a.network_id()?,
+                &a.fixture_network_id()?,
                 Some(b.node_id()?),
                 Kind::Request,
                 json!("x".repeat(MAX_PACKET_BYTES)),
                 None
             )
             .is_err()
-        );
-        let challenge = hub.hello(&a.network_id()?)?;
-        let responder = Hello {
-            node_id: b.node_id()?,
-            nonce: "f".repeat(64),
-            ..challenge.clone()
-        };
-        let transcript = serde_json::to_vec(&Transcript {
-            initiator: &challenge,
-            responder: &responder,
-        })?;
-        let signature = a.sign_payload("peer-client", &transcript)?;
-        let changed = Hello {
-            nonce: "0".repeat(64),
-            ..responder
-        };
-        let replay = serde_json::to_vec(&Transcript {
-            initiator: &challenge,
-            responder: &changed,
-        })?;
-        assert!(verify_payload(&a.public_key_hex()?, "peer-client", &replay, &signature).is_err());
-        assert!(
-            verify_payload(&a.public_key_hex()?, "peer-server", &transcript, &signature).is_err()
         );
         Ok(())
     }
@@ -1135,11 +1157,11 @@ mod tests {
         let url = serve(server.clone(), &mut tasks).await?;
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            client.connect(owner.network_id()?, url),
+            client.connect(owner.fixture_network_id()?, url),
         )
         .await?;
         assert!(result.is_err());
-        assert!(server.online(&owner.network_id()?).await.is_empty());
+        assert!(server.online(&owner.fixture_network_id()?).await.is_empty());
         Ok(())
     }
 
@@ -1149,7 +1171,7 @@ mod tests {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let c = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let (ha, mut ra) = hub(&a, &a, &[&a, &b, &c])?;
         let (hb, mut rb) = hub(&a, &b, &[&a, &b, &c])?;
         let (hc, mut rc) = hub(&a, &c, &[&a, &b, &c])?;

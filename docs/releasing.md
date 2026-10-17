@@ -22,15 +22,24 @@ cd vibeface-node-<version>-<target>
 ./vibeface-node --help
 ```
 
-包内有 Rust 程序、SDK sidecar 源码、文档、用户级服务安装脚本和 `BUILD-INFO.json`，不含身份、配置、数据库、Provider 程序、模型凭证或 npm 依赖。干净 Git 提交的正常构建会记录版本、target 和源码提交；`--skip-build` 或未提交源码构建的 `source_commit` 为 `null`，不能作为提交身份的证明。
+包内有 Rust 程序、SDK sidecar 源码、浏览器密码学 JS/WASM、文档、用户级服务安装脚本和 `BUILD-INFO.json`，不含身份、配置、数据库、Provider 程序、模型凭证或 npm 依赖。干净 Git 提交的正常构建会记录版本、target 和源码提交；`--skip-build` 或未提交源码构建的 `source_commit` 为 `null`，不能作为提交身份的证明。
 
 运行任务前须另装并登录相应 Provider。Codex SDK 管理路径还需 Node.js 18+，在包的 `sidecars/` 下执行 `npm ci --omit=dev`。Cursor 管理路径需另装 Cursor SDK Bridge 并配置凭证。初始化、配对、服务安装和公网 TLS 见 [Node 使用说明](node.md)。
 
 ## CI 验证范围
 
-质量检查包含 Rust fmt、workspace tests、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法，以及 Atlas 迁移文件校验；不连接用户数据库。打包任务校验 SHA256、源码提交、版本和 target，再启动解包后的程序运行现有多进程验收。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
+`crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。检查和四个平台的打包任务下载同一份资源，缺少资源时构建失败，不用空模块替代。
 
-验收失败时只上传报告和三个测试进程日志，不上传测试目录或数据库。正常制品保留 14 天，诊断保留 7 天。CI 不验证真实模型调用、实体手机、物理局域网、公网反向代理或用户后台服务安装。
+质量检查包含 Rust fmt、workspace tests、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch，再启动解包后的程序运行无账号网络验收。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
+
+源码打包前先生成浏览器资源。安装 Rust 的 `wasm32-unknown-unknown` target 和 `wasm-bindgen-cli 0.2.129`，然后执行：
+
+```sh
+bash scripts/build-web-crypto.sh
+bash scripts/package-node.sh
+```
+
+验收失败时只上传报告和四个测试进程日志，不上传测试目录或数据库。正常制品保留 14 天，诊断保留 7 天。CI 不验证真实模型调用、实体手机、物理局域网、公网反向代理或用户后台服务安装。
 
 ## 显式发布版本
 
@@ -57,15 +66,15 @@ nightly 表示开发预发布，需选择 Nightly 更新渠道或手动下载，
 
 Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `vX.Y.Z` 正式版，Nightly 只选择 `vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。更新器比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
 
-自动更新默认关闭，默认渠道为 Stable。策略保存在数据目录的私有 `update.json`，不进入共享会话或 DAG。配置、检查及手动应用命令见 [选择更新渠道](node.md#选择更新渠道)。旧版本没有更新器，首次使用须按下一节手动安装包含更新器的新包。
+自动更新默认关闭，默认渠道为 Stable。策略保存在数据目录的私有 `update.json`，不进入共享会话或 DAG。配置、检查及手动应用命令见 [选择更新渠道](node.md#选择更新渠道)。首次建立受管安装时按下一节放置完整包。
 
 匿名 GitHub API 请求被限流时，更新器明确报错并保留现版，自动更新在下轮再次检查。可在更新服务的运行环境提供 `GITHUB_TOKEN` 提高额度；token 只发往 `api.github.com`，不发给下载 CDN，也不写入配置或更新策略。后台服务不保证继承终端的临时环境变量。
 
 更新器只接受受管安装的 `current` 符号链接，下载对应平台的完整包，核对 SHA256、版本、target、源码身份和存储兼容声明后再安装。包和 checksum 都通过 GitHub HTTPS 下载，这依赖 GitHub 账户、仓库和 TLS 的可信性，不是独立发布签名。macOS 开发者签名和 notarization 仍未提供。
 
-每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序和随包 sidecar，不覆盖账户、身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。使用 Codex SDK 时，更新器在停服务前按新包的 lock 安装 sidecar 依赖，需要可用的 npm；安装失败保留现版，不复制旧 `node_modules`。Cursor SDK 不需要这一步。
+每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序和随包 sidecar，不覆盖身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。使用 Codex SDK 时，更新器在停服务前按新包的 lock 安装 sidecar 依赖，需要可用的 npm；安装失败保留现版，不复制旧 `node_modules`。Cursor SDK 不需要这一步。
 
-更新器只安装声明与当前数据格式兼容的包。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
+`BUILD-INFO.json` 声明 `update_protocol=1` 和 `data_epoch=2`。更新器只安装与本机存储 epoch 一致的包。账号数据库格式不属于 epoch 2，不能让自动更新覆盖该数据目录，也不在启动时隐式转换或清空。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
 
 ## 首次安装更新器或手动更换程序
 
@@ -73,7 +82,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 校验并解压新包到受管安装根目录下的独立目录，通过 `current` 符号链接选择程序。例如，先将解压后的包移动到 `$HOME/.local/share/vibeface/releases/<version>`，再创建指向它的 `$HOME/.local/share/vibeface/current`。保留整个包，不单独复制 Rust binary；更新器需要同包的脚本、sidecar 和 `BUILD-INFO.json`。
 
-用 `current/vibeface-node` 前台启动并核对原账户和历史，随后按 [后台运行说明](node.md#作为后台应用运行) 安装指向这一固定路径的用户服务。停止前台进程后再启动用户服务，不更改原数据目录。已有私有凭证启动脚本时，保留它，并让它通过 `current` 启动 Node。
+用 `current/vibeface-node` 前台启动并核对设备身份和历史，随后按 [后台运行说明](node.md#作为后台应用运行) 安装指向这一固定路径的用户服务。停止前台进程后再启动用户服务，不更改原数据目录。已有私有凭证启动脚本时，保留它，并让它通过 `current` 启动 Node。
 
 确认新程序可用后，再执行 `update configure` 设置渠道和自动更新。普通 `cargo install` 或直接复制 binary 不构成受管安装，更新器会要求先建立完整包与 `current` 链接。
 

@@ -299,8 +299,9 @@ pub async fn run(
         let facts = node.current_facts(network, &conversation).await?;
         let (tasks, targets) = {
             let store = node.store.lock().await;
-            let targets = store.trust_bundle(network)?.context("missing network trust")?.nodes.into_iter()
-                .filter(|n| !n.revoked && n.roles.contains(&NodeRole::Executor)).map(|n| n.node_id).collect::<Vec<_>>();
+            let view = store.trust_bundle(network)?.context("missing network trust")?.project()?;
+            let targets = view.members.into_iter()
+                .filter(|n| !view.revoked.contains(&n.subject_id) && n.kind == crate::identity::IdentityKind::Node && n.node_roles.contains(&NodeRole::Executor)).map(|n| n.subject_id).collect::<Vec<_>>();
             (serde_json::to_value(store.tasks(network, &conversation)?)?, targets)
         };
         let prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &node.config.roots)?;
@@ -578,12 +579,12 @@ mod tests {
     #[test]
     fn invocation_replay_and_crash_do_not_relaunch_or_reuse_unknown_sdk_state() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let network = identity.network_id()?;
+        let network = identity.fixture_network_id()?;
         let mut store = Store::open(":memory:")?;
         store.install_trust_bundle(
             &network,
             &identity
-                .sign_trust_bundle(1, vec![identity.certificate(vec![NodeRole::Scheduler])?])?,
+                .sign_network_fixture(1, vec![identity.certificate(vec![NodeRole::Scheduler])?])?,
         )?;
         let (first, _, fresh) = claim(&mut store, &network, "chat", "trigger", "boot-a", "sdk-a")?;
         assert!(fresh);
@@ -673,12 +674,12 @@ mod tests {
     #[test]
     fn unknown_scheduler_blocks_updates_until_new_user_work_completes() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let network = identity.network_id()?;
+        let network = identity.fixture_network_id()?;
         let mut store = Store::open(":memory:")?;
         store.install_trust_bundle(
             &network,
             &identity
-                .sign_trust_bundle(1, vec![identity.certificate(vec![NodeRole::Scheduler])?])?,
+                .sign_network_fixture(1, vec![identity.certificate(vec![NodeRole::Scheduler])?])?,
         )?;
         store.append_event(
             &identity,

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -13,13 +14,16 @@ use std::{
 };
 use vibeface_node::{
     api,
-    auth::AuthStore,
-    config::{self, Config, ManagerSettings, PeerConfig},
-    crypto::{LocalIdentity, verify_trust_bundle},
+    client::Client,
+    config::{self, Config, ManagerSettings},
+    crypto::{LocalIdentity, digest},
+    identity::{
+        IdentityKind, IdentityStore, Member, NetworkState,
+        local::{BootstrapCapability, InviteEnvelope, PairRequest, PairReview},
+    },
     maintenance,
-    model::TrustBundle,
+    network::NetworkConfig,
     runtime::Runtime,
-    store::Store,
     update::{self, Update},
 };
 
@@ -36,6 +40,8 @@ enum Action {
     Init(Box<Init>),
     /// Start this node with its configured roles.
     Serve(DataDir),
+    /// Display this node's trusted frontend entry and initial pairing capability.
+    Access(Access),
     /// Select a release channel, check, or apply a managed update.
     Update(Update),
     /// Join a personal network using its invite and pinned fingerprint.
@@ -99,38 +105,68 @@ struct Init {
     node_bin: PathBuf,
     #[arg(long)]
     codex_sdk_script: Option<PathBuf>,
+    /// Known discovery or relay WebSocket endpoints. May be repeated.
+    #[arg(long = "bootstrap-url")]
+    bootstrap_urls: Vec<String>,
+    /// Reachable WebSocket addresses published for this Node. May be repeated.
+    #[arg(long = "advertise-url")]
+    advertise_urls: Vec<String>,
+    #[arg(long)]
+    mdns: bool,
+    /// Offer bounded encrypted forwarding to other personal networks.
+    #[arg(long)]
+    public_relay: bool,
 }
 
 #[derive(Args)]
+struct Access {
+    #[command(flatten)]
+    data: DataDir,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+#[command(group(ArgGroup::new("invitation").required(true).args(["invite_file", "invite"])))]
 struct Pair {
     #[command(flatten)]
     data: DataDir,
     #[arg(long)]
-    url: String,
+    invite_file: Option<PathBuf>,
+    /// Base64url encoded invitation copied from a trusted management client.
     #[arg(long)]
-    code: String,
-    /// Network fingerprint displayed by the node that issued the invite.
-    #[arg(long)]
-    network_id: String,
-    #[arg(long)]
-    username: String,
-    #[arg(long, required = true)]
-    password_stdin: bool,
+    invite: Option<String>,
+    #[arg(long, default_value = "Node")]
+    name: String,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PairResponse {
-    network_id: String,
-    trust_bundle: TrustBundle,
+struct Invitation {
+    url: String,
+    node_id: String,
+    relay: bool,
+    invite: InviteSecret,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InviteSecret {
+    invite: InviteEnvelope,
+    capability: String,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PendingPair {
-    origin: String,
-    username: String,
-    response: PairResponse,
+    url: String,
+    node_id: String,
+    relay: bool,
+    invite_id: String,
+    request_id: String,
+    name: String,
+    #[serde(default)]
+    request_hash: Option<String>,
 }
 
 #[tokio::main]
@@ -149,6 +185,7 @@ async fn main() -> Result<()> {
                 result = maintenance::serve(runtime, options.data_dir) => result,
             }
         }
+        Action::Access(options) => access(options),
         Action::Update(options) => update::run(options).await,
         Action::Pair(options) => pair(options).await,
         Action::Tool { name, json } => call_tool(name, json).await,
@@ -166,6 +203,12 @@ fn init(options: Init) -> Result<()> {
             .is_ok_and(|m| m.file_type().is_symlink()),
         "data directory must not be a symbolic link"
     );
+    if dir.exists() {
+        ensure!(
+            fs::read_dir(dir)?.next().is_none(),
+            "initialization requires an empty data directory; existing data was preserved"
+        );
+    }
     let roots: Vec<_> = options
         .roots
         .iter()
@@ -176,6 +219,20 @@ fn init(options: Init) -> Result<()> {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
     }
     configuration.allowed_origins = options.allowed_origins;
+    configuration.network = NetworkConfig {
+        bootstrap_urls: options
+            .bootstrap_urls
+            .iter()
+            .map(|value| network_url(value))
+            .collect::<Result<_>>()?,
+        advertise_urls: options
+            .advertise_urls
+            .iter()
+            .map(|value| network_url(value))
+            .collect::<Result<_>>()?,
+        mdns: options.mdns,
+        relay_enabled: options.public_relay,
+    };
     if let Some(manager) = options.manager {
         let workspace = options
             .workspace
@@ -210,6 +267,13 @@ fn init(options: Init) -> Result<()> {
     config::private_dir(dir)?;
     create_private(&dir.join("identity.json"), &encoded_identity)?;
     create_private(&dir.join("config.json"), &encoded_configuration)?;
+    let identities = IdentityStore::open(&dir.join("identity.sqlite3"))?;
+    let capability = identities.bootstrap_capability()?;
+    create_private(
+        &dir.join("bootstrap.json"),
+        &serde_json::to_vec(&capability)?,
+    )?;
+    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":2}"#)?;
     println!("Initialized node {}", identity.node_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     Ok(())
@@ -226,6 +290,9 @@ fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = options.open(path).context("create new private node file")?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -254,179 +321,340 @@ fn is_loopback(url: &Url) -> bool {
     })
 }
 
-fn read_password() -> Result<String> {
-    let mut bytes = Vec::new();
-    std::io::stdin().take(1027).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= 1026, "password input is too long");
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-        if bytes.last() == Some(&b'\r') {
-            bytes.pop();
-        }
-    }
-    let password = String::from_utf8(bytes).context("password must be UTF-8")?;
+fn network_url(value: &str) -> Result<String> {
+    ensure!(value.len() <= 2048, "network URL is too long");
+    let mut url = Url::parse(value).context("invalid network URL")?;
     ensure!(
-        (12..=1024).contains(&password.len()) && !password.contains(['\n', '\r', '\0']),
-        "password must contain 12 to 1024 bytes without line breaks or NUL"
+        url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && matches!(url.path(), "/" | "/api/network/ws"),
+        "network URL must identify the Node WebSocket endpoint without credentials"
     );
-    Ok(password)
+    let scheme = match url.scheme() {
+        "https" | "wss" => "wss",
+        "http" | "ws" => "ws",
+        _ => bail!("unsupported network URL scheme"),
+    };
+    url.set_scheme(scheme)
+        .map_err(|_| anyhow::anyhow!("invalid network URL scheme"))?;
+    url.set_path("/api/network/ws");
+    Ok(url.to_string())
+}
+
+fn access(options: Access) -> Result<()> {
+    let dir = &options.data.data_dir;
+    let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
+    ensure!(
+        epoch == json!({"data_epoch":2}),
+        "data directory uses another format; existing data was preserved"
+    );
+    let configuration = Config::load(dir)?;
+    let identity = config::identity(dir)?;
+    let identities = IdentityStore::open(&dir.join("identity.sqlite3"))?;
+    let capability = if identities.has_network()? {
+        None
+    } else {
+        let capability: BootstrapCapability =
+            serde_json::from_slice(&read_bounded(&dir.join("bootstrap.json"), 4096)?)
+                .context("initial bootstrap capability is unavailable")?;
+        ensure!(
+            capability.capability.len() == 64 && hex::decode(&capability.capability).is_ok(),
+            "invalid local bootstrap capability"
+        );
+        Some(capability.capability)
+    };
+    let mut url = origin(&configuration.public_url)?;
+    if url.scheme() == "http" && !is_loopback(&url) {
+        ensure!(
+            configuration.listen.ip().is_unspecified() || configuration.listen.ip().is_loopback(),
+            "use a trusted HTTPS frontend; the configured LAN-only listener has no loopback entry"
+        );
+        let host = if configuration.listen.is_ipv6() {
+            "[::1]"
+        } else {
+            "127.0.0.1"
+        };
+        url = origin(&format!("http://{host}:{}", configuration.listen.port()))?;
+    }
+    let entry = json!({"url":url.origin().ascii_serialization(),"node_id":identity.node_id()?,"capability":capability});
+    if options.json {
+        println!("{}", serde_json::to_string(&entry)?);
+    } else {
+        if capability.is_some() {
+            url.set_fragment(Some(&format!(
+                "bootstrap={}",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&entry)?)
+            )));
+        }
+        println!("{url}");
+    }
+    Ok(())
+}
+
+fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= limit, "input file exceeds size limit");
+    Ok(bytes)
+}
+
+fn invitation(options: &Pair) -> Result<Invitation> {
+    let bytes = if let Some(path) = &options.invite_file {
+        read_bounded(path, 128 * 1024)?
+    } else {
+        let encoded = options.invite.as_deref().context("invitation required")?;
+        ensure!(encoded.len() <= 192 * 1024, "invitation is too large");
+        URL_SAFE_NO_PAD
+            .decode(encoded)
+            .context("invalid base64url invitation")?
+    };
+    let invitation: Invitation =
+        serde_json::from_slice(&bytes).context("invalid invitation file")?;
+    ensure!(
+        invitation.node_id.len() == 64 && hex::decode(&invitation.node_id).is_ok(),
+        "invitation requires a pinned Node identity"
+    );
+    ensure!(
+        invitation.invite.invite.payload.new_kind == IdentityKind::Node,
+        "invitation must authorize a Node"
+    );
+    ensure!(
+        digest(invitation.invite.capability.as_bytes())
+            == invitation.invite.invite.payload.capability_hash,
+        "invitation capability mismatch"
+    );
+    network_url(&invitation.url)?;
+    Ok(invitation)
+}
+
+fn verify_review(
+    review: &PairReview,
+    invite: &InviteEnvelope,
+    member: &Member,
+    request_hash: &str,
+) -> Result<()> {
+    let payload = &invite.payload;
+    ensure!(
+        review.version == payload.version
+            && review.invite_id == payload.invite_id
+            && review.network_id == payload.network_id
+            && review.inviter_subject_id == payload.inviter_subject_id
+            && review.epoch == payload.epoch
+            && review.expires_at_ms == payload.expires_at_ms
+            && review.proposal_hash == request_hash
+            && review.new_member == *member,
+        "pairing review does not match the invitation and local device"
+    );
+    Ok(())
 }
 
 async fn pair(options: Pair) -> Result<()> {
-    let dir = options.data.data_dir;
-    let _node_lock = config::lock_data_dir(&dir)?;
-    let mut configuration = Config::load(&dir)?;
-    let identity = config::identity(&dir)?;
-    let mut url = origin(&options.url)?;
-    ensure!(
-        url.scheme() == "https" || is_loopback(&url) || configuration.allow_insecure_lan,
-        "pairing over plaintext LAN requires allow_insecure_lan in config.json"
-    );
-    ensure!(
-        options.network_id.len() == 64 && hex::decode(&options.network_id).is_ok(),
-        "network fingerprint must contain 64 hexadecimal characters"
-    );
-    ensure!(
-        (3..=64).contains(&options.username.len())
-            && options
-                .username
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-')),
-        "username must contain 3 to 64 ASCII letters, digits, dots, dashes or underscores"
-    );
-    let username = options.username.to_ascii_lowercase();
-    let password = read_password()?;
-    let node_id = identity.node_id()?;
-    let public_key = identity.public_key_hex()?;
-    let proof = identity.sign_payload(
-        "pair",
-        &serde_json::to_vec(&[&options.code, &node_id, &public_key])?,
-    )?;
-    let mut auth = AuthStore::open(&dir.join("auth.sqlite3"))?;
-    let pending_path = dir.join("pairing.pending.json");
-    let pending: PendingPair = if pending_path.exists() {
-        let pending: PendingPair = serde_json::from_slice(&fs::read(&pending_path)?)
-            .context("invalid pending pairing receipt")?;
+    let invitation = invitation(&options)?;
+    let url = network_url(&invitation.url)?;
+    let runtime = Runtime::open(&options.data.data_dir).await?;
+    let mut configuration = runtime.config.clone();
+    let identity = &runtime.identity;
+    let payload = &invitation.invite.invite.payload;
+    let pending_path = options.data.data_dir.join("pairing.pending.json");
+    if runtime.has_membership().await? {
         ensure!(
-            pending.origin == url.origin().ascii_serialization() && pending.username == username,
-            "finish the pending pairing with its original URL and username first"
+            pending_path.exists()
+                && runtime.membership_state().await?.genesis.network_id == payload.network_id,
+            "this Node already belongs to a personal network; existing membership was preserved"
         );
-        verify_pair(
-            &pending.response,
-            &options.network_id,
-            &identity,
-            &mut configuration,
-        )?;
-        pending
-    } else {
-        ensure!(
-            !auth
-                .accounts()?
-                .iter()
-                .any(|account| account.username == username
-                    || account.network_id == options.network_id),
-            "username or network is already installed on this node"
-        );
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        let response = client
-            .post(url.join("api/pair")?)
-            .header("Origin", url.origin().ascii_serialization())
-            .json(&json!({
-                "code": options.code,
-                "node_id": node_id,
-                "public_key": public_key,
-                "proof": proof,
-            }))
-            .send()
-            .await
-            .context("reach pairing node")?;
-        ensure!(
-            response.status().is_success(),
-            "pairing rejected with HTTP {}",
-            response.status()
-        );
-        let paired: PairResponse = serde_json::from_slice(&bounded_body(response).await?)
-            .context("invalid pairing response")?;
-        verify_pair(&paired, &options.network_id, &identity, &mut configuration)?;
-        let pending = PendingPair {
-            origin: url.origin().ascii_serialization(),
-            username: username.clone(),
-            response: paired,
-        };
-        config::private_write(&pending_path, &serde_json::to_vec(&pending)?)?;
-        pending
-    };
-    let paired = pending.response;
-    let mut store = Store::open(dir.join("node.sqlite3"))?;
-    store.install_trust_bundle(&paired.network_id, &paired.trust_bundle)?;
-    store.save_local_identity(&paired.network_id, &identity)?;
-    let existing = auth
-        .accounts()?
-        .into_iter()
-        .find(|account| account.username == username || account.network_id == paired.network_id);
-    if let Some(existing) = existing {
-        ensure!(
-            existing.username == username && existing.network_id == paired.network_id,
-            "local account conflicts with pending pairing"
-        );
-        let login = auth.login(&username, &password)?;
-        auth.logout(&login.token)?;
-    } else {
-        auth.install_account(&username, &password, &paired.network_id)?;
     }
-    let peer_scheme = if url.scheme() == "https" { "wss" } else { "ws" };
-    url.set_scheme(peer_scheme)
-        .map_err(|_| anyhow::anyhow!("invalid peer URL scheme"))?;
-    url.set_path("/peer");
-    if !configuration
-        .peers
-        .iter()
-        .any(|peer| peer.network_id == paired.network_id && peer.url == url.as_str())
-    {
-        configuration.peers.push(PeerConfig {
-            network_id: paired.network_id.clone(),
-            url: url.to_string(),
-        });
-    }
-    configuration.save(&dir)?;
-    fs::remove_file(pending_path)?;
-    println!("Paired node {node_id} with network {}", paired.network_id);
-    println!("Restart the node to connect to its new peer.");
-    Ok(())
-}
-
-fn verify_pair(
-    paired: &PairResponse,
-    network_id: &str,
-    identity: &LocalIdentity,
-    configuration: &mut Config,
-) -> Result<()> {
     ensure!(
-        paired.network_id == network_id && paired.trust_bundle.network_id == network_id,
-        "pairing response does not match the pinned network fingerprint"
-    );
-    verify_trust_bundle(&paired.trust_bundle)?;
-    let certificate = paired
-        .trust_bundle
-        .nodes
-        .iter()
-        .find(|node| identity.node_id().is_ok_and(|id| node.node_id == id))
-        .context("pairing response omits this device")?;
-    ensure!(
-        certificate.public_key == identity.public_key_hex()?
-            && !certificate.revoked
-            && !certificate.roles.is_empty()
-            && certificate
-                .roles
+        !payload.manage
+            && payload
+                .node_roles
                 .iter()
                 .all(|role| configuration.roles.contains(role)),
-        "pairing response does not grant this device's configured roles"
+        "invitation exceeds this Node's configured capabilities"
     );
-    configuration.roles = certificate.roles.clone();
-    Ok(())
+    let member = Member::node(identity, &options.name, payload.node_roles.clone())?;
+    let mut pending = if pending_path.exists() {
+        let pending: PendingPair = serde_json::from_slice(&read_bounded(&pending_path, 8192)?)?;
+        ensure!(
+            pending.url == url
+                && pending.node_id == invitation.node_id
+                && pending.relay == invitation.relay
+                && pending.invite_id == payload.invite_id
+                && pending.name == options.name,
+            "finish the pending pairing with its original invitation and device name"
+        );
+        pending
+    } else {
+        let pending = PendingPair {
+            url: url.clone(),
+            node_id: invitation.node_id.clone(),
+            relay: invitation.relay,
+            invite_id: payload.invite_id.clone(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            name: options.name.clone(),
+            request_hash: None,
+        };
+        create_private(&pending_path, &serde_json::to_vec(&pending)?)?;
+        pending
+    };
+    let mut client = Client::connect(&url, identity, &invitation.node_id, invitation.relay).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(660);
+    let mut accepted = false;
+    loop {
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "pairing is still pending; run the same command again to resume"
+        );
+        let status = client
+            .call("pair_status", json!({"request_id":pending.request_id}))
+            .await?;
+        match status
+            .get("status")
+            .and_then(Value::as_str)
+            .context("invalid pairing status")?
+        {
+            "granted" => {
+                let state: NetworkState = serde_json::from_value(
+                    status
+                        .get("state")
+                        .context("paired network state is missing")?
+                        .clone(),
+                )?;
+                let view = state.project()?;
+                ensure!(
+                    view.network_id == payload.network_id,
+                    "paired network does not match the invitation"
+                );
+                let authorized = view.authorize_node(&identity.node_id()?, None)?;
+                ensure!(
+                    authorized == member
+                        && authorized
+                            .node_roles
+                            .iter()
+                            .all(|role| configuration.roles.contains(role)),
+                    "paired network grants unexpected local permissions"
+                );
+                let installed = runtime.install_membership(state).await?;
+                let current = installed.authorize_node(&identity.node_id()?, None)?;
+                ensure!(
+                    current == member,
+                    "installed network no longer grants the requested local membership"
+                );
+                configuration.roles = current.node_roles;
+                if !configuration.network.bootstrap_urls.contains(&url) {
+                    configuration.network.bootstrap_urls.push(url.clone());
+                }
+                configuration.save(&options.data.data_dir)?;
+                fs::remove_file(pending_path)?;
+                println!(
+                    "Paired node {} with network {}",
+                    identity.node_id()?,
+                    payload.network_id
+                );
+                println!("Start the Node to connect to its personal network.");
+                return Ok(());
+            }
+            "not_found" => {
+                ensure!(
+                    !accepted,
+                    "pairing request disappeared; pending receipt was preserved"
+                );
+                let prepared = client.call("prepare_pair_request", json!({"invite":invitation.invite.invite,"capability":invitation.invite.capability,"name":options.name,"request_id":pending.request_id})).await?;
+                let mut request: PairRequest = serde_json::from_value(
+                    prepared
+                        .get("request")
+                        .context("pairing request template missing")?
+                        .clone(),
+                )?;
+                ensure!(
+                    request.request_id == pending.request_id
+                        && request.invite_id == payload.invite_id
+                        && request.capability == invitation.invite.capability
+                        && request.member == member,
+                    "pairing request does not match this device and invitation"
+                );
+                let signing_bytes = request.signing_bytes()?;
+                let request_hash = digest(&signing_bytes);
+                ensure!(
+                    pending
+                        .request_hash
+                        .as_ref()
+                        .is_none_or(|previous| previous == &request_hash),
+                    "pairing request template changed; original pending receipt was preserved"
+                );
+                pending.request_hash = Some(request_hash);
+                config::private_write(&pending_path, &serde_json::to_vec(&pending)?)?;
+                request.proof = identity.sign_payload("identity-pair", &signing_bytes)?;
+                let result = client
+                    .call("pair_request", json!({"request":request}))
+                    .await?;
+                let review: PairReview = serde_json::from_value(
+                    result
+                        .get("review")
+                        .context("pairing review missing")?
+                        .clone(),
+                )?;
+                verify_review(
+                    &review,
+                    &invitation.invite.invite,
+                    &member,
+                    pending
+                        .request_hash
+                        .as_deref()
+                        .context("pending request hash is missing")?,
+                )?;
+                let signature =
+                    identity.sign_payload("identity-pair-review", &review.signing_bytes()?)?;
+                client
+                    .call(
+                        "pair_accept",
+                        json!({"request_id":pending.request_id,"signature":signature}),
+                    )
+                    .await?;
+                accepted = true;
+                println!(
+                    "Pairing request submitted. Confirm this device in the management client."
+                );
+            }
+            "pending" => {
+                if !accepted {
+                    let review: PairReview = serde_json::from_value(
+                        status
+                            .get("review")
+                            .context("pending review missing")?
+                            .clone(),
+                    )?;
+                    verify_review(
+                        &review,
+                        &invitation.invite.invite,
+                        &member,
+                        pending
+                            .request_hash
+                            .as_deref()
+                            .context("pending request hash is missing")?,
+                    )?;
+                    let signature =
+                        identity.sign_payload("identity-pair-review", &review.signing_bytes()?)?;
+                    client
+                        .call(
+                            "pair_accept",
+                            json!({"request_id":pending.request_id,"signature":signature}),
+                        )
+                        .await?;
+                    accepted = true;
+                    println!(
+                        "Pairing request resumed. Confirm this device in the management client."
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            _ => bail!("unsupported pairing status; pending receipt was preserved"),
+        }
+    }
 }
 
 async fn call_tool(name: String, arguments: String) -> Result<()> {
@@ -482,19 +710,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_requires_pairing_pin_and_stdin_password() {
+    fn cli_requires_one_invitation_and_supports_accountless_flags() {
+        assert!(Cli::try_parse_from(["vibeface-node", "pair"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "vibeface-node",
                 "pair",
-                "--url",
-                "http://localhost:4790",
-                "--code",
-                "test",
-                "--username",
-                "harry"
+                "--invite",
+                "abc",
+                "--invite-file",
+                "invite.json"
             ])
             .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vibeface-node",
+                "pair",
+                "--invite",
+                "abc",
+                "--name",
+                "Build Node"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["vibeface-node", "access", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "vibeface-node",
+                "init",
+                "--bootstrap-url",
+                "wss://relay.test/api/network/ws",
+                "--advertise-url",
+                "wss://node.test/api/network/ws",
+                "--mdns",
+                "--public-relay"
+            ])
+            .is_ok()
         );
         assert!(
             Cli::try_parse_from([
@@ -526,36 +778,112 @@ mod tests {
     }
 
     #[test]
-    fn pairing_checks_network_pin_and_narrows_invited_roles() {
-        use vibeface_node::model::NodeRole;
-        let owner = LocalIdentity::generate();
-        let device = LocalIdentity::generate();
-        let network_id = owner.network_id().unwrap();
-        let response = PairResponse {
-            network_id: network_id.clone(),
-            trust_bundle: owner
-                .sign_trust_bundle(
-                    1,
-                    vec![device.certificate(vec![NodeRole::Replica]).unwrap()],
-                )
-                .unwrap(),
-        };
-        let mut configuration = Config::local("127.0.0.1:4790".parse().unwrap(), vec![], false);
-        assert!(
-            verify_pair(
-                &response,
-                &device.network_id().unwrap(),
-                &device,
-                &mut configuration
-            )
-            .is_err()
+    fn network_urls_normalize_without_accepting_credentials() {
+        assert_eq!(
+            network_url("https://node.test").unwrap(),
+            "wss://node.test/api/network/ws"
         );
-        verify_pair(&response, &network_id, &device, &mut configuration).unwrap();
-        assert_eq!(configuration.roles, vec![NodeRole::Replica]);
-        let other = LocalIdentity::generate();
-        assert!(verify_pair(&response, &network_id, &other, &mut configuration).is_err());
-        configuration.roles = vec![NodeRole::Executor];
-        assert!(verify_pair(&response, &network_id, &device, &mut configuration).is_err());
+        assert_eq!(
+            network_url("ws://127.0.0.1:4790/api/network/ws").unwrap(),
+            "ws://127.0.0.1:4790/api/network/ws"
+        );
+        for value in [
+            "file:///tmp/node",
+            "https://user:secret@node.test",
+            "https://node.test/?token=secret",
+            "https://node.test/other",
+        ] {
+            assert!(network_url(value).is_err());
+        }
+    }
+
+    #[test]
+    fn pairing_review_binds_the_exact_local_request() {
+        use vibeface_node::{identity::local::InvitePayload, model::NodeRole};
+        let device = LocalIdentity::generate();
+        let member = Member::node(&device, "Build Node", vec![NodeRole::Replica]).unwrap();
+        let invite = InviteEnvelope {
+            payload: InvitePayload {
+                version: 1,
+                invite_id: "invite".into(),
+                request_id: "invite-request".into(),
+                network_id: "ab".repeat(32),
+                inviter_subject_id: "cd".repeat(32),
+                capability_hash: digest(b"fixture capability"),
+                new_kind: IdentityKind::Node,
+                node_roles: vec![NodeRole::Replica],
+                manage: false,
+                epoch: 1,
+                expires_at_ms: 42,
+                nonce: "invite nonce".into(),
+            },
+            inviter_signature: String::new(),
+        };
+        let request = PairRequest {
+            request_id: "request".into(),
+            invite_id: "invite".into(),
+            capability: "fixture capability".into(),
+            member: member.clone(),
+            nonce: "request nonce".into(),
+            proof: String::new(),
+        };
+        for relay in [false, true] {
+            let mut envelope = json!({
+                "url":"ws://127.0.0.1:4790/api/network/ws",
+                "node_id":device.node_id().unwrap(),
+                "relay":relay,
+                "invite":{"invite":&invite,"capability":"fixture capability"}
+            });
+            let mut options = Pair {
+                data: DataDir {
+                    data_dir: PathBuf::new(),
+                },
+                invite_file: None,
+                invite: Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap())),
+                name: "Build Node".into(),
+            };
+            assert_eq!(super::invitation(&options).unwrap().relay, relay);
+            envelope.as_object_mut().unwrap().remove("relay");
+            options.invite = Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap()));
+            assert!(super::invitation(&options).is_err());
+        }
+        let request_hash = digest(&request.signing_bytes().unwrap());
+        let mut review = PairReview {
+            version: 1,
+            invite_id: "invite".into(),
+            network_id: "ab".repeat(32),
+            inviter_subject_id: "cd".repeat(32),
+            new_member: member.clone(),
+            proposal_hash: request_hash.clone(),
+            parents: vec![],
+            epoch: 1,
+            expires_at_ms: 42,
+        };
+        verify_review(&review, &invite, &member, &request_hash).unwrap();
+        review.proposal_hash = invite.payload.hash().unwrap();
+        assert!(verify_review(&review, &invite, &member, &request_hash).is_err());
+        review.proposal_hash = request_hash.clone();
+        review.new_member.name = "Another Node".into();
+        assert!(verify_review(&review, &invite, &member, &request_hash).is_err());
+    }
+
+    #[test]
+    fn initialization_preserves_nonempty_data_directories() {
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-cli-existing-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("existing-data"), b"original").unwrap();
+        let parsed =
+            Cli::try_parse_from(["vibeface-node", "init", "--data-dir", dir.to_str().unwrap()])
+                .unwrap();
+        let Action::Init(options) = parsed.command else {
+            panic!("expected init")
+        };
+        assert!(init(*options).is_err());
+        assert_eq!(fs::read(dir.join("existing-data")).unwrap(), b"original");
+        assert!(!dir.join("identity.json").exists());
+        assert!(!dir.join("config.json").exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

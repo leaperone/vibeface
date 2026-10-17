@@ -122,7 +122,7 @@ CREATE TABLE budget_days (
   used INTEGER NOT NULL,
   PRIMARY KEY(network_id,day)
 );
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 CREATE TABLE local_values (
   network_id TEXT NOT NULL,
   key TEXT NOT NULL,

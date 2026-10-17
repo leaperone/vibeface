@@ -457,6 +457,7 @@ mod tests {
             .join(format!("maintenance-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let dir = dir.canonicalize()?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":2}"#)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         config.codex_socket = Some(dir.join("unavailable.sock"));
         config.save(&dir)?;

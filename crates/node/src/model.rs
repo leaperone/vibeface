@@ -132,17 +132,6 @@ pub struct NodeCertificate {
     pub revoked: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TrustBundle {
-    pub version: u32,
-    pub network_id: NetworkId,
-    pub owner_public_key: String,
-    pub revision: u64,
-    pub nodes: Vec<NodeCertificate>,
-    pub signature: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct MissingDependencies {
     pub events: Vec<EventHash>,
@@ -212,6 +201,8 @@ pub struct OperationRequest {
     pub basis_heads: Vec<EventHash>,
     pub action: Value,
     pub resources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<crate::binding::SignedBinding>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

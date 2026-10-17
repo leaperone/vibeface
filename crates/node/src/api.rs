@@ -5,38 +5,24 @@ use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Request, State, WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
-    response::{
-        IntoResponse, Response, Sse,
-        sse::{Event, KeepAlive},
-    },
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
-use futures_util::stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
-    convert::Infallible,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::{Duration, Instant},
 };
-use tokio::{
-    net::TcpListener,
-    sync::{Mutex, broadcast},
-};
+use tokio::net::TcpListener;
 
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
-const COOKIE: &str = "vibeface_session";
 const CALLBACK: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
-const AUTH_WINDOW: Duration = Duration::from_secs(60);
-const AUTH_ATTEMPTS: u32 = 20;
 
 #[derive(Clone)]
 struct App {
     node: Arc<Runtime>,
     sites: Vec<Site>,
-    attempts: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>>,
 }
 
 #[derive(Clone)]
@@ -88,17 +74,7 @@ impl ApiError {
         Self(StatusCode::BAD_REQUEST, error.to_string())
     }
     fn forbidden() -> Self {
-        Self(
-            StatusCode::FORBIDDEN,
-            "request origin or CSRF token is invalid".into(),
-        )
-    }
-    fn internal(error: impl std::fmt::Display) -> Self {
-        tracing::error!(%error, "node HTTP operation failed");
-        Self(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "node operation failed".into(),
-        )
+        Self(StatusCode::FORBIDDEN, "request origin is invalid".into())
     }
 }
 
@@ -151,7 +127,6 @@ fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
     let app = App {
         node,
         sites: vec![site],
-        attempts: Arc::new(Mutex::new(HashMap::new())),
     };
     Router::new()
         .route("/api/tools", post(tool))
@@ -181,29 +156,17 @@ pub fn router(node: Arc<Runtime>) -> Router {
 }
 
 fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
-    let app = App {
-        sites,
-        node,
-        attempts: Arc::new(Mutex::new(HashMap::new())),
-    };
+    let app = App { sites, node };
     Router::new()
         .route("/", get(index))
         .route("/app.js", get(javascript))
+        .route("/transport.js", get(transport_javascript))
+        .route("/generated/vibeface_secure.js", get(crypto_javascript))
+        .route("/generated/vibeface_secure_bg.wasm", get(crypto_wasm))
         .route("/style.css", get(stylesheet))
         .route("/api/info", get(info))
-        .route("/api/register", post(register))
-        .route("/api/login", post(login))
-        .route("/api/logout", post(logout))
-        .route("/api/me", get(me))
-        .route("/api/pair", post(pair))
-        .route("/api/rpc", post(rpc))
-        .route("/api/tools", post(tool))
-        .route(
-            CALLBACK,
-            post(tool_callback).layer(DefaultBodyLimit::max(MAX_BODY_BYTES / 2)),
-        )
-        .route("/api/events", get(events))
         .route("/peer", get(peer))
+        .route("/api/network/ws", get(network))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(app.clone(), boundary))
         .with_state(app)
@@ -255,7 +218,7 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"));
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"));
     response
 }
 
@@ -266,7 +229,15 @@ async fn check_boundary(
     path: &str,
     ip: IpAddr,
 ) -> ApiResult<()> {
-    let site = check_site(&app.sites, headers)?;
+    let site = if path == "/api/network/ws" && *method == Method::GET {
+        let host = one_header(headers, header::HOST.as_str()).ok_or_else(ApiError::forbidden)?;
+        app.sites
+            .iter()
+            .find(|site| host.eq_ignore_ascii_case(&site.authority))
+            .ok_or_else(ApiError::forbidden)?
+    } else {
+        check_site(&app.sites, headers)?
+    };
     if !http_site_allowed(site, app.node.config.allow_insecure_lan, ip) {
         return Err(ApiError::forbidden());
     }
@@ -281,33 +252,14 @@ async fn check_boundary(
                 "application/json required".into(),
             ));
         }
-        let is_tool_or_rpc = matches!(path, "/api/rpc" | "/api/tools") || path == CALLBACK;
-        let bearer_call = is_tool_or_rpc && bearer(headers).is_some();
+        let is_tool = path == "/api/tools" || path == CALLBACK;
+        let bearer_call = is_tool && bearer(headers).is_some();
         if !bearer_call
             && !one_header(headers, header::ORIGIN.as_str())
                 .is_some_and(|origin| site.origin.eq_ignore_ascii_case(origin))
         {
             return Err(ApiError::forbidden());
         }
-    }
-    if matches!(path, "/api/register" | "/api/login" | "/api/pair") && *method == Method::POST {
-        let now = Instant::now();
-        let mut attempts = app.attempts.lock().await;
-        attempts.retain(|_, (started, _)| now.duration_since(*started) < AUTH_WINDOW);
-        if attempts.len() >= 4096 && !attempts.contains_key(&ip) {
-            return Err(ApiError(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many authentication attempts".into(),
-            ));
-        }
-        let (_, count) = attempts.entry(ip).or_insert((now, 0));
-        if *count >= AUTH_ATTEMPTS {
-            return Err(ApiError(
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many authentication attempts".into(),
-            ));
-        }
-        *count += 1;
     }
     Ok(())
 }
@@ -342,58 +294,6 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     (!token.is_empty() && token.trim() == token).then_some(token)
 }
 
-fn cookie_token(headers: &HeaderMap) -> Option<String> {
-    let mut found = None;
-    for value in headers.get_all(header::COOKIE) {
-        for cookie in value.to_str().ok()?.split(';') {
-            let Some((name, value)) = cookie.trim().split_once('=') else {
-                continue;
-            };
-            if name == COOKIE {
-                if found.is_some() || value.is_empty() {
-                    return None;
-                }
-                found = Some(value.to_owned());
-            }
-        }
-    }
-    found
-}
-
-fn same_secret(left: &str, right: &str) -> bool {
-    left.len() == right.len()
-        && left
-            .bytes()
-            .zip(right.bytes())
-            .fold(0u8, |different, (left, right)| different | (left ^ right))
-            == 0
-}
-
-async fn access(app: &App, headers: &HeaderMap, mutation: bool) -> ApiResult<Access> {
-    if headers.contains_key(header::AUTHORIZATION) {
-        return bearer_access(app, headers).await;
-    }
-    let token = cookie_token(headers).ok_or_else(ApiError::auth)?;
-    let session = app
-        .node
-        .auth
-        .lock()
-        .await
-        .authenticate(&token)
-        .map_err(ApiError::internal)?
-        .ok_or_else(ApiError::auth)?;
-    if mutation
-        && !one_header(headers, "x-csrf-token").is_some_and(|csrf| same_secret(csrf, &session.csrf))
-    {
-        return Err(ApiError::forbidden());
-    }
-    Ok(Access {
-        network_id: session.account.network_id,
-        human: true,
-        conversation_id: None,
-    })
-}
-
 async fn bearer_access(app: &App, headers: &HeaderMap) -> ApiResult<Access> {
     let token = bearer(headers).ok_or_else(ApiError::auth)?;
     app.node
@@ -402,112 +302,8 @@ async fn bearer_access(app: &App, headers: &HeaderMap) -> ApiResult<Access> {
         .ok_or_else(ApiError::auth)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Credentials {
-    username: String,
-    password: String,
-}
-
 async fn info(State(app): State<App>) -> Json<Value> {
     Json(app.node.info())
-}
-
-async fn register(State(app): State<App>, Json(input): Json<Credentials>) -> ApiResult<Response> {
-    let account = app
-        .node
-        .register(&input.username, &input.password)
-        .await
-        .map_err(ApiError::bad)?;
-    Ok((StatusCode::CREATED, Json(json!({"account": account}))).into_response())
-}
-
-async fn login(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Json(input): Json<Credentials>,
-) -> ApiResult<Response> {
-    let login = app
-        .node
-        .auth
-        .lock()
-        .await
-        .login(&input.username, &input.password)
-        .map_err(|_| ApiError::auth())?;
-    let mut response = Json(json!({"account": login.account, "csrf": login.csrf})).into_response();
-    let site = check_site(&app.sites, &headers)?;
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        session_cookie(&login.token, site.secure, false)?,
-    );
-    Ok(response)
-}
-
-fn session_cookie(token: &str, secure: bool, remove: bool) -> ApiResult<HeaderValue> {
-    if !remove
-        && (token.is_empty()
-            || !token
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
-    {
-        return Err(ApiError::internal("invalid session token encoding"));
-    }
-    let secure_flag = if secure { "; Secure" } else { "" };
-    let expires = if remove { "; Max-Age=0" } else { "" };
-    HeaderValue::from_str(&format!(
-        "{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict{secure_flag}{expires}"
-    ))
-    .map_err(ApiError::internal)
-}
-
-async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult<Response> {
-    if headers.contains_key(header::AUTHORIZATION) {
-        return Err(ApiError::auth());
-    }
-    access(&app, &headers, true).await?;
-    let token = cookie_token(&headers).ok_or_else(ApiError::auth)?;
-    app.node
-        .auth
-        .lock()
-        .await
-        .logout(&token)
-        .map_err(ApiError::internal)?;
-    let mut response = Json(json!({"ok": true})).into_response();
-    let site = check_site(&app.sites, &headers)?;
-    response
-        .headers_mut()
-        .insert(header::SET_COOKIE, session_cookie("", site.secure, true)?);
-    Ok(response)
-}
-
-async fn me(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
-    let token = cookie_token(&headers).ok_or_else(ApiError::auth)?;
-    let session = app
-        .node
-        .auth
-        .lock()
-        .await
-        .authenticate(&token)
-        .map_err(ApiError::internal)?
-        .ok_or_else(ApiError::auth)?;
-    Ok(Json(
-        json!({"account": session.account, "csrf": session.csrf}),
-    ))
-}
-
-async fn pair(State(app): State<App>, Json(input): Json<Value>) -> ApiResult<Json<Value>> {
-    Ok(Json(app.node.pair(input).await.map_err(ApiError::bad)?))
-}
-
-async fn rpc(
-    State(app): State<App>,
-    headers: HeaderMap,
-    Json(input): Json<Value>,
-) -> ApiResult<Json<Value>> {
-    let access = access(&app, &headers, true).await?;
-    Ok(Json(
-        app.node.rpc(access, input).await.map_err(ApiError::bad)?,
-    ))
 }
 
 #[derive(Deserialize)]
@@ -575,44 +371,15 @@ fn validate_tool_call(name: &str, call_id: &str) -> ApiResult<()> {
     Ok(())
 }
 
-async fn events(State(app): State<App>, headers: HeaderMap) -> ApiResult<Response> {
-    if headers.contains_key(header::AUTHORIZATION) {
-        return Err(ApiError::auth());
-    }
-    let authorization = access(&app, &headers, false).await?;
-    let receiver = app.node.events.subscribe();
-    let output = stream::unfold(
-        (app, headers, authorization.network_id, receiver),
-        |(app, headers, network_id, mut receiver)| async move {
-            loop {
-                let update = tokio::time::timeout(Duration::from_secs(30), receiver.recv()).await;
-                if !access(&app, &headers, false)
-                    .await
-                    .is_ok_and(|current| current.network_id == network_id)
-                {
-                    return None;
-                }
-                let event = match update {
-                    Err(_) => continue,
-                    Ok(Err(broadcast::error::RecvError::Closed)) => return None,
-                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => Event::default()
-                        .event("reset")
-                        .data("{\"reason\":\"sync_required\"}"),
-                    Ok(Ok(update)) if update.network_id == network_id => Event::default()
-                        .event("update")
-                        .data(update.payload.to_string()),
-                    Ok(Ok(_)) => continue,
-                };
-                return Some((
-                    Ok::<_, Infallible>(event),
-                    (app, headers, network_id, receiver),
-                ));
+async fn network(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
+    websocket
+        .max_message_size(65535)
+        .max_frame_size(65535)
+        .on_upgrade(move |socket| async move {
+            if let Err(error) = app.node.network.clone().accept(socket).await {
+                tracing::debug!(%error, "network connection closed");
             }
-        },
-    );
-    Ok(Sse::new(output)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-        .into_response())
+        })
 }
 
 async fn peer(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
@@ -644,6 +411,25 @@ async fn stylesheet() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../web/style.css"),
+    )
+}
+
+async fn transport_javascript() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/transport.js"),
+    )
+}
+async fn crypto_javascript() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/generated/vibeface_secure.js"),
+    )
+}
+async fn crypto_wasm() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/wasm")],
+        include_bytes!("../web/generated/vibeface_secure_bg.wasm").as_slice(),
     )
 }
 
@@ -715,27 +501,6 @@ mod tests {
             false,
             "192.168.0.50".parse().unwrap()
         ));
-    }
-
-    #[test]
-    fn session_cookies_are_opaque_and_reject_ambiguous_tokens() {
-        let cookie = session_cookie("secret", true, false).unwrap();
-        assert_eq!(
-            cookie.to_str().unwrap(),
-            "vibeface_session=secret; Path=/; HttpOnly; SameSite=Strict; Secure"
-        );
-        assert!(session_cookie("secret; Domain=example.com", false, false).is_err());
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            "other=1; vibeface_session=secret".parse().unwrap(),
-        );
-        assert_eq!(cookie_token(&headers).as_deref(), Some("secret"));
-        headers.append(header::COOKIE, "vibeface_session=other".parse().unwrap());
-        assert_eq!(cookie_token(&headers), None);
-        assert!(same_secret("token", "token"));
-        assert!(!same_secret("token", "other"));
-        assert!(!same_secret("token", "token-long"));
     }
 
     #[test]
