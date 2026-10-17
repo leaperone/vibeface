@@ -27,7 +27,7 @@
         <p id="client-fingerprint" class="fingerprint small"></p>
         <form method="post" id="pair-form" class="stack"><fieldset class="stack" data-key-controls disabled>
           <label>此浏览器的设备名称<input name="label" autocomplete="off" maxlength="80" required placeholder="例如：我的手机"></label>
-          <label>邀请链接或本机邀请内容<textarea id="pair-invitation" name="invitation" rows="4" maxlength="65536" autocomplete="off" spellcheck="false" required aria-describedby="pair-hint"></textarea></label>
+          <label>配对信息或本机邀请内容<textarea id="pair-invitation" name="invitation" rows="4" maxlength="65536" autocomplete="off" spellcheck="false" required aria-describedby="pair-hint"></textarea></label>
           <p id="pair-hint" class="muted small">首台管理设备的邀请请从 Node 所在电脑的终端取得。其他设备由已授权管理设备添加。请勿把邀请交给陌生人。</p>
           <div id="bootstrap-backup" class="stack" hidden><label>恢复包口令<input name="passphrase" type="password" autocomplete="new-password" minlength="12"></label><label>再次输入口令<input name="confirmation" type="password" autocomplete="new-password" minlength="12"></label><p class="muted small">创建网络时会下载加密恢复包。请独立保存文件和口令，个人私钥不会交给运行节点。</p></div>
           <button id="pair-submit" class="primary" type="submit">核对设备并请求配对</button>

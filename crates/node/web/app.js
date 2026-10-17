@@ -473,6 +473,9 @@ async function submitPair(form) {
   if (prepared.request.member?.subject_id !== clientId || prepared.request.member.public_key !== state.client.publicKey || prepared.request.member.kind !== "client" || prepared.request.member.manage) throw new Error("配对请求与此浏览器的身份或权限不一致。");
   prepared.request.proof = signClientValue(prepared.signing, "identity-pair", [prepared.request.request_id, prepared.request.invite_id, prepared.request.capability, prepared.request.member, prepared.request.nonce]);
   const receipt = await request("pair_request", { request: prepared.request });
+  const invitePayload = invitation.invite.invite.payload;
+  const expectedProposal = [prepared.request.request_id, prepared.request.invite_id, prepared.request.capability, prepared.request.member, prepared.request.nonce];
+  if (receipt.review.version !== 1 || receipt.review.network_id !== invitePayload.network_id || receipt.review.invite_id !== invitePayload.invite_id || receipt.review.epoch !== invitePayload.epoch || receipt.review.inviter_subject_id !== invitePayload.inviter_subject_id || receipt.review.proposal_hash !== await hashValue(expectedProposal) || !matchingValue(receipt.review.new_member, prepared.request.member) || receipt.review.expires_at_ms > invitePayload.expires_at_ms || receipt.review.expires_at_ms <= Date.now()) throw new Error("配对确认与原邀请或已签名的请求不一致，已停止授权。");
   form.elements.invitation.value = "";
   const waiting = { request_id: receipt.request_id, network_id: receipt.review.network_id, entry, review: receipt.review, signing: receipt.signing, accepted: false };
   state.pair = waiting; storage.set("waiting-pair", waiting, true);
@@ -527,9 +530,8 @@ function showInvitation(invitation) {
   const payload = { url: state.entry.address, node_id: state.entry.node_id, invite: invitation };
   const bytes = new TextEncoder().encode(JSON.stringify(payload));
   const encoded = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  const url = new URL("/", location.origin); url.hash = `invite=${encoded}`;
-  const output = $("invite-result"); output.replaceChildren(el("p", "muted small invite-output", "将此一次性邀请复制给自己的新设备。邀请包含访问凭证，请勿发送到公共聊天。新设备申请后，还需在此确认。"));
-  const label = el("label", "", "一次性邀请链接"); const value = el("textarea", "invite-link"); value.readOnly = true; value.value = url.href; label.append(value); output.append(label, button("复制邀请链接", async () => { await navigator.clipboard.writeText(value.value); notice("邀请已复制。请只发送给自己的设备。"); }));
+  const output = $("invite-result"); output.replaceChildren(el("p", "muted small invite-output", "在新设备上打开你信任的 Vibeface 客户端，粘贴以下配对信息。请勿公开分享，新设备申请后还需在此确认。"));
+  const label = el("label", "", "一次性配对信息"); const value = el("textarea", "invite-link"); value.readOnly = true; value.value = encoded; label.append(value); output.append(label, button("复制配对信息", async () => { await navigator.clipboard.writeText(value.value); notice("配对信息已复制。请只发送给自己的设备。"); }));
   if (invitation.invite?.payload?.expires_at_ms) output.append(el("p", "muted small", `到期 ${new Date(invitation.invite.payload.expires_at_ms).toLocaleString()}`));
   output.hidden = false;
 }
