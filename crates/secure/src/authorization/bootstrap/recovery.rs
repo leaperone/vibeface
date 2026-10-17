@@ -1,6 +1,7 @@
 //! Account recovery preserves identity and replaces device authorization atomically.
 
 pub mod context;
+pub mod cross_node;
 pub mod node_enrollment;
 pub mod registration;
 
@@ -38,12 +39,12 @@ pub struct RecoveryEntry {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct RecoveryNodeRequest {
-    claim: Signed<NodeClaim>,
-    expected_account_head: PolicyStamp,
-    expected_space_head: PolicyStamp,
-    account_recovery: Signed<AccountDocument>,
-    node_certificate: DeviceCertificate,
+pub struct RecoveryNodeRequest {
+    pub claim: Signed<NodeClaim>,
+    pub expected_account_head: PolicyStamp,
+    pub expected_space_head: PolicyStamp,
+    pub account_recovery: Signed<AccountDocument>,
+    pub node_certificate: DeviceCertificate,
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +314,28 @@ pub fn prepare_account_recovery(
     certificate_expires_at_ms: f64,
     now_ms: f64,
 ) -> crate::Result<PreparedAccountRecovery> {
+    prepare_account_recovery_preserving_source(
+        material_json,
+        latest_bundle_json,
+        next_root,
+        next_client,
+        claim,
+        certificate_expires_at_ms,
+        now_ms,
+        None,
+    )
+}
+
+fn prepare_account_recovery_preserving_source(
+    material_json: &str,
+    latest_bundle_json: &str,
+    next_root: &Identity,
+    next_client: &Identity,
+    claim: &VerifiedNodeClaim,
+    certificate_expires_at_ms: f64,
+    now_ms: f64,
+    preserved_source: Option<&ServiceId>,
+) -> crate::Result<PreparedAccountRecovery> {
     let prepare = || -> Result<PreparedAccountRecovery> {
         let material = read_material(material_json)?;
         let recovery = validate_material(&material)?;
@@ -404,7 +427,7 @@ pub fn prepare_account_recovery(
             &state,
             &account.devices,
             &mut recovered.revoked_devices,
-            Some(&authority.service),
+            preserved_source.or(Some(&authority.service)),
         )?;
         recovered.enrollment.clear();
         recovered.authenticators.clear();
@@ -464,7 +487,7 @@ pub fn prepare_account_recovery(
             &state,
             &space.devices,
             &mut space_document.revoked_devices,
-            None,
+            preserved_source,
         )?;
         space_document.grants.clear();
         space_document.memberships.clear();
@@ -672,7 +695,13 @@ pub fn finish_account_recovery(
         let mut account = prepared.request.account_recovery.payload.clone();
         account.previous = Some(account_head);
         account.sequence = 1;
-        account.devices = vec![client_hash, node_hash];
+        account.devices.retain(|hash| {
+            state.devices.get(hash).is_some_and(|certificate| {
+                certificate.payload.device != prepared.client_certificate.payload.device
+                    && certificate.payload.device != node_certificate.payload.device
+            })
+        });
+        account.devices.extend([client_hash, node_hash]);
         account.devices.sort();
         account.enrollment = vec![EnrollmentAuthority {
             device: prepared.client_certificate.payload.device.clone(),
@@ -1613,6 +1642,379 @@ mod tests {
         }
         if let Ok(path) = std::env::var("VIBEFACE_NODE_ENROLLMENT_VECTOR") {
             std::fs::write(path, serde_json::to_vec(&serde_json::json!({"now":NOW,"end":END,"material":backup,"pins":original.pins,"bundle":original.bundle,"claim":new_claim.claim,"request":serde_json::from_str::<serde_json::Value>(&request).unwrap(),"possession":possession,"commit_request":serde_json::from_str::<serde_json::Value>(&public).unwrap(),"delta":serde_json::from_str::<serde_json::Value>(&delta).unwrap(),"installation":serde_json::from_str::<serde_json::Value>(&installation).unwrap(),"updated_pins":result.pins(),"updated_bundle":result.bundle()})).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn cross_node_recovery_requires_live_source_cas_two_possessions_and_exact_read_only_history() {
+        use super::cross_node::*;
+        let original = account();
+        let backup = material(&original);
+        let old_state = replay_policies(&original.pins, &original.bundle.journal).unwrap();
+        let inspected: serde_json::Value =
+            serde_json::from_str(&inspect_cross_node_recovery_sources(&backup, RESTORE).unwrap())
+                .unwrap();
+        let resources = inspected["source_projects"].to_string();
+        let original_request = build_cross_node_recovery_request(
+            &backup,
+            &key(5),
+            &key(6),
+            &claim(7, 44, RESTORE),
+            &resources,
+            END - 1000.0,
+            RESTORE,
+            RESTORE + 100_000.0,
+        )
+        .unwrap();
+        let signed: Signed<CrossNodeRecoveryRequest> =
+            serde_json::from_str(&original_request).unwrap();
+        let context = create_cross_node_recovery_witness(
+            &old_state,
+            &signed,
+            &original.bundle,
+            &key(4),
+            RESTORE as u64,
+        )
+        .unwrap();
+        let verified = verify_cross_node_recovery_context(
+            &encode(&context).unwrap(),
+            &original_request,
+            RESTORE,
+        )
+        .unwrap();
+        let prepared =
+            prepare_cross_node_account_recovery(&backup, &verified, &key(5), &key(6), END, RESTORE)
+                .unwrap();
+        let possession: CrossNodeRecoveryPossessionRequest =
+            serde_json::from_str(&prepared.possession_request_json().unwrap()).unwrap();
+        let c_proof = sign_cross_node_recovery_possession(
+            &possession,
+            &key(7),
+            &Nonce::parse(&nonce(44)).unwrap(),
+            RESTORE as u64,
+        )
+        .unwrap();
+        let b_proof = sign_cross_node_recovery_source_possession(
+            &old_state,
+            &possession,
+            &key(4),
+            RESTORE as u64,
+        )
+        .unwrap();
+        let mut pending = finish_cross_node_account_recovery(
+            &prepared,
+            &key(5),
+            c_proof.as_str(),
+            b_proof.as_str(),
+            RESTORE,
+        )
+        .unwrap();
+        let pending_material = pending
+            .recovery_material_json(&key(5), &backup, "https://target.example", RESTORE)
+            .unwrap();
+        assert!(pending_material.len() > 64 * 1024);
+        let sealed = crate::recovery::recovery_seal(
+            pending_material.as_bytes(),
+            "synthetic recovery package password",
+        )
+        .unwrap();
+        let opened =
+            crate::recovery::recovery_open(&sealed, "synthetic recovery package password").unwrap();
+        assert_eq!(opened, pending_material.as_bytes());
+        let restored =
+            restore_prepared_cross_node_recovery_commit(&pending_material, RESTORE + 200_000.0)
+                .unwrap();
+        assert_eq!(
+            restored.request_json().unwrap(),
+            pending.request_json().unwrap()
+        );
+        assert_eq!(
+            restored.client_identity().unwrap().public_key_hex(),
+            key(6).public_key_hex()
+        );
+        let resume: serde_json::Value =
+            serde_json::from_str(&restored.resume_context_json().unwrap()).unwrap();
+        assert_eq!(resume["source"]["node_public_key"], key(4).public_key_hex());
+        assert_eq!(resume["target"]["node_public_key"], key(7).public_key_hex());
+        let request: CrossNodeRecoveryCommitRequest =
+            serde_json::from_str(&pending.request_json().unwrap()).unwrap();
+        let verified_commit = verify_cross_node_recovery_commit(
+            &old_state,
+            &request,
+            &PublicKey::of(&key(4)),
+            RESTORE as u64,
+        )
+        .unwrap();
+        assert_eq!(
+            verified_commit.request_hash().unwrap(),
+            ObjectHash::body(&signed).unwrap()
+        );
+        assert_eq!(
+            verified_commit.possession_hash().unwrap(),
+            ObjectHash::body(&possession).unwrap()
+        );
+        let committed =
+            accept_cross_node_recovery_commit(&verified_commit, &key(4), RESTORE as u64).unwrap();
+        let committed_json = encode(&committed).unwrap();
+        let completed =
+            finish_cross_node_recovery_commit(&restored, &committed_json, RESTORE + 200_000.0)
+                .unwrap();
+        assert_eq!(
+            completed.pins_json().unwrap(),
+            encode(&request.pins).unwrap()
+        );
+        let final_material = completed
+            .final_recovery_material_json("https://target.example", RESTORE + 200_000.0)
+            .unwrap();
+        inspect_account_recovery_material(&final_material, RESTORE + 200_000.0).unwrap();
+        let installed = verify_cross_node_recovery_installation(
+            &committed,
+            &PublicKey::of(&key(7)),
+            &Nonce::parse(&nonce(44)).unwrap(),
+            RESTORE as u64,
+        )
+        .unwrap();
+        let after = replay_policies(installed.pins(), &installed.bundle().journal).unwrap();
+        let selections: serde_json::Value =
+            serde_json::from_str(&completed.source_read_selections_json().unwrap()).unwrap();
+        assert_eq!(selections.as_array().unwrap().len(), 1);
+        let source_bundle: ClientAuthorizationBundle =
+            serde_json::from_value(selections[0]["authorization"].clone()).unwrap();
+        let old_scope = original.authorization.scope();
+        let source_auth = verify_client_authorization(
+            &encode(&source_bundle).unwrap(),
+            &completed.pins_json().unwrap(),
+            old_scope.account_id.as_str(),
+            old_scope.space_id.as_str(),
+            &key(6).public_key_hex(),
+            RESTORE,
+        )
+        .unwrap();
+        assert_eq!(source_auth.audience_public_key(), &PublicKey::of(&key(4)));
+        let resource: ResourceRef =
+            serde_json::from_value(selections[0]["project"].clone()).unwrap();
+        let mut invocation = Invocation {
+            version: AUTH_VERSION,
+            actor: Actor::Account(old_scope.account_id.clone()),
+            device: source_auth.scope.device_id.clone(),
+            initiator: Actor::Account(old_scope.account_id.clone()),
+            initiating_grant: None,
+            resource: resource.clone(),
+            action: Action::ConversationRead,
+            audience: source_auth.audience.clone(),
+            presenter: source_auth.scope.device_id.clone(),
+            operation_id: "synthetic-source-read".to_owned(),
+            body_hash: ObjectHash::body(&serde_json::json!({})).unwrap(),
+            grant_leaf: source_bundle.grant_leaf.clone(),
+            expected_policies: source_auth.heads.clone(),
+            context: InvocationContext::default(),
+            nonce: Nonce::from_bytes([55; 32]),
+            not_before_ms: RESTORE as u64,
+            expires_at_ms: RESTORE as u64 + 1000,
+        };
+        let transport = TransportEvidence::DirectNoise {
+            device: source_auth.scope.device_id.clone(),
+        };
+        let facts = |value: &Invocation| RequestFacts {
+            resource: value.resource.clone(),
+            action: value.action,
+            audience: value.audience.clone(),
+            operation_id: value.operation_id.clone(),
+            body_hash: value.body_hash.clone(),
+            context: value.context.clone(),
+        };
+        let read = after
+            .verify_invocation(
+                &Signed::sign(invocation.clone(), &key(6)).unwrap(),
+                &facts(&invocation),
+                &transport,
+                RESTORE as u64,
+            )
+            .unwrap();
+        assert_eq!(read.dependencies().len(), 2);
+        for action in [
+            Action::MessageAppend,
+            Action::TaskCreate,
+            Action::AgentStart,
+            Action::ExecutionOpen,
+            Action::MemberManage,
+            Action::AttachmentWrite,
+            Action::OperationResolve,
+        ] {
+            invocation.action = action;
+            assert!(
+                after
+                    .verify_invocation(
+                        &Signed::sign(invocation.clone(), &key(6)).unwrap(),
+                        &facts(&invocation),
+                        &transport,
+                        RESTORE as u64
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            source_auth
+                .policy_json()
+                .unwrap()
+                .contains("message_append"),
+            false
+        );
+        assert_eq!(
+            after
+                .account(&old_scope.account_id)
+                .unwrap()
+                .authority
+                .public_key,
+            PublicKey::of(&key(7))
+        );
+        assert_eq!(after.space(&old_scope.space_id).unwrap().resources.len(), 2);
+        assert!(
+            after
+                .verify_account_client_device(
+                    &old_scope.account_id,
+                    &DeviceId::from_key(&PublicKey::of(&key(3))),
+                    RESTORE as u64
+                )
+                .is_err()
+        );
+        assert!(
+            verify_cross_node_recovery_commit(
+                &after,
+                &request,
+                &PublicKey::of(&key(4)),
+                RESTORE as u64
+            )
+            .is_err()
+        );
+        for domain in [
+            PolicyDomain::Account(old_scope.account_id.clone()),
+            PolicyDomain::Space(old_scope.space_id.clone()),
+        ] {
+            let mut advanced = old_state.clone();
+            match domain {
+                PolicyDomain::Account(account) => {
+                    let mut document = advanced.account(&account).unwrap().clone();
+                    document.previous = advanced.head(&PolicyDomain::Account(account)).cloned();
+                    document.sequence += 1;
+                    advanced
+                        .install_account(Signed::sign(document, &key(1)).unwrap())
+                        .unwrap();
+                }
+                PolicyDomain::Space(space) => {
+                    let mut document = advanced.space(&space).unwrap().clone();
+                    document.previous = advanced.head(&PolicyDomain::Space(space)).cloned();
+                    document.sequence += 1;
+                    advanced
+                        .install_space(Signed::sign(document, &key(1)).unwrap())
+                        .unwrap();
+                }
+            }
+            assert!(
+                verify_cross_node_recovery_commit(
+                    &advanced,
+                    &request,
+                    &PublicKey::of(&key(4)),
+                    RESTORE as u64
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            sign_cross_node_recovery_possession(
+                &possession,
+                &key(4),
+                &Nonce::parse(&nonce(44)).unwrap(),
+                RESTORE as u64
+            )
+            .is_err()
+        );
+        assert!(
+            sign_cross_node_recovery_possession(
+                &possession,
+                &key(7),
+                &Nonce::parse(&nonce(45)).unwrap(),
+                RESTORE as u64
+            )
+            .is_err()
+        );
+        assert!(
+            sign_cross_node_recovery_source_possession(
+                &old_state,
+                &possession,
+                &key(7),
+                RESTORE as u64
+            )
+            .is_err()
+        );
+        assert!(
+            finish_cross_node_account_recovery(
+                &prepared,
+                &key(5),
+                b_proof.as_str(),
+                c_proof.as_str(),
+                RESTORE
+            )
+            .is_err()
+        );
+        assert!(
+            finish_cross_node_recovery_commit(&restored, &committed_json, RESTORE - 1.0).is_err()
+        );
+        assert!(
+            verify_cross_node_recovery_installation(
+                &committed,
+                &PublicKey::of(&key(7)),
+                &Nonce::parse(&nonce(44)).unwrap(),
+                END as u64 + 1
+            )
+            .is_err()
+        );
+        let expired =
+            finish_cross_node_recovery_commit(&restored, &committed_json, END + 1.0).unwrap();
+        assert_eq!(expired.scope_json().unwrap(), "null");
+        for mutation in 0..5 {
+            let mut changed = context.clone();
+            match mutation {
+                0 => {
+                    changed.witness =
+                        Signed::sign(changed.witness.payload.clone(), &key(7)).unwrap()
+                }
+                1 => changed.request.payload.new_device_public_key = PublicKey::of(&key(8)),
+                2 => changed.bundle.journal.pop().map(|_| ()).unwrap(),
+                3 => changed.request.payload.saved_pins[0].genesis_root = PublicKey::of(&key(8)),
+                4 => changed.witness.payload.expected_account_head.sequence += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_cross_node_recovery_context(
+                    &encode(&changed).unwrap(),
+                    &original_request,
+                    RESTORE
+                )
+                .is_err()
+            );
+        }
+        let mut changed = request.clone();
+        changed.bundle.journal.retain(|entry| !matches!(entry,JournalEntry::Device(c) if c.payload.public_key==PublicKey::of(&key(4)) && c.issuer==PublicKey::of(&key(5))));
+        assert!(
+            verify_cross_node_recovery_commit(
+                &old_state,
+                &changed,
+                &PublicKey::of(&key(4)),
+                RESTORE as u64
+            )
+            .is_err()
+        );
+        let mut pending_value: serde_json::Value = serde_json::from_str(&pending_material).unwrap();
+        pending_value["client_secret_hex"] = key(8).secret_hex().into();
+        assert!(
+            restore_prepared_cross_node_recovery_commit(&pending_value.to_string(), RESTORE)
+                .is_err()
+        );
+        if let Ok(path) = std::env::var("VIBEFACE_CROSS_NODE_RECOVERY_VECTOR") {
+            std::fs::write(path,encode(&serde_json::json!({"material":backup,"original_bundle":original.bundle,"original_pins":original.pins,
+                "request":signed,"context":context,"possession":possession,"commit_request":request,"committed":committed,
+                "pending_material":pending_material,"read_selections":selections,"now_ms":RESTORE,"expires_at_ms":END})).unwrap()).unwrap();
         }
     }
 }
