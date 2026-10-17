@@ -581,16 +581,25 @@ impl PeerHub {
         );
         ensure!(packet.hops_remaining <= MAX_HOPS, "invalid peer hop limit");
         validate_body(&packet.body, now_ms()?)?;
-        let key = self.authorize(network, &packet.body.origin).await?;
+        let key = match self.authorize(network, &packet.body.origin).await {
+            Ok(key) => key,
+            Err(error) => {
+                tracing::debug!(%error, origin=%packet.body.origin, network, "dropping peer packet from an unknown member");
+                return Ok(());
+            }
+        };
+        if let Some(target) = &packet.body.target {
+            if let Err(error) = self.authorize(network, target).await {
+                tracing::debug!(%error, target, network, "dropping peer packet for an unknown member");
+                return Ok(());
+            }
+        }
         verify_payload(
             &key,
             "peer-packet",
             &serde_json::to_vec(&packet.body)?,
             &packet.signature,
         )?;
-        if let Some(target) = &packet.body.target {
-            self.authorize(network, target).await?;
-        }
         if !self.remember(&packet).await? {
             return Ok(());
         }

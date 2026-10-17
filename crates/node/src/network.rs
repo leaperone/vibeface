@@ -175,14 +175,14 @@ pub struct IncomingSocket {
 }
 
 pub enum NetworkSocket {
-    Server(WebSocket),
+    Server(Box<WebSocket>),
     Limited(Box<NetworkSocket>, OwnedSemaphorePermit),
     Routed(Box<NetworkSocket>, String),
     Client(Box<WebSocketStream<MaybeTlsStream<TcpStream>>>),
 }
 impl NetworkSocket {
     pub fn server(socket: WebSocket) -> Self {
-        Self::Server(socket)
+        Self::Server(Box::new(socket))
     }
     pub fn route(&self) -> Option<String> {
         match self {
@@ -199,7 +199,7 @@ impl Stream for NetworkSocket {
             Self::Limited(socket, _) | Self::Routed(socket, _) => {
                 Pin::new(&mut **socket).poll_next(cx)
             }
-            Self::Server(socket) => Pin::new(socket)
+            Self::Server(socket) => Pin::new(&mut **socket)
                 .poll_next(cx)
                 .map(|item| item.map(|result| result.map_err(Into::into))),
             Self::Client(socket) => loop {
@@ -232,7 +232,7 @@ impl Sink<Message> for NetworkSocket {
             Self::Limited(socket, _) | Self::Routed(socket, _) => {
                 Pin::new(&mut **socket).poll_ready(cx)
             }
-            Self::Server(socket) => Pin::new(socket).poll_ready(cx).map_err(Into::into),
+            Self::Server(socket) => Pin::new(&mut **socket).poll_ready(cx).map_err(Into::into),
             Self::Client(socket) => Pin::new(&mut **socket).poll_ready(cx).map_err(Into::into),
         }
     }
@@ -241,7 +241,7 @@ impl Sink<Message> for NetworkSocket {
             Self::Limited(socket, _) | Self::Routed(socket, _) => {
                 Pin::new(&mut **socket).start_send(item)
             }
-            Self::Server(socket) => Pin::new(socket).start_send(item).map_err(Into::into),
+            Self::Server(socket) => Pin::new(&mut **socket).start_send(item).map_err(Into::into),
             Self::Client(socket) => Pin::new(&mut **socket)
                 .start_send(match item {
                     Message::Text(value) => NativeMessage::Text(value.as_str().to_owned().into()),
@@ -258,7 +258,7 @@ impl Sink<Message> for NetworkSocket {
             Self::Limited(socket, _) | Self::Routed(socket, _) => {
                 Pin::new(&mut **socket).poll_flush(cx)
             }
-            Self::Server(socket) => Pin::new(socket).poll_flush(cx).map_err(Into::into),
+            Self::Server(socket) => Pin::new(&mut **socket).poll_flush(cx).map_err(Into::into),
             Self::Client(socket) => Pin::new(&mut **socket).poll_flush(cx).map_err(Into::into),
         }
     }
@@ -267,7 +267,7 @@ impl Sink<Message> for NetworkSocket {
             Self::Limited(socket, _) | Self::Routed(socket, _) => {
                 Pin::new(&mut **socket).poll_close(cx)
             }
-            Self::Server(socket) => Pin::new(socket).poll_close(cx).map_err(Into::into),
+            Self::Server(socket) => Pin::new(&mut **socket).poll_close(cx).map_err(Into::into),
             Self::Client(socket) => Pin::new(&mut **socket).poll_close(cx).map_err(Into::into),
         }
     }
@@ -885,14 +885,15 @@ impl NetworkHub {
                         }
                     }
                     ServiceEvent::ServiceRemoved(_, name) => {
-                        if let Some(target) = name.strip_suffix(&format!(".{SERVICE_TYPE}")) {
-                            if target.len() == 32 && target.bytes().all(|b| b.is_ascii_hexdigit()) {
-                                self.state
-                                    .lock()
-                                    .await
-                                    .candidates
-                                    .retain(|id, _| !id.starts_with(target));
-                            }
+                        let Some(target) = name.strip_suffix(&format!(".{SERVICE_TYPE}")) else {
+                            continue;
+                        };
+                        if target.len() == 32 && target.bytes().all(|b| b.is_ascii_hexdigit()) {
+                            self.state
+                                .lock()
+                                .await
+                                .candidates
+                                .retain(|id, _| !id.starts_with(target));
                         }
                     }
                     _ => {}

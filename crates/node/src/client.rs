@@ -76,10 +76,10 @@ pub struct Client {
 impl Client {
     pub async fn connect(url: &str, identity: &LocalIdentity, target: &str) -> Result<Self> {
         let endpoint = client_endpoint(url)?;
-        if let Ok(socket) = crate::network::connect_direct(&endpoint, Service::Client).await {
-            if let Ok(client) = Self::from_socket(socket, identity, target).await {
-                return Ok(client);
-            }
+        if let Ok(socket) = crate::network::connect_direct(&endpoint, Service::Client).await
+            && let Ok(client) = Self::from_socket(socket, identity, target).await
+        {
+            return Ok(client);
         }
         let socket = crate::network::connect_relay(&endpoint, target, Service::Client).await?;
         Self::from_socket(socket, identity, target).await
