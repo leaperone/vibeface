@@ -1312,23 +1312,33 @@ pub(crate) fn append_execution_terminal_reconciliation_observation_in(
     identity: &LocalIdentity,
     source: &SignedEvent,
     result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffTerminalReconciliationResult,
+    verified: &vibeface_secure::authorization::execution_handoff::VerifiedExecutionTerminalReconciliation,
     now_ms: u64,
 ) -> Result<SignedEvent> {
     ensure!(
-        result
-            .reconciliation
-            .resolution
-            .observation
-            .handoff
-            .handoff
-            .project_dispatch
-            == *source,
+        verified.wire() == &result.reconciliation
+            && verified.freshness_hash() == &ObjectHash::body(&result.freshness)?
+            && result
+                .reconciliation
+                .resolution
+                .observation
+                .handoff
+                .handoff
+                .project_dispatch
+                == *source,
         "terminal reconciliation belongs to another dispatch"
     );
-    verify_terminal_reconciliation_in(policy, connection, result, now_ms)?;
-    append_signed_execution_observation_in(
+    check_execution_observation_authorizations_in(
         connection,
         policy,
+        identity,
+        verified.resolver(),
+        verified.submission(),
+        now_ms,
+    )?;
+    verified.proof_usage().enforce_limits()?;
+    append_checkpointed_execution_observation_in(
+        connection,
         identity,
         source,
         &serde_json::to_value(result)?,
@@ -1349,31 +1359,282 @@ pub(crate) fn append_execution_resolution_observation_in(
     identity: &LocalIdentity,
     source: &SignedEvent,
     result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffResolutionResult,
+    verified: &vibeface_secure::authorization::execution_handoff::VerifiedExecutionResolution,
     now_ms: u64,
 ) -> Result<SignedEvent> {
     use vibeface_secure::authorization::execution_handoff::verify_execution_resolution_receipt_signature;
     ensure!(
-        result
-            .resolution
-            .resolution
-            .observation
-            .handoff
-            .handoff
-            .project_dispatch
-            == *source,
+        verified.wire() == &result.resolution
+            && result
+                .resolution
+                .resolution
+                .observation
+                .handoff
+                .handoff
+                .project_dispatch
+                == *source,
         "resolution acknowledgement belongs to another dispatch"
     );
     verify_execution_resolution_receipt_signature(result)?;
-    verify_resolution_observation_in(policy, connection, result)?;
-    append_signed_execution_observation_in(
+    check_execution_observation_authorizations_in(
         connection,
         policy,
+        identity,
+        verified.resolver(),
+        verified.submission(),
+        now_ms,
+    )?;
+    policy
+        .verified()
+        .verify_execution_resolution_freshness(verified, &result.freshness, now_ms)?;
+    verified.proof_usage().enforce_limits()?;
+    append_checkpointed_execution_observation_in(
+        connection,
         identity,
         source,
         &serde_json::to_value(result)?,
         result.handoff_receipt.payload.state,
         now_ms,
     )
+}
+
+fn check_execution_observation_authorizations_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    identity: &LocalIdentity,
+    resolver: &VerifiedAuthorization,
+    submission: &VerifiedAuthorization,
+    now_ms: u64,
+) -> Result<()> {
+    super::admission::check_policy_heads_in(connection, policy.verified(), resolver, now_ms)?;
+    super::admission::check_policy_heads_in(connection, policy.verified(), submission, now_ms)?;
+    ensure!(
+        resolver.audience().device
+            == DeviceId::from_key(&PublicKey::parse(&identity.public_key_hex()?)?),
+        "execution observation must be appended by its current Project host"
+    );
+    Ok(())
+}
+
+fn ready_observation_scope_in(
+    connection: &Connection,
+    source: &SignedEvent,
+) -> Result<BTreeMap<String, StoredEvent>> {
+    let expected: Event = serde_json::from_str(&source.canonical_body)?;
+    let mut statement = connection.prepare(
+        "SELECT hash,envelope,status,author,sequence FROM events WHERE space_id=? AND resource_id=? AND scope_id=? ORDER BY hash LIMIT 129",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                expected.network_id,
+                expected.resource_id.as_str(),
+                expected.scope_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        rows.len() <= 128,
+        "execution observation scope checkpoint is too large"
+    );
+    let mut events = BTreeMap::new();
+    let mut sequences = BTreeSet::new();
+    let mut total_bytes = 0usize;
+    for (hash, encoded, status, author, sequence) in rows {
+        total_bytes = total_bytes
+            .checked_add(encoded.len())
+            .context("execution observation scope size overflow")?;
+        ensure!(
+            total_bytes <= 8 * 1024 * 1024,
+            "execution observation scope checkpoint is too large"
+        );
+        let envelope: SignedEvent = serde_json::from_str(&encoded)?;
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+        ensure!(
+            status == "ready"
+                && envelope.canonical_body.len() <= crate::model::MAX_EVENT_BYTES
+                && envelope.hash == hash
+                && crypto::digest(envelope.canonical_body.as_bytes()) == hash
+                && serde_json::to_string(&event)? == envelope.canonical_body
+                && event.network_id == expected.network_id
+                && event.resource_id == expected.resource_id
+                && event.scope_id == expected.scope_id
+                && event.author == author
+                && event.sequence == sequence
+                && sequences.insert((author, sequence)),
+            "execution observation scope checkpoint changed"
+        );
+        crypto::validate_event_shape(&event)?;
+        for blob in &event.blobs {
+            ensure!(
+                has_blob_from(connection, &event.network_id, blob)?,
+                "execution observation scope has missing blob content"
+            );
+        }
+        events.insert(
+            hash,
+            StoredEvent {
+                envelope,
+                event,
+                status,
+            },
+        );
+    }
+    ensure!(
+        events
+            .get(&source.hash)
+            .is_some_and(|event| event.envelope == *source),
+        "execution observation has no exact local ready Dispatch checkpoint"
+    );
+    for stored in events.values() {
+        for dependency in stored.event.parents.iter().chain(&stored.event.previous) {
+            ensure!(
+                events.contains_key(dependency),
+                "execution observation scope has missing causal history"
+            );
+        }
+        if let Some(previous) = &stored.event.previous {
+            let prior = &events[previous].event;
+            ensure!(
+                prior.author == stored.event.author
+                    && prior.sequence.checked_add(1) == Some(stored.event.sequence),
+                "execution observation scope author chain changed"
+            );
+        }
+    }
+    Ok(events)
+}
+
+fn append_checkpointed_execution_observation_in(
+    connection: &Connection,
+    identity: &LocalIdentity,
+    source: &SignedEvent,
+    result: &Value,
+    state: vibeface_secure::authorization::execution_handoff::ExecutionHandoffState,
+    now_ms: u64,
+) -> Result<SignedEvent> {
+    let events = ready_observation_scope_in(connection, source)?;
+    let source_event = &events[&source.hash].event;
+    crypto::verify_signed_event(
+        &source_event.network_id,
+        source,
+        &identity.public_key_hex()?,
+    )?;
+    let EventBody::DispatchRecorded {
+        operation_id,
+        task_id,
+        target_node,
+        session_id,
+        ..
+    } = &source_event.body
+    else {
+        bail!("execution observation checkpoint is not a Dispatch")
+    };
+    let state: OperationState = serde_json::from_value(serde_json::to_value(state)?)?;
+    ensure!(
+        state != OperationState::Accepted,
+        "accepted handoff has no execution observation"
+    );
+    let (stored_state, stored_result): (String, String) = connection.query_row(
+        "SELECT state,result FROM operations WHERE space_id=? AND operation_id=?",
+        params![source_event.network_id, operation_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(
+        serde_json::from_str::<OperationState>(&stored_state)? == state
+            && serde_json::from_str::<Value>(&stored_result)? == *result,
+        "execution observation differs from its durable signed acknowledgement"
+    );
+    let proof = admission(source_event);
+    ensure!(
+        now_ms >= proof.admitted_at_ms,
+        "execution observation predates its original admission"
+    );
+    super::admission::validate_persisted_admission(connection, proof)?;
+    let bytes = serde_json::to_vec(result)?;
+    ensure!(
+        bytes.len() <= crate::model::MAX_BLOB_BYTES,
+        "execution observation proof is too large"
+    );
+    let blob = BlobRef {
+        hash: crypto::digest(&bytes),
+        size: bytes.len() as u64,
+    };
+    let body = EventBody::ExecutionObserved {
+        operation_id: operation_id.clone(),
+        task_id: task_id.clone(),
+        target_node: target_node.clone(),
+        session_id: session_id.clone(),
+        status: serde_json::to_value(state)?
+            .as_str()
+            .context("invalid execution observation state")?
+            .to_owned(),
+        detail: json!({"result_blob":blob}),
+    };
+    let invocation_hash = proof.invocation.hash()?;
+    for stored in events.values() {
+        ensure!(
+            admission(&stored.event).invocation.hash()? != invocation_hash
+                || event_slot(&stored.event.body) != event_slot(&body),
+            "execution observation conflicts with its original invocation slot"
+        );
+    }
+    connection.execute(
+        "INSERT OR IGNORE INTO blobs(space_id,hash,size,content) VALUES(?,?,?,?)",
+        params![source_event.network_id, blob.hash, blob.size, bytes],
+    )?;
+    ensure!(
+        has_blob_from(connection, &source_event.network_id, &blob)?,
+        "execution observation blob conflicts with stored bytes"
+    );
+    let author = identity.node_id()?;
+    let previous = events
+        .values()
+        .filter(|event| event.event.author == author)
+        .max_by_key(|event| event.event.sequence);
+    let sequence = previous.map_or(Ok(1), |event| {
+        event
+            .event
+            .sequence
+            .checked_add(1)
+            .context("execution observation author sequence overflow")
+    })?;
+    let mut parents = heads_from_events(&events, &source_event.scope_id);
+    parents.push(source.hash.clone());
+    parents.sort();
+    parents.dedup();
+    ensure!(
+        closure_hashes(&events, &parents).len() == events.len(),
+        "execution observation scope has cyclic causal history"
+    );
+    let envelope = identity.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: source_event.network_id.clone(),
+        resource_id: source_event.resource_id.clone(),
+        cause: EventCause::Derived {
+            admission: proof.clone(),
+            source: source.hash.clone(),
+        },
+        scope_id: source_event.scope_id.clone(),
+        author: author.clone(),
+        sequence,
+        previous: previous.map(|event| event.envelope.hash.clone()),
+        parents,
+        created_at_ms: i64::try_from(now_ms)?,
+        body,
+        blobs: vec![blob],
+    })?;
+    connection.execute("INSERT INTO events(space_id,resource_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?,'ready')", params![source_event.network_id, source_event.resource_id.as_str(), envelope.hash, source_event.scope_id, author, sequence, serde_json::to_string(&envelope)?])?;
+    Ok(envelope)
 }
 
 fn append_signed_execution_observation_in(

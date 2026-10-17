@@ -2109,10 +2109,14 @@ pub struct ExecutionHandoffTerminalReconciliationResult {
 
 pub struct VerifiedExecutionTerminalReconciliation {
     authorization: VerifiedExecutionResolution,
+    freshness_hash: ObjectHash,
 }
 impl VerifiedExecutionTerminalReconciliation {
     pub fn proof_usage(&self) -> &ExecutionProofUsage {
         self.authorization.proof_usage()
+    }
+    pub fn freshness_hash(&self) -> &ObjectHash {
+        &self.freshness_hash
     }
     pub fn resolver(&self) -> &VerifiedAuthorization {
         self.authorization.resolver()
@@ -2150,7 +2154,10 @@ impl VerifiedPolicySet {
             now_ms,
         )?;
         self.verify_execution_resolution_freshness(&authorization, &result.freshness, now_ms)?;
-        Ok(VerifiedExecutionTerminalReconciliation { authorization })
+        Ok(VerifiedExecutionTerminalReconciliation {
+            authorization,
+            freshness_hash: ObjectHash::body(&result.freshness)?,
+        })
     }
 }
 
