@@ -971,6 +971,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_member_packet_is_dropped_without_closing_trusted_link() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let known = LocalIdentity::generate();
+        let unknown = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let (receiver, mut inbound) = hub(&owner, &known, &[&owner, &known])?;
+        let (sender, _) = hub(&owner, &unknown, &[&owner, &known, &unknown])?;
+        let (send, _) = mpsc::channel(1);
+        receiver.state.lock().await.links.insert(
+            (network.clone(), owner.node_id()?),
+            Link {
+                id: "trusted".into(),
+                outbound: true,
+                send,
+            },
+        );
+        let packet = sender.packet(
+            &network,
+            Some(&known.node_id()?),
+            Kind::Request,
+            json!({"unknown":true}),
+            None,
+        )?;
+        receiver
+            .receive_packet(&network, &owner.node_id()?, packet)
+            .await?;
+        assert!(inbound.try_recv().is_err());
+        assert!(
+            receiver
+                .state
+                .lock()
+                .await
+                .links
+                .contains_key(&(network, owner.node_id()?))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn replies_must_match_expected_origin_and_network() -> Result<()> {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
