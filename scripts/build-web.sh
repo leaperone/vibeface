@@ -12,6 +12,7 @@ if ! command -v pnpm >/dev/null; then
 fi
 pnpm install --frozen-lockfile
 pnpm run generate-routes
+pnpm run test
 pnpm run typecheck
 pnpm run build
 [[ -s dist/client/_shell.html ]] || { echo 'SPA shell was not written to dist/client/_shell.html' >&2; exit 1; }
