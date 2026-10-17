@@ -18,6 +18,7 @@ const INITIAL_SCHEMA: &str = include_str!("../migrations/202610180001_initial.sq
 
 pub struct Store {
     pub(crate) connection: Connection,
+    pub(crate) policy: crate::identity::journal::PolicyState,
 }
 fn verify_schema(connection: &Connection) -> Result<()> {
     let metadata: (String, u32, u32, String, String) = connection.query_row(
@@ -59,6 +60,7 @@ fn schema_objects(connection: &Connection) -> Result<Vec<(String, String, String
 }
 
 fn validate_persisted_state(connection: &Connection) -> Result<()> {
+    crate::identity::journal::PolicyState::load(connection)?;
     let mut statement = connection.prepare("SELECT space_id,revision,bundle FROM spaces")?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -211,10 +213,10 @@ pub(crate) fn install_trust_bundle_in(
 }
 
 #[derive(Clone)]
-struct StoredEvent {
-    envelope: SignedEvent,
-    event: Event,
-    status: String,
+pub(crate) struct StoredEvent {
+    pub(crate) envelope: SignedEvent,
+    pub(crate) event: Event,
+    pub(crate) status: String,
 }
 
 impl Store {
@@ -277,7 +279,8 @@ impl Store {
                 );
             }
         }
-        Ok(Self { connection })
+        let policy = crate::identity::journal::PolicyState::load(&connection)?;
+        Ok(Self { connection, policy })
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -330,7 +333,8 @@ impl Store {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
             private_sidecars(path)?;
         }
-        let mut store = Self { connection };
+        let policy = crate::identity::journal::PolicyState::load(&connection)?;
+        let mut store = Self { connection, policy };
         store
             .connection
             .pragma_update(None, "journal_mode", "WAL")?;
@@ -1859,7 +1863,7 @@ fn authorize_node_from(
     );
     view.authorize_node(node_id, role)?.certificate()
 }
-fn validate_operation_binding_from(
+pub(crate) fn validate_operation_binding_from(
     connection: &Connection,
     request: &OperationRequest,
 ) -> Result<()> {
@@ -1922,7 +1926,7 @@ fn validate_operation_binding_from(
     Ok(())
 }
 
-fn heads_from_events(events: &BTreeMap<String, StoredEvent>, scope_id: &str) -> Vec<String> {
+pub(crate) fn heads_from_events(events: &BTreeMap<String, StoredEvent>, scope_id: &str) -> Vec<String> {
     let mut heads: BTreeSet<String> = events
         .iter()
         .filter(|(_, e)| e.event.scope_id == scope_id)
@@ -1935,7 +1939,7 @@ fn heads_from_events(events: &BTreeMap<String, StoredEvent>, scope_id: &str) -> 
     }
     heads.into_iter().collect()
 }
-fn load_events_from(
+pub(crate) fn load_events_from(
     connection: &Connection,
     network_id: &str,
 ) -> Result<BTreeMap<String, StoredEvent>> {
@@ -1979,7 +1983,7 @@ fn load_events_from(
     Ok(result)
 }
 
-fn has_blob_from(connection: &Connection, network_id: &str, blob: &BlobRef) -> Result<bool> {
+pub(crate) fn has_blob_from(connection: &Connection, network_id: &str, blob: &BlobRef) -> Result<bool> {
     let content: Option<Vec<u8>> = connection
         .query_row(
             "SELECT content FROM blobs WHERE space_id=? AND hash=? AND size=?",
@@ -1997,7 +2001,7 @@ fn optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>
 fn dependencies(event: &Event) -> impl Iterator<Item = &String> {
     event.parents.iter().chain(event.previous.iter())
 }
-fn closure_hashes(events: &BTreeMap<String, StoredEvent>, heads: &[String]) -> BTreeSet<String> {
+pub(crate) fn closure_hashes(events: &BTreeMap<String, StoredEvent>, heads: &[String]) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
     let mut stack = heads.to_vec();
     while let Some(hash) = stack.pop() {
@@ -2044,7 +2048,7 @@ fn topological(events: &BTreeMap<String, StoredEvent>, closure: &BTreeSet<String
     }
     ordered
 }
-fn canonical_resource(resource: &str) -> Result<String> {
+pub(crate) fn canonical_resource(resource: &str) -> Result<String> {
     ensure!(resource.len() <= 4096, "resource path too long");
     let path = Path::new(resource);
     ensure!(path.is_absolute(), "resource paths must be absolute");
@@ -2078,7 +2082,7 @@ fn canonical_resource(resource: &str) -> Result<String> {
         .map(str::to_string)
         .context("resource path must be UTF-8")
 }
-fn paths_overlap(left: &str, right: &str) -> bool {
+pub(crate) fn paths_overlap(left: &str, right: &str) -> bool {
     let left = Path::new(left);
     let right = Path::new(right);
     left.starts_with(right) || right.starts_with(left)
