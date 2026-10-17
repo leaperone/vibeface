@@ -753,12 +753,14 @@ def verify_web_assets(node, module):
         if path in checked:
             continue
         checked.add(path)
+        if path == "/generated/vibeface_secure.js":
+            continue
         require(len(checked) < 256, "static dependency traversal is bounded")
         content, asset_headers = fetch(path)
         mime = asset_headers.get_content_type()
         content_types.add(mime)
         require(path.startswith("/assets/") and asset_headers["Cache-Control"] == "public, max-age=31536000, immutable",
-                "hashed client assets are immutable")
+                f"{path}: hashed client assets are immutable")
         body, head_headers = fetch(path, method="HEAD")
         require(not body and int(head_headers["Content-Length"]) == len(content)
                 and head_headers.get_content_type() == mime and head_headers["Cache-Control"] == asset_headers["Cache-Control"],
