@@ -2887,10 +2887,11 @@ impl Runtime {
                     }
                 };
                 if target == self.identity.node_id()? {
-                    self.require_role(network, NodeRole::Scheduler).await?;
-                    self.spawn_scheduler(network.clone(), scope, trigger.clone())
-                        .await?;
-                    Ok(json!({"state":"accepted","trigger":trigger}))
+                    if self.config.manager.is_some() {
+                        self.require_role(network, NodeRole::Scheduler).await?;
+                        self.spawn_scheduler(network.clone(), scope, trigger.clone()).await?;
+                    }
+                    Ok(json!({"state":"accepted","trigger":trigger,"manager_started":self.config.manager.is_some()}))
                 } else {
                     self.peer_request(
                         network,
