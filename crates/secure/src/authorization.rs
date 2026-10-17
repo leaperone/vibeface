@@ -605,6 +605,7 @@ pub struct InvocationContext {
     pub conversation: Option<String>,
     pub task: Option<ObjectHash>,
     pub sdk_session: Option<SessionRef>,
+    pub execution_session: Option<SessionRef>,
     pub executor_kind: Option<String>,
     pub workspace_resource: Option<ResourceId>,
 }
@@ -1047,6 +1048,10 @@ fn validate_context(context: &InvocationContext) -> Result<()> {
         context.conversation.as_deref(),
         context.executor_kind.as_deref(),
         context.sdk_session.as_ref().map(|s| s.session_id.as_str()),
+        context
+            .execution_session
+            .as_ref()
+            .map(|s| s.session_id.as_str()),
     ]
     .into_iter()
     .flatten()
@@ -1072,6 +1077,7 @@ fn context_tighter(parent: &InvocationContext, child: &InvocationContext) -> boo
     same_or_tighter(&parent.conversation, &child.conversation)
         && same_or_tighter(&parent.task, &child.task)
         && same_or_tighter(&parent.sdk_session, &child.sdk_session)
+        && same_or_tighter(&parent.execution_session, &child.execution_session)
         && same_or_tighter(&parent.executor_kind, &child.executor_kind)
         && same_or_tighter(&parent.workspace_resource, &child.workspace_resource)
 }
@@ -2289,6 +2295,25 @@ impl VerifiedPolicySet {
             &mut BTreeSet::new(),
         )?;
         require(
+            !matches!(i.actor, Actor::Account(_)) || i.context.sdk_session.is_none(),
+            "account invocation cannot claim SDK adapter session",
+        )?;
+        if let Some(session) = &i.context.execution_session {
+            let target = self.find_device(&session.target)?;
+            require(
+                matches!(target.payload.subject, Actor::Service(_))
+                    && target.payload.uses.contains(&DeviceUse::Noise),
+                "execution target is not a service",
+            )?;
+            self.validate_certificate(
+                target,
+                now_ms,
+                &mut budget,
+                &mut dependencies,
+                &mut BTreeSet::new(),
+            )?;
+        }
+        require(
             !i.action.requires_account() || matches!(i.actor, Actor::Account(_)),
             "action requires account actor",
         )?;
@@ -3220,6 +3245,77 @@ mod tests {
                 .verify_invocation(&signed, &facts, &peer, NOW)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn sdk_adapter_and_execution_sessions_are_verified_independently() {
+        let mut f = Fixture::new();
+        let child = f.delegate();
+        let mut invocation = f.service_invocation(&child);
+        let sdk = SessionRef {
+            target: f.audience.device.clone(),
+            session_id: "manager-sdk".into(),
+        };
+        let execution = SessionRef {
+            target: f.audience.device.clone(),
+            session_id: "executor-session".into(),
+        };
+        invocation.context.sdk_session = Some(sdk.clone());
+        invocation.context.execution_session = Some(execution.clone());
+        let transport = TransportEvidence::LocalAgentAdapter {
+            service: f.audience.service.clone(),
+            session: sdk.clone(),
+        };
+        let signed = Signed::sign(invocation.clone(), &f.node).unwrap();
+        assert!(
+            f.state
+                .verify_invocation(&signed, &f.facts(&invocation), &transport, NOW)
+                .is_ok()
+        );
+        let wrong_adapter = TransportEvidence::LocalAgentAdapter {
+            service: f.audience.service.clone(),
+            session: execution,
+        };
+        assert!(
+            f.state
+                .verify_invocation(&signed, &f.facts(&invocation), &wrong_adapter, NOW)
+                .is_err()
+        );
+        let mut wrong_facts = f.facts(&invocation);
+        wrong_facts
+            .context
+            .execution_session
+            .as_mut()
+            .unwrap()
+            .session_id = "wrong-execution".into();
+        assert!(
+            f.state
+                .verify_invocation(&signed, &wrong_facts, &transport, NOW)
+                .is_err()
+        );
+        let mut constraints = invocation.context.clone();
+        constraints.execution_session.as_mut().unwrap().session_id = "pinned-execution".into();
+        assert!(!context_tighter(&constraints, &invocation.context));
+        invocation
+            .context
+            .execution_session
+            .as_mut()
+            .unwrap()
+            .session_id
+            .clear();
+        assert!(
+            f.state
+                .verify_invocation(
+                    &Signed::sign(invocation.clone(), &f.node).unwrap(),
+                    &f.facts(&invocation),
+                    &transport,
+                    NOW
+                )
+                .is_err()
+        );
+        let mut direct = f.invocation();
+        direct.context.sdk_session = Some(sdk);
+        assert!(f.check(direct, &f.user, NOW).is_err());
     }
 
     #[test]
