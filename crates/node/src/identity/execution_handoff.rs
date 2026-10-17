@@ -84,9 +84,17 @@ fn original_authorization_from(
     now_ms: u64,
 ) -> Result<VerifiedAuthorization> {
     wire.hash()?;
-    let source = current.verify_project_execution_source(&wire.handoff, now_ms)?;
-    let dispatch: Event = serde_json::from_str(&wire.handoff.project_dispatch.canonical_body)?;
-    let task: Event = serde_json::from_str(&wire.handoff.task_creation.canonical_body)?;
+    original_capsule_authorization(current, &wire.handoff, now_ms)
+}
+
+fn original_capsule_authorization(
+    current: &VerifiedPolicySet,
+    handoff: &ExecutionHandoff,
+    now_ms: u64,
+) -> Result<VerifiedAuthorization> {
+    let source = current.verify_project_execution_source(&handoff, now_ms)?;
+    let dispatch: Event = serde_json::from_str(&handoff.project_dispatch.canonical_body)?;
+    let task: Event = serde_json::from_str(&handoff.task_creation.canonical_body)?;
     let original = capsule_admission(&dispatch)?;
     let task_proof = capsule_admission(&task)?;
     ensure!(
@@ -101,7 +109,7 @@ fn original_authorization_from(
         &project,
         &task.scope_id,
         None,
-        wire.handoff.task_sdk_origin.as_ref(),
+        handoff.task_sdk_origin.as_ref(),
     )?;
     let crate::model::EventBody::TaskCreated {
         task_id,
@@ -121,15 +129,16 @@ fn original_authorization_from(
             && task.created_at_ms == task_proof.admitted_at_ms as i64,
         "task creation differs from its admitted input"
     );
-    let operation = request(wire)?;
+    let operation: OperationRequest =
+        serde_json::from_value(original.source_body["request"].clone())?;
     let facts = capsule_facts(
         &original,
         &project,
         &dispatch.scope_id,
-        Some((&operation, &wire.handoff)),
-        wire.handoff.sdk_origin.as_ref(),
+        Some((&operation, &handoff)),
+        handoff.sdk_origin.as_ref(),
     )?;
-    let admitted = source.original_admission(&wire.handoff, now_ms)?;
+    let admitted = source.original_admission(&handoff, now_ms)?;
     let auth = current.verify_operation_authorization(
         &admitted,
         &facts,
@@ -981,6 +990,8 @@ impl Store {
         freshness: Option<&ExecutionHandoffFreshness>,
         now_ms: u64,
     ) -> Result<ExecutionProofUsage> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let current = self.policy.verified();
         let original =
             original_authorization_from(&self.connection, &self.policy, current, wire, now_ms)?;
@@ -995,13 +1006,15 @@ impl Store {
             admission.as_ref(),
             now_ms,
         )?;
-        match freshness {
-            Some(proof) => Ok(current
+        let mut usage = match freshness {
+            Some(proof) => current
                 .verify_execution_handoff_freshness(&verified, proof, now_ms)?
                 .proof_usage()
-                .clone()),
-            None => Ok(verified.proof_usage().clone()),
-        }
+                .clone(),
+            None => verified.proof_usage().clone(),
+        };
+        usage.record_actual_signature_counts(_signature_scope.counts());
+        Ok(usage)
     }
 
     pub fn execution_handoff_resolution_proof_usage(
@@ -1011,6 +1024,8 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<ExecutionProofUsage> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let auth = self.execution_handoff_resolution_authorization(wire, transport, now_ms)?;
         let mut usage = auth.proof_usage().clone();
         if let Some(proof) = freshness {
@@ -1023,8 +1038,135 @@ impl Store {
             }
         }
         usage.enforce_limits()?;
+        usage.record_actual_signature_counts(_signature_scope.counts());
         Ok(usage)
     }
+}
+
+fn ready_execution_source_event(
+    connection: &Connection,
+    space: &str,
+    hash: &str,
+    expected_resource: Option<&ResourceId>,
+) -> Result<StoredEvent> {
+    let row: (String, String, String, u64, String) = connection.query_row(
+        "SELECT envelope,scope_id,author,sequence,resource_id FROM events WHERE space_id=? AND hash=? AND status='ready'",
+        params![space, hash], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    ).context("execution source is not a locally accepted ready event")?;
+    let envelope: crate::model::SignedEvent = serde_json::from_str(&row.0)?;
+    ensure!(
+        envelope.canonical_body.len() <= crate::model::MAX_EVENT_BYTES
+            && envelope.hash == hash
+            && crate::crypto::digest(envelope.canonical_body.as_bytes()) == hash,
+        "ready execution source hash changed"
+    );
+    let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+    ensure!(
+        serde_json::to_string(&event)? == envelope.canonical_body
+            && event.network_id == space
+            && event.scope_id == row.1
+            && event.author == row.2
+            && event.sequence == row.3
+            && event.resource_id.as_str() == row.4
+            && expected_resource.is_none_or(|resource| resource == &event.resource_id),
+        "ready execution source metadata changed"
+    );
+    crate::crypto::validate_event_shape(&event)?;
+    Ok(StoredEvent {
+        envelope,
+        event,
+        status: "ready".into(),
+    })
+}
+
+fn ready_execution_source_events(
+    connection: &Connection,
+    space: &str,
+    operation: &str,
+) -> Result<BTreeMap<String, StoredEvent>> {
+    let hashes = connection.prepare("SELECT hash FROM events WHERE space_id=? AND status='ready' AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.type')='dispatch_recorded' AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.operation_id')=? LIMIT 2")?
+        .query_map(params![space, operation], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        hashes.len() == 1,
+        "operation has missing or ambiguous ready dispatches"
+    );
+    let dispatch = ready_execution_source_event(connection, space, &hashes[0], None)?;
+    let project = dispatch.event.resource_id.clone();
+    let conversation = dispatch.event.scope_id.clone();
+    let proof = capsule_admission(&dispatch.event)?;
+    let request: OperationRequest = serde_json::from_value(proof.source_body["request"].clone())?;
+    let binding = request
+        .binding
+        .as_ref()
+        .context("dispatch has no Task binding")?;
+    let task =
+        ready_execution_source_event(connection, space, &binding.binding.task_ref, Some(&project))?;
+    let task_proof = capsule_admission(&task.event)?;
+    let mut events = BTreeMap::from([
+        (dispatch.envelope.hash.clone(), dispatch),
+        (task.envelope.hash.clone(), task),
+    ]);
+    let mut loaded_bytes = events
+        .values()
+        .map(|stored| stored.envelope.canonical_body.len())
+        .sum::<usize>();
+    for proof in [&proof, &task_proof] {
+        if proof.source_body["sdk_session"].is_null() {
+            continue;
+        }
+        let session: vibeface_secure::authorization::SessionRef =
+            serde_json::from_value(proof.source_body["sdk_session"].clone())?;
+        let expected = proof.source_body["parent_invocation"]
+            .as_str()
+            .context("SDK source has no Account parent")?;
+        let mut pending = std::collections::VecDeque::from([session.session_id.clone()]);
+        let mut visited = std::collections::BTreeSet::new();
+        let mut found = false;
+        while let Some(hash) = pending.pop_front() {
+            if !visited.insert(hash.clone()) {
+                continue;
+            }
+            ensure!(
+                visited.len() <= 128 && events.len() <= 128,
+                "SDK source ancestry is too large"
+            );
+            if !events.contains_key(&hash) {
+                let stored =
+                    ready_execution_source_event(connection, space, &hash, Some(&project))?;
+                loaded_bytes += stored.envelope.canonical_body.len();
+                ensure!(
+                    loaded_bytes <= MAX_EXECUTION_HANDOFF_BYTES,
+                    "SDK source ancestry is too large"
+                );
+                events.insert(hash.clone(), stored);
+            }
+            let stored = &events[&hash];
+            ensure!(
+                stored.event.scope_id == conversation,
+                "SDK source crossed a conversation"
+            );
+            if matches!(&stored.event.body, EventBody::MessagePosted { role, .. } if role == "user")
+            {
+                let admission = capsule_admission(&stored.event)?;
+                if admission.invocation.hash()?.as_str() == expected {
+                    ensure!(
+                        ObjectHash::body(&admission.source_body)?
+                            == admission.invocation.payload.body_hash,
+                        "SDK Account Message source body changed"
+                    );
+                    found = true;
+                    break;
+                }
+            }
+            pending.extend(stored.event.parents.iter().cloned());
+            pending.extend(stored.event.previous.iter().cloned());
+            if let crate::model::EventCause::Derived { source, .. } = &stored.event.cause {
+                pending.push_back(source.clone());
+            }
+        }
+        ensure!(found, "SDK source has no bounded causal Account message");
+    }
+    Ok(events)
 }
 
 impl Store {
@@ -1038,7 +1180,9 @@ impl Store {
         target_public_key: PublicKey,
         now_ms: u64,
     ) -> Result<ExecutionHandoff> {
-        let events = load_events_from(&self.connection, original_space)?;
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let events = ready_execution_source_events(&self.connection, original_space, operation_id)?;
         let mut dispatch = None;
         for event in events.values() {
             if matches!(&event.event.body, EventBody::DispatchRecorded { operation_id: candidate, .. } if candidate == operation_id)
@@ -1050,13 +1194,6 @@ impl Store {
             }
         }
         let dispatch = dispatch.context("operation has no admitted dispatch")?;
-        super::event_authorization::current_event_authorization(
-            &self.policy,
-            &self.connection,
-            &dispatch.event,
-            &events,
-            now_ms,
-        )?;
         let original = capsule_admission(&dispatch.event)?;
         let operation: OperationRequest =
             serde_json::from_value(original.source_body["request"].clone())?;
@@ -1088,6 +1225,7 @@ impl Store {
         let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
             .map_err(anyhow::Error::msg)?;
         handoff.attest_source(&signer)?;
+        original_capsule_authorization(self.policy.verified(), &handoff, now_ms)?;
         Ok(handoff)
     }
 
@@ -1098,6 +1236,8 @@ impl Store {
         operation_id: &str,
         now_ms: u64,
     ) -> Result<VerifiedExecutionHandoff> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let stored = stored_from(
             &self.connection,
             execution_space,
@@ -1129,6 +1269,8 @@ impl Store {
         stage: CheckStage,
         now_ms: u64,
     ) -> Result<ExecutionHandoffChallenge> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let original = original_authorization_from(
             &self.connection,
             &self.policy,
@@ -1263,6 +1405,8 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<AdmittedExecutionHandoff> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let (execution, original_space, operation_id) = scope(wire)?;
         if let Some(stored) =
             stored_from(&self.connection, &execution, &original_space, &operation_id)?
@@ -1373,6 +1517,8 @@ impl Store {
         proof: &ExecutionHandoffFreshness,
         now_ms: u64,
     ) -> Result<()> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         ensure!(
             proof.challenge.stage == CheckStage::RemoteRead,
             "handoff read requires its own freshness purpose"
@@ -1410,6 +1556,8 @@ impl Store {
         proof: &ExecutionHandoffFreshness,
         now_ms: u64,
     ) -> Result<(AdmittedExecutionHandoff, bool, u64)> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let (execution, original, operation) = scope(auth.wire())?;
         let tx = self
             .connection
@@ -1446,6 +1594,8 @@ impl Store {
         proof: &ExecutionHandoffFreshness,
         now_ms: u64,
     ) -> Result<u64> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let (execution, original, operation) = scope(auth.wire())?;
         let tx = self
             .connection
@@ -1493,6 +1643,8 @@ impl Store {
         native_session_id: &str,
         now_ms: u64,
     ) -> Result<()> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         ensure!(
             !native_session_id.is_empty() && native_session_id.len() <= 512,
             "invalid native execution session ID"
@@ -1556,6 +1708,8 @@ impl Store {
         original_project: &ResourceRef,
         operation_id: &str,
     ) -> Result<Option<ExecutionContext>> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let executions=self.connection.prepare("SELECT execution_space_id FROM execution_handoffs WHERE original_space_id=? AND operation_id=?")?
             .query_map(params![original_project.space.as_str(),operation_id],|row|row.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
         ensure!(
@@ -1598,6 +1752,8 @@ impl Store {
         operation_id: &str,
         now_ms: u64,
     ) -> Result<AdmittedExecutionHandoff> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let stored = stored_from(
             &self.connection,
             execution_space,
@@ -1645,6 +1801,8 @@ impl Store {
         session: Option<&ExecutionSession>,
         now_ms: u64,
     ) -> Result<AdmittedExecutionHandoff> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         ensure!(
             state.terminal() || state == OperationState::Unknown,
             "invalid execution handoff completion state"
@@ -1870,22 +2028,16 @@ fn verify_resolution_challenge_record(
 
 fn reconstruct_resolution(
     connection: &Connection,
-    policy: &PolicyState,
+    _policy: &PolicyState,
     saved: &StoredResolution,
 ) -> Result<VerifiedExecutionResolutionAdmission> {
     verify_resolution_challenge_record(connection, &saved.wire, &saved.freshness, true)?;
-    let historical =
-        policy.historical(&saved.freshness.challenge.policies, saved.resolved_at_ms)?;
-    let resolver =
-        resolution_resolver_from(policy, &historical, &saved.wire, saved.resolved_at_ms)?;
-    let verified = historical.verify_execution_resolution(
-        &saved.wire,
-        &resolver,
-        &saved.transport,
-        None,
+    Ok(verify_execution_resolution_admission_checkpoint(
+        &saved.result,
+        &saved.freshness,
+        &StoredTransport::from(&saved.transport),
         saved.resolved_at_ms,
-    )?;
-    Ok(historical.admit_execution_resolution(&verified, &saved.freshness, saved.resolved_at_ms)?)
+    )?)
 }
 
 fn resolution_original_observation_from(
@@ -1974,8 +2126,12 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<VerifiedExecutionResolution> {
-        let resolver =
-            resolution_resolver_from(&self.policy, self.policy.verified(), wire, now_ms)?;
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let resolver = self
+            .policy
+            .verified()
+            .verify_execution_resolution_account_checkpoint(wire, transport, now_ms)?;
         let admission = if wire.resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal
         {
             resolution_original_observation_from(&self.connection, &self.policy, wire)?;
@@ -2018,6 +2174,8 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<Option<ExecutionHandoffResolutionResult>> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         if wire.resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal {
             return Ok(None);
         }
@@ -2055,6 +2213,8 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<ExecutionHandoffResolutionChallenge> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         ensure!(
             wire.resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal
                 || stored_resolution_from(&self.connection, wire)?.is_none(),
@@ -2157,6 +2317,8 @@ impl Store {
         proof: &ExecutionHandoffResolutionFreshness,
         now_ms: u64,
     ) -> Result<()> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         ensure!(
             auth.wire().resolution.purpose == ExecutionResolutionPurpose::ResolveUnknown,
             "only an explicit unknown resolution can fence execution"
@@ -2186,6 +2348,8 @@ impl Store {
         proof: &ExecutionHandoffResolutionFreshness,
         now_ms: u64,
     ) -> Result<ExecutionHandoffTerminalReconciliationResult> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         ensure!(
             auth.wire().resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal,
             "terminal reconciliation cannot resolve an unknown executor operation"
@@ -2222,6 +2386,8 @@ impl Store {
         stopped: &crate::engine::StoppedExecution,
         now_ms: u64,
     ) -> Result<ExecutionHandoffResolutionResult> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         ensure!(
             wire.resolution.purpose == ExecutionResolutionPurpose::ResolveUnknown,
             "terminal reconciliation cannot mutate executor state"
