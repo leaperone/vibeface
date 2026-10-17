@@ -257,7 +257,7 @@ test("workspace callers retain offline message identity and bound execution task
   }
 })
 
-test("task pending controls stay inside their conversation and retain task and resource locks", () => {
+test("task pending controls stay inside their conversation and retain task and resource locks", async () => {
   const task = parseConversation({ ...context, tasks: [{ task_id: "task", title: "work", goal: "goal", acceptance: "done", detail: "running", status: "working", binding: { target_node: "executor", session_id: "session", operation_id: "execution", revision: 4, state: "running", freshness: "local_ledger", capabilities: ["interrupt"], pending_requests: [] } }] }).tasks[0]
   const operation = (kind: "request" | "control", changes: Record<string, unknown> = {}) => {
     const identity = { operation_id: kind, network_id: "network", conversation_id: "chat", task_id: "task", target_node: "executor", session_id: "session", expected_revision: 4, ...changes }
@@ -265,6 +265,7 @@ test("task pending controls stay inside their conversation and retain task and r
     return { operation_id: identity.operation_id, conversation_id: identity.conversation_id, target_node: identity.target_node, session_id: identity.session_id, [kind]: payload }
   }
   let pending: ReturnType<typeof parsePending> = []
+  const reconciled: ReturnType<typeof parsePending> = [], retried: ReturnType<typeof parsePending> = []
   const elements: { type: unknown; props: Record<string, unknown> }[] = []
   const jsx = (type: unknown, props: Record<string, unknown>) => { const element = { type, props }; elements.push(element); return element }
   const ui = new Proxy({}, { get: (_target, name) => String(name) })
@@ -272,7 +273,7 @@ test("task pending controls stay inside their conversation and retain task and r
   const require = (specifier: string) => {
     if (specifier === "react") return { useId: () => "task", useState: (initial: unknown) => [initial, () => {}] }
     if (specifier === "react/jsx-runtime") return { jsx, jsxs: jsx }
-    if (specifier === "./context") return { useWorkspace: () => ({ pending, nodes: [{ node_id: "executor", online: true, revoked: false }], writable: true, connectionOnline: true, canAutoFollowup: true }) }
+    if (specifier === "./context") return { useWorkspace: () => ({ pending, nodes: [{ node_id: "executor", online: true, revoked: false }], writable: true, connectionOnline: true, canAutoFollowup: true, run: (action: () => Promise<void>) => action(), reconcile: async (operation: typeof pending[number]) => { reconciled.push(operation) }, retryTaskControl: async (operation: typeof pending[number]) => { retried.push(operation) } }) }
     if (specifier === "./labels") return { nodeName, stateNames }
     return ui
   }
@@ -296,4 +297,27 @@ test("task pending controls stay inside their conversation and retain task and r
     assert.equal(interrupt.length, 1, scenario.name)
     assert.equal(interrupt[0].props.disabled, scenario.locked, scenario.name)
   }
+  for (const kind of ["request", "control"] as const) {
+    pending = parsePending([operation(kind)], "network")
+    elements.length = 0
+    TaskActivity({ task, conversationId: "chat" })
+    const card = elements.find(({ props }) => props.operation === pending[0])
+    assert.ok(card && typeof card.type === "function")
+    elements.length = 0
+    card.type(card.props)
+    const reconcile = elements.find(({ props }) => props.children === "核对原操作")
+    assert.ok(reconcile && typeof reconcile.props.action === "function")
+    assert.equal(reconcile.props.disabled, false)
+    await reconcile.props.action()
+    assert.equal(reconciled.at(-1), pending[0])
+    const retry = elements.find(({ props }) => props.children === "重试原请求")
+    assert.equal(Boolean(retry), kind === "control")
+    assert.equal(elements.some(({ props }) => props.children === "重试会保留原操作编号与内容，不会新建请求。"), kind === "control")
+    if (kind === "control") {
+      assert.ok(retry && typeof retry.props.action === "function")
+      await retry.props.action()
+      assert.equal(retried.at(-1), pending[0])
+    }
+  }
+  assert.equal(retried.length, 1)
 })

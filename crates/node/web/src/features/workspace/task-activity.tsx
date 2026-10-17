@@ -184,9 +184,9 @@ function TaskPendingControl({ operation }: { operation: PendingOperation }) {
       <p className="text-sm">原操作编号：<code className="break-all text-xs">{operation.operation_id}</code></p>
       <div className="flex flex-wrap gap-2">
         <ActionButton disabled={!workspace.writable || !online} action={() => workspace.run(async () => { setResult(await workspace.reconcile(operation)) })}>核对原操作</ActionButton>
-        <ActionButton disabled={!workspace.writable || !online} action={() => workspace.run(async () => { await workspace.retryTaskControl(operation) })}>重试原请求</ActionButton>
+        {operation.control ? <ActionButton disabled={!workspace.writable || !online} action={() => workspace.run(async () => { await workspace.retryTaskControl(operation) })}>重试原请求</ActionButton> : null}
       </div>
-      <p className="text-sm text-muted-foreground">重试会保留原操作编号与内容，不会新建请求。</p>
+      {operation.control ? <p className="text-sm text-muted-foreground">重试会保留原操作编号与内容，不会新建请求。</p> : null}
       {result !== undefined ? <RawDetails title="核对结果" value={result} defaultOpen /> : null}
     </section>
   )
