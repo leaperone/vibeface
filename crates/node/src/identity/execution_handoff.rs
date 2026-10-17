@@ -48,6 +48,7 @@ struct StoredHandoff {
     request: OperationRequest,
     transport: TransportEvidence,
     admission: ExecutionHandoffFreshness,
+    admission_receipt: Signed<ExecutionHandoffAdmissionReceipt>,
     admitted_at_ms: u64,
     state: OperationState,
     result: Value,
@@ -77,13 +78,13 @@ fn request(wire: &SignedExecutionHandoff) -> Result<OperationRequest> {
 
 fn original_authorization_from(
     _connection: &Connection,
-    policy: &PolicyState,
+    _policy: &PolicyState,
     current: &VerifiedPolicySet,
     wire: &SignedExecutionHandoff,
     now_ms: u64,
 ) -> Result<VerifiedAuthorization> {
     wire.hash()?;
-    current.verify_project_execution_source(&wire.handoff, now_ms)?;
+    let source = current.verify_project_execution_source(&wire.handoff, now_ms)?;
     let dispatch: Event = serde_json::from_str(&wire.handoff.project_dispatch.canonical_body)?;
     let task: Event = serde_json::from_str(&wire.handoff.task_creation.canonical_body)?;
     let original = capsule_admission(&dispatch)?;
@@ -95,7 +96,7 @@ fn original_authorization_from(
         "capsule task host or admission order changed"
     );
     let project = original.invocation.payload.resource.clone();
-    let task_facts = capsule_facts(
+    capsule_facts(
         &task_proof,
         &project,
         &task.scope_id,
@@ -120,12 +121,6 @@ fn original_authorization_from(
             && task.created_at_ms == task_proof.admitted_at_ms as i64,
         "task creation differs from its admitted input"
     );
-    verify_capsule_admission(
-        policy,
-        &task_proof,
-        &task_facts,
-        wire.handoff.task_sdk_origin.as_ref(),
-    )?;
     let operation = request(wire)?;
     let facts = capsule_facts(
         &original,
@@ -134,20 +129,11 @@ fn original_authorization_from(
         Some((&operation, &wire.handoff)),
         wire.handoff.sdk_origin.as_ref(),
     )?;
-    let admitted =
-        verify_capsule_admission(policy, &original, &facts, wire.handoff.sdk_origin.as_ref())?;
+    let admitted = source.original_admission(&wire.handoff, now_ms)?;
     let auth = current.verify_operation_authorization(
         &admitted,
         &facts,
         &original.transport.clone().into_evidence(),
-        now_ms,
-    )?;
-    verify_capsule_sdk(
-        current,
-        policy,
-        &original,
-        &facts,
-        wire.handoff.sdk_origin.as_ref(),
         now_ms,
     )?;
     Ok(auth)
@@ -494,11 +480,7 @@ fn compact_sdk_from_events(
     }))
 }
 
-fn reconstruct_handoff(
-    connection: &Connection,
-    policy: &PolicyState,
-    stored: &StoredHandoff,
-) -> Result<VerifiedExecutionAdmission> {
+fn verify_local_handoff_checkpoint(connection: &Connection, stored: &StoredHandoff) -> Result<()> {
     verify_challenge_record(connection, &stored.wire, &stored.admission, true)?;
     let (execution, original, operation) = scope(&stored.wire)?;
     let nonce:(String,String,String,String)=connection.query_row("SELECT device_id,nonce,invocation_hash,body_hash FROM execution_handoff_nonces WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",
@@ -513,28 +495,32 @@ fn reconstruct_handoff(
             ),
         "handoff nonce ledger changed"
     );
-    let historical =
-        policy.historical(&stored.admission.challenge.policies, stored.admitted_at_ms)?;
-    let original = original_authorization_from(
-        connection,
-        policy,
-        &historical,
+    if let Some((lease, _, _)) = &stored.lease {
+        verify_challenge_record(connection, &stored.wire, lease, true)?;
+    }
+    verify_execution_handoff_admission_checkpoint(
         &stored.wire,
-        stored.admitted_at_ms,
-    )?;
-    let verified = historical.verify_execution_handoff(
-        &stored.wire,
-        &original,
-        &stored.transport,
-        None,
-        stored.admitted_at_ms,
-    )?;
-    let freshness = historical.verify_execution_handoff_freshness(
-        &verified,
+        &stored.admission_receipt,
         &stored.admission,
+        &StoredTransport::from(&stored.transport),
         stored.admitted_at_ms,
     )?;
-    Ok(historical.admit_execution_handoff(&verified, &freshness, stored.admitted_at_ms)?)
+    Ok(())
+}
+
+fn reconstruct_handoff(
+    connection: &Connection,
+    _policy: &PolicyState,
+    stored: &StoredHandoff,
+) -> Result<VerifiedExecutionAdmission> {
+    verify_local_handoff_checkpoint(connection, stored)?;
+    Ok(verify_execution_handoff_admission_checkpoint(
+        &stored.wire,
+        &stored.admission_receipt,
+        &stored.admission,
+        &StoredTransport::from(&stored.transport),
+        stored.admitted_at_ms,
+    )?)
 }
 
 fn verified_lease_deadline(
@@ -596,14 +582,15 @@ fn stored_from(
         target: String,
         session: String,
         control: bool,
+        admission_receipt: String,
     }
     let raw = connection.query_row(
-        "SELECT handoff,original_request,admission_transport,admission_challenge,admission_receipts,admitted_at_ms,state,result,lease_challenge,lease_receipts,lease_verified_at_ms,lease_deadline_ms,result_receipt,handoff_hash,invocation_hash,body_hash,target_node,session_id,control FROM execution_handoffs WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",
+        "SELECT handoff,original_request,admission_transport,admission_challenge,admission_receipts,admitted_at_ms,state,result,lease_challenge,lease_receipts,lease_verified_at_ms,lease_deadline_ms,result_receipt,handoff_hash,invocation_hash,body_hash,target_node,session_id,control,admission_receipt FROM execution_handoffs WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",
         params![execution, original, operation], |row| Ok(Raw {
             wire: row.get(0)?, request: row.get(1)?, transport: row.get(2)?, challenge: row.get(3)?, receipts: row.get(4)?,
             admitted: row.get(5)?, state: row.get(6)?, result: row.get(7)?, lease_challenge: row.get(8)?, lease_receipts: row.get(9)?,
             lease_verified: row.get(10)?, lease_deadline: row.get(11)?, receipt: row.get(12)?, handoff_hash: row.get(13)?,
-            invocation_hash: row.get(14)?, body_hash: row.get(15)?, target: row.get(16)?, session: row.get(17)?, control: row.get(18)?,
+            invocation_hash: row.get(14)?, body_hash: row.get(15)?, target: row.get(16)?, session: row.get(17)?, control: row.get(18)?, admission_receipt: row.get(19)?,
         })).optional()?;
     let Some(raw) = raw else { return Ok(None) };
     let wire: SignedExecutionHandoff = serde_json::from_str(&raw.wire)?;
@@ -651,6 +638,7 @@ fn stored_from(
             challenge: serde_json::from_str(&raw.challenge)?,
             receipts: serde_json::from_str(&raw.receipts)?,
         },
+        admission_receipt: serde_json::from_str(&raw.admission_receipt)?,
         admitted_at_ms: raw.admitted,
         state: serde_json::from_value(Value::String(raw.state))?,
         result: serde_json::from_str(&raw.result)?,
@@ -986,6 +974,60 @@ fn dto(
 }
 
 impl Store {
+    pub fn execution_handoff_proof_usage(
+        &self,
+        wire: &SignedExecutionHandoff,
+        transport: &TransportEvidence,
+        freshness: Option<&ExecutionHandoffFreshness>,
+        now_ms: u64,
+    ) -> Result<ExecutionProofUsage> {
+        let current = self.policy.verified();
+        let original =
+            original_authorization_from(&self.connection, &self.policy, current, wire, now_ms)?;
+        let (execution, space, operation) = scope(wire)?;
+        let admission = stored_from(&self.connection, &execution, &space, &operation)?
+            .map(|stored| reconstruct_handoff(&self.connection, &self.policy, &stored))
+            .transpose()?;
+        let verified = current.verify_execution_handoff(
+            wire,
+            &original,
+            transport,
+            admission.as_ref(),
+            now_ms,
+        )?;
+        match freshness {
+            Some(proof) => Ok(current
+                .verify_execution_handoff_freshness(&verified, proof, now_ms)?
+                .proof_usage()
+                .clone()),
+            None => Ok(verified.proof_usage().clone()),
+        }
+    }
+
+    pub fn execution_handoff_resolution_proof_usage(
+        &self,
+        wire: &SignedExecutionHandoffResolution,
+        freshness: Option<&ExecutionHandoffResolutionFreshness>,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<ExecutionProofUsage> {
+        let auth = self.execution_handoff_resolution_authorization(wire, transport, now_ms)?;
+        let mut usage = auth.proof_usage().clone();
+        if let Some(proof) = freshness {
+            self.policy
+                .verified()
+                .verify_execution_resolution_freshness(&auth, proof, now_ms)?;
+            usage.record_metadata(&proof.challenge)?;
+            for receipt in &proof.receipts {
+                usage.record_signed(receipt)?;
+            }
+        }
+        usage.enforce_limits()?;
+        Ok(usage)
+    }
+}
+
+impl Store {
     pub fn execution_handoff_payload(
         &self,
         identity: &LocalIdentity,
@@ -1270,6 +1312,12 @@ impl Store {
         );
         let (resources, session) =
             validate_execution_context(&tx, identity, &verified, &operation)?;
+        let reused: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM execution_handoff_resolutions WHERE execution_space_id=? AND submission_device=? AND submission_nonce=?)",
+            params![execution, wire.invocation.payload.device.as_str(), wire.invocation.payload.nonce.as_str()],
+            |row| row.get(0),
+        )?;
+        ensure!(!reused, "handoff reused a prior executor resolution nonce");
         check_execution_session_in(
             &tx,
             &original_space,
@@ -1286,10 +1334,21 @@ impl Store {
             CheckStage::Admit,
             now_ms,
         )?;
-        tx.execute("INSERT INTO execution_handoffs(execution_space_id,original_space_id,operation_id,target_node,session_id,original_request,handoff,handoff_hash,invocation_hash,body_hash,admission_transport,admission_challenge,admission_receipts,admitted_at_ms,state,control,result) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'accepted',?,'null')",
+        let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let admission_receipt = Signed::sign(
+            ExecutionHandoffAdmissionReceipt::new(
+                wire,
+                proof,
+                &StoredTransport::from(transport),
+                now_ms,
+            )?,
+            &signer,
+        )?;
+        tx.execute("INSERT INTO execution_handoffs(execution_space_id,original_space_id,operation_id,target_node,session_id,original_request,handoff,handoff_hash,invocation_hash,body_hash,admission_transport,admission_challenge,admission_receipts,admission_receipt,admitted_at_ms,state,control,result) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'accepted',?,'null')",
             params![execution, original_space, operation_id, operation.target_node, operation.session_id, serde_json::to_string(&operation)?, serde_json::to_string(wire)?,
                 wire.hash()?.as_str(), wire.invocation.hash()?.as_str(), wire.invocation.payload.body_hash.as_str(), serde_json::to_string(&StoredTransport::from(transport))?,
-                serde_json::to_string(&proof.challenge)?, serde_json::to_string(&proof.receipts)?, now_ms, is_control(&operation)])?;
+                serde_json::to_string(&proof.challenge)?, serde_json::to_string(&proof.receipts)?, serde_json::to_string(&admission_receipt)?, now_ms, is_control(&operation)])?;
         tx.execute("INSERT INTO execution_handoff_nonces(execution_space_id,device_id,nonce,original_space_id,operation_id,invocation_hash,body_hash) VALUES(?,?,?,?,?,?,?)",
             params![execution, wire.invocation.payload.device.as_str(), wire.invocation.payload.nonce.as_str(), original_space, operation_id,
                 wire.invocation.hash()?.as_str(), wire.invocation.payload.body_hash.as_str()])?;
@@ -1831,7 +1890,7 @@ fn reconstruct_resolution(
 
 fn resolution_original_observation_from(
     connection: &Connection,
-    policy: &PolicyState,
+    _policy: &PolicyState,
     wire: &SignedExecutionHandoffResolution,
 ) -> Result<StoredHandoff> {
     let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
@@ -1841,7 +1900,30 @@ fn resolution_original_observation_from(
         stored.wire == wire.resolution.observation.handoff,
         "resolution changed the executor's accepted carrier"
     );
-    reconstruct_handoff(connection, policy, &stored)?;
+    verify_local_handoff_checkpoint(connection, &stored)?;
+    verify_execution_handoff_receipt_signature(
+        &stored.wire,
+        &wire.resolution.observation.receipt,
+        &stored.result,
+    )?;
+    let actual = connection.prepare("SELECT target_node,resource FROM execution_handoff_reservations WHERE execution_space_id=? AND original_space_id=? AND operation_id=? ORDER BY resource")?
+        .query_map(params![execution, original, operation], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut expected = if stored.state.terminal() {
+        Vec::new()
+    } else {
+        stored
+            .request
+            .resources
+            .iter()
+            .map(|resource| (stored.request.target_node.clone(), resource.clone()))
+            .collect::<Vec<_>>()
+    };
+    expected.sort();
+    ensure!(
+        actual == expected,
+        "execution checkpoint reservations changed"
+    );
     ensure!(
         (match wire.resolution.purpose {
             ExecutionResolutionPurpose::ResolveUnknown => stored.state == OperationState::Unknown,
@@ -1912,12 +1994,21 @@ impl Store {
             resolution_original_observation_from(&self.connection, &self.policy, wire)?;
             None
         };
-        Ok(self.policy.verified().verify_execution_resolution(
+        let verified = self.policy.verified().verify_execution_resolution(
             wire,
             &resolver,
             transport,
             admission.as_ref(),
             now_ms,
+        )?;
+        let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
+        let stored = stored_from(&self.connection, &execution, &original, &operation)?
+            .context("resolution acceptance checkpoint disappeared")?;
+        Ok(verified.with_admission_checkpoint(
+            &stored.admission_receipt,
+            &stored.admission,
+            &StoredTransport::from(&stored.transport),
+            stored.admitted_at_ms,
         )?)
     }
 
@@ -2389,7 +2480,7 @@ pub(crate) fn validate_execution_handoff_storage(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         binding::{self, TaskBinding},
@@ -2399,16 +2490,16 @@ mod tests {
     use anyhow::Result;
     use vibeface_secure::{Identity, authorization::*};
 
-    struct Fixture {
-        project: TestNetwork,
-        executor: TestNetwork,
-        store: Store,
-        wire: SignedExecutionHandoff,
-        transport: TransportEvidence,
+    pub(crate) struct Fixture {
+        pub(crate) project: TestNetwork,
+        pub(crate) executor: TestNetwork,
+        pub(crate) store: Store,
+        pub(crate) wire: SignedExecutionHandoff,
+        pub(crate) transport: TransportEvidence,
     }
 
     impl Fixture {
-        fn new() -> Result<Self> {
+        pub(crate) fn new() -> Result<Self> {
             let project = TestNetwork::new()?;
             let executor = TestNetwork::new()?;
             let mut store = project.memory().context("install Project fixture")?;
@@ -3055,7 +3146,7 @@ mod tests {
             Ok(grant)
         }
 
-        fn resolution(
+        pub(crate) fn resolution(
             &mut self,
             purpose: ExecutionResolutionPurpose,
         ) -> Result<SignedExecutionHandoffResolution> {
@@ -3279,7 +3370,7 @@ mod tests {
             Ok(())
         }
 
-        fn resolution_freshness(
+        pub(crate) fn resolution_freshness(
             &mut self,
             wire: &SignedExecutionHandoffResolution,
             at: u64,
@@ -3336,7 +3427,23 @@ mod tests {
             Ok(engine.fence_operation(&context).await?.0)
         }
 
-        fn start_unknown(&mut self) -> Result<()> {
+        fn print_handoff_proof_counts(&mut self, label: &str) -> Result<()> {
+            let proof = self.freshness(CheckStage::Admit, now())?;
+            let usage = self.store.execution_handoff_proof_usage(
+                &self.wire,
+                &self.transport,
+                Some(&proof),
+                now(),
+            )?;
+            println!(
+                "HANDOFF_PROOF_USAGE {}",
+                serde_json::json!({"case":label,"capsule_transport_bytes":serde_json::to_vec(&self.wire)?.len(),
+                "submit_rpc_json_bytes":serde_json::to_vec(&json!({"type":"execution_handoff_submit","handoff":self.wire}))?.len(),
+                "freshness_json_bytes":serde_json::to_vec(&proof)?.len(),"proof":usage.counts(),"within_ordinary_limits":usage.enforce_limits().is_ok()})
+            );
+            Ok(())
+        }
+        pub(crate) fn start_unknown(&mut self) -> Result<()> {
             self.accept()?;
             let proof = self.freshness(CheckStage::Start, now() + 3)?;
             let auth = self.store.execution_handoff_authorization(
@@ -3357,7 +3464,11 @@ mod tests {
             Ok(())
         }
 
-        fn freshness(&mut self, stage: CheckStage, at: u64) -> Result<ExecutionHandoffFreshness> {
+        pub(crate) fn freshness(
+            &mut self,
+            stage: CheckStage,
+            at: u64,
+        ) -> Result<ExecutionHandoffFreshness> {
             let challenge = self.store.issue_execution_handoff_challenge(
                 &self.wire,
                 &self.transport,
@@ -3378,7 +3489,7 @@ mod tests {
             })
         }
 
-        fn accept(&mut self) -> Result<ExecutionHandoffFreshness> {
+        pub(crate) fn accept(&mut self) -> Result<ExecutionHandoffFreshness> {
             let proof = self.freshness(CheckStage::Admit, now())?;
             self.store.accept_execution_handoff(
                 &self.executor.node,
@@ -3414,6 +3525,18 @@ mod tests {
         );
         let wire = fixture.resolution(ExecutionResolutionPurpose::ResolveUnknown)?;
         let proof = fixture.resolution_freshness(&wire, now() + 55)?;
+        let usage = fixture.store.execution_handoff_resolution_proof_usage(
+            &wire,
+            Some(&proof),
+            &fixture.transport,
+            now() + 55,
+        )?;
+        println!(
+            "HANDOFF_PROOF_USAGE {}",
+            json!({"case":"account_resolution_after_revocation","capsule_transport_bytes":serde_json::to_vec(&wire)?.len(),
+            "submit_rpc_json_bytes":serde_json::to_vec(&json!({"type":"execution_handoff_resolve","resolution":wire}))?.len(),
+            "freshness_json_bytes":serde_json::to_vec(&proof)?.len(),"proof":usage.counts(),"within_ordinary_limits":usage.enforce_limits().is_ok()})
+        );
         let wrong_fence = fixture.fence("another-operation").await?;
         assert!(
             fixture
@@ -3863,10 +3986,66 @@ mod tests {
     fn independent_executor_keeps_original_scope_and_never_restarts_unknown() -> Result<()> {
         let mut fixture = Fixture::new()?;
         fixture.verify_builder_and_isolate_executor()?;
+        fixture.print_handoff_proof_counts("account_production_builder")?;
         assert!(
             !serde_json::to_string(&fixture.wire)?.contains("other-task-secret-DO-NOT-DISCLOSE")
         );
         let admission = fixture.accept()?;
+        let checkpoint = stored_from(
+            &fixture.store.connection,
+            fixture.executor.space.as_str(),
+            fixture.project.space.as_str(),
+            "original-operation",
+        )?
+        .unwrap()
+        .admission_receipt;
+        let signer = Identity::from_secret_hex(&fixture.executor.node.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        for field in [
+            "handoff_hash",
+            "submission_invocation_hash",
+            "original_invocation_hash",
+            "original_request_hash",
+            "admission_hash",
+            "transport_hash",
+            "admitted_at_ms",
+            "version",
+        ] {
+            let mut payload = serde_json::to_value(&checkpoint.payload)?;
+            payload[field] = if field == "version" {
+                json!(AUTH_VERSION + 1)
+            } else if field == "admitted_at_ms" {
+                json!(checkpoint.payload.admitted_at_ms + 1)
+            } else {
+                json!(ObjectHash::body(&field)?)
+            };
+            let altered = Signed::sign(
+                serde_json::from_value::<ExecutionHandoffAdmissionReceipt>(payload)?,
+                &signer,
+            )?;
+            fixture.store.connection.execute(
+                "UPDATE execution_handoffs SET admission_receipt=?",
+                [serde_json::to_string(&altered)?],
+            )?;
+            let before = fixture.store.connection.total_changes();
+            assert!(
+                fixture
+                    .store
+                    .execution_handoff_authorization(
+                        fixture.executor.space.as_str(),
+                        fixture.project.space.as_str(),
+                        "original-operation",
+                        now() + 2
+                    )
+                    .is_err(),
+                "accepted replaced checkpoint field {field}"
+            );
+            assert_eq!(before, fixture.store.connection.total_changes());
+        }
+        fixture.store.connection.execute(
+            "UPDATE execution_handoffs SET admission_receipt=?",
+            [serde_json::to_string(&checkpoint)?],
+        )?;
         let duplicate = fixture.store.accept_execution_handoff(
             &fixture.executor.node,
             &fixture.wire,
@@ -4016,6 +4195,7 @@ mod tests {
     fn sdk_capsule_preserves_account_origin_without_replicating_private_messages() -> Result<()> {
         let mut fixture = Fixture::sdk()?;
         fixture.verify_builder_and_isolate_executor()?;
+        fixture.print_handoff_proof_counts("sdk_production_builder")?;
         let bytes = serde_json::to_string(&fixture.wire)?;
         assert!(!bytes.contains("private-user-message-DO-NOT-DISCLOSE"));
         assert!(!bytes.contains("other-task-secret-DO-NOT-DISCLOSE"));
@@ -4163,10 +4343,27 @@ mod tests {
                 )
                 .is_err()
         );
-        let mut altered = fixture.wire.clone();
-        altered.handoff.sdk_origin.as_mut().unwrap().receipts[0]
+        let mut historical = fixture.wire.clone();
+        historical.handoff.sdk_origin.as_mut().unwrap().receipts[0]
             .payload
             .expires_at_ms += 1;
+        historical.handoff.attest_source(&signer)?;
+        resign_carrier(&mut historical)?;
+        fixture.store.issue_execution_handoff_challenge(
+            &historical,
+            &fixture.transport,
+            CheckStage::Admit,
+            now(),
+        )?;
+        let mut altered = fixture.wire.clone();
+        altered
+            .handoff
+            .sdk_origin
+            .as_mut()
+            .unwrap()
+            .invocation
+            .payload
+            .body_hash = ObjectHash::body(&"forged Account message")?;
         altered.handoff.attest_source(&signer)?;
         resign_carrier(&mut altered)?;
         assert!(

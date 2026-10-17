@@ -38,11 +38,97 @@ impl SignedObject for ProjectExecutionSource {
 
 pub struct VerifiedProjectExecutionSource {
     capsule_hash: ObjectHash,
+    usage: ExecutionProofUsage,
 }
 impl VerifiedProjectExecutionSource {
     pub fn capsule_hash(&self) -> &ObjectHash {
         &self.capsule_hash
     }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
+    pub fn original_admission(
+        &self,
+        handoff: &ExecutionHandoff,
+        now_ms: u64,
+    ) -> Result<VerifiedAdmission> {
+        self.check_capsule(handoff)?;
+        let (_, proof, _, _) = original_dispatch(handoff)?;
+        attested_admission(
+            &proof.invocation,
+            &proof.challenge,
+            proof.admitted_at_ms,
+            now_ms,
+        )
+    }
+    pub fn sdk_parent_admission(
+        &self,
+        handoff: &ExecutionHandoff,
+        now_ms: u64,
+    ) -> Result<Option<VerifiedAdmission>> {
+        self.check_capsule(handoff)?;
+        let Some(origin) = &handoff.sdk_origin else {
+            return Ok(None);
+        };
+        let (_, proof, _, _) = original_dispatch(handoff)?;
+        let parent = &origin.invocation.payload;
+        require(
+            matches!(parent.actor, Actor::Account(_))
+                && parent.initiator == parent.actor
+                && parent.initiating_grant.is_none()
+                && parent.action == Action::MessageAppend
+                && parent.resource == proof.invocation.payload.resource
+                && parent.audience == proof.invocation.payload.audience
+                && parent.context.conversation == proof.invocation.payload.context.conversation
+                && parent.context.workspace_resource
+                    == proof.invocation.payload.context.workspace_resource
+                && parent.context.sdk_session.is_none()
+                && parent.context.execution_session.is_none()
+                && origin.admitted_at_ms <= proof.admitted_at_ms,
+            "invalid attested Account message origin",
+        )?;
+        Ok(Some(attested_admission(
+            &origin.invocation,
+            &origin.challenge,
+            origin.admitted_at_ms,
+            now_ms,
+        )?))
+    }
+    fn check_capsule(&self, handoff: &ExecutionHandoff) -> Result<()> {
+        require(
+            handoff.source_statement()?.capsule_hash == self.capsule_hash,
+            "Project source checkpoint belongs to another capsule",
+        )
+    }
+}
+
+fn attested_admission(
+    invocation: &Signed<Invocation>,
+    challenge: &FreshnessChallenge,
+    admitted_at_ms: u64,
+    now_ms: u64,
+) -> Result<VerifiedAdmission> {
+    let value = &invocation.payload;
+    require(
+        admitted_at_ms <= now_ms
+            && value.not_before_ms <= admitted_at_ms
+            && admitted_at_ms < value.expires_at_ms
+            && challenge.version == AUTH_VERSION
+            && challenge.stage == CheckStage::Admit
+            && challenge.invocation_hash == invocation.hash()?
+            && challenge.operation_id == value.operation_id
+            && challenge.body_hash == value.body_hash
+            && challenge.audience == value.audience
+            && challenge.presenter == value.presenter
+            && challenge.issued_at_ms <= admitted_at_ms
+            && admitted_at_ms < challenge.expires_at_ms
+            && challenge.policies.len() <= MAX_POLICY_DOMAINS,
+        "invalid Project-attested admission checkpoint",
+    )?;
+    Ok(VerifiedAdmission {
+        invocation: invocation.clone(),
+        admitted_at_ms,
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -253,6 +339,83 @@ pub struct ExecutionHandoffFreshness {
     pub receipts: Vec<Signed<FreshnessReceipt>>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionHandoffAdmissionReceipt {
+    pub version: u16,
+    pub handoff_hash: ObjectHash,
+    pub submission_invocation_hash: ObjectHash,
+    pub original_invocation_hash: ObjectHash,
+    pub original_request_hash: ObjectHash,
+    pub admission_hash: ObjectHash,
+    pub transport_hash: ObjectHash,
+    pub admitted_at_ms: u64,
+}
+impl sealed::Sealed for ExecutionHandoffAdmissionReceipt {}
+impl SignedObject for ExecutionHandoffAdmissionReceipt {
+    const DOMAIN: &'static str = "execution-handoff-admission-receipt-v2";
+}
+
+impl ExecutionHandoffAdmissionReceipt {
+    pub fn new(
+        wire: &SignedExecutionHandoff,
+        admission: &ExecutionHandoffFreshness,
+        transport: &StoredTransport,
+        admitted_at_ms: u64,
+    ) -> Result<Self> {
+        let (_, original, request, _) = original_dispatch(&wire.handoff)?;
+        Ok(Self {
+            version: AUTH_VERSION,
+            handoff_hash: wire.hash()?,
+            submission_invocation_hash: wire.invocation.hash()?,
+            original_invocation_hash: original.invocation.hash()?,
+            original_request_hash: ObjectHash::body(&request)?,
+            admission_hash: ObjectHash::body(admission)?,
+            transport_hash: ObjectHash::body(transport)?,
+            admitted_at_ms,
+        })
+    }
+}
+
+pub fn verify_execution_handoff_admission_checkpoint(
+    wire: &SignedExecutionHandoff,
+    receipt: &Signed<ExecutionHandoffAdmissionReceipt>,
+    admission: &ExecutionHandoffFreshness,
+    transport: &StoredTransport,
+    admitted_at_ms: u64,
+) -> Result<VerifiedExecutionAdmission> {
+    receipt.verify_signature()?;
+    require(
+        receipt.issuer == wire.handoff.target_public_key
+            && receipt.payload
+                == ExecutionHandoffAdmissionReceipt::new(
+                    wire,
+                    admission,
+                    transport,
+                    admitted_at_ms,
+                )?
+            && admission.challenge.stage == CheckStage::Admit
+            && admission.challenge.issued_at_ms <= admitted_at_ms
+            && admitted_at_ms < admission.challenge.expires_at_ms
+            && wire.invocation.payload.not_before_ms <= admitted_at_ms
+            && admitted_at_ms < wire.invocation.payload.expires_at_ms,
+        "executor acceptance checkpoint changed",
+    )?;
+    let mut usage = ExecutionProofUsage::default();
+    usage.record_signed(receipt)?;
+    usage.record_metadata(admission)?;
+    usage.record_metadata(transport)?;
+    usage.enforce_limits()?;
+    Ok(VerifiedExecutionAdmission {
+        handoff_hash: wire.hash()?,
+        submission: VerifiedAdmission {
+            invocation: wire.invocation.clone(),
+            admitted_at_ms,
+        },
+        usage,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct VerifiedExecutionHandoff {
     wire: SignedExecutionHandoff,
@@ -264,9 +427,13 @@ pub struct VerifiedExecutionHandoff {
     binding_hash: String,
     dependencies: Vec<PolicyStamp>,
     verified_at_ms: u64,
+    usage: ExecutionProofUsage,
 }
 
 impl VerifiedExecutionHandoff {
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
     pub fn wire(&self) -> &SignedExecutionHandoff {
         &self.wire
     }
@@ -296,6 +463,7 @@ impl VerifiedExecutionHandoff {
 pub struct VerifiedExecutionAdmission {
     handoff_hash: ObjectHash,
     submission: VerifiedAdmission,
+    usage: ExecutionProofUsage,
 }
 
 #[derive(Clone, Debug)]
@@ -307,9 +475,13 @@ pub struct VerifiedExecutionFreshness {
     dependencies: Vec<PolicyStamp>,
     verified_at_ms: u64,
     expires_at_ms: u64,
+    usage: ExecutionProofUsage,
 }
 
 impl VerifiedExecutionFreshness {
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
     pub fn expires_at_ms(&self) -> u64 {
         self.expires_at_ms
     }
@@ -452,6 +624,9 @@ impl VerifiedPolicySet {
         handoff: &ExecutionHandoff,
         now_ms: u64,
     ) -> Result<VerifiedProjectExecutionSource> {
+        let mut capsule_usage = ExecutionProofUsage::default();
+        capsule_usage.record_capsule(handoff)?;
+        capsule_usage.enforce_limits()?;
         let (dispatch, proof, _, binding) = original_dispatch(handoff)?;
         let statement = handoff.source_statement()?;
         let signed =
@@ -483,10 +658,11 @@ impl VerifiedPolicySet {
                 && proof.invocation.payload.resource == statement.project,
             "capsule is not attested by its current Project host",
         )?;
+        let mut source_budget = Budget::default();
         self.validate_certificate(
             certificate,
             now_ms,
-            &mut Budget::default(),
+            &mut source_budget,
             &mut BTreeMap::new(),
             &mut BTreeSet::new(),
         )?;
@@ -519,9 +695,86 @@ impl VerifiedPolicySet {
             "execution capsule belongs to another task",
         )?;
         verify_binding(&binding, certificate.payload.public_key.as_str()).map_err(invalid_shape)?;
-        Ok(VerifiedProjectExecutionSource {
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_budget(&source_budget)?;
+        usage.record_signed(signed)?;
+        let mut verified = VerifiedProjectExecutionSource {
             capsule_hash: statement.capsule_hash,
-        })
+            usage,
+        };
+        verified.original_admission(handoff, now_ms)?;
+        if let Some(parent) = verified.sdk_parent_admission(handoff, now_ms)? {
+            let origin = handoff
+                .sdk_origin
+                .as_ref()
+                .ok_or(AuthorizationError::InvalidProof("missing SDK origin"))?;
+            let invocation = &proof.invocation.payload;
+            let Actor::Service(service) = &invocation.actor else {
+                return Err(AuthorizationError::InvalidProof(
+                    "SDK origin has no Service child",
+                ));
+            };
+            let session =
+                invocation
+                    .context
+                    .sdk_session
+                    .as_ref()
+                    .ok_or(AuthorizationError::InvalidProof(
+                        "SDK origin has no session",
+                    ))?;
+            require(
+                session.target == invocation.device
+                    && session.session_id == origin.sdk_trigger.as_str()
+                    && proof.source_body["parent_invocation"].as_str()
+                        == Some(origin.invocation.hash()?.as_str())
+                    && proof.source_body["sdk_session"]
+                        == serde_json::to_value(session).map_err(invalid_shape)?
+                    && proof.transport.clone().into_evidence()
+                        == TransportEvidence::LocalAgentAdapter {
+                            service: service.clone(),
+                            session: session.clone(),
+                        },
+                "SDK checkpoint changed its Account source or adapter session",
+            )?;
+            let parent_value = &origin.invocation.payload;
+            let parent_facts = RequestFacts {
+                resource: parent_value.resource.clone(),
+                action: parent_value.action,
+                audience: parent_value.audience.clone(),
+                operation_id: parent_value.operation_id.clone(),
+                body_hash: parent_value.body_hash.clone(),
+                context: parent_value.context.clone(),
+            };
+            let parent = self.verify_operation_authorization(
+                &parent,
+                &parent_facts,
+                &origin.transport.clone().into_evidence(),
+                now_ms,
+            )?;
+            let child_facts = RequestFacts {
+                resource: invocation.resource.clone(),
+                action: invocation.action,
+                audience: invocation.audience.clone(),
+                operation_id: invocation.operation_id.clone(),
+                body_hash: invocation.body_hash.clone(),
+                context: invocation.context.clone(),
+            };
+            let delegation = self.verify_service_delegation(
+                &parent,
+                service,
+                &invocation.grant_leaf,
+                &child_facts,
+                now_ms,
+            )?;
+            require(
+                delegation.device() == &invocation.device
+                    && delegation.initiator() == &invocation.initiator
+                    && delegation.initiating_grant() == invocation.initiating_grant.as_ref(),
+                "SDK checkpoint changed its current delegation",
+            )?;
+            verified.usage.record_authorization(&parent)?;
+        }
+        Ok(verified)
     }
 
     pub fn verify_execution_handoff(
@@ -533,7 +786,7 @@ impl VerifiedPolicySet {
         now_ms: u64,
     ) -> Result<VerifiedExecutionHandoff> {
         self.check_current(original, now_ms)?;
-        self.verify_project_execution_source(&wire.handoff, now_ms)?;
+        let source = self.verify_project_execution_source(&wire.handoff, now_ms)?;
         let hash = wire.hash()?;
         let facts = execution_submission_facts(&wire.handoff, original)?;
         let (event, original_proof, request, binding) = original_dispatch(&wire.handoff)?;
@@ -656,6 +909,14 @@ impl VerifiedPolicySet {
             dependencies.len() <= MAX_POLICY_DOMAINS,
             "handoff has too many policy domains",
         )?;
+        let mut usage = source.usage;
+        usage.record_authorization(original)?;
+        usage.record_authorization(&submission)?;
+        usage.record_handoff(wire)?;
+        if let Some(admitted) = admitted {
+            usage.merge(&admitted.usage);
+        }
+        usage.enforce_limits()?;
         Ok(VerifiedExecutionHandoff {
             wire: wire.clone(),
             hash,
@@ -666,6 +927,7 @@ impl VerifiedPolicySet {
             binding,
             dependencies: dependencies.into_values().collect(),
             verified_at_ms: now_ms,
+            usage,
         })
     }
 
@@ -739,6 +1001,10 @@ impl VerifiedPolicySet {
             validate_window(receipt.issued_at_ms, receipt.expires_at_ms, now_ms)?;
             expires_at_ms = expires_at_ms.min(receipt.expires_at_ms);
         }
+        let mut usage = handoff.usage.clone();
+        usage.record_budget(&budget)?;
+        usage.record_metadata(challenge)?;
+        usage.enforce_limits()?;
         Ok(VerifiedExecutionFreshness {
             handoff_hash: handoff.hash.clone(),
             challenge_hash: hash,
@@ -747,6 +1013,7 @@ impl VerifiedPolicySet {
             dependencies: handoff.dependencies.clone(),
             verified_at_ms: now_ms,
             expires_at_ms,
+            usage,
         })
     }
 
@@ -772,6 +1039,7 @@ impl VerifiedPolicySet {
                 invocation: handoff.submission.invocation.clone(),
                 admitted_at_ms: now_ms,
             },
+            usage: ExecutionProofUsage::default(),
         })
     }
 }
@@ -889,12 +1157,15 @@ impl VerifiedPolicySet {
         )?;
         // The executor's signed acknowledgement attests prior acceptance of this
         // exact carrier. Current grants and both live device chains are still checked.
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_signed(receipt)?;
         let admitted = VerifiedExecutionAdmission {
             handoff_hash: wire.hash()?,
             submission: VerifiedAdmission {
                 invocation: wire.invocation.clone(),
                 admitted_at_ms: receipt.payload.issued_at_ms,
             },
+            usage,
         };
         let project_receipt_origin = TransportEvidence::VerifiedPeer {
             origin: wire.invocation.payload.presenter.clone(),
@@ -1199,8 +1470,30 @@ pub struct VerifiedExecutionResolution {
     submission: VerifiedAuthorization,
     dependencies: Vec<PolicyStamp>,
     verified_at_ms: u64,
+    usage: ExecutionProofUsage,
 }
 impl VerifiedExecutionResolution {
+    pub fn with_admission_checkpoint(
+        mut self,
+        receipt: &Signed<ExecutionHandoffAdmissionReceipt>,
+        admission: &ExecutionHandoffFreshness,
+        transport: &StoredTransport,
+        admitted_at_ms: u64,
+    ) -> Result<Self> {
+        let checkpoint = verify_execution_handoff_admission_checkpoint(
+            &self.wire.resolution.observation.handoff,
+            receipt,
+            admission,
+            transport,
+            admitted_at_ms,
+        )?;
+        self.usage.merge(&checkpoint.usage);
+        self.usage.enforce_limits()?;
+        Ok(self)
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
     pub fn wire(&self) -> &SignedExecutionHandoffResolution {
         &self.wire
     }
@@ -1458,6 +1751,17 @@ impl VerifiedPolicySet {
             dependencies.len() <= MAX_POLICY_DOMAINS,
             "resolution has too many policy domains",
         )?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_authorization(resolver)?;
+        usage.record_authorization(&submission)?;
+        usage.record_admission(&wire.resolution.account_admission)?;
+        usage.record_signed(&wire.resolution.observation.receipt)?;
+        usage.record_signed(&wire.invocation)?;
+        usage.record_metadata(
+            &serde_json::json!({"version":wire.resolution.version,"purpose":wire.resolution.purpose,
+            "result_hash":ObjectHash::body(&wire.resolution.observation.result)?}),
+        )?;
+        usage.enforce_limits()?;
         Ok(VerifiedExecutionResolution {
             wire: wire.clone(),
             hash,
@@ -1465,6 +1769,7 @@ impl VerifiedPolicySet {
             submission,
             dependencies: dependencies.into_values().collect(),
             verified_at_ms: now_ms,
+            usage,
         })
     }
 
@@ -1529,6 +1834,10 @@ impl VerifiedPolicySet {
             validate_window(receipt.issued_at_ms, receipt.expires_at_ms, now_ms)?;
             expiry = expiry.min(receipt.expires_at_ms);
         }
+        let mut usage = value.usage.clone();
+        usage.record_budget(&budget)?;
+        usage.record_metadata(challenge)?;
+        usage.enforce_limits()?;
         Ok(expiry)
     }
 
@@ -1641,6 +1950,8 @@ pub struct ExecutionProofUsage {
     metadata: BTreeMap<ObjectHash, usize>,
     signatures: BTreeSet<ObjectHash>,
     max_chain_depth: usize,
+    historical_wrappers: BTreeMap<ObjectHash, usize>,
+    task_payloads: BTreeMap<ObjectHash, usize>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ExecutionProofCounts {
@@ -1648,6 +1959,9 @@ pub struct ExecutionProofCounts {
     pub unique_signed_objects: usize,
     pub unique_signatures: usize,
     pub max_chain_depth: usize,
+    pub historical_wrappers: usize,
+    pub historical_wrapper_bytes: usize,
+    pub task_payload_bytes: usize,
 }
 impl ExecutionProofUsage {
     pub fn merge(&mut self, other: &Self) {
@@ -1665,6 +1979,18 @@ impl ExecutionProofUsage {
         );
         self.signatures.extend(other.signatures.iter().cloned());
         self.max_chain_depth = self.max_chain_depth.max(other.max_chain_depth);
+        self.historical_wrappers.extend(
+            other
+                .historical_wrappers
+                .iter()
+                .map(|(hash, size)| (hash.clone(), *size)),
+        );
+        self.task_payloads.extend(
+            other
+                .task_payloads
+                .iter()
+                .map(|(hash, size)| (hash.clone(), *size)),
+        );
     }
     pub fn record_authorization(&mut self, auth: &VerifiedAuthorization) -> Result<()> {
         self.record_budget(&auth.budget)?;
@@ -1698,7 +2024,22 @@ impl ExecutionProofUsage {
             .insert(ObjectHash::body(value)?, canonical(value)?.len());
         Ok(())
     }
+    fn record_historical_wrapper<T: SignedObject>(&mut self, value: &Signed<T>) -> Result<()> {
+        let hash = value.hash()?;
+        let size = canonical(value)?.len();
+        self.historical_wrappers.insert(hash.clone(), size);
+        self.metadata.insert(hash, size);
+        Ok(())
+    }
     pub fn record_admission(&mut self, proof: &AdmissionProof) -> Result<()> {
+        self.record_admission_kind(proof, false)
+    }
+    fn record_admission_kind(&mut self, proof: &AdmissionProof, checkpointed: bool) -> Result<()> {
+        require(
+            proof.receipts.len() <= MAX_POLICY_DOMAINS
+                && proof.challenge.policies.len() <= MAX_POLICY_DOMAINS,
+            "too many historical admission items",
+        )?;
         let mut source = proof.source_body.clone();
         if source["method"] == "create_task" {
             for field in ["title", "goal", "acceptance"] {
@@ -1707,6 +2048,8 @@ impl ExecutionProofUsage {
                     .ok_or(AuthorizationError::InvalidProof(
                         "invalid typed task payload",
                     ))?;
+                self.task_payloads
+                    .insert(ObjectHash::body(&value)?, value.len());
                 source[field] = serde_json::json!({"payload_hash":ObjectHash::body(&value)?,"utf8_bytes":value.len()});
             }
         }
@@ -1739,14 +2082,21 @@ impl ExecutionProofUsage {
             let observation: ExecutionHandoffResult =
                 serde_json::from_value(source["execution_observation"].clone())
                     .map_err(invalid_shape)?;
-            self.record_handoff(&observation.handoff)?;
+            self.record_historical_handoff(&observation.handoff)?;
             self.record_signed(&observation.receipt)?;
             source["execution_observation"] =
                 serde_json::json!({"observation_hash":ObjectHash::body(&observation)?});
         }
-        self.record_signed(&proof.invocation)?;
-        for receipt in &proof.receipts {
-            self.record_signed(receipt)?;
+        if checkpointed {
+            self.record_historical_wrapper(&proof.invocation)?;
+            for receipt in &proof.receipts {
+                self.record_historical_wrapper(receipt)?;
+            }
+        } else {
+            self.record_signed(&proof.invocation)?;
+            for receipt in &proof.receipts {
+                self.record_signed(receipt)?;
+            }
         }
         self.record_metadata(&serde_json::json!({"source_body_hash":ObjectHash::body(&proof.source_body)?,"source_metadata":source,
             "challenge":proof.challenge,"admitted_at_ms":proof.admitted_at_ms,"transport":proof.transport}))
@@ -1779,7 +2129,7 @@ impl ExecutionProofUsage {
                 "capsule event has no original admission",
             ));
         };
-        self.record_admission(admission)?;
+        self.record_admission_kind(admission, true)?;
         let metadata = serde_json::json!({"hash":envelope.hash,"signature":envelope.signature,"version":event.version,
             "space_id":event.network_id,"scope_id":event.scope_id,"resource_id":event.resource_id,"author":event.author,
             "sequence":event.sequence,"previous":event.previous,"parents":event.parents,"created_at_ms":event.created_at_ms,
@@ -1795,33 +2145,77 @@ impl ExecutionProofUsage {
         Ok(())
     }
     pub fn record_handoff(&mut self, wire: &SignedExecutionHandoff) -> Result<()> {
-        self.record_event(&wire.handoff.task_creation)?;
-        self.record_event(&wire.handoff.project_dispatch)?;
         self.record_signed(&wire.invocation)?;
-        if let Some(source) = &wire.handoff.source_attestation {
+        self.record_capsule(&wire.handoff)
+    }
+    fn record_capsule(&mut self, handoff: &ExecutionHandoff) -> Result<()> {
+        self.record_event(&handoff.task_creation)?;
+        self.record_event(&handoff.project_dispatch)?;
+        if let Some(source) = &handoff.source_attestation {
             self.record_signed(source)?;
         }
-        for origin in [&wire.handoff.sdk_origin, &wire.handoff.task_sdk_origin]
-            .into_iter()
-            .flatten()
-        {
-            self.record_signed(&origin.invocation)?;
+        for (current, origin) in [
+            (true, &handoff.sdk_origin),
+            (false, &handoff.task_sdk_origin),
+        ] {
+            let Some(origin) = origin else { continue };
+            require(
+                origin.receipts.len() <= MAX_POLICY_DOMAINS
+                    && origin.challenge.policies.len() <= MAX_POLICY_DOMAINS,
+                "too many historical SDK origin items",
+            )?;
+            if current {
+                self.record_signed(&origin.invocation)?;
+            } else {
+                self.record_historical_wrapper(&origin.invocation)?;
+            }
             for receipt in &origin.receipts {
-                self.record_signed(receipt)?;
+                self.record_historical_wrapper(receipt)?;
             }
             self.record_metadata(&serde_json::json!({"message_event":origin.message_event,"sdk_trigger":origin.sdk_trigger,
                 "challenge":origin.challenge,"admitted_at_ms":origin.admitted_at_ms,"transport":origin.transport}))?;
         }
-        self.record_metadata(&serde_json::json!({"version":wire.handoff.version,"execution_resource":wire.handoff.execution_resource,
-            "execution_audience":wire.handoff.execution_audience,"target_public_key":wire.handoff.target_public_key}))
+        self.record_metadata(&serde_json::json!({"version":handoff.version,"execution_resource":handoff.execution_resource,
+            "execution_audience":handoff.execution_audience,"target_public_key":handoff.target_public_key}))
+    }
+    pub fn record_historical_handoff(&mut self, wire: &SignedExecutionHandoff) -> Result<()> {
+        let mut historical = Self::default();
+        historical.record_handoff(wire)?;
+        self.historical_wrappers.extend(
+            historical
+                .objects
+                .iter()
+                .map(|(hash, size)| (hash.clone(), *size)),
+        );
+        self.historical_wrappers
+            .extend(historical.historical_wrappers);
+        self.task_payloads.extend(historical.task_payloads);
+        self.record_metadata(wire)
     }
     pub fn counts(&self) -> ExecutionProofCounts {
         ExecutionProofCounts {
             authorization_bytes: self.objects.values().sum::<usize>()
-                + self.metadata.values().sum::<usize>(),
+                + self
+                    .metadata
+                    .iter()
+                    .filter(|(hash, _)| !self.objects.contains_key(*hash))
+                    .map(|(_, size)| *size)
+                    .sum::<usize>(),
             unique_signed_objects: self.objects.len(),
             unique_signatures: self.signatures.len(),
             max_chain_depth: self.max_chain_depth,
+            historical_wrappers: self
+                .historical_wrappers
+                .keys()
+                .filter(|hash| !self.objects.contains_key(*hash))
+                .count(),
+            historical_wrapper_bytes: self
+                .historical_wrappers
+                .iter()
+                .filter(|(hash, _)| !self.objects.contains_key(*hash))
+                .map(|(_, size)| *size)
+                .sum(),
+            task_payload_bytes: self.task_payloads.values().sum(),
         }
     }
     pub fn enforce_limits(&self) -> Result<()> {
