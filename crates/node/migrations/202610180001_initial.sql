@@ -83,9 +83,11 @@ CREATE UNIQUE INDEX `resource_records_hash` ON `resource_records` (`space_id`, `
 -- Create "policy_nonces" table
 CREATE TABLE `policy_nonces` (`domain_kind` text NOT NULL, `domain_id` text NOT NULL, `nonce` text NOT NULL, `entry_hash` text NOT NULL, PRIMARY KEY (`domain_kind`, `domain_id`, `nonce`), CONSTRAINT `policy_nonces_entry` FOREIGN KEY (`entry_hash`) REFERENCES `policy_journal` (`entry_hash`), CONSTRAINT `policy_nonces_kind` CHECK (domain_kind IN ('account', 'space')));
 -- Create "passkey_pending" table
-CREATE TABLE `passkey_pending` (`account_id` text NOT NULL, `envelope_hash` text NOT NULL, `nonce` text NOT NULL, `pending` text NOT NULL, `expires_at_ms` integer NOT NULL, PRIMARY KEY (`account_id`, `envelope_hash`), CONSTRAINT `passkey_pending_expiry` CHECK (expires_at_ms >= 0));
+CREATE TABLE `passkey_pending` (`account_id` text NOT NULL, `envelope_hash` text NOT NULL, `intent_hash` text NOT NULL, `nonce` text NOT NULL, `pending` text NOT NULL, `expires_at_ms` integer NOT NULL, PRIMARY KEY (`account_id`, `envelope_hash`), CONSTRAINT `passkey_pending_expiry` CHECK (expires_at_ms >= 0));
 -- Create index "passkey_pending_account_nonce" to table: "passkey_pending"
 CREATE UNIQUE INDEX `passkey_pending_account_nonce` ON `passkey_pending` (`account_id`, `nonce`);
+-- Create index "passkey_pending_account_intent" to table: "passkey_pending"
+CREATE UNIQUE INDEX `passkey_pending_account_intent` ON `passkey_pending` (`account_id`, `intent_hash`);
 -- Create "passkey_authenticators" table
 CREATE TABLE `passkey_authenticators` (`account_id` text NOT NULL, `credential_id` text NOT NULL, `rp_id` text NOT NULL, `record_hash` text NOT NULL, `sign_count` integer NOT NULL, `backup_state` integer NOT NULL, `last_envelope_hash` text NOT NULL, PRIMARY KEY (`account_id`, `credential_id`), CONSTRAINT `passkey_authenticators_pending` FOREIGN KEY (`account_id`, `last_envelope_hash`) REFERENCES `passkey_pending` (`account_id`, `envelope_hash`), CONSTRAINT `passkey_authenticators_counter` CHECK (sign_count BETWEEN 0 AND 4294967295), CONSTRAINT `passkey_authenticators_backup` CHECK (backup_state IN (0, 1)));
 -- Create index "passkey_authenticators_rp_credential" to table: "passkey_authenticators"

@@ -1009,6 +1009,9 @@ table "passkey_pending" {
   column "envelope_hash" {
     type = text
   }
+  column "intent_hash" {
+    type = text
+  }
   column "nonce" {
     type = text
   }
@@ -1024,6 +1027,10 @@ table "passkey_pending" {
   index "passkey_pending_account_nonce" {
     unique = true
     columns = [column.account_id, column.nonce]
+  }
+  index "passkey_pending_account_intent" {
+    unique = true
+    columns = [column.account_id, column.intent_hash]
   }
   check "passkey_pending_expiry" {
     expr = "expires_at_ms >= 0"
