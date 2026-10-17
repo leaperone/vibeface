@@ -2060,6 +2060,35 @@ impl Store {
         Ok(receipts)
     }
 
+    pub fn authorize_execution_handoff_resolution_fence(
+        &self,
+        auth: &VerifiedExecutionResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+        now_ms: u64,
+    ) -> Result<()> {
+        ensure!(
+            auth.wire().resolution.purpose == ExecutionResolutionPurpose::ResolveUnknown,
+            "only an explicit unknown resolution can fence execution"
+        );
+        resolution_original_observation_from(&self.connection, &self.policy, auth.wire())?;
+        check_policy_heads_in(
+            &self.connection,
+            self.policy.verified(),
+            auth.resolver(),
+            now_ms,
+        )?;
+        check_policy_heads_in(
+            &self.connection,
+            self.policy.verified(),
+            auth.submission(),
+            now_ms,
+        )?;
+        self.policy
+            .verified()
+            .verify_execution_resolution_freshness(auth, proof, now_ms)?;
+        verify_resolution_challenge_record(&self.connection, auth.wire(), proof, false)
+    }
+
     pub fn authorize_execution_handoff_terminal_reconciliation(
         &self,
         auth: &VerifiedExecutionResolution,
@@ -3080,7 +3109,7 @@ mod tests {
                 "session_id":"same-session","outcome":outcome,"evidence":"verified stopped process and external side effects",
                 "execution_resource":self.wire.handoff.execution_resource,"target_public_key":self.wire.handoff.target_public_key,
                 "execution_grant":carrier_grant.hash()?,"original_handoff_hash":self.wire.hash()?,
-                "original_body_hash":original.invocation.payload.body_hash,"unknown_receipt_hash":observation.receipt.hash()?});
+                "original_body_hash":original.invocation.payload.body_hash,"unknown_receipt_hash":observation.receipt.hash()?,"execution_observation":observation});
             let mut account = original.invocation.payload.clone();
             account.actor = Actor::Account(self.executor.account.clone());
             account.initiator = account.actor.clone();
@@ -3499,8 +3528,34 @@ mod tests {
         let wire = fixture.resolution(ExecutionResolutionPurpose::ResolveUnknown)?;
         let proof = fixture.resolution_freshness(&wire, now() + 55)?;
         let stopped = fixture.fence("original-operation").await?;
+        let auth = fixture.store.execution_handoff_resolution_authorization(
+            &wire,
+            &fixture.transport,
+            now() + 56,
+        )?;
         let mut missing = proof.clone();
         missing.receipts.pop();
+        let before = fixture.store.connection.total_changes();
+        assert!(
+            fixture
+                .store
+                .authorize_execution_handoff_resolution_fence(&auth, &missing, now() + 56)
+                .is_err()
+        );
+        fixture
+            .store
+            .authorize_execution_handoff_resolution_fence(&auth, &proof, now() + 56)?;
+        assert!(
+            fixture
+                .store
+                .authorize_execution_handoff_resolution_fence(
+                    &auth,
+                    &proof,
+                    proof.challenge.expires_at_ms
+                )
+                .is_err()
+        );
+        assert_eq!(before, fixture.store.connection.total_changes());
         let before = fixture.store.connection.total_changes();
         assert!(
             fixture

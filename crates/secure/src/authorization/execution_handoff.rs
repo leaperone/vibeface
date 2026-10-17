@@ -1060,6 +1060,7 @@ pub fn execution_resolution_account_facts(
                     | "original_body_hash"
                     | "unknown_receipt_hash"
                     | "resolution_purpose"
+                    | "execution_observation"
             )
         }),
         "resolution cannot disclose unrelated fields",
@@ -1082,6 +1083,8 @@ pub fn execution_resolution_account_facts(
             }
         }) && body["resolution_purpose"]
             == serde_json::to_value(value.purpose).map_err(invalid_shape)?
+            && body["execution_observation"]
+                == serde_json::to_value(&value.observation).map_err(invalid_shape)?
             && unknown.receipt.payload.issued_at_ms <= proof.admitted_at_ms
             && matches!(proof.invocation.payload.actor, Actor::Account(_))
             && proof.invocation.payload.context.sdk_session.is_none()
@@ -1629,5 +1632,207 @@ impl VerifiedPolicySet {
         )?;
         self.verify_execution_resolution_freshness(&authorization, &result.freshness, now_ms)?;
         Ok(VerifiedExecutionTerminalReconciliation { authorization })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExecutionProofUsage {
+    objects: BTreeMap<ObjectHash, usize>,
+    metadata: BTreeMap<ObjectHash, usize>,
+    signatures: BTreeSet<ObjectHash>,
+    max_chain_depth: usize,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct ExecutionProofCounts {
+    pub authorization_bytes: usize,
+    pub unique_signed_objects: usize,
+    pub unique_signatures: usize,
+    pub max_chain_depth: usize,
+}
+impl ExecutionProofUsage {
+    pub fn merge(&mut self, other: &Self) {
+        self.objects.extend(
+            other
+                .objects
+                .iter()
+                .map(|(hash, size)| (hash.clone(), *size)),
+        );
+        self.metadata.extend(
+            other
+                .metadata
+                .iter()
+                .map(|(hash, size)| (hash.clone(), *size)),
+        );
+        self.signatures.extend(other.signatures.iter().cloned());
+        self.max_chain_depth = self.max_chain_depth.max(other.max_chain_depth);
+    }
+    pub fn record_authorization(&mut self, auth: &VerifiedAuthorization) -> Result<()> {
+        self.record_budget(&auth.budget)?;
+        self.max_chain_depth = self.max_chain_depth.max(auth.grant_path().len());
+        Ok(())
+    }
+    fn record_budget(&mut self, budget: &Budget) -> Result<()> {
+        for (hash, size) in &budget.object_bytes {
+            self.objects.insert(hash.clone(), *size);
+        }
+        for signature in &budget.signatures {
+            self.signatures.insert(ObjectHash::body(signature)?);
+        }
+        self.signatures
+            .extend(budget.external_signatures.iter().cloned());
+        Ok(())
+    }
+    pub fn record_signed<T: SignedObject>(&mut self, value: &Signed<T>) -> Result<()> {
+        self.objects.insert(value.hash()?, canonical(value)?.len());
+        let message_hash = value.hash()?;
+        self.signatures.insert(ObjectHash::body(&(
+            &value.issuer,
+            T::DOMAIN,
+            message_hash,
+            &value.signature,
+        ))?);
+        Ok(())
+    }
+    pub fn record_metadata<T: Serialize>(&mut self, value: &T) -> Result<()> {
+        self.metadata
+            .insert(ObjectHash::body(value)?, canonical(value)?.len());
+        Ok(())
+    }
+    pub fn record_admission(&mut self, proof: &AdmissionProof) -> Result<()> {
+        let mut source = proof.source_body.clone();
+        if source["method"] == "create_task" {
+            for field in ["title", "goal", "acceptance"] {
+                let value = source[field]
+                    .as_str()
+                    .ok_or(AuthorizationError::InvalidProof(
+                        "invalid typed task payload",
+                    ))?;
+                source[field] = serde_json::json!({"payload_hash":ObjectHash::body(&value)?,"utf8_bytes":value.len()});
+            }
+        }
+        if source["method"] == "operate" {
+            if matches!(
+                source["request"]["action"]["type"].as_str(),
+                Some("send" | "steer")
+            ) {
+                let text = source["request"]["action"]["text"].as_str().ok_or(
+                    AuthorizationError::InvalidProof("invalid typed execution text"),
+                )?;
+                source["request"]["action"]["text"] = serde_json::json!({"payload_hash":ObjectHash::body(&text)?,"utf8_bytes":text.len()});
+            }
+            let binding: SignedBinding =
+                serde_json::from_value(source["request"]["binding"].clone())
+                    .map_err(invalid_shape)?;
+            self.record_binding(&binding)?;
+            source["request"]["binding"] =
+                serde_json::json!({"signed_binding_hash":ObjectHash::body(&binding)?});
+            if !source["execution_session_receipt"].is_null() {
+                let receipt: Signed<ExecutionHandoffReceipt> =
+                    serde_json::from_value(source["execution_session_receipt"].clone())
+                        .map_err(invalid_shape)?;
+                self.record_signed(&receipt)?;
+                source["execution_session_receipt"] =
+                    serde_json::json!({"signed_receipt_hash":receipt.hash()?});
+            }
+        }
+        if source["method"] == "resolve_unknown" && !source["execution_observation"].is_null() {
+            let observation: ExecutionHandoffResult =
+                serde_json::from_value(source["execution_observation"].clone())
+                    .map_err(invalid_shape)?;
+            self.record_handoff(&observation.handoff)?;
+            self.record_signed(&observation.receipt)?;
+            source["execution_observation"] =
+                serde_json::json!({"observation_hash":ObjectHash::body(&observation)?});
+        }
+        self.record_signed(&proof.invocation)?;
+        for receipt in &proof.receipts {
+            self.record_signed(receipt)?;
+        }
+        self.record_metadata(&serde_json::json!({"source_body_hash":ObjectHash::body(&proof.source_body)?,"source_metadata":source,
+            "challenge":proof.challenge,"admitted_at_ms":proof.admitted_at_ms,"transport":proof.transport}))
+    }
+    pub fn record_binding(&mut self, binding: &SignedBinding) -> Result<()> {
+        let hash = ObjectHash::body(binding)?;
+        self.objects.insert(hash.clone(), canonical(binding)?.len());
+        self.signatures.insert(ObjectHash::body(&(
+            BINDING_DOMAIN,
+            &binding.binding.authority_node,
+            binding_hash(&binding.binding).map_err(invalid_shape)?,
+            &binding.signature,
+        ))?);
+        if let Some(seal) = &binding.binding.previous_seal {
+            self.objects
+                .insert(ObjectHash::body(seal)?, canonical(seal)?.len());
+            self.signatures.insert(ObjectHash::body(&(
+                SEAL_DOMAIN,
+                &seal.seal.target_node,
+                ObjectHash::body(&seal.seal)?,
+                &seal.signature,
+            ))?);
+        }
+        Ok(())
+    }
+    pub fn record_event(&mut self, envelope: &SignedEvent) -> Result<()> {
+        let event: Event = serde_json::from_str(&envelope.canonical_body).map_err(invalid_shape)?;
+        let EventCause::Invocation { admission } = &event.cause else {
+            return Err(AuthorizationError::InvalidProof(
+                "capsule event has no original admission",
+            ));
+        };
+        self.record_admission(admission)?;
+        let metadata = serde_json::json!({"hash":envelope.hash,"signature":envelope.signature,"version":event.version,
+            "space_id":event.network_id,"scope_id":event.scope_id,"resource_id":event.resource_id,"author":event.author,
+            "sequence":event.sequence,"previous":event.previous,"parents":event.parents,"created_at_ms":event.created_at_ms,
+            "admission_hash":ObjectHash::body(admission)?,"body_hash":ObjectHash::body(&event.body)?});
+        self.objects
+            .insert(ObjectHash::body(&metadata)?, canonical(&metadata)?.len());
+        self.signatures.insert(ObjectHash::body(&(
+            "vibeface:event:v2",
+            &event.author,
+            &envelope.hash,
+            &envelope.signature,
+        ))?);
+        Ok(())
+    }
+    pub fn record_handoff(&mut self, wire: &SignedExecutionHandoff) -> Result<()> {
+        self.record_event(&wire.handoff.task_creation)?;
+        self.record_event(&wire.handoff.project_dispatch)?;
+        self.record_signed(&wire.invocation)?;
+        if let Some(source) = &wire.handoff.source_attestation {
+            self.record_signed(source)?;
+        }
+        for origin in [&wire.handoff.sdk_origin, &wire.handoff.task_sdk_origin]
+            .into_iter()
+            .flatten()
+        {
+            self.record_signed(&origin.invocation)?;
+            for receipt in &origin.receipts {
+                self.record_signed(receipt)?;
+            }
+            self.record_metadata(&serde_json::json!({"message_event":origin.message_event,"sdk_trigger":origin.sdk_trigger,
+                "challenge":origin.challenge,"admitted_at_ms":origin.admitted_at_ms,"transport":origin.transport}))?;
+        }
+        self.record_metadata(&serde_json::json!({"version":wire.handoff.version,"execution_resource":wire.handoff.execution_resource,
+            "execution_audience":wire.handoff.execution_audience,"target_public_key":wire.handoff.target_public_key}))
+    }
+    pub fn counts(&self) -> ExecutionProofCounts {
+        ExecutionProofCounts {
+            authorization_bytes: self.objects.values().sum::<usize>()
+                + self.metadata.values().sum::<usize>(),
+            unique_signed_objects: self.objects.len(),
+            unique_signatures: self.signatures.len(),
+            max_chain_depth: self.max_chain_depth,
+        }
+    }
+    pub fn enforce_limits(&self) -> Result<()> {
+        let counts = self.counts();
+        if counts.authorization_bytes > MAX_PROOF_BYTES
+            || counts.unique_signed_objects > MAX_PROOF_OBJECTS
+            || counts.unique_signatures > MAX_PROOF_SIGNATURES
+            || counts.max_chain_depth > MAX_DELEGATION_DEPTH
+        {
+            return Err(AuthorizationError::BudgetExceeded);
+        }
+        Ok(())
     }
 }
