@@ -274,6 +274,7 @@ pub fn prepare_account_creation(
                 revoked_devices: vec![],
                 authenticators: vec![],
                 authenticator_approval: None,
+                device_enrollment: None,
                 root_acceptance: None,
                 recovery_approvals: vec![],
             },

@@ -7,6 +7,7 @@ pub use authenticator_management::{
 };
 pub mod bootstrap;
 pub mod directory;
+pub mod enrollment;
 pub mod projection;
 pub mod services;
 use crate::{Identity, membership::canonical_json};
@@ -373,6 +374,7 @@ pub struct AccountDocument {
     pub revoked_devices: Vec<DeviceId>,
     pub authenticators: Vec<ObjectHash>,
     pub authenticator_approval: Option<AuthenticatorPolicyApproval>,
+    pub device_enrollment: Option<enrollment::PasskeyEnrollmentProof>,
     pub root_acceptance: Option<Signature>,
     pub recovery_approvals: Vec<KeyApproval>,
 }
@@ -1254,7 +1256,8 @@ impl VerifiedPolicySet {
                 && d.revoked_devices.is_empty()
                 && d.enrollment.is_empty()
                 && d.authenticators.is_empty()
-                && d.authenticator_approval.is_none(),
+                && d.authenticator_approval.is_none()
+                && d.device_enrollment.is_none(),
             "invalid account genesis",
         )?;
         self.validate_account(d)?;
@@ -1334,6 +1337,12 @@ impl VerifiedPolicySet {
         self.validate_authenticator_registration(d)?;
         let ordinary_device = signed.issuer != previous.current_root
             && !previous.recovery.keys.contains(&signed.issuer);
+        if d.device_enrollment.is_some() && d.device_enrollment != previous.device_enrollment {
+            require(
+                ordinary_device,
+                "passkey enrollment must be signed by its new device",
+            )?;
+        }
         if ordinary_device {
             self.authorize_account_delta(
                 &signed,
@@ -1396,6 +1405,18 @@ impl VerifiedPolicySet {
             )?;
         }
         let stamp = account_stamp(&signed)?;
+        let enrolled = if signed.payload.device_enrollment != previous.device_enrollment {
+            signed
+                .payload
+                .device_enrollment
+                .as_ref()
+                .map(|proof| proof.certificate.clone())
+        } else {
+            None
+        };
+        let enrolled = enrolled
+            .map(|certificate| certificate.hash().map(|hash| (hash, certificate)))
+            .transpose()?;
         self.roots
             .insert(stamp.clone(), signed.payload.current_root.clone());
         let state = self
@@ -1404,6 +1425,9 @@ impl VerifiedPolicySet {
             .ok_or(AuthorizationError::PolicyConflict)?;
         state.history.push(signed);
         state.stamp = stamp.clone();
+        if let Some((hash, certificate)) = enrolled {
+            self.devices.insert(hash, certificate);
+        }
         Ok(stamp)
     }
     pub fn trust_space_genesis(
@@ -1901,6 +1925,12 @@ impl VerifiedPolicySet {
                 d.enrollment_grant.is_none(),
                 "account enrollment uses account rights",
             )?;
+            let (registered, revoked) = self.active_device_hashes(&d.owner)?;
+            if registered.contains(&signed.hash()?) && !revoked.contains(&d.device) {
+                budget.dependencies.extend(dependencies.clone());
+                visiting.remove(&d.device);
+                return Ok(());
+            }
             let issuer_device = DeviceId::from_key(&signed.issuer);
             let issuer = self.find_device(&issuer_device)?;
             require(
@@ -2757,6 +2787,7 @@ mod tests {
                     revoked_devices: vec![],
                     authenticators: vec![],
                     authenticator_approval: None,
+                    device_enrollment: None,
                     root_acceptance: None,
                     recovery_approvals: vec![],
                 },
@@ -4080,7 +4111,7 @@ mod tests {
         );
     }
     #[test]
-    fn grant_chain_hits_signature_budget_before_object_or_depth_limit() {
+    fn grant_chain_shares_signature_budget_with_other_proofs() {
         let mut f = Fixture::new();
         let mut actors = vec![];
         for i in 0..8 {
@@ -4178,17 +4209,39 @@ mod tests {
                 .unwrap()
                 .clone();
             grant.nonce = Nonce::from_bytes([80 + index as u8; 32]);
-            let result = f.state.install_grant(
-                Signed::sign(grant.clone(), &actors[index - 1].1).unwrap(),
-                NOW,
-            );
-            if index == 7 {
-                assert_eq!(result.unwrap_err(), AuthorizationError::BudgetExceeded);
-            } else {
-                parent = result.unwrap();
-                f.update_space(|d| d.grants.push(parent.clone()));
-            }
+            parent = f
+                .state
+                .install_grant(
+                    Signed::sign(grant.clone(), &actors[index - 1].1).unwrap(),
+                    NOW,
+                )
+                .unwrap();
+            f.update_space(|d| d.grants.push(parent.clone()));
         }
+        let path = f.state.grant_chain(Some(&parent)).unwrap();
+        assert_eq!(path.len(), MAX_DELEGATION_DEPTH);
+        let mut budget = Budget::default();
+        let mut dependencies = BTreeMap::new();
+        for (account, _) in actors.iter().take(6) {
+            let device = &f.state.account(account).unwrap().enrollment[0].device;
+            f.state
+                .validate_certificate(
+                    f.state.find_device(device).unwrap(),
+                    NOW,
+                    &mut budget,
+                    &mut dependencies,
+                    &mut BTreeSet::new(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            f.state
+                .verify_grant_path(&path, NOW, &mut budget, &mut dependencies, true)
+                .unwrap_err(),
+            AuthorizationError::BudgetExceeded
+        );
+        assert_eq!(budget.signatures.len(), MAX_PROOF_SIGNATURES);
+        assert!(budget.objects.len() < MAX_PROOF_OBJECTS);
     }
 
     #[test]
@@ -4947,6 +5000,11 @@ impl VerifiedPolicySet {
         budget: &mut Budget,
     ) -> Result<()> {
         let d = &signed.payload;
+        if let Some(proof) = &d.device_enrollment {
+            if previous.device_enrollment.as_ref() != Some(proof) {
+                return enrollment::authorize_passkey_delta(self, signed, previous, at, budget);
+            }
+        }
         self.authorize_authenticator_delta(signed, previous, at, budget)?;
         let device = DeviceId::from_key(&signed.issuer);
         let certificate = self.find_device(&device)?;
@@ -4982,6 +5040,26 @@ impl VerifiedPolicySet {
             !removals || authority.rights.contains(&AccountRight::RevokeDevice),
             "governor lacks device revocation right",
         )?;
+        require(
+            !additions.is_empty() || removals || d.authenticators != previous.authenticators,
+            "empty account device change",
+        )?;
+        let newly_revoked: Vec<_> = d
+            .revoked_devices
+            .iter()
+            .filter(|id| !previous.revoked_devices.contains(id))
+            .collect();
+        for device in &newly_revoked {
+            require(
+                previous.devices.iter().any(|hash| {
+                    self.devices
+                        .get(hash)
+                        .is_some_and(|c| &c.payload.device == *device)
+                }),
+                "revocation requires a current device",
+            )?;
+        }
+        let mut new_devices = BTreeMap::new();
         for hash in additions {
             let certificate = self
                 .devices
@@ -4997,12 +5075,59 @@ impl VerifiedPolicySet {
                 &mut BTreeSet::new(),
             )?;
             require(
-                self.devices
-                    .get(hash)
-                    .is_some_and(|c| c.issuer == signed.issuer),
+                certificate.issuer == signed.issuer
+                    && certificate.payload.issued_under
+                        == *self
+                            .head(&PolicyDomain::Account(d.account.clone()))
+                            .ok_or(AuthorizationError::PolicyConflict)?
+                    && !previous.devices.iter().any(|old| {
+                        self.devices
+                            .get(old)
+                            .is_some_and(|c| c.payload.device == certificate.payload.device)
+                    })
+                    && !previous
+                        .revoked_devices
+                        .contains(&certificate.payload.device),
                 "governor cannot register another issuer certificate",
             )?;
+            new_devices.insert(certificate.payload.device.clone(), &certificate.payload);
         }
+        let mut enrollment: Vec<_> = previous
+            .enrollment
+            .iter()
+            .filter(|entry| !newly_revoked.contains(&&entry.device))
+            .cloned()
+            .collect();
+        for entry in &d.enrollment {
+            if previous.enrollment.iter().any(|old| old == entry) {
+                continue;
+            }
+            let certificate =
+                new_devices
+                    .get(&entry.device)
+                    .ok_or(AuthorizationError::InvalidProof(
+                        "delegation requires a new device certificate",
+                    ))?;
+            require(
+                certificate.subject == Actor::Account(d.account.clone())
+                    && entry
+                        .rights
+                        .iter()
+                        .all(|right| authority.rights.contains(right))
+                    && entry.expires_at_ms > at
+                    && entry.expires_at_ms <= authority.expires_at_ms
+                    && entry.expires_at_ms <= certificate.expires_at_ms
+                    && (!entry.rights.contains(&AccountRight::EnrollDevice)
+                        || certificate.uses.contains(&DeviceUse::EnrollDevice)),
+                "delegated enrollment rights exceed current manager authority",
+            )?;
+            enrollment.push(entry.clone());
+        }
+        enrollment.sort_by(|a, b| a.device.cmp(&b.device));
+        require(
+            d.enrollment == enrollment,
+            "enrollment rights require explicit new-device delegation or revocation",
+        )?;
         let mut expected = previous.clone();
         expected.previous = d.previous.clone();
         expected.sequence = d.sequence;
@@ -5010,6 +5135,8 @@ impl VerifiedPolicySet {
         expected.revoked_devices = d.revoked_devices.clone();
         expected.authenticators = d.authenticators.clone();
         expected.authenticator_approval = d.authenticator_approval.clone();
+        expected.enrollment = enrollment;
+        expected.device_enrollment = None;
         require(
             *d == expected,
             "account device changed root-controlled policy",

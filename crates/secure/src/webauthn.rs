@@ -1344,6 +1344,7 @@ pub(crate) mod tests {
             revoked_devices: vec![],
             authenticators: vec![],
             authenticator_approval: None,
+            device_enrollment: None,
             root_acceptance: None,
             recovery_approvals: vec![],
         };

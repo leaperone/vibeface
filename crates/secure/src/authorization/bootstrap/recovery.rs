@@ -362,6 +362,7 @@ pub fn prepare_account_recovery(
         recovered.enrollment.clear();
         recovered.authenticators.clear();
         recovered.authenticator_approval = None;
+        recovered.device_enrollment = None;
         recovered.root_acceptance = None;
         recovered.recovery_approvals.clear();
         recovered.approve_recovery(&recovery)?;
