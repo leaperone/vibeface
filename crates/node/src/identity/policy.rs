@@ -184,7 +184,9 @@ pub(crate) fn request_facts_from(
                             "task creation reference mismatch"
                         );
                     }
-                    creation = Some(ObjectHash::body(&envelope)?);
+                    creation = Some(vibeface_secure::authorization::EventRef::parse(
+                        &envelope.hash,
+                    )?);
                 }
             }
             context.task = Some(creation.context("task creation is missing")?);

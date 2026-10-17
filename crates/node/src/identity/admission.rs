@@ -441,7 +441,9 @@ fn persisted_admission_facts(
             if body["task_id"].as_str() == Some(task_id.as_str())),
             "historical task command differs from its task creation"
         );
-        context.task = Some(ObjectHash::body(&source.envelope)?);
+        context.task = Some(vibeface_secure::authorization::EventRef::parse(
+            &source.envelope.hash,
+        )?);
         let (target, session_id, executor) = if method == "seal_execution" {
             let signed: crate::binding::SignedBinding =
                 serde_json::from_value(body["binding"].clone())?;

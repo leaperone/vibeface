@@ -242,7 +242,7 @@ impl Store {
         );
         let admission = consume_authorization_in(
             &tx,
-            self.policy.verified(),
+            &self.policy,
             auth,
             proof,
             transport,
@@ -398,7 +398,7 @@ impl Store {
         };
         consume_authorization_in(
             &tx,
-            self.policy.verified(),
+            &self.policy,
             auth,
             proof,
             transport,
@@ -525,7 +525,7 @@ impl Store {
         current_binding_in(&tx, &old)?;
         consume_authorization_in(
             &tx,
-            self.policy.verified(),
+            &self.policy,
             auth,
             proof,
             transport,

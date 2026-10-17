@@ -618,6 +618,8 @@ mod tests {
                     recovery: recovery.clone(),
                     enrollment: vec![],
                     authenticators: vec![],
+                    authenticator_approval: None,
+                    device_enrollment: None,
                     devices: vec![],
                     revoked_devices: vec![],
                     root_acceptance: None,

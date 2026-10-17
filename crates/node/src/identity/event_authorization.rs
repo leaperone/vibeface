@@ -405,7 +405,9 @@ fn historical_facts(
                 "task creation reference mismatch"
             );
         }
-        context.task = Some(ObjectHash::body(&creation.envelope)?);
+        context.task = Some(vibeface_secure::authorization::EventRef::parse(
+            &creation.envelope.hash,
+        )?);
         task_creation = Some(creation);
     }
     if let Some(request) = request {
@@ -1578,7 +1580,10 @@ mod tests {
             &dependency_closure(&event, &events)?.unwrap(),
         )?
         .unwrap();
-        assert_eq!(facts.context.task, Some(ObjectHash::body(&task)?));
+        assert_eq!(
+            facts.context.task,
+            Some(vibeface_secure::authorization::EventRef::parse(&task.hash)?)
+        );
         assert_eq!(
             current_event_authorization(
                 &fixture.policy,

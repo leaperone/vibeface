@@ -95,6 +95,7 @@ fn validate_persisted_state(connection: &Connection) -> Result<()> {
         .collect();
     ensure!(seen == expected, "stored space projection is incomplete");
     crate::identity::policy::validate_resource_projections(connection)?;
+    crate::identity::admission::validate_persisted_authorizations(connection, &policy)?;
     Ok(())
 }
 
@@ -1071,7 +1072,7 @@ impl Store {
         ensure!(ready, "task creation changed before binding");
         crate::identity::admission::consume_authorization_in(
             &tx,
-            self.policy.verified(),
+            &self.policy,
             auth,
             proof,
             transport,
@@ -1582,11 +1583,23 @@ impl Store {
         })
     }
     pub fn recover_running(&mut self) -> Result<usize> {
-        let count = self.connection.execute(
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let count = tx.execute(
             "UPDATE operations SET state='\"unknown\"' WHERE state='\"running\"'",
             [],
         )?;
-        self.connection.execute("UPDATE continuation_claims SET record=json_set(record,'$.state','unknown') WHERE json_extract(record,'$.state')='running'",[])?;
+        tx.execute("UPDATE continuation_claims SET record=json_set(record,'$.state','unknown') WHERE json_extract(record,'$.state')='running'",[])?;
+        tx.execute(
+            "UPDATE local_values SET value=json_set(value,'$.state','unknown') WHERE key GLOB 'scheduler:invocation:*' AND json_extract(value,'$.state')='running'",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE local_values SET value=json_set(value,'$.active.state','unknown','$.native_id',NULL) WHERE key GLOB 'scheduler:session:*' AND json_extract(value,'$.active.state') IN ('running','unknown')",
+            [],
+        )?;
+        tx.commit()?;
         Ok(count)
     }
     pub fn claim_continuation(

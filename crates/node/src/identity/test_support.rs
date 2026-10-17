@@ -311,7 +311,7 @@ impl TestNetwork {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let admission = super::admission::consume_authorization_in(
             &tx,
-            store.policy.verified(),
+            &store.policy,
             &auth,
             &proof,
             &transport,
