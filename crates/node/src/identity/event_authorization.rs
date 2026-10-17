@@ -341,6 +341,7 @@ fn historical_facts(
     let request = (text(body, "method")? == "operate")
         .then(|| serde_json::from_value::<OperationRequest>(body["request"].clone()))
         .transpose()?;
+    let mut resolution_request = None;
     if text(body, "method")? == "resolve_unknown" {
         let mut dispatches = ancestors.iter().filter_map(|hash| {
             let prior = &events[hash].event;
@@ -373,6 +374,7 @@ fn historical_facts(
             original.target_node == crypto::fingerprint(audience_key(state, proof)?.as_str())?,
             "resolution targets another service device"
         );
+        resolution_request = Some(original);
     }
     let mut context = InvocationContext {
         conversation: Some(scope.into()),
@@ -478,6 +480,22 @@ fn historical_facts(
                 return Ok(None);
             }
         }
+    } else if let Some(original) = resolution_request {
+        let binding = original
+            .binding
+            .as_ref()
+            .context("resolved operation has no task binding")?;
+        context.execution_session = Some(SessionRef {
+            target: execution_device(state, proof, &original.target_node)?,
+            session_id: original.session_id,
+        });
+        context.executor_kind = binding.binding.open_spec["executor"]
+            .as_str()
+            .map(str::to_owned);
+        ensure!(
+            context.executor_kind.is_some(),
+            "resolved operation binding has no executor"
+        );
     } else if matches!(text(body, "method")?, "bind_execution" | "rebind_execution") {
         context.execution_session = Some(SessionRef {
             target: execution_device(state, proof, text(body, "target_node")?)?,
