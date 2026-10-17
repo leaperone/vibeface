@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 
 pub mod authorization;
 pub mod membership;
+pub mod webauthn;
 
 mod recovery;
 pub use recovery::{recovery_open, recovery_seal};

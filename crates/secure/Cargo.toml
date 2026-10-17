@@ -10,6 +10,10 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 anyhow.workspace = true
 argon2.workspace = true
+base64 = "0.22"
+coset = "=0.4.2"
+p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa"] }
+url = "2"
 chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 ed25519-dalek.workspace = true
 getrandom = "=0.3.4"
@@ -21,6 +25,10 @@ snow = { version = "=0.10.0", default-features = false, features = ["default-res
 zeroize = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom02 = { package = "getrandom", version = "=0.2.17", features = ["js"] }
 getrandom = { version = "=0.3.4", features = ["wasm_js"] }
 wasm-bindgen = "=0.2.129"
 js-sys = "=0.3.106"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.79"

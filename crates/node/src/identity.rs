@@ -3,6 +3,7 @@
 pub use vibeface_secure::membership::*;
 
 pub mod local;
+pub mod webauthn;
 
 #[cfg(test)]
 mod tests {
