@@ -47,6 +47,9 @@ export function parseNodes(value: unknown): NodeInfo[] {
     }
   })
 }
+export function canSelectScheduler(node: NodeInfo | undefined): node is NodeInfo {
+  return Boolean(node && !node.revoked && node.roles.includes("scheduler") && (!node.online || !node.capabilities || node.capabilities.manager))
+}
 export function parseConversations(value: unknown): ConversationSummary[] {
   return list(record(value).conversations).map(conversation)
 }

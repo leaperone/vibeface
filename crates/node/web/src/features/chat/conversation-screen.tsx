@@ -20,6 +20,7 @@ export function ConversationScreen() {
   const [reportResults, setReportResults] = useState(false)
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
   const text = drafts.get(conversationId) ?? ''
+  const originalEntry = !messagePending || messagePending.entry_node === workspace.info.node_id
   const jobs = data?.scheduler?.jobs ?? []
   const activeJobs = jobs.filter((job) => ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling', 'unknown'].includes(job.state))
   const visibleJobs = activeJobs.length ? activeJobs : jobs.slice(-1)
@@ -27,7 +28,7 @@ export function ConversationScreen() {
   const messages = [...(data?.messages ?? []), ...liveMessages]
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const sendDisabled = !workspace.writable || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
-  const hint = !workspace.connectionOnline ? '正在恢复只读连接。未确认操作保留原编号，不会自动重发。' : messagePending ? '先核对原消息，再发送新内容。' : workspace.writeNotice || composerHint(gate) || (data?.scheduler?.write_frozen ? '旧调用结果待核对，新的消息只允许只读交谈。' : activeJobs.some((job) => ['queued', 'claimed', 'running'].includes(job.state)) ? '可继续发送；新消息会可靠排队，后台任务继续运行。' : '')
+  const hint = !workspace.connectionOnline ? '正在恢复只读连接。未确认操作保留原编号，不会自动重发。' : messagePending ? originalEntry ? '先核对原消息，再发送新内容。' : '原消息尚未确认，请回原入口核对或重试；当前入口可只读查看进展。' : workspace.writeNotice || composerHint(gate) || (data?.scheduler?.write_frozen ? '旧调用结果待核对，新的消息只允许只读交谈。' : activeJobs.some((job) => ['queued', 'claimed', 'running'].includes(job.state)) ? '可继续发送；新消息会可靠排队，后台任务继续运行。' : '')
 
   useEffect(() => {
     if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)
@@ -88,12 +89,12 @@ export function ConversationScreen() {
                 ['内容', messagePending.text],
               ]} />
               <p>完成后只读汇报：{messagePending.report_results ? '本人已授权' : '未授权'}。</p>
-              <p>重试会保留原编号、内容和调度设备。</p>
+              <p>重试会保留原编号、内容、调度设备和原入口。{originalEntry ? '' : '请回原入口重试；当前入口只能核对已同步进展。'}</p>
             </CollapsibleContent>
           </Collapsible>
           <div className="pending-message-actions">
             <ActionButton variant="default" disabled={messageBusy} action={() => workspace.run(() => workspace.refresh())}>核对原消息</ActionButton>
-            <ActionButton disabled={!workspace.writable || messageBusy || workspace.incomplete} action={() => workspace.run(async () => {
+            <ActionButton disabled={!workspace.writable || !originalEntry || messageBusy || workspace.incomplete} action={() => workspace.run(async () => {
               await workspace.sendMessage(messagePending.text)
               clearSentDraft(messagePending.conversation_id, messagePending.text)
             })}>重试原消息</ActionButton>

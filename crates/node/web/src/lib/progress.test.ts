@@ -63,3 +63,20 @@ test('legacy events without a sequence still preserve snapshots and deltas', () 
   assert.equal(state[0].text, '开头结尾')
   assert.equal(state[0].sequence, undefined)
 })
+test('canonical manager status and tool events remain typed progress', () => {
+  const samples = [
+    { type: 'status', status: 'running' },
+    { type: 'status', status: 'finishing' },
+    { type: 'status', status: 'completed' },
+    { type: 'tool', item_id: 't1', status: 'completed', name: 'command_execution' },
+  ]
+  let state: ReturnType<typeof mergeProgress> = []
+  for (const [index, progress] of samples.entries()) {
+    const event = manager(index + 1, progress)
+    assert.equal(event.type, 'manager_progress')
+    state = mergeProgress(state, event)
+  }
+  assert.equal(state[0].sequence, samples.length)
+  assert.equal(state[0].needsRefresh, false)
+  assert.equal(state[0].status, 'completed')
+})

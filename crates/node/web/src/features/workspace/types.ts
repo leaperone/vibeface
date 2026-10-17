@@ -129,6 +129,6 @@ export type ChatSlotState = {
   schedulerNodeId: string | null
   missing: boolean
   schedulerOnline: boolean
-  managerReady: boolean
+  schedulerAllowed: boolean
 }
 export type { PendingMessage }

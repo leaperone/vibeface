@@ -25,7 +25,6 @@ export function TaskActivity({ task, conversationId }: { task: TaskRecord; conve
   const status = taskStatuses.find((value) => value === task.status) ?? "open"
   const binding = task.binding
   const capabilities = binding?.capabilities ?? []
-  const canRead = capabilities.includes("status") || capabilities.includes("read")
   const hasFollowupVersion = task.followup_version !== undefined
   const targetOnline = workspace.nodes.some((node) => node.node_id === binding?.target_node && node.online && !node.revoked)
   const pendingControls = workspace.pending.filter((operation) => operation.control?.task_id === task.task_id || (binding && operation.target_node === binding.target_node && operation.session_id === binding.session_id))
@@ -52,7 +51,7 @@ export function TaskActivity({ task, conversationId }: { task: TaskRecord; conve
             {!targetOnline ? <p role="status" className="text-sm text-muted-foreground">当前只能看到已同步进展；执行设备恢复连接后才能核对实时状态。</p> : null}
             {binding.state === "unknown" ? <p role="status" className="text-sm">执行结果未知，请核对当前进程与外部结果，避免重复执行。</p> : null}
             <div className="flex flex-wrap gap-2">
-              {canRead ? <ActionButton disabled={!workspace.connectionOnline || !targetOnline} action={() => workspace.run(async () => { await workspace.taskControl(task.task_id, "status") })}>核对执行状态</ActionButton> : null}
+              <ActionButton disabled={!workspace.connectionOnline} action={() => workspace.run(async () => { await workspace.taskControl(task.task_id, "status") })}>核对执行状态</ActionButton>
               {capabilities.includes("interrupt") ? <ActionButton disabled={!canControl} variant="destructive" action={() => workspace.run(async () => { await workspace.taskControl(task.task_id, "interrupt") })}>停止当前执行</ActionButton> : null}
             </div>
             {capabilities.includes("steer") ? (

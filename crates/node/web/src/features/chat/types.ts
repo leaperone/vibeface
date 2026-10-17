@@ -16,4 +16,4 @@ export type PendingMessage = {
   report_results?: boolean
   rejected?: { entry_node: string }
 }
-export type MessageRequest = Pick<PendingMessage, "conversation_id" | "message_id" | "text" | "basis_heads" | "scheduler_node" | "report_results">
+export type MessageRequest = Pick<PendingMessage, "conversation_id" | "message_id" | "text" | "basis_heads" | "scheduler_node" | "entry_node" | "report_results">

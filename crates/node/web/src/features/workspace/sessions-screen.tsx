@@ -193,7 +193,10 @@ function SessionCard({ session, conversationId }: { session: SessionRecord; conv
   const workspace = useWorkspace()
   const actual = workspace.actual[`${session.target_node}:${session.session_id}`]
   const task = workspace.data?.tasks.find((item) => item.binding?.target_node === session.target_node && item.binding.session_id === session.session_id)
-  if (task) return <TaskActivity task={task} conversationId={conversationId} />
+  if (task) return <div className="grid gap-3">
+    <TaskActivity task={task} conversationId={conversationId} />
+    <Card><CardContent><CommandForm session={session} conversationId={conversationId} /></CardContent></Card>
+  </div>
   const canRead = session.capabilities?.includes("read")
   return (
     <Card>

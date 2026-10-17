@@ -9,7 +9,7 @@ import { isIncomplete, mergeBasis, missingCount, stateNames } from "./labels"
 import {
   frontierMap, inputText, parseConversation, parseConversations, parseNodes, parseNotifications, parseOperation,
   parsePending, parsePendingMessages, parsePendingConversation, parsePendingTasks, parseSession, record,
-  parseArtifactPage, hasQueuedMessage,
+  parseArtifactPage, hasQueuedMessage, canSelectScheduler,
 } from "./model"
 import { errorText, parseReconcile, reconcileDecision, type ReconcileRecord } from "./reconcile"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
@@ -169,7 +169,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (activeId.current) await readConversation(activeId.current)
       requireCurrent()
       setSchedulerNodeId((previous) => {
-        const choices = nextNodes.filter((node) => !node.revoked && node.roles.includes("scheduler") && node.capabilities?.manager)
+        const choices = nextNodes.filter(canSelectScheduler)
         return choices.some((node) => node.node_id === previous) ? previous : choices[0]?.node_id ?? ""
       })
       notifyBrowser(nextNotifications)
@@ -278,7 +278,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   const selectedScheduler = nodes.find((node) => node.node_id === (messagePending?.scheduler_node ?? schedulerNodeId))
   const chatSlot = {
     conversationId: conversationId || null, schedulerNodeId: selectedScheduler?.node_id ?? null,
-    missing: incomplete, schedulerOnline: Boolean(selectedScheduler?.online && !selectedScheduler.revoked), managerReady: Boolean(selectedScheduler && !selectedScheduler.revoked && selectedScheduler.capabilities?.manager),
+    missing: incomplete, schedulerOnline: Boolean(selectedScheduler?.online && !selectedScheduler.revoked), schedulerAllowed: canSelectScheduler(selectedScheduler),
   }
 
   return {
@@ -337,7 +337,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       const context = requireContext(), id = activeId.current
       const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
       const scheduler = nodes.find((item) => item.node_id === (prior?.scheduler_node ?? schedulerNodeId))
-      if (!scheduler || scheduler.revoked || !scheduler.capabilities?.manager) throw new Error("原调度设备的授权或配置不可用，请先核对原消息。")
+      if (!canSelectScheduler(scheduler)) throw new Error("原调度设备的授权或已知管理配置不可用，请先核对原消息。")
       const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: scheduler.node_id, entryNode: connection.entry.node_id, pending: prior, heads: context.heads, reportResults })
       if (!prepared.ok) throw new Error(prepared.error)
       replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])
@@ -445,8 +445,9 @@ function useWorkspaceState(connection: ReadyConnection) {
       const context = requireContext(id)
       if (pendingRef.current.some((item) => item.conversation_id === id && item.target_node === target.target_node && (action.type === "open" || item.session_id === target.session_id))) throw new Error("此设备有尚未确认的操作，请先核对原操作。")
       const session = context.sessions.find((item) => item.target_node === target.target_node && item.session_id === target.session_id)
+      const task = context.tasks.find((item) => item.binding?.target_node === target.target_node && item.binding.session_id === target.session_id)
       if (session?.state === "unknown" && action.type !== "read") throw new Error("执行结果未知，请先读取实际状态并人工核对。")
-      const request: OperationRequest = { operation_id: newId(), network_id: networkId, conversation_id: id, task_id: null, target_node: target.target_node, session_id: target.session_id, expected_revision: target.revision ?? 0, basis_heads: context.heads, resources: [], action }
+      const request: OperationRequest = { operation_id: newId(), network_id: networkId, conversation_id: id, task_id: task?.task_id ?? null, target_node: target.target_node, session_id: target.session_id, expected_revision: target.revision ?? 0, basis_heads: context.heads, resources: [], action }
       replacePending([...pendingRef.current, { operation_id: request.operation_id, target_node: request.target_node, session_id: request.session_id, conversation_id: id, request }])
       const result = parseOperation(record(await connection.rpc("operate", { request })).operation)
       requireCurrent()
