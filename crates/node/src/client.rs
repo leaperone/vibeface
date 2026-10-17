@@ -334,7 +334,7 @@ async fn dispatch(
                     "bootstrap requires its original management identity"
                 );
             } else {
-                node.identities.bootstrap_network(
+                node.store.lock().await.bootstrap_network(
                     state.clone(),
                     text(&params, "capability")?,
                     &session.subject_id,
@@ -353,7 +353,7 @@ async fn dispatch(
                 .transpose()?
                 .unwrap_or_default();
             sort_roles(&mut roles)?;
-            let payload = node.identities.create_invite(InviteRequest {
+            let payload = node.store.lock().await.create_invite(InviteRequest {
                 request_id: request_id(&params)?,
                 network_id: view.network_id,
                 inviter_subject_id: session.subject_id.clone(),
@@ -381,7 +381,7 @@ async fn dispatch(
                 crypto::digest(capability.as_bytes()) == invite.payload.capability_hash,
                 "invitation capability mismatch"
             );
-            node.identities.commit_invite(invite.clone())?;
+            node.store.lock().await.commit_invite(invite.clone())?;
             Ok(json!({"invite":invite,"capability":capability}))
         }
         "prepare_pair_request" => {
@@ -443,14 +443,14 @@ async fn dispatch(
                 "pair request is for another channel identity"
             );
             let request_id = request.request_id.clone();
-            let review = node.identities.pair_request(request)?;
+            let review = node.store.lock().await.pair_request(request)?;
             let signing = signing("identity-pair-review", review.signing_bytes()?);
             Ok(json!({"request_id":request_id,"review":review,"signing":signing}))
         }
         "pair_accept" => {
             node.membership_state().await?;
             let request_id = text(&params, "request_id")?;
-            let review = node.identities.lookup_pair(request_id)?;
+            let review = node.store.lock().await.lookup_pair(request_id)?;
             ensure!(
                 review.new_member.subject_id == session.subject_id
                     && review.new_member.public_key == session.public_key,
@@ -465,7 +465,9 @@ async fn dispatch(
                 return Ok(json!({"status":"granted"}));
             }
             let receipt = node
-                .identities
+                .store
+                .lock()
+                .await
                 .accept_pair(review, text(&params, "signature")?.to_owned())?;
             let _ = node.events.send(crate::runtime::Update {
                 network_id: state.genesis.network_id,
@@ -476,13 +478,15 @@ async fn dispatch(
         "pair_requests" => {
             manager_view(node, session).await?;
             Ok(serde_json::to_value(
-                node.identities.pending_pairs(&session.subject_id)?,
+                node.store.lock().await.pending_pairs(&session.subject_id)?,
             )?)
         }
         "prepare_pair" => {
             let view = manager_view(node, session).await?;
             let pair = node
-                .identities
+                .store
+                .lock()
+                .await
                 .pending_pairs(&session.subject_id)?
                 .into_iter()
                 .find(|pair| pair.request_id == params["request_id"])
@@ -510,7 +514,9 @@ async fn dispatch(
                 return authentication(node, session).await;
             }
             let pair = node
-                .identities
+                .store
+                .lock()
+                .await
                 .pending_pairs(&session.subject_id)?
                 .into_iter()
                 .find(|pair| pair.request_id == params["request_id"])
@@ -521,12 +527,12 @@ async fn dispatch(
                 event == expected && event.issuer == session.subject_id,
                 "grant differs from approved pair review"
             );
-            node.identities.confirm_pair(PairConfirm {
+            node.store.lock().await.confirm_pair(PairConfirm {
                 review: pair.review,
                 inviter_signature: text(&params, "inviter_signature")?.to_owned(),
                 new_subject_signature: pair.new_subject_signature,
             })?;
-            let state = node.identities.store_signed_grant(event)?;
+            let state = node.store.lock().await.store_signed_grant(event)?;
             let network_id = state.genesis.network_id.clone();
             node.install_membership(state.clone()).await?;
             announce_membership(node, &network_id, &state).await;
@@ -535,7 +541,7 @@ async fn dispatch(
         "pair_status" => {
             node.membership_state().await?;
             let request_id = text(&params, "request_id")?;
-            let review = match node.identities.lookup_pair(request_id) {
+            let review = match node.store.lock().await.lookup_pair(request_id) {
                 Ok(review) => review,
                 Err(error)
                     if error
@@ -680,7 +686,7 @@ async fn dispatch(
             let fresh = !node.has_membership().await?;
             validate_local_node(node, &state, fresh)?;
             if fresh {
-                node.identities.bootstrap_recovered_network(
+                node.store.lock().await.bootstrap_recovered_network(
                     state.clone(),
                     text(&params, "capability")?,
                     &session.subject_id,
@@ -861,7 +867,9 @@ async fn recovery_context(node: &Runtime, session: &mut Session, params: &Value)
     let state = if node.has_membership().await? {
         node.membership_state().await?
     } else {
-        node.identities
+        node.store
+            .lock()
+            .await
             .verify_bootstrap_capability(text(params, "capability")?)?;
         from_field(params, "state")?
     };

@@ -2,7 +2,7 @@ use crate::{
     config::{self, Config},
     crypto::{self, LocalIdentity},
     engine::{Engine, EngineAction, ExecutorConfig, ExecutorKind, ExecutorSession},
-    identity::{AuthorizationView, IdentityKind, IdentityStore, NetworkState},
+    identity::{AuthorizationView, IdentityKind, NetworkState},
     maintenance::{Busy, Gate},
     model::*,
     network::{IncomingSocket, NetworkHub, Service},
@@ -42,7 +42,10 @@ mod tests {
             .join("../../.artifacts")
             .join(format!("runtime-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":2}"#)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &serde_json::to_vec(&config::data_format())?,
+        )?;
         let mut cfg = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         cfg.codex_socket = Some(dir.join("unavailable.sock"));
         cfg.save(&dir)?;
@@ -50,6 +53,7 @@ mod tests {
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
         )?;
+        drop(Store::open(dir.join("node.sqlite3"))?);
         Ok(dir)
     }
     async fn conversation(node: &Runtime) -> Result<String> {
@@ -125,8 +129,9 @@ mod tests {
         let dir = fixture()?;
         std::fs::remove_file(dir.join("data-epoch.json"))?;
         let config = std::fs::read(dir.join("config.json"))?;
+        let database = std::fs::read(dir.join("node.sqlite3"))?;
         assert!(Runtime::open(&dir).await.is_err());
-        assert!(!dir.join("node.sqlite3").exists());
+        assert_eq!(std::fs::read(dir.join("node.sqlite3"))?, database);
         assert!(!dir.join("identity.sqlite3").exists());
         assert_eq!(std::fs::read(dir.join("config.json"))?, config);
         std::fs::remove_dir_all(dir)?;
@@ -134,7 +139,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn membership_reopen_recovers_either_durable_store_without_root_secrets() -> Result<()> {
+    async fn missing_or_empty_ready_database_is_rejected_before_lock_creation() -> Result<()> {
+        for empty in [false, true] {
+            let dir = fixture()?;
+            if empty {
+                std::fs::write(dir.join("node.sqlite3"), [])?;
+            } else {
+                std::fs::remove_file(dir.join("node.sqlite3"))?;
+            }
+            let snapshot = || -> Result<BTreeSet<(String, Vec<u8>)>> {
+                std::fs::read_dir(&dir)?
+                    .map(|entry| {
+                        let entry = entry?;
+                        Ok((
+                            entry.file_name().to_string_lossy().into_owned(),
+                            std::fs::read(entry.path())?,
+                        ))
+                    })
+                    .collect()
+            };
+            let before = snapshot()?;
+            assert!(Runtime::open(&dir).await.is_err());
+            assert!(!dir.join("node.lock").exists());
+            assert_eq!(snapshot()?, before);
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn membership_reopen_uses_one_store_without_root_secrets() -> Result<()> {
         let dir = fixture()?;
         let node = Runtime::open(&dir).await?;
         assert!(!node.has_membership().await?);
@@ -143,7 +177,7 @@ mod tests {
             1,
             vec![node.identity.certificate(node.config.roles.clone())?],
         )?;
-        node.identities.init_network(initial.clone())?;
+        node.store.lock().await.init_network(initial.clone())?;
         drop(node);
         let node = Runtime::open(&dir).await?;
         assert_eq!(node.membership_state().await?, initial);
@@ -162,7 +196,7 @@ mod tests {
         drop(node);
         let node = Runtime::open(&dir).await?;
         assert_eq!(node.membership_state().await?, updated);
-        assert_eq!(node.identities.public_state()?, updated);
+        assert_eq!(node.store.lock().await.public_state()?, updated);
         assert!(!dir.join("auth.sqlite3").exists());
         drop(node);
         std::fs::remove_dir_all(dir)?;
@@ -1234,7 +1268,6 @@ pub struct Runtime {
     pub config: Config,
     pub identity: LocalIdentity,
     pub store: Arc<Mutex<Store>>,
-    pub identities: Arc<IdentityStore>,
     pub network: Arc<NetworkHub>,
     pub hub: Arc<PeerHub>,
     pub events: broadcast::Sender<Update>,
@@ -1399,45 +1432,15 @@ fn require_executor_followup(
 
 impl Runtime {
     pub async fn open(dir: &Path) -> Result<Self> {
-        let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
-        ensure!(
-            epoch == json!({"data_epoch":2}),
-            "this Node requires an initialized data epoch 2 directory"
-        );
+        config::verify_data_format(dir)?;
         let mut config = Config::load(dir)?;
         let process_lock = config::lock_data_dir(dir)?;
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
-        let identities = Arc::new(IdentityStore::open(&dir.join("identity.sqlite3"))?);
-        let networks = store.networks()?;
-        ensure!(
-            networks.len() <= 1,
-            "one installation can join only one personal network"
-        );
-        let stored = networks
-            .first()
-            .map(|network| store.trust_bundle(network))
-            .transpose()?
-            .flatten();
-        let local = if identities.has_network()? {
-            Some(identities.public_state()?)
-        } else {
-            None
-        };
-        let state = match (local, stored) {
-            (Some(a), Some(b)) => Some(if a.epoch() >= b.epoch() {
-                b.merge(&a)?
-            } else {
-                a.merge(&b)?
-            }),
-            (a, b) => a.or(b),
-        };
-        if let Some(state) = state {
-            let view = state.project()?;
-            store.install_trust_bundle(&view.network_id, &state)?;
-            identities.install_state(state)?;
+        if store.has_network()? {
+            let view = store.public_state()?.project()?;
             if view.authorize_node(&identity.node_id()?, None).is_ok() {
-                store.save_local_identity(&view.network_id, &identity)?;
+                store.save_local_device(&view.network_id, &identity)?;
             }
         }
         let store = Arc::new(Mutex::new(store));
@@ -1513,7 +1516,6 @@ impl Runtime {
             config,
             identity,
             store,
-            identities,
             network,
             hub,
             events,
@@ -1532,78 +1534,19 @@ impl Runtime {
     pub async fn install_membership(&self, incoming: NetworkState) -> Result<AuthorizationView> {
         let _work = self.maintenance.enter()?;
         let mut store = self.store.lock().await;
-        let mut state = incoming;
-        let networks = store.networks()?;
-        ensure!(
-            networks
-                .iter()
-                .all(|network| network == &state.genesis.network_id),
-            "installation belongs to a different personal network"
-        );
-        if self.identities.has_network()? {
-            let previous = self.identities.public_state()?;
-            state = previous.merge(&state)?;
-        }
-        if let Some(previous) = store.trust_bundle(&state.genesis.network_id)? {
-            state = previous.merge(&state)?;
-        }
-        let view = state.project()?;
-        self.identities.install_state(state.clone())?;
-        store.install_trust_bundle(&view.network_id, &state)?;
+        let view = store.install_state(incoming)?;
         if view.authorize_node(&self.identity.node_id()?, None).is_ok() {
-            store.save_local_identity(&view.network_id, &self.identity)?;
+            store.save_local_device(&view.network_id, &self.identity)?;
         }
         Ok(view)
     }
 
     pub async fn has_membership(&self) -> Result<bool> {
-        let in_identity = self.identities.has_network()?;
-        let in_store = !self.store.lock().await.networks()?.is_empty();
-        if !in_identity && !in_store {
-            return Ok(false);
-        }
-        self.membership_state().await?;
-        Ok(true)
+        self.store.lock().await.has_network()
     }
 
     pub async fn membership_state(&self) -> Result<NetworkState> {
-        let local = if self.identities.has_network()? {
-            Some(self.identities.public_state()?)
-        } else {
-            None
-        };
-        let mut store = self.store.lock().await;
-        let networks = store.networks()?;
-        ensure!(
-            networks.len() <= 1,
-            "one installation can join only one personal network"
-        );
-        let stored = networks
-            .first()
-            .map(|network| store.trust_bundle(network))
-            .transpose()?
-            .flatten();
-        let merged = match (&local, &stored) {
-            (Some(a), Some(b)) => {
-                if a.epoch() >= b.epoch() {
-                    b.merge(a)?
-                } else {
-                    a.merge(b)?
-                }
-            }
-            (Some(state), None) | (None, Some(state)) => state.clone(),
-            (None, None) => bail!("personal network is not installed"),
-        };
-        if stored.as_ref() != Some(&merged) || local.as_ref() != Some(&merged) {
-            let _work = self.maintenance.enter()?;
-            self.identities.install_state(merged.clone())?;
-            store.install_trust_bundle(&merged.genesis.network_id, &merged)?;
-            let view = merged.project()?;
-            if view.authorize_node(&self.identity.node_id()?, None).is_ok() {
-                store.save_local_identity(&view.network_id, &self.identity)?;
-            }
-        }
-        Ok(merged)
+        self.store.lock().await.public_state()
     }
     pub fn info(&self) -> Value {
         json!({"node_id":self.identity.node_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
@@ -1678,7 +1621,7 @@ impl Runtime {
             let mut tick = tokio::time::interval(Duration::from_secs(3));
             loop {
                 tick.tick().await;
-                let Ok(state) = node.identities.public_state() else {
+                let Ok(state) = node.store.lock().await.public_state() else {
                     continue;
                 };
                 let Ok(view) = state.project() else { continue };

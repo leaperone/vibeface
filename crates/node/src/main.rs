@@ -18,7 +18,7 @@ use vibeface::{
     config::{self, Config, ManagerSettings},
     crypto::{LocalIdentity, digest},
     identity::{
-        IdentityKind, IdentityStore, Member, NetworkState,
+        IdentityKind, Member, NetworkState,
         local::{BootstrapCapability, InviteEnvelope, PairRequest, PairReview},
     },
     maintenance,
@@ -351,11 +351,15 @@ fn init(options: Init) -> Result<()> {
     initialize(dir, configuration)
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Initialization {
+    target: PathBuf,
+    format: Value,
+    configuration: Config,
+}
+
 fn initialize(dir: &Path, configuration: Config) -> Result<()> {
-    ensure!(
-        !dir.join("identity.json").exists() && !dir.join("config.json").exists(),
-        "node already initialized; existing identity and configuration were preserved"
-    );
     ensure!(
         !dir.symlink_metadata()
             .is_ok_and(|m| m.file_type().is_symlink()),
@@ -368,25 +372,220 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         );
     }
     configuration.validate()?;
-    let identity = LocalIdentity::generate();
-    let encoded_identity = serde_json::to_vec_pretty(&identity)?;
-    let encoded_configuration = serde_json::to_vec_pretty(&configuration)?;
-    config::private_dir(dir)?;
-    create_private(&dir.join("identity.json"), &encoded_identity)?;
-    create_private(&dir.join("config.json"), &encoded_configuration)?;
-    let identities = IdentityStore::open(&dir.join("identity.sqlite3"))?;
-    let capability = identities.bootstrap_capability()?;
-    create_private(
-        &dir.join("bootstrap.json"),
-        &serde_json::to_vec(&capability)?,
-    )?;
-    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":2}"#)?;
+    let absolute = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+    let parent = absolute
+        .parent()
+        .context("data directory requires a parent")?;
+    fs::create_dir_all(parent)?;
+    let target = parent.canonicalize()?.join(
+        absolute
+            .file_name()
+            .context("data directory requires a name")?,
+    );
+    let staging = target.with_file_name(format!(
+        ".vibeface-initialize-{}",
+        &digest(target.as_os_str().as_encoded_bytes())[..24]
+    ));
+    if !staging.exists() {
+        config::private_dir(&staging)?;
+    }
+    config::verify_private_dir(&staging)?;
+    for entry in fs::read_dir(&staging)? {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().context("unrecognized initialization file")?;
+        let published = matches!(
+            name,
+            "initializing.json"
+                | "data-epoch.json"
+                | "identity.json"
+                | "config.json"
+                | "bootstrap.json"
+                | "node.sqlite3"
+                | "node.sqlite3-wal"
+                | "node.sqlite3-shm"
+                | "node.sqlite3-journal"
+                | "node.lock"
+        );
+        let pending = [
+            "initializing.json",
+            "data-epoch.json",
+            "identity.json",
+            "config.json",
+            "bootstrap.json",
+        ]
+        .iter()
+        .any(|file| name == format!(".{file}.initializing.tmp"));
+        let metadata = fs::symlink_metadata(entry.path())?;
+        ensure!(
+            (published || pending)
+                && metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == config::effective_uid()
+                && metadata.permissions().mode() & 0o077 == 0,
+            "unrecognized initialization staging data was preserved"
+        );
+    }
+    let manifest = staging.join("initializing.json");
+    if manifest.exists() {
+        let initialization: Initialization =
+            serde_json::from_slice(&read_bounded(&manifest, 65_536)?)?;
+        ensure!(
+            initialization.target == target && initialization.format == config::data_format(),
+            "initialization format or target mismatch"
+        );
+    } else {
+        ensure!(
+            fs::read_dir(&staging)?.all(|entry| entry.is_ok_and(|entry| matches!(
+                entry.file_name().to_str(),
+                Some("node.lock" | ".initializing.json.initializing.tmp")
+            ))),
+            "unrecognized initialization staging data was preserved"
+        );
+    }
+    let _lock = config::lock_data_dir(&staging)?;
+    for name in [
+        "initializing.json",
+        "data-epoch.json",
+        "identity.json",
+        "config.json",
+        "bootstrap.json",
+    ] {
+        let pending = staging.join(format!(".{name}.initializing.tmp"));
+        match fs::symlink_metadata(&pending) {
+            Ok(metadata) => {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                ensure!(
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.uid() == config::effective_uid()
+                        && metadata.permissions().mode() & 0o077 == 0,
+                    "invalid unfinished initialization file was preserved"
+                );
+                fs::remove_file(pending)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let manifest = staging.join("initializing.json");
+    if !manifest.exists() {
+        ensure!(
+            fs::read_dir(&staging)?
+                .all(|entry| entry.is_ok_and(|entry| entry.file_name() == "node.lock")),
+            "unrecognized initialization staging data was preserved"
+        );
+        create_private(
+            &manifest,
+            &serde_json::to_vec(&Initialization {
+                target: target.clone(),
+                format: config::data_format(),
+                configuration,
+            })?,
+        )?;
+    }
+    for entry in fs::read_dir(&staging)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        ensure!(
+            matches!(
+                name.to_str(),
+                Some(
+                    "initializing.json"
+                        | "data-epoch.json"
+                        | "identity.json"
+                        | "config.json"
+                        | "bootstrap.json"
+                        | "node.sqlite3"
+                        | "node.sqlite3-wal"
+                        | "node.sqlite3-shm"
+                        | "node.sqlite3-journal"
+                        | "node.lock"
+                )
+            ) && entry.file_type()?.is_file()
+                && !entry.file_type()?.is_symlink(),
+            "unrecognized initialization staging data was preserved"
+        );
+    }
+    let initialization: Initialization = serde_json::from_slice(&read_bounded(&manifest, 65_536)?)?;
+    ensure!(
+        initialization.target == target && initialization.format == config::data_format(),
+        "initialization format or target mismatch"
+    );
+    let configuration = initialization.configuration;
+    configuration.validate()?;
+    let marker = staging.join("data-epoch.json");
+    if !marker.exists() {
+        create_private(&marker, &serde_json::to_vec(&config::data_format())?)?;
+    }
+    config::verify_format_marker(&staging)?;
+    let identity_path = staging.join("identity.json");
+    if !identity_path.exists() {
+        create_private(
+            &identity_path,
+            &serde_json::to_vec_pretty(&LocalIdentity::generate())?,
+        )?;
+    }
+    let identity = config::identity(&staging)?;
+    let configuration_path = staging.join("config.json");
+    if !configuration_path.exists() {
+        create_private(
+            &configuration_path,
+            &serde_json::to_vec_pretty(&configuration)?,
+        )?;
+    }
+    let actual = Config::load(&staging)?;
+    ensure!(
+        serde_json::to_value(&actual)? == serde_json::to_value(&configuration)?,
+        "initialization configuration changed"
+    );
+    {
+        let store = vibeface::store::Store::initialize(&staging.join("node.sqlite3"))?;
+        let bootstrap_path = staging.join("bootstrap.json");
+        if !bootstrap_path.exists() {
+            create_private(
+                &bootstrap_path,
+                &serde_json::to_vec(&BootstrapCapability::generate())?,
+            )?;
+        }
+        let capability: BootstrapCapability =
+            serde_json::from_slice(&read_bounded(&bootstrap_path, 4096)?)?;
+        store.install_bootstrap_capability(&capability)?;
+    }
+    fs::File::open(&staging)?.sync_all()?;
+    if target.exists() {
+        ensure!(
+            fs::read_dir(&target)?.next().is_none(),
+            "data directory changed during initialization; existing data was preserved"
+        );
+    }
+    fs::rename(&staging, &target)?;
+    fs::File::open(parent)?.sync_all()?;
+    fs::remove_file(target.join("initializing.json"))?;
+    fs::File::open(&target)?.sync_all()?;
     println!("Initialized node {}", identity.node_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     Ok(())
 }
 
 fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    ensure!(
+        matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+        "private node file already exists"
+    );
+    let parent = path
+        .parent()
+        .context("private node file requires a directory")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid private node filename")?;
+    let pending = parent.join(format!(".{name}.initializing.tmp"));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -394,12 +593,14 @@ fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path).context("create new private node file")?;
+    let mut file = options
+        .open(&pending)
+        .context("create new private node file")?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)?.sync_all()?;
-    }
+    fs::hard_link(&pending, path).context("publish new private node file without replacement")?;
+    fs::remove_file(pending)?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -453,15 +654,11 @@ fn network_url(value: &str) -> Result<String> {
 
 fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
-    let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
-    ensure!(
-        epoch == json!({"data_epoch":2}),
-        "data directory uses another format; existing data was preserved"
-    );
+    config::verify_data_format(dir)?;
     let configuration = Config::load(dir)?;
     let identity = config::identity(dir)?;
-    let identities = IdentityStore::open(&dir.join("identity.sqlite3"))?;
-    let capability = if identities.has_network()? {
+    let store = vibeface::store::Store::open_read_only(&dir.join("node.sqlite3"))?;
+    let capability = if store.has_network()? {
         None
     } else {
         let capability: BootstrapCapability =
@@ -1105,6 +1302,119 @@ mod tests {
         assert!(!dir.join("identity.json").exists());
         assert!(!dir.join("config.json").exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interrupted_initialization_resumes_each_durable_stage_without_replacing_keys() -> Result<()>
+    {
+        let root =
+            std::env::temp_dir().join(format!("vibeface-init-resume-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&root)?;
+        for stage in 0..8 {
+            let target = root.canonicalize()?.join(format!("node-{stage}"));
+            let staging = target.with_file_name(format!(
+                ".vibeface-initialize-{}",
+                &digest(target.as_os_str().as_encoded_bytes())[..24]
+            ));
+            config::private_dir(&staging)?;
+            let configuration = Config::local(DEFAULT_LISTEN, vec![], false);
+            let identity = LocalIdentity::generate();
+            let capability = BootstrapCapability::generate();
+            let identity_bytes = serde_json::to_vec_pretty(&identity)?;
+            let capability_bytes = serde_json::to_vec(&capability)?;
+            if stage >= 1 {
+                create_private(
+                    &staging.join("initializing.json"),
+                    &serde_json::to_vec(&Initialization {
+                        target: target.clone(),
+                        format: config::data_format(),
+                        configuration: configuration.clone(),
+                    })?,
+                )?;
+            }
+            if stage >= 2 {
+                create_private(
+                    &staging.join("data-epoch.json"),
+                    &serde_json::to_vec(&config::data_format())?,
+                )?;
+            }
+            if stage >= 3 {
+                create_private(&staging.join("identity.json"), &identity_bytes)?;
+            }
+            if stage >= 4 {
+                create_private(
+                    &staging.join("config.json"),
+                    &serde_json::to_vec_pretty(&configuration)?,
+                )?;
+            }
+            if stage >= 5 {
+                drop(vibeface::store::Store::open(staging.join("node.sqlite3"))?);
+            }
+            if stage >= 6 {
+                create_private(&staging.join("bootstrap.json"), &capability_bytes)?;
+            }
+            if stage >= 7 {
+                let store = vibeface::store::Store::open(staging.join("node.sqlite3"))?;
+                store.install_bootstrap_capability(&capability)?;
+            }
+            let interrupted_name = match stage {
+                0 => "initializing.json",
+                1 => "data-epoch.json",
+                2 => "identity.json",
+                3 => "config.json",
+                _ => "bootstrap.json",
+            };
+            let unfinished = staging.join(format!(".{interrupted_name}.initializing.tmp"));
+            if staging.join(interrupted_name).exists() {
+                fs::hard_link(staging.join(interrupted_name), &unfinished)?;
+            } else {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&unfinished)?;
+                file.write_all(b"{incomplete")?;
+                file.sync_all()?;
+            }
+            initialize(&target, configuration)?;
+            config::verify_data_format(&target)?;
+            assert!(!staging.exists());
+            assert!(!target.join("identity.sqlite3").exists());
+            if stage >= 3 {
+                assert_eq!(fs::read(target.join("identity.json"))?, identity_bytes);
+            }
+            if stage >= 6 {
+                assert_eq!(fs::read(target.join("bootstrap.json"))?, capability_bytes);
+            }
+            let store = vibeface::store::Store::open(target.join("node.sqlite3"))?;
+            let actual: BootstrapCapability =
+                serde_json::from_slice(&fs::read(target.join("bootstrap.json"))?)?;
+            store.verify_bootstrap_capability(&actual.capability)?;
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn initialization_refuses_public_staging_before_persisting_secrets() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("vibeface-init-public-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&root)?;
+        let target = root.canonicalize()?.join("node");
+        let staging = target.with_file_name(format!(
+            ".vibeface-initialize-{}",
+            &digest(target.as_os_str().as_encoded_bytes())[..24]
+        ));
+        fs::create_dir(&staging)?;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))?;
+        assert!(initialize(&target, Config::local(DEFAULT_LISTEN, vec![], false)).is_err());
+        assert!(!target.exists());
+        assert!(fs::read_dir(&staging)?.next().is_none());
+        assert_eq!(fs::metadata(&staging)?.permissions().mode() & 0o777, 0o755);
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

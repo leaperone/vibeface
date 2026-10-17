@@ -457,7 +457,10 @@ mod tests {
             .join(format!("maintenance-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let dir = dir.canonicalize()?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":2}"#)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &serde_json::to_vec(&config::data_format())?,
+        )?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         config.codex_socket = Some(dir.join("unavailable.sock"));
         config.save(&dir)?;
@@ -466,6 +469,7 @@ mod tests {
             &serde_json::to_vec(&LocalIdentity::generate())?,
         )?;
         config::private_write(&dir.join("update-pending.json"), b"{}")?;
+        drop(crate::store::Store::open(dir.join("node.sqlite3"))?);
         let node = Arc::new(Runtime::open(&dir).await?);
         let server = tokio::spawn(serve(node.clone(), dir.clone()));
         let result = async {

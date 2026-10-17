@@ -9,6 +9,64 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const FORMAT_ID: &str = "vibeface-node";
+pub const DATA_EPOCH: u32 = 3;
+pub const LAYOUT_VERSION: u32 = 1;
+
+pub fn effective_uid() -> u32 {
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() }
+}
+
+pub fn verify_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.permissions().mode() & 0o077 == 0
+            && metadata.uid() == effective_uid(),
+        "data directory must be private, owned by the current user and not a symlink"
+    );
+    Ok(())
+}
+
+pub fn data_format() -> serde_json::Value {
+    serde_json::json!({"format": FORMAT_ID, "data_epoch": DATA_EPOCH, "layout_version": LAYOUT_VERSION})
+}
+
+pub fn verify_format_marker(dir: &Path) -> Result<()> {
+    verify_private_dir(dir)?;
+    let marker = dir.join("data-epoch.json");
+    let metadata = std::fs::symlink_metadata(&marker)
+        .context("missing or invalid data format marker; existing data was preserved")?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 4096,
+        "invalid data format marker; existing data was preserved"
+    );
+    let value: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(marker)
+            .context("unreadable data format marker; existing data was preserved")?,
+    )
+    .context("invalid data format marker; existing data was preserved")?;
+    ensure!(
+        value == data_format(),
+        "this Node requires a new data epoch 3 directory; existing data was preserved"
+    );
+    ensure!(
+        matches!(std::fs::symlink_metadata(dir.join("identity.sqlite3")), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+        "legacy identity database is unsupported; existing data was preserved"
+    );
+    Ok(())
+}
+
+pub fn verify_data_format(dir: &Path) -> Result<()> {
+    verify_format_marker(dir)?;
+    crate::store::Store::verify_existing_database(&dir.join("node.sqlite3"))
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
