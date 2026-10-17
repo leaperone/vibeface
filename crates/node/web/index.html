@@ -7,14 +7,14 @@
   <meta name="theme-color" content="#f6f5f1">
   <title>Vibeface · 我的设备</title>
   <link rel="stylesheet" href="/style.css">
-  <script src="/app.js" defer></script>
+  <script type="module" src="/app.js"></script>
 </head>
 <body>
   <a class="skip-link" href="#main">跳到主要内容</a>
   <header class="topbar">
     <a class="brand" href="/" aria-label="Vibeface 首页"><span class="brand-mark" aria-hidden="true">v</span>vibeface</a>
     <div class="connection"><span class="status-dot" aria-hidden="true"></span><span id="connection-state">连接中</span><span id="node-label" class="mono"></span></div>
-    <button id="logout" class="quiet" type="button" hidden>退出登录</button>
+    <button id="disconnect" class="quiet" type="button" hidden>断开连接</button>
   </header>
   <div id="notice" class="notice" role="status" aria-live="polite"></div>
   <div id="error" class="error" role="alert" hidden></div>
@@ -22,38 +22,63 @@
     <section id="auth-view" class="auth-view">
       <div class="auth-intro"><p class="eyebrow">你的设备，你的工作</p><h1>从任意入口，<br>继续同一个会话。</h1><p>与本地调度 Agent 聊天，查看任务和执行结果。设备离线后，可从其他已同步的设备继续。</p><div class="origin-label"><span>当前入口</span><code id="auth-origin"></code></div></div>
       <div class="auth-card">
-        <h2 id="auth-title">登录此入口</h2><p id="auth-description" class="muted">使用此入口上的账户登录。换到其他地址时需要重新登录。</p>
-        <form id="auth-form" class="stack">
-          <label>用户名<input id="username" name="username" autocomplete="username" required maxlength="128"></label>
-          <label>密码<input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024"></label>
-          <button id="auth-submit" class="primary" type="submit">登录</button>
-        </form>
-        <button id="auth-toggle" class="text-button" type="button">第一次使用？创建账户</button>
+        <h2 id="auth-title">连接自己的设备</h2>
+        <p id="auth-description" class="muted">首次连接需要可信邀请。设备密钥保存在此浏览器，之后自动认证，不需要注册账户。</p>
+        <p id="client-fingerprint" class="fingerprint small"></p>
+        <form method="post" id="pair-form" class="stack"><fieldset class="stack" data-key-controls disabled>
+          <label>此浏览器的设备名称<input name="label" autocomplete="off" maxlength="80" required placeholder="例如：我的手机"></label>
+          <label>邀请链接或本机邀请内容<textarea id="pair-invitation" name="invitation" rows="4" maxlength="65536" autocomplete="off" spellcheck="false" required aria-describedby="pair-hint"></textarea></label>
+          <p id="pair-hint" class="muted small">首台管理设备的邀请请从 Node 所在电脑的终端取得。其他设备由已授权管理设备添加。请勿把邀请交给陌生人。</p>
+          <div id="bootstrap-backup" class="stack" hidden><label>恢复包口令<input name="passphrase" type="password" autocomplete="new-password" minlength="12"></label><label>再次输入口令<input name="confirmation" type="password" autocomplete="new-password" minlength="12"></label><p class="muted small">创建网络时会下载加密恢复包。请独立保存文件和口令，个人私钥不会交给运行节点。</p></div>
+          <button id="pair-submit" class="primary" type="submit">核对设备并请求配对</button>
+        </fieldset></form>
+        <section id="pair-status" class="pair-status" role="status" hidden></section>
+        <details class="panel"><summary>连接已配对设备</summary>
+          <form method="post" id="connect-form" class="stack"><fieldset class="stack" data-key-controls disabled>
+            <label>入口地址<input name="address" type="url" required placeholder="https://node.example.com"></label>
+            <label>目标设备指纹<input name="node_id" required minlength="64" maxlength="64" spellcheck="false" autocapitalize="off" autocomplete="off" aria-describedby="fingerprint-hint"></label>
+            <p id="fingerprint-hint" class="muted small">从你自己的终端或管理设备取得完整指纹。入口地址可以是公共中继，目标指纹始终是你的设备。</p>
+            <label class="check-label"><input name="relay" type="checkbox">通过此入口中继到目标设备</label>
+            <button type="submit" class="secondary">连接设备</button>
+          </fieldset></form>
+        </details>
+        <details class="panel"><summary>从恢复包恢复</summary>
+          <form method="post" id="initial-recovery-form" class="stack"><fieldset class="stack" data-key-controls disabled><label>新节点的本机初始化邀请<input name="bootstrap_invitation" autocomplete="off" spellcheck="false" placeholder="已有网络节点可留空"></label>
+            <label>可信设备入口<input name="address" type="url" required placeholder="https://node.example.com"></label>
+            <label>目标设备指纹<input name="node_id" required minlength="64" maxlength="64" spellcheck="false" autocomplete="off"></label>
+            <label>恢复后此浏览器的设备名称<input name="name" maxlength="80" required placeholder="例如：我的新手机"></label><label>加密恢复包<input name="bundle" type="file" accept="application/json,.json" required></label>
+            <label>恢复包口令<input name="passphrase" type="password" autocomplete="off" required></label>
+            <p class="muted small">恢复包用于重建管理授权。聊天正文和工程文件仍需要现存副本或独立备份。请只在可信客户端恢复。</p>
+            <button type="submit" class="secondary">核验恢复包并恢复</button>
+          </fieldset></form>
+        </details>
+        <button id="replace-key" type="button" class="secondary" hidden>生成新设备密钥并重新配对</button>
+        <div id="saved-connections" class="stack"></div>
       </div>
     </section>
     <div id="workspace" class="workspace" hidden>
       <aside class="sidebar" aria-label="入口和会话">
         <section>
-          <div class="section-heading"><h2>我的入口</h2><span class="tiny-label">此浏览器</span></div>
+          <div class="section-heading"><h2>我的连接</h2><span class="tiny-label">此浏览器</span></div>
           <ul id="entry-list" class="entry-list"></ul>
-          <details class="compact-details"><summary>添加入口</summary><form id="entry-form" class="stack"><label>入口地址<input id="entry-address" name="address" type="url" placeholder="http://192.168.1.10:8080" required></label><button type="submit" class="secondary">保存地址</button></form></details>
+          <details class="compact-details"><summary>添加连接路径</summary><form method="post" id="entry-form" class="stack"><label>入口地址<input name="address" type="url" placeholder="https://node.example.com" required></label><label>目标设备指纹<input name="node_id" required minlength="64" maxlength="64" spellcheck="false" autocomplete="off"></label><label class="check-label"><input name="relay" type="checkbox">经此入口中继</label><button type="submit" class="secondary">保存连接</button></form></details>
         </section>
         <section class="conversation-section">
           <div class="section-heading"><h2>会话</h2><button id="new-conversation" type="button" class="quiet">新建</button></div>
-          <form id="conversation-form" class="stack" hidden><label>会话名称<input id="conversation-title" name="title" required maxlength="200" placeholder="例如：重构支付模块"></label><div class="button-row"><button type="submit" class="secondary">创建</button><button id="cancel-conversation" type="button" class="quiet">取消</button></div></form>
+          <form method="post" id="conversation-form" class="stack" hidden><label>会话名称<input id="conversation-title" name="title" required maxlength="200" placeholder="例如：重构支付模块"></label><div class="button-row"><button type="submit" class="secondary">创建</button><button id="cancel-conversation" type="button" class="quiet">取消</button></div></form>
           <ul id="conversation-list" class="conversation-list"></ul>
         </section>
-        <div class="sidebar-footer"><span id="account-label"></span><span class="muted">仅管理你自己的设备</span></div>
+        <div class="sidebar-footer"><span id="identity-label"></span><span class="muted">仅管理你自己的设备</span></div>
       </aside>
       <section class="work-area">
         <header class="workspace-heading"><div><p class="eyebrow">个人工作空间</p><h1 id="conversation-heading">开始一个会话</h1></div><button id="refresh" class="secondary" type="button">刷新状态</button></header>
         <nav class="view-nav" aria-label="工作空间视图">
-          <button type="button" data-view="chat" aria-current="page">会话</button><button type="button" data-view="tasks">工单 <span id="task-count" class="count">0</span></button><button type="button" data-view="sessions">执行会话</button><button type="button" data-view="devices">设备</button><button type="button" data-view="notifications">通知 <span id="notification-count" class="count">0</span></button>
+          <button type="button" data-view="chat" aria-current="page">会话</button><button type="button" data-view="tasks">工单 <span id="task-count" class="count">0</span></button><button type="button" data-view="sessions">执行会话</button><button type="button" data-view="devices">我的设备</button><button type="button" data-view="recovery">备份与恢复</button><button type="button" data-view="notifications">通知 <span id="notification-count" class="count">0</span></button>
         </nav>
         <div id="sync-state" class="sync-state" role="status"></div>
         <section id="view-chat" class="view chat-view" aria-label="调度会话">
           <div id="messages" class="messages" role="log" aria-label="聊天记录" aria-live="polite" aria-relevant="additions"></div>
-          <form id="message-form" class="composer">
+          <form method="post" id="message-form" class="composer">
             <label for="message-text">给调度 Agent 发消息</label><textarea id="message-text" name="text" rows="3" required maxlength="100000" placeholder="描述目标，或询问某个任务的进展…"></textarea>
             <div class="composer-footer"><label class="scheduler-label">调度设备<select id="scheduler-node" name="scheduler"></select></label><button type="submit" class="primary">发送消息</button></div>
             <p id="manager-hint" class="muted small"></p>
@@ -62,18 +87,25 @@
         <section id="view-tasks" class="view" aria-label="工单" hidden>
           <div class="view-heading"><div><h2>把目标写清楚</h2><p class="muted">执行器结束一轮，工单仍需按验收条件确认。</p></div></div>
           <div id="tasks" class="card-list"></div>
-          <details class="panel"><summary>新建工单</summary><form id="task-form" class="stack"><label>标题<input name="title" required maxlength="200"></label><label>目标<textarea name="goal" rows="3" required maxlength="50000"></textarea></label><label>验收条件<textarea name="acceptance" rows="3" required maxlength="50000"></textarea></label><label class="check-label"><input name="auto_followup" type="checkbox">完成执行后，让调度 Agent 继续检查</label><button type="submit" class="primary">创建工单</button></form></details>
+          <details class="panel"><summary>新建工单</summary><form method="post" id="task-form" class="stack"><label>标题<input name="title" required maxlength="200"></label><label>目标<textarea name="goal" rows="3" required maxlength="50000"></textarea></label><label>验收条件<textarea name="acceptance" rows="3" required maxlength="50000"></textarea></label><label class="check-label"><input name="auto_followup" type="checkbox">完成执行后，让调度 Agent 继续检查</label><button type="submit" class="primary">创建工单</button></form></details>
         </section>
         <section id="view-sessions" class="view" aria-label="执行会话" hidden>
           <div class="view-heading"><div><h2>实际执行会话</h2><p class="muted">操作发到指定设备。结果未知时先核对，避免重复执行。</p></div></div>
           <div id="pending-operations" class="card-list"></div><div id="sessions" class="card-list"></div>
-          <details class="panel"><summary>打开执行会话</summary><form id="session-form" class="stack"><label>执行设备<select id="executor-node" name="target_node" required></select></label><label>执行器<select id="executor-kind" name="executor"><option value="codex">Codex</option><option value="claude_code">Claude Code</option><option value="cursor_agent">Cursor Agent</option></select></label><label>工作目录<input name="cwd" required placeholder="/Users/you/project" maxlength="4096"></label><p class="muted small">目录须位于目标设备配置的允许范围内。</p><button type="submit" class="primary">打开会话</button></form></details>
+          <details class="panel"><summary>打开执行会话</summary><form method="post" id="session-form" class="stack"><label>执行设备<select id="executor-node" name="target_node" required></select></label><label>执行器<select id="executor-kind" name="executor"><option value="codex">Codex</option><option value="claude_code">Claude Code</option><option value="cursor_agent">Cursor Agent</option></select></label><label>工作目录<input name="cwd" required placeholder="/Users/you/project" maxlength="4096"></label><p class="muted small">目录须位于目标设备配置的允许范围内。</p><button type="submit" class="primary">打开会话</button></form></details>
           <details class="panel"><summary>操作记录</summary><div id="operations" class="card-list"></div></details>
         </section>
         <section id="view-devices" class="view" aria-label="我的设备" hidden>
           <div class="view-heading"><div><h2>连接你的设备</h2><p class="muted">每个地址只是入口。设备使用固定身份同步会话和任务。</p></div></div>
           <div id="devices" class="card-list"></div>
-          <section class="panel"><h3>配对另一台设备</h3><form id="invite-form" class="stack"><fieldset><legend>允许新设备承担的角色</legend><div class="check-grid"><label class="check-label"><input type="checkbox" name="role" value="replica" checked>同步</label><label class="check-label"><input type="checkbox" name="role" value="scheduler" checked>调度</label><label class="check-label"><input type="checkbox" name="role" value="executor" checked>执行</label><label class="check-label"><input type="checkbox" name="role" value="relay">中继</label><label class="check-label"><input type="checkbox" name="role" value="gateway">接入</label></div></fieldset><button type="submit" class="secondary">生成配对码</button></form><div id="invite-result" hidden></div></section>
+          <section id="manage-devices" class="panel" hidden><h3>添加设备</h3><p class="muted small">仅把邀请交给你自己的设备。新设备还需在两端核对并确认，邀请到期后自动失效。</p><form method="post" id="invite-form" class="stack"><label>设备类型<select id="invite-kind" name="kind"><option value="client">手机或网页客户端</option><option value="node">运行节点的电脑或服务器</option></select></label><fieldset id="invite-node-roles" hidden><legend>允许运行节点承担的角色</legend><div class="check-grid"><label class="check-label"><input type="checkbox" name="role" value="replica" checked>同步</label><label class="check-label"><input type="checkbox" name="role" value="scheduler" checked>调度</label><label class="check-label"><input type="checkbox" name="role" value="executor" checked>执行</label><label class="check-label"><input type="checkbox" name="role" value="relay">中继</label><label class="check-label"><input type="checkbox" name="role" value="gateway">接入</label></div></fieldset><p class="muted small">普通邀请不会授予管理权限。需要增加管理设备时，在备份与恢复中解锁恢复包并明确授权。</p><button type="submit" class="secondary">创建一次性邀请</button></form><div id="invite-result" hidden></div></section>
+          <section id="pair-requests-panel" class="panel" hidden><h3>核对待配对设备</h3><div id="pair-requests" class="card-list"></div></section>
+        </section>
+        <section id="view-recovery" class="view" aria-label="备份与恢复" hidden>
+          <div class="view-heading"><div><h2>保管自己的恢复材料</h2><p class="muted">恢复身份、恢复解密材料和恢复业务数据是不同的事情。请独立备份重要工程。</p></div></div>
+          <section class="panel"><h3>此浏览器的设备身份</h3><p id="recovery-client-id" class="fingerprint"></p><p class="muted small">设备密钥只保存在此浏览器的 IndexedDB。清除站点数据或更换浏览器后，需要重新配对或恢复。私钥不会写入地址或共享任务记录。</p></section>
+          <section id="manage-recovery" class="panel" hidden><h3>重新加密恢复包</h3><p class="muted small">运行节点不保存个人私钥。使用已有恢复包，可以在此浏览器内更换保护口令并下载新文件。</p><form method="post" id="recovery-export-form" class="stack"><fieldset class="stack" data-key-controls disabled><label>已有加密恢复包<input name="bundle" type="file" accept="application/json,.json" required></label><label>原恢复包口令<input name="old_passphrase" type="password" autocomplete="off" required></label><label>恢复包口令<input name="passphrase" type="password" autocomplete="new-password" minlength="12" required></label><label>再次输入口令<input name="confirmation" type="password" autocomplete="new-password" minlength="12" required></label><p class="muted small">使用至少 12 个字符的独立口令。恢复包和口令请分开保存，遗失后无法重置。</p><button type="submit" class="secondary">下载加密恢复包</button></fieldset></form></section>
+          <section class="panel"><h3>恢复管理权限</h3><form method="post" id="recovery-import-form" class="stack"><fieldset class="stack" data-key-controls disabled><label>恢复后此浏览器的设备名称<input name="name" maxlength="80" required placeholder="例如：我的新手机"></label><label>加密恢复包<input name="bundle" type="file" accept="application/json,.json" required></label><label>恢复包口令<input name="passphrase" type="password" autocomplete="off" required></label><p class="muted small">恢复会建立新的管理授权。已离线设备须同步恢复记录后才会拒绝过期授权。</p><button type="submit" class="secondary">核验恢复包并恢复</button></fieldset></form></section>
         </section>
         <section id="view-notifications" class="view" aria-label="通知" hidden>
           <div class="view-heading"><div><h2>需要你关注的进展</h2><p class="muted">普通状态通知不会调用模型。离线期间的未读通知会在重连后显示。</p></div><button id="enable-notifications" type="button" class="secondary">开启浏览器提醒</button></div><div id="notifications" class="card-list"></div>
