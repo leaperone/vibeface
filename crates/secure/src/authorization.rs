@@ -2215,9 +2215,29 @@ impl VerifiedPolicySet {
         now_ms: u64,
         phase: AuthorizationPhase,
     ) -> Result<VerifiedAuthorization> {
-        let i = &signed.payload;
         let mut budget = Budget::default();
         let invocation_hash = budget.verify(signed)?;
+        self.verify_signed_invocation_body(
+            signed,
+            invocation_hash,
+            budget,
+            facts,
+            transport,
+            now_ms,
+            phase,
+        )
+    }
+    fn verify_signed_invocation_body(
+        &self,
+        signed: &Signed<Invocation>,
+        invocation_hash: ObjectHash,
+        mut budget: Budget,
+        facts: &RequestFacts,
+        transport: &TransportEvidence,
+        now_ms: u64,
+        phase: AuthorizationPhase,
+    ) -> Result<VerifiedAuthorization> {
+        let i = &signed.payload;
         require(
             i.version == AUTH_VERSION
                 && valid_operation_id(&i.operation_id)
