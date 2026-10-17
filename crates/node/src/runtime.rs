@@ -1498,7 +1498,8 @@ pub(crate) mod tests {
 
         impl Remote {
             async fn new() -> Result<Self> {
-                Self::from_fixture(Fixture::new()?).await
+                let fixture = Fixture::new().context("create the real Project dispatch fixture")?;
+                Self::from_fixture(fixture).await
             }
 
             async fn from_fixture(mut fixture: Fixture) -> Result<Self> {
@@ -1544,7 +1545,11 @@ pub(crate) mod tests {
                     &project.directory.join("identity.json"),
                     &serde_json::to_vec(&project.node)?,
                 )?;
-                let node = Arc::new(Runtime::open(&project.directory).await?);
+                let node = Arc::new(
+                    Runtime::open(&project.directory)
+                        .await
+                        .context("reopen the real bound Project database")?,
+                );
                 let mut c = executor.memory()?;
                 project.install(&mut c)?;
                 c.install_policy_journal(&journal, now_ms() as u64)?;

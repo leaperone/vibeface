@@ -539,11 +539,25 @@ fn persisted_admission_facts(
                 manager_field(body, "executor")?.to_owned(),
             )
         };
-        let key: String = connection.query_row(
-            "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
-            params![space.as_str(), target],
-            |row| row.get(0),
-        )?;
+        let key: String = if method == "bind_execution" && body.get("execution_resource").is_some() {
+            use vibeface_secure::authorization::{DeviceId, PublicKey};
+            let _: ResourceRef = serde_json::from_value(body["execution_resource"].clone())?;
+            let _: ObjectHash = serde_json::from_value(body["execution_grant"].clone())?;
+            let key: PublicKey = serde_json::from_value(body["target_public_key"].clone())?;
+            let certificate = state
+                .verify_transport_device(&DeviceId::from_key(&key), proof.admitted_at_ms)?;
+            ensure!(
+                certificate.payload.public_key == key,
+                "historical execution target differs from its independent certificate"
+            );
+            key.to_string()
+        } else {
+            connection.query_row(
+                "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
+                params![space.as_str(), target],
+                |row| row.get(0),
+            )?
+        };
         ensure!(
             crate::crypto::fingerprint(&key)? == target,
             "historical execution target key mismatch"
