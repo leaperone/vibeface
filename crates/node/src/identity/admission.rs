@@ -2622,6 +2622,109 @@ mod manager_tests {
     }
 
     #[test]
+    fn manager_notification_conflict_preserves_an_independent_candidate_and_acknowledgment()
+    -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        fixture.claim("boot")?;
+        let mut notices = Vec::new();
+        for text in ["first candidate", "second candidate"] {
+            let mut body = fixture.body.clone();
+            body["method"] = json!("agent_notification");
+            body["authorization_id"] = json!(format!("notification:{}", Nonce::random()?));
+            body["notification_id"] = json!("shared-notification");
+            body["kind"] = json!("needs_attention");
+            body["text"] = json!(text);
+            let facts = fixture
+                .store
+                .request_facts(&body, fixture.auth.audience())?;
+            let mut invocation = fixture.auth.signed_invocation().payload.clone();
+            invocation.operation_id = facts.operation_id.clone();
+            invocation.body_hash = facts.body_hash.clone();
+            invocation.context = facts.context.clone();
+            invocation.nonce = Nonce::random()?;
+            let signer = Identity::from_secret_hex(&fixture.network.node.secret_key_hex)
+                .map_err(anyhow::Error::msg)?;
+            let auth = fixture.store.authorize_request(
+                &Signed::sign(invocation, &signer)?,
+                &facts,
+                &fixture.transport,
+                now(),
+            )?;
+            let proof =
+                fixture
+                    .network
+                    .freshness(&mut fixture.store, &auth, CheckStage::Admit, now())?;
+            notices.push(fixture.store.append_authorized_event(
+                &fixture.network.node,
+                &auth,
+                &proof,
+                &fixture.transport,
+                &body,
+                "conversation",
+                EventBody::NotificationRaised {
+                    notification_id: "shared-notification".into(),
+                    kind: "needs_attention".into(),
+                    text: text.into(),
+                },
+                vec![],
+                now() as i64,
+            )?);
+        }
+        let mut ack = fixture.network.body("ack", "conversation");
+        ack["notification_id"] = json!("shared-notification");
+        ack["client_id"] = json!("phone");
+        fixture.network.append(
+            &mut fixture.store,
+            &ack,
+            EventBody::NotificationAcknowledged {
+                notification_id: "shared-notification".into(),
+                client_id: "phone".into(),
+            },
+            now(),
+        )?;
+        let mut replica = fixture.network.memory()?;
+        let journal = fixture
+            .store
+            .connection
+            .prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str::<JournalEntry>(&row?)?))
+            .collect::<Result<Vec<_>>>()?;
+        replica.install_policy_journal(&journal, now())?;
+        replica.import_snapshot(
+            fixture.network.space.as_str(),
+            &fixture
+                .store
+                .export_snapshot(fixture.network.space.as_str(), "conversation")?,
+        )?;
+        let second: crate::model::Event = serde_json::from_str(&notices[1].canonical_body)?;
+        let fork = fixture.network.signed_message(
+            &mut fixture.store,
+            "conflicting second notification",
+            second.sequence,
+            second.previous,
+            second.parents,
+        )?;
+        fixture
+            .store
+            .ingest_event(fixture.network.space.as_str(), &fork)?;
+        replica.ingest_event(fixture.network.space.as_str(), &fork)?;
+        for store in [&fixture.store, &replica] {
+            let pending = store.pending_notifications(fixture.network.space.as_str(), "laptop")?;
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].notification_id, "shared-notification");
+            assert_eq!(pending[0].text, "first candidate");
+            assert_eq!(pending[0].event_hash, notices[0].hash);
+            assert!(
+                store
+                    .pending_notifications(fixture.network.space.as_str(), "phone")?
+                    .is_empty()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn reopening_running_manager_preserves_unknown_work_without_replaying_admission() -> Result<()>
     {
         let mut fixture = Fixture::new_at(true)?;
