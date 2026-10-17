@@ -329,9 +329,9 @@ table "operations" {
   primary_key {
     columns = [column.space_id, column.operation_id]
   }
-  foreign_key "operations_node" {
-    columns = [column.space_id, column.target_node]
-    ref_columns = [table.node_certificates.column.space_id, table.node_certificates.column.node_id]
+  foreign_key "operations_space" {
+    columns = [column.space_id]
+    ref_columns = [table.spaces.column.space_id]
   }
   index "operations_session" {
     columns = [column.space_id, column.target_node, column.session_id, column.state]
@@ -1229,5 +1229,130 @@ table "execution_handoff_sessions" {
   }
   check {
     expr = "(revision >= 0)"
+  }
+}
+
+table "execution_handoff_resolution_challenges" {
+  schema = schema.main
+  column "execution_space_id" {
+    type = text
+  }
+  column "nonce" {
+    type = text
+  }
+  column "original_space_id" {
+    type = text
+  }
+  column "operation_id" {
+    type = text
+  }
+  column "resolution_id" {
+    type = text
+  }
+  column "resolution_hash" {
+    type = text
+  }
+  column "challenge" {
+    type = text
+  }
+  column "expires_at_ms" {
+    type = integer
+  }
+  column "consumed" {
+    type    = integer
+    default = 0
+  }
+  primary_key {
+    columns = [column.execution_space_id, column.nonce]
+  }
+  foreign_key "execution_handoff_resolution_challenges_fk_0" {
+    columns     = [column.execution_space_id, column.original_space_id, column.operation_id]
+    ref_columns = [table.execution_handoffs.column.execution_space_id, table.execution_handoffs.column.original_space_id, table.execution_handoffs.column.operation_id]
+  }
+  check {
+    expr = "(expires_at_ms >= 0)"
+  }
+  check {
+    expr = "(consumed IN (0,1))"
+  }
+}
+
+table "execution_handoff_resolutions" {
+  schema = schema.main
+  column "execution_space_id" {
+    type = text
+  }
+  column "original_space_id" {
+    type = text
+  }
+  column "operation_id" {
+    type = text
+  }
+  column "resolution_id" {
+    type = text
+  }
+  column "resolution_hash" {
+    type = text
+  }
+  column "resolver_device" {
+    type = text
+  }
+  column "resolver_nonce" {
+    type = text
+  }
+  column "resolver_invocation_hash" {
+    type = text
+  }
+  column "resolver_body_hash" {
+    type = text
+  }
+  column "submission_device" {
+    type = text
+  }
+  column "submission_nonce" {
+    type = text
+  }
+  column "submission_invocation_hash" {
+    type = text
+  }
+  column "submission_body_hash" {
+    type = text
+  }
+  column "request" {
+    type = text
+  }
+  column "admission_transport" {
+    type = text
+  }
+  column "freshness" {
+    type = text
+  }
+  column "resolved_at_ms" {
+    type = integer
+  }
+  column "result_receipt" {
+    type = text
+  }
+  primary_key {
+    columns = [column.execution_space_id, column.original_space_id, column.operation_id]
+  }
+  foreign_key "execution_handoff_resolutions_fk_0" {
+    columns     = [column.execution_space_id, column.original_space_id, column.operation_id]
+    ref_columns = [table.execution_handoffs.column.execution_space_id, table.execution_handoffs.column.original_space_id, table.execution_handoffs.column.operation_id]
+  }
+  index "handoff_resolution_id_once" {
+    unique  = true
+    columns = [column.original_space_id, column.resolution_id]
+  }
+  index "handoff_resolution_resolver_nonce_once" {
+    unique  = true
+    columns = [column.execution_space_id, column.resolver_device, column.resolver_nonce]
+  }
+  index "handoff_resolution_submission_nonce_once" {
+    unique  = true
+    columns = [column.execution_space_id, column.submission_device, column.submission_nonce]
+  }
+  check {
+    expr = "(resolved_at_ms >= 0)"
   }
 }
