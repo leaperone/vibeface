@@ -1,4 +1,7 @@
+import childProcess from "node:child_process";
 import { access, constants, stat } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
 import { Codex } from "@openai/codex-sdk";
 
@@ -32,6 +35,8 @@ const INIT_FIELDS = new Set([
   "tool_cli",
   "tool_env",
 ]);
+
+class InputClosedError extends Error {}
 
 class ProtocolError extends Error {
   constructor(message) {
@@ -306,7 +311,7 @@ async function* frameReader(stream) {
 
 async function readFrame(reader) {
   const line = await reader.next();
-  if (line.done) throw new ProtocolError("sidecar input closed before the next frame");
+  if (line.done) throw new InputClosedError("sidecar input closed before the next frame");
   try {
     return JSON.parse(line.value);
   } catch {
@@ -314,10 +319,12 @@ async function readFrame(reader) {
   }
 }
 
-function startControlPump(reader, controller) {
+function startControlPump(reader, controller, sessionId) {
   let pendingSessionAck = null;
   const queuedSessionAcks = [];
   let closed = false;
+  let cancelled = false;
+  let failure = null;
   const rejectPending = (error) => {
     if (pendingSessionAck) {
       pendingSessionAck.reject(error);
@@ -339,18 +346,24 @@ function startControlPump(reader, controller) {
           continue;
         }
         if (isObject(frame) && frame.type === "cancel" && Object.keys(frame).every((key) => ["type", "session_id"].includes(key))) {
+          if ((frame.session_id ?? null) !== sessionId()) throw new ProtocolError("cancel did not match the native session");
+          cancelled = true;
           throw new ProtocolError("Codex execution cancelled");
         }
         throw new ProtocolError("unexpected control frame");
       }
     } catch (error) {
       closed = true;
+      cancelled ||= error instanceof InputClosedError;
+      failure = error;
       rejectPending(error);
       controller.abort();
     }
   })();
   return {
     task,
+    get cancelled() { return cancelled; },
+    get failure() { return failure; },
     waitSessionAck(id) {
       if (closed || pendingSessionAck) return Promise.reject(new ProtocolError("session ACK channel is unavailable"));
       const queued = queuedSessionAcks.indexOf(id);
@@ -361,6 +374,79 @@ function startControlPump(reader, controller) {
       return new Promise((resolve, reject) => {
         pendingSessionAck = { id, resolve, reject };
       });
+    },
+  };
+}
+
+function manageCodexProcess(executable, signal) {
+  const originalSpawn = childProcess.spawn;
+  let child = null;
+  let closed = false;
+  let stopping = null;
+  childProcess.spawn = function (file, args, options) {
+    if (file !== executable) return originalSpawn(file, args, options);
+    if (signal.aborted) throw new ProtocolError("Codex execution cancelled before spawn");
+    if (child) throw new ProtocolError("Codex SDK attempted more than one managed process");
+    child = originalSpawn(file, args, { ...options, detached: process.platform !== "win32" });
+    const observeClose = () => { closed = true; };
+    const observeError = () => {};
+    child.once("close", observeClose);
+    child.on("error", observeError);
+    const removeAllListeners = child.removeAllListeners;
+    child.removeAllListeners = function (event) {
+      const result = event === undefined ? removeAllListeners.call(this) : removeAllListeners.call(this, event);
+      // The pinned SDK removes all listeners before the child necessarily emits close.
+      if (!closed && (event === undefined || event === "close")) this.once("close", observeClose);
+      if (event === undefined || event === "error") this.on("error", observeError);
+      return result;
+    };
+    return child;
+  };
+  syncBuiltinESMExports();
+  const groupExists = () => {
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (error) {
+      return error.code !== "ESRCH";
+    }
+  };
+  const killGroup = (name) => {
+    try { process.kill(-child.pid, name); } catch {}
+  };
+  const stop = () => stopping ??= (async () => {
+    if (!child) return true;
+    if (child.pid && process.platform !== "win32") {
+      // shortcut: Codex tools create separate groups; CLI-group exit cannot confirm tool exit without OS containment.
+      killGroup("SIGTERM");
+      const started = performance.now();
+      while (performance.now() - started < 1_500) {
+        if (closed && !groupExists()) return true;
+        if (performance.now() - started >= 300) killGroup("SIGKILL");
+        await delay(20);
+      }
+    } else {
+      if (process.platform === "win32" && !closed) {
+        try { child.kill("SIGKILL"); } catch {}
+      }
+      for (let attempt = 0; attempt < 75; attempt++) {
+        if (closed) return true;
+        await delay(20);
+      }
+    }
+    // An unconfirmed child must not keep the sidecar alive after its uncertain response.
+    try { child.kill("SIGKILL"); } catch {}
+    for (const stream of child.stdio) stream?.destroy();
+    child.unref();
+    return false;
+  })();
+  signal.addEventListener("abort", stop, { once: true });
+  return {
+    stop,
+    restore() {
+      signal.removeEventListener("abort", stop);
+      childProcess.spawn = originalSpawn;
+      syncBuiltinESMExports();
     },
   };
 }
@@ -399,52 +485,77 @@ async function run(input, reader, secrets) {
   }
 
   const controller = new AbortController();
-  const onSignal = () => controller.abort();
+  let signalCancelled = false;
+  let nativeSessionId = input.sessionId;
+  const onSignal = () => { signalCancelled = true; controller.abort(); };
   process.once("SIGTERM", onSignal);
   process.once("SIGINT", onSignal);
-  const control = startControlPump(reader, controller);
-  const streamed = await thread.runStreamed(prompt, { signal: controller.signal });
+  const managed = manageCodexProcess(codexPath, controller.signal);
+  const control = startControlPump(reader, controller, () => nativeSessionId);
+  const interrupted = new Promise((_, reject) => {
+    controller.signal.addEventListener("abort", () => {
+      managed.stop().then(() => reject(new ProtocolError("Codex execution aborted")));
+    }, { once: true });
+  });
   let finalResponse = "";
   let usage = null;
   let turnCompleted = false;
-  let nativeSessionId = input.sessionId;
   let streamBytes = 0;
-  for await (const rawEvent of streamed.events) {
-    const event = redact(rawEvent, secrets);
-    if (event?.type === "thread.started") {
-      const observed = requireId(event.thread_id, "thread_id");
-      if (nativeSessionId !== null && observed !== nativeSessionId) {
-        throw new ProtocolError("Codex resumed a different native session");
+  let failure = null;
+  try {
+    await Promise.race([(async () => {
+      const streamed = await thread.runStreamed(prompt, { signal: controller.signal });
+      for await (const rawEvent of streamed.events) {
+        const event = redact(rawEvent, secrets);
+        if (event?.type === "thread.started") {
+          const observed = requireId(event.thread_id, "thread_id");
+          if (nativeSessionId !== null && observed !== nativeSessionId) {
+            throw new ProtocolError("Codex resumed a different native session");
+          }
+          if (nativeSessionId === null) {
+            nativeSessionId = observed;
+            const sessionAck = control.waitSessionAck(observed);
+            write({ type: "session", session_id: observed });
+            await sessionAck;
+          }
+        }
+        if (event?.type === "item.completed" && event.item?.type === "agent_message") {
+          finalResponse = event.item.text ?? "";
+        }
+        if (event?.type === "turn.completed") {
+          usage = event.usage ?? null;
+          turnCompleted = true;
+        }
+        // SDK item.started/updated/completed each carry the current item snapshot.
+        const message = { type: "event", event: bounded(event, MAX_EVENT_BYTES) };
+        streamBytes += bytes(JSON.stringify(message));
+        if (streamBytes > MAX_STREAM_BYTES) throw new ProtocolError("sidecar output stream exceeded the size limit");
+        write(message);
+        if (event?.type === "turn.failed") throw new Error(event.error?.message || "Codex turn failed");
       }
-      if (nativeSessionId === null) {
-        nativeSessionId = observed;
-        const sessionAck = control.waitSessionAck(observed);
-        write({ type: "session", session_id: observed });
-        await sessionAck;
-      }
-    }
-    if (event?.type === "item.completed" && event.item?.type === "agent_message") {
-      finalResponse = event.item.text ?? "";
-    }
-    if (event?.type === "turn.completed") {
-      usage = event.usage ?? null;
-      turnCompleted = true;
-    }
-    const message = { type: "event", event: bounded(event, MAX_EVENT_BYTES) };
-    streamBytes += bytes(JSON.stringify(message));
-    if (streamBytes > MAX_STREAM_BYTES) throw new ProtocolError("sidecar output stream exceeded the size limit");
-    write(message);
-    if (event?.type === "turn.failed") throw new Error(event.error?.message || "Codex turn failed");
+      if (!turnCompleted) throw new Error("Codex stream ended without turn.completed");
+      if (nativeSessionId === null) throw new Error("Codex stream ended without a native session ID");
+      if (bytes(finalResponse) > MAX_RESULT_BYTES) throw new ProtocolError("Codex final response exceeded the size limit");
+    })(), interrupted]);
+  } catch (error) {
+    failure = error;
   }
-  if (!turnCompleted) throw new Error("Codex stream ended without turn.completed");
-  if (nativeSessionId === null) throw new Error("Codex stream ended without a native session ID");
-  if (bytes(finalResponse) > MAX_RESULT_BYTES) throw new ProtocolError("Codex final response exceeded the size limit");
-  write({ type: "result", session_id: nativeSessionId, final_response: redactString(finalResponse, secrets), usage: bounded(redact(usage, secrets), MAX_EVENT_BYTES) });
   controller.abort();
+  const exited = await managed.stop();
   process.removeListener("SIGTERM", onSignal);
   process.removeListener("SIGINT", onSignal);
-  void control.task;
+  managed.restore();
   closeInput();
+  if (!exited) throw new ProtocolError("Codex cancellation could not confirm managed process exit");
+  if (signalCancelled || control.cancelled) {
+    write({ type: "error", session_id: nativeSessionId, confirmation: "managed_cli_exited", message: "Codex CLI exited; detached tool process exit is unconfirmed", uncertain: true });
+    process.exitCode = 1;
+    return;
+  }
+  if (control.failure) throw control.failure;
+  if (failure) throw failure;
+  write({ type: "result", session_id: nativeSessionId, final_response: redactString(finalResponse, secrets), usage: bounded(redact(usage, secrets), MAX_EVENT_BYTES) });
+  void control.task;
 }
 
 const reader = frameReader(process.stdin);

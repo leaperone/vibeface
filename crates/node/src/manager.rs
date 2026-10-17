@@ -12,7 +12,9 @@ use std::{
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
+    sync::watch,
 };
+pub use vibeface_bridge::agent::AgentFailure as ManagerFailure;
 use vibeface_bridge::agent::{
     self, AgentResult, CustomToolConfig, SdkAgentConfig, ToolCallbackConfig,
 };
@@ -69,11 +71,37 @@ impl Default for ManagerConfig {
     }
 }
 
+impl ManagerKind {
+    pub fn capabilities(self) -> Value {
+        json!({
+            "verified": false,
+            "streaming": true,
+            "cancel": true,
+            "steer": false,
+            "resume_local_session": true,
+            "text_stream_mode": match self { ManagerKind::CursorSdk => "delta_and_snapshot", ManagerKind::CodexSdk => "snapshot" },
+            "cancel_request": true,
+            "cancel_confirmation": self == ManagerKind::CursorSdk,
+            "cancel_confirmation_evidence": match self { ManagerKind::CursorSdk => "provider_terminal_or_managed_process_exit", ManagerKind::CodexSdk => "unavailable_for_detached_sdk_tools" },
+            "native_steer": false,
+            "run_reconcile": false,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct ManagerError {
-    pub uncertain: bool,
+    pub kind: ManagerFailure,
     pub session_id: Option<String>,
     pub message: String,
+}
+impl ManagerError {
+    pub fn uncertain(&self) -> bool {
+        self.kind == ManagerFailure::Unknown
+    }
+    pub fn cancelled(&self) -> bool {
+        self.kind == ManagerFailure::Cancelled
+    }
 }
 impl std::fmt::Display for ManagerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -87,6 +115,7 @@ pub async fn run_manager<F, P, PF>(
     prompt: &str,
     previous_session_id: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
+    cancel: watch::Receiver<bool>,
     progress: P,
 ) -> Result<AgentResult>
 where
@@ -101,6 +130,14 @@ where
     );
     if let Some(id) = previous_session_id {
         vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
+    }
+    if *cancel.borrow() {
+        return Err(ManagerError {
+            kind: ManagerFailure::Cancelled,
+            session_id: previous_session_id.map(str::to_owned),
+            message: "management cancelled before SDK launch".into(),
+        }
+        .into());
     }
     match config.kind {
         ManagerKind::CursorSdk => {
@@ -124,13 +161,14 @@ where
                 prompt,
                 previous_session_id,
                 persist_session,
+                cancel,
                 progress,
             )
             .await
             .map_err(|error| {
                 if let Some(sdk) = error.downcast_ref::<agent::AgentRunError>() {
                     ManagerError {
-                        uncertain: sdk.uncertain,
+                        kind: sdk.kind,
                         session_id: sdk.session_id.clone(),
                         message: sdk.to_string(),
                     }
@@ -146,6 +184,7 @@ where
                 prompt,
                 previous_session_id,
                 persist_session,
+                cancel,
                 progress,
             )
             .await
@@ -158,6 +197,7 @@ async fn run_codex<F, P, PF>(
     prompt: &str,
     session_id: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
+    mut cancel: watch::Receiver<bool>,
     mut progress: P,
 ) -> Result<AgentResult>
 where
@@ -185,7 +225,7 @@ where
         persist.take().unwrap()(id.clone())
             .await
             .map_err(|error| ManagerError {
-                uncertain: false,
+                kind: ManagerFailure::Failed,
                 session_id: native.clone(),
                 message: format!("persist Codex SDK session before resume: {error}"),
             })?;
@@ -202,10 +242,12 @@ where
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
     let mut child = command
         .spawn()
         .context("start official Codex SDK sidecar; install the pinned SDK dependencies first")?;
+    let process_group = child.id().context("Codex SDK sidecar has no process id")?;
     let mut stdin = child.stdin.take().context("Codex SDK input unavailable")?;
     let stdout = child
         .stdout
@@ -227,10 +269,10 @@ where
     });
     let mut sent = false;
     let secrets = secret_values(config);
+    let mut reader = BufReader::new(stdout);
     let operation = async {
         write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":native,"cwd":config.workspace,"model":config.model,"codex_path":codex,
             "tool_cli":tool_cli,"tool_env":config.tool_env})).await?;
-        let mut reader = BufReader::new(stdout);
         let ready = read_message(&mut reader).await?;
         ensure!(
             ready["type"] == "ready" && ready["session_id"].as_str() == native.as_deref(),
@@ -265,7 +307,11 @@ where
                     write_message(&mut stdin, &json!({"type":"session_ack","session_id":id}))
                         .await?;
                 }
-                Some("event") => progress(message["event"].clone()).await?,
+                Some("event") => {
+                    if let Some(event) = codex_progress(&message["event"]) {
+                        progress(event).await?;
+                    }
+                }
                 Some("result") => {
                     ensure!(
                         native.is_some() && message["session_id"].as_str() == native.as_deref(),
@@ -299,7 +345,9 @@ where
             }
         }
     };
+    let mut cancellation_requested = false;
     let outcome = tokio::select! {
+        biased;
         result = tokio::time::timeout(Duration::from_secs(config.timeout_secs), operation) => result.unwrap_or_else(|_|Err(anyhow!("Codex SDK management timed out; reconcile before retrying"))),
         diagnostics = async {
             match (&mut stderr_task).await {
@@ -307,25 +355,115 @@ where
                 _ => Err(anyhow!("Codex SDK diagnostic stream failed")),
             }
         } => diagnostics,
-    };
-    stderr_task.abort();
-    if outcome.is_err() {
-        let _ = write_message(&mut stdin, &json!({"type":"cancel"})).await;
-        if tokio::time::timeout(Duration::from_secs(3), child.wait())
-            .await
-            .is_err()
-        {
-            let _ = child.kill().await;
+        _ = agent::wait_for_cancel(&mut cancel) => {
+            cancellation_requested = true;
+            Err(anyhow!("Codex SDK management cancellation requested"))
         }
+    };
+    let mut cancellation_confirmed = false;
+    if outcome.is_err() {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            write_message(&mut stdin, &json!({"type":"cancel","session_id":native})),
+        )
+        .await;
+        if cancellation_requested {
+            cancellation_confirmed = tokio::time::timeout(Duration::from_secs(6), async {
+                let mut total = 0;
+                loop {
+                    let message = read_message(&mut reader).await?;
+                    total += serde_json::to_vec(&message)?.len();
+                    ensure!(
+                        total <= MAX_STREAM,
+                        "Codex cancellation stream exceeded its size limit"
+                    );
+                    match message["type"].as_str() {
+                        Some("cancelled") => {
+                            ensure!(
+                                message["session_id"].as_str() == native.as_deref()
+                                    && message["confirmation"] == "managed_processes_exited",
+                                "Codex SDK returned an invalid cancellation confirmation"
+                            );
+                            ensure!(
+                                child.wait().await?.success(),
+                                "Codex SDK sidecar failed after cancellation"
+                            );
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        Some("event") => {}
+                        _ => return Err(anyhow!("Codex SDK cancellation was not confirmed")),
+                    }
+                }
+            })
+            .await
+            .is_ok_and(|result| result.is_ok());
+        } else {
+            let _ = tokio::time::timeout(Duration::from_secs(6), child.wait()).await;
+        }
+        let _ = agent::terminate_process_group(&mut child, process_group).await;
     }
+    stderr_task.abort();
     outcome.map_err(|error| {
         ManagerError {
-            uncertain: sent,
+            kind: if cancellation_confirmed {
+                ManagerFailure::Cancelled
+            } else if cancellation_requested || sent {
+                ManagerFailure::Unknown
+            } else {
+                ManagerFailure::Failed
+            },
             session_id: native,
             message: redact_string(error.to_string(), &secrets),
         }
         .into()
     })
+}
+
+fn codex_progress(event: &Value) -> Option<Value> {
+    let kind = event.get("type")?.as_str()?;
+    match kind {
+        "item.started" | "item.updated" | "item.completed" => {
+            let item = event.get("item")?;
+            let id = item.get("id")?.as_str()?;
+            if vibeface_protocol::validate_id(id).is_err() {
+                return None;
+            }
+            match item.get("type")?.as_str()? {
+                "agent_message" => {
+                    let text: String = item
+                        .get("text")?
+                        .as_str()?
+                        .chars()
+                        .filter(|ch| !ch.is_control() || matches!(*ch, '\n' | '\r' | '\t'))
+                        .take(16_384)
+                        .collect();
+                    Some(json!({"type":"text_snapshot","item_id":id,"text":text}))
+                }
+                "command_execution" | "mcp_tool_call" | "file_change" | "web_search" => {
+                    let state = if kind == "item.completed" {
+                        "completed"
+                    } else {
+                        "running"
+                    };
+                    let mut value =
+                        json!({"type":"tool","item_id":id,"state":state,"tool":item["type"]});
+                    if let Some(status) = item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .filter(|text| text.len() <= 128 && !text.chars().any(char::is_control))
+                    {
+                        value["state"] = json!(status);
+                    }
+                    Some(value)
+                }
+                _ => None,
+            }
+        }
+        "turn.started" => Some(json!({"type":"status","state":"running"})),
+        "turn.completed" => Some(json!({"type":"status","state":"finishing"})),
+        "turn.failed" | "error" => Some(json!({"type":"status","state":"failed"})),
+        _ => None,
+    }
 }
 
 fn resolve_executable(path: &Path) -> Result<PathBuf> {
@@ -561,6 +699,7 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
                 tokio::fs::write(marker, b"yes").await?;
                 Ok(())
             },
+            watch::channel(false).1,
             |_| async { Ok(()) },
         )
         .await
@@ -572,14 +711,80 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
             "fixture",
             None,
             |_| async { anyhow::bail!("fixture storage failed") },
+            watch::channel(false).1,
             |_| async { Ok(()) },
         )
         .await
         .err()
         .unwrap();
         let error = error.downcast_ref::<ManagerError>().unwrap();
-        assert!(error.uncertain);
+        assert!(error.uncertain());
         assert_eq!(error.session_id.as_deref(), Some("fixture-native"));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[test]
+    fn codex_full_item_updates_are_snapshots_without_tool_arguments() {
+        let started = codex_progress(&json!({"type":"item.started","item":{"id":"m1","type":"agent_message","text":"hello"}})).unwrap();
+        let updated = codex_progress(&json!({"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"hello\nworld"}})).unwrap();
+        assert_eq!(started["type"], "text_snapshot");
+        assert_eq!(
+            updated,
+            json!({"type":"text_snapshot","item_id":"m1","text":"hello\nworld"})
+        );
+        assert_eq!(codex_progress(&json!({"type":"item.completed","item":{"id":"t1","type":"command_execution","command":"secret-token","aggregated_output":"private","status":"completed"}})).unwrap(),
+            json!({"type":"tool","item_id":"t1","state":"completed","tool":"command_execution"}));
+        assert!(codex_progress(&json!({"type":"item.updated","item":{"id":"r1","type":"reasoning","text":"private"}})).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_requires_bound_managed_process_confirmation() {
+        let directory =
+            std::env::temp_dir().join(format!("vibeface-manager-cancel-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let script = directory.join("fixture.sh");
+        for (session, expected) in [
+            ("fixture-native", ManagerFailure::Cancelled),
+            ("wrong-native", ManagerFailure::Unknown),
+        ] {
+            let fixture = format!(
+                r#"IFS= read -r init || exit 1
+printf '%s\n' '{{"type":"ready","session_id":"fixture-native"}}'
+IFS= read -r ack || exit 2
+printf '%s\n' '{{"type":"event","event":{{"type":"turn.started"}}}}'
+IFS= read -r cancel || exit 3
+case "$cancel" in *cancel*) ;; *) exit 4 ;; esac
+printf '%s\n' '{{"type":"cancelled","session_id":"{session}","confirmation":"managed_processes_exited"}}'
+"#
+            );
+            tokio::fs::write(&script, fixture).await.unwrap();
+            let config = ManagerConfig {
+                kind: ManagerKind::CodexSdk,
+                workspace: directory.clone(),
+                node_bin: "/bin/sh".into(),
+                codex_bin: "/usr/bin/true".into(),
+                codex_sdk_script: script.clone(),
+                timeout_secs: 5,
+                ..ManagerConfig::default()
+            };
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let error = run_manager(
+                &config,
+                "fixture",
+                Some("fixture-native"),
+                |_| async { Ok(()) },
+                cancel_rx,
+                move |event| {
+                    assert_eq!(event, json!({"type":"status","state":"running"}));
+                    cancel_tx.send(true).unwrap();
+                    async { Ok(()) }
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.downcast_ref::<ManagerError>().unwrap().kind, expected);
+        }
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
