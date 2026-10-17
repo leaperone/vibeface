@@ -21,6 +21,9 @@ let recoveryRequest;
 let recoveryPreparation;
 let nodeEnrollment;
 let nodeEnrollmentCommit;
+let crossNodeRequest;
+let crossNodePreparation;
+let crossNodeCommit;
 function sealedRecovery(material, password) {
   const plaintext = encoder.encode(material);
   try { return Buffer.from(crypto.recoverySeal(plaintext, password)).toString('hex'); }
@@ -322,6 +325,77 @@ async function command(input) {
       nodeEnrollment.free(); nodeEnrollment = undefined; openedRecoveryMaterial = undefined;
     }
   }
+  if (input.op === 'cross_recovery_sources') {
+    return JSON.parse(crypto.inspectCrossNodeRecoverySources(openedRecoveryMaterial, Date.now()));
+  }
+  if (input.op === 'build_cross_recovery') {
+    assert(openedRecoveryMaterial, 'cross-Node recovery requires locally opened recovery material');
+    assert(!crossNodeRequest && !crossNodePreparation && !crossNodeCommit, 'cross-Node recovery already has an original request');
+    const now = Date.now();
+    const claim = crypto.verifyNodeClaim(JSON.stringify(input.claim), input.node_public_key, input.claim_nonce, now);
+    try {
+      const resources = input.source_projects || JSON.parse(crypto.inspectCrossNodeRecoverySources(openedRecoveryMaterial, now)).source_projects;
+      crossNodeRequest = JSON.parse(crypto.buildCrossNodeRecoveryRequest(
+        openedRecoveryMaterial, identity('root'), identity(), claim, JSON.stringify(resources),
+        now + 3_600_000, now, Math.min(now + 60_000, input.claim.payload.expires_at_ms),
+      ));
+      return crossNodeRequest;
+    } finally { claim.free(); }
+  }
+  if (input.op === 'prepare_cross_recovery') {
+    assert(crossNodeRequest && !crossNodePreparation && !crossNodeCommit, 'cross-Node preparation requires the saved original request');
+    const now = Date.now();
+    const verified = crypto.verifyCrossNodeRecoveryContext(JSON.stringify(input.context), JSON.stringify(crossNodeRequest), now);
+    try {
+      crossNodePreparation = crypto.prepareCrossNodeAccountRecovery(
+        openedRecoveryMaterial, verified, identity('root'), identity(), now + 86_400_000, now,
+      );
+      return JSON.parse(crossNodePreparation.possessionRequestJson());
+    } finally { verified.free(); }
+  }
+  if (input.op === 'finish_cross_preparation') {
+    assert(crossNodePreparation && !crossNodeCommit, 'cross-Node completion requires the saved preparation');
+    const now = Date.now();
+    crossNodeCommit = crypto.finishCrossNodeAccountRecovery(
+      crossNodePreparation, identity('root'), input.target_proof, input.source_proof, now,
+    );
+    const pending = crossNodeCommit.recoveryMaterialJson(identity('root'), openedRecoveryMaterial, input.endpoint, now);
+    return { request: JSON.parse(crossNodeCommit.requestJson()), review: JSON.parse(crossNodeCommit.publicReviewJson()),
+      pending_envelope: sealedRecovery(pending, input.password) };
+  }
+  if (input.op === 'restore_cross_preparation') {
+    assert(connections.size === 0 && !crossNodeRequest && !crossNodePreparation && !crossNodeCommit,
+      'pending cross-Node recovery restores before any new connection or request');
+    const plaintext = crypto.recoveryOpen(Uint8Array.from(Buffer.from(input.pending_envelope, 'hex')), input.password);
+    try {
+      crossNodeCommit = crypto.restorePreparedCrossNodeRecoveryCommit(decoder.decode(plaintext), Date.now());
+      const client = crossNodeCommit.clientIdentity();
+      keys.get('client').free(); keys.set('client', client);
+      return { request: JSON.parse(crossNodeCommit.requestJson()), review: JSON.parse(crossNodeCommit.publicReviewJson()),
+        resume: JSON.parse(crossNodeCommit.resumeContextJson()), identity: exposed(client) };
+    } finally { plaintext.fill(0); }
+  }
+  if (input.op === 'finish_cross_recovery') {
+    assert(crossNodeCommit, 'cross-Node recovery requires the saved original commit preparation');
+    const now = Date.now();
+    const verified = crypto.finishCrossNodeRecoveryCommit(crossNodeCommit, JSON.stringify(input.committed), now);
+    try {
+      const pins = JSON.parse(verified.pinsJson());
+      const scope = JSON.parse(verified.scopeJson());
+      const review = JSON.parse(crossNodeCommit.publicReviewJson());
+      const sourceReadsCurrent = scope !== null && now < review.source_read_expires_at_ms;
+      const result = { pins, scope, authorization: JSON.parse(verified.bundleJson()),
+        installation: JSON.parse(verified.installationJson()),
+        source_reads_current: sourceReadsCurrent,
+        source_read_selections: sourceReadsCurrent ? JSON.parse(verified.sourceReadSelectionsJson()) : null,
+        recovery_envelope: sealedRecovery(verified.finalRecoveryMaterialJson(input.endpoint, now), input.password) };
+      trust = scope ? { pins, scope } : undefined;
+      crossNodeCommit.free(); crossNodeCommit = undefined;
+      crossNodePreparation?.free(); crossNodePreparation = undefined;
+      crossNodeRequest = undefined; openedRecoveryMaterial = undefined;
+      return result;
+    } finally { verified.free(); }
+  }
   if (input.op === 'trust') {
     assert(!trust, 'local account trust is already established');
     trust = structuredClone(input.trust);
@@ -395,4 +469,6 @@ creation?.free();
 recoveryPreparation?.free();
 nodeEnrollment?.free();
 nodeEnrollmentCommit?.free();
+crossNodePreparation?.free();
+crossNodeCommit?.free();
 for (const key of keys.values()) key.free();
