@@ -2,17 +2,115 @@ use super::{events::*, task_binding::*, *};
 use serde_json::Value;
 
 pub const MAX_EXECUTION_HANDOFF_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_EXECUTION_HANDOFF_EVENTS: usize = 256;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CompactSdkOrigin {
+    pub message_event: EventRef,
+    pub invocation: Signed<Invocation>,
+    pub challenge: FreshnessChallenge,
+    pub receipts: Vec<Signed<FreshnessReceipt>>,
+    pub admitted_at_ms: u64,
+    pub transport: StoredTransport,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectExecutionSource {
+    pub version: u16,
+    pub capsule_hash: ObjectHash,
+    pub project: ResourceRef,
+    pub task: EventRef,
+    pub operation_id: String,
+    pub original_invocation_hash: ObjectHash,
+    pub original_admission_hash: ObjectHash,
+    pub binding_hash: String,
+    pub binding_generation: u64,
+    pub execution_session: SessionRef,
+    pub sdk_origin_hash: Option<ObjectHash>,
+    pub task_sdk_origin_hash: Option<ObjectHash>,
+}
+impl sealed::Sealed for ProjectExecutionSource {}
+impl SignedObject for ProjectExecutionSource {
+    const DOMAIN: &'static str = "project-execution-source-v2";
+}
+
+pub struct VerifiedProjectExecutionSource {
+    capsule_hash: ObjectHash,
+}
+impl VerifiedProjectExecutionSource {
+    pub fn capsule_hash(&self) -> &ObjectHash {
+        &self.capsule_hash
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionHandoff {
     pub version: u16,
     pub project_dispatch: SignedEvent,
-    pub project_history: Vec<SignedEvent>,
+    pub task_creation: SignedEvent,
+    pub sdk_origin: Option<CompactSdkOrigin>,
+    pub task_sdk_origin: Option<CompactSdkOrigin>,
     pub execution_resource: ResourceRef,
     pub execution_audience: Audience,
     pub target_public_key: PublicKey,
+    pub source_attestation: Option<Signed<ProjectExecutionSource>>,
+}
+
+impl ExecutionHandoff {
+    pub fn source_statement(&self) -> Result<ProjectExecutionSource> {
+        let (event, proof, _, binding) = original_dispatch(self)?;
+        #[derive(Serialize)]
+        struct Capsule<'a> {
+            version: u16,
+            project_dispatch: &'a SignedEvent,
+            task_creation: &'a SignedEvent,
+            sdk_origin: &'a Option<CompactSdkOrigin>,
+            task_sdk_origin: &'a Option<CompactSdkOrigin>,
+            execution_resource: &'a ResourceRef,
+            execution_audience: &'a Audience,
+            target_public_key: &'a PublicKey,
+        }
+        Ok(ProjectExecutionSource {
+            version: AUTH_VERSION,
+            capsule_hash: ObjectHash::body(&Capsule {
+                version: self.version,
+                project_dispatch: &self.project_dispatch,
+                task_creation: &self.task_creation,
+                sdk_origin: &self.sdk_origin,
+                task_sdk_origin: &self.task_sdk_origin,
+                execution_resource: &self.execution_resource,
+                execution_audience: &self.execution_audience,
+                target_public_key: &self.target_public_key,
+            })?,
+            project: ResourceRef {
+                space: SpaceId::parse(&event.network_id)?,
+                resource: event.resource_id,
+            },
+            task: EventRef::parse(&self.task_creation.hash)?,
+            operation_id: proof.invocation.payload.operation_id.clone(),
+            original_invocation_hash: proof.invocation.hash()?,
+            original_admission_hash: ObjectHash::body(&proof)?,
+            binding_hash: binding_hash(&binding.binding).map_err(invalid_shape)?,
+            binding_generation: binding.binding.generation,
+            execution_session: SessionRef {
+                target: self.execution_audience.device.clone(),
+                session_id: binding.binding.session_id,
+            },
+            sdk_origin_hash: self.sdk_origin.as_ref().map(ObjectHash::body).transpose()?,
+            task_sdk_origin_hash: self
+                .task_sdk_origin
+                .as_ref()
+                .map(ObjectHash::body)
+                .transpose()?,
+        })
+    }
+
+    pub fn attest_source(&mut self, identity: &Identity) -> Result<()> {
+        self.source_attestation = Some(Signed::sign(self.source_statement()?, identity)?);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -222,17 +320,8 @@ fn original_dispatch(
     handoff: &ExecutionHandoff,
 ) -> Result<(Event, AdmissionProof, Value, SignedBinding)> {
     require(
-        handoff.version == AUTH_VERSION
-            && handoff.project_history.len() <= MAX_EXECUTION_HANDOFF_EVENTS
-            && handoff
-                .project_history
-                .windows(2)
-                .all(|pair| pair[0].hash < pair[1].hash)
-            && handoff
-                .project_history
-                .iter()
-                .all(|event| event.hash != handoff.project_dispatch.hash),
-        "invalid execution handoff event set",
+        handoff.version == AUTH_VERSION,
+        "invalid execution handoff version",
     )?;
     let event: Event =
         serde_json::from_str(&handoff.project_dispatch.canonical_body).map_err(invalid_shape)?;
@@ -346,6 +435,82 @@ fn execution_action(request: &Value) -> Result<Action> {
 }
 
 impl VerifiedPolicySet {
+    pub fn verify_project_execution_source(
+        &self,
+        handoff: &ExecutionHandoff,
+        now_ms: u64,
+    ) -> Result<VerifiedProjectExecutionSource> {
+        let (dispatch, proof, _, binding) = original_dispatch(handoff)?;
+        let statement = handoff.source_statement()?;
+        let signed =
+            handoff
+                .source_attestation
+                .as_ref()
+                .ok_or(AuthorizationError::InvalidProof(
+                    "missing Project execution source attestation",
+                ))?;
+        signed.verify_signature()?;
+        require(
+            signed.payload == statement,
+            "Project execution source attestation changed",
+        )?;
+        let audience = &proof.invocation.payload.audience;
+        let project = self
+            .resource(&statement.project.space, &statement.project.resource)
+            .ok_or(AuthorizationError::InvalidProof("missing source Project"))?;
+        let certificate = self.find_device(&audience.device)?;
+        require(
+            project.payload.kind == ResourceKind::Project
+                && project.payload.host == audience.service
+                && certificate.payload.subject == Actor::Service(project.payload.host.clone())
+                && certificate
+                    .payload
+                    .uses
+                    .contains(&DeviceUse::ServiceInvocation)
+                && signed.issuer == certificate.payload.public_key
+                && proof.invocation.payload.resource == statement.project,
+            "capsule is not attested by its current Project host",
+        )?;
+        self.validate_certificate(
+            certificate,
+            now_ms,
+            &mut Budget::default(),
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+        )?;
+        let task = events::verify_signed_event(
+            &serde_json::to_string(&handoff.task_creation).map_err(invalid_shape)?,
+            statement.project.space.as_str(),
+            statement.project.resource.as_str(),
+            certificate.payload.public_key.as_str(),
+        )
+        .map_err(invalid_shape)?;
+        events::verify_signed_event(
+            &serde_json::to_string(&handoff.project_dispatch).map_err(invalid_shape)?,
+            statement.project.space.as_str(),
+            statement.project.resource.as_str(),
+            certificate.payload.public_key.as_str(),
+        )
+        .map_err(invalid_shape)?;
+        let EventBody::TaskCreated { task_id, .. } = &task.event().body else {
+            return Err(AuthorizationError::InvalidProof(
+                "capsule source is not a task creation",
+            ));
+        };
+        require(
+            binding.binding.task_ref == handoff.task_creation.hash
+                && binding.binding.task_id == *task_id
+                && binding.binding.authority_node == task.event().author
+                && task.event().scope_id == dispatch.scope_id
+                && task.event().blobs.is_empty(),
+            "execution capsule belongs to another task",
+        )?;
+        verify_binding(&binding, certificate.payload.public_key.as_str()).map_err(invalid_shape)?;
+        Ok(VerifiedProjectExecutionSource {
+            capsule_hash: statement.capsule_hash,
+        })
+    }
+
     pub fn verify_execution_handoff(
         &self,
         wire: &SignedExecutionHandoff,
@@ -355,6 +520,7 @@ impl VerifiedPolicySet {
         now_ms: u64,
     ) -> Result<VerifiedExecutionHandoff> {
         self.check_current(original, now_ms)?;
+        self.verify_project_execution_source(&wire.handoff, now_ms)?;
         let hash = wire.hash()?;
         let facts = execution_submission_facts(&wire.handoff, original)?;
         let (event, _, request, binding) = original_dispatch(&wire.handoff)?;
