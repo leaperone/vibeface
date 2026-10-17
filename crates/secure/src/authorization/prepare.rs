@@ -22,6 +22,214 @@ pub struct PrepareIntent {
 }
 signed_object!(PrepareIntent, "prepare-intent-v2");
 
+/// A remote executor selected from policy roots already trusted by the caller.
+#[derive(Clone, Debug)]
+pub struct VerifiedExecutionDestination {
+    project: ResourceRef,
+    project_audience: Audience,
+    resource: ResourceRef,
+    audience: Audience,
+    public_key: PublicKey,
+    context: InvocationContext,
+    action: Action,
+    grant_leaf: ObjectHash,
+    heads: Vec<PolicyStamp>,
+    initiator: Actor,
+    initiating_grant: Option<ObjectHash>,
+}
+impl VerifiedExecutionDestination {
+    pub fn resource(&self) -> &ResourceRef {
+        &self.resource
+    }
+    pub fn audience(&self) -> &Audience {
+        &self.audience
+    }
+    pub fn public_key(&self) -> &PublicKey {
+        &self.public_key
+    }
+    pub fn grant_leaf(&self) -> &ObjectHash {
+        &self.grant_leaf
+    }
+    pub fn heads(&self) -> &[PolicyStamp] {
+        &self.heads
+    }
+    pub fn initiator(&self) -> &Actor {
+        &self.initiator
+    }
+    pub fn initiating_grant(&self) -> Option<&ObjectHash> {
+        self.initiating_grant.as_ref()
+    }
+    pub fn check_facts(&self, facts: &RequestFacts) -> Result<()> {
+        let mut context = facts.context.clone();
+        context.sdk_session = None;
+        require(
+            facts.resource == self.project
+                && facts.audience == self.project_audience
+                && facts.action == self.action
+                && context == self.context,
+            "remote destination differs from Project facts",
+        )
+    }
+}
+
+impl VerifiedPolicySet {
+    pub fn verify_execution_destination(
+        &self,
+        project: &ResourceRef,
+        project_audience: &Audience,
+        resource: &ResourceRef,
+        public_key: &PublicKey,
+        grant_leaf: &ObjectHash,
+        context: &InvocationContext,
+        action: Action,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionDestination> {
+        require(
+            matches!(
+                action,
+                Action::ExecutionOpen
+                    | Action::ExecutionSend
+                    | Action::ExecutionSteer
+                    | Action::ExecutionInterrupt
+                    | Action::ExecutionRespondApproval
+                    | Action::OperationStatusRead
+            ),
+            "unsupported remote execution action",
+        )?;
+        let project_record = self
+            .resource(&project.space, &project.resource)
+            .ok_or(AuthorizationError::InvalidProof("missing Project resource"))?;
+        let execution = self.resource(&resource.space, &resource.resource).ok_or(
+            AuthorizationError::InvalidProof("missing ExecutionService resource"),
+        )?;
+        let host = self.verify_service_device(&project.space, &project_audience.device, now_ms)?;
+        let target_device = DeviceId::from_key(public_key);
+        let target = self.verify_service_device(&resource.space, &target_device, now_ms)?;
+        let audience = Audience {
+            service: execution.payload.host.clone(),
+            device: target_device,
+        };
+        require(
+            project_record.payload.kind == ResourceKind::Project
+                && project_record.payload.host == project_audience.service
+                && host.payload.subject == Actor::Service(project_audience.service.clone())
+                && host.payload.uses.contains(&DeviceUse::ServiceInvocation)
+                && execution.payload.kind == ResourceKind::ExecutionService
+                && execution.payload.host != project_audience.service
+                && target.payload.public_key == *public_key
+                && target.payload.subject == Actor::Service(audience.service.clone())
+                && context
+                    .execution_session
+                    .as_ref()
+                    .is_some_and(|session| session.target == audience.device)
+                && context.task.is_some()
+                && context.conversation.is_some()
+                && context.executor_kind.is_some()
+                && context.workspace_resource.as_ref() == Some(&project.resource),
+            "remote destination must be an independent registered execution service",
+        )?;
+        let leaf = self
+            .grant(grant_leaf)
+            .ok_or(AuthorizationError::InvalidProof(
+                "missing remote execution grant",
+            ))?;
+        let mut execution_context = context.clone();
+        execution_context.sdk_session = None;
+        execution_context.workspace_resource = Some(resource.resource.clone());
+        require(
+            leaf.payload.scope == ResourceScope::Exact(resource.clone())
+                && leaf.payload.grantee
+                    == Grantee::Actor(Actor::Service(project_audience.service.clone()))
+                && leaf.payload.remaining_delegations == 0
+                && leaf.payload.audience == audience
+                && !leaf.payload.constraints.require_account_actor
+                && !leaf.payload.constraints.require_webauthn_uv
+                && leaf.payload.actions.contains(&Action::ExecutionSubmit)
+                && leaf.payload.actions.contains(&action)
+                && leaf.payload.actions.iter().all(|action| {
+                    matches!(
+                        action,
+                        Action::ExecutionSubmit
+                            | Action::ExecutionOpen
+                            | Action::ExecutionSend
+                            | Action::ExecutionSteer
+                            | Action::ExecutionInterrupt
+                            | Action::ExecutionRespondApproval
+                            | Action::OperationStatusRead
+                    )
+                })
+                && leaf.payload.expires_at_ms < u64::MAX
+                && leaf.payload.constraints.context == execution_context,
+            "remote execution grant must exactly bind this task and executor",
+        )?;
+        let mut budget = Budget::default();
+        let mut dependencies = BTreeMap::new();
+        budget.verify(project_record)?;
+        budget.verify(execution)?;
+        for certificate in [host, target] {
+            self.validate_certificate(
+                certificate,
+                now_ms,
+                &mut budget,
+                &mut dependencies,
+                &mut BTreeSet::new(),
+            )?;
+        }
+        let path = self.grant_chain(Some(grant_leaf))?;
+        let (initiating, _) =
+            self.verify_grant_path(&path, now_ms, &mut budget, &mut dependencies, true)?;
+        self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
+        let (initiator, initiating_grant) = match initiating {
+            Some((actor, hash)) => (actor, Some(hash)),
+            None => (Actor::Service(project_audience.service.clone()), None),
+        };
+        let mut context = context.clone();
+        context.sdk_session = None;
+        Ok(VerifiedExecutionDestination {
+            project: project.clone(),
+            project_audience: project_audience.clone(),
+            resource: resource.clone(),
+            audience,
+            public_key: public_key.clone(),
+            context,
+            action,
+            grant_leaf: grant_leaf.clone(),
+            heads: dependencies.into_values().collect(),
+            initiator,
+            initiating_grant,
+        })
+    }
+}
+
+fn remote_selection(body: &Value) -> Result<Option<(ResourceRef, PublicKey, ObjectHash)>> {
+    let fields = [
+        body.get("execution_resource"),
+        body.get("target_public_key"),
+        body.get("execution_grant"),
+    ];
+    if fields.iter().all(|field| field.is_none()) {
+        return Ok(None);
+    }
+    require(
+        fields
+            .iter()
+            .all(|field| field.is_some_and(|value| !value.is_null())),
+        "remote execution selection is incomplete",
+    )?;
+    require(
+        matches!(body["method"].as_str(), Some("operate" | "bind_execution")),
+        "remote execution selection is not valid for this method",
+    )?;
+    Ok(Some((
+        serde_json::from_value(body["execution_resource"].clone())
+            .map_err(|_| AuthorizationError::InvalidProof("invalid execution resource"))?,
+        serde_json::from_value(body["target_public_key"].clone())
+            .map_err(|_| AuthorizationError::InvalidProof("invalid execution public key"))?,
+        serde_json::from_value(body["execution_grant"].clone())
+            .map_err(|_| AuthorizationError::InvalidProof("invalid execution grant"))?,
+    )))
+}
+
 #[derive(Clone, Debug)]
 pub struct VerifiedPrepareAuthorization {
     resource: ResourceRef,
@@ -30,8 +238,12 @@ pub struct VerifiedPrepareAuthorization {
     operation_id: String,
     audience: Audience,
     presenter: DeviceId,
+    destination: Option<VerifiedExecutionDestination>,
 }
 impl VerifiedPrepareAuthorization {
+    pub fn execution_destination(&self) -> Option<&VerifiedExecutionDestination> {
+        self.destination.as_ref()
+    }
     pub fn resource(&self) -> &ResourceRef {
         &self.resource
     }
@@ -256,7 +468,17 @@ fn check_raw_context(intent: &PrepareIntent, body: &Value, audience_key: &Public
     if context.execution_session.is_some() {
         require(found, "prepare execution session has no raw session")?;
     }
-    if body["method"].as_str() == Some("operate") {
+    let remote = remote_selection(body)?;
+    if let Some((_, key, _)) = &remote {
+        require(
+            intent.execution_target_public_key.as_ref() == Some(key)
+                && context.execution_session.as_ref().is_some_and(|session| {
+                    session.target == DeviceId::from_key(key) && session.target != i.audience.device
+                }),
+            "remote execution target differs from the explicit client pin",
+        )?;
+    }
+    if body["method"].as_str() == Some("operate") && remote.is_none() {
         require(
             context
                 .execution_session
@@ -435,6 +657,20 @@ impl VerifiedPolicySet {
                 "execution key differs from policy certificate",
             )?;
         }
+        let destination = remote_selection(raw_body)?
+            .map(|(resource, key, grant)| {
+                self.verify_execution_destination(
+                    &i.resource,
+                    local_audience,
+                    &resource,
+                    &key,
+                    &grant,
+                    &i.context,
+                    i.action,
+                    now_ms,
+                )
+            })
+            .transpose()?;
         let facts = RequestFacts {
             resource: i.resource.clone(),
             action: expected_action,
@@ -465,6 +701,7 @@ impl VerifiedPolicySet {
             operation_id: i.operation_id.clone(),
             audience: i.audience.clone(),
             presenter: i.presenter.clone(),
+            destination,
         })
     }
 }
@@ -481,9 +718,23 @@ mod tests {
         let leaf = leaf.unwrap_or_else(|| f.state.grants.keys().next().unwrap().clone());
         let ah = f.state.account_history(&f.account).unwrap();
         let sh = f.state.space_history(&space).unwrap();
-        let mut journal = vec![JournalEntry::AccountGenesis(ah[0].clone())];
-        journal.extend(f.state.devices.values().cloned().map(JournalEntry::Device));
-        journal.extend(ah[1..].iter().cloned().map(JournalEntry::Account));
+        let mut journal = Vec::new();
+        for (index, document) in ah.iter().enumerate() {
+            journal.push(if index == 0 {
+                JournalEntry::AccountGenesis(document.clone())
+            } else {
+                JournalEntry::Account(document.clone())
+            });
+            let stamp = account_stamp(document).unwrap();
+            journal.extend(
+                f.state
+                    .devices
+                    .values()
+                    .filter(|certificate| certificate.payload.issued_under == stamp)
+                    .cloned()
+                    .map(JournalEntry::Device),
+            );
+        }
         for (index, document) in sh.iter().enumerate() {
             journal.push(if index == 0 {
                 JournalEntry::SpaceGenesis(document.clone())
@@ -589,6 +840,226 @@ mod tests {
             },
             now,
         )
+    }
+
+    #[test]
+    fn remote_prepare_requires_an_exact_current_execution_grant() {
+        let mut f = Fixture::new();
+        let executor = Identity::from_secret_hex(&hex::encode([87; 32])).unwrap();
+        let execution_key = PublicKey::of(&executor);
+        let space = SpaceId::personal(&f.account);
+        let audience = Audience {
+            service: ServiceId::from_key(&PublicKey::of(&f.node)),
+            device: DeviceId::from_key(&PublicKey::of(&f.node)),
+        };
+        let mut certificate = DeviceCertificate {
+            version: AUTH_VERSION,
+            owner: PolicyDomain::Account(f.account.clone()),
+            subject: Actor::Service(ServiceId::from_key(&execution_key)),
+            device: DeviceId::from_key(&execution_key),
+            public_key: execution_key.clone(),
+            uses: vec![DeviceUse::Noise, DeviceUse::ServiceInvocation],
+            possession: None,
+            enrollment_grant: None,
+            issued_under: f
+                .state
+                .head(&PolicyDomain::Account(f.account.clone()))
+                .unwrap()
+                .clone(),
+            nonce: Nonce::random().unwrap(),
+            not_before_ms: 0,
+            expires_at_ms: 1_000_000,
+        };
+        certificate.prove_possession(&executor).unwrap();
+        let hash = f
+            .state
+            .install_device(Signed::sign(certificate, &f.root).unwrap(), NOW)
+            .unwrap();
+        let mut account = f.state.account(&f.account).unwrap().clone();
+        account.previous = f
+            .state
+            .head(&PolicyDomain::Account(f.account.clone()))
+            .cloned();
+        account.sequence += 1;
+        account.devices.push(hash);
+        account.devices.sort();
+        f.state
+            .install_account(Signed::sign(account, &f.root).unwrap())
+            .unwrap();
+        let execution = ResourceRef {
+            space: space.clone(),
+            resource: ResourceId::from_bytes([88; 32]),
+        };
+        let stamp = f
+            .state
+            .head(&PolicyDomain::Space(space.clone()))
+            .unwrap()
+            .clone();
+        let resource_hash = f
+            .state
+            .install_resource(
+                Signed::sign(
+                    ResourceRecord {
+                        version: AUTH_VERSION,
+                        space: space.clone(),
+                        resource: execution.resource.clone(),
+                        kind: ResourceKind::ExecutionService,
+                        host: ServiceId::from_key(&execution_key),
+                        issued_under: stamp.clone(),
+                        nonce: Nonce::random().unwrap(),
+                    },
+                    &f.root,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let project = ResourceRef {
+            space: space.clone(),
+            resource: ResourceId::from_bytes([10; 32]),
+        };
+        let context = InvocationContext {
+            conversation: Some("chat".into()),
+            task: Some(EventRef::parse(&hex::encode([89; 32])).unwrap()),
+            execution_session: Some(SessionRef {
+                target: DeviceId::from_key(&execution_key),
+                session_id: "remote-session".into(),
+            }),
+            executor_kind: Some("codex".into()),
+            workspace_resource: Some(project.resource.clone()),
+            sdk_session: None,
+        };
+        let mut execution_context = context.clone();
+        execution_context.workspace_resource = Some(execution.resource.clone());
+        let grant = Signed::sign(
+            Grant {
+                version: AUTH_VERSION,
+                owner_space: space.clone(),
+                scope: ResourceScope::Exact(execution.clone()),
+                grantee: Grantee::Actor(Actor::Service(audience.service.clone())),
+                actions: vec![Action::ExecutionSend, Action::ExecutionSubmit],
+                audience: Audience {
+                    service: ServiceId::from_key(&execution_key),
+                    device: DeviceId::from_key(&execution_key),
+                },
+                constraints: GrantConstraints {
+                    context: execution_context,
+                    ..Default::default()
+                },
+                parent: None,
+                remaining_delegations: 0,
+                issued_under: stamp.clone(),
+                not_before_ms: 0,
+                expires_at_ms: 1_000_000,
+                nonce: Nonce::random().unwrap(),
+            },
+            &f.root,
+        )
+        .unwrap();
+        let leaf = f.state.install_grant(grant.clone(), NOW).unwrap();
+        let mut document = f.state.space(&space).unwrap().clone();
+        document.previous = Some(stamp);
+        document.sequence += 1;
+        document.resources.push(resource_hash);
+        document.resources.sort();
+        document.grants.push(leaf.clone());
+        document.grants.sort();
+        f.state
+            .install_space(Signed::sign(document, &f.root).unwrap())
+            .unwrap();
+        let (auth, user) = client(&f, None);
+        let body = json!({"method":"operate","space_id":space,"resource_id":project.resource,
+            "authorization_id":"prepare_1","conversation_id":"chat","task_ref":context.task,
+            "execution_resource":execution,"target_public_key":execution_key,"execution_grant":leaf,
+            "request":{"conversation_id":"chat","session_id":"remote-session",
+                "target_node":hex::encode(Sha256::digest(crate::decode32(execution_key.as_str()).unwrap())),
+                "action":{"type":"send","text":"one task"}}});
+        let raw = PrepareContext {
+            context: context.clone(),
+            execution_target_public_key: Some(execution_key.clone()),
+            ..Default::default()
+        };
+        let signed = sign(&auth, &body, &raw, &user, "execution_send").unwrap();
+        let verified = check(&f, &signed, &body, Action::ExecutionSend, NOW).unwrap();
+        assert_eq!(
+            verified.execution_destination().unwrap().grant_leaf(),
+            &leaf
+        );
+        let mut ordinary = body.clone();
+        for field in ["execution_resource", "target_public_key", "execution_grant"] {
+            ordinary.as_object_mut().unwrap().remove(field);
+        }
+        assert!(sign(&auth, &ordinary, &raw, &user, "execution_send").is_err());
+        let mut changed = context.clone();
+        changed.task = Some(EventRef::parse(&hex::encode([90; 32])).unwrap());
+        assert!(
+            f.state
+                .verify_execution_destination(
+                    &project,
+                    &audience,
+                    &execution,
+                    &execution_key,
+                    &leaf,
+                    &changed,
+                    Action::ExecutionSend,
+                    NOW
+                )
+                .is_err()
+        );
+        assert!(
+            f.state
+                .verify_execution_destination(
+                    &project,
+                    &audience,
+                    &execution,
+                    &PublicKey::of(&user),
+                    &leaf,
+                    &context,
+                    Action::ExecutionSend,
+                    NOW
+                )
+                .is_err()
+        );
+        let mut wide = grant.payload.clone();
+        wide.scope = ResourceScope::WholeSpace(space.clone());
+        let wide = f
+            .state
+            .install_grant(Signed::sign(wide, &f.root).unwrap(), NOW)
+            .unwrap();
+        assert!(
+            f.state
+                .verify_execution_destination(
+                    &project,
+                    &audience,
+                    &execution,
+                    &execution_key,
+                    &wide,
+                    &context,
+                    Action::ExecutionSend,
+                    NOW
+                )
+                .is_err()
+        );
+        let mut document = f.state.space(&space).unwrap().clone();
+        document.previous = f.state.head(&PolicyDomain::Space(space.clone())).cloned();
+        document.sequence += 1;
+        document.grants.retain(|hash| hash != &leaf);
+        f.state
+            .install_space(Signed::sign(document, &f.root).unwrap())
+            .unwrap();
+        assert!(
+            f.state
+                .verify_execution_destination(
+                    &project,
+                    &audience,
+                    &execution,
+                    &execution_key,
+                    &leaf,
+                    &context,
+                    Action::ExecutionSend,
+                    NOW
+                )
+                .is_err()
+        );
     }
 
     #[test]
