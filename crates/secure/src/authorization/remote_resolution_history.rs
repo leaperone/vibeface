@@ -90,7 +90,7 @@ fn load(
         .into_iter()
         .chain(execution.journal)
         .filter_map(|entry| match ObjectHash::body(&entry) {
-            Ok(hash) if seen.insert(hash) => Some(Ok(entry)),
+            Ok(hash) if seen.insert(hash.clone()) => Some(Ok(entry)),
             Ok(_) => None,
             Err(error) => Some(Err(error)),
         })
