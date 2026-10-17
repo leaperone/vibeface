@@ -75,7 +75,7 @@ pub(crate) fn validate_remote_resource_path(value: &str) -> Result<&str> {
     Ok(value)
 }
 
-fn check_destination_heads_in(connection: &Connection, heads: &[PolicyStamp]) -> Result<()> {
+pub(super) fn check_destination_heads_in(connection: &Connection, heads: &[PolicyStamp]) -> Result<()> {
     for stamp in heads {
         let (kind, id) = match &stamp.domain {
             PolicyDomain::Account(id) => ("account", id.as_str()),
@@ -98,7 +98,7 @@ fn check_destination_heads_in(connection: &Connection, heads: &[PolicyStamp]) ->
     Ok(())
 }
 
-fn dispatch_facts_from(
+pub(super) fn dispatch_facts_from(
     connection: &Connection,
     policies: &VerifiedPolicySet,
     body: &Value,
@@ -106,7 +106,7 @@ fn dispatch_facts_from(
     now_ms: u64,
 ) -> Result<VerifiedDispatchFacts> {
     ensure!(
-        matches!(body["method"].as_str(), Some("operate" | "bind_execution")),
+        matches!(body["method"].as_str(), Some("operate" | "bind_execution" | "resolve_unknown")),
         "remote dispatch method is not supported"
     );
     let project = ResourceRef {
