@@ -55,6 +55,9 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
         "service management requires the current managed binary; run {}",
         binary.display()
     );
+    if matches!(action, Action::Install | Action::Start | Action::Restart) {
+        config::Config::load(data)?;
+    }
     let mut command = Command::new(root.join("current/scripts/install-node-service.sh"));
     command.arg(action.argument()).arg("--data-dir").arg(data);
     if matches!(action, Action::Install | Action::InstallUpdater) {
@@ -71,7 +74,6 @@ pub async fn run(options: Service) -> Result<()> {
     let data = std::fs::canonicalize(options.data_dir)
         .context("initialized data directory is required; run vibeface-node init first")?;
     config::identity(&data)?;
-    config::Config::load(&data)?;
     let root = update::managed_install_root(&data)?;
     let status = command(&root, &data, &std::env::current_exe()?, options.action)?
         .status()
@@ -93,6 +95,16 @@ mod tests {
         std::fs::write(package.join("vibeface-node"), b"binary").unwrap();
         std::os::unix::fs::symlink(&package, root.join("current")).unwrap();
         let data = root.join("data with spaces");
+        std::fs::create_dir(&data).unwrap();
+        let project = root.join("project");
+        std::fs::create_dir(&project).unwrap();
+        config::Config::local(
+            "127.0.0.1:4790".parse().unwrap(),
+            vec![project.clone()],
+            false,
+        )
+        .save(&data)
+        .unwrap();
         let executable = package.join("vibeface-node");
         let install = command(&root, &data, &executable, Action::Install).unwrap();
         let install = install.as_std();
@@ -115,6 +127,20 @@ mod tests {
         let unrelated = root.join("local-build");
         std::fs::write(&unrelated, b"another binary").unwrap();
         assert!(command(&root, &data, &unrelated, Action::Install).is_err());
+        std::fs::remove_dir(project).unwrap();
+        assert!(config::Config::load(&data).is_err());
+        for action in [
+            Action::Stop,
+            Action::Status,
+            Action::Uninstall,
+            Action::InstallUpdater,
+            Action::UninstallUpdater,
+        ] {
+            assert!(command(&root, &data, &executable, action).is_ok());
+        }
+        for action in [Action::Install, Action::Start, Action::Restart] {
+            assert!(command(&root, &data, &executable, action).is_err());
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }
