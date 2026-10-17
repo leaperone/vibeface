@@ -272,7 +272,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = PolicyState::load(&tx)?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
         if let Some(saved) = pending_from(&tx, space, authorization)? {
             ensure!(
                 saved.wire.resolution.account_admission.source_body == *body
@@ -404,7 +404,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = PolicyState::load(&tx)?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
         let mut pending = pending_from(&tx, space, authorization)?
             .context("resolution acknowledgement has no prepared Account decision")?;
         ensure!(

@@ -1044,6 +1044,24 @@ impl Store {
                 current == expected,
                 "freshness challenge references an outdated local authority policy"
             );
+            let (kind, id) = match &expected.domain {
+                PolicyDomain::Account(id) => ("account", id.as_str()),
+                PolicyDomain::Space(id) => ("space", id.as_str()),
+            };
+            let persisted: Option<(u64, u64, String)> = self.connection.query_row(
+                "SELECT authority_epoch,sequence,head_hash FROM current_policy_heads WHERE domain_kind=? AND domain_id=?",
+                params![kind,id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).optional()?;
+            ensure!(
+                persisted
+                    == Some((
+                        current.authority_epoch,
+                        current.sequence,
+                        current.head.to_string()
+                    )),
+                "persisted authority policy changed before freshness signing"
+            );
             ensure!(
                 authority.device == DeviceId::from_key(&key)
                     && authority.service == ServiceId::from_key(&key),
@@ -1373,5 +1391,39 @@ impl crate::runtime::Runtime {
             ),
             _ => anyhow::bail!("unknown identity method"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::test_support::{TestNetwork, now};
+
+    #[test]
+    fn freshness_signing_rejects_authority_revocation_from_another_connection() -> Result<()> {
+        let network = TestNetwork::new()?;
+        let path = network.directory.join("freshness-authority.sqlite3");
+        let mut stale = network.at(&path)?;
+        let body = network.body("create_conversation", "freshness-scope");
+        let (authorization, _) = network.authorization(&stale, &body, now())?;
+        let challenge = stale.issue_freshness(&authorization, CheckStage::Admit, now())?;
+        assert_eq!(
+            stale
+                .sign_current_receipts(&challenge, &network.node, now())?
+                .len(),
+            challenge.policies.len()
+        );
+        let mut writer = Store::open(&path)?;
+        network.revoke_node(&mut writer)?;
+        let error = stale
+            .sign_current_receipts(&challenge, &network.node, now())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("persisted authority policy changed"),
+            "{error}"
+        );
+        Ok(())
     }
 }
