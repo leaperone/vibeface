@@ -225,7 +225,10 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
     .await
     {
         Ok(()) => {
-            let work = if matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+            let work = if matches!(
+                *request.method(),
+                Method::GET | Method::HEAD | Method::OPTIONS
+            ) {
                 Ok(None)
             } else {
                 app.node.maintenance.enter().map(Some)
@@ -235,9 +238,10 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
                 Err(_) => ApiError(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "node is preparing an update; try again after it restarts".into(),
-                ).into_response(),
+                )
+                .into_response(),
             }
-        },
+        }
         Err(error) => error.into_response(),
     };
     let headers = response.headers_mut();

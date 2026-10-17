@@ -12,14 +12,15 @@ use std::{
     time::Duration,
 };
 use vibeface_node::{
-    api, maintenance,
-    update::{self, Update},
+    api,
     auth::AuthStore,
     config::{self, Config, ManagerSettings, PeerConfig},
     crypto::{LocalIdentity, verify_trust_bundle},
+    maintenance,
     model::TrustBundle,
     runtime::Runtime,
     store::Store,
+    update::{self, Update},
 };
 
 #[derive(Parser)]
