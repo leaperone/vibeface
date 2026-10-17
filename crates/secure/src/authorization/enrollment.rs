@@ -1640,6 +1640,97 @@ mod tests {
     }
 
     #[test]
+    fn offer_approval_checks_the_exact_intent_without_a_business_bundle() {
+        let f = Fixture::new();
+        let json = create_device_enrollment_offer(
+            &key(3),
+            f.account().as_str(),
+            "https://node.example",
+            &key(4).public_key_hex(),
+            "[]",
+            END as f64,
+            &f.pins_json(),
+            &f.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let offer = verify_device_enrollment_offer(&json, NOW as f64).unwrap();
+        let intent_json =
+            create_device_enrollment_intent_from_offer(&offer, &key(5), NOW as f64).unwrap();
+        let canonical_json = verify_device_enrollment_intent_for_offer(
+            &offer,
+            &intent_json,
+            &key(5).public_key_hex(),
+            NOW as f64,
+        )
+        .unwrap();
+        let intent: DeviceEnrollmentIntent = parse(&canonical_json).unwrap();
+        assert_eq!(canonical_json.as_bytes(), canonical(&intent).unwrap());
+        let signed = Signed::sign(intent.clone(), &key(3)).unwrap();
+        let qualified =
+            verify_account_enrollment_from_offer(&encode(&signed).unwrap(), &offer, NOW as f64)
+                .unwrap();
+        assert_eq!(qualified.intent(), &intent);
+        assert_eq!(qualified.intent_hash(), &ObjectHash::body(&intent).unwrap());
+        for field in 0..8 {
+            let mut changed = intent.clone();
+            match field {
+                0 => changed.target = DeviceId::from_key(&PublicKey::of(&key(19))),
+                1 => changed.requested_rights = vec![AccountRight::EnrollDevice],
+                2 => changed.certificate_expires_at_ms = END + 1,
+                3 => changed.certificate_not_before_ms = NOW - 1,
+                4 => changed.certificate_not_before_ms = NOW + 1,
+                5 => changed.account = AccountId::from_root(&PublicKey::of(&key(19))),
+                6 => changed.expected_heads[0].sequence += 1,
+                _ => changed.new_device_public_key = PublicKey::of(&key(19)),
+            }
+            assert!(
+                verify_device_enrollment_intent_for_offer(
+                    &offer,
+                    &encode(&changed).unwrap(),
+                    &key(5).public_key_hex(),
+                    NOW as f64
+                )
+                .is_err()
+            );
+            if field != 7 {
+                assert!(
+                    verify_account_enrollment_from_offer(
+                        &encode(&Signed::sign(changed, &key(3)).unwrap()).unwrap(),
+                        &offer,
+                        NOW as f64
+                    )
+                    .is_err()
+                );
+            }
+        }
+        assert!(
+            verify_account_enrollment_from_offer(
+                &encode(&Signed::sign(intent.clone(), &key(1)).unwrap()).unwrap(),
+                &offer,
+                NOW as f64
+            )
+            .is_err()
+        );
+        assert!(
+            verify_account_enrollment_from_offer(
+                &encode(&Signed::sign(intent, &key(5)).unwrap()).unwrap(),
+                &offer,
+                NOW as f64
+            )
+            .is_err()
+        );
+        assert!(
+            verify_account_enrollment_from_offer(
+                &encode(&signed).unwrap(),
+                &offer,
+                offer.expires_at_ms()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn historical_root_and_recovery_keys_cannot_be_enrolled_as_daily_devices() {
         let f = Fixture::new();
         let mut state = f.state();

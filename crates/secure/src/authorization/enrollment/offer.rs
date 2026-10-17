@@ -318,3 +318,82 @@ pub fn create_device_enrollment_intent_from_offer(
     };
     encode(&create().map_err(|error| error.to_string())?)
 }
+
+fn intent_state_from_offer(
+    offer: &VerifiedEnrollmentOffer,
+    intent: &DeviceEnrollmentIntent,
+    expected_new_device: &PublicKey,
+    now: u64,
+) -> Result<VerifiedPolicySet> {
+    let checked = verify_enrollment_offer(&offer.signed, now)?;
+    let value = &checked.signed.payload;
+    validate_window(
+        intent.certificate_not_before_ms,
+        intent.certificate_expires_at_ms,
+        now,
+    )?;
+    require(
+        intent.account == value.account
+            && intent.new_device_public_key == *expected_new_device
+            && intent.requested_rights == value.requested_rights
+            && intent.certificate_not_before_ms >= value.issued_at_ms
+            && intent.certificate_expires_at_ms <= value.certificate_expires_at_ms
+            && intent.target == DeviceId::from_key(&value.entry.node_public_key)
+            && intent.expected_heads == [checked.account_head],
+        "device enrollment intent differs from verified offer",
+    )?;
+    let account_pins: Vec<_> = value
+        .pins
+        .iter()
+        .filter(|pin| pin.domain == PolicyDomain::Account(value.account.clone()))
+        .cloned()
+        .collect();
+    let state = replay_policies(&account_pins, &value.manager_journal)?;
+    independent_device_key(&state, &intent.account, expected_new_device)?;
+    Ok(state)
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyDeviceEnrollmentIntentForOffer))]
+pub fn verify_device_enrollment_intent_for_offer(
+    offer: &VerifiedEnrollmentOffer,
+    intent_json: &str,
+    expected_new_device_public_key: &str,
+    now_ms: f64,
+) -> crate::Result<String> {
+    let verify = || -> Result<String> {
+        let intent: DeviceEnrollmentIntent = parse(intent_json)?;
+        intent_state_from_offer(
+            offer,
+            &intent,
+            &PublicKey::parse(expected_new_device_public_key)?,
+            time(now_ms)?,
+        )?;
+        String::from_utf8(canonical(&intent)?)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid enrollment intent UTF-8"))
+    };
+    verify().map_err(|error| error.to_string())
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyAccountEnrollmentFromOffer))]
+pub fn verify_account_enrollment_from_offer(
+    signed_intent_json: &str,
+    offer: &VerifiedEnrollmentOffer,
+    now_ms: f64,
+) -> crate::Result<VerifiedAccountEnrollment> {
+    let verify = || -> Result<VerifiedAccountEnrollment> {
+        let signed: Signed<DeviceEnrollmentIntent> = decode_signed(signed_intent_json.as_bytes())?;
+        require(
+            signed.issuer == offer.signed.issuer,
+            "enrollment approval is from another manager",
+        )?;
+        let now = time(now_ms)?;
+        let state = intent_state_from_offer(
+            offer,
+            &signed.payload,
+            &signed.payload.new_device_public_key,
+            now,
+        )?;
+        verify_account_enrollment(&state, &signed, now)
+    };
+    verify().map_err(|error| error.to_string())
+}
