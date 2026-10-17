@@ -163,6 +163,7 @@ struct PendingPair {
     invite_id: String,
     request_id: String,
     name: String,
+    request_hash: Option<String>,
 }
 
 #[tokio::main]
@@ -420,7 +421,12 @@ fn invitation(options: &Pair) -> Result<Invitation> {
     Ok(invitation)
 }
 
-fn verify_review(review: &PairReview, invite: &InviteEnvelope, member: &Member) -> Result<()> {
+fn verify_review(
+    review: &PairReview,
+    invite: &InviteEnvelope,
+    member: &Member,
+    request_hash: &str,
+) -> Result<()> {
     let payload = &invite.payload;
     ensure!(
         review.version == payload.version
@@ -429,7 +435,7 @@ fn verify_review(review: &PairReview, invite: &InviteEnvelope, member: &Member) 
             && review.inviter_subject_id == payload.inviter_subject_id
             && review.epoch == payload.epoch
             && review.expires_at_ms == payload.expires_at_ms
-            && review.proposal_hash == payload.hash()?
+            && review.proposal_hash == request_hash
             && review.new_member == *member,
         "pairing review does not match the invitation and local device"
     );
@@ -453,7 +459,7 @@ async fn pair(options: Pair) -> Result<()> {
     );
     let member = Member::node(identity, &options.name, payload.node_roles.clone())?;
     let pending_path = options.data.data_dir.join("pairing.pending.json");
-    let pending = if pending_path.exists() {
+    let mut pending = if pending_path.exists() {
         let pending: PendingPair = serde_json::from_slice(&read_bounded(&pending_path, 8192)?)?;
         ensure!(
             pending.url == url
@@ -470,6 +476,7 @@ async fn pair(options: Pair) -> Result<()> {
             invite_id: payload.invite_id.clone(),
             request_id: uuid::Uuid::new_v4().to_string(),
             name: options.name.clone(),
+            request_hash: None,
         };
         create_private(&pending_path, &serde_json::to_vec(&pending)?)?;
         pending
@@ -545,8 +552,18 @@ async fn pair(options: Pair) -> Result<()> {
                         && request.member == member,
                     "pairing request does not match this device and invitation"
                 );
-                request.proof =
-                    identity.sign_payload("identity-pair", &request.signing_bytes()?)?;
+                let signing_bytes = request.signing_bytes()?;
+                let request_hash = digest(&signing_bytes);
+                ensure!(
+                    pending
+                        .request_hash
+                        .as_ref()
+                        .is_none_or(|previous| previous == &request_hash),
+                    "pairing request template changed; original pending receipt was preserved"
+                );
+                pending.request_hash = Some(request_hash);
+                config::private_write(&pending_path, &serde_json::to_vec(&pending)?)?;
+                request.proof = identity.sign_payload("identity-pair", &signing_bytes)?;
                 let result = client
                     .call("pair_request", json!({"request":request}))
                     .await?;
@@ -556,7 +573,15 @@ async fn pair(options: Pair) -> Result<()> {
                         .context("pairing review missing")?
                         .clone(),
                 )?;
-                verify_review(&review, &invitation.invite.invite, &member)?;
+                verify_review(
+                    &review,
+                    &invitation.invite.invite,
+                    &member,
+                    pending
+                        .request_hash
+                        .as_deref()
+                        .context("pending request hash is missing")?,
+                )?;
                 let signature =
                     identity.sign_payload("identity-pair-review", &review.signing_bytes()?)?;
                 client
@@ -578,7 +603,15 @@ async fn pair(options: Pair) -> Result<()> {
                             .context("pending review missing")?
                             .clone(),
                     )?;
-                    verify_review(&review, &invitation.invite.invite, &member)?;
+                    verify_review(
+                        &review,
+                        &invitation.invite.invite,
+                        &member,
+                        pending
+                            .request_hash
+                            .as_deref()
+                            .context("pending request hash is missing")?,
+                    )?;
                     let signature =
                         identity.sign_payload("identity-pair-review", &review.signing_bytes()?)?;
                     client
