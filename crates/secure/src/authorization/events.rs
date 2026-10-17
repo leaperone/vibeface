@@ -351,8 +351,16 @@ pub fn verify_signed_event(
     let key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| "invalid event public key")?;
     let mut signed_bytes = b"vibeface:event:v2:".to_vec();
     signed_bytes.extend_from_slice(envelope.hash.as_bytes());
-    key.verify_strict(&signed_bytes, &signature)
-        .map_err(|_| "invalid event signature")?;
+    crate::signature_verification::verify_cached(
+        key.as_bytes(),
+        "vibeface:event:v2",
+        &signed_bytes,
+        &signature_bytes,
+        || {
+            key.verify_strict(&signed_bytes, &signature)
+                .map_err(|_| "invalid event signature".to_owned())
+        },
+    )?;
     let envelope_context_hash = ObjectHash::body(&envelope).map_err(|e| e.to_string())?;
     Ok(VerifiedEvent {
         envelope,

@@ -740,9 +740,17 @@ pub fn verify_passkey_assertion(
         .map_err(|_| "invalid passkey DER signature")?;
     let mut signed = auth_bytes;
     signed.extend_from_slice(&Sha256::digest(&client_bytes));
-    public_key(&credential.cose_public_key)?
-        .verify(&signed, &signature)
-        .map_err(|_| "invalid passkey signature")?;
+    let key = public_key(&credential.cose_public_key)?;
+    crate::signature_verification::verify_cached(
+        credential.cose_public_key.as_slice(),
+        "webauthn-assertion",
+        &signed,
+        signature.to_der().as_bytes(),
+        || {
+            key.verify(&signed, &signature)
+                .map_err(|_| "invalid passkey signature".to_owned())
+        },
+    )?;
     Ok(VerifiedPasskeyAssertion {
         envelope: pending.envelope.clone(),
         record_hash: credential.record_hash.clone(),

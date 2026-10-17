@@ -7,10 +7,10 @@ pub use authenticator_management::{
 };
 pub mod bootstrap;
 pub mod directory;
+pub mod enrollment;
 pub mod execution_handoff;
 pub mod execution_service;
 pub mod remote_share;
-pub mod enrollment;
 pub mod passkey_node;
 pub mod projection;
 pub mod services;
@@ -1040,8 +1040,13 @@ impl Budget {
         if self.signatures.len() + self.external_signatures.len() >= MAX_PROOF_SIGNATURES {
             return Err(AuthorizationError::BudgetExceeded);
         }
-        crate::verify(key.as_str(), domain, bytes, signature.as_str())
-            .map_err(|_| AuthorizationError::InvalidProof("invalid object signature"))?;
+        crate::verify(key.as_str(), domain, bytes, signature.as_str()).map_err(|error| {
+            if error == crate::signature_verification::SIGNATURE_BUDGET_ERROR {
+                AuthorizationError::BudgetExceeded
+            } else {
+                AuthorizationError::InvalidProof("invalid object signature")
+            }
+        })?;
         self.signatures
             .insert((key.clone(), domain.to_owned(), hash, signature.clone()));
         Ok(())

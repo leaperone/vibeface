@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 
 pub mod authorization;
 pub mod membership;
+pub mod signature_verification;
 pub mod webauthn;
 
 mod recovery;
@@ -73,8 +74,11 @@ pub fn verify(public_key: &str, domain: &str, payload: &[u8], signature: &str) -
         .map_err(|_| "invalid identity public key")?;
     let bytes = hex::decode(signature).map_err(|_| "invalid signature encoding")?;
     let signature = Signature::from_slice(&bytes).map_err(|_| "invalid signature size")?;
-    key.verify_strict(&signing_message(domain, payload)?, &signature)
-        .map_err(|_| "invalid identity signature".to_owned())
+    let message = signing_message(domain, payload)?;
+    signature_verification::verify_cached(key.as_bytes(), domain, &message, &bytes, || {
+        key.verify_strict(&message, &signature)
+            .map_err(|_| "invalid identity signature".to_owned())
+    })
 }
 
 fn decode32(value: &str) -> Result<[u8; 32]> {
