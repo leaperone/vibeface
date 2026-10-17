@@ -809,6 +809,7 @@ pub struct PasskeyAssertionProof {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyPasskeyAssertion))]
 pub fn verify_assertion_json(
     proof_json: &str,
+    trusted_state_json: &str,
     pinned_roots_json: &str,
     journal_json: &str,
     expected_envelope_hash: &str,
@@ -817,6 +818,11 @@ pub fn verify_assertion_json(
     now_ms: f64,
 ) -> Result<VerifiedPasskeyAssertion> {
     let proof: PasskeyAssertionProof = decode_json(proof_json, 65_536)?;
+    let trusted_state: AuthenticatorState = decode_json(trusted_state_json, 1024)?;
+    require(
+        proof.state == trusted_state,
+        "passkey proof ledger does not match independent trusted state",
+    )?;
     expected_pending(
         &proof.pending,
         expected_envelope_hash,
@@ -832,7 +838,7 @@ pub fn verify_assertion_json(
     let authorized = policies
         .verify_authenticator(&proof.record, now_ms)
         .map_err(|e| e.to_string())?;
-    let credential = RegisteredPasskey::from_authorized(&authorized, proof.state)?;
+    let credential = RegisteredPasskey::from_authorized(&authorized, trusted_state)?;
     verify_passkey_assertion(&proof.pending, &credential, &proof.response, now_ms)
 }
 
@@ -1363,13 +1369,13 @@ mod tests {
             PasskeyPurpose::EnrollDevice,
             AuthenticationCeremony::IdentifiedAccount,
         );
-        let assertion = assertion(
+        let response = assertion(
             &assertion_pending,
             auth(&assertion_pending, 0x0d, 0),
             client(&assertion_pending, "webauthn.get"),
             None,
         );
-        assert!(verify_passkey_assertion(&assertion_pending, &passkey, &assertion, NOW).is_ok());
+        assert!(verify_passkey_assertion(&assertion_pending, &passkey, &response, NOW).is_ok());
         let journal = vec![
             JournalEntry::AccountGenesis(genesis),
             JournalEntry::Authenticator(signed.clone()),
@@ -1384,7 +1390,7 @@ mod tests {
             pending: assertion_pending.clone(),
             record: signed.clone(),
             state: passkey.state(),
-            response: assertion,
+            response,
         };
         let expected = assertion_pending.envelope_hash().unwrap();
         let proof_json = serde_json::to_string(&proof).unwrap();
@@ -1392,6 +1398,7 @@ mod tests {
         let pins_json = serde_json::to_string(&pins).unwrap();
         let verified = verify_assertion_json(
             &proof_json,
+            &serde_json::to_string(&proof.state).unwrap(),
             &pins_json,
             &journal_json,
             expected.as_str(),
@@ -1402,11 +1409,51 @@ mod tests {
         .unwrap();
         assert_eq!(verified.account(), &account);
         assert!(verified.proof_json().unwrap().contains("record_hash"));
+        let mut lowered = proof.clone();
+        lowered.state.sign_count = 2;
+        lowered.response = assertion(
+            &assertion_pending,
+            auth(&assertion_pending, 0x0d, 3),
+            client(&assertion_pending, "webauthn.get"),
+            None,
+        );
+        let lowered_json = serde_json::to_string(&lowered).unwrap();
+        let trusted = AuthenticatorState {
+            sign_count: 3,
+            backup_state: false,
+        };
+        assert!(
+            verify_assertion_json(
+                &lowered_json,
+                &serde_json::to_string(&trusted).unwrap(),
+                &pins_json,
+                &journal_json,
+                expected.as_str(),
+                "client.example",
+                "https://client.example",
+                NOW as f64
+            )
+            .is_err()
+        );
+        assert!(
+            verify_assertion_json(
+                &lowered_json,
+                &serde_json::to_string(&lowered.state).unwrap(),
+                &pins_json,
+                &journal_json,
+                expected.as_str(),
+                "client.example",
+                "https://client.example",
+                NOW as f64
+            )
+            .is_ok()
+        );
         let mut wrong_pins = pins.clone();
         wrong_pins[0].genesis_root = PublicKey::of(&node);
         assert!(
             verify_assertion_json(
                 &proof_json,
+                &serde_json::to_string(&proof.state).unwrap(),
                 &serde_json::to_string(&wrong_pins).unwrap(),
                 &journal_json,
                 expected.as_str(),
