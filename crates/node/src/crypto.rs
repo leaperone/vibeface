@@ -289,6 +289,68 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn admission(
+        owner: &LocalIdentity,
+        space: &str,
+        resource: &vibeface_secure::authorization::ResourceId,
+    ) -> Result<AdmissionProof> {
+        use vibeface_secure::authorization::*;
+        let identity = vibeface_secure::Identity::from_secret_hex(&owner.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let key = PublicKey::of(&identity);
+        let actor = Actor::Account(AccountId::from_root(&key));
+        let device = DeviceId::from_key(&key);
+        let audience = Audience {
+            service: ServiceId::from_key(&key),
+            device: device.clone(),
+        };
+        let source_body = serde_json::json!({"method":"create_conversation","space_id":space,"authorization_id":"test","conversation_id":"c","title":"test"});
+        let invocation = Signed::sign(
+            Invocation {
+                version: AUTH_VERSION,
+                actor: actor.clone(),
+                device: device.clone(),
+                initiator: actor,
+                initiating_grant: None,
+                resource: ResourceRef {
+                    space: SpaceId::parse(space)?,
+                    resource: resource.clone(),
+                },
+                action: Action::ConversationCreate,
+                audience: audience.clone(),
+                presenter: device.clone(),
+                operation_id: "test".into(),
+                body_hash: ObjectHash::body(&source_body)?,
+                grant_leaf: ObjectHash::parse(&format!("h2_{}", "0".repeat(64)))?,
+                expected_policies: vec![],
+                context: InvocationContext::default(),
+                nonce: Nonce::from_bytes([1; 32]),
+                not_before_ms: 0,
+                expires_at_ms: 100,
+            },
+            &identity,
+        )?;
+        let challenge = FreshnessChallenge {
+            version: AUTH_VERSION,
+            stage: CheckStage::Admit,
+            invocation_hash: invocation.hash()?,
+            operation_id: "test".into(),
+            body_hash: invocation.payload.body_hash.clone(),
+            audience,
+            presenter: device,
+            policies: vec![],
+            nonce: Nonce::from_bytes([2; 32]),
+            issued_at_ms: 0,
+            expires_at_ms: 100,
+        };
+        Ok(AdmissionProof {
+            invocation,
+            source_body,
+            challenge,
+            receipts: vec![],
+            admitted_at_ms: 0,
+        })
+    }
     #[test]
     fn signatures_pin_identity_and_original_bytes() -> Result<()> {
         let owner = LocalIdentity::generate();
@@ -343,9 +405,14 @@ mod tests {
         );
         assert!(owner.sign_payload("bad:domain", b"challenge").is_err());
         let space_id = format!("spc2_{}", owner.fixture_network_id()?);
+        let resource_id = vibeface_secure::authorization::ResourceId::from_bytes([7; 32]);
         let body = Event {
             version: WIRE_VERSION,
             network_id: space_id.clone(),
+            cause: EventCause::Invocation {
+                admission: admission(&owner, &space_id, &resource_id)?,
+            },
+            resource_id,
             scope_id: "c".into(),
             author: owner.node_id()?,
             sequence: 1,

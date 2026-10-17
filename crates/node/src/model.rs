@@ -5,6 +5,21 @@ pub type NetworkId = String;
 pub type NodeId = String;
 pub type EventHash = String;
 pub type ScopeId = String;
+
+#[derive(Clone, Debug)]
+pub struct AgentSession {
+    pub space_id: vibeface_secure::authorization::SpaceId,
+    pub service: vibeface_secure::authorization::ServiceId,
+    pub device: vibeface_secure::authorization::DeviceId,
+    pub conversation_id: String,
+    pub sdk_session: vibeface_secure::authorization::SessionRef,
+    pub grant_leaf: vibeface_secure::authorization::ObjectHash,
+    pub initiator: vibeface_secure::authorization::Actor,
+    pub initiating_grant: Option<vibeface_secure::authorization::ObjectHash>,
+    pub parent_invocation: vibeface_secure::authorization::ObjectHash,
+    pub expected_policies: Vec<vibeface_secure::authorization::PolicyStamp>,
+    pub expires_at_ms: u64,
+}
 pub const WIRE_VERSION: u32 = 2;
 pub const MAX_EVENT_BYTES: usize = 1_048_576;
 pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
@@ -78,10 +93,37 @@ pub enum EventBody {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct AdmissionProof {
+    pub invocation:
+        vibeface_secure::authorization::Signed<vibeface_secure::authorization::Invocation>,
+    pub source_body: Value,
+    pub challenge: vibeface_secure::authorization::FreshnessChallenge,
+    pub receipts: Vec<
+        vibeface_secure::authorization::Signed<vibeface_secure::authorization::FreshnessReceipt>,
+    >,
+    pub admitted_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EventCause {
+    Invocation {
+        admission: AdmissionProof,
+    },
+    Derived {
+        admission: AdmissionProof,
+        source: EventHash,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Event {
     pub version: u32,
     #[serde(rename = "space_id")]
     pub network_id: NetworkId,
+    pub resource_id: vibeface_secure::authorization::ResourceId,
+    pub cause: EventCause,
     pub scope_id: ScopeId,
     pub author: NodeId,
     pub sequence: u64,
