@@ -27,6 +27,23 @@ struct SpaceCommitParams {
     request: SpaceGovernanceRequest,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionServiceSelectParams {
+    account_id: AccountId,
+    device_public_key: PublicKey,
+    source_project: ResourceRef,
+    target_node_public_key: PublicKey,
+    execution_resource: Option<ResourceRef>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionServiceMapping {
+    source_project: ResourceRef,
+    management_parent: ObjectHash,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct TeamCreateResponse {
@@ -256,6 +273,128 @@ fn check_space_receipt(
 }
 
 impl Store {
+    pub(crate) fn execution_service_select(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        now_ms: u64,
+    ) -> Result<Value> {
+        let _signature_scope = ScopedSignatureVerification::new();
+        ensure!(
+            serde_json::to_vec(params)?.len() <= MAX_PROOF_BYTES,
+            "execution selection request too large"
+        );
+        let params: ExecutionServiceSelectParams = serde_json::from_value(params.clone())?;
+        let principal = PublicKey::parse(principal)?;
+        let node = PublicKey::parse(&identity.public_key_hex()?)?;
+        ensure!(
+            params.device_public_key == principal,
+            "execution selector differs from Noise identity"
+        );
+        ensure!(
+            params.target_node_public_key == node,
+            "execution selection target differs from the physical node"
+        );
+        let personal = SpaceId::personal(&params.account_id);
+        ensure!(
+            params
+                .execution_resource
+                .as_ref()
+                .is_none_or(|resource| resource.space == personal),
+            "execution selection must use the physical owner's personal space"
+        );
+        let tx = self.connection.transaction()?;
+        let policy = journal::PolicyState::reload_verified(&tx, &self.policy)?;
+        let state = policy.verified();
+        let source = state
+            .space(&params.source_project.space)
+            .context("unknown execution source space")?;
+        let allowed = source.grants.iter().any(|leaf| {
+            state
+                .grant(leaf)
+                .is_some_and(|grant| grant.payload.actions.contains(&Action::ResourceManage))
+                && execution_service::verify_execution_service_source_management(
+                    state,
+                    &params.account_id,
+                    &principal,
+                    &params.source_project,
+                    leaf,
+                    &node,
+                    now_ms,
+                )
+                .is_ok()
+        });
+        ensure!(
+            allowed,
+            "execution selection requires current physical owner resource management"
+        );
+        let root = source_root(&tx, &params.source_project)?;
+        let journal = {
+            let mut statement = tx.prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .map(|row| Ok(serde_json::from_str::<JournalEntry>(&row?)?))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mappings = {
+            let mut statement = tx.prepare(
+                "SELECT key,value FROM local_values WHERE space_id=? AND key LIKE 'execution-service-source:%' ORDER BY key"
+            )?;
+            statement
+                .query_map([personal.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut selections = Vec::new();
+        for (key, encoded) in mappings {
+            let resource = ResourceRef {
+                space: personal.clone(),
+                resource: ResourceId::parse(
+                    key.strip_prefix("execution-service-source:")
+                        .context("invalid execution service mapping")?,
+                )?,
+            };
+            if params
+                .execution_resource
+                .as_ref()
+                .is_some_and(|expected| expected != &resource)
+            {
+                continue;
+            }
+            let mapping: ExecutionServiceMapping = serde_json::from_str(&encoded)?;
+            if mapping.source_project != params.source_project {
+                continue;
+            }
+            ensure!(
+                source_root(&tx, &resource)? == root,
+                "execution source mapping changed"
+            );
+            if let Ok(selection) = execution_service::project_execution_service_selection(
+                state,
+                policy.pins(),
+                &journal,
+                &params.account_id,
+                &principal,
+                &mapping.source_project,
+                &resource,
+                &mapping.management_parent,
+                &node,
+                now_ms,
+            ) {
+                selections.push(selection);
+            }
+        }
+        ensure!(
+            params.execution_resource.is_none() || selections.len() == 1,
+            "execution service has no current registered management selection"
+        );
+        tx.commit()?;
+        self.policy = policy;
+        Ok(serde_json::json!({"selections": selections}))
+    }
+
     pub(crate) fn execution_service_registration_challenge(
         &mut self,
         identity: &LocalIdentity,
@@ -631,6 +770,22 @@ impl Store {
                             serde_json::to_string(root)?
                         ],
                     )?;
+                    let [JournalEntry::Resource(_), JournalEntry::Grant(parent)] =
+                        registration.request.new_objects.as_slice()
+                    else {
+                        bail!("execution registration management parent is missing");
+                    };
+                    tx.execute(
+                        "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
+                        params![
+                            resource.space.as_str(),
+                            format!("execution-service-source:{}", resource.resource),
+                            serde_json::to_string(&ExecutionServiceMapping {
+                                source_project: registration.intent.payload.source_project.clone(),
+                                management_parent: parent.hash()?,
+                            })?
+                        ],
+                    )?;
                 }
                 save_receipt(&tx, &key, request_hash, principal, &response)?;
                 if let Some(registration) = &registration {
@@ -901,6 +1056,62 @@ mod tests {
             assert_eq!(verified.space_id(), execution.space.as_str());
             let result_bundle: ClientAuthorizationBundle =
                 serde_json::from_str(&verified.bundle_json().map_err(anyhow::Error::msg)?)?;
+            let selection_params = json!({
+                "account_id": network.account,
+                "device_public_key": network.client.public_key_hex(),
+                "source_project": source,
+                "target_node_public_key": network.node.public_key_hex()?,
+                "execution_resource": execution,
+            });
+            let before_select = row_counts(&store)?;
+            let selected = store.execution_service_select(
+                &network.node,
+                &network.client.public_key_hex(),
+                &selection_params,
+                now(),
+            )?;
+            assert_eq!(row_counts(&store)?, before_select);
+            assert_eq!(selected["selections"].as_array().unwrap().len(), 1);
+            let selection: execution_service::ExecutionServiceSelection =
+                serde_json::from_value(selected["selections"][0].clone())?;
+            assert_eq!(selection.authorization.grant_leaf, result_bundle.grant_leaf);
+            assert_eq!(selection.source_project, source);
+            assert_eq!(selection.execution_resource, execution);
+            let selection_json = serde_json::to_string(&selection)?;
+            assert!(!selection_json.contains(network.project.to_str().unwrap()));
+            assert!(!selection_json.contains("secret"));
+            let native_selection = execution_service::verify_execution_service_selection(
+                &selection_json,
+                &verified.pins_json().map_err(anyhow::Error::msg)?,
+                &serde_json::to_string(&source)?,
+                &serde_json::to_string(&execution)?,
+                network.account.as_str(),
+                &network.client.public_key_hex(),
+                &network.node.public_key_hex()?,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)?;
+            assert_eq!(native_selection.grant_leaf(), &result_bundle.grant_leaf);
+            for wrong_target in [
+                network.client.public_key_hex(),
+                Identity::generate()
+                    .map_err(anyhow::Error::msg)?
+                    .public_key_hex(),
+            ] {
+                assert!(
+                    execution_service::verify_execution_service_selection(
+                        &selection_json,
+                        &verified.pins_json().map_err(anyhow::Error::msg)?,
+                        &serde_json::to_string(&source)?,
+                        &serde_json::to_string(&execution)?,
+                        network.account.as_str(),
+                        &network.client.public_key_hex(),
+                        &wrong_target,
+                        now() as f64,
+                    )
+                    .is_err()
+                );
+            }
             let parent = store
                 .policy
                 .verified()
@@ -965,9 +1176,234 @@ mod tests {
             );
             assert_eq!(row_counts(&reopened)?, counts);
             assert_eq!(
+                reopened.execution_service_select(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    &selection_params,
+                    now() + 200_000,
+                )?,
+                selected
+            );
+            assert_eq!(row_counts(&reopened)?, counts);
+            assert_eq!(
                 source_root(&reopened.connection, &execution)?,
                 network.project
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn execution_service_selection_keeps_original_parent_and_reloads_revocations() -> Result<()> {
+        for revoke in ["source", "client", "parent", "node"] {
+            let network = TestNetwork::new()?;
+            let path = network.directory.join("execution-selection.sqlite3");
+            let mut store = network.at(&path)?;
+            let source = ResourceRef {
+                space: network.space.clone(),
+                resource: network.resource.clone(),
+            };
+            let prepared =
+                prepare_execution_registration(&network, &source, &network.pins, &network.bundle)?;
+            let request: Value =
+                serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
+            let response = store.governance_command(
+                &network.node,
+                &network.client.public_key_hex(),
+                "execution_service_register",
+                &request,
+                now(),
+            )?;
+            let resource = ResourceRef {
+                space: SpaceId::parse(&prepared.space_id())?,
+                resource: ResourceId::parse(&prepared.resource_id())?,
+            };
+            let committed = execution_service::finish_execution_service_registration(
+                &prepared,
+                &serde_json::to_string(&response["committed"])?,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let bundle: ClientAuthorizationBundle =
+                serde_json::from_str(&committed.bundle_json().map_err(anyhow::Error::msg)?)?;
+            let parent = bundle.grant_leaf;
+            let mut other = store
+                .policy
+                .verified()
+                .grant(&parent)
+                .context("management parent missing")?
+                .payload
+                .clone();
+            other.actions = vec![Action::OperationStatusRead];
+            other.remaining_delegations = 0;
+            other.nonce = Nonce::random()?;
+            other.issued_under = store
+                .policy
+                .verified()
+                .head(&PolicyDomain::Space(network.space.clone()))
+                .unwrap()
+                .clone();
+            let other = Signed::sign(other, &network.root)?;
+            let mut document = store
+                .policy
+                .verified()
+                .space(&network.space)
+                .unwrap()
+                .clone();
+            document.previous = Some(other.payload.issued_under.clone());
+            document.sequence += 1;
+            document.grants.push(other.hash()?);
+            document.grants.sort();
+            store.install_policy_journal(
+                &[
+                    JournalEntry::Grant(other.clone()),
+                    JournalEntry::Space(Signed::sign(document, &network.root)?),
+                ],
+                now() + 1,
+            )?;
+            let params = json!({
+                "account_id":network.account,"device_public_key":network.client.public_key_hex(),
+                "source_project":source,"target_node_public_key":network.node.public_key_hex()?,
+                "execution_resource":resource,
+            });
+            drop(store);
+            let mut store = Store::open(&path)?;
+            let before = row_counts(&store)?;
+            let selected = store.execution_service_select(
+                &network.node,
+                &network.client.public_key_hex(),
+                &params,
+                now() + 2,
+            )?;
+            let selection: execution_service::ExecutionServiceSelection =
+                serde_json::from_value(selected["selections"][0].clone())?;
+            assert_eq!(selection.authorization.grant_leaf, parent);
+            assert_ne!(selection.authorization.grant_leaf, other.hash()?);
+            let mut list_params = params.clone();
+            list_params
+                .as_object_mut()
+                .unwrap()
+                .remove("execution_resource");
+            assert_eq!(
+                store.execution_service_select(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    &list_params,
+                    now() + 2,
+                )?,
+                selected
+            );
+            let verified = execution_service::verify_execution_service_selection(
+                &serde_json::to_string(&selection)?,
+                &committed.pins_json().map_err(anyhow::Error::msg)?,
+                &serde_json::to_string(&source)?,
+                &serde_json::to_string(&resource)?,
+                network.account.as_str(),
+                &network.client.public_key_hex(),
+                &network.node.public_key_hex()?,
+                (now() + 2) as f64,
+            )
+            .map_err(anyhow::Error::msg)?;
+            assert_eq!(verified.grant_leaf(), &parent);
+            let mut wrong_leaf = selection.clone();
+            wrong_leaf.authorization.grant_leaf = other.hash()?;
+            wrong_leaf
+                .authorization
+                .journal
+                .push(JournalEntry::Grant(other));
+            assert!(
+                execution_service::verify_execution_service_selection(
+                    &serde_json::to_string(&wrong_leaf)?,
+                    &committed.pins_json().map_err(anyhow::Error::msg)?,
+                    &serde_json::to_string(&source)?,
+                    &serde_json::to_string(&resource)?,
+                    network.account.as_str(),
+                    &network.client.public_key_hex(),
+                    &network.node.public_key_hex()?,
+                    (now() + 2) as f64,
+                )
+                .is_err()
+            );
+            let foreign = TestNetwork::new()?;
+            let mut foreign_params = params.clone();
+            foreign_params["account_id"] = serde_json::to_value(&foreign.account)?;
+            foreign_params["device_public_key"] = json!(foreign.client.public_key_hex());
+            assert!(
+                store
+                    .execution_service_select(
+                        &network.node,
+                        &foreign.client.public_key_hex(),
+                        &foreign_params,
+                        now() + 2,
+                    )
+                    .is_err()
+            );
+            let mut wrong_target = params.clone();
+            wrong_target["target_node_public_key"] = json!(foreign.node.public_key_hex()?);
+            assert!(
+                store
+                    .execution_service_select(
+                        &foreign.node,
+                        &network.client.public_key_hex(),
+                        &wrong_target,
+                        now() + 2,
+                    )
+                    .is_err()
+            );
+            assert!(
+                store
+                    .execution_service_select(
+                        &network.node,
+                        &foreign.client.public_key_hex(),
+                        &params,
+                        now() + 2,
+                    )
+                    .is_err()
+            );
+            assert_eq!(row_counts(&store)?, before);
+            let mut independent = Store::open(&path)?;
+            match revoke {
+                "client" => network.revoke_client(&mut independent)?,
+                "node" => network.revoke_node(&mut independent)?,
+                "source" | "parent" => {
+                    let mut document = independent
+                        .policy
+                        .verified()
+                        .space(&network.space)
+                        .unwrap()
+                        .clone();
+                    document.previous = independent
+                        .policy
+                        .verified()
+                        .head(&PolicyDomain::Space(network.space.clone()))
+                        .cloned();
+                    document.sequence += 1;
+                    let removed = if revoke == "source" {
+                        &network.bundle.grant_leaf
+                    } else {
+                        &parent
+                    };
+                    document.grants.retain(|leaf| leaf != removed);
+                    independent.install_policy_journal(
+                        &[JournalEntry::Space(Signed::sign(document, &network.root)?)],
+                        now() + 3,
+                    )?;
+                }
+                _ => unreachable!(),
+            }
+            let after_revoke = row_counts(&independent)?;
+            assert!(
+                store
+                    .execution_service_select(
+                        &network.node,
+                        &network.client.public_key_hex(),
+                        &params,
+                        now() + 4,
+                    )
+                    .is_err(),
+                "stale selection accepted {revoke} revocation"
+            );
+            assert_eq!(row_counts(&store)?, after_revoke);
         }
         Ok(())
     }
@@ -1488,6 +1924,30 @@ mod tests {
             resource: ResourceId::parse(&verified.resource_id())?,
         };
         assert_eq!(source_root(&local.connection, &execution)?, network.project);
+        assert!(remote.policy.verified().space(&network.space).is_none());
+        let before_select = row_counts(&local)?;
+        let selection = local.execution_service_select(
+            &network.node,
+            &network.client.public_key_hex(),
+            &json!({"account_id":network.account,"device_public_key":network.client.public_key_hex(),
+                "source_project":source,"target_node_public_key":network.node.public_key_hex()?,
+                "execution_resource":execution}),
+            now(),
+        )?;
+        let selection: execution_service::ExecutionServiceSelection =
+            serde_json::from_value(selection["selections"][0].clone())?;
+        execution_service::verify_execution_service_selection(
+            &serde_json::to_string(&selection)?,
+            &verified.pins_json().map_err(anyhow::Error::msg)?,
+            &serde_json::to_string(&source)?,
+            &serde_json::to_string(&execution)?,
+            network.account.as_str(),
+            &network.client.public_key_hex(),
+            &network.node.public_key_hex()?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(row_counts(&local)?, before_select);
         assert!(remote.policy.verified().space(&network.space).is_none());
         Ok(())
     }

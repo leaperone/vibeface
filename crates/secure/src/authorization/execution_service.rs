@@ -44,6 +44,15 @@ pub struct ExecutionServiceRegistrationRequest {
     pub request: governance::SpaceGovernanceRequest,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionServiceSelection {
+    pub source_project: ResourceRef,
+    pub execution_resource: ResourceRef,
+    pub authorization: ClientAuthorizationBundle,
+    pub pins: Vec<PolicyPin>,
+}
+
 pub struct VerifiedExecutionServiceRegistrationRequest {
     expected_heads: Vec<PolicyStamp>,
     commit_heads: Vec<PolicyStamp>,
@@ -205,6 +214,186 @@ fn authorization(
         max_depth: state.grant_chain(Some(source_grant))?.len(),
         crypto_counts: SignatureVerification::current_counts(),
     })
+}
+
+pub fn verify_execution_service_source_management(
+    state: &VerifiedPolicySet,
+    account: &AccountId,
+    signer: &PublicKey,
+    source: &ResourceRef,
+    source_grant: &ObjectHash,
+    node: &PublicKey,
+    now: u64,
+) -> Result<()> {
+    authorization(
+        state,
+        account,
+        signer,
+        source,
+        source_grant,
+        node,
+        now,
+        &mut Budget::default(),
+    )?;
+    Ok(())
+}
+
+fn verify_management_parent(
+    state: &VerifiedPolicySet,
+    account: &AccountId,
+    signer: &PublicKey,
+    resource: &ResourceRef,
+    parent: &ObjectHash,
+    node: &PublicKey,
+    now: u64,
+) -> Result<()> {
+    let personal = SpaceId::personal(account);
+    require(
+        resource.space == personal,
+        "execution service must belong to the physical owner's personal space",
+    )?;
+    let mut budget = Budget::default();
+    let mut dependencies = BTreeMap::new();
+    let client = state.find_device(&DeviceId::from_key(signer))?;
+    require(
+        client.payload.owner == PolicyDomain::Account(account.clone())
+            && client.payload.uses.contains(&DeviceUse::Noise)
+            && client.payload.uses.contains(&DeviceUse::AccountInvocation)
+            && state.actor_for_signer(signer, now, &mut budget, &mut dependencies)?
+                == Actor::Account(account.clone()),
+        "execution selection requires the current physical owner's account client",
+    )?;
+    let target = state.find_device(&DeviceId::from_key(node))?;
+    require(
+        target.payload.public_key == *node
+            && target.payload.owner == PolicyDomain::Account(account.clone())
+            && target.payload.subject == Actor::Service(ServiceId::from_key(node))
+            && target.payload.uses.contains(&DeviceUse::Noise),
+        "execution selection cannot configure another account's physical node",
+    )?;
+    let document = state
+        .space(&personal)
+        .ok_or(AuthorizationError::PolicyConflict)?;
+    state.ensure_personal_current(document)?;
+    state.validate_service_reference(&personal, target)?;
+    state.validate_certificate(
+        target,
+        now,
+        &mut budget,
+        &mut dependencies,
+        &mut BTreeSet::new(),
+    )?;
+    let record = state.resource(&resource.space, &resource.resource).ok_or(
+        AuthorizationError::InvalidProof("missing execution service resource"),
+    )?;
+    require(
+        record.payload.kind == ResourceKind::ExecutionService
+            && record.payload.host == ServiceId::from_key(node),
+        "selected resource is not an execution service on the physical node",
+    )?;
+    budget.verify(record)?;
+    let grant = state.grant(parent).ok_or(AuthorizationError::InvalidProof(
+        "missing execution service management parent",
+    ))?;
+    require(
+        grant.payload.owner_space == personal
+            && grant.payload.scope == ResourceScope::Exact(resource.clone())
+            && grant.payload.grantee == Grantee::Actor(Actor::Account(account.clone()))
+            && grant.payload.actions == management_actions()
+            && grant.payload.audience
+                == (Audience {
+                    service: ServiceId::from_key(node),
+                    device: DeviceId::from_key(node),
+                })
+            && grant.payload.parent.is_none()
+            && grant.payload.remaining_delegations == 1
+            && grant.payload.constraints == GrantConstraints::default(),
+        "selected grant is not the execution service management parent",
+    )?;
+    let path = state.grant_chain(Some(parent))?;
+    state.verify_grant_path(&path, now, &mut budget, &mut dependencies, true)?;
+    Ok(())
+}
+
+pub fn project_execution_service_selection(
+    state: &VerifiedPolicySet,
+    pins: &[PolicyPin],
+    journal: &[JournalEntry],
+    account: &AccountId,
+    signer: &PublicKey,
+    source: &ResourceRef,
+    resource: &ResourceRef,
+    parent: &ObjectHash,
+    node: &PublicKey,
+    now: u64,
+) -> Result<ExecutionServiceSelection> {
+    verify_management_parent(state, account, signer, resource, parent, node, now)?;
+    let authorization = state.client_authorization_projection(
+        pins,
+        journal,
+        account,
+        &resource.space,
+        signer,
+        parent,
+        now,
+    )?;
+    Ok(ExecutionServiceSelection {
+        source_project: source.clone(),
+        execution_resource: resource.clone(),
+        pins: projection_pins(pins, &authorization),
+        authorization,
+    })
+}
+
+/// The authenticated physical Node supplies the source mapping. Pins remain independent.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyExecutionServiceSelection))]
+pub fn verify_execution_service_selection(
+    selection_json: &str,
+    pinned_roots_json: &str,
+    expected_source_project_json: &str,
+    expected_execution_resource_json: &str,
+    expected_account: &str,
+    expected_device_public_key: &str,
+    expected_target_node_public_key: &str,
+    now_ms: f64,
+) -> crate::Result<VerifiedClientAuthorization> {
+    let _signature_scope = ScopedSignatureVerification::new();
+    let verify = || -> Result<_> {
+        let selection: ExecutionServiceSelection = parse(selection_json)?;
+        let source: ResourceRef = parse(expected_source_project_json)?;
+        let resource: ResourceRef = parse(expected_execution_resource_json)?;
+        require(
+            selection.source_project == source && selection.execution_resource == resource,
+            "execution selection differs from the requested source and service",
+        )?;
+        let pins: Vec<PolicyPin> = parse(pinned_roots_json)?;
+        let account = AccountId::parse(expected_account)?;
+        let signer = PublicKey::parse(expected_device_public_key)?;
+        let node = PublicKey::parse(expected_target_node_public_key)?;
+        let now = bootstrap::timestamp(now_ms)?;
+        let state = replay_policies(&pins, &selection.authorization.journal)?;
+        verify_management_parent(
+            &state,
+            &account,
+            &signer,
+            &resource,
+            &selection.authorization.grant_leaf,
+            &node,
+            now,
+        )?;
+        verify_client_authorization(
+            &serde_json::to_string(&selection.authorization).map_err(|_| {
+                AuthorizationError::InvalidProof("execution selection encoding failed")
+            })?,
+            pinned_roots_json,
+            expected_account,
+            resource.space.as_str(),
+            expected_device_public_key,
+            now_ms,
+        )
+        .map_err(|_| AuthorizationError::InvalidProof("invalid execution selection authorization"))
+    };
+    verify().map_err(|error| error.to_string())
 }
 
 pub fn verify_execution_service_registration(
