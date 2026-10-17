@@ -2391,7 +2391,7 @@ mod tests {
         ];
         let before = f.counts();
         let head = f.head();
-        f.store.connection.execute_batch("CREATE TEMP TRIGGER reject_passkey_receipt BEFORE INSERT ON passkey_receipts BEGIN SELECT RAISE(ABORT,'receipt rejected'); END").unwrap();
+        f.store.connection.execute_batch("CREATE TEMP TRIGGER reject_passkey_receipt BEFORE INSERT ON passkey_receipts WHEN (SELECT count(*) FROM passkey_receipts)=2 BEGIN SELECT RAISE(ABORT,'second receipt rejected'); END").unwrap();
         assert!(
             f.store
                 .complete_passkey_registration_at_authority(&f.authority, &second, &f.context, NOW)
@@ -2425,6 +2425,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert!(
+            read_receipt(&f.store.connection, &f.account, &second.pending_id, None)
+                .unwrap()
+                .is_none()
+        );
         f.store
             .connection
             .execute_batch("DROP TRIGGER reject_passkey_receipt")
@@ -2434,6 +2439,18 @@ mod tests {
             .unwrap();
         assert_eq!(f.counts().1, 2);
         assert_eq!(f.counts().2, 3);
+        let registration_receipt =
+            read_receipt(&f.store.connection, &f.account, &second.pending_id, None)
+                .unwrap()
+                .unwrap();
+        let approval_receipt = read_receipt(&f.store.connection, &f.account, &approval_id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registration_receipt.completion_hash,
+            approval_receipt.completion_hash
+        );
+        assert_eq!(registration_receipt.journal, approval_receipt.journal);
         assert_eq!(
             read_ledger(
                 &f.store.connection,
