@@ -20,6 +20,7 @@ pub(crate) struct PolicyState {
 #[derive(Clone, PartialEq, Eq)]
 struct AcceptedEntry {
     entry: JournalEntry,
+    encoded: String,
     received_at_ms: u64,
 }
 
@@ -278,10 +279,78 @@ impl PolicyState {
                 hash,
                 AcceptedEntry {
                     entry,
+                    encoded,
                     received_at_ms,
                 },
             );
         }
+        result.check_minimum_heads()?;
+        result.check_heads(connection)?;
+        result.check_nonces(connection)?;
+        Ok(result)
+    }
+
+    pub(crate) fn reload_verified(connection: &Connection, known: &Self) -> Result<Self> {
+        let pins = read_pins(connection)?;
+        for pin in &known.pins {
+            ensure!(
+                pins.iter().find(|current| current.domain == pin.domain) == Some(pin),
+                "trusted policy pin changed or was removed"
+            );
+        }
+        let mut result = known.clone();
+        result.pins = pins;
+        let mut statement = connection.prepare(
+            "SELECT entry_hash,entry,accepted_at_ms FROM policy_journal ORDER BY ordinal",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        })?;
+        let mut count = 0;
+        for row in rows {
+            let (hash, encoded, received_at_ms) = row?;
+            let hash = ObjectHash::parse(&hash)?;
+            let entry: JournalEntry = serde_json::from_str(&encoded)?;
+            ensure!(
+                entry_hash(&entry)? == hash,
+                "stored policy entry hash mismatch"
+            );
+            let accepted = AcceptedEntry {
+                entry,
+                encoded,
+                received_at_ms,
+            };
+            if count < known.order.len() {
+                ensure!(
+                    known.order.get(count) == Some(&hash)
+                        && known.accepted.get(&hash) == Some(&accepted),
+                    "verified policy journal prefix was replaced or reordered"
+                );
+            } else {
+                ensure!(
+                    !result.accepted.contains_key(&hash),
+                    "duplicate policy journal entry"
+                );
+                apply_entry(
+                    &mut result.state,
+                    &result.pins,
+                    &accepted.entry,
+                    received_at_ms,
+                    true,
+                )?;
+                result.order.push(hash.clone());
+                result.accepted.insert(hash, accepted);
+            }
+            count += 1;
+        }
+        ensure!(
+            count >= known.order.len(),
+            "verified policy journal prefix was removed"
+        );
         result.check_minimum_heads()?;
         result.check_heads(connection)?;
         result.check_nonces(connection)?;
@@ -619,6 +688,7 @@ impl PolicyState {
             apply_entry(&mut after.state, &after.pins, entry, now_ms, replay)?;
             let accepted = AcceptedEntry {
                 entry: entry.clone(),
+                encoded: serde_json::to_string(entry)?,
                 received_at_ms: now_ms,
             };
             after.order.push(hash.clone());
@@ -658,11 +728,13 @@ fn check_snapshot(connection: &Connection, state: &PolicyState) -> Result<()> {
             state.order.get(count) == Some(&hash),
             "accepted policy journal changed concurrently"
         );
-        let entry = serde_json::from_str(&entry)?;
+        let encoded = entry;
+        let entry = serde_json::from_str(&encoded)?;
         ensure!(
             state.accepted.get(&hash)
                 == Some(&AcceptedEntry {
                     entry,
+                    encoded,
                     received_at_ms
                 }),
             "accepted policy journal changed concurrently"
@@ -689,11 +761,7 @@ pub(crate) fn commit_in(
         for (hash, accepted) in &update.additions {
             transaction.execute(
                 "INSERT INTO policy_journal(entry_hash,entry,accepted_at_ms) VALUES(?,?,?)",
-                params![
-                    hash.as_str(),
-                    serde_json::to_string(&accepted.entry)?,
-                    accepted.received_at_ms
-                ],
+                params![hash.as_str(), &accepted.encoded, accepted.received_at_ms],
             )?;
             if let Some(commit) = commit(&accepted.entry) {
                 let (kind, id) = domain_key(&commit.payload.previous.domain);
@@ -1487,5 +1555,152 @@ mod tests {
             "policy update is too large"
         );
         assert_eq!(fixture.count("policy_journal"), 2);
+    }
+    #[test]
+    fn reload_verified_reuses_only_the_exact_prefix_and_verifies_new_commits() {
+        use vibeface_secure::signature_verification::SignatureVerification;
+        let mut fixture = Fixture::new();
+        let old = fixture.state.clone();
+        let no_change = SignatureVerification::new();
+        let unchanged = no_change
+            .run(|| PolicyState::reload_verified(&fixture.connection, &old))
+            .unwrap();
+        assert_eq!(unchanged.heads(), old.heads());
+        assert_eq!(no_change.counts().actual_verifications, 0);
+        fixture.accept(&[fixture.space_commit(21)], NOW).unwrap();
+        let tail = SignatureVerification::new();
+        let updated = tail
+            .run(|| PolicyState::reload_verified(&fixture.connection, &old))
+            .unwrap();
+        assert_eq!(updated.heads(), fixture.state.heads());
+        assert_eq!(updated.order, fixture.state.order);
+        assert!(tail.counts().actual_verifications > 0);
+        assert!(tail.counts().actual_verifications <= 32);
+        assert_ne!(updated.heads(), old.heads());
+        assert_eq!(
+            PolicyState::load(&fixture.connection).unwrap().heads(),
+            updated.heads()
+        );
+    }
+
+    #[test]
+    fn reload_verified_rejects_modified_removed_or_reordered_prefix_and_pins() {
+        for sql in [
+            "UPDATE policy_journal SET entry=entry||' ' WHERE ordinal=(SELECT MIN(ordinal) FROM policy_journal)",
+            "UPDATE policy_journal SET accepted_at_ms=accepted_at_ms+1 WHERE ordinal=(SELECT MIN(ordinal) FROM policy_journal)",
+            "DELETE FROM policy_journal WHERE ordinal=(SELECT MIN(ordinal) FROM policy_journal)",
+            "UPDATE policy_journal SET ordinal=100 WHERE ordinal=(SELECT MIN(ordinal) FROM policy_journal)",
+            "DELETE FROM policy_pins WHERE domain_kind='account'",
+            "UPDATE policy_pins SET genesis_root=replace(genesis_root,'a','b') WHERE domain_kind='account'",
+            "DELETE FROM current_policy_heads WHERE domain_kind='account'",
+        ] {
+            let fixture = Fixture::new();
+            fixture.connection.execute_batch(sql).unwrap();
+            assert!(
+                PolicyState::reload_verified(&fixture.connection, &fixture.state).is_err(),
+                "{sql}"
+            );
+        }
+        let fixture = Fixture::new();
+        let pin = &fixture.state.pins()[0];
+        let head = fixture.state.verified().head(&pin.domain).unwrap();
+        let (kind, id) = domain_key(&pin.domain);
+        fixture
+            .connection
+            .execute(
+                "UPDATE policy_pins SET minimum_head=? WHERE domain_kind=? AND domain_id=?",
+                params![serde_json::to_string(head).unwrap(), kind, id],
+            )
+            .unwrap();
+        assert!(PolicyState::reload_verified(&fixture.connection, &fixture.state).is_err());
+    }
+
+    #[test]
+    fn reload_verified_rejects_forged_tail_and_missing_commit_nonce() {
+        let mut fixture = Fixture::new();
+        let old = fixture.state.clone();
+        fixture.accept(&[fixture.space_commit(22)], NOW).unwrap();
+        fixture
+            .connection
+            .execute("DELETE FROM policy_nonces", [])
+            .unwrap();
+        assert!(PolicyState::reload_verified(&fixture.connection, &old).is_err());
+        let fixture = Fixture::new();
+        let mut change = fixture.space_commit(23);
+        if let JournalEntry::SpaceCommit(change) = &mut change {
+            change.commit.signature = Signed::sign(change.commit.payload.clone(), &key(9))
+                .unwrap()
+                .signature;
+        }
+        fixture
+            .connection
+            .execute(
+                "INSERT INTO policy_journal(entry_hash,entry,accepted_at_ms) VALUES(?,?,?)",
+                params![
+                    entry_hash(&change).unwrap().as_str(),
+                    serde_json::to_string(&change).unwrap(),
+                    NOW
+                ],
+            )
+            .unwrap();
+        assert!(PolicyState::reload_verified(&fixture.connection, &fixture.state).is_err());
+        assert_eq!(fixture.state.order.len(), 2);
+    }
+    #[test]
+    fn reload_verified_observes_another_connection_and_preserves_conflict_rollback() {
+        let fixture = Fixture::new();
+        let uri = format!(
+            "file:journal-reload-{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        );
+        let mut writer = Connection::open(&uri).unwrap();
+        writer
+            .execute_batch(include_str!("../../migrations/202610180001_initial.sql"))
+            .unwrap();
+        let entries: Vec<_> = fixture
+            .state
+            .order
+            .iter()
+            .map(|hash| fixture.state.accepted[hash].entry.clone())
+            .collect();
+        let initial = PolicyState::default()
+            .prepare_bootstrap(fixture.state.pins(), &entries, NOW)
+            .unwrap();
+        let tx = writer.transaction().unwrap();
+        let known = commit_in(&tx, &initial).unwrap();
+        tx.commit().unwrap();
+        let mut reader = Connection::open(&uri).unwrap();
+        let next = known
+            .prepare_network_update(&[fixture.space_commit(24)], NOW)
+            .unwrap();
+        let stale = known
+            .prepare_network_update(&[fixture.space_commit(25)], NOW)
+            .unwrap();
+        let tx = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let changed = commit_in(&tx, &next).unwrap();
+        tx.commit().unwrap();
+        let scope = vibeface_secure::signature_verification::SignatureVerification::new();
+        let tx = reader.transaction().unwrap();
+        let observed = scope
+            .run(|| PolicyState::reload_verified(&tx, &known))
+            .unwrap();
+        assert_eq!(observed.heads(), changed.heads());
+        assert_ne!(observed.heads(), known.heads());
+        assert!(scope.counts().actual_verifications > 0);
+        tx.commit().unwrap();
+        let tx = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(commit_in(&tx, &stale).is_err());
+        tx.rollback().unwrap();
+        let after = PolicyState::load(&reader).unwrap();
+        assert_eq!(after.heads(), changed.heads());
+        assert_eq!(after.order, changed.order);
+        assert_eq!(
+            after.nonce_bindings().unwrap(),
+            changed.nonce_bindings().unwrap()
+        );
     }
 }
