@@ -16,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh 
 curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --channel nightly
 ```
 
-这些公开入口在本 PR 合并后可用；本次代码交付本身不创建 Release。安装器依赖系统 Bash、curl、tar、gzip 和 SHA256 工具，不需要 Python、jq、Rust 或 Node.js。它按数值版本选择已公开的渠道版本，不选择 rc，也不会因最新包缺少当前平台而退回旧版。网络或 GitHub API 限流失败会保留错误。
+安装器依赖系统 Bash、curl、tar、gzip 和 SHA256 工具，不需要 Python、jq、Rust 或 Node.js。它按数值版本选择已公开的渠道版本，不选择 rc，也不会因最新包缺少当前平台而退回旧版。网络或 GitHub API 限流失败会保留错误。
 
 如需先检查脚本，再运行：
 
@@ -36,7 +36,7 @@ bash install.sh --channel nightly
 
 它不创建节点数据、不创建个人网络、不启动后台服务、不安装 Provider，也不开启自动更新。安装后按提示把 `~/.local/bin` 加入 PATH，或直接使用该目录下的 CLI。SHA256 与包同由 GitHub 提供，不能替代独立发布签名。
 
-已有 `current` 或同名 bin 文件时，安装器保留原文件并拒绝安装。受管安装通过 `update apply` 升级，不能绕过正在运行节点的维护检查。不要只复制 binary；更新和服务管理需要完整包。
+已有 `current` 或同名 bin 文件时，安装器保留原文件并拒绝安装。包协议 2 的受管安装通过 `update apply` 升级，不能绕过正在运行节点的维护检查。包协议 1 的旧预览版需要 [一次性手动更换程序](releasing.md#手动建立受管安装或更换程序)，不支持自动跨命名更新。不要只复制 binary；更新和服务管理需要完整包。
 
 自定义位置需使用绝对路径，并保持安装根目录和 bin 目录为普通目录：
 
@@ -51,18 +51,27 @@ bash install.sh --channel nightly \
 ```sh
 vibeface --version
 vibeface --help
-vibeface init --root /absolute/path/to/projects
-vibeface status
-vibeface serve
+vibeface
 ```
 
-`init` 默认使用 `~/.vibeface`，拒绝覆盖非空数据目录。`serve` 默认仅监听回环地址。保持前台进程运行，在另一个终端执行：
+直接运行默认使用 `~/.vibeface`。首次仅在不存在或为空的真实目录中创建本机身份与配置，监听 `127.0.0.1:4790`，不开放局域网，不允许执行目录，不启用管理 Agent 或发现服务。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。保持前台进程运行，在另一个终端执行：
 
 ```sh
 vibeface access
 ```
 
 在可信浏览器打开本机链接，创建个人网络并保存加密恢复包。已有个人网络时应配对，不能重新创建网络代替配对。见 [添加自己的设备](node.md#添加自己的设备)。编码执行需要另装并登录 Codex 等 Provider；聊天调度需要 [配置管理 Agent](node.md#配置管理-agent)。
+
+使用自定义数据目录可以直接执行 `vibeface --data-dir /absolute/path/to/data`。根 `--data-dir` 只用于直接启动；有子命令时，把该参数写在子命令后，例如 `vibeface status --data-dir /absolute/path/to/data`。混用根参数与子命令会报错，避免操作错误的数据目录。
+
+要在首次启动前设置执行目录，使用显式初始化：
+
+```sh
+vibeface init --root /absolute/path/to/projects
+vibeface
+```
+
+`init` 拒绝覆盖非空数据目录。显式 `vibeface serve` 只启动已初始化节点。已有节点先停止进程，再修改原 `config.json`，不要重新初始化身份。
 
 ## 用 CLI 管理后台服务
 

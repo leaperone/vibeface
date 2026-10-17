@@ -250,9 +250,8 @@ install_release() (
   made_bin=true
   complete=true
   printf 'Installed %s at %s\n' "$tag" "$bin_dir/vibeface"
-  printf 'No node data or services were created. Next:\n  %q init --root /absolute/path/to/projects\n' "$bin_dir/vibeface"
-  printf '  %q update configure --install-root %q --channel %s --automatic false\n' "$bin_dir/vibeface" "$install_root" "$channel"
-  printf '  %q serve\n' "$bin_dir/vibeface"
+  printf 'No node data or services were created. Start your local node:\n  %q\n' "$bin_dir/vibeface"
+  printf 'After initialization, select its update channel:\n  %q update configure --install-root %q --channel %s --automatic false\n' "$bin_dir/vibeface" "$install_root" "$channel"
   # shellcheck disable=SC2016 # Print the PATH expression for the user to evaluate.
   case ":$PATH:" in *":$bin_dir:"*) ;; *) printf 'Add your bin directory to PATH, or use the absolute CLI path above:\n  export PATH=%q:"$PATH"\n' "$bin_dir" ;; esac
 )

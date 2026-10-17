@@ -148,6 +148,70 @@ def available_port():
         return stream.getsockname()[1]
 
 
+def verify_direct_start(run, binary):
+    directory = run / "direct-start"
+    provider_free = run / "provider-free-bin"
+    provider_free.mkdir()
+    environment = {**os.environ, "PATH": str(provider_free)}
+    missing = run / "explicit-serve-missing"
+    result = subprocess.run([str(binary), "serve", "--data-dir", str(missing)],
+                            env=environment, capture_output=True, timeout=10)
+    require(result.returncode != 0 and not missing.exists(),
+            "explicit serve requires initialized data and does not create an identity")
+    configuration = None
+    protected = None
+    log_path = run / "direct-start.log"
+    for attempt in range(3):
+        with log_path.open("ab") as log:
+            process = subprocess.Popen([str(binary), "--data-dir", str(directory)],
+                                       env=environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            try:
+                if attempt == 0:
+                    wait_for("direct startup initialization", lambda: (directory / "data-epoch.json").exists())
+                    configuration = json.loads((directory / "config.json").read_text())
+                    require(configuration["listen"] == "127.0.0.1:4790"
+                            and configuration["roots"] == [] and configuration["manager"] is None
+                            and not configuration["allow_insecure_lan"]
+                            and configuration["network"] == {"bootstrap_urls": [], "advertise_urls": [],
+                                                              "mdns": False, "relay_enabled": False},
+                            "direct first startup grants no execution roots, manager or remote ingress")
+                else:
+                    url = configuration["public_url"]
+
+                    def own_listener():
+                        with urllib.request.urlopen(url + "/api/info", timeout=1) as response:
+                            return json.load(response)
+
+                    info = wait_for("direct startup listener", own_listener)
+                    require(process.poll() is None, "direct startup remains running")
+                    status = subprocess.run([str(binary), "status", "--json", "--data-dir", str(directory)],
+                                            env=environment, capture_output=True, timeout=10)
+                    require(status.returncode == 0 and json.loads(status.stdout)["node_id"] == info["node_id"],
+                            "direct startup serves the same identity on HTTP and its private socket")
+                    with urllib.request.urlopen(url, timeout=5) as response:
+                        require(response.status == 200 and b"<html" in response.read(),
+                                "direct startup serves the embedded web client")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        if attempt == 0:
+            configuration["listen"] = f"127.0.0.1:{available_port()}"
+            configuration["public_url"] = "http://" + configuration["listen"]
+            private_json(directory / "config.json", configuration)
+            protected = {path: file_sha256(directory / path)
+                         for path in ("identity.json", "config.json", "bootstrap.json", "data-epoch.json")}
+        else:
+            require(all(file_sha256(directory / path) == digest for path, digest in protected.items()),
+                    "direct startup and restart preserve the exact identity, config, bootstrap and epoch")
+    capability = json.loads((directory / "bootstrap.json").read_text())["capability"]
+    require(capability.encode() not in log_path.read_bytes(), "startup never prints the bootstrap capability")
+
+
 class RelayCapture:
     def __init__(self, upstream_port):
         self.port = available_port()
@@ -1029,6 +1093,8 @@ def acceptance(options):
         print("PASS " + description, flush=True)
 
     try:
+        verify_direct_start(run, binary)
+        passed("direct CLI startup initializes safely and restarts the same node without provider calls")
         for name in ("A", "B", "C", "R"):
             nodes.append(Node(run, name, binary, workspace, fixture, helper, module))
         a, b, c, relay = nodes

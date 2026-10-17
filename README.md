@@ -37,7 +37,13 @@ curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh 
 curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --channel nightly
 ```
 
-以上入口在本 PR 合并后可用。安装器验证完整包及 SHA256，不创建身份、启动服务或配置自动更新；没有 Stable 时也不会自动改装 Nightly。安装、初始化和通过 CLI 管理节点见 [安装说明](docs/install.md)。现有安装请使用 `vibeface update apply`，不要重复运行首次安装器。
+安装器验证完整包及 SHA256，不创建身份、启动服务或配置自动更新；没有 Stable 时也不会自动改装 Nightly。安装后直接启动：
+
+```sh
+vibeface
+```
+
+首次运行仅在不存在或为空的数据目录中初始化，默认使用 `~/.vibeface` 并监听 `127.0.0.1:4790`，不授予执行目录或启用管理 Agent。已有节点使用原身份和配置启动。安装和 CLI 管理见 [安装说明](docs/install.md)。受管安装使用 `vibeface update apply`；包协议 1 的旧预览版需按 [手动更换程序](docs/releasing.md#手动建立受管安装或更换程序) 一次性切换，不重新初始化身份。
 
 ## 从源码开始
 
