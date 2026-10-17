@@ -7,6 +7,7 @@ pub const MAX_EXECUTION_HANDOFF_BYTES: usize = 8 * 1024 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct CompactSdkOrigin {
     pub message_event: EventRef,
+    pub sdk_trigger: EventRef,
     pub invocation: Signed<Invocation>,
     pub challenge: FreshnessChallenge,
     pub receipts: Vec<Signed<FreshnessReceipt>>,

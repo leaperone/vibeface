@@ -318,7 +318,7 @@ fn capsule_facts(
         let session: SessionRef = serde_json::from_value(body["sdk_session"].clone())?;
         ensure!(
             session.target == proof.invocation.payload.device
-                && session.session_id == origin.message_event.as_str()
+                && session.session_id == origin.sdk_trigger.as_str()
                 && body["parent_invocation"].as_str() == Some(origin.invocation.hash()?.as_str())
                 && proof.transport.clone().into_evidence()
                     == TransportEvidence::LocalAgentAdapter {
@@ -471,9 +471,7 @@ fn compact_sdk_from_events(
     }
     let session: vibeface_secure::authorization::SessionRef =
         serde_json::from_value(proof.source_body["sdk_session"].clone())?;
-    let parent = events
-        .get(&session.session_id)
-        .context("SDK source message is missing")?;
+    let parent = super::services::agent_account_message(events, &session.session_id)?;
     let original = capsule_admission(&parent.event)?;
     ensure!(
         matches!(&parent.event.body,EventBody::MessagePosted {role,..} if role=="user")
@@ -487,6 +485,7 @@ fn compact_sdk_from_events(
     );
     Ok(Some(CompactSdkOrigin {
         message_event: vibeface_secure::authorization::EventRef::parse(&parent.envelope.hash)?,
+        sdk_trigger: vibeface_secure::authorization::EventRef::parse(&session.session_id)?,
         invocation: original.invocation,
         challenge: original.challenge,
         receipts: original.receipts,
@@ -2311,6 +2310,7 @@ mod tests {
             fixture.wire.handoff.project_dispatch = fixture.project.node.sign_event(dispatch)?;
             fixture.wire.handoff.sdk_origin = Some(CompactSdkOrigin {
                 message_event: EventRef::parse(&message.hash)?,
+                sdk_trigger: EventRef::parse(&message.hash)?,
                 invocation: parent.invocation,
                 challenge: parent.challenge,
                 receipts: parent.receipts,
