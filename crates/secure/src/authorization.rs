@@ -1,7 +1,9 @@
 //! Typed, root-approved policy and single-path capability verification.
 
+pub mod authenticators;
 pub mod bootstrap;
 use crate::{Identity, membership::canonical_json};
+pub use authenticators::{AuthenticatorRecord, VerifiedAuthenticator};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -337,6 +339,7 @@ pub struct KeyApproval {
 pub enum AccountRight {
     EnrollDevice,
     RevokeDevice,
+    ManageAuthenticators,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -361,6 +364,7 @@ pub struct AccountDocument {
     pub enrollment: Vec<EnrollmentAuthority>,
     pub devices: Vec<ObjectHash>,
     pub revoked_devices: Vec<DeviceId>,
+    pub authenticators: Vec<ObjectHash>,
     pub root_acceptance: Option<Signature>,
     pub recovery_approvals: Vec<KeyApproval>,
 }
@@ -949,6 +953,7 @@ pub struct VerifiedPolicySet {
     spaces: BTreeMap<SpaceId, SpaceState>,
     devices: BTreeMap<ObjectHash, Signed<DeviceCertificate>>,
     resources: BTreeMap<ObjectHash, Signed<ResourceRecord>>,
+    authenticators: BTreeMap<ObjectHash, Signed<AuthenticatorRecord>>,
     memberships: BTreeMap<ObjectHash, Signed<Membership>>,
     grants: BTreeMap<ObjectHash, Signed<Grant>>,
     roots: BTreeMap<PolicyStamp, PublicKey>,
@@ -1165,6 +1170,7 @@ impl VerifiedPolicySet {
             .filter_map(|h| self.resources.get(h))
             .find(|r| r.payload.space == *space && r.payload.resource == *id)
     }
+    /// Stores a signed object; only a current policy hash commitment authorizes its use.
     pub fn install_resource(&mut self, signed: Signed<ResourceRecord>) -> Result<ObjectHash> {
         require(self.resources.len() < 16384, "too many resource records")?;
         let r = &signed.payload;
@@ -1216,7 +1222,8 @@ impl VerifiedPolicySet {
                 && d.recovery_approvals.is_empty()
                 && d.devices.is_empty()
                 && d.revoked_devices.is_empty()
-                && d.enrollment.is_empty(),
+                && d.enrollment.is_empty()
+                && d.authenticators.is_empty(),
             "invalid account genesis",
         )?;
         self.validate_account(d)?;
@@ -1293,6 +1300,7 @@ impl VerifiedPolicySet {
             &d.revoked_devices,
             &d.current_root,
         )?;
+        self.validate_authenticator_registration(d)?;
         let ordinary_device = signed.issuer != previous.current_root
             && !previous.recovery.keys.contains(&signed.issuer);
         if ordinary_device {
@@ -1611,6 +1619,8 @@ impl VerifiedPolicySet {
                 && d.devices.len() <= 1024
                 && d.revoked_devices.len() <= 4096
                 && d.enrollment.len() <= 1024
+                && d.authenticators.len() <= 128
+                && sorted_unique(&d.authenticators)
                 && sorted_unique(&d.devices)
                 && sorted_unique(&d.revoked_devices),
             "invalid account document",
@@ -1622,7 +1632,7 @@ impl VerifiedPolicySet {
         require(
             d.enrollment
                 .iter()
-                .all(|e| !e.rights.is_empty() && e.rights.len() <= 2 && sorted_unique(&e.rights)),
+                .all(|e| !e.rights.is_empty() && e.rights.len() <= 3 && sorted_unique(&e.rights)),
             "invalid account enrollment rights",
         )?;
         require(
@@ -2548,25 +2558,25 @@ fn validate_recovery_transition(old: &RecoveryPolicy, new: &RecoveryPolicy) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    const NOW: u64 = 1000;
+    pub(super) const NOW: u64 = 1000;
     fn key(byte: u8) -> Identity {
         Identity::from_secret_hex(&hex::encode([byte; 32])).unwrap()
     }
-    struct Fixture {
-        state: VerifiedPolicySet,
-        root: Identity,
+    pub(super) struct Fixture {
+        pub(super) state: VerifiedPolicySet,
+        pub(super) root: Identity,
         recovery: Identity,
         authority: Identity,
         user: Identity,
-        node: Identity,
-        account: AccountId,
+        pub(super) node: Identity,
+        pub(super) account: AccountId,
         space: SpaceId,
         resource: ResourceRef,
         audience: Audience,
         root_grant: ObjectHash,
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let root = key(1);
             let recovery = key(2);
             let authority = key(3);
@@ -2602,6 +2612,7 @@ mod tests {
                     enrollment: vec![],
                     devices: vec![],
                     revoked_devices: vec![],
+                    authenticators: vec![],
                     root_acceptance: None,
                     recovery_approvals: vec![],
                 },
@@ -4490,6 +4501,9 @@ impl VerifiedPolicySet {
         budget: &mut Budget,
     ) -> Result<()> {
         let d = &signed.payload;
+        if d.authenticators != previous.authenticators {
+            return Err(AuthorizationError::UserPresenceRequired);
+        }
         let device = DeviceId::from_key(&signed.issuer);
         let certificate = self.find_device(&device)?;
         require(
@@ -4786,6 +4800,7 @@ pub enum JournalEntry {
     Space(Signed<SpaceDocument>),
     Device(Signed<DeviceCertificate>),
     Resource(Signed<ResourceRecord>),
+    Authenticator(Signed<AuthenticatorRecord>),
     Membership(Signed<Membership>),
     Grant(Signed<Grant>),
     AccountCommit(Committed<AccountDocument>),
@@ -5152,6 +5167,7 @@ pub fn prepare_authorization_signing(
             "device_certificate" => prepare_signed::<DeviceCertificate>(json, &issuer)?,
             "membership" => prepare_signed::<Membership>(json, &issuer)?,
             "resource" => prepare_signed::<ResourceRecord>(json, &issuer)?,
+            "authenticator" => prepare_signed::<AuthenticatorRecord>(json, &issuer)?,
             "grant" => prepare_signed::<Grant>(json, &issuer)?,
             "invocation" => prepare_signed::<Invocation>(json, &issuer)?,
             "policy_commit" => prepare_signed::<PolicyCommit>(json, &issuer)?,
@@ -5389,6 +5405,10 @@ pub fn replay_policies(pins: &[PolicyPin], journal: &[JournalEntry]) -> Result<V
             }
             JournalEntry::Resource(signed) => {
                 state.install_resource(signed)?;
+            }
+            JournalEntry::Authenticator(signed) => {
+                let at = signed.payload.not_before_ms;
+                state.install_authenticator(signed, at)?;
             }
             JournalEntry::Membership(signed) => {
                 let at = signed.payload.not_before_ms;

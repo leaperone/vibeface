@@ -186,6 +186,7 @@ pub fn prepare_account_creation(
                 enrollment: vec![],
                 devices: vec![],
                 revoked_devices: vec![],
+                authenticators: vec![],
                 root_acceptance: None,
                 recovery_approvals: vec![],
             },
