@@ -49,6 +49,7 @@ fn entry_hash(entry: &JournalEntry) -> Result<ObjectHash> {
         JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => value.hash()?,
         JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => value.hash()?,
         JournalEntry::Device(value) => value.hash()?,
+        JournalEntry::Authenticator(value) => value.hash()?,
         JournalEntry::Membership(value) => value.hash()?,
         JournalEntry::Grant(value) => value.hash()?,
         JournalEntry::Resource(value) => value.hash()?,
@@ -114,6 +115,9 @@ fn apply_entry(
         }
         JournalEntry::Device(value) => {
             state.install_device(value.clone(), at_ms)?;
+        }
+        JournalEntry::Authenticator(value) => {
+            state.install_authenticator(value.clone(), at_ms)?;
         }
         JournalEntry::Membership(value) => {
             state.install_membership(value.clone(), at_ms)?;
@@ -607,6 +611,7 @@ mod tests {
                     authority: AuthorityBinding::from_key(PublicKey::of(&authority)),
                     recovery: recovery.clone(),
                     enrollment: vec![],
+                    authenticators: vec![],
                     devices: vec![],
                     revoked_devices: vec![],
                     root_acceptance: None,
