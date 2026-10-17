@@ -472,7 +472,7 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         "initialization configuration changed"
     );
     {
-        let store = vibeface::store::Store::initialize(&staging.join("node.sqlite3"))?;
+        let mut store = vibeface::store::Store::initialize(&staging.join("node.sqlite3"))?;
         let bootstrap_path = staging.join("bootstrap.json");
         if !bootstrap_path.exists() {
             create_private(
@@ -947,7 +947,7 @@ mod tests {
                 create_private(&staging.join("bootstrap.json"), &capability_bytes)?;
             }
             if stage >= 7 {
-                let store = vibeface::store::Store::open(staging.join("node.sqlite3"))?;
+                let mut store = vibeface::store::Store::open(staging.join("node.sqlite3"))?;
                 store.install_bootstrap_capability(&capability)?;
             }
             let interrupted_name = match stage {
