@@ -76,13 +76,6 @@ impl ApiError {
     fn forbidden() -> Self {
         Self(StatusCode::FORBIDDEN, "request origin is invalid".into())
     }
-    fn internal(error: impl std::fmt::Display) -> Self {
-        tracing::error!(%error, "node HTTP operation failed");
-        Self(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "node operation failed".into(),
-        )
-    }
 }
 
 impl IntoResponse for ApiError {
@@ -259,8 +252,8 @@ async fn check_boundary(
                 "application/json required".into(),
             ));
         }
-        let is_tool_or_rpc = matches!(path, "/api/rpc" | "/api/tools") || path == CALLBACK;
-        let bearer_call = is_tool_or_rpc && bearer(headers).is_some();
+        let is_tool = path == "/api/tools" || path == CALLBACK;
+        let bearer_call = is_tool && bearer(headers).is_some();
         if !bearer_call
             && !one_header(headers, header::ORIGIN.as_str())
                 .is_some_and(|origin| site.origin.eq_ignore_ascii_case(origin))
