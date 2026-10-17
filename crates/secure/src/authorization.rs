@@ -99,6 +99,7 @@ text_type!(SpaceId, "spc2_", 32);
 text_type!(ResourceId, "res2_", 32);
 text_type!(ServiceId, "svc2_", 32);
 text_type!(ObjectHash, "h2_", 32);
+text_type!(EventRef, "", 32);
 text_type!(PublicKey, "", 32);
 text_type!(Signature, "", 64);
 text_type!(Nonce, "", 32);
@@ -612,7 +613,7 @@ pub struct SessionRef {
 #[serde(deny_unknown_fields)]
 pub struct InvocationContext {
     pub conversation: Option<String>,
-    pub task: Option<ObjectHash>,
+    pub task: Option<EventRef>,
     pub sdk_session: Option<SessionRef>,
     pub execution_session: Option<SessionRef>,
     pub executor_kind: Option<String>,
@@ -4587,22 +4588,34 @@ mod tests {
             derive_authorization_body_hash(body).unwrap(),
             typed.payload.body_hash.as_str()
         );
-        assert_eq!(
-            serde_json::from_str::<Signed<Invocation>>(
-                &sign_client_invocation(
-                    &auth,
-                    &json,
-                    body,
-                    "message_append",
-                    "op_1",
-                    &f.user,
-                    NOW as f64
-                )
-                .unwrap()
+        let client_signed: Signed<Invocation> = serde_json::from_str(
+            &sign_client_invocation(
+                &auth,
+                &json,
+                body,
+                "message_append",
+                "op_1",
+                &f.user,
+                NOW as f64,
             )
             .unwrap(),
-            typed
-        );
+        )
+        .unwrap();
+        assert_ne!(client_signed.payload.nonce, typed.payload.nonce);
+        client_signed.verify_signature().unwrap();
+        let mut expected = typed.payload.clone();
+        expected.nonce = client_signed.payload.nonce.clone();
+        assert_eq!(client_signed.payload, expected);
+        f.state
+            .verify_invocation(
+                &client_signed,
+                &f.facts(&typed.payload),
+                &TransportEvidence::DirectNoise {
+                    device: typed.payload.device.clone(),
+                },
+                NOW,
+            )
+            .unwrap();
         assert!(
             sign_client_invocation(
                 &auth,
@@ -4847,6 +4860,10 @@ mod tests {
         );
         assert!(node_fingerprint(&"AA".repeat(32)).is_err());
         assert!(node_fingerprint("bad-key").is_err());
+        assert!(EventRef::parse(&"ab".repeat(32)).is_ok());
+        assert!(EventRef::parse(&format!("h2_{}", "ab".repeat(32))).is_err());
+        assert!(EventRef::parse(&"AB".repeat(32)).is_err());
+
         let bytes = serde_json::to_vec(&signed).unwrap();
         assert_eq!(decode_signed::<Invocation>(&bytes).unwrap(), signed);
         let text = String::from_utf8(bytes).unwrap();
@@ -5973,7 +5990,7 @@ fn sign_client_invocation_inner(
             && now <= 9_007_199_254_740_991.0,
         "invalid client signing input",
     )?;
-    let invocation: Invocation = serde_json::from_str(json)
+    let mut invocation: Invocation = serde_json::from_str(json)
         .map_err(|_| AuthorizationError::InvalidProof("invalid invocation JSON"))?;
     let action: Action = serde_json::from_value(serde_json::Value::String(action.to_owned()))
         .map_err(|_| AuthorizationError::InvalidProof("unknown expected action"))?;
@@ -6013,6 +6030,7 @@ fn sign_client_invocation_inner(
         invocation.expires_at_ms - invocation.not_before_ms <= INVOCATION_MAX_AGE_MS,
         "invocation lifetime too long",
     )?;
+    invocation.nonce = Nonce::random()?;
     serde_json::to_string(&Signed::sign(invocation, key)?)
         .map_err(|_| AuthorizationError::InvalidProof("client invocation encoding failed"))
 }
