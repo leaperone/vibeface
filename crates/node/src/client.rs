@@ -8,9 +8,13 @@ use crate::{
 use anyhow::{Context, Result, bail, ensure};
 use axum::extract::ws::Message;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, MapAccess, SeqAccess, Visitor},
+};
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -180,7 +184,7 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                     Message::Binary(bytes) => {
                         if let Some(plaintext) = secure(channel.open_record(&bytes))? {
                             partial_started = None;
-                            let request: Request = serde_json::from_slice(&plaintext).context("invalid client request")?;
+                            let request = parse_request(&plaintext).context("invalid client request")?;
                             validate_request(&request)?;
                             let result = dispatch(&node, &mut session, request).await;
                             let (id, result) = result;
@@ -423,6 +427,68 @@ fn client_endpoint(value: &str) -> Result<String> {
 fn secure<T>(result: std::result::Result<T, String>) -> Result<T> {
     result.map_err(anyhow::Error::msg)
 }
+
+struct UniqueJsonKeys;
+
+impl<'de> Deserialize<'de> for UniqueJsonKeys {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        deserializer.deserialize_any(Self)
+    }
+}
+
+impl<'de> Visitor<'de> for UniqueJsonKeys {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON with unique object keys")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> std::result::Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> std::result::Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> std::result::Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> std::result::Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_str<E>(self, _: &str) -> std::result::Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> std::result::Result<Self, A::Error> {
+        while sequence.next_element::<Self>()?.is_some() {}
+        Ok(Self)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut object: A) -> std::result::Result<Self, A::Error> {
+        let mut keys = HashSet::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if !keys.insert(key) {
+                return Err(de::Error::custom("duplicate JSON object key"));
+            }
+            object.next_value::<Self>()?;
+        }
+        Ok(Self)
+    }
+}
+
+fn parse_request(bytes: &[u8]) -> Result<Request> {
+    serde_json::from_slice::<UniqueJsonKeys>(bytes)?;
+    Ok(serde_json::from_slice(bytes)?)
+}
+
 fn validate_request(request: &Request) -> Result<()> {
     ensure!(
         !request.id.is_empty()
@@ -482,6 +548,34 @@ async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_requests_reject_duplicate_keys_at_every_depth() -> Result<()> {
+        let request = parse_request(
+            br#" { "params": {"targets":[{"target":"a"},{"target":"b"}],"proof":{"issuer":"root","account":"owner"},"positive":18446744073709551615,"negative":-1,"fraction":1.5,"active":true,"empty":null}, "method":"rpc", "id":"read" } "#,
+        )?;
+        validate_request(&request)?;
+        assert_eq!(request.id, "read");
+        assert_eq!(request.method, "rpc");
+        assert_eq!(
+            request.params,
+            json!({"targets":[{"target":"a"},{"target":"b"}],"proof":{"issuer":"root","account":"owner"},"positive":u64::MAX,"negative":-1,"fraction":1.5,"active":true,"empty":null})
+        );
+        for bytes in [
+            br#"{"id":"read","method":"rpc","params":{},"params":{}}"#.as_slice(),
+            br#"{"id":"read","method":"rpc","params":{"proof":{"issuer":"root","issuer":"root"}}}"#,
+            br#"{"id":"read","method":"rpc","params":{"scope":{"account":"owner","account":"other"}}}"#,
+            br#"{"id":"read","method":"rpc","params":{"bindings":[{"target":"a","target":"b"}]}}"#,
+            br#"{"id":"read","method":"rpc","params":{"proof":{"issuer":"root","\u0069ssuer":"root"}}}"#,
+        ] {
+            let error = match parse_request(bytes) {
+                Ok(_) => panic!("duplicate object key was accepted"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("duplicate JSON object key"));
+        }
+        Ok(())
+    }
 
     #[test]
     fn encrypted_requests_require_bounded_ids_and_reject_legacy_invocations() {
