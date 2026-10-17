@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn business_roles_require_replica() {
+    fn gateway_and_scheduler_require_replica_but_executor_does_not() {
         let mut config = Config::local("127.0.0.1:0".parse().unwrap(), vec![], false);
         assert!(config.validate().is_ok());
         for roles in [
@@ -357,16 +357,18 @@ mod tests {
             vec![NodeRole::Relay, NodeRole::Replica],
             vec![NodeRole::Gateway, NodeRole::Relay, NodeRole::Replica],
             vec![NodeRole::Scheduler, NodeRole::Replica],
+            vec![NodeRole::Executor],
+            vec![NodeRole::Executor, NodeRole::Relay],
             vec![NodeRole::Executor, NodeRole::Replica],
         ] {
             config.roles = roles;
             assert!(config.validate().is_ok());
         }
-        for role in [NodeRole::Gateway, NodeRole::Scheduler, NodeRole::Executor] {
+        for role in [NodeRole::Gateway, NodeRole::Scheduler] {
             config.roles = vec![role, NodeRole::Relay];
             assert_eq!(
                 config.validate().unwrap_err().to_string(),
-                "gateway, scheduler and executor roles require replica"
+                "gateway and scheduler roles require replica"
             );
         }
     }

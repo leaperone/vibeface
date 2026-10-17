@@ -22,10 +22,10 @@ pub fn validate_role_dependencies(roles: &[NodeRole]) -> anyhow::Result<()> {
             || !roles.iter().any(|role| {
                 matches!(
                     role,
-                    NodeRole::Gateway | NodeRole::Scheduler | NodeRole::Executor
+                    NodeRole::Gateway | NodeRole::Scheduler
                 )
             }),
-        "gateway, scheduler and executor roles require replica"
+        "gateway and scheduler roles require replica"
     );
     Ok(())
 }
