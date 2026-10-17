@@ -120,6 +120,14 @@ pub struct SignedExecutionHandoff {
     pub invocation: Signed<Invocation>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionHandoffResult {
+    pub handoff: SignedExecutionHandoff,
+    pub receipt: Signed<ExecutionHandoffReceipt>,
+    pub result: Value,
+}
+
 impl SignedExecutionHandoff {
     pub fn hash(&self) -> Result<ObjectHash> {
         require(
@@ -502,7 +510,8 @@ impl VerifiedPolicySet {
                 && binding.binding.task_id == *task_id
                 && binding.binding.authority_node == task.event().author
                 && task.event().scope_id == dispatch.scope_id
-                && task.event().blobs.is_empty(),
+                && task.event().blobs.is_empty()
+                && dispatch.blobs.is_empty(),
             "execution capsule belongs to another task",
         )?;
         verify_binding(&binding, certificate.payload.public_key.as_str()).map_err(invalid_shape)?;
@@ -523,7 +532,12 @@ impl VerifiedPolicySet {
         self.verify_project_execution_source(&wire.handoff, now_ms)?;
         let hash = wire.hash()?;
         let facts = execution_submission_facts(&wire.handoff, original)?;
-        let (event, _, request, binding) = original_dispatch(&wire.handoff)?;
+        let (event, original_proof, request, binding) = original_dispatch(&wire.handoff)?;
+        require(
+            original_proof.source_body["execution_grant"].as_str()
+                == Some(wire.invocation.payload.grant_leaf.as_str()),
+            "submission changed the originally selected execution grant",
+        )?;
         let project = self
             .resource(&original.resource().space, &original.resource().resource)
             .ok_or(AuthorizationError::InvalidProof("missing Project resource"))?;
@@ -771,6 +785,23 @@ pub enum ExecutionHandoffState {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct ExecutionSessionSnapshot {
+    pub original_project: ResourceRef,
+    pub execution_resource: ResourceRef,
+    pub task: EventRef,
+    pub binding_hash: String,
+    pub binding_generation: u64,
+    pub target: DeviceId,
+    pub session_id: String,
+    pub revision: u64,
+    pub executor: String,
+    pub cwd: String,
+    pub state: String,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionHandoffReceipt {
     pub version: u16,
     pub operation_id: String,
@@ -782,6 +813,7 @@ pub struct ExecutionHandoffReceipt {
     pub binding_generation: u64,
     pub state: ExecutionHandoffState,
     pub result_hash: ObjectHash,
+    pub session: Option<ExecutionSessionSnapshot>,
     pub issued_at_ms: u64,
 }
 impl sealed::Sealed for ExecutionHandoffReceipt {}
@@ -797,6 +829,29 @@ pub fn verify_execution_handoff_receipt_signature(
     receipt.verify_signature()?;
     let (event, proof, _, binding) = original_dispatch(&wire.handoff)?;
     let value = &receipt.payload;
+    if let Some(session) = &value.session {
+        require(
+            session.original_project
+                == ResourceRef {
+                    space: SpaceId::parse(&event.network_id)?,
+                    resource: event.resource_id.clone(),
+                }
+                && session.execution_resource == wire.handoff.execution_resource
+                && session.task.as_str() == binding.binding.task_ref
+                && session.binding_hash == binding_hash(&binding.binding).map_err(invalid_shape)?
+                && session.binding_generation == binding.binding.generation
+                && session.target == wire.handoff.execution_audience.device
+                && session.session_id == binding.binding.session_id
+                && binding.binding.open_spec["executor"].as_str()
+                    == Some(session.executor.as_str())
+                && binding.binding.open_spec["cwd"].as_str() == Some(session.cwd.as_str())
+                && !session.state.is_empty()
+                && session.state.len() <= 128
+                && session.expires_at_ms > value.issued_at_ms
+                && session.expires_at_ms - value.issued_at_ms <= EXECUTION_LEASE_MS,
+            "signed executor session snapshot differs from its task binding",
+        )?;
+    }
     require(
         receipt.issuer == wire.handoff.target_public_key
             && value.version == AUTH_VERSION
@@ -814,6 +869,41 @@ pub fn verify_execution_handoff_receipt_signature(
 }
 
 impl VerifiedPolicySet {
+    pub fn verify_execution_handoff_ack(
+        &self,
+        wire: &SignedExecutionHandoff,
+        original: &VerifiedAuthorization,
+        receipt: &Signed<ExecutionHandoffReceipt>,
+        result: &Value,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionHandoff> {
+        verify_execution_handoff_receipt_signature(wire, receipt, result)?;
+        require(
+            receipt.payload.issued_at_ms >= wire.invocation.payload.not_before_ms
+                && receipt.payload.issued_at_ms <= now_ms,
+            "execution receipt has an invalid admission clock",
+        )?;
+        // The executor's signed acknowledgement attests prior acceptance of this
+        // exact carrier. Current grants and both live device chains are still checked.
+        let admitted = VerifiedExecutionAdmission {
+            handoff_hash: wire.hash()?,
+            submission: VerifiedAdmission {
+                invocation: wire.invocation.clone(),
+                admitted_at_ms: receipt.payload.issued_at_ms,
+            },
+        };
+        let project_receipt_origin = TransportEvidence::VerifiedPeer {
+            origin: wire.invocation.payload.presenter.clone(),
+        };
+        self.verify_execution_handoff(
+            wire,
+            original,
+            &project_receipt_origin,
+            Some(&admitted),
+            now_ms,
+        )
+    }
+
     pub fn verify_execution_handoff_receipt(
         &self,
         handoff: &VerifiedExecutionHandoff,
