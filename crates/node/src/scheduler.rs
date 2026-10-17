@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn invocation_replay_and_crash_do_not_relaunch_or_reuse_unknown_sdk_state() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let network = identity.network_id()?;
+        let network = identity.fixture_network_id()?;
         let mut store = Store::open(":memory:")?;
         store.install_trust_bundle(
             &network,
@@ -674,7 +674,7 @@ mod tests {
     #[test]
     fn unknown_scheduler_blocks_updates_until_new_user_work_completes() -> Result<()> {
         let identity = LocalIdentity::generate();
-        let network = identity.network_id()?;
+        let network = identity.fixture_network_id()?;
         let mut store = Store::open(":memory:")?;
         store.install_trust_bundle(
             &network,
