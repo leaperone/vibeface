@@ -1351,12 +1351,27 @@ pub(crate) mod tests {
 
     impl Fixture {
         pub(crate) fn new() -> Result<Self> {
+            Self::with_task_creator(false)
+        }
+
+        pub(crate) fn new_with_foreign_account_task() -> Result<Self> {
+            Self::with_task_creator(true)
+        }
+
+        fn with_task_creator(foreign: bool) -> Result<Self> {
             let project = TestNetwork::new()?;
             let executor = TestNetwork::new()?;
             let mut store = project.at(&project.directory.join("project.sqlite3"))?;
-            project.conversation(&mut store, "conversation")?;
-            let task = project.task(&mut store, "conversation", "remote-task")?;
             executor.install(&mut store)?;
+            project.conversation(&mut store, "conversation")?;
+            let (task, mut task_policies) = if foreign {
+                Self::foreign_account_task(&project, &executor, &mut store)?
+            } else {
+                (
+                    project.task(&mut store, "conversation", "remote-task")?,
+                    Vec::new(),
+                )
+            };
             let key = PublicKey::parse(&project.node.public_key_hex()?)?;
             let audience = Audience {
                 service: ServiceId::from_key(&key),
@@ -1439,11 +1454,12 @@ pub(crate) mod tests {
             document.resources.sort();
             document.grants.push(parent.hash()?);
             document.grants.sort();
-            let mut journal = vec![
+            task_policies.extend([
                 JournalEntry::Resource(resource),
                 JournalEntry::Grant(parent.clone()),
                 JournalEntry::Space(Signed::sign(document, &executor.root)?),
-            ];
+            ]);
+            let mut journal = task_policies;
             store.install_policy_journal(&journal, now())?;
             let stamp = store
                 .policy
@@ -1488,6 +1504,122 @@ pub(crate) mod tests {
                 audience,
                 journal,
             })
+        }
+
+        fn foreign_account_task(
+            project: &TestNetwork,
+            executor: &TestNetwork,
+            store: &mut Store,
+        ) -> Result<(crate::model::SignedEvent, Vec<JournalEntry>)> {
+            let domain = PolicyDomain::Space(project.space.clone());
+            let stamp = store.policy.verified().head(&domain).unwrap().clone();
+            let node_key = PublicKey::parse(&project.node.public_key_hex()?)?;
+            let audience = Audience {
+                service: ServiceId::from_key(&node_key),
+                device: DeviceId::from_key(&node_key),
+            };
+            let grant = Signed::sign(
+                Grant {
+                    version: AUTH_VERSION,
+                    owner_space: project.space.clone(),
+                    scope: ResourceScope::Exact(ResourceRef {
+                        space: project.space.clone(),
+                        resource: project.resource.clone(),
+                    }),
+                    grantee: Grantee::Actor(Actor::Account(executor.account.clone())),
+                    actions: vec![Action::TaskCreate],
+                    audience: audience.clone(),
+                    constraints: Default::default(),
+                    parent: None,
+                    remaining_delegations: 0,
+                    issued_under: stamp.clone(),
+                    not_before_ms: now(),
+                    expires_at_ms: now() + 1_000_000,
+                    nonce: Nonce::random()?,
+                },
+                &project.root,
+            )?;
+            let leaf = grant.hash()?;
+            let mut document = store
+                .policy
+                .verified()
+                .space(&project.space)
+                .unwrap()
+                .clone();
+            document.previous = Some(stamp);
+            document.sequence += 1;
+            document.grants.push(leaf.clone());
+            document.grants.sort();
+            let journal = vec![
+                JournalEntry::Grant(grant),
+                JournalEntry::Space(Signed::sign(document, &project.root)?),
+            ];
+            store.install_policy_journal(&journal, now())?;
+            let mut body = project.body("create_task", "conversation");
+            body["task_id"] = json!("remote-task");
+            body["title"] = json!("remote-task");
+            body["goal"] = json!("work");
+            body["acceptance"] = json!("review result");
+            body["auto_followup"] = json!(false);
+            let facts = store.request_facts(&body, &audience)?;
+            let device = DeviceId::from_key(&PublicKey::of(&executor.client));
+            let mut heads = [
+                PolicyDomain::Account(project.account.clone()),
+                PolicyDomain::Account(executor.account.clone()),
+                domain,
+            ]
+            .iter()
+            .map(|domain| store.policy.verified().head(domain).unwrap().clone())
+            .collect::<Vec<_>>();
+            heads.sort_by(|left, right| left.domain.cmp(&right.domain));
+            let invocation = Signed::sign(
+                Invocation {
+                    version: AUTH_VERSION,
+                    actor: Actor::Account(executor.account.clone()),
+                    device: device.clone(),
+                    initiator: Actor::Account(executor.account.clone()),
+                    initiating_grant: None,
+                    resource: facts.resource.clone(),
+                    action: facts.action,
+                    audience,
+                    presenter: device.clone(),
+                    operation_id: facts.operation_id.clone(),
+                    body_hash: facts.body_hash.clone(),
+                    grant_leaf: leaf,
+                    expected_policies: heads,
+                    context: facts.context.clone(),
+                    nonce: Nonce::random()?,
+                    not_before_ms: now(),
+                    expires_at_ms: now() + 100_000,
+                },
+                &executor.client,
+            )?;
+            let transport = TransportEvidence::DirectNoise { device };
+            let auth = store.authorize_request(&invocation, &facts, &transport, now())?;
+            let challenge = store.issue_freshness(&auth, CheckStage::Admit, now())?;
+            let mut receipts = store.sign_current_receipts(&challenge, &project.node, now())?;
+            receipts.extend(store.sign_current_receipts(&challenge, &executor.node, now())?);
+            let proof = FreshnessProof {
+                challenge,
+                receipts,
+            };
+            let event = store.append_authorized_event(
+                &project.node,
+                &auth,
+                &proof,
+                &transport,
+                &body,
+                "conversation",
+                crate::model::EventBody::TaskCreated {
+                    task_id: "remote-task".into(),
+                    title: "remote-task".into(),
+                    goal: "work".into(),
+                    acceptance: "review result".into(),
+                },
+                Vec::new(),
+                now() as i64,
+            )?;
+            Ok((event, journal))
         }
 
         pub(crate) fn selection(&self, method: &str, id: &str) -> Result<Value> {
@@ -1682,6 +1814,23 @@ pub(crate) mod tests {
             body["request"] = serde_json::to_value(&request)?;
             Ok((body, request))
         }
+    }
+
+    #[test]
+    fn foreign_task_fixture_keeps_signed_creator_and_remote_binding() -> Result<()> {
+        let mut f = Fixture::new_with_foreign_account_task()?;
+        let event: crate::model::Event = serde_json::from_str(&f.task.canonical_body)?;
+        let crate::model::EventCause::Invocation { admission } = event.cause else {
+            anyhow::bail!("foreign Task fixture must have an actual admitted Account creation");
+        };
+        assert_eq!(admission.invocation.payload.actor, Actor::Account(f.executor.account.clone()));
+        assert_ne!(admission.invocation.payload.actor, Actor::Account(f.project.account.clone()));
+        let binding = f.bind_at(f.executor.project.to_str().unwrap().to_owned())?;
+        assert_eq!(binding.binding.task_ref, f.task.hash);
+        assert_eq!(binding.binding.target_node, f.executor.node.node_id()?);
+        assert_eq!(f.store.policy.verified().grant(&f.grant).unwrap().payload.constraints.context.task,
+            Some(EventRef::parse(&f.task.hash)?));
+        Ok(())
     }
 
     #[test]
