@@ -3,7 +3,7 @@ use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -12,6 +12,7 @@ use std::{
 use tokio::sync::{Mutex, mpsc};
 use vibeface_bridge::codex::{CodexClient, CodexError};
 use vibeface_protocol::{Command, RpcId};
+use vibeface_secure::authorization::{ResourceId, SpaceId};
 
 #[path = "engine_isolation.rs"]
 mod isolation;
@@ -134,6 +135,30 @@ impl EngineError {
     }
 }
 
+pub(crate) struct StoppedExecution {
+    context: ExecutionContext,
+}
+
+impl StoppedExecution {
+    pub(crate) fn matches_context(&self, context: &ExecutionContext) -> bool {
+        self.context.shared
+            && context.shared
+            && self.context.space_id == context.space_id
+            && self.context.resource_id == context.resource_id
+            && self.context.operation_id == context.operation_id
+    }
+}
+
+type ExecutionGeneration = (SpaceId, ResourceId, String);
+
+fn execution_generation(context: &ExecutionContext) -> ExecutionGeneration {
+    (
+        context.space_id.clone(),
+        context.resource_id.clone(),
+        context.operation_id.clone(),
+    )
+}
+
 #[derive(Clone)]
 pub struct Engine {
     config: ExecutorConfig,
@@ -143,6 +168,7 @@ pub struct Engine {
     manager_isolation: Option<DockerIsolation>,
     codex_contexts: Arc<Mutex<BTreeMap<(Option<String>, String), ExecutionContext>>>,
     personal_turns: Arc<Mutex<BTreeMap<(String, String, String), (String, String)>>>,
+    fenced_operations: Arc<Mutex<BTreeSet<ExecutionGeneration>>>,
 }
 
 impl Engine {
@@ -167,6 +193,7 @@ impl Engine {
             manager_isolation,
             codex_contexts,
             personal_turns: Arc::new(Mutex::new(BTreeMap::new())),
+            fenced_operations: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -364,6 +391,30 @@ impl Engine {
             .await
     }
 
+    pub(crate) async fn fence_operation(
+        &self,
+        context: &ExecutionContext,
+    ) -> Result<(StoppedExecution, Vec<String>)> {
+        ensure!(context.shared, "only isolated execution can be fenced");
+        vibeface_protocol::validate_id(&context.operation_id).map_err(anyhow::Error::msg)?;
+        let mut fenced = self.fenced_operations.lock().await;
+        fenced.insert(execution_generation(context));
+        let affected = self.cancel_operation(context).await?;
+        for operation in &affected {
+            fenced.insert((
+                context.space_id.clone(),
+                context.resource_id.clone(),
+                operation.clone(),
+            ));
+        }
+        Ok((
+            StoppedExecution {
+                context: context.clone(),
+            },
+            affected,
+        ))
+    }
+
     pub async fn affected_operations(&self, context: &ExecutionContext) -> Vec<String> {
         match &self.isolation {
             Some(isolation) if context.shared => isolation.affected(context).await,
@@ -501,6 +552,13 @@ impl Engine {
                 .map_err(|error| EngineError::rejected(session, error))?;
         }
         let isolated = if context.shared {
+            let fenced = self.fenced_operations.lock().await;
+            if fenced.contains(&execution_generation(context)) {
+                return Err(EngineError::rejected(
+                    session,
+                    "execution generation was fenced; reconcile its original operation",
+                ));
+            }
             let isolation = self.isolation.as_ref().ok_or_else(|| {
                 EngineError::rejected(session, "shared execution isolation is not configured")
             })?;
@@ -516,12 +574,12 @@ impl Engine {
                     "shared Cursor execution has no verified restricted model gateway transport",
                 ));
             }
-            Some(
-                isolation
-                    .prepare(context, &session.cwd)
-                    .await
-                    .map_err(|error| EngineError::rejected(session, error.to_string()))?,
-            )
+            let prepared = isolation
+                .prepare(context, &session.cwd)
+                .await
+                .map_err(|error| EngineError::rejected(session, error.to_string()))?;
+            drop(fenced);
+            Some(prepared)
         } else {
             None
         };
@@ -859,6 +917,103 @@ fn codex_error(error: CodexError, native_session_id: Option<String>) -> EngineEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn confirmed_fencing_blocks_a_concurrent_late_execution_generation() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("vff-{}", uuid::Uuid::new_v4()));
+        let data = root.join("node");
+        let project = root.join("project");
+        crate::config::private_dir(&data)?;
+        std::fs::create_dir(&project)?;
+        let marker = root.join("inspect-started");
+        let release = root.join("release-inspect");
+        let docker = root.join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nprintf 'inspect\\n' >> '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\nprintf 'No such container\\n' >&2\nexit 1\n",
+                marker.display(),
+                release.display()
+            ),
+        )?;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700))?;
+        let (events, _) = mpsc::unbounded_channel();
+        let engine = Engine::new(
+            ExecutorConfig {
+                execution_isolation: Some(ExecutionIsolationConfig {
+                    image: format!("sha256:{}", "a".repeat(64)),
+                    docker_bin: docker,
+                    egress: None,
+                }),
+                data_dir: Some(data),
+                ..ExecutorConfig::default()
+            },
+            events,
+        );
+        let mut context = personal_context();
+        assert!(engine.fence_operation(&context).await.is_err());
+        assert!(!marker.exists());
+        context.shared = true;
+        let stopping = engine.clone();
+        let stopping_context = context.clone();
+        let stopped =
+            tokio::spawn(async move { stopping.fence_operation(&stopping_context).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        let delayed = engine.clone();
+        let delayed_context = context.clone();
+        let mut late = tokio::spawn(async move {
+            delayed
+                .execute_authorized(
+                    &delayed_context,
+                    &ExecutorSession {
+                        executor: ExecutorKind::ClaudeCode,
+                        cwd: project,
+                        native_session_id: None,
+                    },
+                    EngineAction::Send {
+                        text: "must not execute".into(),
+                    },
+                    |_| async { anyhow::bail!("a fenced operation persisted a native session") },
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut late)
+                .await
+                .is_err()
+        );
+        std::fs::write(release, b"release")?;
+        let (token, affected) = stopped.await??;
+        assert_eq!(affected, vec![context.operation_id.clone()]);
+        assert!(token.matches_context(&context));
+        let mut alternatives = [
+            context.clone(),
+            context.clone(),
+            context.clone(),
+            context.clone(),
+        ];
+        alternatives[0].shared = false;
+        alternatives[1].operation_id.push_str("-other");
+        alternatives[2].resource_id = ResourceId::from_bytes([8; 32]);
+        alternatives[3].space_id = SpaceId::parse(&format!("spc2_{}", "f".repeat(64)))?;
+        for other in alternatives {
+            assert!(!token.matches_context(&other));
+        }
+        let failure = late
+            .await?
+            .expect_err("a late execution generation must be rejected");
+        assert!(!failure.uncertain);
+        assert!(failure.message.contains("generation was fenced"));
+        assert_eq!(std::fs::read_to_string(marker)?, "inspect\n");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn codex_events_use_trusted_thread_and_container_bindings() -> Result<()> {
