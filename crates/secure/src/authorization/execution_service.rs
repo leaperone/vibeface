@@ -709,7 +709,7 @@ pub fn finish_execution_service_registration(
         pins.iter_mut()
             .find(|pin| pin.domain == head.domain)
             .ok_or(AuthorizationError::PolicyConflict)?
-            .minimum_head = Some(head);
+            .minimum_head = Some(head.clone());
         let mut journal = prepared.bundle.journal.clone();
         journal.extend(prepared.request.request.new_objects.clone());
         journal.push(JournalEntry::SpaceCommit(committed));
