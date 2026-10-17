@@ -565,6 +565,10 @@ impl VerifiedRemoteExecutionShare {
     pub fn pins_json(&self) -> crate::Result<String> {
         self.change.pins_json()
     }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = scopeJson))]
+    pub fn scope_json(&self) -> crate::Result<String> {
+        self.change.scope_json()
+    }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = shareJson))]
     pub fn share_json(&self) -> crate::Result<String> {
         self.share
@@ -1001,6 +1005,7 @@ mod tests {
             finish_remote_execution_share(&prepared, &committed, (END + 1) as f64).unwrap();
         assert_eq!(expired.pins_json().unwrap(), finished.pins_json().unwrap());
         assert!(expired.share_json().is_err());
+        assert_eq!(expired.scope_json().unwrap(), "null");
         if let Ok(path) = std::env::var("VIBEFACE_REMOTE_SHARE_VECTOR") {
             std::fs::write(path,encode(&serde_json::json!({"source_pins":source_pins,"source_bundle":source_bundle,"request":envelope,
             "pins":pins,"bundle":bundle,"resource":resource,"intent":input,"prepared":request,"committed":serde_json::from_str::<serde_json::Value>(&committed).unwrap(),"share":share,"now":NOW,"end":END})).unwrap()).unwrap();
