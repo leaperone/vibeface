@@ -8,6 +8,13 @@ RUN npm install --global --no-audit --no-fund @openai/codex@0.163.0 @anthropic-a
     && useradd --uid 10001 --user-group --create-home --shell /bin/sh vibeface \
     && install -d -o vibeface -g vibeface /project
 
+COPY sidecars/package.json sidecars/package-lock.json /opt/vibeface/sdk/
+RUN cd /opt/vibeface/sdk \
+    && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && node -e 'if (JSON.parse(require("node:fs").readFileSync("node_modules/@openai/codex-sdk/package.json")).version !== "0.163.0") process.exit(1)'
+COPY sidecars/codex-manager.mjs /opt/vibeface/sdk/codex-manager.mjs
+RUN chmod 0555 /opt/vibeface/sdk/codex-manager.mjs
+
 ENV HOME=/home/vibeface
 ENV PATH=/usr/local/bin:/usr/bin:/bin
 USER 10001:10001

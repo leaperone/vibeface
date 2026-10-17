@@ -83,13 +83,11 @@ cat > "$package/RUNTIME-REQUIREMENTS.md" <<'REQUIREMENTS'
 The archive contains the Rust node binary and SDK sidecar sources. Install the provider tools separately before enabling the corresponding node roles.
 
 - Codex execution needs the `codex` CLI and its authenticated account.
-- The Codex SDK sidecar needs Node.js 18 or newer. Run `npm ci --omit=dev` in `sidecars/` before using it.
-- Cursor scheduling needs the official Cursor SDK bridge executable and CURSOR_API_KEY in the service environment.
 - Claude and Cursor CLI execution need their respective authenticated executables.
-- Shared execution needs Docker and an immutable Linux image built with `bash scripts/build-execution-image.sh`. The included recipe installs real Codex 0.163.0, Claude Code 2.1.296, Node.js and Python 3. It contains no provider credentials.
-- Set `execution_isolation.image` to the emitted `sha256:` image ID and `docker_bin` to the absolute Docker CLI path. Model egress uses the separately configured scoped gateway, never a host HOME or upstream key in the execution container. Shared Cursor model egress is currently rejected.
+- Codex SDK management and shared execution need Docker and an immutable Linux image built with `bash scripts/build-execution-image.sh`. The included recipe installs real Codex 0.163.0, Claude Code 2.1.296, Node.js, Python 3 and the locked SDK sidecar. It contains no provider credentials.
+- Set `execution_isolation.image` to the emitted `sha256:` image ID and `docker_bin` to the absolute Docker CLI path. Model egress uses the separately configured scoped gateway, never a host HOME or upstream key in the container. Cursor SDK management and shared Cursor model egress are currently rejected.
 
-Use absolute provider and sidecar paths in `config.json` when running a background service. No credentials, provider runtimes, or npm dependencies are included.
+Use absolute provider paths for personal host execution. Management uses the fixed sidecar in the image, with no host process fallback. No credentials, provider runtimes, or npm dependencies are included in the archive.
 REQUIREMENTS
 COPYFILE_DISABLE=1 tar -czf "$output/$name.tar.gz" -C "$staging" "$name"
 cd "$output"

@@ -24,7 +24,7 @@ cd vibeface-<version>-<target>
 
 包内有 Rust 程序、SDK sidecar 源码、浏览器密码学 JS/WASM、文档、用户级服务安装脚本、共享执行镜像的 Dockerfile 与构建脚本，以及 `BUILD-INFO.json`。不含身份、配置、数据库、Provider 程序、模型凭证或 npm 依赖。干净 Git 提交的正常构建会记录版本、target 和源码提交；`--skip-build` 或未提交源码构建的 `source_commit` 为 `null`，不能作为提交身份的证明。
 
-运行任务前须另装并登录相应 Provider。Codex SDK 管理路径还需 Node.js 18+，在包的 `sidecars/` 下执行 `npm ci --omit=dev`。Cursor 管理路径需另装 Cursor SDK Bridge 并配置凭证。初始化、配对、服务安装和公网 TLS 见 [Node 使用说明](node.md)。
+个人宿主执行器须另装并登录相应 Provider。Codex SDK 管理统一使用 Docker 内的受信 sidecar，不从宿主配置脚本或程序路径；Cursor SDK 管理目前拒绝。初始化、设备登记、服务安装和公网 TLS 见 [Node 使用说明](node.md)。
 
 共享资源另用 Docker 隔离执行，按[共享执行镜像](execution-image.md)构建真实 Codex、Claude Code 和 watchdog 依赖。构建输出固定 image ID 与源码身份，不发布远程镜像。宿主 Provider 凭证不进入执行容器。
 
@@ -77,7 +77,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 更新器只接受受管安装的 `current` 符号链接，下载对应平台的完整包，核对 SHA256、版本、target、源码身份和存储兼容声明后再安装。包和 checksum 都通过 GitHub HTTPS 下载，这依赖 GitHub 账户、仓库和 TLS 的可信性，不是独立发布签名。macOS 开发者签名和 notarization 仍未提供。
 
-每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序和随包 sidecar，不覆盖身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。使用 Codex SDK 时，更新器在停服务前按新包的 lock 安装 sidecar 依赖，需要可用的 npm；安装失败保留现版，不复制旧 `node_modules`。Cursor SDK 不需要这一步。
+每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序和随包构建来源，不覆盖身份、历史、配置和凭证，也不更新宿主 Provider 程序或已固定的执行镜像。需要新 SDK sidecar 时，从对应新包重建镜像，核对 image ID 后显式更新配置，不复制旧 `node_modules`。
 
 `BUILD-INFO.json` 声明 `update_protocol=2` 和 `data_epoch=3`。包协议 2 要求同名 `vibeface` 程序和制品，不接受旧包布局。新数据库采用 `vibeface-node` 格式和 layout version 1，身份授权与业务状态共用 `node.sqlite3`。更新器只安装与本机存储 epoch 一致的包。epoch 2 及更早的数据目录不兼容，不在启动或更新时导入、转换或清空。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
 
