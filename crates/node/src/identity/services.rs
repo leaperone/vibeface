@@ -1,4 +1,7 @@
-use super::{event_authorization::event_authorization_in_view, journal::PolicyState};
+use super::{
+    event_authorization::{event_authorization_in_view, verify_event_envelope},
+    journal::PolicyState,
+};
 use crate::{
     model::{AgentSession, EventBody, EventCause, OperationRequest},
     store::{Store, StoredEvent, closure_hashes, heads_from_events, load_events_from},
@@ -71,6 +74,32 @@ pub(crate) fn agent_account_message<'a>(
     Ok(message)
 }
 
+pub(crate) fn resolve_current_agent_origin(
+    policy: &PolicyState,
+    connection: &Connection,
+    events: &BTreeMap<String, StoredEvent>,
+    trigger: &str,
+    now_ms: u64,
+) -> Result<AgentOrigin> {
+    let source = events.get(trigger).context("agent trigger is missing")?;
+    let heads = heads_from_events(events, &source.event.scope_id);
+    ensure!(
+        closure_hashes(events, &heads).iter().all(|hash| events
+            .get(hash)
+            .is_some_and(|event| event.status == "ready")),
+        "current agent context is not ready"
+    );
+    resolve_agent_origin(
+        policy,
+        connection,
+        policy.verified(),
+        events,
+        trigger,
+        &heads,
+        now_ms,
+    )
+}
+
 pub(crate) fn resolve_agent_origin(
     policy: &PolicyState,
     connection: &Connection,
@@ -82,7 +111,10 @@ pub(crate) fn resolve_agent_origin(
 ) -> Result<AgentOrigin> {
     let source = events.get(trigger).context("agent trigger is missing")?;
     let event = &source.event;
-    ensure!(source.status == "ready", "agent trigger is not ready");
+    ensure!(
+        verify_event_envelope(policy, &event.network_id, &source.envelope)? == *event,
+        "agent trigger differs from its signed envelope"
+    );
     if matches!(&event.body, EventBody::MessagePosted { role, text, .. } if role == "user" && !text.trim().is_empty())
     {
         let parent = event_authorization_in_view(policy, connection, state, event, events, now_ms)?;
@@ -150,8 +182,7 @@ pub(crate) fn resolve_agent_origin(
                 .iter()
                 .all(|hash| events
                     .get(hash)
-                    .is_some_and(|stored| stored.status == "ready"
-                        && stored.event.network_id == event.network_id
+                    .is_some_and(|stored| stored.event.network_id == event.network_id
                         && stored.event.scope_id == event.scope_id
                         && stored.event.resource_id == event.resource_id)),
         "continuation snapshot is incomplete or crosses its resource"
@@ -177,6 +208,10 @@ pub(crate) fn resolve_agent_origin(
     );
     let parent =
         event_authorization_in_view(policy, connection, state, &message.event, events, now_ms)?;
+    ensure!(
+        verify_event_envelope(policy, &event.network_id, &message.envelope)? == message.event,
+        "continuation account message differs from its signed envelope"
+    );
     ensure!(
         parent.actor() == authorized.initiator() && parent.resource() == authorized.resource(),
         "continuation changed its initiating account or project"
@@ -222,10 +257,12 @@ pub(crate) fn resolve_agent_origin(
         {
             continue;
         }
-        if event_authorization_in_view(policy, connection, state, decision, events, now_ms)
-            .is_ok_and(|grant| {
-                matches!(grant.actor(), Actor::Account(_)) && grant.actor() == parent.actor()
-            })
+        if verify_event_envelope(policy, &event.network_id, &events[hash].envelope)
+            .is_ok_and(|verified| verified == *decision)
+            && event_authorization_in_view(policy, connection, state, decision, events, now_ms)
+                .is_ok_and(|grant| {
+                    matches!(grant.actor(), Actor::Account(_)) && grant.actor() == parent.actor()
+                })
         {
             permission = true;
             break;
@@ -267,14 +304,11 @@ fn check_heads(connection: &Connection, heads: &[PolicyStamp]) -> Result<()> {
 impl Store {
     pub(crate) fn agent_origin(&self, session: &AgentSession, now_ms: u64) -> Result<AgentOrigin> {
         let events = load_events_from(&self.connection, session.space_id.as_str())?;
-        let heads = heads_from_events(&events, &session.conversation_id);
-        let origin = resolve_agent_origin(
+        let origin = resolve_current_agent_origin(
             &self.policy,
             &self.connection,
-            self.policy.verified(),
             &events,
             &session.sdk_session.session_id,
-            &heads,
             now_ms,
         )?;
         ensure!(
@@ -325,16 +359,8 @@ impl Store {
             event.network_id == space && event.scope_id == conversation,
             "agent trigger belongs to another space or conversation"
         );
-        let heads = heads_from_events(&events, conversation);
-        let origin = resolve_agent_origin(
-            &self.policy,
-            &self.connection,
-            self.policy.verified(),
-            &events,
-            trigger,
-            &heads,
-            now_ms,
-        )?;
+        let origin =
+            resolve_current_agent_origin(&self.policy, &self.connection, &events, trigger, now_ms)?;
         if let Some(request) = &origin.execution {
             crate::store::validate_operation_binding_from(&self.connection, request)?;
         }

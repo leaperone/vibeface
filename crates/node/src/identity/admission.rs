@@ -1053,15 +1053,8 @@ fn check_manager_parent(
         "manager invocation differs from its persisted delegation"
     );
     let events = load_events_from(connection, space)?;
-    let heads = crate::store::heads_from_events(&events, conversation);
-    let origin = super::services::resolve_agent_origin(
-        policy,
-        connection,
-        policy.verified(),
-        &events,
-        trigger,
-        &heads,
-        now_ms,
+    let origin = super::services::resolve_current_agent_origin(
+        policy, connection, &events, trigger, now_ms,
     )?;
     if let Some(request) = &origin.execution {
         crate::store::validate_operation_binding_from(connection, request)?;
