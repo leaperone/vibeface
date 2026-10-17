@@ -276,6 +276,14 @@ fn load_admission_from(
     load_authorization_from(connection, space, &ids[0])
 }
 
+pub(super) fn admission_for_operation_from(
+    connection: &Connection,
+    space: &str,
+    operation_id: &str,
+) -> Result<AdmissionProof> {
+    Ok(load_admission_from(connection, space, operation_id)?.proof)
+}
+
 fn load_authorization_from(
     connection: &Connection,
     space: &str,
@@ -407,6 +415,11 @@ fn persisted_admission_facts(
 ) -> Result<RequestFacts> {
     if let Some(facts) =
         super::event_authorization::persisted_admission_facts(connection, policy, proof)?
+    {
+        return Ok(facts);
+    }
+    if let Some(facts) =
+        super::execution_dispatch_resolution::persisted_resolution_facts(connection, proof)?
     {
         return Ok(facts);
     }
