@@ -12,7 +12,8 @@ use std::{
     time::Duration,
 };
 use vibeface_node::{
-    api,
+    api, maintenance,
+    update::{self, Update},
     auth::AuthStore,
     config::{self, Config, ManagerSettings, PeerConfig},
     crypto::{LocalIdentity, verify_trust_bundle},
@@ -34,6 +35,8 @@ enum Action {
     Init(Box<Init>),
     /// Start this node with its configured roles.
     Serve(DataDir),
+    /// Select a release channel, check, or apply a managed update.
+    Update(Update),
     /// Join a personal network using its invite and pinned fingerprint.
     Pair(Pair),
     /// Call a node tool from a locally managed SDK process.
@@ -140,8 +143,12 @@ async fn main() -> Result<()> {
         Action::Serve(options) => {
             let runtime = Arc::new(Runtime::open(&options.data_dir).await?);
             runtime.start().await?;
-            api::serve(runtime).await
+            tokio::select! {
+                result = api::serve(runtime.clone()) => result,
+                result = maintenance::serve(runtime, options.data_dir) => result,
+            }
         }
+        Action::Update(options) => update::run(options).await,
         Action::Pair(options) => pair(options).await,
         Action::Tool { name, json } => call_tool(name, json).await,
     }
