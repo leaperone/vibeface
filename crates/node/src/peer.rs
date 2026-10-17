@@ -817,7 +817,7 @@ mod tests {
         identity: &LocalIdentity,
         nodes: &[&LocalIdentity],
     ) -> Result<(Arc<PeerHub>, mpsc::Receiver<Inbound>)> {
-        let network = owner.network_id()?;
+        let network = owner.fixture_network_id()?;
         let mut store = Store::open(":memory:")?;
         let certificates = nodes
             .iter()
@@ -836,7 +836,7 @@ mod tests {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let c = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let (sender, _) = hub(&a, &a, &[&a, &b, &c])?;
         let (enabled, _) = hub(&a, &b, &[&a, &b, &c])?;
         let (disabled, mut inbound) =
@@ -906,7 +906,7 @@ mod tests {
     async fn signed_packets_are_network_bound_deduped_and_revocation_checked() -> Result<()> {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let (sender, _) = hub(&a, &a, &[&a, &b])?;
         let (receiver, mut inbound) = hub(&a, &b, &[&a, &b])?;
         let packet = sender.packet(
@@ -927,7 +927,7 @@ mod tests {
         assert!(inbound.try_recv().is_err());
         assert!(
             receiver
-                .receive_packet(&b.network_id()?, &a.node_id()?, packet.clone())
+                .receive_packet(&b.fixture_network_id()?, &a.node_id()?, packet.clone())
                 .await
                 .is_err()
         );
@@ -969,7 +969,7 @@ mod tests {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let c = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let (requester, _) = hub(&a, &a, &[&a, &b, &c])?;
         let (expected, _) = hub(&a, &b, &[&a, &b, &c])?;
         let (other, _) = hub(&a, &c, &[&a, &b, &c])?;
@@ -1017,7 +1017,7 @@ mod tests {
         let b = LocalIdentity::generate();
         let (hub, _) = hub(&a, &a, &[&a, &b])?;
         let packet = hub.packet(
-            &a.network_id()?,
+            &a.fixture_network_id()?,
             Some(b.node_id()?),
             Kind::Request,
             json!("ok"),
@@ -1045,7 +1045,7 @@ mod tests {
         );
         assert!(
             hub.packet(
-                &a.network_id()?,
+                &a.fixture_network_id()?,
                 Some(b.node_id()?),
                 Kind::Request,
                 json!("x".repeat(MAX_PACKET_BYTES)),
@@ -1112,11 +1112,11 @@ mod tests {
         let url = serve(server.clone(), &mut tasks).await?;
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            client.connect(owner.network_id()?, url),
+            client.connect(owner.fixture_network_id()?, url),
         )
         .await?;
         assert!(result.is_err());
-        assert!(server.online(&owner.network_id()?).await.is_empty());
+        assert!(server.online(&owner.fixture_network_id()?).await.is_empty());
         Ok(())
     }
 
@@ -1126,7 +1126,7 @@ mod tests {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let c = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let (ha, mut ra) = hub(&a, &a, &[&a, &b, &c])?;
         let (hb, mut rb) = hub(&a, &b, &[&a, &b, &c])?;
         let (hc, mut rc) = hub(&a, &c, &[&a, &b, &c])?;

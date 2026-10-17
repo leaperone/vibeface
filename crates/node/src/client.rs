@@ -3,8 +3,8 @@
 use crate::{
     crypto::{self, LocalIdentity},
     identity::{
-        self, AuthorizationView, Genesis, GovernanceAction, GovernanceEvent, IdentityKind, Member,
-        NetworkState, RootCheckpoint,
+        self, AuthorizationView, Genesis, GovernanceAction, GovernanceEvent, HistoricalNode,
+        IdentityKind, Member, NetworkState, RootCheckpoint,
         local::{InviteEnvelope, InviteRequest, PairConfirm, PairRequest},
     },
     network::{NetworkSocket, Service},
@@ -619,6 +619,7 @@ async fn dispatch(
                 member.validate()?;
             }
             members.sort_by(|a, b| a.subject_id.cmp(&b.subject_id));
+            let historical_nodes = recovery_history(state, &members)?;
             let checkpoint = RootCheckpoint {
                 version: identity::IDENTITY_VERSION,
                 network_id: state.genesis.network_id.clone(),
@@ -627,6 +628,7 @@ async fn dispatch(
                     .checked_add(1)
                     .context("recovery epoch overflow")?,
                 members,
+                historical_nodes,
                 signature: String::new(),
             };
             let signing = signing("identity-recovery", checkpoint.signing_bytes()?);
@@ -739,6 +741,27 @@ fn validate_local_node(node: &Runtime, state: &NetworkState, required: bool) -> 
     }
     Ok(())
 }
+fn recovery_history(state: &NetworkState, members: &[Member]) -> Result<Vec<HistoricalNode>> {
+    let mut history: std::collections::BTreeMap<String, HistoricalNode> = state
+        .historical_nodes()?
+        .into_iter()
+        .map(|node| (node.subject_id.clone(), node))
+        .collect();
+    for member in members
+        .iter()
+        .filter(|member| member.kind == IdentityKind::Node)
+    {
+        let node = HistoricalNode {
+            subject_id: member.subject_id.clone(),
+            public_key: member.public_key.clone(),
+        };
+        if let Some(previous) = history.insert(node.subject_id.clone(), node.clone()) {
+            ensure!(previous == node, "historical device key conflict");
+        }
+    }
+    Ok(history.into_values().collect())
+}
+
 fn grant_event(review: &crate::identity::local::PairReview) -> Result<GovernanceEvent> {
     ensure!(
         !review.new_member.manage,
@@ -996,6 +1019,46 @@ async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_keeps_old_node_keys_and_covers_the_new_local_node() -> Result<()> {
+        let root = LocalIdentity::generate();
+        let admin = Member::client(&LocalIdentity::generate(), "owner", true)?;
+        let old = Member::node(
+            &LocalIdentity::generate(),
+            "old node",
+            vec![crate::model::NodeRole::Replica],
+        )?;
+        let new = Member::node(
+            &LocalIdentity::generate(),
+            "new node",
+            vec![crate::model::NodeRole::Replica],
+        )?;
+        let state = NetworkState::new(Genesis::create(&root, vec![admin.clone(), old.clone()])?)?;
+        let members = vec![admin, new.clone()];
+        let history = recovery_history(&state, &members)?;
+        assert!(
+            history
+                .iter()
+                .any(|node| node.subject_id == old.subject_id && node.public_key == old.public_key)
+        );
+        assert!(
+            history
+                .iter()
+                .any(|node| node.subject_id == new.subject_id && node.public_key == new.public_key)
+        );
+        assert!(
+            history
+                .windows(2)
+                .all(|nodes| nodes[0].subject_id < nodes[1].subject_id)
+        );
+        assert!(
+            !members
+                .iter()
+                .any(|member| member.subject_id == old.subject_id)
+        );
+        Ok(())
+    }
+
     #[test]
     fn rpc_client_identity_is_bound_to_the_noise_principal() {
         let mut input = json!({"method":"notifications"});
