@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
 };
 
@@ -122,7 +122,115 @@ enum OpenPurpose {
     Initialize,
 }
 
-fn prepare_database(path: &Path, purpose: OpenPurpose) -> Result<()> {
+struct SnapshotDirectory(PathBuf);
+
+impl Drop for SnapshotDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct DatabaseReadView {
+    connection: Connection,
+    _snapshot: Option<SnapshotDirectory>,
+}
+
+fn database_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn database_read_view(path: &Path) -> Result<DatabaseReadView> {
+    let files: Vec<_> = std::iter::once(path.to_path_buf())
+        .chain(["-wal", "-journal"].map(|suffix| database_sidecar(path, suffix)))
+        .map(|file| match fs::symlink_metadata(&file) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file() && !metadata.file_type().is_symlink(),
+                    "database snapshot source must be a regular file"
+                );
+                Ok((file, Some(metadata)))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((file, None)),
+            Err(error) => Err(error.into()),
+        })
+        .collect::<Result<_>>()?;
+    let has_recovery = files
+        .iter()
+        .skip(1)
+        .any(|(_, metadata)| metadata.as_ref().is_some_and(|metadata| metadata.len() > 0));
+    if !has_recovery {
+        let mut uri = reqwest::Url::from_file_path(path.canonicalize()?)
+            .map_err(|_| anyhow::anyhow!("invalid database path"))?;
+        uri.query_pairs_mut().append_pair("immutable", "1");
+        return Ok(DatabaseReadView {
+            connection: Connection::open_with_flags(
+                uri.as_str(),
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?,
+            _snapshot: None,
+        });
+    }
+    let snapshot_path =
+        std::env::temp_dir().join(format!("vibeface-db-check-{}", uuid::Uuid::new_v4()));
+    fs::DirBuilder::new().mode(0o700).create(&snapshot_path)?;
+    let snapshot = SnapshotDirectory(snapshot_path);
+    let destination = snapshot.0.join("node.sqlite3");
+    for (index, (source, metadata)) in files.iter().enumerate() {
+        if metadata.is_some() {
+            let target = match index {
+                0 => destination.clone(),
+                1 => database_sidecar(&destination, "-wal"),
+                _ => database_sidecar(&destination, "-journal"),
+            };
+            fs::copy(source, &target).context("copy database for read-only format verification")?;
+            fs::set_permissions(target, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    for (source, previous) in files {
+        let current = match fs::symlink_metadata(source) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let unchanged = match (previous, current) {
+            (None, None) => true,
+            (Some(before), Some(after)) => {
+                !after.file_type().is_symlink()
+                    && (
+                        before.dev(),
+                        before.ino(),
+                        before.len(),
+                        before.mtime(),
+                        before.mtime_nsec(),
+                    ) == (
+                        after.dev(),
+                        after.ino(),
+                        after.len(),
+                        after.mtime(),
+                        after.mtime_nsec(),
+                    )
+            }
+            _ => false,
+        };
+        ensure!(
+            unchanged,
+            "database changed during read-only format verification"
+        );
+    }
+    Ok(DatabaseReadView {
+        connection: Connection::open_with_flags(
+            destination.canonicalize()?,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?,
+        _snapshot: Some(snapshot),
+    })
+}
+
+fn prepare_database(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -148,19 +256,12 @@ fn prepare_database(path: &Path, purpose: OpenPurpose) -> Result<()> {
                     );
                 }
             }
-            if meta.len() > 0 && purpose == OpenPurpose::Ready {
-                let mut uri = reqwest::Url::from_file_path(path.canonicalize()?)
-                    .map_err(|_| anyhow::anyhow!("invalid database path"))?;
-                uri.query_pairs_mut().append_pair("immutable", "1");
-                let connection = Connection::open_with_flags(
-                    uri.as_str(),
-                    OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | OpenFlags::SQLITE_OPEN_URI
-                        | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-                )?;
+            if meta.len() > 0 {
+                let view = database_read_view(path)?;
+                let connection = &view.connection;
                 let tables: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |r| r.get(0))?;
                 if tables > 0 {
-                    verify_schema(&connection)?;
+                    verify_schema(connection)?;
                 } else {
                     let version: u32 =
                         connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -217,16 +318,8 @@ impl Store {
             meta.len() > 0,
             "data format database is empty; existing data was preserved"
         );
-        let mut uri = reqwest::Url::from_file_path(path.canonicalize()?)
-            .map_err(|_| anyhow::anyhow!("invalid database path"))?;
-        uri.query_pairs_mut().append_pair("immutable", "1");
-        let connection = Connection::open_with_flags(
-            uri.as_str(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_URI
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        verify_schema(&connection)
+        let view = database_read_view(path)?;
+        verify_schema(&view.connection)
     }
     pub fn open_read_only(path: &Path) -> Result<Self> {
         Self::verify_existing_database(path)?;
@@ -265,7 +358,7 @@ impl Store {
     fn open_for(path: &Path, purpose: OpenPurpose) -> Result<Self> {
         let memory = path == Path::new(":memory:");
         if !memory {
-            prepare_database(path, purpose)?;
+            prepare_database(path)?;
         }
         let canonical = if memory {
             None
@@ -3154,6 +3247,73 @@ mod tests {
                 "\"running\""
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn format_verification_uses_committed_wal_without_mutating_the_source() -> Result<()> {
+        let network = TestNetwork::new()?;
+        let db = network.directory.join("wal-format.sqlite3");
+        drop(Store::initialize(&db)?);
+        let writer = Connection::open(&db)?;
+        writer.pragma_update(None, "wal_autocheckpoint", 0)?;
+        writer.execute("UPDATE schema_metadata SET data_epoch=data_epoch-1", [])?;
+        let wal = database_sidecar(&db, "-wal");
+        assert!(fs::metadata(&wal)?.len() > 32);
+        let mut uri = reqwest::Url::from_file_path(&db).unwrap();
+        uri.query_pairs_mut().append_pair("immutable", "1");
+        let main_only = Connection::open_with_flags(
+            uri.as_str(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        assert_eq!(
+            main_only.query_row("SELECT data_epoch FROM schema_metadata", [], |row| row
+                .get::<_, u32>(0))?,
+            crate::config::DATA_EPOCH
+        );
+        drop(main_only);
+        let snapshot = || -> Result<Vec<(PathBuf, Vec<u8>, u32)>> {
+            std::iter::once(db.clone())
+                .chain(["-wal", "-shm", "-journal"].map(|suffix| database_sidecar(&db, suffix)))
+                .filter(|file| file.exists())
+                .map(|file| {
+                    Ok((
+                        file.clone(),
+                        fs::read(&file)?,
+                        fs::metadata(file)?.permissions().mode(),
+                    ))
+                })
+                .collect()
+        };
+        let before = snapshot()?;
+        assert!(Store::verify_existing_database(&db).is_err());
+        assert_eq!(snapshot()?, before);
+        assert!(Store::open(&db).is_err());
+        assert_eq!(snapshot()?, before);
+        assert!(Store::initialize(&db).is_err());
+        assert_eq!(snapshot()?, before);
+        writer.execute(
+            "UPDATE schema_metadata SET data_epoch=?",
+            [crate::config::DATA_EPOCH],
+        )?;
+        writer.execute(
+            "INSERT INTO identity_meta(key,value) VALUES('wal-fixture','committed')",
+            [],
+        )?;
+        let before = snapshot()?;
+        Store::verify_existing_database(&db)?;
+        assert_eq!(snapshot()?, before);
+        let view = database_read_view(&db)?;
+        assert_eq!(
+            view.connection.query_row(
+                "SELECT value FROM identity_meta WHERE key='wal-fixture'",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            "committed"
+        );
+        drop(view);
+        assert_eq!(snapshot()?, before);
         Ok(())
     }
 
