@@ -440,28 +440,30 @@ fn codex_progress(event: &Value) -> Option<Value> {
                     Some(json!({"type":"text_snapshot","item_id":id,"text":text}))
                 }
                 "command_execution" | "mcp_tool_call" | "file_change" | "web_search" => {
-                    let state = if kind == "item.completed" {
+                    let status = if kind == "item.completed" {
                         "completed"
                     } else {
                         "running"
                     };
                     let mut value =
-                        json!({"type":"tool","item_id":id,"state":state,"tool":item["type"]});
-                    if let Some(status) = item
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .filter(|text| text.len() <= 128 && !text.chars().any(char::is_control))
+                        json!({"type":"tool","item_id":id,"status":status,"name":item["type"]});
+                    if let Some(status) =
+                        item.get("status").and_then(Value::as_str).filter(|text| {
+                            !text.is_empty()
+                                && text.len() <= 128
+                                && !text.chars().any(char::is_control)
+                        })
                     {
-                        value["state"] = json!(status);
+                        value["status"] = json!(status);
                     }
                     Some(value)
                 }
                 _ => None,
             }
         }
-        "turn.started" => Some(json!({"type":"status","state":"running"})),
-        "turn.completed" => Some(json!({"type":"status","state":"finishing"})),
-        "turn.failed" | "error" => Some(json!({"type":"status","state":"failed"})),
+        "turn.started" => Some(json!({"type":"status","status":"running"})),
+        "turn.completed" => Some(json!({"type":"status","status":"finishing"})),
+        "turn.failed" | "error" => Some(json!({"type":"status","status":"failed"})),
         _ => None,
     }
 }
@@ -725,6 +727,16 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
 
     #[test]
     fn codex_full_item_updates_are_snapshots_without_tool_arguments() {
+        for (kind, status) in [
+            ("turn.started", "running"),
+            ("turn.completed", "finishing"),
+            ("turn.failed", "failed"),
+        ] {
+            assert_eq!(
+                codex_progress(&json!({"type":kind})),
+                Some(json!({"type":"status","status":status}))
+            );
+        }
         let started = codex_progress(&json!({"type":"item.started","item":{"id":"m1","type":"agent_message","text":"hello"}})).unwrap();
         let updated = codex_progress(&json!({"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"hello\nworld"}})).unwrap();
         assert_eq!(started["type"], "text_snapshot");
@@ -733,7 +745,9 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
             json!({"type":"text_snapshot","item_id":"m1","text":"hello\nworld"})
         );
         assert_eq!(codex_progress(&json!({"type":"item.completed","item":{"id":"t1","type":"command_execution","command":"secret-token","aggregated_output":"private","status":"completed"}})).unwrap(),
-            json!({"type":"tool","item_id":"t1","state":"completed","tool":"command_execution"}));
+            json!({"type":"tool","item_id":"t1","status":"completed","name":"command_execution"}));
+        assert_eq!(codex_progress(&json!({"type":"item.started","item":{"id":"t1","type":"command_execution","status":""}})).unwrap(),
+            json!({"type":"tool","item_id":"t1","status":"running","name":"command_execution"}));
         assert!(codex_progress(&json!({"type":"item.updated","item":{"id":"r1","type":"reasoning","text":"private"}})).is_none());
     }
 
@@ -775,7 +789,7 @@ printf '%s\n' '{{"type":"cancelled","session_id":"{session}","confirmation":"man
                 |_| async { Ok(()) },
                 cancel_rx,
                 move |event| {
-                    assert_eq!(event, json!({"type":"status","state":"running"}));
+                    assert_eq!(event, json!({"type":"status","status":"running"}));
                     cancel_tx.send(true).unwrap();
                     async { Ok(()) }
                 },

@@ -871,7 +871,7 @@ impl RunState {
                 "Cursor SDK stream closed before result and done"
             );
             self.ended = true;
-            progress(json!({"type":"status","state":"completed"})).await?;
+            progress(json!({"type":"status","status":"completed"})).await?;
             return Ok(());
         }
         ensure!(!self.done, "Cursor SDK emitted data after done");
@@ -916,10 +916,7 @@ impl RunState {
                 .and_then(safe_usage);
             let mut event = Map::new();
             event.insert("type".into(), Value::String("status".into()));
-            event.insert("state".into(), Value::String("finishing".into()));
-            if let Some(status) = result.get("status").and_then(safe_scalar) {
-                event.insert("status".into(), status);
-            }
+            event.insert("status".into(), Value::String("finishing".into()));
             if let Some(run_id) = &self.run_id {
                 event.insert("run_id".into(), Value::String(run_id.clone()));
             }
@@ -1016,12 +1013,13 @@ impl RunState {
     }
 }
 
-fn safe_scalar(value: &Value) -> Option<Value> {
+fn safe_label(value: &Value) -> Option<Value> {
     match value {
-        Value::String(text) if text.len() <= 128 && !text.chars().any(char::is_control) => {
+        Value::String(text)
+            if !text.is_empty() && text.len() <= 128 && !text.chars().any(char::is_control) =>
+        {
             Some(Value::String(text.clone()))
         }
-        Value::Number(number) => Some(Value::Number(number.clone())),
         _ => None,
     }
 }
@@ -1086,27 +1084,40 @@ fn safe_progress_event(kind: &str, event: &Value) -> Option<Value> {
         }
         "tool_call" => {
             output.insert("type".into(), json!("tool"));
-            for key in ["id", "call_id", "name", "status"] {
-                if let Some(value) = object.get(key).and_then(safe_scalar) {
+            for key in ["name", "status"] {
+                if let Some(value) = object.get(key).and_then(safe_label) {
                     output.insert(key.into(), value);
                 }
+            }
+            if !output.contains_key("name") && !output.contains_key("status") {
+                return None;
+            }
+            if let Some(id) = object
+                .get("call_id")
+                .or_else(|| object.get("id"))
+                .and_then(safe_label)
+            {
+                output.insert("item_id".into(), id);
             }
         }
         "system" | "status" => {
             output.insert("type".into(), json!("status"));
-            for key in ["status", "subtype"] {
-                if let Some(value) = object.get(key).and_then(safe_scalar) {
-                    output.insert(key.into(), value);
-                }
+            if let Some(value) = object
+                .get("status")
+                .or_else(|| object.get("subtype"))
+                .and_then(safe_label)
+            {
+                output.insert("status".into(), value);
             }
             if kind == "status"
                 && let Some(text) = object.get("message").and_then(safe_text)
+                && !text.is_empty()
             {
                 output.insert("text".into(), json!(text));
             }
-        }
-        "usage" => {
-            output.insert("type".into(), json!("status"));
+            if !output.contains_key("status") && !output.contains_key("text") {
+                return None;
+            }
         }
         _ => return None,
     }
@@ -1513,6 +1524,68 @@ mod tests {
         assert_eq!(
             redacted,
             json!({"text": "prefix [redacted] [redacted]", "items": ["[redacted]"]})
+        );
+    }
+
+    #[test]
+    fn cursor_status_and_tool_fields_match_the_live_progress_contract() {
+        assert_eq!(
+            safe_progress_event("system", &json!({"subtype":"init"})),
+            Some(json!({"type":"status","status":"init"}))
+        );
+        assert_eq!(
+            safe_progress_event("status", &json!({"status":"RUNNING","message":""})),
+            Some(json!({"type":"status","status":"RUNNING"}))
+        );
+        assert_eq!(
+            safe_progress_event(
+                "tool_call",
+                &json!({"call_id":"call-1","name":"context","status":"completed","args":{"secret":"hidden"},"result":{"secret":"hidden"}})
+            ),
+            Some(json!({"type":"tool","item_id":"call-1","name":"context","status":"completed"}))
+        );
+        assert!(
+            safe_progress_event(
+                "tool_call",
+                &json!({"name":"","status":3,"call_id":"call-1"})
+            )
+            .is_none()
+        );
+        assert!(safe_progress_event("status", &json!({"status":3,"message":""})).is_none());
+        assert!(safe_progress_event("usage", &json!({"usage":{"inputTokens":3}})).is_none());
+    }
+
+    #[tokio::test]
+    async fn cursor_terminal_progress_reports_canonical_status_without_native_numbers() {
+        let mut state = RunState::default();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let mut progress = move |value| {
+            sink.lock().unwrap().push(value);
+            async { Ok(()) }
+        };
+        for (flags, message) in [
+            (0, result(json!(3))),
+            (0, json!({"done":{"agentId":"a","runId":"r"}})),
+            (2, json!({})),
+        ] {
+            state
+                .accept(flags, message, "a", &mut progress)
+                .await
+                .unwrap();
+        }
+        let events = captured.lock().unwrap();
+        let statuses: Vec<_> = events
+            .iter()
+            .filter(|value| value["type"] == "status")
+            .cloned()
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                json!({"type":"status","status":"finishing","run_id":"r","usage":{"inputTokens":"42","outputTokens":"7"}}),
+                json!({"type":"status","status":"completed"})
+            ]
         );
     }
 
