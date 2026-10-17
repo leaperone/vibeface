@@ -1,6 +1,7 @@
 //! Account recovery preserves identity and replaces device authorization atomically.
 
 pub mod context;
+pub mod registration;
 
 use super::*;
 use zeroize::Zeroize;
@@ -1183,6 +1184,199 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn first_authenticator_material_stays_private_and_receipt_advances_the_pin() {
+        use crate::authorization::enrollment::AuthenticatorEnrollmentIntent;
+        use crate::webauthn::*;
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use coset::cbor::Value;
+        use registration::*;
+        let created = account();
+        let backup = material(&created);
+        let pins = created.pins_json().unwrap();
+        let bundle = created.bundle_json().unwrap();
+        let signed_intent =
+            build_first_authenticator_enrollment_intent(&backup, &pins, &bundle, &key(3), NOW, END)
+                .unwrap();
+        let intent: Signed<AuthenticatorEnrollmentIntent> =
+            serde_json::from_str(&signed_intent).unwrap();
+        assert!(
+            build_first_authenticator_enrollment_intent(&backup, &pins, &bundle, &key(4), NOW, END)
+                .is_err()
+        );
+        assert!(
+            build_first_authenticator_enrollment_intent(&backup, "[]", &bundle, &key(3), NOW, END)
+                .is_err()
+        );
+        let pending = PendingPasskey::prepare(
+            EnrollmentEnvelope {
+                version: AUTH_VERSION,
+                purpose: PasskeyPurpose::RegisterAuthenticator,
+                account: intent.payload.account.clone(),
+                device_public_key: intent.payload.requesting_device_public_key.clone(),
+                rights: vec![AccountRight::ManageAuthenticators],
+                target: intent.payload.target.clone(),
+                enrollment_hash: ObjectHash::body(&intent.payload).unwrap(),
+                expected_heads: intent.payload.expected_heads.clone(),
+                nonce: Nonce::from_bytes([96; 32]),
+                not_before_ms: NOW as u64,
+                expires_at_ms: NOW as u64 + 10_000,
+            },
+            RelyingParty::new("client.example", "https://client.example").unwrap(),
+            &[7; 32],
+            AuthenticationCeremony::IdentifiedAccount,
+            vec![],
+            NOW as u64,
+        )
+        .unwrap();
+        let mut auth = crate::webauthn::tests::auth(&pending, 0x5d, 7);
+        auth.extend([0; 16]);
+        auth.extend(32u16.to_be_bytes());
+        auth.extend([9; 32]);
+        auth.extend(crate::webauthn::tests::cose());
+        let object = Value::Map(vec![
+            (Value::Text("fmt".into()), Value::Text("none".into())),
+            (Value::Text("authData".into()), Value::Bytes(auth)),
+            (Value::Text("attStmt".into()), Value::Map(vec![])),
+        ]);
+        let mut bytes = Vec::new();
+        coset::cbor::ser::into_writer(&object, &mut bytes).unwrap();
+        let response = RegistrationResponse {
+            id: URL_SAFE_NO_PAD.encode([9; 32]),
+            raw_id: URL_SAFE_NO_PAD.encode([9; 32]),
+            credential_type: "public-key".into(),
+            response: AttestationResponse {
+                client_data_json: URL_SAFE_NO_PAD
+                    .encode(crate::webauthn::tests::client(&pending, "webauthn.create")),
+                attestation_object: URL_SAFE_NO_PAD.encode(bytes),
+                transports: vec![],
+            },
+            client_extension_results: serde_json::json!({}),
+        };
+        let verified = verify_passkey_registration(&pending, &response, NOW as u64).unwrap();
+        let prepared = prepare_first_authenticator_registration(
+            &backup,
+            &pins,
+            &bundle,
+            &signed_intent,
+            &verified,
+            NOW,
+        )
+        .unwrap();
+        let request = prepared.request_json().unwrap();
+        assert!(!request.contains("secret_hex"));
+        let wire: serde_json::Value = serde_json::from_str(&request).unwrap();
+        let record: Signed<AuthenticatorRecord> =
+            serde_json::from_value(wire["record"].clone()).unwrap();
+        assert_eq!(
+            record.payload.initial_state,
+            AuthenticatorState {
+                sign_count: 7,
+                backup_state: true
+            }
+        );
+        assert_eq!(record.payload.nonce, pending.envelope().nonce);
+        let proposal: Signed<AccountDocument> =
+            serde_json::from_value(wire["proposal"].clone()).unwrap();
+        let previous = proposal.payload.previous.clone().unwrap();
+        let commit = Signed::sign(
+            PolicyCommit {
+                version: AUTH_VERSION,
+                previous: previous.clone(),
+                proposal_hash: proposal.hash().unwrap(),
+                accepted_at_ms: NOW as u64,
+                issued_at_ms: NOW as u64,
+                expires_at_ms: NOW as u64 + 10_000,
+                nonce: Nonce::from_bytes([97; 32]),
+                dependencies: vec![previous.clone()],
+            },
+            &key(4),
+        )
+        .unwrap();
+        let receipt = Signed::sign(
+            FreshnessReceipt {
+                version: AUTH_VERSION,
+                current: previous,
+                challenge_hash: commit.challenge_hash().unwrap(),
+                issued_at_ms: NOW as u64,
+                expires_at_ms: NOW as u64 + 10_000,
+            },
+            &key(4),
+        )
+        .unwrap();
+        let mut committed = Committed {
+            proposal,
+            commit,
+            receipts: vec![receipt],
+        };
+        let delta = vec![
+            JournalEntry::Authenticator(record.clone()),
+            JournalEntry::AccountCommit(committed.clone()),
+        ];
+        let finished = finish_first_authenticator_registration(
+            &prepared,
+            &serde_json::to_string(&delta).unwrap(),
+            NOW,
+        )
+        .unwrap();
+        let updated_pins: Vec<PolicyPin> =
+            serde_json::from_str(&finished.pins_json().unwrap()).unwrap();
+        let updated_bundle: ClientAuthorizationBundle =
+            serde_json::from_str(&finished.bundle_json().unwrap()).unwrap();
+        let state = replay_policies(&updated_pins, &updated_bundle.journal).unwrap();
+        assert_eq!(
+            state
+                .verify_authenticator(&record, NOW as u64)
+                .unwrap()
+                .state_floor(),
+            record.payload.initial_state
+        );
+        assert_eq!(
+            updated_pins
+                .iter()
+                .find(|p| p.domain == PolicyDomain::Account(intent.payload.account.clone()))
+                .unwrap()
+                .minimum_head
+                .as_ref(),
+            state.head(&PolicyDomain::Account(intent.payload.account.clone()))
+        );
+        assert!(
+            build_first_authenticator_enrollment_intent(
+                &backup,
+                &finished.pins_json().unwrap(),
+                &finished.bundle_json().unwrap(),
+                &key(3),
+                NOW,
+                END
+            )
+            .is_err()
+        );
+        assert!(
+            finish_first_authenticator_registration(
+                &prepared,
+                &prepared.completion_journal_json().unwrap(),
+                NOW
+            )
+            .is_err()
+        );
+        committed.receipts.clear();
+        let failed = vec![
+            JournalEntry::Authenticator(record),
+            JournalEntry::AccountCommit(committed),
+        ];
+        assert!(
+            finish_first_authenticator_registration(
+                &prepared,
+                &serde_json::to_string(&failed).unwrap(),
+                NOW
+            )
+            .is_err()
+        );
+        if let Ok(path) = std::env::var("VIBEFACE_FIRST_REGISTRATION_VECTOR") {
+            std::fs::write(path, serde_json::to_vec(&serde_json::json!({"now":NOW,"end":END,"material":backup,"pins":created.pins,"bundle":created.bundle,"intent":intent,"pending":pending,"response":response,"request":wire,"committed_journal":delta,"updated_pins":updated_pins,"updated_bundle":updated_bundle})).unwrap()).unwrap();
         }
     }
 }
