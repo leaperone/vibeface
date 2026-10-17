@@ -19,6 +19,7 @@ use std::{
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
 use uuid::Uuid;
+use vibeface_secure::signature_verification::SignatureVerification;
 use vibeface_secure::{Channel, Handshake};
 
 pub const MAX_PACKET_BYTES: usize = 2 * 1024 * 1024;
@@ -43,6 +44,7 @@ pub struct Inbound {
     pub request_id: String,
     pub payload: Value,
     pub broadcast: bool,
+    pub(crate) verification: SignatureVerification,
 }
 
 pub struct PeerHub {
@@ -281,12 +283,22 @@ impl PeerHub {
     }
 
     async fn authorize(&self, network: &str, node: &str) -> Result<String> {
-        Ok(self
-            .store
-            .lock()
+        self.authorize_with_verification(network, node, &SignatureVerification::new())
             .await
-            .authorize_transport_node(node, crate::runtime::now_ms() as u64)?
-            .public_key)
+    }
+
+    async fn authorize_with_verification(
+        &self,
+        _network: &str,
+        node: &str,
+        verification: &SignatureVerification,
+    ) -> Result<String> {
+        let store = self.store.lock().await;
+        verification.run(|| {
+            Ok(store
+                .authorize_transport_node(node, crate::runtime::now_ms() as u64)?
+                .public_key)
+        })
     }
 
     fn hello(&self, network: &str) -> Result<Hello> {
@@ -561,16 +573,22 @@ impl PeerHub {
     }
 
     async fn emit(&self, packet: Packet) -> Result<()> {
-        self.authorize(&packet.body.network_id, &packet.body.origin)
-            .await?;
+        let verification = SignatureVerification::new();
+        self.authorize_with_verification(
+            &packet.body.network_id,
+            &packet.body.origin,
+            &verification,
+        )
+        .await?;
         if let Some(target) = &packet.body.target {
-            self.authorize(&packet.body.network_id, target).await?;
+            self.authorize_with_verification(&packet.body.network_id, target, &verification)
+                .await?;
         }
         if !self.remember(&packet).await? {
             return Ok(());
         }
         if packet.body.target.as_deref() == Some(packet.body.origin.as_str()) {
-            return self.deliver(&packet).await;
+            return self.deliver(&packet, verification).await;
         }
         let sent = self.forward(&packet, None).await?;
         ensure!(
@@ -581,13 +599,17 @@ impl PeerHub {
     }
 
     async fn receive_packet(&self, network: &str, peer: &str, packet: Packet) -> Result<()> {
+        let verification = SignatureVerification::new();
         ensure!(
             packet.body.network_id == network,
             "cross-network peer packet"
         );
         ensure!(packet.hops_remaining <= MAX_HOPS, "invalid peer hop limit");
         validate_body(&packet.body, now_ms()?)?;
-        let key = match self.authorize(network, &packet.body.origin).await {
+        let key = match self
+            .authorize_with_verification(network, &packet.body.origin, &verification)
+            .await
+        {
             Ok(key) => key,
             Err(error) => {
                 tracing::debug!(%error, origin=%packet.body.origin, network, "dropping peer packet from an unknown member");
@@ -595,23 +617,27 @@ impl PeerHub {
             }
         };
         if let Some(target) = &packet.body.target
-            && let Err(error) = self.authorize(network, target).await
+            && let Err(error) = self
+                .authorize_with_verification(network, target, &verification)
+                .await
         {
             tracing::debug!(%error, target, network, "dropping peer packet for an unknown member");
             return Ok(());
         }
-        verify_payload(
-            &key,
-            "peer-packet",
-            &serde_json::to_vec(&packet.body)?,
-            &packet.signature,
-        )?;
+        verification.run(|| {
+            verify_payload(
+                &key,
+                "peer-packet",
+                &serde_json::to_vec(&packet.body)?,
+                &packet.signature,
+            )
+        })?;
         if !self.remember(&packet).await? {
             return Ok(());
         }
         let local = self.identity.node_id()?;
         if packet.body.target.as_deref() == Some(local.as_str()) {
-            return self.deliver(&packet).await;
+            return self.deliver(&packet, verification).await;
         }
         if packet.body.kind == Kind::Presence {
             let mut state = self.state.lock().await;
@@ -621,7 +647,7 @@ impl PeerHub {
                 Instant::now(),
             );
         } else if packet.body.kind == Kind::Broadcast {
-            self.deliver(&packet).await?;
+            self.deliver(&packet, verification).await?;
         }
         if self.relay_enabled
             && packet.hops_remaining > 0
@@ -660,7 +686,7 @@ impl PeerHub {
         Ok(true)
     }
 
-    async fn deliver(&self, packet: &Packet) -> Result<()> {
+    async fn deliver(&self, packet: &Packet, verification: SignatureVerification) -> Result<()> {
         if packet.body.kind == Kind::Response {
             let key = (
                 packet.body.network_id.clone(),
@@ -683,6 +709,7 @@ impl PeerHub {
                     request_id: packet.body.request_id.clone(),
                     payload: packet.body.payload.clone(),
                     broadcast: packet.body.kind == Kind::Broadcast,
+                    verification,
                 })
                 .context("peer inbound queue unavailable")?;
         }
@@ -969,10 +996,26 @@ mod tests {
             json!("local"),
             None,
         )?;
+        let packet_body = serde_json::to_vec(&packet.body)?;
+        let packet_signature = packet.signature.clone();
         disabled
             .receive_packet(&network, &a.node_id()?, packet)
             .await?;
-        assert_eq!(inbound.try_recv()?.payload, json!("local"));
+        let local = inbound.try_recv()?;
+        assert_eq!(local.payload, json!("local"));
+        let before = local.verification.counts();
+        assert!(before.actual_verifications > 0 && before.actual_verifications <= 32);
+        local.verification.run(|| {
+            verify_payload(
+                &a.public_key_hex()?,
+                "peer-packet",
+                &packet_body,
+                &packet_signature,
+            )
+        })?;
+        let after = local.verification.counts();
+        assert_eq!(after.actual_verifications, before.actual_verifications);
+        assert_eq!(after.cache_hits, before.cache_hits + 1);
         revoke_service(&owner, &mut *enabled.store.lock().await, &b)?;
         let packet = sender.packet(
             &network,

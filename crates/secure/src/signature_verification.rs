@@ -24,6 +24,15 @@ struct State {
 #[derive(Clone, Default)]
 pub struct SignatureVerification(Arc<Mutex<State>>);
 
+impl std::fmt::Debug for SignatureVerification {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SignatureVerification")
+            .field("counts", &self.counts())
+            .finish_non_exhaustive()
+    }
+}
+
 struct Scope {
     id: Rc<()>,
     handle: SignatureVerification,

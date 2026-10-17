@@ -826,6 +826,7 @@ pub(crate) mod tests {
                 request_id: uuid::Uuid::new_v4().to_string(),
                 payload,
                 broadcast: false,
+                verification: SignatureVerification::new(),
             };
             assert!(node.handle_peer(&message).await.is_err());
         }
@@ -840,6 +841,7 @@ pub(crate) mod tests {
             request_id: "actual-peer-read".into(),
             payload: json!({"type":"rpc","authorization_body":body,"invocation":invocation}),
             broadcast: false,
+            verification: SignatureVerification::new(),
         };
         assert_eq!(
             node.handle_peer(&message).await?["conversations"]

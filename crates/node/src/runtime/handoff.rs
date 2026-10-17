@@ -1437,6 +1437,7 @@ mod tests {
                 network_id: prepared.context.space_id.to_string(), origin: prepared.fixture.project.node.node_id()?,
                 request_id: "retry-successful-resolution".into(),
                 payload: json!({"type":"execution_handoff_resolve","resolution":prepared.wire}), broadcast: false,
+                verification: SignatureVerification::new(),
             };
             let retry_verification = SignatureVerification::new();
             let response = prepared.node.handle_handoff_peer(&message, prepared.wire.invocation.payload.device.clone(), &retry_verification).await?;
