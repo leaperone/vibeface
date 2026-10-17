@@ -45,6 +45,7 @@ export async function rpc(
 export function openEvents(
   clientId: string,
   onSignal: (event: MessageEvent) => void,
+  onConnection?: (online: boolean) => void,
 ): () => void {
   const source = new EventSource(
     `/api/events?client_id=${encodeURIComponent(clientId)}`,
@@ -55,7 +56,11 @@ export function openEvents(
   source.addEventListener("update", notify)
   source.addEventListener("reset", notify)
   source.addEventListener("message", notify)
+  source.onopen = () => onConnection?.(true)
+  source.onerror = () => onConnection?.(false)
   return () => {
+    source.onopen = null
+    source.onerror = null
     source.removeEventListener("update", notify)
     source.removeEventListener("reset", notify)
     source.removeEventListener("message", notify)
