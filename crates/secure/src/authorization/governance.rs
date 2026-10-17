@@ -58,7 +58,7 @@ pub struct SpaceMembershipIntent {
 #[serde(deny_unknown_fields)]
 pub struct DirectionalGrantIntent {
     pub space: SpaceId,
-    pub grantee: Actor,
+    pub grantee: Grantee,
     pub scope: ResourceScope,
     pub actions: Vec<Action>,
     pub audience_node_public_key: PublicKey,
@@ -319,7 +319,7 @@ pub fn prepare_directional_grant(
                 version: AUTH_VERSION,
                 owner_space: intent.space.clone(),
                 scope: intent.scope,
-                grantee: Grantee::Actor(intent.grantee),
+                grantee: intent.grantee,
                 actions: intent.actions,
                 audience: Audience {
                     service: ServiceId::from_key(&intent.audience_node_public_key),
@@ -1516,7 +1516,7 @@ mod tests {
         );
         let grant_intent = DirectionalGrantIntent {
             space: space.clone(),
-            grantee: Actor::Account(team.account.clone()),
+            grantee: Grantee::Actor(Actor::Account(team.account.clone())),
             scope: ResourceScope::Exact(ResourceRef {
                 space: space.clone(),
                 resource: team.project.clone(),
@@ -1674,7 +1674,7 @@ mod tests {
         );
         let grant = DirectionalGrantIntent {
             space: result.scope.space_id.clone(),
-            grantee: Actor::Account(team.account.clone()),
+            grantee: Grantee::Actor(Actor::Account(team.account.clone())),
             scope: ResourceScope::WholeSpace(result.scope.space_id.clone()),
             actions: vec![Action::ConversationRead],
             audience_node_public_key: PublicKey::of(&key(4)),
