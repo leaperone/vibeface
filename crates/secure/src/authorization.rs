@@ -2398,6 +2398,47 @@ impl VerifiedPolicySet {
             verified_at_ms: now_ms,
         })
     }
+    /// Verifies service membership; per-operation rights still require an Invocation.
+    pub fn verify_service_device(
+        &self,
+        space: &SpaceId,
+        device: &DeviceId,
+        now_ms: u64,
+    ) -> Result<&Signed<DeviceCertificate>> {
+        let document = self
+            .space(space)
+            .ok_or(AuthorizationError::InvalidProof("missing service space"))?;
+        self.ensure_personal_current(document)?;
+        let certificate = self.find_device(device)?;
+        require(
+            matches!(certificate.payload.subject, Actor::Service(_))
+                && certificate.payload.uses.contains(&DeviceUse::Noise),
+            "device is not a Noise service",
+        )?;
+        match &document.root {
+            SpaceRoot::Personal { owner, .. } => require(
+                certificate.payload.owner == PolicyDomain::Account(owner.clone()),
+                "service belongs to another personal account",
+            )?,
+            SpaceRoot::Team { .. } => require(
+                certificate.payload.owner == PolicyDomain::Space(space.clone())
+                    && document.devices.contains(&certificate.hash()?),
+                "service is not registered in team space",
+            )?,
+        }
+        let mut budget = Budget::default();
+        let mut dependencies = BTreeMap::new();
+        self.dependency(&PolicyDomain::Space(space.clone()), &mut dependencies)?;
+        self.validate_certificate(
+            certificate,
+            now_ms,
+            &mut budget,
+            &mut dependencies,
+            &mut BTreeSet::new(),
+        )?;
+        self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
+        Ok(certificate)
+    }
     fn validate_presenter(
         &self,
         device: &DeviceId,
@@ -3155,6 +3196,49 @@ mod tests {
             f.state
                 .verify_invocation(&signed, &facts, &peer, NOW)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn service_membership_checks_space_subject_and_live_revocation() {
+        let mut f = Fixture::new();
+        assert!(
+            f.state
+                .verify_service_device(&f.space, &f.audience.device, NOW)
+                .is_ok()
+        );
+        assert!(
+            f.state
+                .verify_service_device(&f.space, &DeviceId::from_key(&PublicKey::of(&f.user)), NOW)
+                .is_err()
+        );
+        assert!(
+            f.state
+                .verify_service_device(
+                    &SpaceId::team(&PublicKey::of(&key(29))),
+                    &f.audience.device,
+                    NOW
+                )
+                .is_err()
+        );
+        let mut document = f.state.account(&f.account).unwrap().clone();
+        document.previous = f
+            .state
+            .head(&PolicyDomain::Account(f.account.clone()))
+            .cloned();
+        document.sequence += 1;
+        document
+            .devices
+            .retain(|h| f.state.device(h).unwrap().payload.device != f.audience.device);
+        document.revoked_devices.push(f.audience.device.clone());
+        f.state
+            .install_account(Signed::sign(document, &f.root).unwrap())
+            .unwrap();
+        assert_eq!(
+            f.state
+                .verify_service_device(&f.space, &f.audience.device, NOW)
+                .unwrap_err(),
+            AuthorizationError::Revoked
         );
     }
 
@@ -4135,6 +4219,16 @@ mod tests {
         f.state
             .install_space_committed(f.committed_space(proposal, commit), NOW)
             .unwrap();
+        assert!(
+            f.state
+                .verify_service_device(&team, &DeviceId::from_key(&PublicKey::of(&node)), NOW)
+                .is_ok()
+        );
+        assert!(
+            f.state
+                .verify_service_device(&team, &f.audience.device, NOW)
+                .is_err()
+        );
         let mut document = f.state.space(&team).unwrap().clone();
         let previous = f
             .state
