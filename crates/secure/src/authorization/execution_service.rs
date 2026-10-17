@@ -702,13 +702,15 @@ pub fn verify_execution_service_registration_commit(
 }
 
 fn merged_context(
-    material: &RecoveryMaterial,
+    account: &AccountId,
+    owner_pins: Vec<PolicyPin>,
+    owner_bundle: ClientAuthorizationBundle,
     pins: Vec<PolicyPin>,
     bundle: ClientAuthorizationBundle,
 ) -> Result<(Vec<PolicyPin>, ClientAuthorizationBundle, VerifiedPolicySet)> {
-    let saved = replay_policies(&material.pins, &material.bundle.journal)?;
+    let saved = replay_policies(&owner_pins, &owner_bundle.journal)?;
     let source = replay_policies(&pins, &bundle.journal)?;
-    let domain = PolicyDomain::Account(material.scope.account_id.clone());
+    let domain = PolicyDomain::Account(account.clone());
     let saved_head = saved
         .head(&domain)
         .ok_or(AuthorizationError::PolicyConflict)?;
@@ -720,8 +722,7 @@ fn merged_context(
         saved_first || saved.roots.contains_key(source_head),
         "source and personal account histories conflict",
     )?;
-    let mut combined: BTreeMap<_, _> = material
-        .pins
+    let mut combined: BTreeMap<_, _> = owner_pins
         .iter()
         .map(|pin| (pin.domain.clone(), pin.clone()))
         .collect();
@@ -737,9 +738,9 @@ fn merged_context(
     let mut journal = Vec::new();
     let mut seen = BTreeSet::new();
     let histories = if saved_first {
-        [&material.bundle.journal, &bundle.journal]
+        [&owner_bundle.journal, &bundle.journal]
     } else {
-        [&bundle.journal, &material.bundle.journal]
+        [&bundle.journal, &owner_bundle.journal]
     };
     for history in histories {
         for entry in history {
@@ -754,7 +755,7 @@ fn merged_context(
     )?;
     let pins: Vec<_> = combined.into_values().collect();
     let state = replay_policies(&pins, &journal)?;
-    for pin in &material.pins {
+    for pin in &owner_pins {
         require(
             pin.minimum_head
                 .as_ref()
@@ -781,6 +782,7 @@ pub struct PreparedExecutionServiceRegistration {
     proof_counts: RegistrationProofCounts,
 }
 
+/// Public owner and source histories come from verified Node reads, never private checkpoints.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = prepareExecutionServiceRegistration))]
 pub fn prepare_execution_service_registration(
     source_project_json: &str,
@@ -788,6 +790,8 @@ pub fn prepare_execution_service_registration(
     signer: &Identity,
     pins_json: &str,
     bundle_json: &str,
+    owner_pins_json: &str,
+    owner_bundle_json: &str,
     target_node_public_key: &str,
     now_ms: f64,
     expires_at_ms: f64,
@@ -799,19 +803,63 @@ pub fn prepare_execution_service_registration(
                 AuthorizationError::InvalidProof("invalid execution owner's private material")
             })?;
         let material: RecoveryMaterial = parse(owner_material_json)?;
+        let private_state = bootstrap::recovery::material_state(&material)?;
         let root = Identity::from_secret_hex(&material.root_secret_hex)
             .map_err(|_| AuthorizationError::InvalidProof("invalid execution owner root"))?;
         let source: ResourceRef = parse(source_project_json)?;
-        let (pins, bundle, state) =
-            merged_context(&material, parse(pins_json)?, parse(bundle_json)?)?;
         let account = material.scope.account_id.clone();
+        let personal = SpaceId::personal(&account);
+        let now = bootstrap::timestamp(now_ms)?;
+        let owner_bundle: ClientAuthorizationBundle = parse(owner_bundle_json)?;
         require(
-            state
-                .account(&account)
-                .is_some_and(|account| account.current_root == PublicKey::of(&root)),
+            owner_bundle.grant_leaf == material.bundle.grant_leaf,
+            "execution registration requires the current public owner entry authorization",
+        )?;
+        verify_client_authorization(
+            owner_bundle_json,
+            owner_pins_json,
+            account.as_str(),
+            personal.as_str(),
+            &signer.public_key_hex(),
+            now_ms,
+        )
+        .map_err(|_| {
+            AuthorizationError::InvalidProof("invalid public execution owner authorization")
+        })?;
+        let (pins, bundle, state) = merged_context(
+            &account,
+            parse(owner_pins_json)?,
+            owner_bundle,
+            parse(pins_json)?,
+            parse(bundle_json)?,
+        )?;
+        for pin in material.pins.iter().filter(|pin| {
+            pin.domain == PolicyDomain::Account(account.clone())
+                || pin.domain == PolicyDomain::Space(personal.clone())
+        }) {
+            require(
+                pins.iter().any(|public| {
+                    public.domain == pin.domain && public.genesis_root == pin.genesis_root
+                }) && pin
+                    .minimum_head
+                    .as_ref()
+                    .is_none_or(|head| state.roots.contains_key(head)),
+                "public execution owner history conflicts with private recovery trust",
+            )?;
+        }
+        require(
+            state.account(&account).is_some_and(|current| {
+                current.current_root == PublicKey::of(&root)
+                    && private_state
+                        .account(&account)
+                        .is_some_and(|saved| saved.recovery == current.recovery)
+            }) && state.space(&personal).is_some_and(|current| {
+                private_state.space(&personal).is_some_and(|saved| {
+                    current.current_root == saved.current_root && current.recovery == saved.recovery
+                })
+            }),
             "execution owner's material is not its current root",
         )?;
-        let now = bootstrap::timestamp(now_ms)?;
         let expiry = bootstrap::timestamp(expires_at_ms)?;
         validate_window(now, expiry, now)?;
         let target = PublicKey::parse(target_node_public_key)?;
@@ -825,7 +873,6 @@ pub fn prepare_execution_service_registration(
             now,
             &mut Budget::default(),
         )?;
-        let personal = SpaceId::personal(&account);
         let execution_resource = ResourceRef {
             space: personal.clone(),
             resource: ResourceId::random()?,
@@ -1075,7 +1122,7 @@ pub fn finish_execution_service_registration(
             space_id: personal.clone(),
             device_id: DeviceId::from_key(&intent.issuer),
         };
-        let material = RecoveryMaterial {
+        let mut material = RecoveryMaterial {
             format: prepared.material.format.clone(),
             version: prepared.material.version,
             root_secret_hex: prepared.material.root_secret_hex.clone(),
@@ -1084,7 +1131,9 @@ pub fn finish_execution_service_registration(
             pins: owner_pins,
             bundle: owner_bundle,
             entry: prepared.material.entry.clone(),
+            policy_checkpoint: None,
         };
+        bootstrap::recovery::compact_recovery_material(&mut material, now)?;
         let material_json =
             zeroize::Zeroizing::new(json(&material).map_err(|_| {
                 AuthorizationError::InvalidProof("private material encoding failed")
@@ -1199,6 +1248,8 @@ mod tests {
             &key(3),
             &json(&pins).unwrap(),
             &json(&bundle).unwrap(),
+            &json(&pins).unwrap(),
+            &json(&bundle).unwrap(),
             &key(4).public_key_hex(),
             NOW,
             NOW + 60_000.0,
@@ -1267,6 +1318,30 @@ mod tests {
             commit: Signed::sign(accepted, &key(4)).unwrap(),
             receipts,
         }
+    }
+
+    #[test]
+    fn registration_requires_independent_public_owner_history() {
+        let (_, prepared) = registration();
+        let mut incomplete = prepared.bundle.clone();
+        incomplete
+            .journal
+            .retain(|entry| !matches!(entry, JournalEntry::AccountGenesis(_)));
+        let result = prepare_execution_service_registration(
+            &json(&prepared.request.intent.payload.source_project).unwrap(),
+            &json(&prepared.material).unwrap(),
+            &key(3),
+            &json(&prepared.pins).unwrap(),
+            &json(&prepared.bundle).unwrap(),
+            &json(&prepared.pins).unwrap(),
+            &json(&incomplete).unwrap(),
+            &key(4).public_key_hex(),
+            NOW,
+            NOW + 60_000.0,
+        );
+        assert!(
+            matches!(result, Err(error) if error.contains("invalid public execution owner authorization"))
+        );
     }
 
     #[test]

@@ -969,6 +969,7 @@ mod tests {
 
     fn prepare_execution_registration(
         network: &TestNetwork,
+        store: &Store,
         source: &ResourceRef,
         pins: &[PolicyPin],
         bundle: &ClientAuthorizationBundle,
@@ -981,12 +982,22 @@ mod tests {
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
+        let owner = super::super::policy::authenticate_account_from(
+            &store.connection,
+            &store.policy,
+            &network.client.public_key_hex(),
+            &json!({"account_id":network.account,"space_id":network.space,
+                "device_public_key":network.client.public_key_hex(),"resource_id":network.resource}),
+            now(),
+        )?;
         execution_service::prepare_execution_service_registration(
             &serde_json::to_string(source)?,
             &material,
             &network.client,
             &serde_json::to_string(pins)?,
             &serde_json::to_string(bundle)?,
+            &serde_json::to_string(&owner["pins"])?,
+            &serde_json::to_string(&owner["authorization"])?,
             &network.node.public_key_hex()?,
             now() as f64,
             (now() + 60_000) as f64,
@@ -1020,7 +1031,8 @@ mod tests {
                     network.bundle.clone(),
                 )
             };
-            let prepared = prepare_execution_registration(&network, &source, &pins, &bundle)?;
+            let prepared =
+                prepare_execution_registration(&network, &store, &source, &pins, &bundle)?;
             eprintln!(
                 "execution registration source={} phase=prepare usage={}",
                 if team_source { "team" } else { "personal" },
@@ -1227,8 +1239,13 @@ mod tests {
                 space: network.space.clone(),
                 resource: network.resource.clone(),
             };
-            let prepared =
-                prepare_execution_registration(&network, &source, &network.pins, &network.bundle)?;
+            let prepared = prepare_execution_registration(
+                &network,
+                &store,
+                &source,
+                &network.pins,
+                &network.bundle,
+            )?;
             let request: Value =
                 serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
             let response = store.governance_command(
@@ -1441,8 +1458,13 @@ mod tests {
             space: network.space.clone(),
             resource: network.resource.clone(),
         };
-        let prepared =
-            prepare_execution_registration(&network, &source, &network.pins, &network.bundle)?;
+        let prepared = prepare_execution_registration(
+            &network,
+            &store,
+            &source,
+            &network.pins,
+            &network.bundle,
+        )?;
         let request: ExecutionServiceRegistrationRequest =
             serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
         let original = serde_json::to_value(&request)?;
@@ -1542,8 +1564,13 @@ mod tests {
             space: network.space.clone(),
             resource: network.resource.clone(),
         };
-        let prepared =
-            prepare_execution_registration(&network, &source, &network.pins, &network.bundle)?;
+        let prepared = prepare_execution_registration(
+            &network,
+            &store,
+            &source,
+            &network.pins,
+            &network.bundle,
+        )?;
         let request: ExecutionServiceRegistrationRequest =
             serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
         let original = serde_json::to_value(&request)?;
@@ -1635,8 +1662,13 @@ mod tests {
             space: network.space.clone(),
             resource: network.resource.clone(),
         };
-        let prepared =
-            prepare_execution_registration(&network, &source, &network.pins, &network.bundle)?;
+        let prepared = prepare_execution_registration(
+            &network,
+            &store,
+            &source,
+            &network.pins,
+            &network.bundle,
+        )?;
         let params: Value =
             serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
         let mut independent = Store::open(&path)?;
@@ -1840,7 +1872,7 @@ mod tests {
         remote.policy = state;
         assert!(remote.policy.verified().space(&network.space).is_none());
         let prepared =
-            prepare_execution_registration(&network, &source, local.policy.pins(), &bundle)
+            prepare_execution_registration(&network, &local, &source, local.policy.pins(), &bundle)
                 .context("prepare remote Team source registration")?;
         eprintln!(
             "execution registration source=remote_team phase=prepare usage={}",
