@@ -12,6 +12,7 @@ pub mod execution_handoff;
 pub mod execution_observation;
 pub mod execution_service;
 pub mod remote_share;
+pub mod remote_resolution_history;
 pub mod passkey_node;
 pub mod projection;
 pub mod services;

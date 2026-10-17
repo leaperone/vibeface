@@ -795,6 +795,7 @@ impl Runtime {
                         .handoff_freshness(auth.wire(), &transport, CheckStage::Renew)
                         .await?;
                     let deadline = node.store.lock().await.renew_execution_handoff(
+                        &node.identity,
                         &auth,
                         &proof,
                         now_ms() as u64,
