@@ -72,7 +72,7 @@ export function parseOperation(value: unknown): OperationRecord {
   const data = record(value), request = record(data.request)
   const state = text(data.state)
   if (!["accepted", "running", "unknown", "succeeded", "failed", "rejected"].includes(state)) throw new Error("未知的操作状态。")
-  return { state, request: { operation_id: text(request.operation_id), target_node: text(request.target_node), conversation_id: text(request.conversation_id), session_id: text(request.session_id) }, raw: value }
+  return { state, request: { space_id: text(request.space_id), operation_id: text(request.operation_id), target_node: text(request.target_node), conversation_id: text(request.conversation_id), session_id: text(request.session_id) }, raw: value }
 }
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {
   const data = record(value), missing = record(data.missing)
@@ -97,22 +97,22 @@ export function parseAction(value: unknown): OperateAction {
   }
 }
 
-function operationRequest(value: unknown, networkId: string): OperationRequest {
+function operationRequest(value: unknown, spaceId: string): OperationRequest {
   const data = record(value)
-  if (data.network_id !== networkId || data.task_id !== null) throw new Error("待核对操作属于其他个人网络。")
+  if (data.space_id !== spaceId || data.task_id !== null) throw new Error("待核对操作属于其他空间。")
   return {
-    operation_id: text(data.operation_id), network_id: networkId, conversation_id: text(data.conversation_id), task_id: null,
+    operation_id: text(data.operation_id), space_id: spaceId, conversation_id: text(data.conversation_id), task_id: null,
     target_node: text(data.target_node), session_id: text(data.session_id), expected_revision: number(data.expected_revision),
     basis_heads: texts(data.basis_heads), resources: texts(data.resources), action: parseAction(data.action),
   }
 }
-export function parsePending(value: unknown, networkId: string): PendingOperation[] {
+export function parsePending(value: unknown, spaceId: string): PendingOperation[] {
   return list(value).map((item) => {
-    const data = record(item), request = operationRequest(data.request, networkId)
-    for (const key of ["operation_id", "target_node", "conversation_id", "session_id"] as const) {
+    const data = record(item), request = operationRequest(data.request, spaceId)
+    for (const key of ["space_id", "operation_id", "target_node", "conversation_id", "session_id"] as const) {
       if (data[key] !== request[key]) throw new Error("待核对操作内容不一致。")
     }
-    return { operation_id: request.operation_id, target_node: request.target_node, conversation_id: request.conversation_id, session_id: request.session_id, request }
+    return { space_id: request.space_id, operation_id: request.operation_id, target_node: request.target_node, conversation_id: request.conversation_id, session_id: request.session_id, request }
   })
 }
 export function parsePendingMessages(value: unknown): PendingMessage[] {

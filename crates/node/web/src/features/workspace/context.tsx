@@ -10,15 +10,15 @@ import {
   parsePending, parsePendingMessages, parsePendingConversation, parsePendingTasks, parseSession, record,
 } from "./model"
 import { errorText, parseReconcile, reconcileDecision, type ReconcileRecord } from "./reconcile"
-import { networkKey, newId, readStorage, writeStorage } from "./storage"
+import { scopeKey } from "@/lib/scope"
+import { newId, readStorage, writeStorage } from "./storage"
 import type {
   ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, OperateAction,
   OperationRequest, PendingOperation, PendingMessage, PendingConversation, PendingTask, SessionRecord, WorkspaceView,
 } from "./types"
 
 function useWorkspaceState(connection: ReadyConnection) {
-  const networkId = connection.principal.network_id
-  const clientId = connection.principal.subject_id
+  const spaceId = connection.scope.space_id
   const canAutoFollowup = connection.info.roles.includes("gateway")
   const [booted, setBooted] = useState(false)
   const [writeState, setWriteState] = useState<"checking" | "writable" | "readonly" | "unsupported">("checking")
@@ -49,6 +49,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   const creationsRef = useRef<PendingConversation | null>(null)
   const tasksRef = useRef<PendingTask[]>([])
   const notificationsRef = useRef<NotificationRecord[]>([])
+  const popups = useRef(new Set<Notification>())
   const inFlight = useRef(new Set<string>())
   const refreshingRef = useRef(false)
   const refreshAgain = useRef(false)
@@ -67,8 +68,8 @@ function useWorkspaceState(connection: ReadyConnection) {
     requireCurrent()
     if (!writer.current) throw new Error("此页面只读。关闭正在操作此设备的其他页面，再重新连接。浏览器需支持 Web Locks。")
   }
-  const scoped = (key: string) => networkKey(`${key}.${clientId}`, networkId)
-  const readFrontiers = () => frontierMap(readStorage<unknown>(networkKey("frontiers", networkId), {}, true))
+  const scoped = (key: string) => scopeKey(connection.scope, key)
+  const readFrontiers = () => frontierMap(readStorage<unknown>(scoped("frontiers"), {}, true))
   const replacePending = (next: PendingOperation[]) => {
     requireWriter()
     writeStorage(scoped("pending"), next, true)
@@ -90,7 +91,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     setConversationId(id)
     setData(null)
     setActual({})
-    window.history.replaceState(null, "", conversationHref(window.location.href, id))
+    window.history.replaceState(null, "", conversationHref(window.location.href, id, connection.scope))
   }
   const readConversation = async (id: string) => {
     const sequence = ++readSequence.current
@@ -101,7 +102,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     if (!isIncomplete(next.missing)) {
       const latest = readFrontiers()
       const concurrent = (latest[id] ?? []).filter((head) => !basis.includes(head))
-      writeStorage(networkKey("frontiers", networkId), { ...latest, [id]: [...new Set([...next.heads, ...concurrent])] }, true)
+      writeStorage(scoped("frontiers"), { ...latest, [id]: [...new Set([...next.heads, ...concurrent])] }, true)
     }
     dataRef.current = next
     setData(next)
@@ -109,20 +110,22 @@ function useWorkspaceState(connection: ReadyConnection) {
   }
   const refreshNotificationButton = () => {
     if (!("Notification" in window)) { setNotificationButton({ label: "浏览器不支持提醒", disabled: true }); return }
-    const enabled = readStorage(networkKey("notify", networkId), false)
+    const enabled = readStorage(scoped("notify"), false)
     setNotificationButton(Notification.permission === "granted"
       ? { label: enabled ? "浏览器提醒已开启" : "启用此网络提醒", disabled: enabled }
       : Notification.permission === "denied" ? { label: "请在浏览器设置允许提醒", disabled: true }
       : { label: "开启浏览器提醒", disabled: false })
   }
   const notifyBrowser = (items: NotificationRecord[]) => {
-    if (!("Notification" in window) || Notification.permission !== "granted" || !readStorage(networkKey("notify", networkId), false)) return
-    const seen = new Set(readStorage<string[]>(networkKey("seen", networkId), []))
+    if (!("Notification" in window) || Notification.permission !== "granted" || !readStorage(scoped("notify"), false)) return
+    const seen = new Set(readStorage<string[]>(scoped("seen"), []))
     for (const item of items) {
       if (seen.has(item.notification_id)) continue
       seen.add(item.notification_id)
       try {
-        const popup = new Notification("Vibeface · 任务进展", { body: item.text, tag: item.notification_id })
+        const popup = new Notification("Vibeface · 任务进展", { body: item.text, tag: scoped(item.notification_id) })
+        popups.current.add(popup)
+        popup.onclose = () => popups.current.delete(popup)
         popup.onclick = () => {
           if (!current()) { popup.close(); return }
           window.focus(); selectConversation(item.conversation_id); setView("chat")
@@ -131,7 +134,7 @@ function useWorkspaceState(connection: ReadyConnection) {
         }
       } catch { /* The persisted inbox remains available when browser notifications fail. */ }
     }
-    writeStorage(networkKey("seen", networkId), [...seen].slice(-1000))
+    writeStorage(scoped("seen"), [...seen].slice(-1000))
   }
   const scheduleRefresh = () => {
     if (!current() || refreshTimer.current !== null) return
@@ -176,7 +179,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   refreshRef.current = refresh
 
   const loadPending = () => {
-    const storedPending = parsePending(readStorage<unknown>(scoped("pending"), [], true), networkId)
+    const storedPending = parsePending(readStorage<unknown>(scoped("pending"), [], true), spaceId)
     const storedMessages = parsePendingMessages(readStorage<unknown>(scoped("pending-messages"), [], true))
     const storedConversation = parsePendingConversation(readStorage<unknown>(scoped("pending-conversation"), null, true))
     const storedTasks = parsePendingTasks(readStorage<unknown>(scoped("pending-tasks"), [], true))
@@ -190,15 +193,24 @@ function useWorkspaceState(connection: ReadyConnection) {
     alive.current = true
     try {
       const params = new URL(window.location.href).searchParams
+      const matchingScope = params.get("account") === connection.scope.account_id && params.get("space") === connection.scope.space_id && params.get("device") === connection.scope.device_id
+      if (!matchingScope) {
+        for (const key of ["conversation", "basis", "account", "space", "device"]) params.delete(key)
+        const clean = new URL(window.location.href); clean.search = params.toString(); window.history.replaceState(null, "", clean)
+      }
       activeId.current = params.get("conversation") ?? ""
       setConversationId(activeId.current)
       loadPending()
       const frontiers = readFrontiers(), heads = frontiers[activeId.current] ?? []
       const basis = mergeBasis(heads, params.get("basis"))
-      if (activeId.current && basis !== heads) writeStorage(networkKey("frontiers", networkId), { ...frontiers, [activeId.current]: basis }, true)
+      if (activeId.current && basis !== heads) writeStorage(scoped("frontiers"), { ...frontiers, [activeId.current]: basis }, true)
       setBooted(true)
     } catch (caught) { showError(caught) }
-    return () => { alive.current = false }
+    return () => {
+      alive.current = false; readSequence.current += 1
+      for (const popup of popups.current) popup.close()
+      popups.current.clear()
+    }
   }, [connection])
 
   useEffect(() => {
@@ -310,7 +322,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
       const scheduler = nodes.find((item) => item.node_id === (prior?.scheduler_node ?? schedulerNodeId))
       if (!scheduler?.online || scheduler.revoked || !scheduler.capabilities?.manager) throw new Error("原调度设备不可用，请先恢复连接并核对原消息。")
-      const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: scheduler.node_id, entryNode: connection.entry.node_id, pending: prior, heads: context.heads })
+      const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: scheduler.node_id, entryNode: connection.audience.device, pending: prior, heads: context.heads })
       if (!prepared.ok) throw new Error(prepared.error)
       replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])
       setMessageBusy(true)
@@ -323,7 +335,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       } catch (caught) {
         if (current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
           const original = messagesRef.current.find((item) => item.message_id === prepared.pending.message_id)
-          if (original) replaceMessages(messagesRef.current.map((item) => item === original ? { ...item, rejected: { entry_node: connection.entry.node_id } } : item))
+          if (original) replaceMessages(messagesRef.current.map((item) => item === original ? { ...item, rejected: { entry_node: connection.audience.device } } : item))
         }
         throw caught
       } finally { if (current()) setMessageBusy(false) }
@@ -332,7 +344,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       requireCurrent()
       const id = activeId.current, original = messagesRef.current.find((item) => item.conversation_id === id)
       if (!original) throw new Error("原消息请求尚未结束，请先核对。")
-      if (original.entry_node !== connection.entry.node_id || original.rejected?.entry_node !== connection.entry.node_id) throw new Error("需要原入口明确返回错误，再在同一连接核对完整会话。超时或断线后不能据此解除，请原样重试并核对。")
+      if (original.entry_node !== connection.audience.device || original.rejected?.entry_node !== connection.audience.device) throw new Error("需要原入口明确返回错误，再在同一连接核对完整会话。超时或断线后不能据此解除，请原样重试并核对。")
       const complete = await readConversation(id)
       requireContext(id)
       if (messagesRef.current.find((item) => item.conversation_id === id) !== original || complete.messages.some((item) => item.message_id === original.message_id)) throw new Error("已找到原消息或待核对记录变化，请保留原记录并核对调度结果。")
@@ -344,11 +356,11 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (pendingRef.current.some((item) => item.conversation_id === id && item.target_node === target.target_node && (action.type === "open" || item.session_id === target.session_id))) throw new Error("此设备有尚未确认的操作，请先核对原操作。")
       const session = context.sessions.find((item) => item.target_node === target.target_node && item.session_id === target.session_id)
       if (session?.state === "unknown" && action.type !== "read") throw new Error("执行结果未知，请先读取实际状态并人工核对。")
-      const request: OperationRequest = { operation_id: newId(), network_id: networkId, conversation_id: id, task_id: null, target_node: target.target_node, session_id: target.session_id, expected_revision: target.revision ?? 0, basis_heads: context.heads, resources: [], action }
-      replacePending([...pendingRef.current, { operation_id: request.operation_id, target_node: request.target_node, session_id: request.session_id, conversation_id: id, request }])
+      const request: OperationRequest = { operation_id: newId(), space_id: spaceId, conversation_id: id, task_id: null, target_node: target.target_node, session_id: target.session_id, expected_revision: target.revision ?? 0, basis_heads: context.heads, resources: [], action }
+      replacePending([...pendingRef.current, { space_id: request.space_id, operation_id: request.operation_id, target_node: request.target_node, session_id: request.session_id, conversation_id: id, request }])
       const result = parseOperation(record(await connection.rpc("operate", { request })).operation)
       requireCurrent()
-      if (result.request.operation_id !== request.operation_id || result.request.target_node !== target.target_node || result.request.conversation_id !== id || result.request.session_id !== target.session_id) throw new Error("响应操作与原请求不一致，请核对原操作。")
+      if (result.request.space_id !== spaceId || result.request.operation_id !== request.operation_id || result.request.target_node !== target.target_node || result.request.conversation_id !== id || result.request.session_id !== target.session_id) throw new Error("响应操作与原请求不一致，请核对原操作。")
       removePending(request.operation_id)
       setNoticeText(`操作已提交（${stateNames[result.state] ?? result.state}）。`)
       if (activeId.current === id) await refreshRef.current()
@@ -368,7 +380,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       const operation = pendingRef.current.find((item) => item.operation_id === operationId)
       if (!operation || operation.conversation_id !== activeId.current) throw new Error("请先回到原操作的会话。")
       return withMutation(`operate:${operation.target_node}:${operation.session_id}`, async () => {
-        if (connection.entry.node_id !== operation.target_node) throw new Error("请连接原执行设备，再读取完整会话并核对原操作。")
+        if (connection.audience.device !== operation.target_node) throw new Error("请连接原执行设备，再读取完整会话并核对原操作。")
         const result = parseReconcile(await connection.rpc("reconcile", { target_node: operation.target_node, operation_id: operation.operation_id }))
         requireCurrent()
         if (reconcileDecision(result, operation) !== "missing") throw new Error("原执行设备没有确认该操作缺失，已保留待核对记录。")
@@ -405,8 +417,8 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (!("Notification" in window)) return
       const permission = Notification.permission === "granted" ? "granted" : await Notification.requestPermission()
       requireCurrent()
-      writeStorage(networkKey("notify", networkId), permission === "granted")
-      if (permission === "granted") { writeStorage(networkKey("seen", networkId), notificationsRef.current.map((item) => item.notification_id)); setNoticeText("浏览器提醒已开启。已有通知保留在通知列表中。") }
+      writeStorage(scoped("notify"), permission === "granted")
+      if (permission === "granted") { writeStorage(scoped("seen"), notificationsRef.current.map((item) => item.notification_id)); setNoticeText("浏览器提醒已开启。已有通知保留在通知列表中。") }
       refreshNotificationButton()
     },
   }

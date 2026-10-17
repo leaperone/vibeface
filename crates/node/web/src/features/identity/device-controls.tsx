@@ -84,7 +84,7 @@ export function DeviceControls() {
     })
   }
 
-  const canManage = ready?.principal.can_manage === true
+  const canManage = ready?.authorization.canManage === true
   const needsReplica = roles.some((role) => role === 'gateway' || role === 'scheduler' || role === 'executor')
   const currentReview = review && pairs.find((pair) => pair.request_id === review.request_id && JSON.stringify(pair) === JSON.stringify(review))
 
@@ -95,7 +95,7 @@ export function DeviceControls() {
     <section className={panel} aria-labelledby="current-device-title">
       <h2 id="current-device-title" className="font-semibold">当前连接</h2>
       <dl className="grid gap-3 text-sm">
-        <div><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono">{directory?.network_id || ready?.principal.network_id || '尚未连接'}</dd></div>
+        <div><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono">{directory?.network_id || ready?.scope.space_id || '尚未连接'}</dd></div>
         <div><dt className="text-muted-foreground">此浏览器的设备指纹</dt><dd className="break-all font-mono">{identity?.nodeId || '正在读取'}</dd></div>
         <div><dt className="text-muted-foreground">此浏览器的公钥</dt><dd className="break-all font-mono">{identity?.publicKey || '正在读取'}</dd></div>
         {ready && <>
@@ -103,6 +103,7 @@ export function DeviceControls() {
           <div><dt className="text-muted-foreground">目标节点指纹</dt><dd className="break-all font-mono">{ready.entry.node_id}</dd></div>
         </>}
       </dl>
+      <button type="button" className={button} disabled={busy} onClick={() => void run(device.backupVault, '加密设备备份已下载。请另行保存口令。')}>下载加密设备备份</button>
       {ready && <button type="button" className={button} disabled={busy} onClick={() => device.disconnect()}>断开连接</button>}
     </section>
 

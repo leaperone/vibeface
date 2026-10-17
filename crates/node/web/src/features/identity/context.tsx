@@ -1,24 +1,27 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { connectDevice, initClient, readInvitation, signClient } from '../../../transport.js'
-import type { DeviceChannel } from '../../../transport.js'
+import { clientVaultStatus, connectDevice, exportDeviceVault, initClient, lockClient, readInvitation, signClient } from '../../../transport.js'
+import type { ClientVaultOptions, DeviceChannel, VaultProfile } from '../../../transport.js'
 import {
   array, boolean, deviceName, digest, entryKey, integer, messageOf, parseEntry, parseInfo, parseInvitation,
   parseMember, parsePairReceipt, parseReview, parseSigning, parseView, record, same, signingPayload, text,
 } from '@/lib/node'
 import type { ConnectionEntry, EntryInfo, Member, MembershipView, NodeRole, PairReceipt, PublicIdentity, ReadyConnection, WaitingPair } from '@/lib/node'
 import type { AuthenticationTrust } from '@/lib/secure'
-import { Identity, downloadPackage, openPackage, sealPackage, verifiedView, verifyAuthentication, verifyRecoveryResult, verifyState } from '@/lib/secure'
+import { prepareRpc } from '@/lib/rpc-action'
+import type { AuthorizationTrust } from '@/lib/authorization'
+import { mergeAuthorizationTrust, parseAuthorizationTrust, verifyScopedAuthentication } from '@/lib/authorization'
+import { Identity, downloadPackage, openPackage, sealPackage, verifiedView, verifyRecoveryResult, verifyState } from '@/lib/secure'
 
-type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'unpaired' | 'ready'
+type Phase = 'initializing' | 'blocked' | 'vault_empty' | 'vault_locked' | 'vault_unavailable' | 'key_lost' | 'disconnected' | 'connecting' | 'unpaired' | 'ready'
 type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
 type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (members: Member[]) => Promise<void> }
-type Session = { channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number }
+type Session = { authorization?: ReturnType<typeof verifyScopedAuthentication>; channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number }
 type DeviceContextValue = {
-  identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
+  identity: PublicIdentity | null; vaults: VaultProfile[]; spaces: AuthorizationTrust[]; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; pairs: PairReceipt[]; waiting: WaitingPair | null; review: Review | null; initialInvitation: string
-  connect(entry: ConnectionEntry): Promise<void>; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
-  replaceLostKey(): Promise<void>; pair(invitation: string, name: string, password?: string): Promise<void>; acceptPair(): Promise<void>; checkPair(): Promise<void>; cancelPair(): void
+  connect(entry: ConnectionEntry, spaceId?: string): Promise<void>; selectSpace(spaceId: string): Promise<void>; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
+  initializeVault(options: ClientVaultOptions): Promise<void>; lockVault(): void; backupVault(): Promise<void>; pair(invitation: string, name: string, password?: string): Promise<void>; acceptPair(): Promise<void>; checkPair(): Promise<void>; cancelPair(): void
   refreshDirectory(): Promise<void>; createInvitation(kind: 'client' | 'node', roles: NodeRole[]): Promise<string>; approvePair(requestId: string): Promise<void>; revoke(subjectId: string): Promise<void>
   beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry; bootstrap: string }): Promise<void>
   reencrypt(input: { file: File; oldPassword: string; password: string }): Promise<void>
@@ -26,16 +29,16 @@ type DeviceContextValue = {
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
 const changed = () => new Error('设备连接已切换。原操作结果需要核对，不会自动重发。')
-function load(key: string): unknown { try { const value = localStorage.getItem(`vibeface.${key}`); return value ? JSON.parse(value) : null } catch { return null } }
-function store(key: string, value: unknown) { try { localStorage.setItem(`vibeface.${key}`, JSON.stringify(value)) } catch { throw new Error('浏览器无法保存设备记录。请允许此站点使用本地存储。') } }
-function savedEntries(): ConnectionEntry[] {
-  const value = load('connections')
+function load(key: string, required = false): unknown { try { const value = localStorage.getItem(`vibeface.v3.${key}`); return value ? JSON.parse(value) : null } catch { if (required) throw new Error('无法读取已保存的账户信任，请保留浏览器数据并检查存储权限。'); return null } }
+function store(key: string, value: unknown) { try { localStorage.setItem(`vibeface.v3.${key}`, JSON.stringify(value)) } catch { throw new Error('浏览器无法保存设备记录。请允许此站点使用本地存储。') } }
+function savedEntries(profile: string): ConnectionEntry[] {
+  const value = load(`profile.${profile}.connections`)
   if (!Array.isArray(value)) return []
   return value.flatMap(item => { try { return [parseEntry(item)] } catch { return [] } })
 }
-function loadWaiting(): WaitingPair | null {
+function loadWaiting(profile: string): WaitingPair | null {
   try {
-    const value = load('waiting-pair')
+    const value = load(`profile.${profile}.waiting-pair`)
     if (!value) return null
     const v = record(value)
     const review = parseReview(v.review)
@@ -51,6 +54,8 @@ function isResponseError(error: unknown) { return error instanceof Error && 'res
 
 export function DeviceProvider({ children }: { children: ReactNode }) {
   const [identity, setIdentity] = useState<PublicIdentity | null>(null)
+  const [vaults, setVaults] = useState<VaultProfile[]>([])
+  const [spaces, setSpaces] = useState<AuthorizationTrust[]>([])
   const [ready, setReady] = useState<ReadyConnection | null>(null)
   const [entries, setEntries] = useState<ConnectionEntry[]>([])
   const [phase, setPhase] = useState<Phase>('initializing')
@@ -70,52 +75,85 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const identityRef = useRef<PublicIdentity | null>(null)
   const waitingRef = useRef<WaitingPair | null>(null)
 
+  function storageProfile(own = identityRef.current) {
+    if (!own) throw new Error('请先解锁设备配置。')
+    return own.profileId ?? `temporary-${own.nodeId}`
+  }
+  const profileKey = (key: string) => `profile.${storageProfile()}.${key}`
+  const savedSpaces = () => array(load(profileKey('policy-trusts'), true) ?? []).map(parseAuthorizationTrust)
+
   const cancelSensitive = useCallback(() => { sensitive.current?.cancel(); sensitive.current = null; setReview(null) }, [])
   const disconnect = useCallback(() => {
     generation.current += 1
     cancelSensitive()
     connecting.current?.abort(); connecting.current = null
     const previous = session.current; session.current = null
-    previous?.channel.close()
+    previous?.authorization?.release(); previous?.channel.close()
     listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setInfo(null); setEntry(null)
     waitingRef.current = null; setWaiting(null); setPhase('disconnected'); setError('')
   }, [cancelSensitive])
   const saveEntry = useCallback((candidate: ConnectionEntry) => {
     const parsed = parseEntry(candidate)
-    const next = [...savedEntries().filter(item => entryKey(item) !== entryKey(parsed)), parsed]
-    store('connections', next); setEntries(next)
+    const next = [...savedEntries(storageProfile()).filter(item => entryKey(item) !== entryKey(parsed)), parsed]
+    store(profileKey('connections'), next); setEntries(next)
   }, [])
   const removeEntry = useCallback((candidate: ConnectionEntry) => {
-    const next = savedEntries().filter(item => entryKey(item) !== entryKey(candidate))
-    store('connections', next); setEntries(next)
+    const next = savedEntries(storageProfile()).filter(item => entryKey(item) !== entryKey(candidate))
+    store(profileKey('connections'), next); setEntries(next)
   }, [])
   function current() { const value = session.current; if (!value) throw new Error('先连接并核对自己的设备。'); return value }
-  async function callSession(active: Session, method: string, params: Record<string, unknown> = {}) {
+  async function callSession(active: Session, method: string, params: Record<string, unknown> = {}, invocation?: unknown) {
     if (session.current !== active || active.generation !== generation.current) throw changed()
-    const result = await active.channel.request(method, params)
+    const result = await active.channel.request(method, params, invocation)
     if (session.current !== active || active.generation !== generation.current) throw changed()
     return result
   }
   function scoped(active = current()) { return (method: string, params: Record<string, unknown> = {}) => callSession(active, method, params) }
-  async function authenticate(authValue: unknown, active = current(), expected: AuthenticationTrust | null = null) {
+  async function authenticate(authValue: unknown, active = current(), expected: AuthenticationTrust | AuthorizationTrust | null = null) {
     const request = scoped(active)
     const own = identityRef.current
     if (!own) throw new Error('浏览器密钥尚未初始化。')
-    const { principal, view } = verifyAuthentication(authValue, own, expected)
-    if (session.current !== active) throw changed()
-    const pinnedNetwork = load(`network-for.${active.entry.node_id}`)
-    if (pinnedNetwork && pinnedNetwork !== principal.network_id) throw new Error('此设备返回了不同的个人网络。请先核对原授权。')
-    store(`network-for.${active.entry.node_id}`, principal.network_id)
+    if (expected && expected.kind !== 'policy') throw new Error('旧格式账户授权不能用于当前版本。请使用新格式账户连接卡。')
+    if (!('locks' in navigator)) throw new Error('此浏览器需要支持 Web Locks 才能安全保存账户政策。请更换安全浏览器入口。')
+    const authorization = await navigator.locks.request(profileKey('policy-trust-writer'), () => {
+      if (session.current !== active) throw changed()
+      const known = savedSpaces()
+      const selectedSpace = load(profileKey('last-space'))
+      const candidate = expected ?? known.find(trust => trust.spaceId === selectedSpace) ?? known[0]
+      const trust = mergeAuthorizationTrust(parseAuthorizationTrust(candidate), known)
+      const verified = verifyScopedAuthentication(authValue, own, trust, active.channel.publicKey)
+      try {
+        const others = known.filter(trust => trust.spaceId !== verified.trust.spaceId)
+        const next = [...others.map(trust => mergeAuthorizationTrust(trust, [verified.trust])), verified.trust]
+        store(profileKey('policy-trusts'), next)
+        store(profileKey('last-space'), verified.scope.space_id)
+        setSpaces(next)
+      } catch (error) { verified.release(); throw error }
+      return verified
+    })
+    if (session.current !== active) { authorization.release(); throw changed() }
+    active.authorization?.release(); active.authorization = authorization
     saveEntry(active.entry)
-    await request('subscribe')
+    store(profileKey('last-entry'), active.entry)
+    try { await request('subscribe') }
+    catch (error) { authorization.release(); if (active.authorization === authorization) active.authorization = undefined; throw error }
     const connection: ReadyConnection = {
-      generation: active.generation, entry: active.entry, principal, info: active.info,
+      generation: active.generation, entry: active.entry, scope: authorization.scope, audience: authorization.audience, info: active.info,
+      authorization: { canManage: authorization.canManage, actions: authorization.actions, authorityEpoch: authorization.authorityEpoch },
       request: (method, params) => { if (session.current !== active) return Promise.reject(changed()); return request(method, params) },
-      rpc: (method, params) => { if (session.current !== active) return Promise.reject(changed()); return request('rpc', { method, ...params }) },
-      subscribe(listener) { listeners.current.add(listener); return () => { listeners.current.delete(listener) } },
+      rpc: async (method, params) => {
+        if (session.current !== active) throw changed()
+        const prepared = prepareRpc({ method, params: params ?? {}, spaceId: authorization.scope.space_id, authorizationId: crypto.randomUUID() })
+        const bodyJson = JSON.stringify(prepared.body)
+        const body = record(JSON.parse(bodyJson))
+        const template = record(await request('prepare_invocation', { body }))
+        const invocation = record(JSON.parse(authorization.sign(JSON.stringify(record(template.invocation)), bodyJson, prepared.action, prepared.authorizationId)))
+        return callSession(active, 'rpc', body, invocation)
+      },
+      subscribe(listener) { if (session.current !== active) return () => {}; listeners.current.add(listener); return () => { listeners.current.delete(listener) } },
       isCurrent: () => session.current === active && generation.current === active.generation,
     }
-    setDirectory(view); setReady(connection); setPhase('ready'); setError(''); waitingRef.current = null; setWaiting(null); store('waiting-pair', null)
+    setDirectory(null); setReady(connection); setPhase('ready'); setError(''); waitingRef.current = null; setWaiting(null); store(profileKey('waiting-pair'), null)
   }
   async function open(entryValue: ConnectionEntry) {
     const parsed = parseEntry(entryValue)
@@ -128,7 +166,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         onEvent(value) { const event = record(value); if (version === generation.current && event.type === 'changed') for (const listener of listeners.current) listener() },
         onClose(reason) {
           if (version !== generation.current) return
-          generation.current += 1; session.current = null; cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setWaiting(null); waitingRef.current = null; setPhase('disconnected'); setError(messageOf(reason))
+          generation.current += 1; session.current?.authorization?.release(); session.current = null; cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setWaiting(null); waitingRef.current = null; setPhase('disconnected'); setError(messageOf(reason))
         },
       })
       if (version !== generation.current) { channel.close(); throw changed() }
@@ -142,31 +180,44 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       throw cause
     }
   }
-  async function connect(candidate: ConnectionEntry) {
+  async function connect(candidate: ConnectionEntry, spaceId?: string) {
+    const known = savedSpaces()
+    const selectedSpace = spaceId ?? load(profileKey('last-space'), true)
+    if (selectedSpace !== null && typeof selectedSpace !== 'string') throw new Error('已保存的空间选择无效。请保留浏览器数据并核查。')
+    const trust = selectedSpace ? known.find(trust => trust.spaceId === selectedSpace) : known[0]
+    if (!trust) throw new Error('请先使用新格式连接卡为此设备配置取得账户授权。')
     const active = await open(candidate)
     const request = scoped(active)
     let auth: unknown
-    try { auth = await request('authenticate', { network_id: load(`network-for.${active.entry.node_id}`) ?? '' }) }
-    catch (cause) { if (isResponseError(cause)) { setError('此浏览器尚未获得设备授权。请使用邀请配对，或导入恢复包。'); return }; throw cause }
-    await authenticate(auth, active)
+    try {
+      auth = await request('authenticate', { account_id: trust.accountId, space_id: trust.spaceId, device_public_key: identityRef.current?.publicKey })
+    }
+    catch (cause) { if (isResponseError(cause)) { setError('此设备尚未取得所选空间授权。请在已授权设备上批准。'); return }; throw cause }
+    await authenticate(auth, active, trust)
+  }
+  async function selectSpace(spaceId: string) {
+    if (!ready?.isCurrent()) throw changed()
+    if (ready.scope.space_id === spaceId) return
+    await connect(ready.entry, spaceId)
   }
   async function refreshDirectory() {
     if (!ready?.isCurrent()) return
     const request = scoped()
     const response = record(await request('directory'))
-    const view = verifiedView(response.state, ready.principal.network_id, ownerOf(response.state))
+    const view = verifiedView(response.state, ready.scope.space_id, ownerOf(response.state))
     if (!same(response.view, view)) throw new Error('成员目录与已签名的授权不一致。')
-    const pending = ready.principal.can_manage ? array(await request('pair_requests')).map(parsePairReceipt) : []
+    const pending = ready.authorization.canManage ? array(await request('pair_requests')).map(parsePairReceipt) : []
+    if (!ready.isCurrent()) throw changed()
     setDirectory(view); setPairs(pending)
   }
   async function createInvitation(kind: 'client' | 'node', selectedRoles: NodeRole[]) {
-    if (!ready?.principal.can_manage || !identityRef.current) throw new Error('此设备没有管理权限。')
+    if (!ready?.authorization.canManage || !identityRef.current) throw new Error('此设备没有管理权限。')
     const request = scoped()
     const requestedRoles = kind === 'node' ? [...new Set(selectedRoles)].sort() : []
     if (kind === 'node' && (!requestedRoles.includes('relay') || requestedRoles.some(role => ['gateway', 'scheduler', 'executor'].includes(role)) && !requestedRoles.includes('replica'))) throw new Error('运行节点需要中继权限，接入、调度和执行同时需要同步权限。')
     const prepared = record(await request('prepare_invite', { kind, node_roles: requestedRoles, request_id: crypto.randomUUID() }))
     const invite = record(prepared.invite); const payload = record(invite.payload)
-    if (payload.new_kind !== kind || !same(payload.node_roles, requestedRoles) || payload.manage !== false || payload.inviter_subject_id !== identityRef.current.nodeId || payload.network_id !== ready.principal.network_id || payload.epoch !== ready.principal.epoch || integer(payload.expires_at_ms) <= Date.now()) throw new Error('邀请模板与所选权限不一致。')
+    if (payload.new_kind !== kind || !same(payload.node_roles, requestedRoles) || payload.manage !== false || payload.inviter_subject_id !== identityRef.current.nodeId || payload.network_id !== ready.scope.space_id || payload.epoch !== ready.authorization.authorityEpoch || integer(payload.expires_at_ms) <= Date.now()) throw new Error('邀请模板与所选权限不一致。')
     const capabilityHash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text(prepared.capability))))].map(byte => byte.toString(16).padStart(2, '0')).join('')
     if (payload.capability_hash !== capabilityHash) throw new Error('邀请密钥与签名模板不一致。')
     invite.inviter_signature = sign(prepared.signing, 'identity-invite', payload)
@@ -175,26 +226,26 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     return JSON.stringify({ url: ready.entry.address, node_id: ready.entry.node_id, relay: ready.entry.relay, invite: result })
   }
   async function approvePair(requestId: string) {
-    if (!ready?.principal.can_manage || !identityRef.current) throw new Error('此设备没有管理权限。')
+    if (!ready?.authorization.canManage || !identityRef.current) throw new Error('此设备没有管理权限。')
     const request = scoped()
     const pending = pairs.find(item => item.request_id === requestId)
     if (!pending || !pending.new_subject_signature || pending.review.expires_at_ms <= Date.now()) throw new Error('新设备尚未确认，或请求已过期。请刷新后核对。')
     const proposal = record(await request('prepare_pair', { request_id: requestId }))
     const event = record(proposal.event)
-    const expected = { version: 1, network_id: ready.principal.network_id, epoch: ready.principal.epoch, parents: pending.review.parents, issuer: identityRef.current.nodeId, action: { type: 'grant', member: pending.review.new_member }, signature: '' }
+    const expected = { version: 1, network_id: ready.scope.space_id, epoch: ready.authorization.authorityEpoch, parents: pending.review.parents, issuer: identityRef.current.nodeId, action: { type: 'grant', member: pending.review.new_member }, signature: '' }
     if (!same(proposal.review, pending.review) || !same(event, expected)) throw new Error('配对设备或权限发生变化。请刷新后核对。')
     const inviter_signature = sign(proposal.review_signing, 'identity-pair-review', pending.review)
     event.signature = sign(proposal.signing, 'identity-governance', expected)
     await request('pair_confirm', { request_id: requestId, inviter_signature, event }); await refreshDirectory()
   }
   async function revoke(subjectId: string) {
-    if (!ready?.principal.can_manage || !identityRef.current || !directory) throw new Error('此设备没有管理权限。')
+    if (!ready?.authorization.canManage || !identityRef.current || !directory) throw new Error('此设备没有管理权限。')
     const request = scoped()
     const member = directory.members.find(item => item.subject_id === subjectId)
     if (!member || member.manage) throw new Error('管理客户端的变更需要根恢复确认。')
     const prepared = record(await request('prepare_revoke', { subject_id: subjectId }))
     const event = record(prepared.event)
-    const expected = { version: 1, network_id: ready.principal.network_id, epoch: ready.principal.epoch, parents: directory.heads, issuer: identityRef.current.nodeId, action: { type: 'revoke', subject_id: subjectId }, signature: '' }
+    const expected = { version: 1, network_id: ready.scope.space_id, epoch: ready.authorization.authorityEpoch, parents: directory.heads, issuer: identityRef.current.nodeId, action: { type: 'revoke', subject_id: subjectId }, signature: '' }
     if (!same(event, expected)) throw new Error('撤销模板与当前选择不一致。请刷新目录后重试。')
     event.signature = sign(prepared.signing, 'identity-governance', expected)
     await request('revoke', { event }); await refreshDirectory()
@@ -263,7 +314,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (receipt.request_id !== pairRequest.request_id || pairReview.network_id !== invitation.payload.network_id || pairReview.invite_id !== invitation.payload.invite_id || pairReview.epoch !== invitation.payload.epoch || pairReview.inviter_subject_id !== invitation.payload.inviter_subject_id || pairReview.proposal_hash !== await digest(expectedProposal) || !same(pairReview.new_member, member) || pairReview.expires_at_ms > integer(invitation.payload.expires_at_ms) || pairReview.expires_at_ms <= Date.now()) throw new Error('配对确认与原邀请或已签名请求不一致。')
     if (session.current !== active) throw changed()
     const next = { request_id: text(receipt.request_id), network_id: pairReview.network_id, entry: active.entry, review: pairReview, signing, accepted: false }
-    waitingRef.current = next; store('waiting-pair', next); setWaiting(next)
+    waitingRef.current = next; store(profileKey('waiting-pair'), next); setWaiting(next)
   }
   async function acceptPair() {
     const request = scoped()
@@ -271,7 +322,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (!pending || pending.review.new_member.subject_id !== identityRef.current?.nodeId || pending.review.expires_at_ms <= Date.now()) throw new Error('配对信息失效。请重新取得邀请。')
     await request('pair_accept', { request_id: pending.request_id, signature: sign(pending.signing, 'identity-pair-review', pending.review) })
     if (waitingRef.current !== pending) return
-    const next = { ...pending, accepted: true }; waitingRef.current = next; store('waiting-pair', next); setWaiting(next)
+    const next = { ...pending, accepted: true }; waitingRef.current = next; store(profileKey('waiting-pair'), next); setWaiting(next)
     await checkPair()
   }
   async function checkPair() {
@@ -283,7 +334,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (response.status === 'granted') await authenticate(await request('authenticate', { network_id: pending.network_id }), current(), { kind: 'network', networkId: pending.network_id })
     else if (response.status !== 'pending') throw new Error('配对请求未完成。请在管理设备上核对，或创建新邀请。')
   }
-  function cancelPair() { waitingRef.current = null; setWaiting(null); store('waiting-pair', null) }
+  function cancelPair() { waitingRef.current = null; setWaiting(null); store(profileKey('waiting-pair'), null) }
   async function beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry; bootstrap: string }) {
     const name = deviceName(input.name)
     const active = await open(input.entry)
@@ -352,39 +403,64 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const opened = await openPackage(input.file, input.oldPassword)
     try {
       if (version !== generation.current) throw changed()
-      if (ready && opened.networkId !== ready.principal.network_id) throw new Error('恢复包属于其他个人网络。')
+      if (ready && opened.networkId !== ready.scope.space_id) throw new Error('恢复包属于其他个人网络。')
       const bytes = sealPackage(opened.payload, input.password)
       try { downloadPackage(bytes, opened.networkId) } finally { bytes.fill(0) }
     } finally { opened.release(); input.oldPassword = ''; input.password = '' }
   }
-  async function replaceLostKey() { const own = await initClient({ replaceLostKey: true }); identityRef.current = own; setIdentity(own); setPhase('disconnected'); setError('') }
+  async function initializeVault(options: ClientVaultOptions) {
+    const version = generation.current
+    const own = await initClient(options)
+    if (version !== generation.current) throw changed()
+    identityRef.current = own; setIdentity(own); setPhase('disconnected'); setError('')
+    setEntries(savedEntries(storageProfile(own))); setSpaces(savedSpaces())
+    const pending = initialInvitation ? null : loadWaiting(storageProfile(own))
+    if (pending && pending.review.new_member.subject_id === own.nodeId) {
+      await open(pending.entry)
+      waitingRef.current = pending; setWaiting(pending)
+    } else if (!initialInvitation) {
+      const lastEntry = load(profileKey('last-entry'), true)
+      if (lastEntry) await connect(parseEntry(lastEntry))
+    }
+  }
+  function lockVault() {
+    disconnect(); lockClient(); identityRef.current = null; setIdentity(null); setEntries([]); setSpaces([])
+    setPhase('initializing')
+    const version = generation.current
+    void clientVaultStatus().then(status => {
+      if (version === generation.current) { setVaults(status.profiles); setPhase(status.status === 'locked' ? 'vault_locked' : status.status === 'key_lost' ? 'key_lost' : status.status === 'unavailable' ? 'vault_unavailable' : 'vault_empty'); if (status.status === 'unavailable') setError(status.error) }
+    }).catch(cause => { if (version === generation.current) { setPhase('blocked'); setError(messageOf(cause)) } })
+  }
+  async function backupVault() {
+    const version = generation.current
+    const bytes = new TextEncoder().encode(await exportDeviceVault())
+    try {
+      if (version !== generation.current) throw changed()
+      const url = URL.createObjectURL(new Blob([bytes], { type: 'application/json' }))
+      const link = document.createElement('a'); link.href = url; link.download = 'vibeface-device-vault-v3.json'; link.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } finally { bytes.fill(0) }
+  }
   useEffect(() => {
     let mounted = true
-    setEntries(savedEntries())
     const fragment = new URLSearchParams(location.hash.slice(1))
     const invitation = fragment.get('bootstrap') || fragment.get('invite') || ''
     if (location.hash) { const clean = new URL(location.href); clean.hash = ''; history.replaceState(null, '', clean) }
     if (invitation) setInitialInvitation(invitation)
-    initClient().then(async own => {
-      if (!mounted) return
-      identityRef.current = own; setIdentity(own); setPhase('disconnected')
-      const pending = invitation ? null : loadWaiting()
-      if (pending && pending.review.new_member.subject_id === own.nodeId) {
-        await open(pending.entry)
-        if (!mounted) return
-        waitingRef.current = pending; setWaiting(pending)
-      }
-    }).catch(cause => { if (mounted) { setPhase(cause instanceof Error && 'code' in cause && cause.code === 'key_lost' ? 'key_lost' : 'blocked'); setError(messageOf(cause)) } })
-    return () => { mounted = false; generation.current += 1; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
+    clientVaultStatus().then(status => {
+      if (mounted) { setVaults(status.profiles); setPhase(status.status === 'locked' ? 'vault_locked' : status.status === 'key_lost' ? 'key_lost' : status.status === 'unavailable' ? 'vault_unavailable' : 'vault_empty'); if (status.status === 'unavailable') setError(status.error) }
+    }).catch(cause => { if (mounted) { setPhase('blocked'); setError(messageOf(cause)) } })
+    return () => { mounted = false; generation.current += 1; lockClient(); sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.authorization?.release(); previous?.channel.close(); listeners.current.clear() }
   }, [])
   useEffect(() => {
     if (!waiting?.accepted) return
-    const timer = setInterval(() => { checkPair().catch(cause => setError(messageOf(cause))) }, 3000)
+    const version = generation.current
+    const timer = setInterval(() => { checkPair().catch(cause => { if (version === generation.current) setError(messageOf(cause)) }) }, 3000)
     return () => clearInterval(timer)
   }, [waiting])
   const value: DeviceContextValue = {
-    identity, ready, entries, phase, error, entry, info, directory, pairs, waiting, review, initialInvitation,
-    connect, disconnect, saveEntry, removeEntry, replaceLostKey, pair, acceptPair, checkPair, cancelPair, refreshDirectory, createInvitation, approvePair, revoke, beginRecovery, reencrypt,
+    identity, vaults, spaces, ready, entries, phase, error, entry, info, directory, pairs, waiting, review, initialInvitation,
+    connect, selectSpace, disconnect, saveEntry, removeEntry, initializeVault, lockVault, backupVault, pair, acceptPair, checkPair, cancelPair, refreshDirectory, createInvitation, approvePair, revoke, beginRecovery, reencrypt,
     downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有待下载的恢复包。'); sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('恢复确认已失效。'); await sensitive.current.recover(members) },

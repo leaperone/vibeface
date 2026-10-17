@@ -1,14 +1,17 @@
+import type { IdentityScope } from './scope'
 import { validEndpoint, validTarget } from '../../transport.js'
 
 export type ConnectionEntry = { address: string; node_id: string; relay: boolean }
-export type PublicIdentity = { nodeId: string; publicKey: string }
+export type PublicIdentity = { nodeId: string; publicKey: string; profileId?: string | null }
 export type ClientPrincipal = { network_id: string; subject_id: string; epoch: number; can_manage: boolean }
 export type NodeRole = 'gateway' | 'relay' | 'replica' | 'scheduler' | 'executor'
 export type EntryInfo = { node_id: string; public_key: string; version: string; roles: NodeRole[]; initialized: boolean }
 export type ReadyConnection = {
   readonly generation: number
+  readonly scope: IdentityScope
+  readonly audience: { device: string; service: string }
   entry: ConnectionEntry
-  principal: ClientPrincipal
+  authorization: { canManage: boolean; actions: string[]; authorityEpoch: number }
   info: EntryInfo
   request(method: string, params?: Record<string, unknown>): Promise<unknown>
   rpc(method: string, params?: Record<string, unknown>): Promise<unknown>

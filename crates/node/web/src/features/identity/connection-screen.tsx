@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import { messageOf, parseEntry } from '@/lib/node'
 import { passphrase } from '@/lib/secure'
 import { useDevice } from './context'
+import { VaultControls } from './vault-controls'
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
 
 const input = 'min-h-11 w-full rounded-lg border border-input bg-background px-3 py-2 text-base'
@@ -30,12 +31,13 @@ export function ConnectionScreen() {
     void run(() => device.connect(parseEntry({ address: value(form, 'address'), node_id: value(form, 'node_id'), relay: relay instanceof HTMLInputElement && relay.checked })))
   }
   return <main className="mx-auto min-h-screen w-full max-w-3xl space-y-6 px-4 py-10 sm:px-6">
-    <header className="space-y-2"><p className="text-sm font-medium text-muted-foreground">Vibeface</p><h1 className="text-2xl font-semibold tracking-tight">连接自己的设备网络</h1><p className="text-sm text-muted-foreground">在此可信客户端保存入口，使用独立设备密钥连接节点。无需网站账号。</p></header>
-    <div role="status" className="text-sm text-muted-foreground">{device.phase === 'initializing' ? '正在读取此浏览器的设备密钥…' : device.phase === 'connecting' ? '正在建立加密连接并核对设备…' : device.phase === 'unpaired' ? '目标设备已核验，等待此浏览器授权。' : '连接不会自动重发业务操作。'}</div>
+    <header className="space-y-2"><p className="text-sm font-medium text-muted-foreground">Vibeface</p><h1 className="text-2xl font-semibold tracking-tight">连接自己的设备网络</h1><p className="text-sm text-muted-foreground">先解锁此浏览器的独立设备密钥，再连接已授权空间。账户恢复密钥与设备密钥分别保存。</p></header>
+    <div role="status" className="text-sm text-muted-foreground">{device.phase === 'initializing' ? '正在检查加密设备仓库…' : device.phase === 'connecting' ? '正在建立加密连接并核对设备…' : device.phase === 'unpaired' ? '目标设备已核验，等待此浏览器授权。' : '连接不会自动重发业务操作。'}</div>
     {(error || device.error) && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error || device.error}</p>}
     {device.phase === 'blocked' && <section className={panel}><h2 className="font-semibold">需要可信的安全页面</h2><p className="text-sm text-muted-foreground">请在节点本机打开 http://localhost:4790，或使用你信任的 HTTPS 客户端。普通局域网 HTTP 页面不能安全保存设备密钥。可信页面仍可连接允许的局域网节点。</p></section>}
-    {device.phase === 'key_lost' && <section className={panel}><h2 className="font-semibold">此浏览器的设备密钥已丢失</h2><p className="text-sm text-muted-foreground">原设备授权不会自动迁移到新密钥。生成新设备密钥后，请在管理设备上重新配对，或导入恢复包。</p><button className={button} type="button" disabled={busy} onClick={() => void run(device.replaceLostKey)}>生成新设备密钥</button></section>}
+    {['vault_empty', 'vault_locked', 'vault_unavailable', 'key_lost'].includes(device.phase) && <VaultControls />}
     {device.identity && <p className="break-all rounded-lg bg-muted p-3 text-xs text-muted-foreground">此浏览器设备指纹 <span className="font-mono">{device.identity.nodeId}</span></p>}
+    {device.identity && <button className={button} type="button" onClick={device.lockVault}>锁定设备仓库</button>}
     {device.review && <RecoveryReview />}
     {device.waiting && <section className={panel} aria-labelledby="pair-review-title">
       <h2 id="pair-review-title" className="font-semibold">{device.waiting.accepted ? '等待管理设备确认' : '确认加入自己的网络'}</h2>

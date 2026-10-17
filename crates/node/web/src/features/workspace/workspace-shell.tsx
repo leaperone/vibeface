@@ -6,6 +6,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
@@ -63,7 +64,8 @@ export function WorkspaceShell() {
           <span>{workspace.connectionText}</span>
           {workspace.info.node_id ? <span> {nodeName(workspace.info.node_id)}</span> : null}
         </p>
-        <Button type="button" variant="ghost" onClick={device.disconnect}>断开连接</Button>
+        {device.spaces.length > 1 && <label className="flex items-center gap-2 text-sm">当前空间<NativeSelect aria-label="切换空间" value={device.ready?.scope.space_id ?? ''} onChange={event => void workspace.run(() => device.selectSpace(event.target.value))}>{device.spaces.map(space => <NativeSelectOption key={space.spaceId} value={space.spaceId}>{space.spaceId.slice(0, 17)}</NativeSelectOption>)}</NativeSelect></label>}
+        <Button type="button" variant="ghost" onClick={device.lockVault}>锁定设备仓库</Button>
       </header>
       {workspace.writeNotice ? <Alert role="status"><AlertDescription>{workspace.writeNotice}</AlertDescription></Alert> : null}
       {workspace.noticeText ? <Alert role="status"><AlertDescription>{workspace.noticeText}</AlertDescription></Alert> : null}

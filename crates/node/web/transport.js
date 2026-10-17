@@ -1,11 +1,16 @@
-import init, { Identity, Handshake } from "/generated/vibeface_secure.js";
+import init, { Identity, Handshake, signClientInvocation } from "/generated/vibeface_secure.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const nodePattern = /^[a-f0-9]{64}$/;
-const lostKeyMessage = "此浏览器的设备密钥已被清除。请使用另一台管理设备重新配对，或导入恢复包。原任务不会因此重新执行。";
+const vaultFormat = "vibeface-device-vault-v3";
+const vaultIterations = 600000;
+const vaultMarker = "vibeface.v3.device-created";
 let identity;
 let initializing;
+let identityGeneration = 0;
+let activeProfileId = null;
+const pendingIdentities = new Map();
 
 export function validTarget(value) {
   if (typeof value !== "string" || !nodePattern.test(value)) throw new Error("填写完整的 64 位设备指纹。请从本机终端或可信邀请中取得，不要使用中继提供的替代指纹。");
@@ -40,73 +45,176 @@ export function readInvitation(value) {
   return invitation;
 }
 
+function requireSecureClient() {
+  if (!globalThis.isSecureContext || !globalThis.crypto?.subtle || !globalThis.crypto?.getRandomValues) throw new Error("此地址不能安全使用设备密钥。请在本机使用 http://localhost:4790，或打开你信任的 HTTPS 客户端。普通局域网 HTTP 不会降级认证。");
+}
+
 function database() {
+  if (!globalThis.indexedDB) throw new Error("浏览器不支持加密仓库存储。可以选择仅在当前页面使用的临时会话。");
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open("vibeface-device", 1);
+    const request = indexedDB.open(vaultFormat, 1);
     request.onupgradeneeded = () => request.result.createObjectStore("keys");
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(new Error("无法打开浏览器设备存储。请允许此站点使用 IndexedDB 后重试。"));
+    request.onerror = () => reject(new Error("无法打开加密设备仓库。请允许此站点使用 IndexedDB，或选择临时会话。"));
   });
 }
 
-async function keyRecord(write) {
+async function vaultRecords(id, write) {
   const db = await database();
   try {
     return await new Promise((resolve, reject) => {
       const transaction = db.transaction("keys", write ? "readwrite" : "readonly");
-      const request = write ? transaction.objectStore("keys").put(write, "identity") : transaction.objectStore("keys").get("identity");
+      const keys = transaction.objectStore("keys");
+      const request = write ? keys.add(write, id) : id ? keys.get(id) : keys.getAll();
       let result;
       request.onsuccess = () => { result = request.result; };
       transaction.oncomplete = () => resolve(result);
-      transaction.onerror = () => reject(new Error("无法保存浏览器设备密钥。请允许持久存储后重试。"));
+      transaction.onerror = () => reject(new Error(write ? "无法保存加密设备配置。已有备份不会覆盖，请重新解锁。" : "无法读取加密仓库。请保留浏览器数据并重试。"));
       transaction.onabort = transaction.onerror;
     });
   } finally { db.close(); }
 }
 
-async function claimKey(record) {
-  const db = await database();
+function parseProfile(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.format !== "vibeface-device-profile-v3" || typeof value.id !== "string" || !/^[a-f0-9-]{36}$/.test(value.id) || typeof value.name !== "string" || !value.name.trim() || encoder.encode(value.name).length > 128 || /[\u0000-\u001f\u007f]/.test(value.name) || Object.keys(value).sort().join(",") !== "format,id,name,public_key,vault") throw new Error("加密设备配置格式无效。旧版仓库不会导入。");
+  unhex(value.public_key, 32);
+  parseVault(value.vault);
+  return value;
+}
+
+function passwordBytes(password, creating = false) {
+  if (typeof password !== "string" || !password || encoder.encode(password).length > 1024 || creating && [...password].length < 12) throw new Error("加密仓库口令需要至少 12 个字符，且不超过 1024 字节。");
+  return encoder.encode(password);
+}
+
+function hex(bytes) { return [...bytes].map(byte => byte.toString(16).padStart(2, "0")).join(""); }
+function unhex(value, length) {
+  if (typeof value !== "string" || !/^[a-f0-9]+$/.test(value) || value.length !== length * 2) throw new Error("加密仓库格式无效。旧版明文设备仓库不会导入。");
+  return Uint8Array.from(value.match(/../g), byte => Number.parseInt(byte, 16));
+}
+function parseVault(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.format !== vaultFormat || value.kdf !== "PBKDF2-SHA256" || value.iterations !== vaultIterations || value.cipher !== "AES-256-GCM" || Object.keys(value).sort().join(",") !== "cipher,ciphertext,format,iterations,iv,kdf,salt") throw new Error("加密仓库版本无效。旧版仓库不会导入。");
+  return { salt: unhex(value.salt, 16), iv: unhex(value.iv, 12), ciphertext: unhex(value.ciphertext, 48) };
+}
+async function vaultKey(password, salt, usage, creating = false) {
+  const bytes = passwordBytes(password, creating);
   try {
-    return await new Promise((resolve, reject) => {
-      const transaction = db.transaction("keys", "readwrite");
-      const request = transaction.objectStore("keys").add(record, "identity");
-      let alreadyStored = false;
-      request.onerror = (event) => {
-        if (request.error?.name === "ConstraintError") { alreadyStored = true; event.preventDefault(); event.stopPropagation(); return; }
-        reject(new Error("无法保存浏览器设备密钥。请允许持久存储后重试。"));
-      };
-      transaction.oncomplete = () => resolve(!alreadyStored);
-      transaction.onerror = () => reject(new Error("无法保存浏览器设备密钥。请允许持久存储后重试。"));
-      transaction.onabort = transaction.onerror;
-    });
-  } finally { db.close(); }
+    const material = await crypto.subtle.importKey("raw", bytes, "PBKDF2", false, ["deriveKey"]);
+    return await crypto.subtle.deriveKey({ name: "PBKDF2", hash: "SHA-256", salt, iterations: vaultIterations }, material, { name: "AES-GCM", length: 256 }, false, [usage]);
+  } finally { bytes.fill(0); }
 }
 
-export async function initClient({ replaceLostKey = false } = {}) {
-  if (!globalThis.isSecureContext || !globalThis.crypto?.getRandomValues || !globalThis.indexedDB) throw new Error("此地址不能安全保存设备密钥。请在本机使用 http://localhost:4790，或使用你信任的 HTTPS 客户端连接设备。局域网 HTTP 页面仅能展示此指引，不会降级认证。");
-  if (!initializing) initializing = initializeIdentity(replaceLostKey).catch((error) => { initializing = null; throw error; });
-  return initializing;
+export async function sealDeviceVault(secret, password) {
+  const cleartext = unhex(secret, 32);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  try {
+    const key = await vaultKey(password, salt, "encrypt", true);
+    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: encoder.encode(vaultFormat) }, key, cleartext);
+    return { format: vaultFormat, kdf: "PBKDF2-SHA256", iterations: vaultIterations, cipher: "AES-256-GCM", salt: hex(salt), iv: hex(iv), ciphertext: hex(new Uint8Array(ciphertext)) };
+  } finally { cleartext.fill(0); }
 }
 
-async function initializeIdentity(replaceLostKey) {
+export async function openDeviceVault(value, password) {
+  const { salt, iv, ciphertext } = parseVault(value);
+  let cleartext;
+  try {
+    const key = await vaultKey(password, salt, "decrypt");
+    cleartext = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: encoder.encode(vaultFormat) }, key, ciphertext));
+    if (cleartext.length !== 32) throw new Error("invalid key length");
+    return hex(cleartext);
+  } catch { throw new Error("无法解锁设备仓库。请核对口令，并使用未修改的备份。"); }
+  finally { cleartext?.fill(0); }
+}
+
+export async function clientVaultStatus() {
+  requireSecureClient();
   await init();
-  if (!identity) {
-    const record = await keyRecord();
-    if (record?.secret) identity = Identity.fromSecretHex(record.secret);
+  if (!globalThis.indexedDB) return { status: "unavailable", profiles: [], error: "浏览器不支持加密仓库存储。可以明确选择仅在当前页面保留密钥的临时会话。" };
+  let profiles;
+  try {
+    const records = await vaultRecords();
+    profiles = records.map(record => { const profile = parseProfile(record); return { id: profile.id, name: profile.name }; });
+  } catch { return { status: "unavailable", profiles: [], error: "无法读取加密设备仓库。请保留浏览器数据并检查站点存储权限，或明确选择临时会话。" }; }
+  let created = false;
+  try { created = localStorage.getItem(vaultMarker) === "true"; } catch {}
+  return { status: profiles.length ? "locked" : created ? "key_lost" : "empty", profiles };
+}
+
+export function lockClient() {
+  identityGeneration += 1;
+  identity?.free();
+  for (const candidate of pendingIdentities.values()) candidate.free();
+  pendingIdentities.clear();
+  identity = undefined;
+  activeProfileId = null;
+  initializing = undefined;
+}
+
+export async function initClient(options) {
+  requireSecureClient();
+  if (identity) throw new Error("请先锁定当前设备配置，再解锁或创建其他账户的设备配置。");
+  if (!options || !["unlock", "create", "temporary", "restore"].includes(options.mode)) throw new Error("请先解锁加密仓库，或明确选择临时会话。");
+  if (initializing) throw new Error("设备仓库正在处理，请等待完成。");
+  const generation = identityGeneration;
+  const work = initializeIdentity(options, generation);
+  initializing = work;
+  try { return await work; } finally { if (initializing === work) initializing = undefined; }
+}
+
+async function initializeIdentity(options, generation) {
+  let candidate;
+  let profile = null;
+  try {
+    await init();
+    if (generation !== identityGeneration) throw new Error("设备仓库操作已取消。");
+    if (options.mode === "temporary") { candidate = Identity.generate(); pendingIdentities.set(generation, candidate); }
     else {
-      let previouslyPaired = false;
-      try { previouslyPaired = localStorage.getItem("vibeface.device-created") === "true"; } catch {}
-      if (previouslyPaired && !replaceLostKey) { const error = new Error(lostKeyMessage); error.code = "key_lost"; throw error; }
-      const generated = Identity.generate();
-      let claimed;
-      try { claimed = await claimKey({ secret: generated.secretHex(), created_at: Date.now() }); }
-      catch (error) { generated.free(); throw error; }
-      if (claimed) identity = generated;
-      else { generated.free(); const existing = await keyRecord(); if (!existing?.secret) throw new Error("浏览器设备密钥初始化发生竞争，请刷新后重试。"); identity = Identity.fromSecretHex(existing.secret); }
-      try { localStorage.setItem("vibeface.device-created", "true"); } catch {}
+      if (options.mode === "unlock") {
+        if (typeof options.profileId !== "string" || !/^[a-f0-9-]{36}$/.test(options.profileId)) throw new Error("请选择有效设备配置。");
+        const stored = await vaultRecords(options.profileId);
+        if (generation !== identityGeneration) throw new Error("设备仓库操作已取消。");
+        if (!stored) throw new Error("此浏览器没有所选设备配置。请恢复备份，或明确创建新设备。");
+        profile = parseProfile(stored);
+        const secret = await openDeviceVault(profile.vault, options.password);
+        if (generation !== identityGeneration) throw new Error("设备仓库操作已取消。");
+        candidate = Identity.fromSecretHex(secret);
+        pendingIdentities.set(generation, candidate);
+        if (candidate.publicKeyHex() !== profile.public_key) throw new Error("设备备份公钥与加密密钥不一致。");
+      } else {
+        if (options.mode === "restore") {
+          profile = parseProfile(options.vault);
+          const secret = await openDeviceVault(profile.vault, options.password);
+          if (generation !== identityGeneration) throw new Error("设备仓库操作已取消。");
+          candidate = Identity.fromSecretHex(secret);
+          pendingIdentities.set(generation, candidate);
+          if (candidate.publicKeyHex() !== profile.public_key) throw new Error("设备备份公钥与加密密钥不一致。");
+        } else {
+          candidate = Identity.generate();
+          pendingIdentities.set(generation, candidate);
+          profile = { format: "vibeface-device-profile-v3", id: crypto.randomUUID(), name: options.name, public_key: candidate.publicKeyHex(), vault: await sealDeviceVault(candidate.secretHex(), options.password) };
+          parseProfile(profile);
+        }
+        if (generation !== identityGeneration) throw new Error("设备仓库操作已取消。");
+        await vaultRecords(profile.id, profile);
+        try { localStorage.setItem(vaultMarker, "true"); } catch {}
+      }
     }
+    if (generation !== identityGeneration) throw new Error("设备仓库操作已取消。");
+    identity = candidate;
+    pendingIdentities.delete(generation);
+    activeProfileId = profile?.id ?? null;
+    candidate = undefined;
+    return { nodeId: identity.nodeId(), publicKey: identity.publicKeyHex(), profileId: activeProfileId };
+  } finally {
+    if (candidate && pendingIdentities.get(generation) === candidate) { pendingIdentities.delete(generation); candidate.free(); }
+    options.password = "";
   }
-  return { nodeId: identity.nodeId(), publicKey: identity.publicKeyHex() };
+}
+
+export async function exportDeviceVault() {
+  if (!identity || !activeProfileId) throw new Error("临时会话没有本地设备备份。关闭页面后需要重新批准新设备。");
+  return JSON.stringify(parseProfile(await vaultRecords(activeProfileId)));
 }
 
 export function signClient(domain, payload) {
@@ -114,9 +222,14 @@ export function signClient(domain, payload) {
   return identity.sign(domain, encoder.encode(payload));
 }
 
+export function signAuthorizedClientInvocation(authorization, templateJson, bodyJson, expectedAction, operationId) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  return signClientInvocation(authorization, templateJson, bodyJson, expectedAction, operationId, identity, Date.now());
+}
+
 export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
   if (signal?.aborted) throw new Error("设备连接已取消。");
-  if (!identity) await initClient();
+  if (!identity) throw new Error("请先解锁设备仓库，或选择临时会话。");
   const target = validTarget(entry.node_id);
   const endpoint = validEndpoint(entry.address);
   const url = new URL("/api/network/ws", endpoint);
@@ -210,13 +323,13 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
   return {
     nodeId: target,
     publicKey,
-    request(method, params = {}) {
+    request(method, params = {}, invocation) {
       if (closed) return Promise.reject(disconnected());
       const id = String(++nextId);
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => { pending.delete(id); reject(new Error("设备尚未确认请求结果。请核对原操作，不要重复派发。")); }, 60000);
         pending.set(id, { resolve, reject, timer });
-        try { for (const record of channel.sealMessage(encoder.encode(JSON.stringify({ id, method, params })))) socket.send(record); }
+        try { for (const record of channel.sealMessage(encoder.encode(JSON.stringify(invocation === undefined ? { id, method, params } : { id, method, params, invocation })))) socket.send(record); }
         catch (error) { fail(error); }
       });
     },

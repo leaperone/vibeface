@@ -28,7 +28,7 @@ export type SessionRecord = {
 }
 export type OperationRecord = {
   state: string
-  request: { operation_id: string; target_node: string; conversation_id: string; session_id: string }
+  request: { space_id: string; operation_id: string; target_node: string; conversation_id: string; session_id: string }
   raw: unknown
 }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
@@ -52,7 +52,7 @@ export type OperateAction =
 
 export type OperationRequest = {
   operation_id: string
-  network_id: string
+  space_id: string
   conversation_id: string
   task_id: null
   target_node: string
@@ -62,7 +62,7 @@ export type OperationRequest = {
   resources: string[]
   action: OperateAction
 }
-export type PendingOperation = Pick<OperationRequest, "operation_id" | "target_node" | "session_id" | "conversation_id"> & { request: OperationRequest }
+export type PendingOperation = Pick<OperationRequest, "space_id" | "operation_id" | "target_node" | "session_id" | "conversation_id"> & { request: OperationRequest }
 export type PendingConversation = { conversation_id: string; title: string }
 export type PendingTask = { conversation_id: string; task_id: string; title: string; goal: string; acceptance: string; auto_followup: boolean }
 export type WorkspaceView = "chat" | "tasks" | "sessions" | "devices" | "notifications"
