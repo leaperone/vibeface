@@ -21,6 +21,21 @@ fn remote_session_key(scope: &str, target: &str) -> String {
     )
 }
 
+fn historical_role(store: &Store, network: &str, author: &str, role: NodeRole) -> Result<bool> {
+    let view = store
+        .trust_bundle(network)?
+        .context("network membership missing")?
+        .project()?;
+    // Checkpoints retain historical verification keys after an old member disappears.
+    Ok(view
+        .members
+        .iter()
+        .find(|member| member.subject_id == author)
+        .is_none_or(|member| {
+            member.kind == IdentityKind::Node && member.node_roles.contains(&role)
+        }))
+}
+
 fn observation_entries(
     store: &Store,
     network: &str,
@@ -41,10 +56,7 @@ fn observation_entries(
                 scheduler_node: Some(target),
                 ..
             } if role == "user" => {
-                if store
-                    .authorize_node(network, &event.author, Some(NodeRole::Gateway))
-                    .is_err()
-                {
+                if !historical_role(store, network, &event.author, NodeRole::Gateway)? {
                     continue;
                 }
                 target.clone()
@@ -57,13 +69,10 @@ fn observation_entries(
             } if event.author == *target_node
                 && matches!(status.as_str(), "succeeded" | "failed" | "rejected") =>
             {
-                if store
-                    .authorize_node(network, target_node, Some(NodeRole::Executor))
-                    .is_err()
-                {
+                if !historical_role(store, network, target_node, NodeRole::Executor)? {
                     continue;
                 }
-                let Ok(policy) = store.followup_policy(network, scope, task) else {
+                let Ok(policy) = store.historical_followup_policy(network, scope, task) else {
                     continue;
                 };
                 policy.target_node
@@ -240,7 +249,10 @@ fn observed_job_value(store: &Store, entry: &OutboxEntry, job: &SchedulerJob) ->
                 job.kind == crate::scheduling::TriggerKind::Human,
                 "observed job trigger kind mismatch"
             );
-            store.authorize_node(&entry.network_id, &event.author, Some(NodeRole::Gateway))?;
+            ensure!(
+                historical_role(store, &entry.network_id, &event.author, NodeRole::Gateway)?,
+                "observed human trigger was not written by a Gateway"
+            );
         }
         EventBody::ExecutionObserved {
             task_id: Some(task),
@@ -254,10 +266,13 @@ fn observed_job_value(store: &Store, entry: &OutboxEntry, job: &SchedulerJob) ->
                 job.kind == crate::scheduling::TriggerKind::Autonomous,
                 "observed job trigger kind mismatch"
             );
-            store.authorize_node(&entry.network_id, target_node, Some(NodeRole::Executor))?;
+            ensure!(
+                historical_role(store, &entry.network_id, target_node, NodeRole::Executor)?,
+                "observed result was not written by an Executor"
+            );
             ensure!(
                 store
-                    .followup_policy(&entry.network_id, &entry.conversation_id, task)?
+                    .historical_followup_policy(&entry.network_id, &entry.conversation_id, task)?
                     .target_node
                     == entry.target_node,
                 "observed job belongs to another task scheduler"
@@ -1329,6 +1344,31 @@ mod tests {
         );
         job.target_node = viewer.node_id()?;
         assert!(observed_job_value(&store, &entries[0], &job).is_err());
+        let mut revoked = gateway.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?;
+        revoked.revoked = true;
+        store.install_trust_bundle(
+            &network,
+            &gateway.sign_network_fixture(
+                2,
+                vec![
+                    revoked,
+                    manager.certificate(vec![NodeRole::Scheduler, NodeRole::Replica])?,
+                    viewer.certificate(vec![NodeRole::Replica])?,
+                ],
+            )?,
+        )?;
+        assert!(
+            store
+                .authorize_node(&network, &gateway.node_id()?, None)
+                .is_err()
+        );
+        let historical = observation_entries(&store, &network, "chat", &viewer.node_id()?)?;
+        assert_eq!(historical[0].trigger, message.hash);
+        job.target_node = target.clone();
+        assert_eq!(
+            observed_job_value(&store, &historical[0], &job)?["message_id"],
+            "human"
+        );
         assert!(
             store
                 .scheduler_status(&network, "chat", &message.hash, &target)?
