@@ -186,8 +186,7 @@ install_release() (
   done
   command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || fail 'sha256sum or shasum is required'
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/vibeface-install.XXXXXX")
-  # shellcheck disable=SC2329 # Invoked by the EXIT trap.
-  cleanup() {
+  trap '
     if ! "$complete"; then
       if "$made_bin" && [[ -L "$bin_dir/vibeface-node" && $(readlink "$bin_dir/vibeface-node") == "$install_root/current/vibeface-node" ]]; then rm "$bin_dir/vibeface-node"; fi
       if "$made_current" && [[ -L "$install_root/current" && $(readlink "$install_root/current") == "releases/$version" ]]; then rm "$install_root/current"; fi
@@ -195,8 +194,7 @@ install_release() (
     fi
     [[ -z $lock ]] || rmdir "$lock" || true
     rm -rf "$scratch"
-  }
-  trap cleanup EXIT
+  ' EXIT
   trap 'exit 130' INT TERM
   local page count found=false
   : > "$scratch/releases"
