@@ -675,6 +675,42 @@ impl Store {
         self.policy.verified()
     }
 
+    pub fn authorize_transport_node(
+        &self,
+        node_id: &str,
+        now_ms: u64,
+    ) -> Result<crate::identity::NodeCertificate> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT DISTINCT public_key FROM node_certificates WHERE node_id=?")?;
+        let keys = statement
+            .query_map([node_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ensure!(
+            keys.len() == 1,
+            "transport service identity is missing or ambiguous"
+        );
+        let public_key = PublicKey::parse(&keys[0])?;
+        ensure!(
+            crate::crypto::fingerprint(public_key.as_str())? == node_id,
+            "transport fingerprint differs from its certificate key"
+        );
+        let certificate = self
+            .policy
+            .verified()
+            .verify_transport_device(&DeviceId::from_key(&public_key), now_ms)?;
+        ensure!(
+            certificate.payload.public_key == public_key,
+            "transport certificate differs from its pinned key"
+        );
+        Ok(crate::identity::NodeCertificate {
+            node_id: node_id.to_owned(),
+            public_key: public_key.as_str().to_owned(),
+            roles: vec![],
+            revoked: false,
+        })
+    }
+
     pub fn trusted_policy_pins(&self) -> &[PolicyPin] {
         self.policy.pins()
     }
