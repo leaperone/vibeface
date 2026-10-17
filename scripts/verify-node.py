@@ -1322,6 +1322,14 @@ def phase1_acceptance(options):
     def task_snapshot(client, name, task):
         return next((value for value in conversation(client, name)["tasks"] if value["task_id"] == task), None)
 
+    def bound_task_snapshot(client, name, task, target, session):
+        snapshot = conversation(client, name)
+        record = next((value for value in snapshot["tasks"] if value["task_id"] == task), None)
+        binding = (record or {}).get("binding") or {}
+        return record if (binding.get("target_node") == target and binding.get("session_id") == session
+                          and target in snapshot.get("observation_targets", [])
+                          and not snapshot.get("observation_error")) else None
+
     def autonomous_jobs(name):
         return [job for job in scheduler_records(a, network)
                 if job["conversation_id"] == name and job["kind"] == "autonomous"]
@@ -1512,7 +1520,8 @@ def phase1_acceptance(options):
                 gate=str(manager_gate), dispatch={"task_id": task, "target_node": b.node_id,
                     "cwd": str(directory), "gate": str(execution_gate), "result_size": 280000 if mode == "report" else 0})
             wait_for("background execution starts independently of Manager", lambda: invocations(run, task))
-            wait_for("third entry reads bound task", lambda: task_snapshot(c.client, name, task))
+            wait_for("third entry reads bound task", lambda:
+                     bound_task_snapshot(c.client, name, task, b.node_id, "session-" + task))
             c.client.call("subscribe")
             conversation(c.client, name)
             execution_progress = wait_for("third entry observes exact remote execution progress", lambda:
