@@ -83,7 +83,10 @@ function taskBinding(value: unknown): TaskBinding {
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities)
-  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), kind: text(job.kind), sequence: number(job.sequence), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), read_only: job.read_only == null ? undefined : flag(job.read_only), error: optionalText(job.error), delivery_error: optionalText(job.delivery_error) } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined, write_frozen: data.write_frozen == null ? undefined : flag(data.write_frozen) }
+  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), kind: text(job.kind), sequence: number(job.sequence), message_id: optionalText(job.message_id), target_node: optionalText(job.target_node), reply_message_id: optionalText(job.reply_message_id), read_only: job.read_only == null ? undefined : flag(job.read_only), error: optionalText(job.error), delivery_error: optionalText(job.delivery_error) } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined, write_frozen: data.write_frozen == null ? undefined : flag(data.write_frozen) }
+}
+export function hasQueuedMessage(scheduler: SchedulerSnapshot | null, pending: PendingMessage): boolean {
+  return scheduler?.jobs.some((job) => job.message_id === pending.message_id && job.target_node === pending.scheduler_node && ["queued", "claimed", "running", "cancelling", "completed", "cancelled", "failed", "unknown"].includes(job.state)) ?? false
 }
 function task(value: unknown): TaskRecord {
   const data = record(value)
@@ -168,7 +171,7 @@ export function parsePendingConversation(value: unknown): PendingConversation | 
 export function parsePendingTasks(value: unknown): PendingTask[] {
   return list(value).map((item) => {
     const data = record(item)
-    return { conversation_id: text(data.conversation_id), task_id: text(data.task_id), title: text(data.title), goal: text(data.goal), acceptance: text(data.acceptance), auto_followup: flag(data.auto_followup) }
+    return { conversation_id: text(data.conversation_id), task_id: text(data.task_id), title: text(data.title), goal: text(data.goal), acceptance: text(data.acceptance) }
   })
 }
 export function frontierMap(value: unknown) {

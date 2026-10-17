@@ -46,6 +46,7 @@ export type ManagerJob = {
   kind: string
   sequence: number
   message_id?: string
+  target_node?: string
   reply_message_id?: string
   read_only?: boolean
   error?: string
@@ -121,7 +122,7 @@ export type TaskControlRequest = {
 }
 export type PendingOperation = Pick<OperationRequest, "operation_id" | "target_node" | "session_id" | "conversation_id"> & ({ request: OperationRequest; control?: never } | { request?: never; control: TaskControlRequest })
 export type PendingConversation = { conversation_id: string; title: string }
-export type PendingTask = { conversation_id: string; task_id: string; title: string; goal: string; acceptance: string; auto_followup: boolean }
+export type PendingTask = { conversation_id: string; task_id: string; title: string; goal: string; acceptance: string }
 export type WorkspaceView = "chat" | "tasks" | "sessions" | "devices" | "notifications"
 export type ChatSlotState = {
   conversationId: string | null

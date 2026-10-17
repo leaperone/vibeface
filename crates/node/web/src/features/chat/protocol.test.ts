@@ -3,16 +3,17 @@ import test from 'node:test'
 import { canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, roleLabel } from './protocol.ts'
 
 const ready = { hasConversation: true, loaded: true, missing: false, schedulerOnline: true, managerReady: true, schedulerNodeId: 'node-1' }
-test('send stays disabled until the conversation and scheduler are ready', () => {
+test('send requires authorized configuration and permits an offline scheduler outbox', () => {
   assert.equal(roleLabel('user'), '你')
   assert.equal(roleLabel('assistant'), '调度 Agent')
   assert.equal(canSend({ ...ready, busy: false }), true)
   assert.equal(canSend({ ...ready, missing: true, busy: false }), false)
   assert.equal(canSend({ ...ready, loaded: false, busy: false }), false)
-  assert.equal(canSend({ ...ready, schedulerOnline: false, busy: false }), false)
+  assert.equal(canSend({ ...ready, schedulerOnline: false, busy: false }), true)
   assert.equal(canSend({ ...ready, managerReady: false, busy: false }), false)
   assert.equal(composerHint({ ...ready, missing: true }), '等待上下文补齐后再发送。')
   assert.equal(composerHint(ready), '')
+  assert.match(composerHint({ ...ready, schedulerOnline: false }), /目标确认入队前会保留待核对/)
 })
 test('an explicit retry preserves the complete original message request', () => {
   const first = prepareSend({ conversationId: 'chat', text: ' 继续  ', schedulerNodeId: 'node-a', entryNode: 'entry-a', pending: null, heads: ['head-1'] })

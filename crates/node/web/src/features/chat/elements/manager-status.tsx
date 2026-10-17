@@ -9,7 +9,7 @@ import { ActionButton, StatusBadge, SubmitButton } from '@/features/workspace/pr
 import type { ManagerJob } from '@/features/workspace/types'
 
 const managerStates: Record<string, string> = {
-  delivery_pending: '等待投递到调度端', queued: '等待处理', claimed: '正在准备回复', running: '正在回复',
+  pending_delivery: '等待投递到调度端', queued: '等待处理', claimed: '正在准备回复', running: '正在回复',
   cancelling: '正在核对停止结果', cancelled: '本轮回复已停止', completed: '本轮回复已结束',
   failed: '本轮回复失败', rejected: '本轮请求被拒绝', unknown: '本轮结果待核对',
 }

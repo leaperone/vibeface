@@ -21,7 +21,7 @@ export function ConversationScreen() {
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
   const text = drafts.get(conversationId) ?? ''
   const jobs = data?.scheduler?.jobs ?? []
-  const activeJobs = jobs.filter((job) => ['delivery_pending', 'queued', 'claimed', 'running', 'cancelling', 'unknown'].includes(job.state))
+  const activeJobs = jobs.filter((job) => ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling', 'unknown'].includes(job.state))
   const visibleJobs = activeJobs.length ? activeJobs : jobs.slice(-1)
   const liveMessages = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (['completed', 'failed', 'cancelled', 'unknown', 'rejected'].includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id)))).map((progress) => ({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.needsRefresh ? `实时片段不完整，等待最终结果。\n\n${progress.text}` : progress.text, created_at_ms: 0 }))
   const messages = [...(data?.messages ?? []), ...liveMessages]
@@ -73,7 +73,7 @@ export function ConversationScreen() {
       </Chat>
       {messagePending ? (
         <section className="pending-message" aria-label="待核对消息">
-          <h3 role="status">{messageBusy ? '正在提交消息…' : jobs.some((job) => job.message_id === messagePending.message_id && job.state === 'delivery_pending') ? '入口已接收，等待目标调度端入队' : '消息发送结果待核对'}</h3>
+          <h3 role="status">{messageBusy ? '正在提交消息…' : jobs.some((job) => job.message_id === messagePending.message_id && job.target_node === messagePending.scheduler_node && job.state === 'pending_delivery') ? '入口已接收，等待目标调度端入队' : '消息发送结果待核对'}</h3>
           <Collapsible className="pending-message-details">
             <CollapsibleTrigger asChild>
               <Button variant="ghost" size="sm" className="group -ms-2">

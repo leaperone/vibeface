@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { conversationHref } from "./entry-url.ts"
 import { isIncomplete, mergeBasis } from "./labels.ts"
-import { inputText, parseArtifactPage, parseConversation, parseNodes, parsePending } from "./model.ts"
+import { hasQueuedMessage, inputText, parseArtifactPage, parseConversation, parseNodes, parsePending, parsePendingTasks } from "./model.ts"
 import { parseReconcile, reconcileDecision } from "./reconcile.ts"
 
 const context = {
@@ -44,6 +44,22 @@ test("stored operations retain request contents and enforce the personal network
   assert.deepEqual(parsePending([pending], "network")[0]?.request, full)
   assert.throws(() => parsePending([pending], "other-network"))
   assert.throws(() => parsePending([{ ...pending, target_node: "other" }], "network"))
+})
+test("manual task retries keep the original task identity without replaying legacy followup authorization", () => {
+  const original = { conversation_id: "chat", task_id: "task", title: "title", goal: "goal", acceptance: "done" }
+  assert.deepEqual(parsePendingTasks([original]), [original])
+  assert.deepEqual(parsePendingTasks([{ ...original, auto_followup: true }]), [original])
+  assert.deepEqual(parsePendingTasks([{ ...original, auto_followup: false }]), [original])
+})
+test("only the original scheduler durable job settles a pending human message", () => {
+  const pending = { message_id: "human-message", conversation_id: "chat", text: "work", scheduler_node: "scheduler", entry_node: "gateway", basis_heads: [] }
+  const job = { trigger: "message:event", kind: "human", state: "queued", sequence: 0, message_id: pending.message_id, reply_message_id: "assistant-message", target_node: pending.scheduler_node }
+  for (const state of ["queued", "claimed", "running", "cancelling", "completed", "cancelled", "failed", "unknown"]) assert.equal(hasQueuedMessage({ jobs: [{ ...job, state }] }, pending), true)
+  for (const state of ["pending_delivery", "delivered", "rejected"]) assert.equal(hasQueuedMessage({ jobs: [{ ...job, state }] }, pending), false)
+  assert.equal(hasQueuedMessage(null, pending), false)
+  assert.equal(hasQueuedMessage({ jobs: [{ ...job, target_node: "other-scheduler" }] }, pending), false)
+  assert.equal(hasQueuedMessage({ jobs: [{ ...job, target_node: undefined }] }, pending), false)
+  assert.equal(hasQueuedMessage({ jobs: [{ ...job, message_id: "assistant-message" }] }, pending), false)
 })
 test("stored task controls retain exact approval identity and expected execution revision", () => {
   const control = { ...request, network_id: "network", task_id: "task", expected_operation_id: "original-execution", expected_revision: 4, action: "respond_request", request_id: "approval", response: { decision: "decline" } }

@@ -9,7 +9,7 @@ import { isIncomplete, mergeBasis, missingCount, stateNames } from "./labels"
 import {
   frontierMap, inputText, parseConversation, parseConversations, parseNodes, parseNotifications, parseOperation,
   parsePending, parsePendingMessages, parsePendingConversation, parsePendingTasks, parseSession, record,
-  parseArtifactPage,
+  parseArtifactPage, hasQueuedMessage,
 } from "./model"
 import { errorText, parseReconcile, reconcileDecision, type ReconcileRecord } from "./reconcile"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
@@ -109,9 +109,8 @@ function useWorkspaceState(connection: ReadyConnection) {
     }
     dataRef.current = next
     setData(next)
-    const queuedMessages = new Set(next.scheduler?.jobs.flatMap((job) => job.message_id && ["queued", "claimed", "running", "cancelling", "completed", "cancelled", "failed", "unknown", "rejected"].includes(job.state) ? [job.message_id] : []) ?? [])
-    if (writer.current && messagesRef.current.some((item) => item.conversation_id === id && queuedMessages.has(item.message_id))) {
-      replaceMessages(messagesRef.current.filter((item) => item.conversation_id !== id || !queuedMessages.has(item.message_id)))
+    if (writer.current && messagesRef.current.some((item) => item.conversation_id === id && hasQueuedMessage(next.scheduler, item))) {
+      replaceMessages(messagesRef.current.filter((item) => item.conversation_id !== id || !hasQueuedMessage(next.scheduler, item)))
     }
     setLiveProgress((previous) => previous.filter((progress) => {
       if (progress.kind === "execution") return next.tasks.some((task) => task.binding && task.binding.target_node === progress.target_node && task.binding.session_id === progress.session_id && (!task.binding.operation_id || task.binding.operation_id === progress.operation_id))
@@ -279,7 +278,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   const selectedScheduler = nodes.find((node) => node.node_id === (messagePending?.scheduler_node ?? schedulerNodeId))
   const chatSlot = {
     conversationId: conversationId || null, schedulerNodeId: selectedScheduler?.node_id ?? null,
-    missing: incomplete, schedulerOnline: Boolean(selectedScheduler?.online && !selectedScheduler.revoked), managerReady: Boolean(selectedScheduler?.capabilities?.manager),
+    missing: incomplete, schedulerOnline: Boolean(selectedScheduler?.online && !selectedScheduler.revoked), managerReady: Boolean(selectedScheduler && !selectedScheduler.revoked && selectedScheduler.capabilities?.manager),
   }
 
   return {
@@ -309,16 +308,15 @@ function useWorkspaceState(connection: ReadyConnection) {
       selectConversation(request.conversation_id); setView("chat")
       await refreshRef.current()
     }),
-    createTask: (input: { taskId: string; title: string; goal: string; acceptance: string; autoFollowup: boolean }) => withMutation(`create-task:${activeId.current}`, async () => {
+    createTask: (input: { taskId: string; title: string; goal: string; acceptance: string }) => withMutation(`create-task:${activeId.current}`, async () => {
       const context = requireContext(), id = context.conversation?.conversation_id
       if (!id) throw new Error("先选择会话。")
       const title = inputText(input.title, "工单标题", 65536)
       const goal = inputText(input.goal, "工单目标", 65536)
       const acceptance = inputText(input.acceptance, "验收条件", 65536)
-      if (input.autoFollowup && !canAutoFollowup) throw new Error("当前入口未启用接入角色，不能授权自动继续检查。")
       const prior = tasksRef.current.find((item) => item.conversation_id === id)
-      if (prior && (prior.title !== title || prior.goal !== goal || prior.acceptance !== acceptance || prior.auto_followup !== input.autoFollowup)) throw new Error("还有待确认的工单，请保留原内容与继续检查设置重试。")
-      const request = prior ?? { conversation_id: id, task_id: input.taskId, title, goal, acceptance, auto_followup: input.autoFollowup }
+      if (prior && (prior.title !== title || prior.goal !== goal || prior.acceptance !== acceptance)) throw new Error("还有待确认的工单，请保留原内容重试。")
+      const request = prior ?? { conversation_id: id, task_id: input.taskId, title, goal, acceptance }
       const next = [...tasksRef.current.filter((item) => item.conversation_id !== id), request]
       writeStorage(scoped("pending-tasks"), next, true)
       tasksRef.current = next; setPendingTasks(next)
@@ -339,7 +337,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       const context = requireContext(), id = activeId.current
       const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
       const scheduler = nodes.find((item) => item.node_id === (prior?.scheduler_node ?? schedulerNodeId))
-      if (!scheduler?.online || scheduler.revoked || !scheduler.capabilities?.manager) throw new Error("原调度设备不可用，请先恢复连接并核对原消息。")
+      if (!scheduler || scheduler.revoked || !scheduler.capabilities?.manager) throw new Error("原调度设备的授权或配置不可用，请先核对原消息。")
       const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: scheduler.node_id, entryNode: connection.entry.node_id, pending: prior, heads: context.heads, reportResults })
       if (!prepared.ok) throw new Error(prepared.error)
       replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])

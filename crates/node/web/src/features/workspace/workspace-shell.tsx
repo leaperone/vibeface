@@ -57,7 +57,7 @@ function WorkspaceLayout() {
   const [creating, setCreating] = useState(false)
   const [creatingConversation, setCreatingConversation] = useState(false)
   const awaitingDecisions = workspace.data?.tasks.reduce((count, task) => count + (task.binding?.pending_requests.length ?? 0), 0) ?? 0
-  const queuedReplies = workspace.data?.scheduler?.jobs.filter((job) => ['delivery_pending', 'queued', 'claimed', 'running', 'cancelling', 'unknown'].includes(job.state)).length ?? 0
+  const queuedReplies = workspace.data?.scheduler?.jobs.filter((job) => ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling', 'unknown'].includes(job.state)).length ?? 0
   const title = workspace.view === "chat"
     ? workspace.data?.conversation?.title || "新会话"
     : views.find(([view]) => view === workspace.view)?.[1]

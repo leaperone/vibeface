@@ -17,13 +17,13 @@ export function roleLabel(role: string): string {
   return role
 }
 export function canSend(input: SendGate): boolean {
-  return Boolean(input.hasConversation && input.loaded && !input.missing && input.schedulerOnline && input.managerReady && input.schedulerNodeId && !input.busy)
+  return Boolean(input.hasConversation && input.loaded && !input.missing && input.managerReady && input.schedulerNodeId && !input.busy)
 }
 export function composerHint(input: Omit<SendGate, 'busy'>): string {
   if (!input.hasConversation || !input.loaded) return '先创建或选择一个会话。'
   if (input.missing) return '等待上下文补齐后再发送。'
   if (!input.managerReady || !input.schedulerNodeId) return '设备尚未配置调度 Agent。执行会话仍可直接操作。'
-  if (!input.schedulerOnline) return '所选调度设备离线，请切换其他入口或设备。'
+  if (!input.schedulerOnline) return '调度设备当前离线；入口可先保存原消息，目标确认入队前会保留待核对。'
   return ''
 }
 export function prepareSend(input: {

@@ -32,7 +32,7 @@ export function TasksScreen() {
         <CollapsibleContent forceMount className="pt-4 data-[state=closed]:hidden">
           <Card>
             <CardContent className="space-y-4">
-              {pending ? <p role="status" className="text-sm text-amber-700 dark:text-amber-400">创建结果待确认。保留原内容重试，不会新建重复工单。</p> : null}
+              {pending ? <p role="status" className="text-sm text-amber-700 dark:text-amber-400">创建结果待确认。保留原内容重试，不会新建重复工单。本次只核对创建，后续授权需在任务卡另行确认。</p> : null}
               <form key={pending?.task_id ?? workspace.conversationId}
                 onSubmit={(event) => {
                   event.preventDefault()
@@ -45,7 +45,6 @@ export function TasksScreen() {
                       title: String(new FormData(form).get("title") ?? "").trim(),
                       goal: String(new FormData(form).get("goal") ?? "").trim(),
                       acceptance: String(new FormData(form).get("acceptance") ?? "").trim(),
-                      autoFollowup: pending?.auto_followup ?? false,
                     })
                     form.reset()
                     setOpen(false)
@@ -66,6 +65,7 @@ export function TasksScreen() {
                       <FieldLabel htmlFor="task-acceptance">验收条件</FieldLabel>
                       <Textarea defaultValue={pending?.acceptance ?? ""} readOnly={Boolean(pending)} id="task-acceptance" name="acceptance" rows={3} required maxLength={50000} />
                     </Field>
+                    <p className="text-sm text-muted-foreground">创建后可在任务卡选择完成后只读汇报，或允许本任务继续执行。</p>
                     <SubmitButton busy={busy}>{pending ? "重试确认创建" : "创建工单"}</SubmitButton>
                   </FieldGroup>
                 </fieldset>
