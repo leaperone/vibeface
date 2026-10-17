@@ -163,6 +163,7 @@ struct PendingPair {
     invite_id: String,
     request_id: String,
     name: String,
+    #[serde(default)]
     request_hash: Option<String>,
 }
 
