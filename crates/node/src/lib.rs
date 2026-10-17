@@ -8,6 +8,7 @@ pub mod engine;
 pub mod maintenance;
 pub mod manager;
 pub mod model;
+pub mod network;
 pub mod peer;
 pub mod runtime;
 pub mod scheduler;
