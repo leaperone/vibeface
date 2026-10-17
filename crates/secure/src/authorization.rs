@@ -8,6 +8,7 @@ pub use authenticator_management::{
 pub mod bootstrap;
 pub mod directory;
 pub mod enrollment;
+pub mod passkey_node;
 pub mod projection;
 pub mod services;
 use crate::{Identity, membership::canonical_json};

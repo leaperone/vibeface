@@ -218,7 +218,7 @@ impl PendingPasskey {
             serde_json::json!({"publicKey":{"challenge":self.challenge()?,"rpId":self.relying_party.rp_id,"timeout":PASSKEY_MAX_AGE_MS,"userVerification":"required","allowCredentials":self.credential_ids.iter().map(|id|serde_json::json!({"type":"public-key","id":id})).collect::<Vec<_>>()}}),
         )
     }
-    fn validate(&self, purpose: PasskeyPurpose, now_ms: u64) -> Result<()> {
+    pub(crate) fn validate(&self, purpose: PasskeyPurpose, now_ms: u64) -> Result<()> {
         self.envelope.validate(now_ms)?;
         require(self.envelope.purpose == purpose, "wrong passkey purpose")?;
         RelyingParty::new(&self.relying_party.rp_id, &self.relying_party.origin)?;
