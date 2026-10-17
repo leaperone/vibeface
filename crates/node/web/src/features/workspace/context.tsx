@@ -445,9 +445,8 @@ function useWorkspaceState(connection: ReadyConnection) {
       const context = requireContext(id)
       if (pendingRef.current.some((item) => item.conversation_id === id && item.target_node === target.target_node && (action.type === "open" || item.session_id === target.session_id))) throw new Error("此设备有尚未确认的操作，请先核对原操作。")
       const session = context.sessions.find((item) => item.target_node === target.target_node && item.session_id === target.session_id)
-      const task = context.tasks.find((item) => item.binding?.target_node === target.target_node && item.binding.session_id === target.session_id)
       if (session?.state === "unknown" && action.type !== "read") throw new Error("执行结果未知，请先读取实际状态并人工核对。")
-      const request: OperationRequest = { operation_id: newId(), network_id: networkId, conversation_id: id, task_id: task?.task_id ?? null, target_node: target.target_node, session_id: target.session_id, expected_revision: target.revision ?? 0, basis_heads: context.heads, resources: [], action }
+      const request: OperationRequest = { operation_id: newId(), network_id: networkId, conversation_id: id, task_id: null, target_node: target.target_node, session_id: target.session_id, expected_revision: target.revision ?? 0, basis_heads: context.heads, resources: [], action }
       replacePending([...pendingRef.current, { operation_id: request.operation_id, target_node: request.target_node, session_id: request.session_id, conversation_id: id, request }])
       const result = parseOperation(record(await connection.rpc("operate", { request })).operation)
       requireCurrent()

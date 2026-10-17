@@ -114,7 +114,7 @@ test("creation fields use the server UTF-8 byte limits and reject whitespace", (
   assert.throws(() => inputText("中".repeat(21846), "验收条件", 65536), /65536/)
 })
 
-test("workspace callers retain offline message identity and bound execution tasks", async () => {
+test("workspace callers retain offline message identity and defer reused session task ownership", async () => {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   let cursor = 0
   const afterRender: (() => void)[] = []
@@ -176,7 +176,8 @@ test("workspace callers retain offline message identity and bound execution task
   let rawNodes = [node("revoked", { revoked: true }), node("executor", { roles: ["executor"] }), node("unconfigured", { capabilities: { ...configured, manager: null } }), node("offline", { online: false, capabilities: null }), node("other")]
   let scheduler: Record<string, unknown> | null = null
   const session = { target_node: "executor", session_id: "session", executor: "cursor_agent", state: "idle", cwd: "/project", revision: 4 }
-  const task = { task_id: "task", title: "work", goal: "goal", acceptance: "done", detail: "ready", status: "working", binding: { target_node: session.target_node, session_id: session.session_id, operation_id: "execution", revision: session.revision, state: "idle", capabilities: ["send"], pending_requests: [] } }
+  const task = { task_id: "a-old", title: "work", goal: "goal", acceptance: "done", detail: "ready", status: "working", binding: { target_node: session.target_node, session_id: session.session_id, operation_id: "execution", revision: session.revision, state: "idle", capabilities: ["send"], pending_requests: [] } }
+  const tasks = [task, { ...task, task_id: "b-new", binding: { ...task.binding, operation_id: "new-execution" } }]
   const messages: Record<string, unknown>[] = [], operations: Record<string, unknown>[] = []
   const connection: ReadyConnection = {
     generation: 1, entry: { node_id: "gateway", address: "https://node.example", relay: false },
@@ -187,9 +188,12 @@ test("workspace callers retain offline message identity and bound execution task
       if (method === "nodes") return { nodes: rawNodes }
       if (method === "conversations") return { conversations: [context.conversation] }
       if (method === "notifications") return { notifications: [] }
-      if (method === "conversation") return { ...context, tasks: [task], sessions: [session], scheduler }
+      if (method === "conversation") return { ...context, tasks, sessions: [session], scheduler }
       if (method === "operate") {
         operations.push(JSON.parse(JSON.stringify(body.request)))
+        const storedPending = parsePending(JSON.parse(stored.get("vibeface.pending.client.network") ?? "null"), "network")
+        assert.equal(storedPending.length, 1)
+        assert.deepEqual(storedPending[0].request, operations.at(-1))
         return { operation: { state: "accepted", request: body.request } }
       }
       assert.equal(method, "message")
@@ -247,10 +251,11 @@ test("workspace callers retain offline message identity and bound execution task
     }
     assert.equal(messages.length, 2)
     assert.deepEqual(JSON.parse(stored.get("vibeface.pending-messages.client.network") ?? "null"), [pending])
+    assert.deepEqual(JSON.parse(JSON.stringify(state.data?.tasks.map((item) => item.task_id))), ["a-old", "b-new"])
     await state.operate(session, { type: "send", text: "next" }, "chat")
     assert.equal(operations.length, 1)
     assert.equal(typeof operations[0].operation_id, "string")
-    assert.deepEqual(operations[0], { operation_id: operations[0].operation_id, network_id: "network", conversation_id: "chat", task_id: "task", target_node: "executor", session_id: "session", expected_revision: 4, basis_heads: ["head"], resources: [], action: { type: "send", text: "next" } })
+    assert.deepEqual(operations[0], { operation_id: operations[0].operation_id, network_id: "network", conversation_id: "chat", task_id: null, target_node: "executor", session_id: "session", expected_revision: 4, basis_heads: ["head"], resources: [], action: { type: "send", text: "next" } })
     assert.equal(render().pending.length, 0)
   } finally {
     for (const effect of effects.values()) effect.cleanup?.()
@@ -320,4 +325,35 @@ test("task pending controls stay inside their conversation and retain task and r
     }
   }
   assert.equal(retried.length, 1)
+})
+
+test("a reused execution session shows every bound task and one send form", () => {
+  const session = { target_node: "executor", session_id: "session", executor: "cursor_agent", state: "idle", cwd: "/project", revision: 4 }
+  const task = { task_id: "a-old", title: "work", goal: "goal", acceptance: "done", detail: "ready", status: "working", binding: { target_node: session.target_node, session_id: session.session_id, operation_id: "old-execution", revision: 4, state: "idle", capabilities: ["send"], pending_requests: [] } }
+  const data = parseConversation({ ...context, sessions: [session], tasks: [task, { ...task, task_id: "b-new", binding: { ...task.binding, operation_id: "new-execution" } }, { ...task, task_id: "other-session-task", binding: { ...task.binding, session_id: "other-session" } }] })
+  const elements: { type: unknown; props: Record<string, unknown> }[] = []
+  const jsx = (type: unknown, props: Record<string, unknown>) => { const element = { type, props }; elements.push(element); return element }
+  const ui = new Proxy({}, { get: (_target, name) => String(name) })
+  const module: { exports: Record<string, unknown> } = { exports: {} }
+  const require = (specifier: string) => {
+    if (specifier === "react") return { useState: (initial: unknown) => [initial, () => {}] }
+    if (specifier === "react/jsx-runtime") return { jsx, jsxs: jsx }
+    if (specifier === "./context") return { useWorkspace: () => ({ actual: {}, data }) }
+    if (specifier === "./labels") return { nodeName }
+    return ui
+  }
+  const filename = fileURLToPath(new URL("./sessions-screen.tsx", import.meta.url))
+  const source = readFileSync(filename, "utf8") + "\nexport { SessionCard }\n"
+  const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
+  new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext()(module.exports, require, module)
+  const SessionCard = module.exports.SessionCard
+  assert.ok(typeof SessionCard === "function")
+  SessionCard({ session: data.sessions[0], conversationId: "chat" })
+  const activities = elements.filter(({ type }) => type === "TaskActivity")
+  assert.deepEqual(activities.map(({ props }) => props.task), data.tasks.slice(0, 2))
+  assert.deepEqual(activities.map(({ props }) => props.conversationId), ["chat", "chat"])
+  const sendForms = elements.filter(({ type }) => typeof type === "function" && type.name === "CommandForm")
+  assert.equal(sendForms.length, 1)
+  assert.equal(sendForms[0].props.session, data.sessions[0])
+  assert.equal(sendForms[0].props.conversationId, "chat")
 })

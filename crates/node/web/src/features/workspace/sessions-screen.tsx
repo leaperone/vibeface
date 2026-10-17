@@ -192,9 +192,9 @@ function PendingCard({ operation }: { operation: PendingOperation }) {
 function SessionCard({ session, conversationId }: { session: SessionRecord; conversationId: string }) {
   const workspace = useWorkspace()
   const actual = workspace.actual[`${session.target_node}:${session.session_id}`]
-  const task = workspace.data?.tasks.find((item) => item.binding?.target_node === session.target_node && item.binding.session_id === session.session_id)
-  if (task) return <div className="grid gap-3">
-    <TaskActivity task={task} conversationId={conversationId} />
+  const tasks = workspace.data?.tasks.filter((item) => item.binding?.target_node === session.target_node && item.binding.session_id === session.session_id) ?? []
+  if (tasks.length) return <div className="grid gap-3">
+    {tasks.map((task) => <TaskActivity key={task.task_id} task={task} conversationId={conversationId} />)}
     <Card><CardContent><CommandForm session={session} conversationId={conversationId} /></CardContent></Card>
   </div>
   const canRead = session.capabilities?.includes("read")
