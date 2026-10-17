@@ -98,7 +98,7 @@ fn bounded<T: Serialize>(value: &T) -> Result<()> {
         "cross-node recovery requires a bounded checkpoint",
     )
 }
-fn verify_request(
+fn verify_request_identity(
     state: &VerifiedPolicySet,
     signed: &Signed<CrossNodeRecoveryRequest>,
     now: u64,
@@ -165,16 +165,29 @@ fn verify_request(
             && r.source_read_resources
                 .windows(2)
                 .all(|p| p[0].resource < p[1].resource)
-            && r.source_read_resources.iter().all(|resource| {
-                resource.space == r.space
-                    && state
-                        .resource(&resource.space, &resource.resource)
-                        .is_some_and(|record| {
-                            record.payload.kind == ResourceKind::Project
-                                && record.payload.host
-                                    == ServiceId::from_key(&r.source_node_public_key)
-                        })
-            }),
+            && r.source_read_resources
+                .iter()
+                .all(|resource| resource.space == r.space),
+        "cross-node recovery requires ordered exact personal project references",
+    )
+}
+fn verify_request(
+    state: &VerifiedPolicySet,
+    signed: &Signed<CrossNodeRecoveryRequest>,
+    now: u64,
+) -> Result<()> {
+    verify_request_identity(state, signed, now)?;
+    let request = &signed.payload;
+    require(
+        request.source_read_resources.iter().all(|resource| {
+            state
+                .resource(&resource.space, &resource.resource)
+                .is_some_and(|record| {
+                    record.payload.kind == ResourceKind::Project
+                        && record.payload.host
+                            == ServiceId::from_key(&request.source_node_public_key)
+                })
+        }),
         "cross-node recovery permits only exact existing source projects",
     )
 }
@@ -1056,7 +1069,7 @@ pub fn build_cross_node_recovery_request(
             },
             &recovery,
         )?;
-        verify_request(
+        verify_request_identity(
             &replay_policies(&material.pins, &material.bundle.journal)?,
             &request,
             now,

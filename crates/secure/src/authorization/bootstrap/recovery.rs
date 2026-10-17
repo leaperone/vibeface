@@ -1649,6 +1649,7 @@ mod tests {
     fn cross_node_recovery_requires_live_source_cas_two_possessions_and_exact_read_only_history() {
         use super::cross_node::*;
         let mut original = account();
+        let backup = material(&original);
         let mut source_state = replay_policies(&original.pins, &original.bundle.journal).unwrap();
         let original_space = original.authorization.scope.space_id.clone();
         let first_hash = source_state.space(&original_space).unwrap().resources[0].clone();
@@ -1702,12 +1703,25 @@ mod tests {
             .find(|pin| pin.domain == head.domain)
             .unwrap()
             .minimum_head = Some(head.clone());
-        let backup = material(&original);
         let old_state = replay_policies(&original.pins, &original.bundle.journal).unwrap();
         let inspected: serde_json::Value =
             serde_json::from_str(&inspect_cross_node_recovery_sources(&backup, RESTORE).unwrap())
                 .unwrap();
-        let resources = inspected["source_projects"].to_string();
+        assert_eq!(inspected["source_projects"].as_array().unwrap().len(), 1);
+        let mut current_resources: Vec<_> = old_state
+            .space(&original_space)
+            .unwrap()
+            .resources
+            .iter()
+            .filter_map(|hash| old_state.resources.get(hash))
+            .map(|record| ResourceRef {
+                space: record.payload.space.clone(),
+                resource: record.payload.resource.clone(),
+            })
+            .collect();
+        current_resources.sort_by(|a, b| a.resource.cmp(&b.resource));
+        assert_eq!(current_resources.len(), 2);
+        let resources = encode(&current_resources).unwrap();
         let original_request = build_cross_node_recovery_request(
             &backup,
             &key(5),
@@ -1721,6 +1735,53 @@ mod tests {
         .unwrap();
         let signed: Signed<CrossNodeRecoveryRequest> =
             serde_json::from_str(&original_request).unwrap();
+        let missing_resources = encode(&vec![ResourceRef {
+            space: original_space.clone(),
+            resource: ResourceId::from_bytes([199; 32]),
+        }])
+        .unwrap();
+        let missing_request: Signed<CrossNodeRecoveryRequest> = serde_json::from_str(
+            &build_cross_node_recovery_request(
+                &backup,
+                &key(5),
+                &key(6),
+                &claim(7, 44, RESTORE),
+                &missing_resources,
+                END - 1000.0,
+                RESTORE,
+                RESTORE + 100_000.0,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            create_cross_node_recovery_witness(
+                &old_state,
+                &missing_request,
+                &original.bundle,
+                &key(4),
+                RESTORE as u64
+            )
+            .is_err()
+        );
+        let alien = encode(&vec![ResourceRef {
+            space: SpaceId::personal(&AccountId::from_root(&PublicKey::of(&key(8)))),
+            resource: current_resources[0].resource.clone(),
+        }])
+        .unwrap();
+        assert!(
+            build_cross_node_recovery_request(
+                &backup,
+                &key(5),
+                &key(6),
+                &claim(7, 44, RESTORE),
+                &alien,
+                END - 1000.0,
+                RESTORE,
+                RESTORE + 100_000.0
+            )
+            .is_err()
+        );
         let context = create_cross_node_recovery_witness(
             &old_state,
             &signed,
