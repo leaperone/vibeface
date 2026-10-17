@@ -1648,7 +1648,60 @@ mod tests {
     #[test]
     fn cross_node_recovery_requires_live_source_cas_two_possessions_and_exact_read_only_history() {
         use super::cross_node::*;
-        let original = account();
+        let mut original = account();
+        let mut source_state = replay_policies(&original.pins, &original.bundle.journal).unwrap();
+        let original_space = original.authorization.scope.space_id.clone();
+        let first_hash = source_state.space(&original_space).unwrap().resources[0].clone();
+        let first_resource = source_state
+            .resources
+            .get(&first_hash)
+            .unwrap()
+            .payload
+            .resource
+            .clone();
+        let next_resource = ResourceId::random().unwrap();
+        let record = (0..128)
+            .find_map(|_| {
+                let record = Signed::sign(
+                    ResourceRecord {
+                        version: AUTH_VERSION,
+                        space: original_space.clone(),
+                        resource: next_resource.clone(),
+                        kind: ResourceKind::Project,
+                        host: ServiceId::from_key(&PublicKey::of(&key(4))),
+                        issued_under: source_state
+                            .head(&PolicyDomain::Space(original_space.clone()))
+                            .unwrap()
+                            .clone(),
+                        nonce: Nonce::random().unwrap(),
+                    },
+                    &key(1),
+                )
+                .unwrap();
+                (record.hash().unwrap().cmp(&first_hash) != next_resource.cmp(&first_resource))
+                    .then_some(record)
+            })
+            .expect("fixture must put ObjectHash and ResourceId in opposite orders");
+        let hash = source_state.install_resource(record.clone()).unwrap();
+        let mut space = source_state.space(&original_space).unwrap().clone();
+        space.previous = source_state
+            .head(&PolicyDomain::Space(original_space.clone()))
+            .cloned();
+        space.sequence += 1;
+        space.resources.push(hash);
+        space.resources.sort();
+        let space = Signed::sign(space, &key(1)).unwrap();
+        let head = source_state.install_space(space.clone()).unwrap();
+        original
+            .bundle
+            .journal
+            .extend([JournalEntry::Resource(record), JournalEntry::Space(space)]);
+        original
+            .pins
+            .iter_mut()
+            .find(|pin| pin.domain == head.domain)
+            .unwrap()
+            .minimum_head = Some(head.clone());
         let backup = material(&original);
         let old_state = replay_policies(&original.pins, &original.bundle.journal).unwrap();
         let inspected: serde_json::Value =
@@ -1756,6 +1809,11 @@ mod tests {
         let committed =
             accept_cross_node_recovery_commit(&verified_commit, &key(4), RESTORE as u64).unwrap();
         let committed_json = encode(&committed).unwrap();
+        let request_wire = serde_json::json!({"id":"cross-native","method":"identity/cross_node_recovery_commit","params":request});
+        let committed_wire =
+            serde_json::json!({"id":"cross-native","result":{"committed":committed}});
+        assert!(canonical(&request_wire).unwrap().len() <= MAX_PROOF_BYTES);
+        assert!(canonical(&committed_wire).unwrap().len() <= MAX_PROOF_BYTES);
         let completed =
             finish_cross_node_recovery_commit(&restored, &committed_json, RESTORE + 200_000.0)
                 .unwrap();
@@ -1777,7 +1835,7 @@ mod tests {
         let after = replay_policies(installed.pins(), &installed.bundle().journal).unwrap();
         let selections: serde_json::Value =
             serde_json::from_str(&completed.source_read_selections_json().unwrap()).unwrap();
-        assert_eq!(selections.as_array().unwrap().len(), 1);
+        assert_eq!(selections.as_array().unwrap().len(), 2);
         let source_bundle: ClientAuthorizationBundle =
             serde_json::from_value(selections[0]["authorization"].clone()).unwrap();
         let old_scope = original.authorization.scope();
@@ -1868,7 +1926,7 @@ mod tests {
                 .public_key,
             PublicKey::of(&key(7))
         );
-        assert_eq!(after.space(&old_scope.space_id).unwrap().resources.len(), 2);
+        assert_eq!(after.space(&old_scope.space_id).unwrap().resources.len(), 3);
         assert!(
             after
                 .verify_account_client_device(
@@ -1995,7 +2053,7 @@ mod tests {
             );
         }
         let mut changed = request.clone();
-        changed.bundle.journal.retain(|entry| !matches!(entry,JournalEntry::Device(c) if c.payload.public_key==PublicKey::of(&key(4)) && c.issuer==PublicKey::of(&key(5))));
+        changed.journal_delta.retain(|entry| !matches!(entry,JournalEntry::Device(c) if c.payload.public_key==PublicKey::of(&key(4)) && c.issuer==PublicKey::of(&key(5))));
         assert!(
             verify_cross_node_recovery_commit(
                 &old_state,
@@ -2005,6 +2063,21 @@ mod tests {
             )
             .is_err()
         );
+        let mut oversized = request.clone();
+        oversized
+            .journal_delta
+            .extend(std::iter::repeat_n(request.journal_delta[0].clone(), 200));
+        assert!(matches!(
+            verify_cross_node_recovery_commit(
+                &old_state,
+                &oversized,
+                &PublicKey::of(&key(4)),
+                RESTORE as u64
+            ),
+            Err(AuthorizationError::InvalidProof(
+                "cross-node recovery requires a bounded checkpoint"
+            ))
+        ));
         let mut pending_value: serde_json::Value = serde_json::from_str(&pending_material).unwrap();
         pending_value["client_secret_hex"] = key(8).secret_hex().into();
         assert!(
@@ -2014,7 +2087,8 @@ mod tests {
         if let Ok(path) = std::env::var("VIBEFACE_CROSS_NODE_RECOVERY_VECTOR") {
             std::fs::write(path,encode(&serde_json::json!({"material":backup,"original_bundle":original.bundle,"original_pins":original.pins,
                 "request":signed,"context":context,"possession":possession,"commit_request":request,"committed":committed,
-                "pending_material":pending_material,"read_selections":selections,"now_ms":RESTORE,"expires_at_ms":END})).unwrap()).unwrap();
+                "pending_material":pending_material,"read_selections":selections,"now_ms":RESTORE,"expires_at_ms":END,
+                "request_wire_bytes":canonical(&request_wire).unwrap().len(),"committed_wire_bytes":canonical(&committed_wire).unwrap().len()})).unwrap()).unwrap();
         }
     }
 }

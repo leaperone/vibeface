@@ -56,7 +56,16 @@ pub struct CrossNodeRecoveryPossessionRequest {
 pub struct CrossNodeRecoveryCommitRequest {
     pub possession: CrossNodeRecoveryPossessionRequest,
     pub pins: Vec<PolicyPin>,
-    pub bundle: ClientAuthorizationBundle,
+    pub journal_delta: Vec<JournalEntry>,
+    pub grant_leaf: ObjectHash,
+}
+impl CrossNodeRecoveryCommitRequest {
+    pub fn bundle(&self) -> ClientAuthorizationBundle {
+        let mut bundle = self.possession.context.bundle.clone();
+        bundle.journal.extend(self.journal_delta.clone());
+        bundle.grant_leaf = self.grant_leaf.clone();
+        bundle
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -85,8 +94,8 @@ pub struct CrossNodeRecoveryCommitted {
 
 fn bounded<T: Serialize>(value: &T) -> Result<()> {
     require(
-        canonical(value)?.len() <= MAX_RECOVERY_JOURNAL_BYTES,
-        "cross-node recovery too large",
+        canonical(value)?.len() <= MAX_PROOF_BYTES,
+        "cross-node recovery requires a bounded checkpoint",
     )
 }
 fn verify_request(
@@ -271,6 +280,7 @@ fn verify_possession(
     request: &CrossNodeRecoveryPossessionRequest,
     now: u64,
 ) -> Result<VerifiedPolicySet> {
+    bounded(request)?;
     let mut state = verify_context(&request.context, now)?;
     let r = &request.context.request.payload;
     verify_request(&state, &request.context.request, now)?;
@@ -412,6 +422,7 @@ pub fn sign_cross_node_recovery_source_possession(
 #[derive(Clone, Debug)]
 pub struct VerifiedCrossNodeRecoveryCommit {
     request: CrossNodeRecoveryCommitRequest,
+    bundle: ClientAuthorizationBundle,
     committed_account_head: PolicyStamp,
     committed_space_head: PolicyStamp,
 }
@@ -484,10 +495,10 @@ impl VerifiedCrossNodeRecoveryCommit {
         &self.request.pins
     }
     pub fn bundle(&self) -> &ClientAuthorizationBundle {
-        &self.request.bundle
+        &self.bundle
     }
     pub fn journal_delta(&self) -> &[JournalEntry] {
-        &self.request.bundle.journal[self.request.possession.context.bundle.journal.len()..]
+        &self.request.journal_delta
     }
 }
 fn verify_delta_shape(
@@ -736,17 +747,14 @@ fn verify_completed(
     let before = verify_possession(&request.possession, now)?;
     let r = &request.possession.context.request.payload;
     require(
-        request
-            .bundle
-            .journal
-            .starts_with(&request.possession.context.bundle.journal)
-            && request.pins.len() == r.saved_pins.len()
+        request.pins.len() == r.saved_pins.len()
             && request.pins.iter().zip(&r.saved_pins).all(|(pin, saved)| {
                 pin.domain == saved.domain && pin.genesis_root == saved.genesis_root
             }),
         "recovery changed pinned roots or original source history",
     )?;
-    let delta = &request.bundle.journal[request.possession.context.bundle.journal.len()..];
+    let delta = &request.journal_delta;
+    let bundle = request.bundle();
     require(
         delta.first()
             == Some(&JournalEntry::Account(
@@ -777,7 +785,7 @@ fn verify_completed(
         "recovery delta contains unrelated policy mutations",
     )?;
     verify_delta_shape(request, &before, delta)?;
-    let after = replay_policies(&request.pins, &request.bundle.journal)?;
+    let after = replay_policies(&request.pins, &bundle.journal)?;
     let account = after
         .account(&r.account)
         .ok_or(AuthorizationError::PolicyConflict)?;
@@ -882,6 +890,7 @@ fn verify_completed(
     )?;
     Ok(VerifiedCrossNodeRecoveryCommit {
         request: request.clone(),
+        bundle,
         committed_account_head: account_head,
         committed_space_head: space_head,
     })
@@ -942,15 +951,18 @@ pub fn accept_cross_node_recovery_commit(
         },
         source,
     )?;
-    Ok(CrossNodeRecoveryCommitted {
+    let committed = CrossNodeRecoveryCommitted {
         request: verified.request.clone(),
         receipt,
-    })
+    };
+    bounded(&committed)?;
+    Ok(committed)
 }
 fn verify_committed(
     committed: &CrossNodeRecoveryCommitted,
     now: u64,
 ) -> Result<VerifiedCrossNodeRecoveryCommit> {
+    bounded(committed)?;
     let receipt = &committed.receipt;
     receipt.verify_signature()?;
     require(
@@ -1209,7 +1221,7 @@ pub fn inspect_cross_node_recovery_sources(
     let space = state
         .space(&material.scope.space_id)
         .ok_or("missing recovery personal space")?;
-    let source_projects: Vec<_> = space
+    let mut source_projects: Vec<_> = space
         .resources
         .iter()
         .filter_map(|hash| state.resources.get(hash))
@@ -1222,6 +1234,7 @@ pub fn inspect_cross_node_recovery_sources(
             resource: record.payload.resource.clone(),
         })
         .collect();
+    source_projects.sort_by(|a, b| a.resource.cmp(&b.resource));
     encode(
         &serde_json::json!({"source_projects":source_projects,"entry":material.entry,"scope":material.scope}),
     )
@@ -1241,6 +1254,7 @@ pub fn restore_prepared_cross_node_recovery_commit(
         serde_json::from_str(pending_json).map_err(|_| "invalid pending cross-node recovery")?;
     let now = timestamp(now_ms).map_err(|e| e.to_string())?;
     let request = &pending.commit_request;
+    let bundle = request.bundle();
     let r = &request.possession.context.request.payload;
     let prepared_at = request.possession.source_certificate.not_before_ms;
     validate_material(&pending.material).map_err(|e| e.to_string())?;
@@ -1255,7 +1269,7 @@ pub fn restore_prepared_cross_node_recovery_commit(
             && pending.version == AUTH_VERSION
             && prepared_at <= now
             && pending.material.pins == request.pins
-            && pending.material.bundle == request.bundle
+            && pending.material.bundle == bundle
             && pending.material.scope.account_id == r.account
             && pending.material.scope.space_id == r.space
             && pending.material.entry.node_public_key == r.target_claim.payload.node_public_key
@@ -1267,7 +1281,7 @@ pub fn restore_prepared_cross_node_recovery_commit(
     .map_err(|e| e.to_string())?;
     verify_completed(request, prepared_at).map_err(|e| e.to_string())?;
     let authorization = verify_client_authorization(
-        &encode(&request.bundle)?,
+        &encode(&bundle)?,
         &encode(&request.pins)?,
         r.account.as_str(),
         r.space.as_str(),
@@ -1284,7 +1298,7 @@ pub fn restore_prepared_cross_node_recovery_commit(
         request: request.clone(),
         created: CreatedAccount {
             pins: request.pins.clone(),
-            bundle: request.bundle.clone(),
+            bundle,
             authorization,
         },
         client_secret_hex: pending.client_secret_hex.clone(),
@@ -1420,7 +1434,8 @@ pub fn finish_cross_node_account_recovery(
     let request = CrossNodeRecoveryCommitRequest {
         possession: prepared.possession.clone(),
         pins,
-        bundle,
+        journal_delta: bundle.journal[prepared.possession.context.bundle.journal.len()..].to_vec(),
+        grant_leaf: bundle.grant_leaf,
     };
     verify_completed(&request, now).map_err(|e| e.to_string())?;
     Ok(PreparedCrossNodeRecoveryCommit {
@@ -1457,7 +1472,7 @@ impl PreparedCrossNodeRecoveryCommit {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = publicReviewJson))]
     pub fn public_review_json(&self) -> crate::Result<String> {
         let r = &self.request.possession.context.request.payload;
-        let state = replay_policies(&self.request.pins, &self.request.bundle.journal)
+        let state = replay_policies(&self.created.pins, &self.created.bundle.journal)
             .map_err(|e| e.to_string())?;
         let service_grant = state
             .space(&r.space)
