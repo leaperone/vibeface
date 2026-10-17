@@ -6249,3 +6249,4 @@ pub mod events;
 
 pub mod prepare;
 pub use prepare::sign_client_prepare_intent;
+pub mod governance;
