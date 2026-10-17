@@ -1355,6 +1355,9 @@ def phase1_acceptance(options):
         wait_for("first management invocation starts", lambda: len(calls(name, label="queue-first")) == 1)
         second, _ = send(a.client, name, "queue-second")
         wait_for("busy second message remains durably queued", lambda: state(second, "queued"))
+        cancelled_queued, _ = send(a.client, name, "queue-cancelled")
+        queued_before = wait_for("cancellation target remains queued behind the active reply",
+                                lambda: state(cancelled_queued, "queued"))
         retry = a.client.rpc("message", conversation_id=name, message_id="queue-first", text=original,
                              scheduler_node=a.node_id, report_results=False)
         require(retry["trigger"] == first["trigger"], "message retry retains its exact trigger")
@@ -1362,7 +1365,8 @@ def phase1_acceptance(options):
         wait_for("third entry imports this conversation", lambda: conversation(c.client, name))
         wait_for("third entry restores original Manager active and queued durable states", lambda:
                  (lambda jobs: any(job["trigger"] == first["trigger"] and job["state"] == "running" for job in jobs)
-                  and any(job["trigger"] == second["trigger"] and job["state"] == "queued" for job in jobs))(
+                  and any(job["trigger"] == second["trigger"] and job["state"] == "queued" for job in jobs)
+                  and any(job["trigger"] == cancelled_queued["trigger"] and job["state"] == "queued" for job in jobs))(
                       conversation(c.client, name)["scheduler"]["jobs"]))
         progress = wait_for("third entry observes actual remote management text", lambda:
             [event["payload"] for event in c.client.command("events") if event.get("payload", {}).get("type") == "manager_progress"
@@ -1374,6 +1378,24 @@ def phase1_acceptance(options):
         for row in progress:
             require(seen.setdefault((row["invocation_id"], row["sequence"]), row["progress"]) == row["progress"],
                     "replayed management progress keeps the same content for its invocation sequence")
+        active_before = state(first, "running")
+        require(active_before, "original reply remains running before queued cancellation")
+        cancelled_reply = c.client.rpc("cancel_manager", conversation_id=name, trigger=cancelled_queued["trigger"])
+        require(cancelled_reply.get("cancel_requested") is True
+                and cancelled_reply["job"]["state"] == "cancelled"
+                and "attempt" not in cancelled_reply["job"],
+                "third entry cancels queued work before any SDK attempt")
+        cancelled_job = wait_for("queued cancellation persists at the original Scheduler",
+                                 lambda: state(cancelled_queued, "cancelled"))
+        require(all(cancelled_job[key] == queued_before[key] for key in ("message_id", "basis_heads", "sequence")),
+                "queued cancellation preserves the original accepted message and basis")
+        repeated_cancel = a.client.rpc("cancel_manager", conversation_id=name, trigger=cancelled_queued["trigger"])
+        require(repeated_cancel.get("cancel_requested") is True and repeated_cancel["job"] == cancelled_reply["job"],
+                "repeated queued cancellation confirms the same terminal job")
+        active_after = state(first, "running")
+        require(active_after and active_after["attempt"] == active_before["attempt"] and state(second, "queued")
+                and not calls(name, label="queue-cancelled"),
+                "queued cancellation leaves the active attempt and other queued message intact")
         lease, maintenance_reply = maintenance(a, "acquire")
         lease.close()
         require(maintenance_reply["status"] != "ready", "running and queued jobs prevent managed update drain")
@@ -1385,16 +1407,23 @@ def phase1_acceptance(options):
             wait_for("consumer exit/new enqueue is not lost", lambda: completed(race))
         snapshot = conversation(a.client, name)
         jobs = snapshot["scheduler"]["jobs"]
-        require(len(jobs) == len(calls(name)) == 6
-                and {job["trigger"] for job in jobs} == {call["trigger"] for call in calls(name)}
-                and all(job["state"] == "completed" for job in jobs),
-                "every trigger invokes once and terminal states persist")
+        completed_jobs = [job for job in jobs if job["state"] == "completed"]
+        cancelled_jobs = [job for job in jobs if job["state"] == "cancelled"]
+        require(len(jobs) == 7 and len(completed_jobs) == len(calls(name)) == 6
+                and {job["trigger"] for job in completed_jobs} == {call["trigger"] for call in calls(name)}
+                and [job["trigger"] for job in cancelled_jobs] == [cancelled_queued["trigger"]],
+                "each uncancelled trigger invokes once and queued cancellation remains terminal")
+        require(not cancelled_jobs[0].get("reply_message_id") and not calls(name, label="queue-cancelled")
+                and not any(message["message_id"] == cancelled_job["message_id"] for message in snapshot["messages"])
+                and sum(message["message_id"] == "queue-cancelled" for message in snapshot["messages"]) == 1,
+                "cancelled queued work retains its user message without an SDK call or assistant reply")
         require(all(sum(message["message_id"] == job["reply_message_id"] for message in snapshot["messages"]) == 1
-                    for job in snapshot["scheduler"]["jobs"]), "each completed job has exactly one persisted final reply")
+                    for job in completed_jobs), "each completed job has exactly one persisted final reply")
         require(calls(name)[1]["resumed"] and calls(name)[0]["native_session_id"] == calls(name)[1]["native_session_id"],
                 "successful consecutive calls preserve the local native session")
-        passed("busy messages persist, retry deduplicates, consumer wakes again, remote text and final replies match",
-               triggers=[first["trigger"], second["trigger"]], invocations=len(calls(name)))
+        passed("busy messages persist, retry deduplicates, queued cancellation is final and remaining replies match",
+               triggers=[first["trigger"], second["trigger"]], cancelled_trigger=cancelled_queued["trigger"],
+               invocations=len(calls(name)))
 
         for unconfirmed in (False, True):
             name = new_conversation("phase1-cancel-" + str(unconfirmed).lower())

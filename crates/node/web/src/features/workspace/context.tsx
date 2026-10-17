@@ -364,9 +364,13 @@ function useWorkspaceState(connection: ReadyConnection) {
     cancelManager: (trigger: string) => withMutation(`cancel-manager:${trigger}`, async () => {
       const id = activeId.current
       requireContext(id)
-      await connection.rpc("cancel_manager", { conversation_id: id, trigger })
+      const receipt = record(await connection.rpc("cancel_manager", { conversation_id: id, trigger }))
       requireCurrent()
-      setNoticeText("已提交停止回复请求。已派出的后台任务会单独继续，最终状态以核对结果为准。")
+      const job = record(receipt.job)
+      if (receipt.publication_pending === true) setNoticeText("本轮已有结果，正在补齐发布；未提交停止请求。")
+      else if (receipt.cancel_requested === true && job.state === "cancelled") setNoticeText("本轮回复已停止。已派出的后台任务会单独继续。")
+      else if (receipt.cancel_requested === true) setNoticeText("已提交停止回复请求。已派出的后台任务会单独继续，最终状态以核对结果为准。")
+      else setNoticeText("本轮当前状态未接受停止请求，请核对最新状态。")
       if (activeId.current === id) await refreshRef.current()
     }),
     setFollowup: (taskId: string, mode: FollowupMode) => withMutation(`followup:${taskId}`, async () => {

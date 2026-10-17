@@ -47,7 +47,8 @@ pub enum JobState {
         detail: String,
     },
     Cancelled {
-        attempt: ManagerAttempt,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<ManagerAttempt>,
         evidence: String,
     },
     Unknown {
@@ -73,12 +74,12 @@ impl JobState {
     pub fn attempt(&self) -> Option<&ManagerAttempt> {
         match self {
             Self::Queued => None,
+            Self::Cancelled { attempt, .. } => attempt.as_ref(),
             Self::Claimed { attempt }
             | Self::Running { attempt }
             | Self::Cancelling { attempt }
             | Self::Completed { attempt }
             | Self::Failed { attempt, .. }
-            | Self::Cancelled { attempt, .. }
             | Self::Unknown { attempt, .. } => Some(attempt),
         }
     }

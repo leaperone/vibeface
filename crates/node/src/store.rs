@@ -721,21 +721,32 @@ impl Store {
         network: &str,
         conversation: &str,
         target: &str,
+        trigger: &str,
     ) -> Result<Option<SchedulerJob>> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut session = load_scheduler_session(&tx, network, conversation, target)?;
-        let Some(trigger) = session.active.clone() else {
+        let key = scheduler_key("job", conversation, target, trigger);
+        let Some(mut job): Option<SchedulerJob> = scheduler_load(&tx, network, &key)? else {
             return Ok(None);
         };
-        let key = scheduler_key("job", conversation, target, &trigger);
-        let mut job: SchedulerJob =
-            scheduler_load(&tx, network, &key)?.context("missing active scheduler job")?;
         if scheduler_publication_from(&tx, network, &job)?.is_some() {
             return Ok(Some(job));
         }
-        if let JobState::Claimed { attempt } | JobState::Running { attempt } = &job.state {
+        if matches!(job.state, JobState::Queued) {
+            job.state = JobState::Cancelled {
+                attempt: None,
+                evidence: "user cancelled before the scheduler claimed this trigger".into(),
+            };
+            session.pending.retain(|pending| pending != trigger);
+            scheduler_save(&tx, network, &key, &job)?;
+            save_scheduler_session(&tx, network, &session)?;
+        } else if let JobState::Claimed { attempt } | JobState::Running { attempt } = &job.state {
+            ensure!(
+                session.active.as_deref() == Some(trigger),
+                "management reply changed; refresh before stopping"
+            );
             job.state = JobState::Cancelling {
                 attempt: attempt.clone(),
             };
@@ -2405,7 +2416,10 @@ fn publish_scheduler_terminal_from(
     job.state = match marker.outcome {
         JobOutcome::Completed => JobState::Completed { attempt },
         JobOutcome::Failed(detail) => JobState::Failed { attempt, detail },
-        JobOutcome::Cancelled(evidence) => JobState::Cancelled { attempt, evidence },
+        JobOutcome::Cancelled(evidence) => JobState::Cancelled {
+            attempt: Some(attempt),
+            evidence,
+        },
         JobOutcome::Unknown(detail) => {
             session.unresolved.insert(job.trigger.clone());
             session.native_id = None;
@@ -3482,7 +3496,7 @@ mod tests {
         )?);
         assert!(matches!(
             store
-                .request_manager_cancel(&network, "conversation", &target)?
+                .request_manager_cancel(&network, "conversation", &target, &first.hash)?
                 .unwrap()
                 .state,
             JobState::Running { .. }
@@ -3721,7 +3735,7 @@ mod tests {
             assert!(matches!(current.state, JobState::Running { .. }));
             assert!(matches!(
                 store
-                    .request_manager_cancel(&network, scope, &target)?
+                    .request_manager_cancel(&network, scope, &target, trigger)?
                     .unwrap()
                     .state,
                 JobState::Running { .. }
@@ -3815,7 +3829,7 @@ mod tests {
                 .unwrap();
             let attempt = claimed.job.state.attempt().unwrap().id.clone();
             if cancelled {
-                store.request_manager_cancel(&network, "conversation", &target)?;
+                store.request_manager_cancel(&network, "conversation", &target, &message.hash)?;
             }
             store.connection.execute_batch("CREATE TRIGGER reject_prestart_terminal BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'injected prestart terminal failure'); END;")?;
             let outcome = if cancelled {
@@ -4138,6 +4152,61 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn scheduler_queued_cancellation_and_claim_preserve_each_serialized_winner() -> Result<()> {
+        for claim_first in [false, true] {
+            let owner = LocalIdentity::generate();
+            let network = owner.fixture_network_id()?;
+            let target = owner.node_id()?;
+            let mut store = memory(&owner, None)?;
+            conversation(&mut store, &owner)?;
+            let event = admitted_message(&mut store, &owner, "cancel", &target)?;
+            let claimed = if claim_first {
+                store.claim_next(&network, "conversation", &target, "boot", "sdk")?
+            } else {
+                None
+            };
+            let cancelled = store
+                .request_manager_cancel(&network, "conversation", &target, &event.hash)?
+                .unwrap();
+            assert_eq!(cancelled.trigger, event.hash);
+            assert_eq!(
+                store.request_manager_cancel(&network, "conversation", &target, &event.hash)?,
+                Some(cancelled.clone())
+            );
+            assert_eq!(store.budget_usage(&network, "2026-10-18", 5)?.used, 0);
+            if let Some(claimed) = claimed {
+                let attempt = claimed.job.state.attempt().unwrap();
+                assert!(matches!(cancelled.state, JobState::Cancelling { .. }));
+                assert_eq!(cancelled.state.attempt(), Some(attempt));
+                assert!(!store.manager_attempt_allowed(
+                    &network,
+                    "conversation",
+                    &target,
+                    &event.hash,
+                    &attempt.id,
+                    true
+                )?);
+                assert!(
+                    store
+                        .mark_started(&network, "conversation", &target, &event.hash, &attempt.id)
+                        .is_err()
+                );
+            } else {
+                assert!(matches!(cancelled.state, JobState::Cancelled { .. }));
+                assert!(cancelled.state.attempt().is_none());
+                store.recover_scheduler_jobs(&network, &target, "restarted")?;
+                store.scheduler_maintenance_idle(&network)?;
+            }
+            assert!(
+                store
+                    .claim_next(&network, "conversation", &target, "boot", "sdk")?
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn scheduler_cancellation_fences_existing_credentials_before_confirming_terminal() -> Result<()>
     {
         let owner = LocalIdentity::generate();
@@ -4160,7 +4229,7 @@ mod tests {
             true
         )?);
         let cancelling = store
-            .request_manager_cancel(&network, "conversation", &target)?
+            .request_manager_cancel(&network, "conversation", &target, &event.hash)?
             .unwrap();
         assert!(matches!(cancelling.state, JobState::Cancelling { .. }));
         assert!(!store.manager_attempt_allowed(
@@ -4218,6 +4287,15 @@ mod tests {
             vec![],
             3,
         )?;
+        let cancelled = store
+            .scheduler_job(&network, "conversation", &event.hash, &target)?
+            .unwrap();
+        let legacy = serde_json::json!({
+            "state":"cancelled",
+            "attempt":cancelled.state.attempt().unwrap(),
+            "evidence":"SDK cancellation confirmed and Node tools fenced",
+        });
+        assert_eq!(serde_json::from_value::<JobState>(legacy)?, cancelled.state);
         store.scheduler_maintenance_idle(&network)?;
         assert!(
             store

@@ -234,38 +234,23 @@ impl Runtime {
         }
         let job = {
             let mut store = self.store.lock().await;
-            let current = store
-                .scheduler_job(network, scope, trigger, &target)?
+            let job = store
+                .request_manager_cancel(network, scope, &target, trigger)?
                 .context("management job missing")?;
             if store.scheduler_publication_pending(network, scope, &target, trigger)? {
-                return Ok(
-                    json!({"job":current,"cancel_requested":false,"publication_pending":true}),
-                );
+                return Ok(json!({"job":job,"cancel_requested":false,"publication_pending":true}));
             }
-            if !matches!(
-                current.state,
-                JobState::Claimed { .. } | JobState::Running { .. } | JobState::Cancelling { .. }
-            ) {
-                return Ok(json!({"job":current}));
-            }
-            let cancelled = store
-                .request_manager_cancel(network, scope, &target)?
-                .context("management reply is no longer active")?;
-            ensure!(
-                cancelled.trigger == trigger,
-                "management reply changed; refresh before stopping"
-            );
-            cancelled
+            job
         };
-        self.fence_manager_attempt(
-            &job.state
-                .attempt()
-                .context("management attempt missing")?
-                .id,
-        )
-        .await?;
+        if let JobState::Cancelling { attempt } = &job.state {
+            self.fence_manager_attempt(&attempt.id).await?;
+        }
+        let cancel_requested = matches!(
+            job.state,
+            JobState::Cancelling { .. } | JobState::Cancelled { .. }
+        );
         self.publish_changed(network, scope, trigger);
-        Ok(json!({"job":job,"cancel_requested":true}))
+        Ok(json!({"job":job,"cancel_requested":cancel_requested}))
     }
 
     pub(super) async fn resolve_manager_invocation(
