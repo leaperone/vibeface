@@ -1,6 +1,5 @@
 use crate::{
     crypto::{LocalIdentity, digest},
-    identity::NetworkState,
     model::*,
 };
 use anyhow::{Context as _, Result, ensure};
@@ -182,53 +181,6 @@ fn prepare_database(path: &Path, purpose: OpenPurpose) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn install_trust_bundle_in(
-    connection: &Connection,
-    network_id: &str,
-    state: &NetworkState,
-) -> Result<bool> {
-    ensure!(
-        state.genesis.network_id == network_id,
-        "membership belongs to another personal network"
-    );
-    state.project()?;
-    let previous: Option<String> = connection
-        .query_row(
-            "SELECT bundle FROM spaces WHERE space_id=?",
-            [network_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let merged = if let Some(previous) = &previous {
-        serde_json::from_str::<NetworkState>(previous)?.merge(state)?
-    } else {
-        state.clone()
-    };
-    let encoded = serde_json::to_string(&merged)?;
-    if previous.as_ref() == Some(&encoded) {
-        return Ok(false);
-    }
-    connection.execute("INSERT INTO spaces(space_id,revision,bundle) VALUES(?,?,?) ON CONFLICT(space_id) DO UPDATE SET revision=excluded.revision,bundle=excluded.bundle", params![network_id, merged.epoch(), encoded])?;
-    for member in merged.historical_nodes()? {
-        let old: Option<String> = connection
-            .query_row(
-                "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
-                params![network_id, member.subject_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        ensure!(
-            old.as_ref().is_none_or(|key| key == &member.public_key),
-            "historical Node identity key changed"
-        );
-        connection.execute(
-            "INSERT OR IGNORE INTO node_certificates(space_id,node_id,public_key) VALUES(?,?,?)",
-            params![network_id, member.subject_id, member.public_key],
-        )?;
-    }
-    Ok(true)
-}
-
 #[derive(Clone)]
 pub(crate) struct StoredEvent {
     pub(crate) envelope: SignedEvent,
@@ -364,25 +316,6 @@ impl Store {
         }
         Ok(store)
     }
-    pub fn install_trust_bundle(&mut self, network_id: &str, state: &NetworkState) -> Result<bool> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = install_trust_bundle_in(&tx, network_id, state)?;
-        tx.commit()?;
-        Ok(changed)
-    }
-    pub fn trust_bundle(&self, network_id: &str) -> Result<Option<NetworkState>> {
-        optional_json(
-            self.connection
-                .query_row(
-                    "SELECT bundle FROM spaces WHERE space_id=?",
-                    [network_id],
-                    |r| r.get(0),
-                )
-                .optional()?,
-        )
-    }
     pub fn authorize_node(
         &self,
         network_id: &str,
@@ -463,17 +396,6 @@ impl Store {
             status,
             missing: self.missing_dependencies(network_id, std::slice::from_ref(&envelope.hash))?,
         })
-    }
-    pub fn append_event(
-        &mut self,
-        _identity: &LocalIdentity,
-        _network_id: &str,
-        _scope_id: &str,
-        _body: EventBody,
-        _blobs: Vec<BlobRef>,
-        _created_at_ms: i64,
-    ) -> Result<SignedEvent> {
-        anyhow::bail!("events require a signed invocation and current admission proof")
     }
     fn load_events(&self, network_id: &str) -> Result<BTreeMap<String, StoredEvent>> {
         load_events_from(&self.connection, network_id)
@@ -912,80 +834,6 @@ impl Store {
         Ok(Some(serde_json::from_value(record)?))
     }
 
-    pub fn bind_task(
-        &mut self,
-        identity: &LocalIdentity,
-        binding: &crate::binding::TaskBinding,
-    ) -> Result<crate::binding::SignedBinding> {
-        ensure!(
-            binding.authority_node == identity.node_id()?,
-            "this Node is not the task binding authority"
-        );
-        let authority = self.authorize_node(&binding.network_id, &binding.authority_node, None)?;
-        ensure!(
-            authority.roles.contains(&NodeRole::Gateway)
-                || authority.roles.contains(&NodeRole::Scheduler),
-            "task authority cannot bind execution"
-        );
-        self.verify_binding_task(binding, true)?;
-        let hash = crate::binding::binding_hash(binding)?;
-        let record_key = format!("task-binding-record:{hash}");
-        let current_key = format!("task-binding-current:{}", binding.task_ref);
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let ready: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND hash=? AND status='ready')",
-            params![binding.network_id, binding.task_ref],
-            |r| r.get(0),
-        )?;
-        ensure!(ready, "task creation changed before binding confirmation");
-        let current: Option<String> = tx
-            .query_row(
-                "SELECT value FROM local_values WHERE space_id=? AND key=?",
-                params![binding.network_id, current_key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(current) = current {
-            let current: String = serde_json::from_str(&current)?;
-            if current != hash {
-                ensure!(
-                    binding.previous_binding_hash.as_ref() == Some(&current),
-                    "task is already bound to another execution; query its existing binding"
-                );
-                ensure!(
-                    binding.previous_seal.is_some(),
-                    "changing executor requires a sealed previous binding"
-                );
-            }
-        } else {
-            ensure!(
-                binding.generation == 1 && binding.previous_binding_hash.is_none(),
-                "initial binding must be generation one"
-            );
-        }
-        let unsigned = serde_json::json!({"binding":binding,"signature":null});
-        tx.execute(
-            "INSERT OR IGNORE INTO local_values(space_id,key,value) VALUES(?,?,?)",
-            params![
-                binding.network_id,
-                record_key,
-                serde_json::to_string(&unsigned)?
-            ],
-        )?;
-        tx.execute("INSERT INTO local_values(space_id,key,value) VALUES(?,?,?) ON CONFLICT(space_id,key) DO UPDATE SET value=excluded.value",params![binding.network_id,current_key,serde_json::to_string(&hash)?])?;
-        tx.commit()?;
-        // No binding proof leaves this Node before its unique value is durable.
-        let proof = crate::binding::sign_binding(identity, binding)?;
-        self.local_set(
-            &binding.network_id,
-            &record_key,
-            &serde_json::to_value(&proof)?,
-        )?;
-        Ok(proof)
-    }
-
     pub fn bind_task_authorized(
         &mut self,
         identity: &LocalIdentity,
@@ -1096,11 +944,6 @@ impl Store {
         Ok(signed)
     }
 
-    pub fn install_binding(&mut self, proof: &crate::binding::SignedBinding) -> Result<()> {
-        self.verify_binding_creation(proof)?;
-        self.install_verified_binding(proof)
-    }
-
     fn install_verified_binding(&mut self, proof: &crate::binding::SignedBinding) -> Result<()> {
         let binding = &proof.binding;
         let hash = crate::binding::binding_hash(binding)?;
@@ -1173,97 +1016,6 @@ impl Store {
         self.install_verified_binding(proof)
     }
 
-    pub fn seal_binding(
-        &mut self,
-        identity: &LocalIdentity,
-        proof: &crate::binding::SignedBinding,
-    ) -> Result<crate::binding::SignedSeal> {
-        self.verify_binding_creation(proof)?;
-        let binding = &proof.binding;
-        ensure!(
-            binding.target_node == identity.node_id()?,
-            "only the bound executor can seal execution"
-        );
-        let hash = crate::binding::binding_hash(binding)?;
-        let key = format!("task-binding-seal:{hash}");
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<String> = tx
-            .query_row(
-                "SELECT value FROM local_values WHERE space_id=? AND key=?",
-                params![binding.network_id, key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(existing) = existing {
-            let value: Value = serde_json::from_str(&existing)?;
-            let seal: crate::binding::BindingSeal = serde_json::from_value(value["seal"].clone())?;
-            tx.commit()?;
-            let signed = crate::binding::sign_seal(identity, &seal)?;
-            self.local_set(&binding.network_id, &key, &serde_json::to_value(&signed)?)?;
-            return Ok(signed);
-        }
-        let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE space_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"'))",params![binding.network_id,binding.target_node,binding.session_id],|r|r.get(0))?;
-        ensure!(
-            !busy,
-            "cannot seal an unresolved execution; reconcile unknown results first"
-        );
-        let pending = {
-            let mut statement=tx.prepare("SELECT o.operation_id,o.state FROM operations o JOIN local_values v ON v.space_id=o.space_id AND v.key='completion:' || o.operation_id WHERE o.space_id=? AND o.target_node=? AND o.session_id=?")?;
-            statement
-                .query_map(
-                    params![binding.network_id, binding.target_node, binding.session_id],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-                )?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        if !pending.is_empty() {
-            let events = load_events_from(&tx, &binding.network_id)?;
-            for (operation, state) in pending {
-                let state: OperationState = serde_json::from_str(&state)?;
-                let expected = serde_json::to_value(state)?
-                    .as_str()
-                    .context("invalid operation state")?
-                    .to_owned();
-                ensure!(events.values().any(|stored|stored.status == "ready" && stored.event.author == binding.target_node
-                    && stored.event.scope_id == binding.conversation_id
-                    && matches!(&stored.event.body,EventBody::ExecutionObserved{operation_id,target_node,session_id,status,..}
-                        if operation_id == &operation && target_node == &binding.target_node && session_id == &binding.session_id && status == &expected)),
-                    "execution completion must be durable before sealing");
-            }
-        }
-        let session:Option<String>=tx.query_row("SELECT record FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",params![binding.network_id,binding.target_node,binding.session_id],|r|r.get(0)).optional()?;
-        let revision = if let Some(session) = session {
-            let session: ExecutionSession = serde_json::from_str(&session)?;
-            ensure!(
-                matches!(session.state.as_str(), "idle" | "closed"),
-                "native execution session is not idle"
-            );
-            session.revision
-        } else {
-            0
-        };
-        let seal = crate::binding::BindingSeal {
-            network_id: binding.network_id.clone(),
-            binding_hash: hash,
-            target_node: binding.target_node.clone(),
-            final_revision: revision,
-        };
-        tx.execute(
-            "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
-            params![
-                binding.network_id,
-                key,
-                serde_json::to_string(&serde_json::json!({"seal":seal,"signature":null}))?
-            ],
-        )?;
-        tx.commit()?;
-        let signed = crate::binding::sign_seal(identity, &seal)?;
-        self.local_set(&binding.network_id, &key, &serde_json::to_value(&signed)?)?;
-        Ok(signed)
-    }
-
     pub fn validate_operation_binding(&self, request: &OperationRequest) -> Result<()> {
         let proof = request
             .binding
@@ -1273,240 +1025,6 @@ impl Store {
         validate_operation_binding_from(&self.connection, request)
     }
 
-    #[cfg(test)]
-    pub(crate) fn bind_test_operation(
-        &mut self,
-        identity: &LocalIdentity,
-        request: &mut OperationRequest,
-    ) -> Result<()> {
-        let task_id = request
-            .task_id
-            .get_or_insert_with(|| format!("fixture-{}", request.operation_id))
-            .clone();
-        let creation =
-            match self.task_creation(&request.network_id, &request.conversation_id, &task_id) {
-                Ok(event) => event,
-                Err(_) => self.append_event(
-                    identity,
-                    &request.network_id,
-                    &request.conversation_id,
-                    EventBody::TaskCreated {
-                        task_id: task_id.clone(),
-                        title: "fixture".into(),
-                        goal: "fixture".into(),
-                        acceptance: "fixture".into(),
-                    },
-                    vec![],
-                    2,
-                )?,
-            };
-        if let Some(proof) = self.task_binding(&request.network_id, &creation.hash)? {
-            request.binding = Some(proof);
-            return Ok(());
-        }
-        let open_spec =
-            if request.action["type"] == "open" && request.action["executor"].is_string() {
-                request.action.clone()
-            } else if let Some(session) = self.session(
-                &request.network_id,
-                &request.target_node,
-                &request.session_id,
-            )? {
-                serde_json::json!({"type":"open","executor":session.executor,"cwd":session.cwd})
-            } else {
-                serde_json::json!({"type":"open","executor":"codex","cwd":"/tmp"})
-            };
-        let binding = crate::binding::TaskBinding {
-            network_id: request.network_id.clone(),
-            conversation_id: request.conversation_id.clone(),
-            task_ref: creation.hash,
-            task_id,
-            authority_node: identity.node_id()?,
-            generation: 1,
-            target_node: request.target_node.clone(),
-            session_id: request.session_id.clone(),
-            open_spec,
-            previous_binding_hash: None,
-            previous_seal: None,
-        };
-        request.binding = Some(self.bind_task(identity, &binding)?);
-        Ok(())
-    }
-
-    pub fn accept_operation(
-        &mut self,
-        network_id: &str,
-        request: &OperationRequest,
-    ) -> Result<OperationRecord> {
-        self.admit_operation(network_id, request, false)
-    }
-    pub fn accept_control_operation(
-        &mut self,
-        network_id: &str,
-        request: &OperationRequest,
-    ) -> Result<OperationRecord> {
-        ensure!(
-            request.resources.is_empty(),
-            "control operations cannot reserve resources"
-        );
-        ensure!(
-            matches!(
-                request.action.get("type").and_then(Value::as_str),
-                Some("read" | "steer" | "interrupt" | "respond_request")
-            ),
-            "invalid control operation action"
-        );
-        self.admit_operation(network_id, request, true)
-    }
-    fn admit_operation(
-        &mut self,
-        network_id: &str,
-        request: &OperationRequest,
-        control: bool,
-    ) -> Result<OperationRecord> {
-        ensure!(
-            request.network_id == network_id,
-            "operation network mismatch"
-        );
-        ensure!(
-            !request.operation_id.is_empty() && !request.session_id.is_empty(),
-            "operation and session IDs are required"
-        );
-        ensure!(
-            request.expected_revision < i64::MAX as u64,
-            "revision overflow"
-        );
-        ensure!(
-            request.resources.len() <= 128,
-            "too many resource reservations"
-        );
-        self.validate_operation_binding(request)?;
-        let encoded = serde_json::to_string(request)?;
-        ensure!(encoded.len() <= MAX_EVENT_BYTES, "operation too large");
-        if let Some(old) = self.operation(network_id, &request.operation_id)? {
-            ensure!(
-                old.request == *request,
-                "operation ID reused with different body"
-            );
-            return Ok(old);
-        }
-        self.authorize_node(network_id, &request.target_node, Some(NodeRole::Executor))?;
-        let complete = self.context(network_id, &request.conversation_id, &request.basis_heads)?;
-        ensure!(
-            complete.missing.is_complete(),
-            "required context is incomplete or conflicting"
-        );
-        let mut resources = request
-            .resources
-            .iter()
-            .map(|r| canonical_resource(r))
-            .collect::<Result<Vec<_>>>()?;
-        resources.sort();
-        resources.dedup();
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let old: Option<(String, String, String)> = tx
-            .query_row(
-                "SELECT request,state,result FROM operations WHERE space_id=? AND operation_id=?",
-                params![network_id, request.operation_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        if let Some((old, state, result)) = old {
-            ensure!(old == encoded, "operation ID reused with different body");
-            return Ok(OperationRecord {
-                request: request.clone(),
-                state: serde_json::from_str(&state)?,
-                result: serde_json::from_str(&result)?,
-            });
-        }
-        validate_operation_binding_from(&tx, request)?;
-        for event in &complete.events {
-            let hash = digest(serde_json::to_string(event)?.as_bytes());
-            let ready:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND hash=? AND status='ready')",params![network_id,hash],|r|r.get(0))?;
-            ensure!(ready, "context changed during admission");
-        }
-        let revision:Option<u64>=tx.query_row("SELECT revision FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",params![network_id,request.target_node,request.session_id],|r|r.get(0)).optional()?;
-        ensure!(
-            revision.unwrap_or(0) == request.expected_revision,
-            "stale execution session revision"
-        );
-        check_execution_session_in(
-            &tx,
-            network_id,
-            &request.target_node,
-            &request.session_id,
-            control,
-        )?;
-        check_execution_resources_in(&tx, &request.target_node, &resources)?;
-        tx.execute("INSERT INTO operations(space_id,operation_id,target_node,session_id,request,state,control,result) VALUES(?,?,?,?,?,'\"accepted\"',?,'null')",params![network_id,request.operation_id,request.target_node,request.session_id,encoded,control])?;
-        for resource in resources {
-            tx.execute("INSERT INTO resource_reservations(space_id,operation_id,target_node,resource) VALUES(?,?,?,?)",params![network_id,request.operation_id,request.target_node,resource])?;
-        }
-        tx.commit()?;
-        Ok(OperationRecord {
-            request: request.clone(),
-            state: OperationState::Accepted,
-            result: Value::Null,
-        })
-    }
-    pub fn claim_operation(
-        &mut self,
-        network_id: &str,
-        operation_id: &str,
-    ) -> Result<OperationRecord> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let encoded: String = tx.query_row(
-            "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
-            params![network_id, operation_id],
-            |r| r.get(0),
-        )?;
-        let request: OperationRequest = serde_json::from_str(&encoded)?;
-        validate_operation_binding_from(&tx, &request)?;
-        authorize_node_from(
-            &tx,
-            network_id,
-            &request.target_node,
-            Some(NodeRole::Executor),
-        )?;
-        let revision:Option<u64>=tx.query_row("SELECT revision FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",params![network_id,request.target_node,request.session_id],|r|r.get(0)).optional()?;
-        ensure!(
-            revision.unwrap_or(0) == request.expected_revision,
-            "execution session changed before claim"
-        );
-        let events = load_events_from(&tx, network_id)?;
-        let heads = if request.basis_heads.is_empty() {
-            heads_from_events(&events, &request.conversation_id)
-        } else {
-            request.basis_heads.clone()
-        };
-        for hash in closure_hashes(&events, &heads) {
-            let event = events
-                .get(&hash)
-                .context("operation basis is missing before claim")?;
-            ensure!(
-                event.status == "ready",
-                "operation basis became incomplete or conflicting"
-            );
-            for blob in &event.event.blobs {
-                ensure!(
-                    has_blob_from(&tx, network_id, blob)?,
-                    "operation basis content became incomplete"
-                );
-            }
-        }
-        let changed=tx.execute("UPDATE operations SET state='\"running\"' WHERE space_id=? AND operation_id=? AND state='\"accepted\"'",params![network_id,operation_id])?;
-        ensure!(
-            changed == 1,
-            "operation is not accepted or has already been claimed"
-        );
-        tx.commit()?;
-        self.operation(network_id, operation_id)?
-            .context("operation disappeared")
-    }
     pub fn finish_operation(
         &mut self,
         network_id: &str,
@@ -2966,7 +2484,7 @@ mod tests {
         delayed.operation_id = "delayed".into();
         assert!(network.admit(&mut store, &delayed).is_err());
         let replacement = rebind(&network, &mut store, binding, &sealed, "replacement")?;
-        store.install_binding(binding)?;
+        store.install_historical_binding(binding)?;
         assert_eq!(
             store
                 .task_binding(space, &binding.binding.task_ref)?
