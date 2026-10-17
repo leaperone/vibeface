@@ -2493,8 +2493,16 @@ mod manager_tests {
 
     impl Fixture {
         fn new() -> Result<Self> {
+            Self::new_at(false)
+        }
+
+        fn new_at(persistent: bool) -> Result<Self> {
             let network = TestNetwork::new()?;
-            let mut store = network.memory()?;
+            let mut store = if persistent {
+                network.at(&network.directory.join("node.sqlite3"))?
+            } else {
+                network.memory()?
+            };
             network.conversation(&mut store, "conversation")?;
             let service = vibeface_secure::authorization::ServiceId::from_key(&PublicKey::parse(
                 &network.node.public_key_hex()?,
@@ -2618,6 +2626,65 @@ mod manager_tests {
                 now(),
             )
         }
+    }
+
+    #[test]
+    fn reopening_running_manager_preserves_unknown_work_without_replaying_admission() -> Result<()>
+    {
+        let mut fixture = Fixture::new_at(true)?;
+        let first = fixture.claim("boot-before-restart")?;
+        let key = scheduler::key("session", "conversation", "");
+        let mut session: LocalSession = local_from(
+            &fixture.store.connection,
+            fixture.network.space.as_str(),
+            &key,
+        )?
+        .unwrap();
+        session.native_id = Some("native-before-restart".into());
+        fixture.store.local_set(
+            fixture.network.space.as_str(),
+            &key,
+            &serde_json::to_value(&session)?,
+        )?;
+        let counts: (u64,u64) = fixture.store.connection.query_row(
+            "SELECT (SELECT count(*) FROM accepted_authorizations),(SELECT count(*) FROM authorization_nonces)",[],|row| Ok((row.get(0)?,row.get(1)?)))?;
+        let Fixture {
+            network,
+            store,
+            auth,
+            transport,
+            body,
+            proof,
+            sdk_config,
+            ..
+        } = fixture;
+        drop(store);
+        let mut reopened = Store::open(network.directory.join("node.sqlite3"))?;
+        let session: LocalSession =
+            local_from(&reopened.connection, network.space.as_str(), &key)?.unwrap();
+        assert!(session.native_id.is_none());
+        assert!(
+            session
+                .active
+                .as_ref()
+                .is_some_and(|active| active.trigger == first.invocation.trigger
+                    && active.state == InvocationState::Unknown)
+        );
+        let replay = reopened.claim_authorized_manager(
+            &auth,
+            &proof,
+            &transport,
+            &body,
+            "boot-after-restart",
+            &sdk_config,
+            now(),
+        )?;
+        assert!(!replay.fresh && replay.invocation.state == InvocationState::Unknown);
+        assert!(replay.previous_native_id.is_none());
+        assert_eq!(reopened.connection.query_row(
+            "SELECT (SELECT count(*) FROM accepted_authorizations),(SELECT count(*) FROM authorization_nonces)",[],|row| Ok((row.get::<_,u64>(0)?,row.get::<_,u64>(1)?)))?,counts);
+        assert!(reopened.operations(network.space.as_str())?.is_empty());
+        Ok(())
     }
 
     #[test]
