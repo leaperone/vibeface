@@ -1192,10 +1192,22 @@ mod tests {
                     &network.node,
                     &network.client.public_key_hex(),
                     &selection_params,
-                    now() + 200_000,
+                    now() + 20_000,
                 )?,
                 selected
             );
+            if team_source {
+                assert!(
+                    reopened
+                        .execution_service_select(
+                            &network.node,
+                            &network.client.public_key_hex(),
+                            &selection_params,
+                            now() + 200_000,
+                        )
+                        .is_err()
+                );
+            }
             assert_eq!(row_counts(&reopened)?, counts);
             assert_eq!(
                 source_root(&reopened.connection, &execution)?,
