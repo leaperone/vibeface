@@ -205,15 +205,57 @@ A 已派发 B 后掉线时，从 C 打开原业务会话，等待 DAG 补齐，�
 ./scripts/install-node-service.sh status
 ```
 
-macOS 使用当前登录用户的 launchd agent，日志位于数据目录的 `service.stdout.log` 和 `service.stderr.log`。Linux 使用 `systemd --user`。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
+macOS 使用当前登录用户的 launchd agent，日志位于数据目录的 `service.stdout.log` 和 `service.stderr.log`。Linux 使用 `systemd --user`，Node 日志由用户 journal 保存。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
 
 后台服务不保证继承终端的 PATH 或临时环境变量。在 `config.json` 使用 Provider 和 sidecar 的绝对路径，并通过对应服务管理器配置模型凭证。安装脚本不保存或复制密钥。
 
-卸载只移除服务，不删除账户、身份和历史：
+卸载同时移除 Node 服务和更新定时服务，不删除账户、身份、配置和历史：
 
 ```sh
 ./scripts/install-node-service.sh uninstall
 ```
+
+## 选择更新渠道
+
+自动更新需要完整发布包与受管安装目录。固定的 `current` 符号链接指向当前包，Node 用户服务也通过该路径启动。首次安装方式见 [构建与发布](releasing.md#首次安装更新器或手动更换程序)。
+
+选择 Stable 并开启自动更新：
+
+```sh
+"$HOME/.local/share/vibeface/current/vibeface-node" update configure \
+	--data-dir "$HOME/.vibeface" \
+	--install-root "$HOME/.local/share/vibeface" \
+	--channel stable \
+	--automatic true
+```
+
+将 `stable` 改为 `nightly` 可跟随开发预发布。Stable 不会安装 Nightly；尚无正式版时不会自动更换版本。切换渠道不触发降级。默认渠道为 Stable，未配置时不开启自动更新；已有 Nightly 安装应显式选择 `nightly`。
+
+查看策略和最近结果、主动检查或立即尝试升级：
+
+```sh
+"$HOME/.local/share/vibeface/current/vibeface-node" update status --data-dir "$HOME/.vibeface"
+"$HOME/.local/share/vibeface/current/vibeface-node" update check --data-dir "$HOME/.vibeface"
+"$HOME/.local/share/vibeface/current/vibeface-node" update apply --data-dir "$HOME/.vibeface"
+```
+
+`check` 只查询与校验版本信息。`apply` 仅安装声明与当前数据格式兼容的包，需要安全的空闲窗口。活动任务、管理 Agent 调用和结果未知的操作都会阻止安装，先完成或核对原任务，不需要关闭网页。升级不会调用模型或修改 Provider 密钥。
+
+开启自动更新会安装独立的用户定时服务。macOS 的 `com.leaperone.vibeface.update` 在载入时和每小时尝试更新；Linux 的 `vibeface-update.timer` 每小时启动一次独立 oneshot 服务。Linux 关机期间不能更新，用户服务能否在退出登录后运行取决于 lingering。更新日志位于数据目录的 `update.stdout.log` 与 `update.stderr.log`，文件权限为 600。`scripts/install-node-service.sh status` 同时展示 Node 与更新服务的真实状态。
+
+关闭自动更新时，保留所选渠道与受管路径，重新执行 `configure`：
+
+```sh
+"$HOME/.local/share/vibeface/current/vibeface-node" update configure \
+	--data-dir "$HOME/.vibeface" \
+	--install-root "$HOME/.local/share/vibeface" \
+	--channel stable \
+	--automatic false
+```
+
+这会移除更新定时服务，手动 `check` 和 `apply` 仍可使用。只移除定时服务也可运行 `scripts/install-node-service.sh uninstall-updater`；该命令不更改策略文件，若重新配置自动更新，定时服务会再次安装。
+
+更新器先核对包和存储兼容声明，再停止 Node 并切换 `current`。新进程健康检查失败时只恢复上一份程序入口，不自动还原数据库；账户、会话、身份、配置和凭证仍保存在原数据目录。校验、网络和安装失败可通过 `update status` 与更新日志查看。
 
 ## 备份与维护
 
