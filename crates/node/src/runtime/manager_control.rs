@@ -237,6 +237,11 @@ impl Runtime {
             let current = store
                 .scheduler_job(network, scope, trigger, &target)?
                 .context("management job missing")?;
+            if store.scheduler_publication_pending(network, scope, &target, trigger)? {
+                return Ok(
+                    json!({"job":current,"cancel_requested":false,"publication_pending":true}),
+                );
+            }
             if !matches!(
                 current.state,
                 JobState::Claimed { .. } | JobState::Running { .. } | JobState::Cancelling { .. }

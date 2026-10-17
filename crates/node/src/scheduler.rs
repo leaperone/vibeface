@@ -216,6 +216,22 @@ pub async fn run(
     }).catch_unwind().await.unwrap_or_else(|_| Err(anyhow::anyhow!("management attempt panicked; reconcile its outcome")));
     let final_result: Result<Value> = async {
         if let Err(error) = outcome {
+            if node.store.lock().await.scheduler_publication_pending(
+                &network,
+                &conversation,
+                &target,
+                &trigger,
+            )? {
+                let current = node
+                    .store
+                    .lock()
+                    .await
+                    .scheduler_job(&network, &conversation, &trigger, &target)?
+                    .context("management job missing")?;
+                let mut value = invocation_value(&current, &network);
+                value["publication_pending"] = json!(true);
+                return Ok(value);
+            }
             let cancellation = error
                 .downcast_ref::<ManagerError>()
                 .is_some_and(|e| e.cancelled());

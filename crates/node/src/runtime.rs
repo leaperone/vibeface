@@ -941,6 +941,16 @@ mod tests {
         configure_manager(&dir)?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
+        let wrong_entry = node.rpc(Access { network_id: network.clone(), human: true, conversation_id: None, manager: None },
+            json!({"method":"message","conversation_id":"chat","message_id":"wrong-entry","text":"same goal","entry_node":"another-gateway"})).await.unwrap_err();
+        assert!(wrong_entry.to_string().contains("original gateway"));
+        assert!(
+            node.store
+                .lock()
+                .await
+                .messages(&network, "chat")?
+                .is_empty()
+        );
         let barrier = Arc::new(tokio::sync::Barrier::new(16));
         let mut calls = Vec::new();
         for _ in 0..16 {

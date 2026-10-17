@@ -710,6 +710,7 @@ impl Store {
             vec![],
             at,
         )?;
+        policy_from(&tx, network, scope, task, mode != FollowupMode::Off)?;
         tx.commit()?;
         Ok(envelope)
     }
@@ -1297,6 +1298,56 @@ mod tests {
             params![serde_json::to_string(&corrupt)?, network, bad.hash],
         )?;
         assert!(store.followup_policy(&network, "chat", "task").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_grant_does_not_commit_an_unusable_policy_version() -> Result<()> {
+        let (mut store, identity, network, node) = fixture()?;
+        store.create_task_with_origin(&identity, &network, "chat", task_body("task"), None, 2)?;
+        store.set_task_followup(
+            &identity,
+            &network,
+            "chat",
+            "task",
+            FollowupMode::Off,
+            0,
+            Some(&node),
+            3,
+        )?;
+        let next_gateway = LocalIdentity::generate();
+        store.install_trust_bundle(
+            &network,
+            &identity.sign_network_fixture(
+                2,
+                vec![
+                    identity.certificate(vec![
+                        NodeRole::Scheduler,
+                        NodeRole::Replica,
+                        NodeRole::Executor,
+                    ])?,
+                    next_gateway.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?,
+                ],
+            )?,
+        )?;
+        let before = store.heads(&network, "chat")?;
+        assert!(
+            store
+                .set_task_followup(
+                    &next_gateway,
+                    &network,
+                    "chat",
+                    "task",
+                    FollowupMode::Continue,
+                    1,
+                    None,
+                    4
+                )
+                .is_err()
+        );
+        let policy = store.followup_policy(&network, "chat", "task")?;
+        assert_eq!((policy.mode, policy.version), (FollowupMode::Off, 1));
+        assert_eq!(store.heads(&network, "chat")?, before);
         Ok(())
     }
 

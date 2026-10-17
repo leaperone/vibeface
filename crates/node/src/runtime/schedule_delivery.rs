@@ -425,6 +425,19 @@ impl Runtime {
         let networks = self.store.lock().await.networks()?;
         for network in networks {
             if self.config.roles.contains(&NodeRole::Scheduler) {
+                let publications = self.store.lock().await.flush_scheduler_publications(
+                    &self.identity,
+                    &network,
+                    &local,
+                )?;
+                for publication in publications.published {
+                    for hash in publication.event_hashes {
+                        self.publish_changed(&network, &publication.job.conversation_id, &hash);
+                    }
+                }
+                for error in publications.errors {
+                    tracing::warn!(%error, "known management outcome awaits history publication");
+                }
                 let workers = self.schedule_workers.lock().await.clone();
                 let (unknown, abandoned) = {
                     let mut store = self.store.lock().await;
@@ -433,6 +446,14 @@ impl Runtime {
                     let mut abandoned = Vec::new();
                     for scope in store.scopes(&network)? {
                         for job in store.scheduler_jobs(&network, &scope, &local)? {
+                            if store.scheduler_publication_pending(
+                                &network,
+                                &scope,
+                                &local,
+                                &job.trigger,
+                            )? {
+                                continue;
+                            }
                             if let JobState::Unknown {
                                 attempt,
                                 fenced: false,
@@ -618,6 +639,12 @@ impl Runtime {
         self.require_role(network, NodeRole::Gateway).await?;
         let message_id = id(input, "message_id")?;
         let local = self.identity.node_id()?;
+        if let Some(entry) = input.get("entry_node") {
+            ensure!(
+                entry.as_str() == Some(local.as_str()),
+                "retry this message through its original gateway; do not resubmit it at another entry"
+            );
+        }
         let target = input["scheduler_node"]
             .as_str()
             .unwrap_or(&local)
