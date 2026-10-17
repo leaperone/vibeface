@@ -1,5 +1,5 @@
 import { Bubble, BubbleContent } from '@/components/ui/bubble'
-import { Message as MessageRoot, MessageContent } from '@/components/ui/message'
+import { Message as MessageRoot, MessageContent, MessageHeader } from '@/components/ui/message'
 
 import { messageKey, roleLabel } from '../protocol.ts'
 import type { TranscriptMessage } from '../types.ts'
@@ -10,7 +10,7 @@ export function Message({ message }: { message: TranscriptMessage }) {
   return (
     <MessageRoot align={user ? 'end' : undefined} data-message-id={messageKey(message)}>
       <MessageContent className="gap-2">
-        <header>
+        <MessageHeader className="gap-2 px-0 text-xs font-normal">
           <span>{roleLabel(message.role)}</span>
           {when ? (
             <time dateTime={when.toISOString()}>
@@ -22,14 +22,10 @@ export function Message({ message }: { message: TranscriptMessage }) {
               })}
             </time>
           ) : null}
-        </header>
-        {user ? (
-          <Bubble align="end" variant="muted">
-            <BubbleContent>{message.text}</BubbleContent>
-          </Bubble>
-        ) : (
-          <p className="whitespace-pre-wrap">{message.text}</p>
-        )}
+        </MessageHeader>
+        <Bubble align={user ? 'end' : 'start'} variant={user ? 'muted' : 'ghost'}>
+          <BubbleContent>{message.text}</BubbleContent>
+        </Bubble>
       </MessageContent>
     </MessageRoot>
   )

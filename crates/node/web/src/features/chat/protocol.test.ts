@@ -12,6 +12,7 @@ test('send stays disabled until the conversation and scheduler are ready', () =>
   assert.equal(canSend({ ...ready, schedulerOnline: false, busy: false }), false)
   assert.equal(canSend({ ...ready, managerReady: false, busy: false }), false)
   assert.equal(composerHint({ ...ready, missing: true }), '等待上下文补齐后再发送。')
+  assert.equal(composerHint(ready), '')
 })
 test('an explicit retry preserves the complete original message request', () => {
   const first = prepareSend({ conversationId: 'chat', text: ' 继续  ', schedulerNodeId: 'node-a', entryNode: 'entry-a', pending: null, heads: ['head-1'] })
