@@ -1,7 +1,5 @@
 use super::{
-    admission::{
-        admission_for_operation_from, consume_execution_dispatch_in, reconstruct_admission,
-    },
+    admission::{admission_for_operation_from, consume_execution_dispatch_in},
     execution_dispatch::{VerifiedDispatchFacts, check_destination_heads_in},
     execution_handoff::resolution_resolver_from,
     journal::PolicyState,
@@ -9,7 +7,7 @@ use super::{
 };
 use crate::{
     crypto::LocalIdentity,
-    model::{AdmissionProof, OperationRecord, OperationRequest, OperationState},
+    model::{AdmissionProof, EventCause, OperationRecord, OperationRequest, OperationState},
     store::{Store, validate_operation_binding_from},
 };
 use anyhow::{Context, Result, ensure};
@@ -78,7 +76,7 @@ fn operation_from(
 
 fn check_original_in(
     connection: &Connection,
-    policy: &PolicyState,
+    identity: &LocalIdentity,
     observation: &ExecutionHandoffResult,
 ) -> Result<(OperationRecord, AdmissionProof)> {
     let receipt = &observation.receipt.payload;
@@ -105,19 +103,40 @@ fn check_original_in(
             == stored.request,
         "resolution changed the original operation request"
     );
-    let facts = super::event_authorization::persisted_admission_facts(connection, policy, &proof)?
-        .context("original remote operation has no admitted dispatch")?;
-    reconstruct_admission(
-        policy,
-        &proof,
-        &facts,
-        &proof.transport.clone().into_evidence(),
-    )?;
-    validate_operation_binding_from(connection, &stored.request)?;
+    let local = PublicKey::parse(&identity.public_key_hex()?)?;
+    let source = observation
+        .handoff
+        .handoff
+        .source_attestation
+        .as_ref()
+        .context("original remote operation has no Project source checkpoint")?;
+    source.verify_signature()?;
+    proof.invocation.verify_signature()?;
+    observation.handoff.invocation.verify_signature()?;
+    let submission = &observation.handoff.invocation.payload;
+    ensure!(
+        source.issuer == local
+            && source.payload == observation.handoff.handoff.source_statement()?
+            && observation.handoff.invocation.issuer == local
+            && proof.invocation.payload.audience.device == DeviceId::from_key(&local)
+            && proof.invocation.payload.body_hash == ObjectHash::body(&proof.source_body)?
+            && proof.invocation.payload.operation_id == *operation
+            && submission.operation_id == *operation
+            && submission.device == DeviceId::from_key(&local)
+            && submission.presenter == DeviceId::from_key(&local)
+            && submission.actor
+                == Actor::Service(proof.invocation.payload.audience.service.clone())
+            && submission.resource == observation.handoff.handoff.execution_resource
+            && submission.audience == observation.handoff.handoff.execution_audience
+            && submission.action == Action::ExecutionSubmit
+            && submission.body_hash == ObjectHash::body(&observation.handoff.handoff)?,
+        "original remote checkpoint changed its local host, signed request or submission"
+    );
     let dispatch: crate::model::Event =
         serde_json::from_str(&observation.handoff.handoff.project_dispatch.canonical_body)?;
     ensure!(
-        dispatch.network_id == space
+        matches!(&dispatch.cause, EventCause::Invocation { admission } if admission == &proof)
+            && dispatch.network_id == space
             && dispatch.resource_id == proof.invocation.payload.resource.resource
             && dispatch.scope_id == stored.request.conversation_id
             && matches!(&dispatch.body, crate::model::EventBody::DispatchRecorded {operation_id,action,..}
@@ -229,6 +248,8 @@ impl Store {
         body: &Value,
         now_ms: u64,
     ) -> Result<(SignedExecutionHandoffResolution, bool)> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         ensure!(
             auth.action() == Action::OperationResolve
                 && matches!(auth.actor(), Actor::Account(_))
@@ -263,7 +284,7 @@ impl Store {
             self.policy = current;
             return Ok((saved.wire, false));
         }
-        let (stored, original) = check_original_in(&tx, &current, &observation)?;
+        let (stored, original) = check_original_in(&tx, identity, &observation)?;
         ensure!(
             stored.state == OperationState::Unknown,
             "only an unknown Project operation can be resolved"
@@ -275,6 +296,7 @@ impl Store {
                 && DeviceId::from_key(&PublicKey::of(&signer)) == auth.audience().device,
             "resolution targets another Project or local host"
         );
+        validate_operation_binding_from(&tx, &stored.request)?;
         dispatch.revalidate(&tx, &current, body, auth.audience(), now_ms)?;
         let admitted = consume_execution_dispatch_in(
             &tx, &current, auth, proof, transport, body, None, now_ms, dispatch,
@@ -371,6 +393,8 @@ impl Store {
         result: ResolutionResult<'_>,
         now_ms: u64,
     ) -> Result<OperationRecord> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let wire = result.wire();
         let account = &wire.resolution.account_admission;
         let space = account.invocation.payload.resource.space.as_str();
@@ -387,7 +411,7 @@ impl Store {
             pending.wire == *wire,
             "resolution acknowledgement changed its prepared request"
         );
-        let (stored, _) = check_original_in(&tx, &current, &wire.resolution.observation)?;
+        let (stored, _) = check_original_in(&tx, identity, &wire.resolution.observation)?;
         if let Some(previous) = &pending.result {
             ensure!(
                 previous == &wrapper,
@@ -410,6 +434,7 @@ impl Store {
             stored.state == OperationState::Unknown,
             "Project operation is no longer unknown"
         );
+        validate_operation_binding_from(&tx, &stored.request)?;
         let local = PublicKey::parse(&identity.public_key_hex()?)?;
         ensure!(
             DeviceId::from_key(&local) == account.invocation.payload.audience.device,
