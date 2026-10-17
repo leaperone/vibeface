@@ -588,11 +588,11 @@ impl PeerHub {
                 return Ok(());
             }
         };
-        if let Some(target) = &packet.body.target {
-            if let Err(error) = self.authorize(network, target).await {
-                tracing::debug!(%error, target, network, "dropping peer packet for an unknown member");
-                return Ok(());
-            }
+        if let Some(target) = &packet.body.target
+            && let Err(error) = self.authorize(network, target).await
+        {
+            tracing::debug!(%error, target, network, "dropping peer packet for an unknown member");
+            return Ok(());
         }
         verify_payload(
             &key,
@@ -989,7 +989,7 @@ mod tests {
         );
         let packet = sender.packet(
             &network,
-            Some(&known.node_id()?),
+            Some(known.node_id()?),
             Kind::Request,
             json!({"unknown":true}),
             None,
