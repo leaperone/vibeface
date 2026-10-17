@@ -85,6 +85,7 @@ pub(super) struct DockerIsolation {
     config: ExecutionIsolationConfig,
     data_dir: PathBuf,
     scopes: Arc<Mutex<BTreeMap<String, IsolatedScope>>>,
+    project_read_only: bool,
 }
 
 struct IsolatedScope {
@@ -95,7 +96,7 @@ struct IsolatedScope {
 }
 
 #[derive(Clone)]
-pub(super) struct IsolatedProcess {
+pub(crate) struct IsolatedProcess {
     config: ExecutionIsolationConfig,
     name: String,
     id: String,
@@ -109,11 +110,30 @@ impl DockerIsolation {
             config,
             data_dir,
             scopes: Arc::new(Mutex::new(BTreeMap::new())),
+            project_read_only: false,
         }
     }
 
     fn scope_key(context: &ExecutionContext) -> String {
         hash(&format!("{}\0{}", context.space_id, context.resource_id))
+    }
+
+    pub fn manager(config: ExecutionIsolationConfig, data_dir: PathBuf) -> Self {
+        Self {
+            project_read_only: true,
+            ..Self::new(config, data_dir)
+        }
+    }
+
+    fn key(&self, context: &ExecutionContext) -> String {
+        if self.project_read_only {
+            hash(&format!(
+                "manager\0{}\0{}",
+                context.space_id, context.resource_id
+            ))
+        } else {
+            Self::scope_key(context)
+        }
     }
 
     pub async fn prepare(
@@ -141,7 +161,7 @@ impl DockerIsolation {
         );
         let uid = crate::config::effective_uid();
         ensure!(uid != 0, "shared execution requires a non-root Node user");
-        let key = Self::scope_key(context);
+        let key = self.key(context);
         let node = hash(
             data_dir
                 .to_str()
@@ -230,12 +250,22 @@ impl DockerIsolation {
                     "--label",
                     &format!("vibeface.scope={key}"),
                     "--label",
+                    &format!("vibeface.project-read-only={}", self.project_read_only),
+                    "--label",
                     &format!(
                         "vibeface.project={}",
                         hash(project.to_str().context("project path must be UTF-8")?)
                     ),
                     "--mount",
-                    &bind_mount(&project, "/project")?,
+                    &format!(
+                        "{}{}",
+                        bind_mount(&project, "/project")?,
+                        if self.project_read_only {
+                            ",readonly"
+                        } else {
+                            ""
+                        }
+                    ),
                     "--mount",
                     &bind_mount(&home, CONTAINER_HOME)?,
                     "--mount",
@@ -299,7 +329,7 @@ impl DockerIsolation {
     ) -> Result<CodexClient> {
         let mut scopes = self.scopes.lock().await;
         let scope = scopes
-            .get_mut(&Self::scope_key(context))
+            .get_mut(&self.key(context))
             .context("isolated resource is not running")?;
         ensure!(
             !scope.stopped
@@ -334,20 +364,27 @@ impl DockerIsolation {
         Ok(scope.codex.as_ref().unwrap().clone())
     }
 
-    pub async fn existing_codex(&self, context: &ExecutionContext) -> Result<CodexClient> {
+    pub async fn existing_codex(
+        &self,
+        context: &ExecutionContext,
+    ) -> Result<(CodexClient, String)> {
         let scopes = self.scopes.lock().await;
         let scope = scopes
-            .get(&Self::scope_key(context))
+            .get(&self.key(context))
             .context("isolated resource is not connected; reconcile its original container")?;
-        ensure!(!scope.stopped, "isolated resource has been stopped");
-        scope
+        ensure!(
+            !scope.stopped && scope.operations.contains_key(&context.operation_id),
+            "isolated operation generation is no longer active"
+        );
+        let codex = scope
             .codex
             .clone()
-            .context("isolated Codex is not connected")
+            .context("isolated Codex is not connected")?;
+        Ok((codex, scope.handle.id.clone()))
     }
 
     pub async fn complete(&self, context: &ExecutionContext) -> Result<()> {
-        let key = Self::scope_key(context);
+        let key = self.key(context);
         let (name, id, expired) = {
             let mut scopes = self.scopes.lock().await;
             let Some(scope) = scopes.get_mut(&key) else {
@@ -391,7 +428,7 @@ impl DockerIsolation {
         validate_lease(expires_at_ms)?;
         let mut scopes = self.scopes.lock().await;
         let scope = scopes
-            .get_mut(&Self::scope_key(context))
+            .get_mut(&self.key(context))
             .context("isolated operation is not running")?;
         ensure!(!scope.stopped, "isolated resource was stopped");
         ensure!(
@@ -415,7 +452,7 @@ impl DockerIsolation {
 
     pub async fn affected(&self, context: &ExecutionContext) -> Vec<String> {
         let mut affected = BTreeSet::from([context.operation_id.clone()]);
-        if let Some(scope) = self.scopes.lock().await.get(&Self::scope_key(context)) {
+        if let Some(scope) = self.scopes.lock().await.get(&self.key(context)) {
             if scope.operations.contains_key(&context.operation_id) {
                 affected.extend(scope.operations.keys().cloned());
             }
@@ -424,7 +461,7 @@ impl DockerIsolation {
     }
 
     pub async fn cancel(&self, context: &ExecutionContext) -> Result<Vec<String>> {
-        let key = Self::scope_key(context);
+        let key = self.key(context);
         let mut scopes = self.scopes.lock().await;
         let node = hash(
             self.data_dir
@@ -535,6 +572,8 @@ impl DockerIsolation {
         ensure!(
             container["Config"]["Labels"]["vibeface.node"] == node
                 && container["Config"]["Labels"]["vibeface.scope"] == key
+                && container["Config"]["Labels"]["vibeface.project-read-only"]
+                    == self.project_read_only.to_string()
                 && container["Config"]["Labels"]["vibeface.project"]
                     == hash(project.to_str().context("project path must be UTF-8")?),
             "isolated container belongs to a different Node, space or project"
@@ -587,7 +626,8 @@ impl DockerIsolation {
             mounts.len() == 3
                 && mounts.iter().all(|mount| mount["Type"] == "bind"
                     && ((mount["Destination"] == "/project"
-                        && mount["Source"] == project.to_string_lossy().as_ref())
+                        && mount["Source"] == project.to_string_lossy().as_ref()
+                        && mount["RW"] == !self.project_read_only)
                         || (mount["Destination"] == CONTAINER_HOME
                             && mount["Source"] == home.to_string_lossy().as_ref())
                         || (mount["Destination"] == "/run/vibeface-control"
@@ -1143,6 +1183,51 @@ mod tests {
         outcome?;
         cleaned?;
         Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the isolation fixture image and local Docker daemon"]
+    async fn manager_and_executor_use_distinct_home_and_project_permissions() -> Result<()> {
+        let root = PathBuf::from(std::env::var("VIBEFACE_ISOLATION_TEST_ROOT")?)
+            .join(uuid::Uuid::new_v4().to_string());
+        let data = root.join("node");
+        let project = root.join("project");
+        crate::config::private_dir(&data)?;
+        std::fs::create_dir(&project)?;
+        let settings = ExecutionIsolationConfig {
+            image: std::env::var("VIBEFACE_ISOLATION_TEST_IMAGE")?,
+            docker_bin: std::env::var("VIBEFACE_ISOLATION_TEST_DOCKER")?.into(),
+            egress: None,
+        };
+        let executor = DockerIsolation::new(settings.clone(), data.clone());
+        let manager = DockerIsolation::manager(settings, data);
+        let context = ExecutionContext {
+            space_id: SpaceId::parse(&format!("spc2_{}", "a".repeat(64)))?,
+            resource_id: ResourceId::parse(&format!("res2_{}", "b".repeat(64)))?,
+            operation_id: "distinct-manager-executor".into(),
+            shared: true,
+            lease_expires_at_ms: vibeface_protocol::now_ms() + 30_000,
+        };
+        let result = async {
+            let writable = executor.prepare(&context, &project).await?;
+            let readonly = manager.prepare(&context, &project).await?;
+            ensure!(writable.id != readonly.id && writable.name != readonly.name, "Manager reused executor generation");
+            let mut write = writable.command("node");
+            write.args(["-e", "require('node:fs').writeFileSync('/home/vibeface/executor-private','private');require('node:fs').writeFileSync('/project/executor-visible','visible')"]);
+            checked_output(write, "write executor positive controls").await?;
+            let mut check = readonly.command("node");
+            check.args(["-e", "const fs=require('node:fs');if(fs.existsSync('/home/vibeface/executor-private')||fs.readFileSync('/project/executor-visible','utf8')!=='visible')process.exit(1);try{fs.writeFileSync('/project/manager-unsafe','unsafe');process.exit(2)}catch{};fs.writeFileSync('/home/vibeface/manager-private','private')"]);
+            checked_output(check, "verify distinct Manager HOME and project read-only mount").await?;
+            let mut reverse = writable.command("node");
+            reverse.args(["-e", "if(require('node:fs').existsSync('/home/vibeface/manager-private'))process.exit(1)"]);
+            checked_output(reverse, "verify executor cannot read Manager HOME").await?;
+            println!("manager-executor-proof={}", serde_json::json!({"same_space_resource":true,"distinct_container_ids":true,"distinct_homes":true,"executor_project_write_positive":true,"manager_project_read_positive":true,"manager_project_write_denied":true}));
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        let _ = executor.complete(&context).await;
+        let _ = manager.complete(&context).await;
+        std::fs::remove_dir_all(root)?;
+        result
     }
 
     #[tokio::test]

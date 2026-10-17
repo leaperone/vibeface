@@ -1,4 +1,8 @@
-import { access, constants, stat } from "node:fs/promises";
+#!/usr/bin/env node
+import { access, chmod, constants, stat, unlink } from "node:fs/promises";
+import { createConnection, createServer } from "node:net";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Codex } from "@openai/codex-sdk";
 
@@ -9,18 +13,7 @@ const MAX_EVENT_BYTES = 65_536;
 const MAX_STREAM_BYTES = 16_777_216;
 const MAX_ID_BYTES = 256;
 const MAX_MODEL_BYTES = 256;
-const MAX_ENV = 64;
-const MAX_ENV_VALUE_BYTES = 4_096;
 const ID_PATTERN = /^[^\u0000-\u001f\u007f\r\n]{1,256}$/;
-const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,255}$/;
-const RESERVED_TOOL_ENV = new Set([
-  "CODEX_HOME",
-  "CODEX_API_KEY",
-  "HOME",
-  "PATH",
-  "OPENAI_API_KEY",
-  "OPENAI_BASE_URL",
-]);
 
 const INIT_FIELDS = new Set([
   "type",
@@ -29,8 +22,7 @@ const INIT_FIELDS = new Set([
   "cwd",
   "model",
   "codex_path",
-  "tool_cli",
-  "tool_env",
+  "tools",
 ]);
 
 class ProtocolError extends Error {
@@ -79,23 +71,6 @@ function rejectUnknownFields(value, allowed, name) {
   }
 }
 
-function validateEnv(env, name) {
-  if (env === undefined) return {};
-  if (!isObject(env) || Object.keys(env).length > MAX_ENV) {
-    throw new ProtocolError(`${name} must contain at most ${MAX_ENV} entries`);
-  }
-  const result = {};
-  for (const [key, value] of Object.entries(env)) {
-    if (!ENV_KEY_PATTERN.test(key) || RESERVED_TOOL_ENV.has(key)) {
-      throw new ProtocolError(`${name} contains an invalid or reserved key`);
-    }
-    if (typeof value !== "string" || bytes(value) > MAX_ENV_VALUE_BYTES || value.includes("\0")) {
-      throw new ProtocolError(`${name}.${key} is invalid`);
-    }
-    result[key] = value;
-  }
-  return result;
-}
 
 async function validateExecutable(value, name) {
   const executable = requireAbsolutePath(value, name);
@@ -130,16 +105,17 @@ function validateInit(value) {
   const model = value.model === undefined || value.model === null || value.model === ""
     ? undefined
     : requireString(value.model, "model", MAX_MODEL_BYTES);
-  const toolCli = value.tool_cli === undefined || value.tool_cli === null ? undefined : value.tool_cli;
-  if (toolCli !== undefined) requireAbsolutePath(toolCli, "tool_cli");
+  if (!Array.isArray(value.tools) || value.tools.length > 32 || value.tools.some((name) => typeof name !== "string" || !/^[a-z][a-z0-9_]{0,127}$/.test(name)) || new Set(value.tools).size !== value.tools.length) {
+    throw new ProtocolError("tools must be a bounded unique catalog");
+  }
+
   return {
     prompt,
     sessionId,
     cwd: value.cwd,
     model,
     codexPath: value.codex_path,
-    toolCli,
-    toolEnv: validateEnv(value.tool_env, "tool_env"),
+    tools: value.tools,
   };
 }
 
@@ -188,7 +164,6 @@ function closeInput() {
 function sdkConfig() {
   return {
     approval_policy: "never",
-    default_permissions: "vibeface_manager",
     web_search: "disabled",
     check_for_update_on_startup: false,
     analytics: { enabled: false },
@@ -201,7 +176,7 @@ function sdkConfig() {
     shell_environment_policy: {
       inherit: "all",
       ignore_default_excludes: true,
-      include_only: ["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "VIBEFACE_NODE_URL", "VIBEFACE_TOOL_TOKEN", "VIBEFACE_NODE_CONVERSATION", "VIBEFACE_NODE_NETWORK"],
+      include_only: ["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "VIBEFACE_MANAGER_TOOL_SOCKET"],
     },
     mcp_servers: {},
     features: {
@@ -235,34 +210,12 @@ function sdkConfig() {
   };
 }
 
-function childEnvironment(input) {
-  const allowed = [
-    "CODEX_HOME",
-    "CODEX_API_KEY",
-    "HOME",
-    "PATH",
-    "LANG",
-    "LC_ALL",
-    "TMPDIR",
-    "OPENAI_API_KEY",
-    "OPENAI_BASE_URL",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-    "no_proxy",
-  ];
+function childEnvironment(socket) {
   const env = {};
-  const providerKeys = JSON.parse(process.env.VIBEFACE_CODEX_PROVIDER_ENV_KEYS || "[]");
-  if (!Array.isArray(providerKeys) || providerKeys.length > MAX_ENV || providerKeys.some((key) => typeof key !== "string" || !ENV_KEY_PATTERN.test(key))) throw new ProtocolError("invalid provider environment key list");
-  allowed.push(...providerKeys);
-  for (const key of allowed) {
+  for (const key of ["CODEX_HOME", "HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "OPENAI_API_KEY", "OPENAI_BASE_URL"]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
-  for (const [key, value] of Object.entries(input.toolEnv)) env[key] = value;
+  if (socket !== undefined) env.VIBEFACE_MANAGER_TOOL_SOCKET = socket;
   return env;
 }
 
@@ -279,7 +232,7 @@ function managerPrompt(prompt, toolCli) {
     ["update_task", { task_id: "existing-id", status: "working", detail: "progress" }, "Record progress. status is open, working, blocked or needs_review. Only the human may accept or cancel tasks."],
   ];
   const catalog = tools.map(([name, args, description]) => `${name} ${JSON.stringify(args)}\n${description}`).join("\n\n");
-  const result = `Node tool access is available through your command-execution tool. Run this executable with a tool name and one shell-quoted JSON object:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor example, run ${executable} tool nodes --json '{}'. The CLI reads its scoped loopback connection from the existing environment and prints a JSON result. Do not read or print credential variables. Use these Node tools to manage tasks and execution; do not use MCP, edit project files or launch executors directly. Conversation and network scope are supplied by the CLI. Use the real results and report errors instead of claiming a failed call succeeded.\n\nAvailable tool arguments and meanings follow. Replace example values with the requested values.\n${catalog}\n\n${prompt}`;
+  const result = `Node tool access is available through your command-execution tool. Run this executable with a tool name and one shell-quoted JSON object:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor example, run ${executable} tool nodes --json '{}'. The CLI uses the private local tool channel and prints a JSON result. The Node callback credentials remain outside this process. Use these Node tools to manage tasks and execution; do not use MCP, edit project files or launch executors directly. Conversation and network scope are supplied by the CLI. Use the real results and report errors instead of claiming a failed call succeeded.\n\nAvailable tool arguments and meanings follow. Replace example values with the requested values.\n${catalog}\n\n${prompt}`;
   if (bytes(result) > MAX_PROMPT_BYTES) throw new ProtocolError("management prompt with Node tool instructions exceeded the size limit");
   return result;
 }
@@ -313,8 +266,69 @@ async function readFrame(reader) {
     throw new ProtocolError("sidecar input was not valid JSON");
   }
 }
+async function toolCommand(args) {
+  if (args.length !== 3 || args[1] !== "--json" || !/^[a-z][a-z0-9_]{0,127}$/.test(args[0])) throw new ProtocolError("invalid tool command");
+  const argumentsValue = JSON.parse(args[2]);
+  if (!isObject(argumentsValue) || bytes(args[2]) > MAX_PROMPT_BYTES) throw new ProtocolError("invalid tool arguments");
+  const socketPath = process.env.VIBEFACE_MANAGER_TOOL_SOCKET;
+  if (typeof socketPath !== "string" || !socketPath.startsWith("/tmp/vibeface-manager-tools-")) throw new ProtocolError("private tool channel missing");
+  const socket = createConnection(socketPath);
+  socket.setTimeout(10_000, () => socket.destroy(new Error("tool channel timeout")));
+  const connected = new Promise((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+  await connected;
+  socket.write(`${JSON.stringify({ name: args[0], arguments: argumentsValue })}\n`);
+  const result = await readFrame(frameReader(socket));
+  socket.destroy();
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+}
 
-function startControlPump(reader, controller) {
+async function startToolChannel(catalog) {
+  const pending = new Map();
+  if (catalog.length === 0) return { path: undefined, respond() { throw new ProtocolError("unexpected tool response"); }, close() {} };
+  const socketPath = `/tmp/vibeface-manager-tools-${process.pid}-${randomUUID()}.sock`;
+  let closed = false;
+  let connections = 0;
+  const server = createServer((socket) => {
+    if (connections >= 16) { socket.destroy(); return; }
+    connections += 1;
+    socket.setTimeout(10_000, () => socket.destroy());
+    socket.once("close", () => { connections -= 1; });
+    void (async () => {
+      const request = await readFrame(frameReader(socket));
+      rejectUnknownFields(request, new Set(["name", "arguments"]), "tool request");
+      if (closed || !catalog.includes(request.name) || !isObject(request.arguments) || pending.size >= 16) throw new ProtocolError("tool outside catalog");
+      const callId = randomUUID();
+      const timeout = setTimeout(() => { pending.delete(callId); socket.destroy(); }, 10_000);
+      socket.once("close", () => { clearTimeout(timeout); pending.delete(callId); });
+      pending.set(callId, { socket, timeout });
+      write({ type: "tool_call", call_id: callId, name: request.name, arguments: request.arguments });
+    })().catch(() => socket.destroy());
+  });
+  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(socketPath, resolve); });
+  await chmod(socketPath, 0o600);
+  return {
+    path: socketPath,
+    respond(id, result) {
+      const request = pending.get(id);
+      if (!request) throw new ProtocolError("tool response has no pending request");
+      pending.delete(id);
+      clearTimeout(request.timeout);
+      const frame = JSON.stringify(result);
+      if (bytes(frame) > MAX_FRAME_BYTES) throw new ProtocolError("tool result too large");
+      request.socket.end(`${frame}\n`);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      for (const request of pending.values()) { clearTimeout(request.timeout); request.socket.destroy(); }
+      pending.clear();
+      server.close();
+      void unlink(socketPath).catch(() => {});
+    },
+  };
+}
+
+function startControlPump(reader, controller, tools) {
   let pendingSessionAck = null;
   const queuedSessionAcks = [];
   let closed = false;
@@ -338,6 +352,11 @@ function startControlPump(reader, controller) {
           pendingSessionAck = null;
           continue;
         }
+        if (isObject(frame) && frame.type === "tool_result") {
+          rejectUnknownFields(frame, new Set(["type", "call_id", "result"]), "tool result");
+          tools.respond(requireId(frame.call_id, "call_id"), frame.result);
+          continue;
+        }
         if (isObject(frame) && frame.type === "cancel" && Object.keys(frame).every((key) => ["type", "session_id"].includes(key))) {
           throw new ProtocolError("Codex execution cancelled");
         }
@@ -347,6 +366,7 @@ function startControlPump(reader, controller) {
       closed = true;
       rejectPending(error);
       controller.abort();
+      tools.close();
     }
   })();
   return {
@@ -368,103 +388,108 @@ function startControlPump(reader, controller) {
 async function run(input, reader, secrets) {
   const cwd = await validateCwd(input.cwd);
   const codexPath = await validateExecutable(input.codexPath, "codex_path");
-  const toolCli = input.toolCli === undefined ? undefined : await validateExecutable(input.toolCli, "tool_cli");
-  const prompt = managerPrompt(input.prompt, toolCli);
+  const toolCli = input.tools.length === 0 ? undefined : fileURLToPath(import.meta.url);
+  const tools = await startToolChannel(input.tools);
+  try {
+    const prompt = managerPrompt(input.prompt, toolCli);
 
-  const codex = new Codex({
-    codexPathOverride: codexPath,
-    config: sdkConfig(),
-    configOverrides: [
-      'permissions.vibeface_manager.filesystem={":root"="read"}',
-      'permissions.vibeface_manager.network={enabled=true,allow_local_binding=true,mode="limited",domains={"127.0.0.1"="allow","localhost"="allow"}}',
-    ],
-    env: childEnvironment(input),
-  });
-  const threadOptions = {
-    model: input.model,
-    threadSource: "vibeface-manager",
-    workingDirectory: cwd,
-    skipGitRepoCheck: true,
-    approvalPolicy: "never",
-    webSearchMode: "disabled",
-  };
-  const thread = input.sessionId === null
-    ? codex.startThread(threadOptions)
-    : codex.resumeThread(input.sessionId, threadOptions);
+    const codex = new Codex({
+      codexPathOverride: codexPath,
+      config: sdkConfig(),
+      baseUrl: process.env.OPENAI_BASE_URL,
+      apiKey: process.env.OPENAI_API_KEY,
+      env: childEnvironment(tools.path),
+    });
+    const threadOptions = {
+      model: input.model,
+      threadSource: "vibeface-manager",
+      workingDirectory: cwd,
+      skipGitRepoCheck: true,
+      approvalPolicy: "never",
+      sandboxMode: "read-only",
+      networkAccessEnabled: false,
+      webSearchMode: "disabled",
+    };
+    const thread = input.sessionId === null
+      ? codex.startThread(threadOptions)
+      : codex.resumeThread(input.sessionId, threadOptions);
 
-  write({ type: "ready", session_id: input.sessionId, protocol: 1 });
-  const ack = await readFrame(reader);
-  if (!isObject(ack) || ack.type !== "ack" || (ack.session_id ?? null) !== input.sessionId || Object.keys(ack).some((key) => !["type", "session_id"].includes(key))) {
-    throw new ProtocolError("expected an ACK for the confirmed session");
-  }
+    write({ type: "ready", session_id: input.sessionId, protocol: 1 });
+    const ack = await readFrame(reader);
+    if (!isObject(ack) || ack.type !== "ack" || (ack.session_id ?? null) !== input.sessionId || Object.keys(ack).some((key) => !["type", "session_id"].includes(key))) {
+      throw new ProtocolError("expected an ACK for the confirmed session");
+    }
 
-  const controller = new AbortController();
-  const onSignal = () => controller.abort();
-  process.once("SIGTERM", onSignal);
-  process.once("SIGINT", onSignal);
-  const control = startControlPump(reader, controller);
-  const streamed = await thread.runStreamed(prompt, { signal: controller.signal });
-  let finalResponse = "";
-  let usage = null;
-  let turnCompleted = false;
-  let nativeSessionId = input.sessionId;
-  let streamBytes = 0;
-  for await (const rawEvent of streamed.events) {
-    const event = redact(rawEvent, secrets);
-    if (event?.type === "thread.started") {
-      const observed = requireId(event.thread_id, "thread_id");
-      if (nativeSessionId !== null && observed !== nativeSessionId) {
-        throw new ProtocolError("Codex resumed a different native session");
+    const controller = new AbortController();
+    const onSignal = () => controller.abort();
+    process.once("SIGTERM", onSignal);
+    process.once("SIGINT", onSignal);
+    const control = startControlPump(reader, controller, tools);
+    const streamed = await thread.runStreamed(prompt, { signal: controller.signal });
+    let finalResponse = "";
+    let usage = null;
+    let turnCompleted = false;
+    let nativeSessionId = input.sessionId;
+    let streamBytes = 0;
+    for await (const rawEvent of streamed.events) {
+      const event = redact(rawEvent, secrets);
+      if (event?.type === "thread.started") {
+        const observed = requireId(event.thread_id, "thread_id");
+        if (nativeSessionId !== null && observed !== nativeSessionId) {
+          throw new ProtocolError("Codex resumed a different native session");
+        }
+        if (nativeSessionId === null) {
+          nativeSessionId = observed;
+          const sessionAck = control.waitSessionAck(observed);
+          write({ type: "session", session_id: observed });
+          await sessionAck;
+        }
       }
-      if (nativeSessionId === null) {
-        nativeSessionId = observed;
-        const sessionAck = control.waitSessionAck(observed);
-        write({ type: "session", session_id: observed });
-        await sessionAck;
+      if (event?.type === "item.completed" && event.item?.type === "agent_message") {
+        finalResponse = event.item.text ?? "";
       }
+      if (event?.type === "turn.completed") {
+        usage = event.usage ?? null;
+        turnCompleted = true;
+      }
+      const message = { type: "event", event: bounded(event, MAX_EVENT_BYTES) };
+      streamBytes += bytes(JSON.stringify(message));
+      if (streamBytes > MAX_STREAM_BYTES) throw new ProtocolError("sidecar output stream exceeded the size limit");
+      write(message);
+      if (event?.type === "turn.failed") throw new Error(event.error?.message || "Codex turn failed");
     }
-    if (event?.type === "item.completed" && event.item?.type === "agent_message") {
-      finalResponse = event.item.text ?? "";
-    }
-    if (event?.type === "turn.completed") {
-      usage = event.usage ?? null;
-      turnCompleted = true;
-    }
-    const message = { type: "event", event: bounded(event, MAX_EVENT_BYTES) };
-    streamBytes += bytes(JSON.stringify(message));
-    if (streamBytes > MAX_STREAM_BYTES) throw new ProtocolError("sidecar output stream exceeded the size limit");
-    write(message);
-    if (event?.type === "turn.failed") throw new Error(event.error?.message || "Codex turn failed");
-  }
-  if (!turnCompleted) throw new Error("Codex stream ended without turn.completed");
-  if (nativeSessionId === null) throw new Error("Codex stream ended without a native session ID");
-  if (bytes(finalResponse) > MAX_RESULT_BYTES) throw new ProtocolError("Codex final response exceeded the size limit");
-  write({ type: "result", session_id: nativeSessionId, final_response: redactString(finalResponse, secrets), usage: bounded(redact(usage, secrets), MAX_EVENT_BYTES) });
-  controller.abort();
-  process.removeListener("SIGTERM", onSignal);
-  process.removeListener("SIGINT", onSignal);
-  void control.task;
-  closeInput();
+    if (!turnCompleted) throw new Error("Codex stream ended without turn.completed");
+    if (nativeSessionId === null) throw new Error("Codex stream ended without a native session ID");
+    if (bytes(finalResponse) > MAX_RESULT_BYTES) throw new ProtocolError("Codex final response exceeded the size limit");
+    write({ type: "result", session_id: nativeSessionId, final_response: redactString(finalResponse, secrets), usage: bounded(redact(usage, secrets), MAX_EVENT_BYTES) });
+    controller.abort();
+    tools.close();
+    process.removeListener("SIGTERM", onSignal);
+    process.removeListener("SIGINT", onSignal);
+    void control.task;
+    closeInput();
+  } finally { tools.close(); }
 }
 
-const reader = frameReader(process.stdin);
-let outputSecrets = [];
-try {
-  const input = validateInit(await readFrame(reader));
-  outputSecrets = [
-    ...Object.values(input.toolEnv),
-    process.env.CODEX_API_KEY,
-    process.env.OPENAI_API_KEY,
-    ...Object.entries(process.env).filter(([key]) => /(?:_KEY|_TOKEN|_SECRET|_PASSWORD)$/.test(key)).map(([, value]) => value),
-  ].filter((value) => typeof value === "string");
-  await run(input, reader, outputSecrets);
-} catch (error) {
-  const message = error instanceof Error ? error.message : "Codex SDK sidecar failed";
+async function main() {
+  const reader = frameReader(process.stdin);
+  let outputSecrets = [];
   try {
-    write({ type: "error", message: redactString(message, outputSecrets), uncertain: true });
-  } catch {
-    process.stderr.write(`${redactString(message, outputSecrets)}\n`);
+    const input = validateInit(await readFrame(reader));
+    outputSecrets = [process.env.OPENAI_API_KEY].filter((value) => typeof value === "string");
+    await run(input, reader, outputSecrets);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Codex SDK sidecar failed";
+    try { write({ type: "error", message: redactString(message, outputSecrets), uncertain: true }); }
+    catch { process.stderr.write(`${redactString(message, outputSecrets)}\n`); }
+    closeInput();
+    process.exitCode = 1;
   }
-  closeInput();
-  process.exitCode = 1;
+}
+
+if (process.argv[2] === "tool") {
+  try { await toolCommand(process.argv.slice(3)); }
+  catch { process.stderr.write("Node tool rejected or unavailable\n"); process.exitCode = 1; }
+} else {
+  await main();
 }
