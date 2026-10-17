@@ -1432,21 +1432,14 @@ impl Store {
             revision.unwrap_or(0) == request.expected_revision,
             "stale execution session revision"
         );
-        let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE space_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"') AND (?=0 OR control=1))",params![network_id,request.target_node,request.session_id,control],|r|r.get(0))?;
-        ensure!(!busy, "execution session has an unresolved operation");
-        {
-            let mut statement =
-                tx.prepare("SELECT resource FROM resource_reservations WHERE target_node=?")?;
-            let existing =
-                statement.query_map(params![request.target_node], |r| r.get::<_, String>(0))?;
-            for row in existing {
-                let existing = row?;
-                ensure!(
-                    !resources.iter().any(|r| paths_overlap(r, &existing)),
-                    "resource overlaps an unresolved operation on this device"
-                );
-            }
-        }
+        check_execution_session_in(
+            &tx,
+            network_id,
+            &request.target_node,
+            &request.session_id,
+            control,
+        )?;
+        check_execution_resources_in(&tx, &request.target_node, &resources)?;
         tx.execute("INSERT INTO operations(space_id,operation_id,target_node,session_id,request,state,control,result) VALUES(?,?,?,?,?,'\"accepted\"',?,'null')",params![network_id,request.operation_id,request.target_node,request.session_id,encoded,control])?;
         for resource in resources {
             tx.execute("INSERT INTO resource_reservations(space_id,operation_id,target_node,resource) VALUES(?,?,?,?)",params![network_id,request.operation_id,request.target_node,resource])?;
@@ -2239,6 +2232,41 @@ pub(crate) fn paths_overlap(left: &str, right: &str) -> bool {
     let left = Path::new(left);
     let right = Path::new(right);
     left.starts_with(right) || right.starts_with(left)
+}
+pub(crate) fn check_execution_resources_in(
+    connection: &Connection,
+    target: &str,
+    resources: &[String],
+) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT resource FROM resource_reservations WHERE target_node=?1 UNION ALL SELECT resource FROM execution_handoff_reservations WHERE target_node=?1",
+    )?;
+    let existing = statement.query_map([target], |row| row.get::<_, String>(0))?;
+    for resource in existing {
+        let resource = resource?;
+        ensure!(
+            !resources
+                .iter()
+                .any(|requested| paths_overlap(requested, &resource)),
+            "resource overlaps an unresolved operation on this device"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn check_execution_session_in(
+    connection: &Connection,
+    original_space: &str,
+    target: &str,
+    session: &str,
+    control: bool,
+) -> Result<()> {
+    let busy: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM operations WHERE space_id=?1 AND target_node=?2 AND session_id=?3 AND state IN ('\"accepted\"','\"running\"','\"unknown\"') AND (?4=0 OR control=1) UNION ALL SELECT 1 FROM execution_handoffs WHERE original_space_id=?1 AND target_node=?2 AND session_id=?3 AND state IN ('accepted','running','unknown') AND (?4=0 OR control=1))",
+        params![original_space,target,session,control], |row| row.get(0),
+    )?;
+    ensure!(!busy, "execution session has an unresolved operation");
+    Ok(())
 }
 fn validate_day(day: &str) -> Result<()> {
     ensure!(

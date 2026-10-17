@@ -1623,21 +1623,14 @@ impl Store {
                 "execution directory is not reserved"
             );
         }
-        let busy: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations WHERE space_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"') AND (?=0 OR control=1))",
-            params![request.network_id, request.target_node, request.session_id, control], |row| row.get(0),
+        crate::store::check_execution_session_in(
+            &tx,
+            &request.network_id,
+            &request.target_node,
+            &request.session_id,
+            control,
         )?;
-        ensure!(!busy, "execution session has an unresolved operation");
-        let reserved = tx
-            .prepare("SELECT resource FROM resource_reservations WHERE target_node=?")?
-            .query_map([&request.target_node], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        ensure!(
-            !resources.iter().any(|resource| reserved
-                .iter()
-                .any(|existing| paths_overlap(resource, existing))),
-            "resource overlaps an unresolved operation on this device"
-        );
+        crate::store::check_execution_resources_in(&tx, &request.target_node, &resources)?;
         let admission = consume_authorization_in(
             &tx,
             &self.policy,
