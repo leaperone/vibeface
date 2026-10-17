@@ -1,6 +1,6 @@
 use crate::{
     crypto::{LocalIdentity, digest, verify_signed_event},
-    identity::{GovernanceAction, IdentityKind, NetworkState},
+    identity::NetworkState,
     model::*,
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -89,19 +89,7 @@ impl Store {
             return Ok(false);
         }
         tx.execute("INSERT INTO networks(network_id,revision,bundle) VALUES(?,?,?) ON CONFLICT(network_id) DO UPDATE SET revision=excluded.revision,bundle=excluded.bundle",params![network_id,merged.epoch(),encoded])?;
-        let mut historical = merged.genesis.initial_members.clone();
-        if let Some(checkpoint) = &merged.checkpoint {
-            historical.extend(checkpoint.members.clone());
-        }
-        for event in &merged.events {
-            if let GovernanceAction::Grant { member } = &event.action {
-                historical.push(member.clone());
-            }
-        }
-        for member in historical
-            .into_iter()
-            .filter(|member| member.kind == IdentityKind::Node)
-        {
+        for member in merged.historical_nodes()? {
             let old: Option<String> = tx
                 .query_row(
                     "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
@@ -2551,6 +2539,65 @@ mod tests {
         assert!(store.claim_operation(&network, "steer").is_err());
         Ok(())
     }
+    #[test]
+    fn root_recovery_preserves_revoked_authors_without_restoring_authority() -> Result<()> {
+        use crate::identity::{Genesis, GovernanceEvent, Member, NetworkState, RootCheckpoint};
+        let root = LocalIdentity::generate();
+        let admin = LocalIdentity::generate();
+        let current = LocalIdentity::generate();
+        let retired = LocalIdentity::generate();
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            vec![
+                Member::client(&admin, "admin", true)?,
+                Member::node(&current, "current", roles())?,
+            ],
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::node(&retired, "retired", roles())?,
+        )?)?;
+        state.append(GovernanceEvent::revoke(
+            &admin,
+            &state.project()?,
+            &retired.node_id()?,
+        )?)?;
+        let event = retired.sign_event(Event {
+            version: WIRE_VERSION,
+            network_id: root.network_id()?,
+            scope_id: "archive".into(),
+            author: retired.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 0,
+            body: EventBody::ConversationCreated {
+                title: "retired author".into(),
+            },
+            blobs: vec![],
+        })?;
+        let members = state
+            .project()?
+            .members
+            .into_iter()
+            .filter(|member| member.subject_id != retired.node_id().unwrap())
+            .collect();
+        let checkpoint =
+            RootCheckpoint::create_with_history(&root, 2, members, state.historical_nodes()?)?;
+        state.recover(checkpoint)?;
+        let network = root.network_id()?;
+        let mut fresh = Store::open(":memory:")?;
+        fresh.install_trust_bundle(&network, &state)?;
+        assert_eq!(fresh.ingest_event(&network, &event)?.status, "ready");
+        assert!(
+            fresh
+                .authorize_node(&network, &retired.node_id()?, None)
+                .is_err()
+        );
+        Ok(())
+    }
+
     #[test]
     fn management_clients_cannot_author_business_dag_events() -> Result<()> {
         let root = LocalIdentity::generate();
