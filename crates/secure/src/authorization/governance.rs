@@ -1148,6 +1148,8 @@ impl PreparedTeamCreation {
         json(&TeamRecoveryMaterial {
             status: "pending",
             pending_request: Some(&self.request),
+            source_pins: Some(&self.pins),
+            source_bundle: Some(&self.bundle),
             format: "vibeface-team-recovery",
             version: AUTH_VERSION,
             root_secret_hex: &self.root_secret_hex,
@@ -1207,6 +1209,8 @@ pub fn accept_team_creation(
 struct TeamRecoveryMaterial<'a> {
     status: &'static str,
     pending_request: Option<&'a Signed<TeamCreationRequest>>,
+    source_pins: Option<&'a [PolicyPin]>,
+    source_bundle: Option<&'a ClientAuthorizationBundle>,
     format: &'static str,
     version: u16,
     root_secret_hex: &'a str,
@@ -1216,6 +1220,97 @@ struct TeamRecoveryMaterial<'a> {
     pins: &'a [PolicyPin],
     bundle: &'a ClientAuthorizationBundle,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingTeamRecoveryMaterial {
+    status: String,
+    pending_request: Signed<TeamCreationRequest>,
+    source_pins: Vec<PolicyPin>,
+    source_bundle: ClientAuthorizationBundle,
+    format: String,
+    version: u16,
+    root_secret_hex: String,
+    owner_account: AccountId,
+    team: SpaceId,
+    recovery_public_key: PublicKey,
+    pins: Vec<PolicyPin>,
+    bundle: ClientAuthorizationBundle,
+}
+impl Drop for PendingTeamRecoveryMaterial {
+    fn drop(&mut self) {
+        self.root_secret_hex.zeroize();
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = restorePreparedTeamCreation))]
+pub fn restore_prepared_team_creation(
+    material_json: &str,
+    client: &Identity,
+    independently_saved_pins_json: &str,
+    current_bundle_json: &str,
+    now_ms: f64,
+) -> crate::Result<PreparedTeamCreation> {
+    let restore = || -> Result<_> {
+        let now = time(now_ms)?;
+        let material: PendingTeamRecoveryMaterial = parse(material_json)?;
+        let (current, saved, _) = load(independently_saved_pins_json, current_bundle_json)?;
+        let request = &material.pending_request.payload;
+        let root = Identity::from_secret_hex(&material.root_secret_hex)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid pending team root"))?;
+        require(
+            material.status == "pending"
+                && material.format == "vibeface-team-recovery"
+                && material.version == AUTH_VERSION
+                && material.owner_account == request.owner_account
+                && material.team == request.team_project.space
+                && PublicKey::of(&root) == request.team_pin.genesis_root
+                && PublicKey::of(client) == request.governor_device_public_key
+                && request.issued_at_ms <= now
+                && material.source_pins.iter().all(|pin| {
+                    saved.iter().any(|trusted| {
+                        trusted.domain == pin.domain && trusted.genesis_root == pin.genesis_root
+                    })
+                })
+                && request
+                    .expected_heads
+                    .iter()
+                    .all(|head| current.roots.contains_key(head)),
+            "pending team differs from independently saved account trust",
+        )?;
+        current.verify_account_client_device(
+            &request.owner_account,
+            &DeviceId::from_key(&PublicKey::of(client)),
+            now,
+        )?;
+        let before = replay_policies(&material.source_pins, &material.source_bundle.journal)?;
+        let verified = verify_team_creation_request(
+            &before,
+            &material.source_bundle,
+            &material.source_pins,
+            &material.pending_request,
+            request.issued_at_ms,
+        )?;
+        let Some(JournalEntry::SpaceGenesis(genesis)) = request.journal_delta.first() else {
+            return Err(AuthorizationError::InvalidProof(
+                "missing pending team genesis",
+            ));
+        };
+        require(
+            material.pins == verified.pins
+                && material.bundle == verified.bundle
+                && genesis.payload.recovery.keys == [material.recovery_public_key.clone()],
+            "pending team backup changed its exact signed request or history",
+        )?;
+        Ok(PreparedTeamCreation {
+            request: material.pending_request.clone(),
+            pins: material.source_pins.clone(),
+            bundle: material.source_bundle.clone(),
+            root_secret_hex: material.root_secret_hex.clone(),
+        })
+    };
+    restore().map_err(|error| error.to_string())
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct VerifiedTeamCreation {
     pins: Vec<PolicyPin>,
@@ -1287,6 +1382,8 @@ pub fn finish_team_creation(
     let recovery_material = json(&TeamRecoveryMaterial {
         status: "committed",
         pending_request: None,
+        source_pins: None,
+        source_bundle: None,
         format: "vibeface-team-recovery",
         version: AUTH_VERSION,
         root_secret_hex: &prepared.root_secret_hex,
@@ -1418,6 +1515,52 @@ mod tests {
             let pending = prepared.recovery_material_json().unwrap();
             let pending_value: serde_json::Value = parse(&pending).unwrap();
             assert_eq!(pending_value["status"], "pending");
+            let restored = restore_prepared_team_creation(
+                &pending,
+                &key(3),
+                &self.pins_json(),
+                &self.bundle_json(),
+                (NOW + INVOCATION_MAX_AGE_MS + 1) as f64,
+            )
+            .unwrap();
+            assert_eq!(
+                restored.request_json().unwrap(),
+                prepared.request_json().unwrap()
+            );
+            assert_eq!(
+                finish_team_creation(&restored, &acceptance, NOW as f64)
+                    .unwrap()
+                    .pins_json()
+                    .unwrap(),
+                finish_team_creation(&prepared, &acceptance, NOW as f64)
+                    .unwrap()
+                    .pins_json()
+                    .unwrap()
+            );
+            for field in ["root_secret_hex", "team", "status", "owner_account"] {
+                let mut altered = pending_value.clone();
+                altered[field] = "invalid".into();
+                assert!(
+                    restore_prepared_team_creation(
+                        &altered.to_string(),
+                        &key(3),
+                        &self.pins_json(),
+                        &self.bundle_json(),
+                        NOW as f64
+                    )
+                    .is_err()
+                );
+            }
+            assert!(
+                restore_prepared_team_creation(
+                    &pending,
+                    &key(12),
+                    &self.pins_json(),
+                    &self.bundle_json(),
+                    NOW as f64
+                )
+                .is_err()
+            );
             assert_eq!(
                 pending_value["pending_request"],
                 serde_json::to_value(&prepared.request).unwrap()
