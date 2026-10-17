@@ -93,8 +93,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
           - runner: macos-15
             target: aarch64-apple-darwin
     env:
@@ -203,7 +201,7 @@ jobs:
           archives=(packages/*.tar.gz)
           checksums=(packages/*.tar.gz.sha256)
           files=(packages/*)
-          [[ "${#archives[@]}" == 4 && "${#checksums[@]}" == 4 && "${#files[@]}" == 8 ]]
+          [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 3 && "${#files[@]}" == 6 ]]
           for archive in "${archives[@]}"; do
             name="$(basename "$archive")"
             [[ "$name" == "vibeface-node-$VERSION-"* ]]
