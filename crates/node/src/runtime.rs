@@ -2034,6 +2034,7 @@ impl Runtime {
                 let local = self.identity.node_id()?;
                 let mut nodes = vec![];
                 let view = bundle.project()?;
+                let revoked_ids = view.revoked.clone();
                 for member in view
                     .members
                     .into_iter()
@@ -2062,6 +2063,15 @@ impl Runtime {
                         Value::Null
                     };
                     nodes.push(json!({"node_id":cert.node_id,"roles":cert.roles,"revoked":cert.revoked,"local":here,"online":live&&!cert.revoked,"capabilities":capabilities}));
+                }
+                let history = bundle.historical_nodes()?;
+                for revoked in revoked_ids {
+                    if nodes.iter().any(|node| node["node_id"] == revoked) {
+                        continue;
+                    }
+                    if history.iter().any(|node| node.subject_id == revoked) {
+                        nodes.push(json!({"node_id":revoked,"roles":[],"revoked":true,"local":false,"online":false,"capabilities":Value::Null}));
+                    }
                 }
                 Ok(json!({"nodes":nodes}))
             }
