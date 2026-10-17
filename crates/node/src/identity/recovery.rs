@@ -119,7 +119,7 @@ pub fn seal(secrets: &RecoverySecrets, passphrase: &str) -> Result<EncryptedReco
         recovery_epoch: secrets.recovery_epoch,
         decryption_keys: secrets.decryption_keys.clone(),
     };
-    let mut payload_bytes = Zeroizing::new(canonical_json(&payload)?);
+    let payload_bytes = Zeroizing::new(canonical_json(&payload)?);
     payload.root_secret_key.zeroize();
     for key in &mut payload.decryption_keys {
         key.key_hex.zeroize();
@@ -203,8 +203,8 @@ fn validate_secrets(secrets: &RecoverySecrets) -> Result<()> {
         "recovery genesis does not match root identity"
     );
     ensure!(
-        secrets.recovery_epoch > 0,
-        "recovery epoch must be positive"
+        (1..=super::MAX_SAFE_INTEGER).contains(&secrets.recovery_epoch),
+        "invalid recovery epoch"
     );
     ensure!(
         secrets.decryption_keys.len() <= MAX_RECOVERY_KEYS,
@@ -212,7 +212,10 @@ fn validate_secrets(secrets: &RecoverySecrets) -> Result<()> {
     );
     let mut epochs = BTreeSet::new();
     for key in &secrets.decryption_keys {
-        ensure!(key.epoch > 0, "recovery key epoch must be positive");
+        ensure!(
+            (1..=super::MAX_SAFE_INTEGER).contains(&key.epoch),
+            "invalid recovery key epoch"
+        );
         ensure!(epochs.insert(key.epoch), "duplicate recovery key epoch");
         validate_key_hex(&key.key_hex)?;
     }
@@ -242,8 +245,8 @@ fn validate_package(package: &EncryptedRecoveryPackage) -> Result<()> {
     );
     validate_id(&package.network_id)?;
     ensure!(
-        package.recovery_epoch > 0,
-        "recovery epoch must be positive"
+        (1..=super::MAX_SAFE_INTEGER).contains(&package.recovery_epoch),
+        "invalid recovery epoch"
     );
     let envelope_bytes =
         serde_json::to_vec(&package.envelope).map_err(|_| anyhow!("invalid recovery envelope"))?;
@@ -274,7 +277,8 @@ mod tests {
         let root = LocalIdentity {
             secret_key_hex: "11".repeat(KEY_BYTES),
         };
-        let member = Member::client(&root, "root", true).unwrap();
+        let admin = LocalIdentity::generate();
+        let member = Member::client(&admin, "admin", true).unwrap();
         let genesis = Genesis::create(&root, vec![member]).unwrap();
         RecoverySecrets {
             network_id: root.network_id().unwrap(),
@@ -317,10 +321,20 @@ mod tests {
     }
 
     #[test]
-    fn malicious_envelope_size_is_rejected_before_secure_open() {
+    fn malicious_kdf_and_envelope_size_are_rejected_before_recovery() {
         let mut package = seal(&secrets(), "correct horse battery staple").unwrap();
-        package.envelope = Value::String("x".repeat(MAX_PACKAGE_BYTES + 1));
+        let header = package
+            .envelope
+            .as_object_mut()
+            .and_then(|envelope| envelope.get_mut("header"))
+            .and_then(Value::as_object_mut)
+            .unwrap();
+        header.insert("memory_kib".into(), Value::from(u32::MAX));
         assert!(open(&package, "correct horse battery staple").is_err());
+
+        let mut oversized = seal(&secrets(), "correct horse battery staple").unwrap();
+        oversized.envelope = Value::String("x".repeat(MAX_PACKAGE_BYTES + 1));
+        assert!(open(&oversized, "correct horse battery staple").is_err());
     }
 
     #[test]

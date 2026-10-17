@@ -159,6 +159,12 @@ impl Genesis {
         );
         validate_id(&self.owner_public_key)?;
         ensure!(
+            self.initial_members
+                .iter()
+                .all(|member| member.public_key != self.owner_public_key),
+            "recovery root cannot be a daily device or client identity"
+        );
+        ensure!(
             self.network_id == crypto::fingerprint(&self.owner_public_key)?,
             "personal-network root fingerprint mismatch"
         );
@@ -194,6 +200,13 @@ impl RootCheckpoint {
         );
         members.sort_by(|a, b| a.subject_id.cmp(&b.subject_id));
         validate_members(&members)?;
+        let root_public_key = root.public_key_hex()?;
+        ensure!(
+            members
+                .iter()
+                .all(|member| member.public_key != root_public_key),
+            "recovery root cannot be a daily device or client identity"
+        );
         let mut checkpoint = Self {
             version: IDENTITY_VERSION,
             network_id: root.network_id()?,
@@ -220,6 +233,12 @@ impl RootCheckpoint {
             "invalid recovery checkpoint"
         );
         validate_members(&self.members)?;
+        ensure!(
+            self.members
+                .iter()
+                .all(|member| member.public_key != genesis.owner_public_key),
+            "recovery root cannot be a daily device or client identity"
+        );
         crypto::verify_payload(
             &genesis.owner_public_key,
             "identity-recovery",
@@ -456,6 +475,9 @@ impl NetworkState {
 
     pub fn recover(&mut self, checkpoint: RootCheckpoint) -> Result<()> {
         checkpoint.verify(&self.genesis)?;
+        if self.checkpoint.as_ref() == Some(&checkpoint) {
+            return Ok(());
+        }
         ensure!(
             checkpoint.epoch > self.epoch(),
             "recovery epoch rollback or conflict"
@@ -596,14 +618,12 @@ impl NetworkState {
                     depth <= MAX_MANAGEMENT_DEPTH,
                     "management history is too deep"
                 );
-                let (members, revoked) = project_members(base, &validated, &order, &ancestors)?;
-                let issuer = members
-                    .get(&event.issuer)
+                let issuer = base
+                    .iter()
+                    .find(|member| member.subject_id == event.issuer)
                     .context("management issuer is unauthorized")?;
                 ensure!(
-                    issuer.kind == IdentityKind::Client
-                        && issuer.manage
-                        && !revoked.contains(&event.issuer),
+                    issuer.kind == IdentityKind::Client && issuer.manage,
                     "management permission required"
                 );
                 crypto::verify_payload(
@@ -624,7 +644,7 @@ impl NetworkState {
             }
         }
         let all = order.iter().cloned().collect();
-        let (members, revoked) = project_members(base, &validated, &order, &all)?;
+        let (members, revoked) = project_members(base, &validated, &all)?;
         ensure!(members.len() <= MAX_MEMBERS, "too many current members");
         let mut heads: BTreeSet<String> = order.into_iter().collect();
         for entry in validated.values() {
@@ -649,41 +669,7 @@ impl NetworkState {
 fn project_members(
     base: &[Member],
     events: &BTreeMap<String, ValidEvent>,
-    order: &[String],
     basis: &BTreeSet<String>,
-) -> Result<(BTreeMap<String, Member>, BTreeSet<String>)> {
-    let mut allowed_grants = BTreeSet::new();
-    for hash in order.iter().filter(|hash| basis.contains(*hash)) {
-        let entry = &events[hash];
-        if !matches!(entry.event.action, GovernanceAction::Grant { .. }) {
-            continue;
-        }
-        let cut_off = basis.iter().any(|revoke_hash| {
-            let revoke = &events[revoke_hash];
-            matches!(&revoke.event.action, GovernanceAction::Revoke { subject_id } if subject_id == &entry.event.issuer)
-                && !revoke.ancestors.contains(hash)
-        });
-        if cut_off {
-            continue;
-        }
-        let (issuer_members, issuer_revoked) =
-            raw_members(base, events, &entry.ancestors, &allowed_grants)?;
-        if issuer_members
-            .get(&entry.event.issuer)
-            .is_some_and(|issuer| issuer.kind == IdentityKind::Client && issuer.manage)
-            && !issuer_revoked.contains(&entry.event.issuer)
-        {
-            allowed_grants.insert(hash.clone());
-        }
-    }
-    raw_members(base, events, basis, &allowed_grants)
-}
-
-fn raw_members(
-    base: &[Member],
-    events: &BTreeMap<String, ValidEvent>,
-    basis: &BTreeSet<String>,
-    allowed_grants: &BTreeSet<String>,
 ) -> Result<(BTreeMap<String, Member>, BTreeSet<String>)> {
     let mut members: BTreeMap<String, Member> = base
         .iter()
@@ -697,13 +683,12 @@ fn raw_members(
             GovernanceAction::Revoke { subject_id } => {
                 revoked.insert(subject_id.clone());
             }
-            GovernanceAction::Grant { member } if allowed_grants.contains(hash) => {
+            GovernanceAction::Grant { member } => {
                 candidates
                     .entry(member.subject_id.clone())
                     .or_default()
                     .push(hash);
             }
-            _ => {}
         }
     }
     for (subject, grants) in candidates {
@@ -988,7 +973,7 @@ mod tests {
         );
         assert!(state.project()?.authorize_client(&a.node_id()?).is_err());
         assert!(state.merge(&original).is_err());
-        assert!(state.recover(checkpoint).is_err());
+        state.recover(checkpoint)?;
         let mut conflict = original.clone();
         conflict.recover(RootCheckpoint::create(
             &root,
@@ -1047,6 +1032,15 @@ mod tests {
                 .is_err()
         );
         assert!(Member::node(&node, "node", vec![NodeRole::Scheduler]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_root_is_not_a_daily_client_identity() -> Result<()> {
+        let root = LocalIdentity::generate();
+        let root_member = Member::client(&root, "unsafe client", true)?;
+        assert!(Genesis::create(&root, vec![root_member.clone()]).is_err());
+        assert!(RootCheckpoint::create(&root, 2, vec![root_member]).is_err());
         Ok(())
     }
 
