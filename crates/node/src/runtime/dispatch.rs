@@ -1,7 +1,9 @@
 use super::*;
 use vibeface_secure::authorization::{
     RequestFacts,
-    execution_handoff::{ExecutionHandoffResult, SignedExecutionHandoff},
+    execution_handoff::{
+        ExecutionHandoffResult, SignedExecutionHandoff, SignedExecutionHandoffResolution,
+    },
 };
 
 pub(super) fn execution_operation_view(
@@ -16,6 +18,48 @@ pub(super) fn execution_operation_view(
         value["execution_source"] = serde_json::to_value(wire.handoff.source_attestation)?;
     }
     Ok(value)
+}
+
+fn completed_execution_resolution(
+    store: &Store,
+    wire: &SignedExecutionHandoffResolution,
+) -> Result<Option<OperationRecord>> {
+    use vibeface_secure::authorization::execution_handoff::{
+        ExecutionHandoffResolutionResult, ExecutionHandoffTerminalReconciliationResult,
+        ExecutionResolutionPurpose,
+    };
+    let operation = store
+        .operation(
+            wire.resolution
+                .account_admission
+                .invocation
+                .payload
+                .resource
+                .space
+                .as_str(),
+            &wire.resolution.observation.receipt.payload.operation_id,
+        )?
+        .context("prepared resolution lost its original operation")?;
+    if !operation.state.terminal() {
+        return Ok(None);
+    }
+    let recorded = match wire.resolution.purpose {
+        ExecutionResolutionPurpose::ResolveUnknown => {
+            serde_json::from_value::<ExecutionHandoffResolutionResult>(operation.result.clone())?
+                .resolution
+        }
+        ExecutionResolutionPurpose::ReconcileTerminal => {
+            serde_json::from_value::<ExecutionHandoffTerminalReconciliationResult>(
+                operation.result.clone(),
+            )?
+            .reconciliation
+        }
+    };
+    ensure!(
+        &recorded == wire,
+        "completed operation belongs to another resolution authorization"
+    );
+    Ok(Some(operation))
 }
 
 impl Runtime {
@@ -686,7 +730,7 @@ impl Runtime {
             access.account_actor(),
             "remote execution resolution requires the user"
         );
-        let (wire, _) = {
+        let (wire, completed) = {
             let mut store = self.store.lock().await;
             access.verification.run(|| {
                 let dispatch = store.execution_dispatch_facts(
@@ -694,7 +738,7 @@ impl Runtime {
                     access.authorization.audience(),
                     now_ms() as u64,
                 )?;
-                store.prepare_execution_dispatch_resolution(
+                let (wire, fresh) = store.prepare_execution_dispatch_resolution(
                     &self.identity,
                     &dispatch,
                     &access.authorization,
@@ -702,15 +746,26 @@ impl Runtime {
                     &access.transport,
                     &access.body,
                     now_ms() as u64,
-                )
+                )?;
+                let completed = if fresh {
+                    None
+                } else {
+                    completed_execution_resolution(&store, &wire)?
+                };
+                Ok::<_, anyhow::Error>((wire, completed))
             })?
         };
-        let response = self.peer_request(
-            &access.network_id,
-            field(&access.body, "target_node")?,
-            json!({"type":"execution_handoff_resolve","resolution":wire}),
-        ).await.context("remote resolution outcome is unconfirmed; reconcile its original authorization before retrying")?;
-        let operation = {
+        let operation = if let Some(completed) = completed {
+            completed
+        } else {
+            let response = self
+                .peer_request(
+                    &access.network_id,
+                    field(&access.body, "target_node")?,
+                    json!({"type":"execution_handoff_resolve","resolution":wire}),
+                )
+                .await
+                .context("remote resolution outcome is unconfirmed; reconcile its original authorization before retrying")?;
             let mut store = self.store.lock().await;
             access.verification.run(|| match wire.resolution.purpose {
                 ExecutionResolutionPurpose::ResolveUnknown => {
@@ -720,6 +775,9 @@ impl Runtime {
                         result.resolution == wire,
                         "executor changed the admitted resolution"
                     );
+                    if let Some(completed) = completed_execution_resolution(&store, &wire)? {
+                        return Ok(completed);
+                    }
                     store.apply_execution_dispatch_resolution(
                         &self.identity,
                         &result,
@@ -733,6 +791,9 @@ impl Runtime {
                         result.reconciliation == wire,
                         "executor changed the admitted terminal reconciliation"
                     );
+                    if let Some(completed) = completed_execution_resolution(&store, &wire)? {
+                        return Ok(completed);
+                    }
                     store.apply_execution_dispatch_terminal_reconciliation(
                         &self.identity,
                         &result,
