@@ -211,6 +211,67 @@ struct RemoteExecutionSelection {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+pub struct VerifiedDirectionalGrantSnapshot {
+    share: String,
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+impl VerifiedDirectionalGrantSnapshot {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = shareJson))]
+    pub fn share_json(&self) -> String {
+        self.share.clone()
+    }
+}
+
+/// Export an already committed grant using the owner's independently saved roots.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyDirectionalGrantSnapshot))]
+pub fn verify_directional_grant_snapshot(
+    bundle_json: &str,
+    pins_json: &str,
+    now_ms: f64,
+) -> crate::Result<VerifiedDirectionalGrantSnapshot> {
+    (|| -> Result<VerifiedDirectionalGrantSnapshot> {
+        let now=client_time(now_ms)?;
+        require(bundle_json.len() <= 1_048_576 && pins_json.len() <= MAX_PROOF_BYTES,"directional grant proof is too large")?;
+        let bundle:ClientAuthorizationBundle=serde_json::from_str(bundle_json)
+            .map_err(|_|AuthorizationError::InvalidProof("invalid directional grant bundle"))?;
+        let pins:Vec<PolicyPin>=serde_json::from_str(pins_json)
+            .map_err(|_|AuthorizationError::InvalidProof("invalid saved directional grant pins"))?;
+        let state=replay_policies(&pins,&bundle.journal)?;
+        let signed=state.grant(&bundle.grant_leaf).ok_or(AuthorizationError::InvalidProof("directional grant is missing"))?;
+        let leaf=&signed.payload;
+        let ResourceScope::Exact(resource)=&leaf.scope else { return Err(AuthorizationError::InvalidProof("execution sharing requires an exact resource")); };
+        let record=state.resource(&resource.space,&resource.resource).ok_or(AuthorizationError::InvalidProof("shared execution resource is missing"))?;
+        let target=state.verify_service_device(&resource.space,&leaf.audience.device,now)?;
+        require(record.payload.kind == ResourceKind::ExecutionService && record.payload.host == leaf.audience.service
+            && target.payload.subject == Actor::Service(leaf.audience.service.clone())
+            && matches!(&leaf.grantee,Grantee::Actor(Actor::Service(service)) if service != &leaf.audience.service)
+            && leaf.remaining_delegations == 0 && leaf.expires_at_ms < u64::MAX
+            && leaf.actions.contains(&Action::ExecutionSubmit)
+            && leaf.actions.iter().any(|action| *action != Action::ExecutionSubmit)
+            && leaf.actions.iter().all(|action| matches!(action,Action::ExecutionSubmit|Action::ExecutionOpen|Action::ExecutionSend
+                |Action::ExecutionSteer|Action::ExecutionInterrupt|Action::ExecutionRespondApproval|Action::OperationStatusRead))
+            && !leaf.constraints.require_account_actor && !leaf.constraints.require_webauthn_uv
+            && leaf.constraints.context.sdk_session.is_none() && leaf.constraints.context.task.is_some()
+            && leaf.constraints.context.conversation.is_some() && leaf.constraints.context.executor_kind.is_some()
+            && leaf.constraints.context.workspace_resource.as_ref() == Some(&resource.resource)
+            && leaf.constraints.context.execution_session.as_ref().is_some_and(|session|session.target == leaf.audience.device),
+            "execution share must be a finite, nondelegable grant to the selected Project service")?;
+        let mut budget=Budget::default();let mut dependencies=BTreeMap::new();
+        budget.verify(record)?;
+        state.validate_certificate(target,now,&mut budget,&mut dependencies,&mut BTreeSet::new())?;
+        let path=state.grant_chain(Some(&bundle.grant_leaf))?;
+        state.verify_grant_path(&path,now,&mut budget,&mut dependencies,true)?;
+        state.expand_authorities(now,&mut budget,&mut dependencies)?;
+        let selection=RemoteExecutionSelection {execution_resource:resource.clone(),target_public_key:target.payload.public_key.clone(),execution_grant:bundle.grant_leaf.clone()};
+        let share=serde_json::to_string(&serde_json::json!({"version":AUTH_VERSION,"kind":"vibeface-remote-execution","authorization":bundle,"selection":selection}))
+            .map_err(|_|AuthorizationError::InvalidProof("execution share encoding failed"))?;
+        Ok(VerifiedDirectionalGrantSnapshot {share})
+    })().map_err(|error|error.to_string())
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct VerifiedRemoteExecution {
     state: VerifiedPolicySet,
     source: VerifiedClientAuthorization,
@@ -219,6 +280,7 @@ pub struct VerifiedRemoteExecution {
     action: Action,
     heads: Vec<PolicyStamp>,
     verified_at_ms: u64,
+    execution_pins: Vec<PolicyPin>,
 }
 
 fn client_time(now: f64) -> Result<u64> {
@@ -286,7 +348,10 @@ pub fn verify_remote_execution(
             "remote execution changed the verified Project authorization",
         )?;
         let mut pins = BTreeMap::<PolicyDomain, PolicyPin>::new();
-        for pin in project_pins.into_iter().chain(execution_pins) {
+        for pin in project_pins
+            .into_iter()
+            .chain(execution_pins.iter().cloned())
+        {
             if let Some(saved) = pins.get_mut(&pin.domain) {
                 require(
                     saved.genesis_root == pin.genesis_root,
@@ -376,6 +441,15 @@ pub fn verify_remote_execution(
             &mut BTreeSet::new(),
         )?;
         state.expand_authorities(now, &mut budget, &mut dependencies)?;
+        let execution_pins = execution_pins
+            .into_iter()
+            .map(|mut pin| {
+                pin.minimum_head = Some(state.head(&pin.domain).cloned().ok_or(
+                    AuthorizationError::InvalidProof("independent execution policy is missing"),
+                )?);
+                Ok(pin)
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(VerifiedRemoteExecution {
             state,
             source: auth.clone(),
@@ -384,6 +458,7 @@ pub fn verify_remote_execution(
             action,
             heads: dependencies.into_values().collect(),
             verified_at_ms: now,
+            execution_pins,
         })
     })()
     .map_err(|error| error.to_string())
@@ -442,6 +517,166 @@ impl VerifiedRemoteExecution {
         serde_json::to_string(&self.selection)
             .map_err(|_| "remote selection encoding failed".into())
     }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = metadataJson))]
+    pub fn metadata_json(&self) -> crate::Result<String> {
+        let record = self
+            .state
+            .resource(
+                &self.selection.execution_resource.space,
+                &self.selection.execution_resource.resource,
+            )
+            .ok_or_else(|| "verified execution resource is missing".to_owned())?;
+        serde_json::to_string(&serde_json::json!({"selection":self.selection,"context":self.context,
+            "audience":Audience {service:record.payload.host.clone(),device:DeviceId::from_key(&self.selection.target_public_key)},
+            "pins":self.execution_pins})).map_err(|_| "remote metadata encoding failed".into())
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = sessionJson))]
+    pub fn session_json(
+        &self,
+        receipt_json: &str,
+        binding_json: &str,
+        now_ms: f64,
+    ) -> crate::Result<String> {
+        (|| -> Result<String> {
+            let now = client_time(now_ms)?;
+            require(
+                now >= self.verified_at_ms
+                    && receipt_json.len() <= MAX_PROOF_BYTES
+                    && binding_json.len() <= MAX_PROOF_BYTES,
+                "invalid remote session proof bounds",
+            )?;
+            let receipt: Signed<execution_handoff::ExecutionHandoffReceipt> =
+                serde_json::from_str(receipt_json).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid executor session receipt")
+                })?;
+            let binding: task_binding::SignedBinding =
+                serde_json::from_str(binding_json).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid executor session binding")
+                })?;
+            let project = ResourceRef {
+                space: self.source.scope.space_id.clone(),
+                resource: self.context.context.workspace_resource.clone().ok_or(
+                    AuthorizationError::InvalidProof("remote Project context is missing"),
+                )?,
+            };
+            self.state.verify_execution_destination(
+                &project,
+                &self.source.audience,
+                &self.selection.execution_resource,
+                &self.selection.target_public_key,
+                &self.selection.execution_grant,
+                &self.context.context,
+                self.action,
+                now,
+            )?;
+            let snapshot = execution_handoff::verify_execution_session_snapshot(
+                &receipt,
+                &project,
+                &self.selection.execution_resource,
+                &self.selection.target_public_key,
+                &binding,
+                &self.source.audience_public_key,
+                now,
+            )?;
+            require(
+                self.context.context.task.as_ref() == Some(&snapshot.task)
+                    && self.context.context.conversation.as_deref()
+                        == Some(binding.binding.conversation_id.as_str())
+                    && self
+                        .context
+                        .context
+                        .execution_session
+                        .as_ref()
+                        .is_some_and(|session| {
+                            session.target == snapshot.target
+                                && session.session_id == snapshot.session_id
+                        }),
+                "session receipt differs from the selected task",
+            )?;
+            let mut value = serde_json::to_value(snapshot).map_err(|_| {
+                AuthorizationError::InvalidProof("session snapshot encoding failed")
+            })?;
+            value["target_node"] = Value::String(binding.binding.target_node.clone());
+            value["execution_session_receipt"] = serde_json::to_value(&receipt)
+                .map_err(|_| AuthorizationError::InvalidProof("session receipt encoding failed"))?;
+            serde_json::to_string(&value)
+                .map_err(|_| AuthorizationError::InvalidProof("session proof encoding failed"))
+        })()
+        .map_err(|error| error.to_string())
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = validateReplay))]
+    pub fn validate_replay(
+        &self,
+        auth: &VerifiedClientAuthorization,
+        body_json: &str,
+        invocation_json: &str,
+        expected_action: &str,
+        operation_id: &str,
+        gateway_public_key: &str,
+        now_ms: f64,
+    ) -> crate::Result<()> {
+        (|| -> Result<()> {
+            require(
+                body_json.len() <= MAX_PROOF_BYTES && invocation_json.len() <= MAX_PROOF_BYTES,
+                "remote replay proof is too large",
+            )?;
+            let now = client_time(now_ms)?;
+            let body: Value = serde_json::from_str(body_json)
+                .map_err(|_| AuthorizationError::InvalidProof("invalid remote replay body"))?;
+            let invocation: Signed<Invocation> =
+                serde_json::from_str(invocation_json).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid remote replay invocation")
+                })?;
+            let qualified = self.signing_authorization(auth, &body, now)?;
+            let i = &invocation.payload;
+            let action: Action = serde_json::from_value(Value::String(expected_action.into()))
+                .map_err(|_| AuthorizationError::InvalidProof("unknown remote replay action"))?;
+            require(
+                i.actor == Actor::Account(qualified.scope.account_id.clone())
+                    && i.device == qualified.scope.device_id
+                    && i.grant_leaf == qualified.grant_leaf
+                    && i.expected_policies == qualified.heads
+                    && i.action == action
+                    && action == self.action
+                    && i.operation_id == operation_id
+                    && i.context == self.context.context,
+                "remote replay changed its verified client authorization",
+            )?;
+            let intent = PrepareIntent {
+                request: i.clone(),
+                binding_generation: self.context.binding_generation,
+                canonical_cwd: self.context.canonical_cwd.clone(),
+                execution_target_public_key: self.context.execution_target_public_key.clone(),
+            };
+            check_raw_context(&intent, &body, &qualified.audience_public_key)?;
+            let gateway = PublicKey::parse(gateway_public_key)?;
+            let transport = if gateway == qualified.audience_public_key {
+                TransportEvidence::DirectNoise {
+                    device: qualified.scope.device_id.clone(),
+                }
+            } else {
+                TransportEvidence::GatewayNoise {
+                    device: qualified.scope.device_id.clone(),
+                    gateway: DeviceId::from_key(&gateway),
+                }
+            };
+            let facts = RequestFacts {
+                resource: raw_resource(&body)?,
+                action,
+                audience: qualified.audience.clone(),
+                operation_id: operation_id.into(),
+                body_hash: ObjectHash::body(&body)?,
+                context: self.context.context.clone(),
+            };
+            self.state
+                .verify_invocation(&invocation, &facts, &transport, now)?;
+            Ok(())
+        })()
+        .map_err(|error| error.to_string())
+    }
+
     pub fn prepare(
         &self,
         auth: &VerifiedClientAuthorization,
@@ -664,6 +899,171 @@ fn execution_key<'a>(
     )?;
     Ok(key)
 }
+fn project_metadata_context(
+    project: &ResourceRef,
+    audience: &Audience,
+    key: &PublicKey,
+    source: &Signed<execution_handoff::ProjectExecutionSource>,
+    binding: &task_binding::SignedBinding,
+) -> Result<PrepareContext> {
+    source.verify_signature()?;
+    task_binding::verify_binding(binding, key.as_str())
+        .map_err(|_| AuthorizationError::InvalidProof("invalid metadata task binding"))?;
+    let b = &binding.binding;
+    let statement = &source.payload;
+    require(
+        source.issuer == *key
+            && statement.version == AUTH_VERSION
+            && statement.project == *project
+            && b.network_id == project.space.as_str()
+            && b.authority_node
+                == hex::encode(Sha256::digest(crate::decode32(key.as_str()).map_err(
+                    |_| AuthorizationError::InvalidProof("invalid Project host key"),
+                )?))
+            && statement.binding_hash
+                == task_binding::binding_hash(b).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid metadata binding hash")
+                })?
+            && statement.binding_generation == b.generation
+            && statement.task.as_str() == b.task_ref
+            && statement.execution_session.session_id == b.session_id
+            && statement.execution_session.target != audience.device,
+        "metadata proof differs from its Project host or bound task",
+    )?;
+    Ok(PrepareContext {
+        context: InvocationContext {
+            conversation: Some(b.conversation_id.clone()),
+            task: Some(statement.task.clone()),
+            workspace_resource: Some(project.resource.clone()),
+            ..Default::default()
+        },
+        binding_generation: Some(b.generation),
+        canonical_cwd: None,
+        execution_target_public_key: None,
+    })
+}
+
+impl VerifiedPolicySet {
+    pub fn verify_execution_dispatch_metadata(
+        &self,
+        project: &ResourceRef,
+        audience: &Audience,
+        source: &Signed<execution_handoff::ProjectExecutionSource>,
+        binding: &task_binding::SignedBinding,
+        now_ms: u64,
+    ) -> Result<PrepareContext> {
+        let record = self.resource(&project.space, &project.resource).ok_or(
+            AuthorizationError::InvalidProof("metadata Project is missing"),
+        )?;
+        let host = self.verify_service_device(&project.space, &audience.device, now_ms)?;
+        require(
+            record.payload.kind == ResourceKind::Project
+                && record.payload.host == audience.service
+                && host.payload.subject == Actor::Service(audience.service.clone()),
+            "metadata targets another Project host",
+        )?;
+        project_metadata_context(project, audience, &host.payload.public_key, source, binding)
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyProjectExecutionMetadata))]
+pub fn verify_project_execution_metadata(
+    auth: &VerifiedClientAuthorization,
+    source_json: &str,
+    binding_json: &str,
+) -> crate::Result<String> {
+    (|| -> Result<String> {
+        require(
+            source_json.len() <= MAX_PROOF_BYTES && binding_json.len() <= MAX_PROOF_BYTES,
+            "metadata evidence is too large",
+        )?;
+        let source: Signed<execution_handoff::ProjectExecutionSource> =
+            serde_json::from_str(source_json)
+                .map_err(|_| AuthorizationError::InvalidProof("invalid Project metadata source"))?;
+        let binding: task_binding::SignedBinding = serde_json::from_str(binding_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid Project metadata binding"))?;
+        require(
+            source.payload.project.space == auth.scope.space_id
+                && scope_covers(&auth.grant_scope, &source.payload.project)
+                && (auth.actions.contains(&Action::OperationStatusRead)
+                    || auth.actions.contains(&Action::OperationReconcile)),
+            "client has no Project metadata read permission",
+        )?;
+        let context = project_metadata_context(
+            &source.payload.project,
+            &auth.audience,
+            &auth.audience_public_key,
+            &source,
+            &binding,
+        )?;
+        serde_json::to_string(&context)
+            .map_err(|_| AuthorizationError::InvalidProof("metadata context encoding failed"))
+    })()
+    .map_err(|error| error.to_string())
+}
+
+fn check_raw_metadata(intent: &PrepareIntent, body: &Value, key: &PublicKey) -> Result<bool> {
+    let Some(source) = body.get("execution_source") else {
+        return Ok(false);
+    };
+    let i = &intent.request;
+    require(
+        matches!(
+            body["method"].as_str(),
+            Some("operation" | "session" | "reconcile")
+        ) && matches!(
+            i.action,
+            Action::OperationStatusRead | Action::OperationReconcile
+        ) && matches!(i.actor, Actor::Account(_))
+            && body.get("request").is_none()
+            && [
+                "execution_resource",
+                "target_public_key",
+                "execution_grant",
+                "sdk_session",
+                "parent_invocation",
+            ]
+            .iter()
+            .all(|field| body.get(*field).is_none()),
+        "invalid Project metadata read purpose",
+    )?;
+    let source: Signed<execution_handoff::ProjectExecutionSource> =
+        serde_json::from_value(source.clone())
+            .map_err(|_| AuthorizationError::InvalidProof("invalid metadata source"))?;
+    let binding: task_binding::SignedBinding = serde_json::from_value(body["binding"].clone())
+        .map_err(|_| AuthorizationError::InvalidProof("invalid metadata binding"))?;
+    let expected = project_metadata_context(&i.resource, &i.audience, key, &source, &binding)?;
+    require(
+        intent.request.context == expected.context
+            && intent.binding_generation == expected.binding_generation
+            && intent.canonical_cwd.is_none()
+            && intent.execution_target_public_key.is_none()
+            && text(body.get("operation_id"))? == Some(source.payload.operation_id.as_str()),
+        "metadata request differs from its durable Project source",
+    )?;
+    for (field, value) in [
+        ("conversation_id", binding.binding.conversation_id.as_str()),
+        ("task_id", binding.binding.task_id.as_str()),
+        ("task_ref", binding.binding.task_ref.as_str()),
+        ("target_node", binding.binding.target_node.as_str()),
+        ("session_id", binding.binding.session_id.as_str()),
+    ] {
+        if let Some(actual) = text(body.get(field))? {
+            require(
+                actual == value,
+                "metadata request changed its original operation context",
+            )?;
+        }
+    }
+    if body["method"] == "session" {
+        require(
+            body.get("target_node").is_some() && body.get("session_id").is_some(),
+            "session metadata needs its original target and session",
+        )?;
+    }
+    Ok(true)
+}
+
 fn raw_binding(value: Option<&Value>) -> Result<Option<task_binding::SignedBinding>> {
     value
         .filter(|value| !value.is_null())
@@ -674,6 +1074,9 @@ fn raw_binding(value: Option<&Value>) -> Result<Option<task_binding::SignedBindi
         .transpose()
 }
 fn check_raw_context(intent: &PrepareIntent, body: &Value, audience_key: &PublicKey) -> Result<()> {
+    if check_raw_metadata(intent, body, audience_key)? {
+        return Ok(());
+    }
     let i = &intent.request;
     let context = &i.context;
     validate_context(context)?;
@@ -1339,6 +1742,16 @@ mod tests {
         let mut execution_bundle = bundle.clone();
         execution_bundle.grant_leaf = leaf.clone();
         let selection = json!({"execution_resource":execution,"target_public_key":execution_key,"execution_grant":leaf});
+        let snapshot = verify_directional_grant_snapshot(
+            &serde_json::to_string(&execution_bundle).unwrap(),
+            &serde_json::to_string(&pins).unwrap(),
+            NOW as f64,
+        )
+        .unwrap();
+        let share: Value = serde_json::from_str(&snapshot.share_json()).unwrap();
+        assert_eq!(share["kind"], "vibeface-remote-execution");
+        assert_eq!(share["selection"], selection);
+        assert!(share.get("pins").is_none());
         let handle = verify_remote_execution(
             &auth,
             &serde_json::to_string(&bundle).unwrap(),
@@ -1379,6 +1792,38 @@ mod tests {
             )
             .unwrap();
         let final_invocation: Signed<Invocation> = serde_json::from_str(&final_wire).unwrap();
+        let metadata: Value = serde_json::from_str(&handle.metadata_json().unwrap()).unwrap();
+        assert_eq!(metadata["context"], serde_json::to_value(&raw).unwrap());
+        assert_eq!(
+            metadata["audience"]["device"],
+            serde_json::to_value(DeviceId::from_key(&execution_key)).unwrap()
+        );
+        handle
+            .validate_replay(
+                &auth,
+                &body.to_string(),
+                &final_wire,
+                "execution_send",
+                "prepare_1",
+                auth.audience_public_key().as_str(),
+                NOW as f64,
+            )
+            .unwrap();
+        let mut corrupt = final_invocation.clone();
+        corrupt.payload.nonce = Nonce::random().unwrap();
+        assert!(
+            handle
+                .validate_replay(
+                    &auth,
+                    &body.to_string(),
+                    &serde_json::to_string(&corrupt).unwrap(),
+                    "execution_send",
+                    "prepare_1",
+                    auth.audience_public_key().as_str(),
+                    NOW as f64
+                )
+                .is_err()
+        );
         assert!(
             f.state
                 .verify_invocation(
