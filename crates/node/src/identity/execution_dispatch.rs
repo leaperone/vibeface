@@ -1235,25 +1235,25 @@ impl Store {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::identity::test_support::{TestNetwork, now};
     use anyhow::Result;
     use vibeface_secure::authorization::*;
 
-    struct Fixture {
-        project: TestNetwork,
-        executor: TestNetwork,
-        store: Store,
-        execution: ResourceRef,
-        grant: ObjectHash,
-        task: crate::model::SignedEvent,
-        audience: Audience,
-        journal: Vec<JournalEntry>,
+    pub(crate) struct Fixture {
+        pub(crate) project: TestNetwork,
+        pub(crate) executor: TestNetwork,
+        pub(crate) store: Store,
+        pub(crate) execution: ResourceRef,
+        pub(crate) grant: ObjectHash,
+        pub(crate) task: crate::model::SignedEvent,
+        pub(crate) audience: Audience,
+        pub(crate) journal: Vec<JournalEntry>,
     }
 
     impl Fixture {
-        fn new() -> Result<Self> {
+        pub(crate) fn new() -> Result<Self> {
             let project = TestNetwork::new()?;
             let executor = TestNetwork::new()?;
             let mut store = project.at(&project.directory.join("project.sqlite3"))?;
@@ -1393,7 +1393,7 @@ mod tests {
             })
         }
 
-        fn selection(&self, method: &str, id: &str) -> Result<Value> {
+        pub(crate) fn selection(&self, method: &str, id: &str) -> Result<Value> {
             Ok(
                 json!({"method":method,"space_id":self.project.space,"resource_id":self.project.resource,
                 "authorization_id":id,"execution_resource":self.execution,"execution_grant":self.grant,
@@ -1538,11 +1538,11 @@ mod tests {
             ))
         }
 
-        fn bind(&mut self) -> Result<SignedBinding> {
+        pub(crate) fn bind(&mut self) -> Result<SignedBinding> {
             self.bind_at(self.project.project.to_str().unwrap().to_owned())
         }
 
-        fn bind_at(&mut self, cwd: String) -> Result<SignedBinding> {
+        pub(crate) fn bind_at(&mut self, cwd: String) -> Result<SignedBinding> {
             let mut body = self.selection("bind_execution", "bind-remote")?;
             for (field, value) in [
                 ("conversation_id", json!("conversation")),
