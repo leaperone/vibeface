@@ -64,6 +64,24 @@ async function keyRecord(write) {
   } finally { db.close(); }
 }
 
+async function claimKey(record) {
+  const db = await database();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = db.transaction("keys", "readwrite");
+      const request = transaction.objectStore("keys").add(record, "identity");
+      let alreadyStored = false;
+      request.onerror = (event) => {
+        if (request.error?.name === "ConstraintError") { alreadyStored = true; event.preventDefault(); return; }
+        reject(new Error("无法保存浏览器设备密钥。请允许持久存储后重试。"));
+      };
+      transaction.oncomplete = () => resolve(!alreadyStored);
+      transaction.onerror = () => reject(new Error("无法保存浏览器设备密钥。请允许持久存储后重试。"));
+      transaction.onabort = transaction.onerror;
+    });
+  } finally { db.close(); }
+}
+
 export async function initClient({ replaceLostKey = false } = {}) {
   if (!globalThis.isSecureContext || !globalThis.crypto?.getRandomValues || !globalThis.indexedDB) throw new Error("此地址不能安全保存设备密钥。请在本机使用 http://localhost:4790，或使用你信任的 HTTPS 客户端连接设备。局域网 HTTP 页面仅能展示此指引，不会降级认证。");
   if (!initializing) initializing = initializeIdentity(replaceLostKey).catch((error) => { initializing = null; throw error; });
@@ -80,9 +98,11 @@ async function initializeIdentity(replaceLostKey) {
       try { previouslyPaired = localStorage.getItem("vibeface.device-created") === "true"; } catch { /* IndexedDB remains the required key store. */ }
       if (previouslyPaired && !replaceLostKey) { const error = new Error(lostKeyMessage); error.code = "key_lost"; throw error; }
       const generated = Identity.generate();
-      try { await keyRecord({ secret: generated.secretHex(), created_at: Date.now() }); }
+      let claimed;
+      try { claimed = await claimKey({ secret: generated.secretHex(), created_at: Date.now() }); }
       catch (error) { generated.free(); throw error; }
-      identity = generated;
+      if (claimed) identity = generated;
+      else { generated.free(); const existing = await keyRecord(); if (!existing?.secret) throw new Error("浏览器设备密钥初始化发生竞争，请刷新后重试。"); identity = Identity.fromSecretHex(existing.secret); }
       try { localStorage.setItem("vibeface.device-created", "true"); } catch { /* Pairing still requires an explicit invitation. */ }
     }
   }

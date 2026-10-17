@@ -395,7 +395,7 @@ async function restoreRecovery(form) {
     if (challenge.challenge?.network_id !== opened.payload.network_id || challenge.challenge.owner_public_key !== opened.root.publicKeyHex() || challenge.challenge.subject_id !== clientId || challenge.challenge.target_node_id !== entry.node_id || challenge.challenge.challenge_id !== challenge.challenge_id || challenge.challenge.genesis_hash !== await hashValue(opened.payload.genesis) || challenge.challenge.expires_at_ms <= Date.now()) throw new Error("恢复身份验证与当前设备连接不一致。");
     const rootProof = opened.root.sign("identity-recovery-access", signingBytes(challenge.signing, "identity-recovery-access", challenge.challenge));
     const recoveredState = { genesis: opened.payload.genesis, checkpoint: null, events: [] };
-    const context = await request("recovery_context", { challenge_id: challenge.challenge_id, signature: rootProof, ...(!state.info.initialized ? { state: recoveredState, capability } : {}) });
+    const context = await request("recovery_context", { challenge_id: challenge.challenge_id, signature: rootProof, recovery_epoch: opened.payload.recovery_epoch, ...(!state.info.initialized ? { state: recoveredState, capability } : {}) });
     if (context.view.network_id !== opened.payload.network_id || context.state.genesis.owner_public_key !== opened.root.publicKeyHex()) throw new Error("恢复目标的个人网络与恢复包不一致。");
     const panel = $("pair-status"); panel.hidden = false; panel.replaceChildren(el("h3", "", "确认恢复后保留的设备"), el("p", "recovery-warning", "恢复会建立新的管理授权。请明确选择保留的设备。旧管理客户端默认不保留；已离线设备需要收到恢复记录后才会拒绝旧授权。"), el("code", "fingerprint", `个人网络 ${opened.payload.network_id}`));
     const members = context.view.members.filter((member) => !(context.view.revoked || []).includes(member.subject_id) && member.subject_id !== clientId);
@@ -544,7 +544,7 @@ async function refreshPairRequests() {
   }
 }
 function showInvitation(invitation) {
-  const payload = { url: state.entry.address, node_id: state.entry.node_id, invite: invitation };
+  const payload = { url: state.entry.address, node_id: state.entry.node_id, relay: Boolean(state.entry.relay), invite: invitation };
   const bytes = new TextEncoder().encode(JSON.stringify(payload));
   const encoded = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const output = $("invite-result"); output.replaceChildren(el("p", "muted small invite-output", "在新设备上打开你信任的 Vibeface 客户端，粘贴以下配对信息。请勿公开分享，新设备申请后还需在此确认。"));

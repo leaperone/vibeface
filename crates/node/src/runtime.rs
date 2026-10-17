@@ -2464,11 +2464,13 @@ impl Runtime {
                 });
                 if let Some(previous) = previous {
                     let request: OperationRequest = serde_json::from_value(previous)?;
+                    let requested_task = args["task_id"].as_str();
                     ensure!(
                         request.target_node == target
                             && request.session_id == session
                             && request.action == action
-                            && request.task_id.as_deref() == args["task_id"].as_str()
+                            && requested_task
+                                .is_none_or(|task| request.task_id.as_deref() == Some(task))
                             && request.expected_revision
                                 == args["expected_revision"].as_u64().unwrap_or(0),
                         "operation ID reused with different tool arguments"
@@ -2527,7 +2529,7 @@ impl Runtime {
         proofs.sort_by_key(|proof| proof.binding.generation);
         let mut store = self.store.lock().await;
         for proof in proofs {
-            store.install_binding(&proof)?;
+            store.install_historical_binding(&proof)?;
         }
         Ok(())
     }

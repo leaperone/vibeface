@@ -448,10 +448,9 @@ impl NetworkHub {
         let mut state = self.state.lock().await;
         state.records.retain(|_, r| r.expires_at > now);
         if let Some(old) = state.records.get(&record.node_id) {
-            ensure!(
-                record.issued_at >= old.issued_at,
-                "older reachability record"
-            );
+            if record.issued_at < old.issued_at {
+                return Ok(());
+            }
         } else {
             ensure!(
                 state.records.len() < MAX_RECORDS,
@@ -512,7 +511,11 @@ impl NetworkHub {
         });
         for result in futures_util::future::join_all(queries).await {
             if let Ok(Some(record)) = result {
-                self.publish(record.clone()).await?;
+                if let Err(error) = self.publish(record.clone()).await
+                    && !error.to_string().contains("older reachability record")
+                {
+                    return Err(error);
+                }
                 records.push(record);
             }
         }

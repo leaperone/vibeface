@@ -61,6 +61,7 @@ struct Recovery {
     state: Option<NetworkState>,
     prepared: Option<RootCheckpoint>,
     authorized_until_ms: Option<i64>,
+    minimum_epoch: u64,
 }
 struct Session {
     subject_id: String,
@@ -630,7 +631,8 @@ async fn dispatch(
                 epoch: state
                     .epoch()
                     .checked_add(1)
-                    .context("recovery epoch overflow")?,
+                    .context("recovery epoch overflow")?
+                    .max(recovery.minimum_epoch),
                 members,
                 historical_nodes,
                 signature: String::new(),
@@ -832,6 +834,7 @@ async fn recovery_challenge(
         state: None,
         prepared: None,
         authorized_until_ms: None,
+        minimum_epoch: 1,
     });
     Ok(json!({"challenge_id":challenge.challenge_id,"challenge":challenge,"signing":signing}))
 }
@@ -858,6 +861,7 @@ async fn recovery_context(node: &Runtime, session: &mut Session, params: &Value)
         state.genesis == recovery.genesis,
         "recovery state belongs to another genesis"
     );
+    recovery.minimum_epoch = params["recovery_epoch"].as_u64().unwrap_or(1);
     let view = state.project()?;
     recovery.authorized = true;
     recovery.authorized_until_ms = Some(crate::runtime::now_ms() + 600_000);

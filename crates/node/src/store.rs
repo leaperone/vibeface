@@ -600,10 +600,21 @@ impl Store {
         let binding = &proof.binding;
         let key = self.public_key(&binding.network_id, &binding.authority_node)?;
         crate::binding::verify_binding(proof, &key)?;
-        self.verify_binding_task(binding)
+        self.verify_binding_task(binding, true)
     }
 
-    fn verify_binding_task(&self, binding: &crate::binding::TaskBinding) -> Result<()> {
+    fn verify_historical_binding(&self, proof: &crate::binding::SignedBinding) -> Result<()> {
+        let binding = &proof.binding;
+        let key = self.public_key(&binding.network_id, &binding.authority_node)?;
+        crate::binding::verify_binding(proof, &key)?;
+        self.verify_binding_task(binding, false)
+    }
+
+    fn verify_binding_task(
+        &self,
+        binding: &crate::binding::TaskBinding,
+        require_current_executor: bool,
+    ) -> Result<()> {
         crate::binding::validate_binding(binding)?;
         let envelope = self
             .event(&binding.network_id, &binding.task_ref)?
@@ -626,11 +637,13 @@ impl Store {
             .is_complete(),
             "binding task history is incomplete or conflicting"
         );
-        self.authorize_node(
-            &binding.network_id,
-            &binding.target_node,
-            Some(NodeRole::Executor),
-        )?;
+        if require_current_executor {
+            self.authorize_node(
+                &binding.network_id,
+                &binding.target_node,
+                Some(NodeRole::Executor),
+            )?;
+        }
         if let Some(seal) = &binding.previous_seal {
             let previous = binding
                 .previous_binding_hash
@@ -696,7 +709,7 @@ impl Store {
                 || authority.roles.contains(&NodeRole::Scheduler),
             "task authority cannot bind execution"
         );
-        self.verify_binding_task(binding)?;
+        self.verify_binding_task(binding, true)?;
         let hash = crate::binding::binding_hash(binding)?;
         let record_key = format!("task-binding-record:{hash}");
         let current_key = format!("task-binding-current:{}", binding.task_ref);
@@ -817,6 +830,21 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn install_historical_binding(
+        &mut self,
+        proof: &crate::binding::SignedBinding,
+    ) -> Result<()> {
+        self.verify_historical_binding(proof)?;
+        let binding = &proof.binding;
+        let hash = crate::binding::binding_hash(binding)?;
+        self.local_set(
+            &binding.network_id,
+            &format!("task-binding-record:{hash}"),
+            &serde_json::to_value(proof)?,
+        )?;
         Ok(())
     }
 
