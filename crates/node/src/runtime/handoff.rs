@@ -144,7 +144,7 @@ impl Runtime {
         .await
     }
 
-    async fn collect_handoff_receipts(
+    pub(super) async fn collect_handoff_receipts(
         &self,
         route: &SpaceId,
         policies: &[vibeface_secure::authorization::PolicyStamp],

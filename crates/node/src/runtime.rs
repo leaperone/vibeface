@@ -1,4 +1,5 @@
 mod handoff;
+mod observation;
 
 mod dispatch;
 
@@ -3613,7 +3614,10 @@ impl Runtime {
         }
         match method {
             "execution_share_request" => {
-                ensure!(access.account_actor(), "execution sharing requires the user");
+                ensure!(
+                    access.account_actor(),
+                    "execution sharing requires the user"
+                );
                 let store = self.store.lock().await;
                 access.verification.run(|| {
                     store.authorize_read(
@@ -5501,6 +5505,15 @@ impl Runtime {
             let store = self.store.lock().await;
             verification.run(|| store.authorize_transport_node(&message.origin, now_ms() as u64))?
         };
+        if matches!(
+            kind,
+            "execution_handoff_observe" | "execution_handoff_observation_receipts"
+        ) {
+            let origin = DeviceId::from_key(&PublicKey::parse(&certificate.public_key)?);
+            return self
+                .handle_execution_observation_peer(message, origin, &verification)
+                .await;
+        }
         if matches!(
             kind,
             "execution_handoff_submit"
