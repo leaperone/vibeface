@@ -5,6 +5,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{collections::BTreeSet, path::PathBuf};
+use vibeface_secure::signature_verification::ScopedSignatureVerification;
 use vibeface_secure::{
     Identity,
     authorization::{
@@ -262,6 +263,7 @@ impl Store {
         params: &Value,
         now_ms: u64,
     ) -> Result<FreshnessChallenge> {
+        let _signature_scope = ScopedSignatureVerification::new();
         ensure!(
             serde_json::to_vec(params)?.len() <= MAX_PROOF_BYTES,
             "governance request too large"
@@ -295,6 +297,8 @@ impl Store {
         params: &Value,
         now_ms: u64,
     ) -> Result<Value> {
+        let _signature_scope =
+            (method == "execution_service_register").then(ScopedSignatureVerification::new);
         self.governance_command_with_registration_freshness(
             identity, principal, method, params, now_ms, None,
         )
@@ -309,6 +313,8 @@ impl Store {
         now_ms: u64,
         registration_freshness: Option<&super::policy::FreshnessProof>,
     ) -> Result<Value> {
+        let _signature_scope =
+            (method == "execution_service_register").then(ScopedSignatureVerification::new);
         ensure!(
             serde_json::to_vec(params)?.len() <= MAX_PROOF_BYTES,
             "governance request too large"
@@ -1186,6 +1192,279 @@ mod tests {
                 .resource(&source.space, &ResourceId::parse(&prepared.resource_id())?,)
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_service_registration_collects_remote_team_freshness_without_personal_replica()
+    -> Result<()> {
+        let network = TestNetwork::new()?;
+        let mut local = network.memory()?;
+        let team_root = Identity::generate().map_err(anyhow::Error::msg)?;
+        let prepared_team = governance::prepare_team_creation(
+            &team_root,
+            &network.client,
+            network.account.as_str(),
+            &network.node.public_key_hex()?,
+            &network.recovery.public_key_hex(),
+            network.resource.as_str(),
+            &serde_json::to_string(&network.pins)?,
+            &serde_json::to_string(&network.bundle)?,
+            (now() + 90_000) as f64,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let team_request: Signed<TeamCreationRequest> =
+            serde_json::from_str(&prepared_team.request_json().map_err(anyhow::Error::msg)?)?;
+        let response: TeamCreateResponse = serde_json::from_value(local.governance_command(
+            &network.node,
+            &network.client.public_key_hex(),
+            "team_create",
+            &json!({"request":team_request}),
+            now(),
+        )?)?;
+        let team_created = governance::finish_team_creation(
+            &prepared_team,
+            &serde_json::to_string(&response.acceptance)?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let team_bundle: ClientAuthorizationBundle =
+            serde_json::from_str(&team_created.bundle_json().map_err(anyhow::Error::msg)?)?;
+        let source = team_request.payload.team_project;
+        let remote_identity = LocalIdentity::generate();
+        let remote_signer = Identity::from_secret_hex(&remote_identity.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let remote_key = PublicKey::of(&remote_signer);
+        let account_head = local
+            .policy
+            .verified()
+            .head(&PolicyDomain::Account(network.account.clone()))
+            .context("account head missing")?
+            .clone();
+        let team_head = local
+            .policy
+            .verified()
+            .head(&PolicyDomain::Space(source.space.clone()))
+            .context("team head missing")?
+            .clone();
+        let mut certificate = DeviceCertificate {
+            version: AUTH_VERSION,
+            owner: PolicyDomain::Account(network.account.clone()),
+            subject: Actor::Service(ServiceId::from_key(&remote_key)),
+            device: DeviceId::from_key(&remote_key),
+            public_key: remote_key.clone(),
+            uses: vec![DeviceUse::Noise, DeviceUse::ServiceInvocation],
+            possession: None,
+            enrollment_grant: None,
+            issued_under: account_head.clone(),
+            nonce: Nonce::random()?,
+            not_before_ms: now(),
+            expires_at_ms: now() + 1_000_000,
+        };
+        certificate.prove_possession(&remote_signer)?;
+        let certificate = Signed::sign(certificate, &network.root)?;
+        let mut account = local
+            .policy
+            .verified()
+            .account(&network.account)
+            .context("account missing")?
+            .clone();
+        account.previous = Some(account_head);
+        account.sequence += 1;
+        account.devices.push(certificate.hash()?);
+        account.devices.sort();
+        let mut grant = local
+            .policy
+            .verified()
+            .grant(&team_bundle.grant_leaf)
+            .context("team owner grant missing")?
+            .payload
+            .clone();
+        grant.audience = Audience {
+            service: ServiceId::from_key(&remote_key),
+            device: DeviceId::from_key(&remote_key),
+        };
+        grant.issued_under = team_head.clone();
+        grant.nonce = Nonce::random()?;
+        let grant = Signed::sign(grant, &team_root)?;
+        let mut team = local
+            .policy
+            .verified()
+            .space(&source.space)
+            .context("team missing")?
+            .clone();
+        team.previous = Some(team_head);
+        team.authority = AuthorityBinding::from_key(remote_key.clone());
+        team.authority_epoch += 1;
+        team.sequence = 0;
+        team.governance_grant = None;
+        team.devices.push(certificate.hash()?);
+        team.devices.sort();
+        team.grants.retain(|hash| hash != &team_bundle.grant_leaf);
+        team.grants.push(grant.hash()?);
+        team.grants.sort();
+        local.install_policy_journal(
+            &[
+                JournalEntry::Device(certificate),
+                JournalEntry::Account(Signed::sign(account, &network.root)?),
+                JournalEntry::Grant(grant.clone()),
+                JournalEntry::Space(Signed::sign(team, &team_root)?),
+            ],
+            now(),
+        )?;
+        let mut statement = local
+            .connection
+            .prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?;
+        let journal: Vec<JournalEntry> = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect::<Result<_>>()?;
+        drop(statement);
+        let bundle = ClientAuthorizationBundle {
+            journal,
+            grant_leaf: grant.hash()?,
+        };
+        let remote_journal: Vec<_> = bundle
+            .journal
+            .iter()
+            .filter(|entry| match entry {
+                JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
+                    value.payload.account == network.account
+                }
+                JournalEntry::AccountCommit(value) => {
+                    value.proposal.payload.account == network.account
+                }
+                JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => {
+                    value.payload.space == source.space
+                }
+                JournalEntry::SpaceCommit(value) => value.proposal.payload.space == source.space,
+                JournalEntry::Device(value) => {
+                    value.payload.owner == PolicyDomain::Account(network.account.clone())
+                }
+                JournalEntry::Authenticator(value) => value.payload.account == network.account,
+                JournalEntry::Resource(value) => value.payload.space == source.space,
+                JournalEntry::Membership(value) => value.payload.space == source.space,
+                JournalEntry::Grant(value) => value.payload.owner_space == source.space,
+            })
+            .cloned()
+            .collect();
+        let remote_pins: Vec<_> = local
+            .policy
+            .pins()
+            .iter()
+            .filter(|pin| {
+                pin.domain == PolicyDomain::Account(network.account.clone())
+                    || pin.domain == PolicyDomain::Space(source.space.clone())
+            })
+            .cloned()
+            .collect();
+        let mut remote = Store::initialize(":memory:")?;
+        let update = remote
+            .policy
+            .prepare_bootstrap(&remote_pins, &remote_journal, now())?;
+        let tx = remote
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = journal::commit_in(&tx, &update)?;
+        project_policy_in(&tx, &state)?;
+        tx.commit()?;
+        remote.policy = state;
+        assert!(remote.policy.verified().space(&network.space).is_none());
+        let prepared =
+            prepare_execution_registration(&network, &source, local.policy.pins(), &bundle)?;
+        let params: Value =
+            serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
+        let counts = row_counts(&local)?;
+        let error = local
+            .governance_command(
+                &network.node,
+                &network.client.public_key_hex(),
+                "execution_service_register",
+                &params,
+                now(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<AuthorizationError>(),
+            Some(AuthorizationError::NeedFreshness(_))
+        ));
+        let challenge = local.execution_service_registration_challenge(
+            &network.node,
+            &network.client.public_key_hex(),
+            &params,
+            now(),
+        )?;
+        let own_receipts = local.sign_current_receipts(&challenge, &network.node, now())?;
+        let remote_receipts = remote.sign_current_receipts(&challenge, &remote_identity, now())?;
+        assert_eq!(own_receipts.len(), 2);
+        assert_eq!(remote_receipts.len(), 1);
+        assert_eq!(
+            remote_receipts[0].payload.current.domain,
+            PolicyDomain::Space(source.space.clone())
+        );
+        let mut stale = challenge.clone();
+        stale
+            .policies
+            .iter_mut()
+            .find(|head| head.domain == PolicyDomain::Space(source.space.clone()))
+            .context("source head missing")?
+            .sequence += 1;
+        assert!(
+            remote
+                .sign_current_receipts(&stale, &remote_identity, now())
+                .is_err()
+        );
+        for receipts in [
+            own_receipts.clone(),
+            [
+                own_receipts.clone(),
+                remote_receipts.clone(),
+                remote_receipts.clone(),
+            ]
+            .concat(),
+        ] {
+            assert!(
+                local
+                    .governance_command_with_registration_freshness(
+                        &network.node,
+                        &network.client.public_key_hex(),
+                        "execution_service_register",
+                        &params,
+                        now(),
+                        Some(&super::super::policy::FreshnessProof {
+                            challenge: challenge.clone(),
+                            receipts
+                        })
+                    )
+                    .is_err()
+            );
+            assert_eq!(row_counts(&local)?, counts);
+        }
+        let proof = super::super::policy::FreshnessProof {
+            challenge,
+            receipts: [own_receipts, remote_receipts].concat(),
+        };
+        let result = local.governance_command_with_registration_freshness(
+            &network.node,
+            &network.client.public_key_hex(),
+            "execution_service_register",
+            &params,
+            now(),
+            Some(&proof),
+        )?;
+        let verified = execution_service::finish_execution_service_registration(
+            &prepared,
+            &serde_json::to_string(&result["committed"])?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let execution = ResourceRef {
+            space: SpaceId::parse(&verified.space_id())?,
+            resource: ResourceId::parse(&verified.resource_id())?,
+        };
+        assert_eq!(source_root(&local.connection, &execution)?, network.project);
+        assert!(remote.policy.verified().space(&network.space).is_none());
         Ok(())
     }
 

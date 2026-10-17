@@ -1,6 +1,9 @@
 //! Execution services require their physical owner's current personal root.
 
 use super::{bootstrap::recovery::RecoveryMaterial, governance, *};
+use crate::signature_verification::{
+    ScopedSignatureVerification, SignatureVerification, SignatureVerificationCounts,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +50,7 @@ pub struct VerifiedExecutionServiceRegistrationRequest {
     expires: u64,
     budget: Budget,
     max_depth: usize,
+    crypto_counts: Option<SignatureVerificationCounts>,
 }
 impl VerifiedExecutionServiceRegistrationRequest {
     pub fn expected_heads(&self) -> &[PolicyStamp] {
@@ -67,6 +71,14 @@ impl VerifiedExecutionServiceRegistrationRequest {
             bytes: self.budget.bytes,
             signatures: self.budget.signatures.len() + self.budget.external_signatures.len(),
             max_depth: self.max_depth,
+            actual_verifications: self
+                .crypto_counts
+                .as_ref()
+                .map_or(0, |counts| counts.actual_verifications as usize),
+            cache_hits: self
+                .crypto_counts
+                .as_ref()
+                .map_or(0, |counts| counts.cache_hits as usize),
         }
     }
 }
@@ -78,6 +90,8 @@ pub struct RegistrationProofCounts {
     pub bytes: usize,
     pub signatures: usize,
     pub max_depth: usize,
+    pub actual_verifications: usize,
+    pub cache_hits: usize,
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T> {
@@ -189,6 +203,7 @@ fn authorization(
         expires: budget.expires_at_ms,
         budget: budget.clone(),
         max_depth: state.grant_chain(Some(source_grant))?.len(),
+        crypto_counts: SignatureVerification::current_counts(),
     })
 }
 
@@ -198,6 +213,7 @@ pub fn verify_execution_service_registration(
     local_node: &PublicKey,
     now: u64,
 ) -> Result<VerifiedExecutionServiceRegistrationRequest> {
+    let _signature_scope = ScopedSignatureVerification::new();
     require(
         canonical(signed)?.len() <= MAX_PROOF_BYTES,
         "execution registration too large",
@@ -294,7 +310,7 @@ pub fn verify_execution_service_registration(
     budget.verify(&request.proposal)?;
     budget.verify(resource)?;
     budget.verify(parent)?;
-    let verified = authorization(
+    let mut verified = authorization(
         state,
         &intent.account,
         &signed.intent.issuer,
@@ -314,6 +330,7 @@ pub fn verify_execution_service_registration(
     candidate.install_resource(resource.clone())?;
     candidate.install_grant(parent.clone(), now)?;
     candidate.install_space(request.proposal.clone())?;
+    verified.crypto_counts = SignatureVerification::current_counts();
     Ok(verified)
 }
 
@@ -323,6 +340,7 @@ pub fn execution_service_registration_challenge(
     local_node: &PublicKey,
     now: u64,
 ) -> Result<FreshnessChallenge> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let verified = verify_execution_service_registration(state, request, local_node, now)?;
     let intent = &request.intent;
     Ok(FreshnessChallenge {
@@ -354,6 +372,7 @@ pub fn verify_execution_service_registration_freshness(
     local_node: &PublicKey,
     now: u64,
 ) -> Result<VerifiedExecutionServiceRegistrationRequest> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let mut verified = verify_execution_service_registration(state, request, local_node, now)?;
     check_registration_freshness(
         state,
@@ -364,6 +383,7 @@ pub fn verify_execution_service_registration_freshness(
         now,
         &mut verified,
     )?;
+    verified.crypto_counts = SignatureVerification::current_counts();
     Ok(verified)
 }
 
@@ -449,6 +469,7 @@ pub fn verify_execution_service_registration_commit(
     local_node: &PublicKey,
     now: u64,
 ) -> Result<VerifiedExecutionServiceRegistrationRequest> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let mut verified = verify_execution_service_registration(state, request, local_node, now)?;
     if let Some((challenge, receipts)) = freshness {
         check_registration_freshness(
@@ -485,6 +506,7 @@ pub fn verify_execution_service_registration_commit(
     candidate.install_resource(resource.clone())?;
     candidate.install_grant(parent.clone(), now)?;
     candidate.install_space_committed(committed.clone(), now)?;
+    verified.crypto_counts = SignatureVerification::current_counts();
     Ok(verified)
 }
 
@@ -579,6 +601,7 @@ pub fn prepare_execution_service_registration(
     now_ms: f64,
     expires_at_ms: f64,
 ) -> crate::Result<PreparedExecutionServiceRegistration> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let prepare = || -> Result<_> {
         bootstrap::recovery::inspect_account_recovery_material(owner_material_json, now_ms)
             .map_err(|_| {
@@ -790,6 +813,7 @@ pub fn finish_execution_service_registration(
     committed_json: &str,
     now_ms: f64,
 ) -> crate::Result<VerifiedExecutionServiceRegistration> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let finish = || -> Result<_> {
         let now = bootstrap::timestamp(now_ms)?;
         let committed: Committed<SpaceDocument> = parse(committed_json)?;
@@ -799,7 +823,7 @@ pub fn finish_execution_service_registration(
             "execution registration receipt is from the future",
         )?;
         let mut state = replay_policies(&prepared.pins, &prepared.bundle.journal)?;
-        let verified = verify_execution_service_registration_commit(
+        let mut verified = verify_execution_service_registration_commit(
             &state,
             &prepared.request,
             &committed,
@@ -877,6 +901,7 @@ pub fn finish_execution_service_registration(
         bootstrap::recovery::inspect_account_recovery_material(&material_json, now_ms).map_err(
             |_| AuthorizationError::InvalidProof("updated execution owner material is invalid"),
         )?;
+        verified.crypto_counts = SignatureVerification::current_counts();
         Ok(VerifiedExecutionServiceRegistration {
             resource: intent.payload.execution_resource.clone(),
             pins: personal_pins,
