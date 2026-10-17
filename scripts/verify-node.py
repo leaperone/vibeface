@@ -1770,9 +1770,12 @@ def acceptance(options):
         notification = "result:fixture-delayed-send:succeeded"
         wait_for("C receives durable B result notification", lambda: any(n["notification_id"] == notification for n in c.client.rpc("notifications", client_id=phone)["notifications"]))
         wait_for("C receives live event stream update", lambda: len(stream.lines) > 0)
-        after = c.client.rpc("conversation", conversation_id=conversation)
+        after = wait_for("fresh C reads the completed original binding",
+                         lambda: shared_history(c.client, conversation, task, send))
         require(next(item for item in after["tasks"] if item["task_id"] == task)["status"] != "accepted", "turn completion never accepts a task")
         require(any(s["session_id"] == "fixture-main" for s in after["sessions"]), "C reads actual B execution state after A exits")
+        require(next(item for item in after["operations"] if item["request"]["operation_id"] == send["operation_id"])["state"] == "succeeded",
+                "fresh C caches the original executor's known successful result")
         require(len(invocations(run, "delayed")) == 1, "retries and imported history do not repeat execution")
         wait_for("large result blob replicated to C", lambda: verify_blobs(c, network) >= 1)
         count = verify_snapshot(c.client.rpc("export", conversation_id=conversation))
