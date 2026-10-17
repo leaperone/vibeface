@@ -1,3 +1,5 @@
+mod handoff;
+
 mod dispatch;
 
 use crate::identity::policy::FreshnessProof;
@@ -25,7 +27,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use vibeface_secure::authorization::{
     AUTH_VERSION, Actor, Audience, CheckStage, DeviceId, FreshnessChallenge, FreshnessReceipt,
     INVOCATION_MAX_AGE_MS, Invocation, Nonce, ObjectHash, PolicyDomain, PublicKey, ServiceId,
-    Signed, SpaceId, TransportEvidence, VerifiedAuthorization, VerifiedClientAuthorization,
+    Signed, SpaceId, ResourceId, ResourceRef, TransportEvidence, VerifiedAuthorization, VerifiedClientAuthorization,
 };
 
 #[derive(Clone)]
@@ -1475,6 +1477,7 @@ pub struct Runtime {
     pub tool_url: std::sync::OnceLock<String>,
     pub maintenance: Arc<Gate>,
     completion_lock: Mutex<()>,
+    handoff_resolution_lock: Mutex<()>,
     execution_dispatch_polls: Mutex<BTreeSet<(String, String)>>,
     execution_leases: Mutex<BTreeSet<(String, String)>>,
     pub engine: Engine,
@@ -2383,6 +2386,7 @@ impl Runtime {
             tool_url: std::sync::OnceLock::new(),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             completion_lock: Mutex::new(()),
+            handoff_resolution_lock: Mutex::new(()),
             execution_dispatch_polls: Mutex::new(BTreeSet::new()),
             execution_leases: Mutex::new(BTreeSet::new()),
             engine,
@@ -2542,10 +2546,12 @@ impl Runtime {
     async fn recover_operations(self: &Arc<Self>) -> Result<()> {
         let _work = self.maintenance.enter()?;
         let networks = self.store.lock().await.networks()?;
+        let local = self.identity.node_id()?;
         for network in networks {
             self.flush_completions(&network).await?;
             let operations = self.store.lock().await.operations(&network)?;
             for operation in operations {
+                if operation.request.target_node != local { continue; }
                 if operation.state == OperationState::Unknown {
                     self.finish(&operation.request,OperationState::Unknown,if operation.result.is_null(){json!({"error":"Node restarted while the external outcome was unresolved; reconcile before retrying"})}else{operation.result}).await?;
                     continue;
@@ -2561,11 +2567,18 @@ impl Runtime {
                 });
             }
         }
+        self.recover_handoffs().await?;
+        self.recover_execution_dispatches().await?;
         Ok(())
     }
     pub(crate) async fn maintenance_idle(&self) -> Result<()> {
         let local = self.identity.node_id()?;
         let store = self.store.lock().await;
+        let pending_handoffs: u64 = store.connection.query_row(
+            "SELECT count(*) FROM execution_handoffs WHERE state IN ('accepted','running','unknown')",
+            [], |row| row.get(0),
+        )?;
+        ensure!(pending_handoffs == 0, Busy("delegated execution requires completion or reconciliation".into()));
         for network in store.networks()? {
             for operation in store.operations(&network)? {
                 if operation.request.target_node != local {
@@ -2999,6 +3012,8 @@ impl Runtime {
                     .filter(|operation| operation.request.conversation_id == scope)
                     .collect::<Vec<_>>();
                 let sessions = session_views(&store, network, &scope, &operations)?;
+                let operations = operations.iter().map(|operation| dispatch::execution_operation_view(&store, operation))
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(
                     json!({"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),"messages":store.messages(network,&scope)?,"tasks":task_views(&store,network,&scope)?,"heads":context.heads,"missing":context.missing,"sessions":sessions,"operations":operations}),
                 )
@@ -4658,6 +4673,10 @@ impl Runtime {
             .lock()
             .await
             .authorize_transport_node(&message.origin, now_ms() as u64)?;
+        if matches!(kind, "execution_handoff_submit" | "execution_handoff_status" | "execution_handoff_receipts" | "execution_handoff_resolve" | "execution_handoff_resolution_receipts") {
+            let origin = DeviceId::from_key(&PublicKey::parse(&certificate.public_key)?);
+            return self.handle_handoff_peer(message, origin).await;
+        }
         if kind == "freshness_receipt" {
             let challenge: FreshnessChallenge =
                 serde_json::from_value(envelope["challenge"].clone())?;
@@ -4770,13 +4789,15 @@ impl Runtime {
         let context = &envelope["execution_context"];
         let space = SpaceId::parse(field(context, "space_id")?)?;
         let operation_id = id(context, "operation_id")?;
-        let Some(operation) = self
+        let operation = self
             .store
             .lock()
             .await
-            .operation(space.as_str(), &operation_id)?
-        else {
-            return Ok(());
+            .operation(space.as_str(), &operation_id)?;
+        let Some(operation) = operation else {
+            return self.observe_handoff(&envelope, ResourceRef {
+                space: space.clone(), resource: ResourceId::parse(field(context, "resource_id")?)?,
+            }, &operation_id).await;
         };
         if !matches!(
             operation.state,
