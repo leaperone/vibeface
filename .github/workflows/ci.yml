@@ -136,8 +136,8 @@ jobs:
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           bash -n install.sh
-          bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/verify-schema.sh
-          shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/verify-schema.sh
+          bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/verify-schema.sh scripts/build-execution-image.sh
+          shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/verify-schema.sh scripts/build-execution-image.sh
           bash install.sh --self-test
       - name: Check JavaScript syntax
         run: |
@@ -220,6 +220,8 @@ jobs:
           web = binary.parent / "web"
           assert (web / "vibeface_secure.js").stat().st_size > 0
           assert (web / "vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm")
+          assert (binary.parent / "scripts/build-execution-image.sh").is_file()
+          assert (binary.parent / "scripts/execution/Dockerfile").is_file()
           assert subprocess.check_output([str(binary), "--version"], text=True).strip() == f'vibeface {info["version"]}'
           PY
           "$package/vibeface" --help

@@ -22,9 +22,11 @@ cd vibeface-<version>-<target>
 ./vibeface --help
 ```
 
-包内有 Rust 程序、SDK sidecar 源码、浏览器密码学 JS/WASM、文档、用户级服务安装脚本和 `BUILD-INFO.json`，不含身份、配置、数据库、Provider 程序、模型凭证或 npm 依赖。干净 Git 提交的正常构建会记录版本、target 和源码提交；`--skip-build` 或未提交源码构建的 `source_commit` 为 `null`，不能作为提交身份的证明。
+包内有 Rust 程序、SDK sidecar 源码、浏览器密码学 JS/WASM、文档、用户级服务安装脚本、共享执行镜像的 Dockerfile 与构建脚本，以及 `BUILD-INFO.json`。不含身份、配置、数据库、Provider 程序、模型凭证或 npm 依赖。干净 Git 提交的正常构建会记录版本、target 和源码提交；`--skip-build` 或未提交源码构建的 `source_commit` 为 `null`，不能作为提交身份的证明。
 
 运行任务前须另装并登录相应 Provider。Codex SDK 管理路径还需 Node.js 18+，在包的 `sidecars/` 下执行 `npm ci --omit=dev`。Cursor 管理路径需另装 Cursor SDK Bridge 并配置凭证。初始化、配对、服务安装和公网 TLS 见 [Node 使用说明](node.md)。
+
+共享资源另用 Docker 隔离执行，按[共享执行镜像](execution-image.md)构建真实 Codex、Claude Code 和 watchdog 依赖。构建输出固定 image ID 与源码身份，不发布远程镜像。宿主 Provider 凭证不进入执行容器。
 
 ## CI 验证范围
 
