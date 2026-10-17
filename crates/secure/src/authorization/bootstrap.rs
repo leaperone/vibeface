@@ -1,5 +1,6 @@
 //! Two-phase account creation with a pinned Node and its device possession proof.
 
+pub mod recovery;
 use super::*;
 
 pub const NODE_CLAIM_MAX_AGE_MS: u64 = 120_000;
