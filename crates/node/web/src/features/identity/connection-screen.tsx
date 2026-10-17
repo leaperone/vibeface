@@ -10,6 +10,8 @@ import { messageOf, parseEntry } from '@/lib/node'
 import { passphrase } from '@/lib/secure'
 import { useDevice } from './context'
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
+import { VaultControls } from './vault-controls'
+import { IncomingEnrollmentControls } from './enrollment-status'
 
 const input = 'min-h-10'
 const button = 'min-h-10'
@@ -22,7 +24,6 @@ export function ConnectionScreen() {
   const [busy, setBusy] = useState(false)
   const pending = useRef(false)
   const [error, setError] = useState('')
-  const [confirmed, setConfirmed] = useState(false)
   const [entryOpen, setEntryOpen] = useState(false)
   const [invitationOpen, setInvitationOpen] = useState(false)
   useEffect(() => {
@@ -47,21 +48,15 @@ export function ConnectionScreen() {
       <header className="space-y-2 pb-2">
         <p className="text-sm font-medium text-muted-foreground">Vibeface</p>
         <h1 className="text-2xl font-semibold tracking-tight">连接设备</h1>
-        <p className="text-sm text-muted-foreground">选择已保存的入口，或使用邀请加入网络。</p>
+        <p className="text-sm text-muted-foreground">解锁此浏览器的独立设备配置，再选择入口或使用设备邀请。</p>
       </header>
       {['initializing', 'connecting', 'unpaired'].includes(device.phase) && <p role="status" className="text-sm text-muted-foreground">{device.phase === 'initializing' ? '正在读取设备密钥…' : device.phase === 'connecting' ? '正在建立加密连接并核对设备…' : '等待此浏览器授权。'}</p>}
       {(error || device.error) && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error || device.error}</p>}
       {device.phase === 'blocked' && <Card className={panel} aria-labelledby="secure-page-title"><h2 id="secure-page-title" className="font-semibold">需要可信的安全页面</h2><p className="text-sm text-muted-foreground">请在节点本机打开 http://localhost:4790，或使用你信任的 HTTPS 客户端。普通局域网 HTTP 页面不能安全保存设备密钥。可信页面仍可连接允许的局域网节点。</p></Card>}
-      {device.phase === 'key_lost' && <Card className={panel} aria-labelledby="lost-key-title"><h2 id="lost-key-title" className="font-semibold">设备密钥已丢失</h2><p className="text-sm text-muted-foreground">原设备授权不会自动迁移到新密钥。生成新设备密钥后，请在管理设备上重新配对，或导入恢复包。</p><Button variant="outline" className={`${button} self-start`} type="button" disabled={busy} onClick={() => void run(device.replaceLostKey)}>生成新设备密钥</Button></Card>}
+      {['vault_empty', 'vault_locked', 'vault_unavailable', 'key_lost'].includes(device.phase) && <VaultControls />}
+      {device.identity && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.lockVault}>锁定设备仓库</Button>}
       {device.review && <RecoveryReview />}
-      {device.waiting && <Card className={panel} aria-labelledby="pair-review-title">
-        <h2 id="pair-review-title" className="font-semibold">{device.waiting.accepted ? '等待管理设备确认' : '确认加入网络'}</h2>
-        <p className="text-sm text-muted-foreground">请与管理设备核对以下完整指纹。双方确认后，此浏览器获得普通客户端权限。</p>
-        <dl className="grid gap-3 text-sm"><div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono text-xs">{device.waiting.network_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono text-xs">{device.waiting.review.inviter_subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">此浏览器</dt><dd className="break-all font-mono text-xs">{device.waiting.review.new_member.subject_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">设备名称</dt><dd className="break-all">{device.waiting.review.new_member.name}</dd></div></dl>
-        {!device.waiting.accepted && <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />我已核对个人网络及双方设备指纹</label>}
-        <div className="flex flex-wrap gap-2"><Button className={button} type="button" disabled={busy || !device.waiting.accepted && !confirmed} onClick={() => void run(device.waiting?.accepted ? device.checkPair : device.acceptPair)}>{device.waiting.accepted ? '检查配对进度' : '确认加入'}</Button><Button variant="outline" className={button} type="button" onClick={() => { device.cancelPair(); setConfirmed(false) }}>取消本地配对</Button></div>
-        <p className="text-xs text-muted-foreground">取消仅清除此浏览器的等待记录。若已发送确认，请在管理设备上核对设备授权。</p>
-      </Card>}
+      <IncomingEnrollmentControls />
       <Card className="gap-0 py-0">
         {device.entries.length > 0 && <div className="space-y-3 p-5">
           <h2 className="font-semibold">已保存的入口</h2>
@@ -88,21 +83,20 @@ export function ConnectionScreen() {
       </Card>
       <Card className="gap-0 py-0">
         <Collapsible open={invitationOpen} onOpenChange={setInvitationOpen}>
-          <CollapsibleTrigger asChild><Button variant="ghost" className={disclosure} type="button"><span className="font-semibold">使用邀请加入或创建网络</span><ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform" /></Button></CollapsibleTrigger>
+          <CollapsibleTrigger asChild><Button variant="ghost" className={disclosure} type="button"><span className="font-semibold">使用设备邀请或可信 Node 连接卡</span><ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform" /></Button></CollapsibleTrigger>
           <CollapsibleContent forceMount className="space-y-4 px-5 pb-5 data-[state=closed]:hidden">
-            <p className="text-sm text-muted-foreground">已有网络：从管理设备获取一次性邀请。首次创建：在节点终端运行 <code>vibeface access</code>，粘贴输出。</p>
+            <p className="text-sm text-muted-foreground">在新设备上扫描自己设备显示的二维码。首次创建账户时，在 Node 终端运行 <code>vibeface access</code>，使用其输出的可信连接卡。</p>
             <form className="space-y-4" onSubmit={event => {
               event.preventDefault(); const form = event.currentTarget
               void run(async () => {
                 const password = value(form, 'password'); const confirmation = value(form, 'confirmation')
-                try { await device.pair(value(form, 'invitation'), value(form, 'name'), password || confirmation ? passphrase(password, confirmation) : undefined) }
+                try { await device.useConnectionCard(value(form, 'invitation'), password || confirmation ? passphrase(password, confirmation) : undefined) }
                 finally { form.reset() }
               })
-            }}><fieldset disabled={busy || !usable || !!device.review} className="space-y-4">
-              <label className="grid gap-2 text-sm">邀请内容<Textarea key={device.initialInvitation} className="min-h-28 font-mono text-xs" name="invitation" required defaultValue={device.initialInvitation} autoComplete="off" spellCheck={false} /></label>
-              <label className="grid gap-2 text-sm">此浏览器名称<Input className={input} name="name" required maxLength={128} autoComplete="off" /></label>
+            }}><fieldset disabled={busy || !usable || !!device.review || !!device.incomingEnrollment} className="space-y-4">
+              <label className="grid gap-2 text-sm">设备邀请或连接卡<Textarea key={device.initialInvitation} className="min-h-28 font-mono text-xs" name="invitation" required defaultValue={device.initialInvitation} autoComplete="off" spellCheck={false} /></label>
               <details className="group/passphrase">
-                <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-2 rounded-lg text-sm font-medium focus-visible:outline-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">首次创建：设置恢复包口令<ChevronDown className="size-4 transition-transform group-open/passphrase:rotate-180" /></summary>
+                <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-2 rounded-lg text-sm font-medium focus-visible:outline-2 focus-visible:outline-ring [&::-webkit-details-marker]:hidden">首次创建账户时设置恢复包口令<ChevronDown className="size-4 transition-transform group-open/passphrase:rotate-180" /></summary>
                 <div className="space-y-4 pt-2">
                   <p className="text-xs text-muted-foreground">至少 12 个字符。请独立保存口令，网站无法找回。</p>
                   <label className="grid gap-2 text-sm">加密恢复包口令<Input className={input} type="password" name="password" autoComplete="new-password" minLength={12} /></label>

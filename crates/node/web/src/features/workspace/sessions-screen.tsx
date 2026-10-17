@@ -28,15 +28,18 @@ export function SessionsScreen() {
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [executorId, setExecutorId] = useState("")
+  const [taskId, setTaskId] = useState("")
   const [kind, setKind] = useState("codex")
   const devices = workspace.nodes.filter((node) => node.roles?.includes("executor"))
   const selected = devices.find((node) => node.node_id === executorId)
   const kinds = selected?.capabilities?.executors ?? []
   const sessions = workspace.data?.sessions ?? []
+  const tasks = (workspace.data?.tasks ?? []).filter(task => task.binding === null && !["accepted", "cancelled"].includes(task.status))
   const operations = [...(workspace.data?.operations ?? [])].reverse()
   const unresolved = operations.filter((operation) => operation.state === "unknown")
   const history = operations.filter((operation) => operation.state !== "unknown")
   const pending = workspace.pending.filter((item) => item.conversation_id === workspace.conversationId)
+  const pendingBindings = workspace.pendingBindings.filter(item => item.request.conversation_id === workspace.conversationId)
 
   useEffect(() => {
     if (typeof document !== "undefined" && document.activeElement?.id === "executor-node") return
@@ -46,6 +49,10 @@ export function SessionsScreen() {
   useEffect(() => {
     if (kinds.length > 0 && !kinds.includes(kind)) setKind(kinds[0])
   }, [kind, kinds])
+
+  useEffect(() => {
+    setTaskId(current => tasks.some(task => task.task_id === current) ? current : tasks[0]?.task_id ?? "")
+  }, [tasks])
 
   return (
     <section className="workspace-screen space-y-5" aria-label="执行会话" hidden={workspace.view !== "sessions"}>
@@ -68,8 +75,9 @@ export function SessionsScreen() {
                   setBusy(true)
                   void workspace.run(async () => {
                     if (!target?.online) throw new Error("执行设备离线，请先恢复连接。")
+                    if (!tasks.some(task => task.task_id === taskId)) throw new Error("先选择尚未绑定的工单。")
                     await workspace.operate(
-                      { target_node: target.node_id, session_id: newId(), revision: 0 },
+                      { target_node: target.node_id, session_id: newId(), task_id: taskId, revision: 0 },
                       { type: "open", executor: kind, cwd: String(new FormData(form).get("cwd") ?? "").trim() },
                       workspace.conversationId,
                     )
@@ -78,6 +86,14 @@ export function SessionsScreen() {
                 }}
               >
                 <FieldGroup>
+                  <Field>
+                    <FieldLabel htmlFor="executor-task">工单</FieldLabel>
+                    <NativeSelect id="executor-task" name="task_id" required value={taskId} onChange={(event: ChangeEvent<HTMLSelectElement>) => setTaskId(event.target.value)}>
+                      {tasks.length ? tasks.map(task => (
+                        <NativeSelectOption key={task.task_id} value={task.task_id}>{task.title}</NativeSelectOption>
+                      )) : <NativeSelectOption value="">先创建尚未绑定的工单</NativeSelectOption>}
+                    </NativeSelect>
+                  </Field>
                   <Field>
                     <FieldLabel htmlFor="executor-node">执行设备</FieldLabel>
                     <NativeSelect id="executor-node" name="target_node" required value={executorId} onChange={(event: ChangeEvent<HTMLSelectElement>) => setExecutorId(event.target.value)}>
@@ -101,7 +117,7 @@ export function SessionsScreen() {
                     <Input id="session-cwd" name="cwd" required placeholder="/Users/you/project" maxLength={4096} />
                     <p className="text-sm text-muted-foreground">使用执行设备允许的目录。</p>
                   </Field>
-                  <SubmitButton busy={busy}>打开会话</SubmitButton>
+                  <Button type="submit" disabled={busy || !tasks.length || !workspace.writable} aria-busy={busy}>绑定工单并打开会话</Button>
                 </FieldGroup>
               </form>
             </CardContent>
@@ -110,12 +126,22 @@ export function SessionsScreen() {
       </Collapsible>
       <div className="grid gap-4">
         {pending.map((operation) => <PendingCard key={operation.operation_id} operation={operation} />)}
+        {pendingBindings.map(item => (
+          <Card key={item.request.operation_id}>
+            <CardHeader><CardTitle>有一笔工单绑定尚未确认</CardTitle></CardHeader>
+            <CardContent>
+              <p className="break-words text-sm">{item.task.title} · {nodeName(item.request.target_node)} · {item.request.action.cwd}</p>
+              <p className="text-sm text-muted-foreground">保留原会话编号和绑定内容。先向节点核对；仍未找到时，按原内容重试绑定，验证后打开会话。</p>
+              <ActionButton action={() => workspace.run(() => workspace.resumeBinding(item.request.operation_id))}>核对原绑定并打开会话</ActionButton>
+            </CardContent>
+          </Card>
+        ))}
         {unresolved.map((operation) => (
           <OperationCard key={operation.request.operation_id} operation={operation} />
         ))}
         {sessions.length ? sessions.map((session) => (
           <SessionCard key={`${session.target_node}:${session.session_id}`} session={session} conversationId={workspace.conversationId} />
-        )) : <p className="py-10 text-center text-sm text-muted-foreground">{workspace.conversationId ? "还没有执行会话，可让调度 Agent 派发任务或打开执行器。" : "先选择或新建会话，再打开执行会话。"}</p>}
+        )) : <p className="py-10 text-center text-sm text-muted-foreground">{workspace.conversationId ? "还没有执行会话，请先创建工单，再绑定到执行设备。" : "先选择或新建会话，再打开执行会话。"}</p>}
       </div>
       <Collapsible>
         <CollapsibleTrigger asChild>
@@ -209,7 +235,7 @@ function SessionCard({ session, conversationId }: { session: SessionRecord; conv
             <Button type="button" variant="ghost" className="h-auto min-h-9 gap-2 px-0 text-muted-foreground [&[data-state=open]>svg]:rotate-180">会话详情<ChevronDownIcon className="size-4 shrink-0 transition-transform" /></Button>
           </CollapsibleTrigger>
           <CollapsibleContent className="grid gap-3 pt-3">
-            <DetailList pairs={[["会话 ID", session.session_id], ["版本", session.revision === undefined ? undefined : String(session.revision)]]} />
+            <DetailList pairs={[["工单", session.task_id], ["会话 ID", session.session_id], ["版本", session.revision === undefined ? undefined : String(session.revision)]]} />
             {actual !== undefined ? <RawDetails title="实际执行状态" value={actual} /> : null}
           </CollapsibleContent>
         </Collapsible>

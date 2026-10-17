@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import {
   Sidebar,
   SidebarContent,
@@ -161,6 +162,9 @@ function WorkspaceLayout() {
           </SidebarGroup>
         </SidebarContent>
         <SidebarFooter className="max-h-[45%] shrink-0 gap-2 overflow-y-auto border-t px-4 py-3">
+          {device.spaces.length > 1 && <label className="grid gap-1 text-xs text-muted-foreground">当前空间<NativeSelect aria-label="切换空间" value={device.ready?.scope.space_id ?? ''} onChange={event => void workspace.run(() => device.selectSpace(event.target.value))}>{device.spaces.map(space => <NativeSelectOption key={space.spaceId} value={space.spaceId}>{space.spaceId.slice(0, 17)}</NativeSelectOption>)}</NativeSelect></label>}
+          {device.ready && <label className="grid min-w-0 gap-1 text-xs text-muted-foreground">当前项目<NativeSelect aria-label="切换项目" value={device.ready.project.id} onChange={event => void workspace.run(() => device.selectProject(event.target.value))}>{device.ready.projects.map(project => <NativeSelectOption key={project.id} value={project.id}>{project.id.slice(0, 17)}</NativeSelectOption>)}</NativeSelect></label>}
+          <Button type="button" size="sm" variant="ghost" className="h-8 justify-start px-0 text-muted-foreground" onClick={device.lockVault}>锁定设备仓库</Button>
           <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground" data-connection={workspace.connectionOnline ? "online" : "offline"} title={workspace.connectionText}>
             <span className={`size-1.5 shrink-0 rounded-full ${workspace.connectionOnline ? "bg-emerald-500" : "bg-destructive"}`} aria-hidden="true" />
             <span>{workspace.connectionOnline ? "已连接" : "连接已中断"}</span>

@@ -23,10 +23,6 @@ export function writeStorage(key: string, value: unknown, required = false) {
   }
 }
 
-export function networkKey(key: string, networkId: string) {
-  return `${key}.${networkId}`
-}
-
 export function newId() {
   return globalThis.crypto.randomUUID()
 }
