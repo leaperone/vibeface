@@ -40,7 +40,11 @@ fn prepared_request(
     Ok(Some(serde_json::from_value(prepared["request"].clone())?))
 }
 
-fn bound_request(context: &Context, proof: &SignedBinding) -> Result<Option<OperationRequest>> {
+fn bound_request(
+    store: &Store,
+    context: &Context,
+    proof: &SignedBinding,
+) -> Result<Option<OperationRequest>> {
     let binding = &proof.binding;
     let mut requests = Vec::new();
     for event in &context.events {
@@ -77,15 +81,31 @@ fn bound_request(context: &Context, proof: &SignedBinding) -> Result<Option<Oper
     else {
         return Ok(None);
     };
-    let mut latest = requests
+    let latest = requests
         .into_iter()
-        .filter(|request| request.expected_revision == revision);
-    let request = latest.next();
+        .filter(|request| request.expected_revision == revision)
+        .collect::<Vec<_>>();
+    if latest.len() == 1 {
+        return Ok(latest.into_iter().next());
+    }
+    let mut proven = Vec::new();
+    for request in latest {
+        let admitted = store
+            .operation(&request.network_id, &request.operation_id)?
+            .is_some_and(|operation| {
+                operation.state != OperationState::Rejected
+                    && same_business_request(&operation.request, &request)
+            });
+        let observed = context.events.iter().any(|event|event.scope_id == binding.conversation_id && event.author == binding.target_node && matches!(&event.body,EventBody::ExecutionObserved { operation_id,task_id:Some(task),target_node,session_id,status,.. } if operation_id == &request.operation_id && task == &binding.task_id && target_node == &binding.target_node && session_id == &binding.session_id && status != "rejected"));
+        if admitted || observed {
+            proven.push(request);
+        }
+    }
     ensure!(
-        latest.next().is_none(),
+        proven.len() == 1,
         "task has competing execution requests; reconcile before controlling it"
     );
-    Ok(request)
+    Ok(proven.pop())
 }
 
 fn pending_requests(snapshot: &Value, native: Option<&str>, turn: Option<&str>) -> Vec<Value> {
@@ -98,7 +118,7 @@ fn pending_requests(snapshot: &Value, native: Option<&str>, turn: Option<&str>) 
         .filter(|request| serde_json::from_value::<vibeface_protocol::RpcId>(request["id"].clone()).is_ok())
         .map(|request| {
             let method = request["method"].as_str().unwrap_or("request");
-            let mut projected = json!({"request_id":request["id"],"kind":method,"text":serde_json::to_string_pretty(&request["params"]).unwrap_or_default()});
+            let mut projected = json!({"request_id":request["id"],"kind":method,"text":request_text(method,&request["params"])});
             if matches!(method, "item/commandExecution/requestApproval" | "item/fileChange/requestApproval") {
                 let decisions = request["params"]["availableDecisions"].as_array();
                 let choices = [("批准一次", "accept"), ("拒绝", "decline"), ("取消本轮", "cancel")]
@@ -118,18 +138,59 @@ fn pending_requests(snapshot: &Value, native: Option<&str>, turn: Option<&str>) 
 }
 
 fn executor_capabilities(executor: &str, reachable: bool) -> Vec<&'static str> {
-    if executor == "codex" && reachable {
-        vec![
-            "open",
-            "send",
-            "read",
-            "steer",
-            "interrupt",
-            "respond_request",
-        ]
-    } else {
-        vec!["open", "send"]
+    serde_json::from_value::<ExecutorKind>(json!(executor))
+        .map(|kind| {
+            kind.capabilities()
+                .iter()
+                .copied()
+                .filter(|capability| reachable || matches!(*capability, "open" | "send"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn request_text(method: &str, params: &Value) -> String {
+    let mut lines = vec![match method {
+        "item/commandExecution/requestApproval" => "执行器请求运行命令。".to_owned(),
+        "item/fileChange/requestApproval" => "执行器请求修改文件。".to_owned(),
+        "item/tool/requestUserInput" => "执行器需要你补充信息。".to_owned(),
+        _ => return "执行器发来暂不支持的请求，请到执行设备处理。".into(),
+    }];
+    if let Some(reason) = params["reason"]
+        .as_str()
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        lines.push(reason.into());
     }
+    if method == "item/commandExecution/requestApproval" {
+        if let Some(command) = params["command"].as_str() {
+            lines.push(format!("命令：{command}"));
+        } else if let Some(command) = params["command"].as_array() {
+            lines.push(format!(
+                "命令：{}",
+                command
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
+        if let Some(cwd) = params["cwd"].as_str() {
+            lines.push(format!("目录：{cwd}"));
+        }
+    }
+    if method == "item/fileChange/requestApproval" {
+        if let Some(root) = params["grantRoot"].as_str() {
+            lines.push(format!("允许修改的目录：{root}"));
+        }
+        if let Some(changes) = params["changes"].as_object() {
+            lines.push(format!(
+                "文件：{}",
+                changes.keys().cloned().collect::<Vec<_>>().join("、")
+            ));
+        }
+    }
+    lines.join("\n")
 }
 
 fn artifact_page(hash: &str, bytes: &[u8], offset: u64, limit: u64) -> Result<Value> {
@@ -236,7 +297,7 @@ impl Runtime {
                     continue;
                 }
                 targets.insert(binding.target_node.clone());
-                let request = match bound_request(&context, &proof) {
+                let request = match bound_request(&store, &context, &proof) {
                     Ok(request) => request,
                     Err(error) => {
                         value["binding_error"] = json!(format!("{error:#}"));
@@ -416,7 +477,7 @@ impl Runtime {
             "task history is incomplete or conflicting"
         );
         let request =
-            bound_request(&context, &proof)?.context("task has no dispatched execution")?;
+            bound_request(&store, &context, &proof)?.context("task has no dispatched execution")?;
         Ok((proof, request))
     }
 
@@ -700,6 +761,67 @@ mod tests {
     }
 
     #[test]
+    fn competing_dispatches_require_the_original_executors_proof() -> Result<()> {
+        let store = Store::open(":memory:")?;
+        let proof: SignedBinding = serde_json::from_value(
+            json!({"signature":"signature","binding":{"network_id":"network","conversation_id":"chat","task_ref":"creation","task_id":"task","authority_node":"scheduler","generation":1,"target_node":"executor","session_id":"session","open_spec":{"type":"open","executor":"codex","cwd":"/tmp"},"previous_binding_hash":null,"previous_seal":null}}),
+        )?;
+        let event = |author: &str, body: EventBody| Event {
+            version: 1,
+            network_id: "network".into(),
+            scope_id: "chat".into(),
+            author: author.into(),
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 0,
+            body,
+            blobs: vec![],
+        };
+        let mut context = Context {
+            network_id: "network".into(),
+            scope_id: "chat".into(),
+            heads: vec![],
+            events: vec![],
+            missing: MissingDependencies::default(),
+        };
+        for operation in ["winner", "rejected"] {
+            let request: OperationRequest = serde_json::from_value(
+                json!({"operation_id":operation,"network_id":"network","conversation_id":"chat","task_id":"task","target_node":"executor","session_id":"session","expected_revision":1,"basis_heads":[],"action":{"type":"send","text":"work"},"resources":[],"binding":proof}),
+            )?;
+            context.events.push(event(
+                "scheduler",
+                EventBody::DispatchRecorded {
+                    operation_id: operation.into(),
+                    task_id: Some("task".into()),
+                    target_node: "executor".into(),
+                    session_id: "session".into(),
+                    action: json!(request),
+                },
+            ));
+        }
+        assert!(bound_request(&store, &context, &proof).is_err());
+        let observed = EventBody::ExecutionObserved {
+            operation_id: "winner".into(),
+            task_id: Some("task".into()),
+            target_node: "executor".into(),
+            session_id: "session".into(),
+            status: "running".into(),
+            detail: json!({}),
+        };
+        context.events.push(event("other-node", observed.clone()));
+        assert!(bound_request(&store, &context, &proof).is_err());
+        context.events.push(event("executor", observed));
+        assert_eq!(
+            bound_request(&store, &context, &proof)?
+                .expect("proven winner")
+                .operation_id,
+            "winner"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn artifact_pages_preserve_utf8_and_reject_split_offsets() -> Result<()> {
         let bytes = "a中文🙂z".as_bytes();
         let first = artifact_page("hash", bytes, 0, 4)?;
@@ -781,6 +903,19 @@ mod tests {
         let snapshot = json!({"pending_requests":[{"id":1,"method":"item/tool/requestUserInput","params":{"questions":[]}}, {"id":2,"method":"item/commandExecution/requestApproval","params":{"threadId":"other","turnId":"original"}}]});
         assert!(pending_requests(&snapshot, None, Some("original")).is_empty());
         assert!(pending_requests(&snapshot, Some("native"), Some("original")).is_empty());
+        let projected = pending_requests(
+            &json!({"pending_requests":[{"id":9,"method":"item/commandExecution/requestApproval","params":{"threadId":"native","turnId":"original","command":"cargo check","cwd":"/workspace","reason":"核验修改"}}]}),
+            Some("native"),
+            Some("original"),
+        );
+        assert!(
+            projected[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cargo check")
+        );
+        assert!(!projected[0]["text"].as_str().unwrap().contains("threadId"));
+        assert!(!projected[0]["text"].as_str().unwrap().contains("turnId"));
         Ok(())
     }
 }
