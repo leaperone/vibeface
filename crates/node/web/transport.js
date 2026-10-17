@@ -72,7 +72,7 @@ async function claimKey(record) {
       const request = transaction.objectStore("keys").add(record, "identity");
       let alreadyStored = false;
       request.onerror = (event) => {
-        if (request.error?.name === "ConstraintError") { alreadyStored = true; event.preventDefault(); return; }
+        if (request.error?.name === "ConstraintError") { alreadyStored = true; event.preventDefault(); event.stopPropagation(); return; }
         reject(new Error("无法保存浏览器设备密钥。请允许持久存储后重试。"));
       };
       transaction.oncomplete = () => resolve(!alreadyStored);

@@ -625,6 +625,10 @@ async fn dispatch(
             }
             members.sort_by(|a, b| a.subject_id.cmp(&b.subject_id));
             let historical_nodes = recovery_history(state, &members)?;
+            let minimum_epoch = recovery
+                .minimum_epoch
+                .checked_add(1)
+                .context("recovery epoch overflow")?;
             let checkpoint = RootCheckpoint {
                 version: identity::IDENTITY_VERSION,
                 network_id: state.genesis.network_id.clone(),
@@ -632,7 +636,7 @@ async fn dispatch(
                     .epoch()
                     .checked_add(1)
                     .context("recovery epoch overflow")?
-                    .max(recovery.minimum_epoch),
+                    .max(minimum_epoch),
                 members,
                 historical_nodes,
                 signature: String::new(),
