@@ -1,5 +1,6 @@
 //! Typed, root-approved policy and single-path capability verification.
 
+pub mod bootstrap;
 use crate::{Identity, membership::canonical_json};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
