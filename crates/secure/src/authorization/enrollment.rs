@@ -836,16 +836,17 @@ pub fn finish_account_device_change(
     let finish = || -> Result<(Option<ClientAuthorizationBundle>, Vec<JournalEntry>, Vec<PolicyPin>, Option<PublicKey>)> {
         let now = time(now_ms)?;
         let committed: Committed<AccountDocument> = parse(committed_json)?;
+        let accepted = committed.commit.payload.accepted_at_ms;
         require(
-            committed.proposal == prepared.request.proposal,
+            committed.proposal == prepared.request.proposal && accepted <= now,
             "policy commit belongs to another device request",
         )?;
         let journal = prepared.bundle.as_ref().map(|bundle| bundle.journal.as_slice()).unwrap_or(&prepared.account_journal);
         let replay_pins: Vec<_> = prepared.pins.iter().filter(|pin| prepared.bundle.is_some()
             || pin.domain == PolicyDomain::Account(prepared.request.proposal.payload.account.clone())).cloned().collect();
         let mut state = replay_policies(&replay_pins, journal)?;
-        validate_device_request(&mut state, &prepared.request, now)?;
-        let head = state.install_account_committed(committed.clone(), now)?;
+        validate_device_request(&mut state, &prepared.request, accepted)?;
+        let head = state.replay_account_committed(committed.clone())?;
         let mut journal = journal.to_vec();
         let key = match &prepared.request.change {
             AccountDeviceChange::Enrollment { certificate, .. } => {
@@ -878,18 +879,16 @@ pub fn finish_account_device_change(
             .ok_or("missing enrolled client grant")?
             .payload
             .owner_space;
-        Some(
-            verify_client_authorization(
-                &encode(&bundle)?,
-                &encode(&pins)?,
-                prepared.request.proposal.payload.account.as_str(),
-                space.as_str(),
-                key.as_str(),
-                now_ms,
-            )?
-            .scope()
-            .clone(),
+        verify_client_authorization(
+            &encode(&bundle)?,
+            &encode(&pins)?,
+            prepared.request.proposal.payload.account.as_str(),
+            space.as_str(),
+            key.as_str(),
+            now_ms,
         )
+        .ok()
+        .map(|verified| verified.scope().clone())
     } else {
         None
     };
@@ -2008,6 +2007,39 @@ mod tests {
             result.scope.unwrap().device_id,
             proof.certificate.payload.device
         );
+    }
+
+    #[test]
+    fn completed_device_receipts_survive_pending_expiry_without_new_authority() {
+        let f = Fixture::new();
+        let proof = f.passkey_proof(6);
+        let passkey = prepare_passkey_device_enrollment(
+            &encode(&proof.intent).unwrap(),
+            &encode(&proof.certificate).unwrap(),
+            &encode(&proof.assertion).unwrap(),
+            &key(6),
+            &f.pins_json(),
+            &f.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        for prepared in [f.manager(5, vec![]), passkey] {
+            let result = f.accept(&prepared);
+            let Some(JournalEntry::AccountCommit(committed)) =
+                result.bundle.as_ref().unwrap().journal.last()
+            else {
+                panic!("missing committed result")
+            };
+            let receipt = encode(committed).unwrap();
+            let delayed =
+                finish_account_device_change(&prepared, &receipt, (NOW + 200_000) as f64).unwrap();
+            assert_eq!(delayed.pins_json().unwrap(), result.pins_json().unwrap());
+            let expired =
+                finish_account_device_change(&prepared, &receipt, (END + 1) as f64).unwrap();
+            assert_eq!(expired.pins_json().unwrap(), result.pins_json().unwrap());
+            assert_eq!(expired.scope_json().unwrap(), "null");
+            assert!(finish_account_device_change(&prepared, &receipt, (NOW - 1) as f64).is_err());
+        }
     }
 
     #[test]

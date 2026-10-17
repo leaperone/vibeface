@@ -1368,6 +1368,21 @@ mod tests {
             NOW,
         )
         .unwrap();
+        let late = finish_first_authenticator_registration(
+            &prepared,
+            &serde_json::to_string(&delta).unwrap(),
+            END + 1.0,
+        )
+        .unwrap();
+        assert_eq!(late.pins_json().unwrap(), finished.pins_json().unwrap());
+        assert!(
+            finish_first_authenticator_registration(
+                &prepared,
+                &serde_json::to_string(&delta).unwrap(),
+                NOW - 1.0
+            )
+            .is_err()
+        );
         let updated_pins: Vec<PolicyPin> =
             serde_json::from_str(&finished.pins_json().unwrap()).unwrap();
         let updated_bundle: ClientAuthorizationBundle =
@@ -1435,10 +1450,13 @@ mod tests {
         let bundle = original.bundle_json().unwrap();
         let new_claim = claim(7, 44, NOW);
         let prepared =
-            prepare_account_node_enrollment(&backup, &pins, &bundle, &new_claim, END, NOW).unwrap();
+            prepare_account_node_enrollment(&backup, &pins, &bundle, &key(3), &new_claim, END, NOW)
+                .unwrap();
         let request = prepared.request_json().unwrap();
         assert!(!request.contains("secret_hex"));
-        let signed: Signed<AccountNodeEnrollmentIntent> = serde_json::from_str(&request).unwrap();
+        let possession_request: AccountNodePossessionRequest =
+            serde_json::from_str(&request).unwrap();
+        let signed = possession_request.intent.clone();
         assert_eq!(
             signed.payload.certificate.owner,
             PolicyDomain::Account(original.authorization.scope.account_id.clone())
@@ -1448,47 +1466,17 @@ mod tests {
             [DeviceUse::Noise, DeviceUse::ServiceInvocation]
         );
         assert!(
-            sign_account_node_enrollment_possession(
-                &request,
-                &key(8),
-                &nonce(44),
-                &pins,
-                &bundle,
-                NOW
-            )
-            .is_err()
+            sign_account_node_enrollment_possession(&request, &key(8), &nonce(44), NOW).is_err()
         );
         assert!(
-            sign_account_node_enrollment_possession(
-                &request,
-                &key(7),
-                &nonce(43),
-                &pins,
-                &bundle,
-                NOW
-            )
-            .is_err()
+            sign_account_node_enrollment_possession(&request, &key(7), &nonce(43), NOW).is_err()
         );
         assert!(
-            sign_account_node_enrollment_possession(
-                &request,
-                &key(7),
-                &nonce(44),
-                &pins,
-                &bundle,
-                NOW + 100_000.0
-            )
-            .is_err()
+            sign_account_node_enrollment_possession(&request, &key(7), &nonce(44), NOW + 100_000.0)
+                .is_err()
         );
-        let possession = sign_account_node_enrollment_possession(
-            &request,
-            &key(7),
-            &nonce(44),
-            &pins,
-            &bundle,
-            NOW,
-        )
-        .unwrap();
+        let possession =
+            sign_account_node_enrollment_possession(&request, &key(7), &nonce(44), NOW).unwrap();
         assert!(
             prepare_account_node_enrollment_commit(&prepared, &backup, &"00".repeat(64), NOW)
                 .is_err()
@@ -1538,17 +1526,62 @@ mod tests {
         );
         let mut wrong = signed.payload;
         wrong.certificate.uses.push(DeviceUse::AccountInvocation);
-        let wrong = Signed::sign(wrong, &key(1)).unwrap();
+        let wrong = AccountNodePossessionRequest {
+            intent: Signed::sign(wrong, &key(1)).unwrap(),
+            ..possession_request
+        };
         assert!(
             sign_account_node_enrollment_possession(
                 &encode(&wrong).unwrap(),
                 &key(7),
                 &nonce(44),
-                &pins,
-                &bundle,
                 NOW
             )
             .is_err()
+        );
+        let mut changed_context: AccountNodePossessionRequest =
+            serde_json::from_str(&request).unwrap();
+        changed_context.bundle.grant_leaf = ObjectHash::body(&"another public context").unwrap();
+        assert!(
+            sign_account_node_enrollment_possession(
+                &encode(&changed_context).unwrap(),
+                &key(7),
+                &nonce(44),
+                NOW
+            )
+            .unwrap_err()
+            .contains("trust context")
+        );
+        let mut changed_installation: serde_json::Value =
+            serde_json::from_str(&installation).unwrap();
+        changed_installation["pins"] = serde_json::json!([]);
+        assert!(
+            verify_account_node_installation(
+                &encode(&changed_installation).unwrap(),
+                &key(7),
+                &nonce(44),
+                NOW
+            )
+            .unwrap_err()
+            .contains("trust context")
+        );
+        assert!(
+            after
+                .verify_account_client_device(
+                    result.account(),
+                    &DeviceId::from_key(&PublicKey::of(&key(3))),
+                    NOW as u64
+                )
+                .is_ok()
+        );
+        assert!(
+            after
+                .verify_account_client_device(
+                    result.account(),
+                    &DeviceId::from_key(&PublicKey::of(&key(4))),
+                    NOW as u64
+                )
+                .is_err()
         );
         for reused in 1..=4 {
             assert!(
@@ -1556,6 +1589,7 @@ mod tests {
                     &backup,
                     &pins,
                     &bundle,
+                    &key(3),
                     &claim(reused, 44, NOW),
                     END,
                     NOW

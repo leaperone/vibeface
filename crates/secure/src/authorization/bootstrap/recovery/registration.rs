@@ -255,10 +255,15 @@ pub fn finish_first_authenticator_registration(
             "first registration receipt changed the approved record or proposal",
         )?;
         let now = timestamp(now_ms)?;
+        let accepted = change.commit.payload.accepted_at_ms;
+        require(
+            accepted <= now,
+            "first registration receipt is from the future",
+        )?;
         let mut state = replay_policies(&prepared.pins, &prepared.bundle.journal)?;
-        state.install_authenticator(record.clone(), now)?;
-        let head = state.install_account_committed(change.clone(), now)?;
-        state.verify_authenticator(record, now)?;
+        state.install_authenticator(record.clone(), accepted)?;
+        let head = state.replay_account_committed(change.clone())?;
+        state.verify_authenticator(record, accepted)?;
         let mut pins = prepared.pins.clone();
         let pin = pins
             .iter_mut()

@@ -2542,6 +2542,33 @@ impl VerifiedPolicySet {
             verified_at_ms: now_ms,
         })
     }
+    /// Authenticates the current account client without granting operation rights.
+    pub fn verify_account_client_device(
+        &self,
+        account: &AccountId,
+        device: &DeviceId,
+        now_ms: u64,
+    ) -> Result<&Signed<DeviceCertificate>> {
+        let certificate = self.find_device(device)?;
+        require(
+            certificate.payload.owner == PolicyDomain::Account(account.clone())
+                && certificate.payload.subject == Actor::Account(account.clone())
+                && certificate.payload.uses.contains(&DeviceUse::Noise)
+                && certificate
+                    .payload
+                    .uses
+                    .contains(&DeviceUse::AccountInvocation),
+            "device is not a current account client",
+        )?;
+        self.validate_certificate(
+            certificate,
+            now_ms,
+            &mut Budget::default(),
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+        )?;
+        Ok(certificate)
+    }
     /// Verifies service membership; per-operation rights still require an Invocation.
     pub fn verify_service_device(
         &self,

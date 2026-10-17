@@ -7,6 +7,8 @@ use super::*;
 pub struct AccountNodeEnrollmentIntent {
     pub version: u16,
     pub account: AccountId,
+    pub requesting_device: DeviceId,
+    pub context_hash: ObjectHash,
     pub expected_head: PolicyStamp,
     pub authority: DeviceId,
     pub claim: Signed<NodeClaim>,
@@ -17,6 +19,18 @@ pub struct AccountNodeEnrollmentIntent {
 impl sealed::Sealed for AccountNodeEnrollmentIntent {}
 impl SignedObject for AccountNodeEnrollmentIntent {
     const DOMAIN: &'static str = "account-node-enrollment-v2";
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountNodePossessionRequest {
+    pub intent: Signed<AccountNodeEnrollmentIntent>,
+    pub pins: Vec<PolicyPin>,
+    pub bundle: ClientAuthorizationBundle,
+}
+
+fn context_hash(pins: &[PolicyPin], bundle: &ClientAuthorizationBundle) -> Result<ObjectHash> {
+    ObjectHash::body(&serde_json::json!({"pins": pins, "bundle": bundle}))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +159,7 @@ fn verify_intent(
         "node enrollment changed the current account root, head or authority",
     )?;
     validate_window(i.issued_at_ms, i.expires_at_ms, now)?;
+    state.verify_account_client_device(&i.account, &i.requesting_device, now)?;
     require(
         i.expires_at_ms - i.issued_at_ms <= NODE_CLAIM_MAX_AGE_MS
             && i.expires_at_ms <= i.claim.payload.expires_at_ms,
@@ -228,6 +243,7 @@ pub fn prepare_account_node_enrollment(
     material_json: &str,
     pins_json: &str,
     bundle_json: &str,
+    requesting_client: &Identity,
     claim: &VerifiedNodeClaim,
     certificate_expires_at_ms: f64,
     now_ms: f64,
@@ -254,6 +270,8 @@ pub fn prepare_account_node_enrollment(
             AccountNodeEnrollmentIntent {
                 version: AUTH_VERSION,
                 account: account.clone(),
+                requesting_device: DeviceId::from_key(&PublicKey::of(requesting_client)),
+                context_hash: context_hash(&pins, &bundle)?,
                 expected_head: head.clone(),
                 authority: state
                     .account(&account)
@@ -295,7 +313,11 @@ pub fn prepare_account_node_enrollment(
 impl PreparedAccountNodeEnrollment {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = requestJson))]
     pub fn request_json(&self) -> crate::Result<String> {
-        encode(&self.intent)
+        encode(&AccountNodePossessionRequest {
+            intent: self.intent.clone(),
+            pins: self.pins.clone(),
+            bundle: self.bundle.clone(),
+        })
     }
 }
 
@@ -304,15 +326,22 @@ pub fn sign_account_node_enrollment_possession(
     request_json: &str,
     node: &Identity,
     expected_claim_nonce: &str,
-    pins_json: &str,
-    bundle_json: &str,
     now_ms: f64,
 ) -> crate::Result<String> {
     let sign = || -> Result<String> {
-        let request: Signed<AccountNodeEnrollmentIntent> = decode_signed(request_json.as_bytes())?;
-        let pins: Vec<PolicyPin> = decode_bounded(pins_json, MAX_PROOF_BYTES)?;
-        let bundle = read_bundle(bundle_json)?;
-        let state = replay_policies(&pins, &bundle.journal)?;
+        let request: AccountNodePossessionRequest =
+            decode_bounded(request_json, MAX_RECOVERY_JOURNAL_BYTES)?;
+        require(
+            request.bundle.journal.len() <= 126
+                && canonical(&request.pins)?.len() <= MAX_PROOF_BYTES,
+            "node possession history requires checkpoint",
+        )?;
+        require(
+            request.intent.payload.context_hash == context_hash(&request.pins, &request.bundle)?,
+            "node possession changed the root approved public trust context",
+        )?;
+        let state = replay_policies(&request.pins, &request.bundle.journal)?;
+        let request = request.intent;
         let now = timestamp(now_ms)?;
         verify_intent(&state, &request, now)?;
         validate_claim(
@@ -540,6 +569,11 @@ pub fn verify_account_node_installation(
 ) -> crate::Result<VerifiedAccountNodeEnrollment> {
     let verify = || -> Result<VerifiedAccountNodeEnrollment> {
         let installation: AccountNodeInstallation = decode_bounded(installation_json, 2_097_152)?;
+        require(
+            installation.request.intent.payload.context_hash
+                == context_hash(&installation.pins, &installation.bundle)?,
+            "node installation changed the root approved public trust context",
+        )?;
         let accepted = installation.committed.commit.payload.accepted_at_ms;
         validate_claim(
             &installation.request.intent.payload.claim,
