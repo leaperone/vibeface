@@ -3190,6 +3190,66 @@ mod tests {
             })
         }
 
+        fn resign_resolution_account(
+            &self,
+            wire: &mut SignedExecutionHandoffResolution,
+        ) -> Result<()> {
+            let proof = &mut wire.resolution.account_admission;
+            let mut invocation = proof.invocation.payload.clone();
+            invocation.operation_id = proof.source_body["authorization_id"]
+                .as_str()
+                .unwrap()
+                .into();
+            invocation.body_hash = ObjectHash::body(&proof.source_body)?;
+            invocation.nonce = Nonce::random()?;
+            proof.invocation = Signed::sign(invocation.clone(), &self.executor.client)?;
+            let facts = RequestFacts {
+                resource: invocation.resource,
+                action: invocation.action,
+                audience: invocation.audience,
+                operation_id: invocation.operation_id,
+                body_hash: invocation.body_hash,
+                context: invocation.context,
+            };
+            let auth = self.store.policy.verified().verify_invocation(
+                &proof.invocation,
+                &facts,
+                &proof.transport.clone().into_evidence(),
+                now() + 50,
+            )?;
+            proof.challenge = FreshnessChallenge::new(
+                &auth,
+                CheckStage::Admit,
+                Nonce::random()?,
+                now() + 50,
+                now() + 10_050,
+            )?;
+            proof.receipts = self.store.sign_current_receipts(
+                &proof.challenge,
+                &self.project.node,
+                now() + 50,
+            )?;
+            proof.receipts.extend(self.store.sign_current_receipts(
+                &proof.challenge,
+                &self.executor.node,
+                now() + 50,
+            )?);
+            self.store.policy.verified().verify_freshness(
+                &auth,
+                &proof.challenge,
+                &proof.receipts,
+                now() + 51,
+            )?;
+            let signer = Identity::from_secret_hex(&self.project.node.secret_key_hex)
+                .map_err(anyhow::Error::msg)?;
+            let mut carrier = wire.invocation.payload.clone();
+            carrier.operation_id = proof.invocation.payload.operation_id.clone();
+            carrier.body_hash = ObjectHash::body(&wire.resolution)?;
+            carrier.nonce = Nonce::random()?;
+            wire.invocation = Signed::sign(carrier, &signer)?;
+            Ok(())
+        }
+
         fn resolution_freshness(
             &mut self,
             wire: &SignedExecutionHandoffResolution,
@@ -3517,6 +3577,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fully_signed_resolution_rejects_changed_tuple_and_only_one_decision_can_win()
+    -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        fixture.start_unknown()?;
+        let wire = fixture.resolution(ExecutionResolutionPurpose::ResolveUnknown)?;
+        let wrong_values = vec![
+            ("operation_id", json!("another-operation")),
+            ("session_id", json!("another-session")),
+            ("task_ref", json!("f".repeat(64))),
+            (
+                "original_body_hash",
+                json!(format!("h2_{}", "f".repeat(64))),
+            ),
+            ("execution_grant", json!(format!("h2_{}", "f".repeat(64)))),
+            ("conversation_id", json!("another-conversation")),
+            (
+                "unknown_receipt_hash",
+                json!(format!("h2_{}", "f".repeat(64))),
+            ),
+        ];
+        for (field, value) in wrong_values {
+            let mut altered = wire.clone();
+            altered.resolution.account_admission.source_body[field] = value;
+            fixture.resign_resolution_account(&mut altered)?;
+            let before = fixture.store.connection.total_changes();
+            assert!(
+                fixture
+                    .store
+                    .issue_execution_handoff_resolution_challenge(
+                        &altered,
+                        &fixture.transport,
+                        now() + 55
+                    )
+                    .is_err(),
+                "changed {field} must be rejected"
+            );
+            assert_eq!(
+                before,
+                fixture.store.connection.total_changes(),
+                "changed {field} must write nothing"
+            );
+        }
+        let mut other = wire.clone();
+        other.resolution.account_admission.source_body["authorization_id"] =
+            json!("opposite-resolution");
+        other.resolution.account_admission.source_body["outcome"] = json!("failed");
+        fixture.resign_resolution_account(&mut other)?;
+        let proof = fixture.resolution_freshness(&wire, now() + 55)?;
+        let other_proof = fixture.resolution_freshness(&other, now() + 55)?;
+        let stopped = fixture.fence("original-operation").await?;
+        fixture.store.resolve_execution_handoff(
+            &fixture.executor.node,
+            &wire,
+            &proof,
+            &fixture.transport,
+            &stopped,
+            now() + 56,
+        )?;
+        let before = fixture.store.connection.total_changes();
+        assert!(
+            fixture
+                .store
+                .resolve_execution_handoff(
+                    &fixture.executor.node,
+                    &other,
+                    &other_proof,
+                    &fixture.transport,
+                    &stopped,
+                    now() + 57
+                )
+                .is_err()
+        );
+        assert_eq!(before, fixture.store.connection.total_changes());
+        assert_eq!(
+            fixture.store.connection.query_row(
+                "SELECT state FROM execution_handoffs",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            "succeeded"
+        );
+        assert_eq!(
+            fixture.store.connection.query_row(
+                "SELECT COUNT(*) FROM execution_handoff_resolutions",
+                [],
+                |r| r.get::<_, u64>(0)
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolution_rechecks_both_current_devices_and_preserves_unknown_after_revocation()
+    -> Result<()> {
+        for revoke_project in [true, false] {
+            let mut fixture = Fixture::new()?;
+            fixture.start_unknown()?;
+            let wire = fixture.resolution(ExecutionResolutionPurpose::ResolveUnknown)?;
+            let proof = fixture.resolution_freshness(&wire, now() + 55)?;
+            let stopped = fixture.fence("original-operation").await?;
+            if revoke_project {
+                fixture.project.revoke_node(&mut fixture.store)?;
+            } else {
+                fixture.executor.revoke_node(&mut fixture.store)?;
+            }
+            let before = fixture.store.connection.total_changes();
+            assert!(
+                fixture
+                    .store
+                    .resolve_execution_handoff(
+                        &fixture.executor.node,
+                        &wire,
+                        &proof,
+                        &fixture.transport,
+                        &stopped,
+                        now() + 56
+                    )
+                    .is_err()
+            );
+            assert_eq!(before, fixture.store.connection.total_changes());
+            assert_eq!(
+                fixture.store.connection.query_row(
+                    "SELECT state FROM execution_handoffs",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )?,
+                "unknown"
+            );
+            assert_eq!(
+                fixture.store.connection.query_row(
+                    "SELECT COUNT(*) FROM execution_handoff_reservations",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )?,
+                1
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn terminal_reconciliation_is_purpose_bound_and_never_mutates_executor_state()
     -> Result<()> {
         let mut fixture = Fixture::new()?;
@@ -3626,6 +3828,24 @@ mod tests {
             fixture.executor.space
         );
         assert_eq!(duplicate.execution_context.space_id, fixture.project.space);
+        let read = fixture.freshness(CheckStage::RemoteRead, now() + 3)?;
+        let read_auth = fixture.store.execution_handoff_authorization(
+            fixture.executor.space.as_str(),
+            fixture.project.space.as_str(),
+            "original-operation",
+            now() + 4,
+        )?;
+        let before = fixture.store.connection.total_changes();
+        fixture
+            .store
+            .authorize_execution_handoff_read(&read_auth, &read, now() + 4)?;
+        assert_eq!(before, fixture.store.connection.total_changes());
+        assert!(
+            fixture
+                .store
+                .claim_execution_handoff(&fixture.executor.node, &read_auth, &read, now() + 4)
+                .is_err()
+        );
         assert_eq!(
             duplicate.execution_context.resource_id,
             fixture.project.resource
