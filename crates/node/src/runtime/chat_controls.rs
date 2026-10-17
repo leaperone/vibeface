@@ -40,21 +40,19 @@ fn prepared_request(
     Ok(Some(serde_json::from_value(prepared["request"].clone())?))
 }
 
-fn bound_request(
-    store: &Store,
-    context: &Context,
-    proof: &SignedBinding,
-) -> Result<Option<OperationRequest>> {
+fn bound_dispatches(context: &Context, proof: &SignedBinding) -> Result<Vec<OperationRequest>> {
     let binding = &proof.binding;
     let mut requests = Vec::new();
     for event in &context.events {
-        if event.scope_id != binding.conversation_id {
+        if event.network_id != binding.network_id || event.scope_id != binding.conversation_id {
             continue;
         }
         let EventBody::DispatchRecorded {
-            action,
             operation_id,
-            ..
+            task_id,
+            target_node,
+            session_id,
+            action,
         } = &event.body
         else {
             continue;
@@ -62,45 +60,122 @@ fn bound_request(
         let Ok(request) = serde_json::from_value::<OperationRequest>(action.clone()) else {
             continue;
         };
-        if request.network_id == binding.network_id
-            && request.conversation_id == binding.conversation_id
-            && request.task_id.as_deref() == Some(binding.task_id.as_str())
-            && request.target_node == binding.target_node
-            && request.session_id == binding.session_id
-            && request.operation_id == *operation_id
-            && request.binding.as_ref() == Some(proof)
-            && matches!(request.action["type"].as_str(), Some("open" | "send"))
+        if request.network_id != binding.network_id
+            || request.conversation_id != binding.conversation_id
+            || request.task_id.as_deref() != Some(binding.task_id.as_str())
+            || request.target_node != binding.target_node
+            || request.session_id != binding.session_id
+            || request.binding.as_ref() != Some(proof)
+        {
+            continue;
+        }
+        ensure!(
+            request.operation_id == *operation_id
+                && request.task_id == *task_id
+                && request.target_node == *target_node
+                && request.session_id == *session_id,
+            "dispatch metadata does not match its task request"
+        );
+        ensure!(
+            context.events.iter().all(|other| {
+                !matches!(&other.body, EventBody::DispatchRecorded { operation_id: id, .. } if id == operation_id)
+                    || (other.network_id == event.network_id
+                        && other.scope_id == event.scope_id
+                        && other.body == event.body)
+            }),
+            "operation ID reused with different dispatched body"
+        );
+        if !requests
+            .iter()
+            .any(|old: &OperationRequest| old.operation_id == request.operation_id)
         {
             requests.push(request);
         }
     }
-    let Some(revision) = requests
+    Ok(requests)
+}
+
+fn matches_dispatch(requests: &[OperationRequest], operation: &OperationRecord) -> Result<bool> {
+    let Some(request) = requests
         .iter()
-        .map(|request| request.expected_revision)
-        .max()
+        .find(|request| request.operation_id == operation.request.operation_id)
     else {
-        return Ok(None);
+        return Ok(false);
     };
-    let latest = requests
-        .into_iter()
-        .filter(|request| request.expected_revision == revision)
-        .collect::<Vec<_>>();
-    if latest.len() == 1 {
-        return Ok(latest.into_iter().next());
+    ensure!(
+        same_business_request(&operation.request, request),
+        "operation ledger does not match its dispatched body"
+    );
+    Ok(true)
+}
+
+fn bound_operations(
+    requests: &[OperationRequest],
+    records: impl IntoIterator<Item = OperationRecord>,
+) -> Result<Vec<OperationRecord>> {
+    let mut operations = Vec::new();
+    for record in records {
+        if matches_dispatch(requests, &record)?
+            && !operations.iter().any(|old: &OperationRecord| {
+                old.request.operation_id == record.request.operation_id
+            })
+        {
+            operations.push(record);
+        }
     }
+    Ok(operations)
+}
+
+fn status_records(status: &Value) -> Result<Vec<OperationRecord>> {
+    let mut records: Vec<OperationRecord> = status
+        .get("operations")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(operation) = status.get("operation") {
+        let operation: OperationRecord = serde_json::from_value(operation.clone())?;
+        if let Some(duplicate) = records
+            .iter()
+            .find(|record| record.request.operation_id == operation.request.operation_id)
+        {
+            ensure!(
+                duplicate == &operation,
+                "executor status has conflicting operation records"
+            );
+        } else {
+            records.push(operation);
+        }
+    }
+    Ok(records)
+}
+
+fn bound_request(
+    store: &Store,
+    context: &Context,
+    proof: &SignedBinding,
+) -> Result<Option<OperationRequest>> {
+    let binding = &proof.binding;
     let mut proven = Vec::new();
-    for request in latest {
-        let admitted = store
-            .operation(&request.network_id, &request.operation_id)?
-            .is_some_and(|operation| {
-                operation.state != OperationState::Rejected
-                    && same_business_request(&operation.request, &request)
-            });
-        let observed = context.events.iter().any(|event|event.scope_id == binding.conversation_id && event.author == binding.target_node && matches!(&event.body,EventBody::ExecutionObserved { operation_id,task_id:Some(task),target_node,session_id,status,.. } if operation_id == &request.operation_id && task == &binding.task_id && target_node == &binding.target_node && session_id == &binding.session_id && status != "rejected"));
+    for request in bound_dispatches(context, proof)? {
+        if !matches!(request.action["type"].as_str(), Some("open" | "send")) {
+            continue;
+        }
+        let admitted =
+            if let Some(operation) = store.operation(&request.network_id, &request.operation_id)? {
+                matches_dispatch(std::slice::from_ref(&request), &operation)?
+                    && operation.state != OperationState::Rejected
+            } else {
+                false
+            };
+        let observed = context.events.iter().any(|event|event.network_id == binding.network_id && event.scope_id == binding.conversation_id && event.author == binding.target_node && matches!(&event.body,EventBody::ExecutionObserved { operation_id,task_id:Some(task),target_node,session_id,status,.. } if operation_id == &request.operation_id && task == &binding.task_id && target_node == &binding.target_node && session_id == &binding.session_id && status != "rejected"));
         if admitted || observed {
             proven.push(request);
         }
     }
+    let Some(revision) = proven.iter().map(|request| request.expected_revision).max() else {
+        return Ok(None);
+    };
+    proven.retain(|request| request.expected_revision == revision);
     ensure!(
         proven.len() == 1,
         "task has competing execution requests; reconcile before controlling it"
@@ -257,6 +332,7 @@ impl Runtime {
         let mut tasks = Vec::new();
         let mut sessions = Vec::new();
         let mut operations = Vec::new();
+        let local_operations = store.operations(network)?;
         for task in store.tasks(network, scope)? {
             let mut value = json!(task);
             match store.followup_policy(network, scope, &task.task_id) {
@@ -305,21 +381,38 @@ impl Runtime {
                         continue;
                     }
                 };
+                let requests = bound_dispatches(&context, &proof)?;
                 let cached = store.local_value(
                     network,
                     &session_cache_key(&binding.target_node, &binding.session_id),
+                )?;
+                let local_target = binding.target_node == local;
+                let cached_records = cached
+                    .as_ref()
+                    .filter(|_| !local_target)
+                    .map(status_records)
+                    .transpose()?
+                    .unwrap_or_default();
+                let records = bound_operations(
+                    &requests,
+                    local_operations.iter().cloned().chain(cached_records),
                 )?;
                 let local_session =
                     store.session(network, &binding.target_node, &binding.session_id)?;
                 let session = local_session.or_else(|| {
                     cached.as_ref().and_then(|value| {
-                        serde_json::from_value::<ExecutionSession>(value["session"].clone()).ok()
+                        serde_json::from_value::<ExecutionSession>(value["session"].clone())
+                            .ok()
+                            .filter(|session| {
+                                session.network_id == *network
+                                    && session.target_node == binding.target_node
+                                    && session.session_id == binding.session_id
+                            })
                     })
                 });
                 let native = session
                     .as_ref()
                     .and_then(|session| session.native_session_id.as_deref());
-                let local_target = binding.target_node == local;
                 let actual = if local_target {
                     engine.clone()
                 } else {
@@ -334,25 +427,11 @@ impl Runtime {
                     .map(|session| session.executor.as_str())
                     .or_else(|| binding.open_spec["executor"].as_str())
                     .unwrap_or("");
-                let operation = request
-                    .as_ref()
-                    .and_then(|request| {
-                        store
-                            .operation(network, &request.operation_id)
-                            .ok()
-                            .flatten()
-                    })
-                    .or_else(|| {
-                        cached.as_ref().and_then(|value| {
-                            serde_json::from_value::<OperationRecord>(value["operation"].clone())
-                                .ok()
-                                .filter(|operation| {
-                                    request.as_ref().is_some_and(|request| {
-                                        same_business_request(&operation.request, request)
-                                    })
-                                })
-                        })
-                    });
+                let operation = request.as_ref().and_then(|request| {
+                    records
+                        .iter()
+                        .find(|record| record.request.operation_id == request.operation_id)
+                });
                 let turn = if local_target {
                     request
                         .as_ref()
@@ -362,7 +441,15 @@ impl Runtime {
                         .transpose()?
                         .flatten()
                 } else if operation.is_some() {
-                    cached.as_ref().map(|value| value["turn"].clone())
+                    cached
+                        .as_ref()
+                        .filter(|value| {
+                            request.as_ref().is_some_and(|request| {
+                                value["operation"]["request"]["operation_id"].as_str()
+                                    == Some(request.operation_id.as_str())
+                            })
+                        })
+                        .map(|value| value["turn"].clone())
                 } else {
                     None
                 };
@@ -377,9 +464,7 @@ impl Runtime {
                 if let Some(session) = session {
                     sessions.push(json!(session));
                 }
-                if let Some(operation) = operation {
-                    operations.push(json!(operation));
-                }
+                operations.extend(records.into_iter().map(|operation| json!(operation)));
                 value["binding"] = projected;
             }
             tasks.push(value);
@@ -459,7 +544,7 @@ impl Runtime {
         network: &str,
         scope: &str,
         task: &str,
-    ) -> Result<(SignedBinding, OperationRequest)> {
+    ) -> Result<(SignedBinding, Context)> {
         self.cache_context_bindings(network, scope).await?;
         let store = self.store.lock().await;
         let creation = store.task_creation(network, scope, task)?;
@@ -476,9 +561,7 @@ impl Runtime {
             context.missing.is_complete(),
             "task history is incomplete or conflicting"
         );
-        let request =
-            bound_request(&store, &context, &proof)?.context("task has no dispatched execution")?;
-        Ok((proof, request))
+        Ok((proof, context))
     }
 
     pub(super) async fn chat_task_status(
@@ -487,13 +570,17 @@ impl Runtime {
         scope: &str,
         task: &str,
     ) -> Result<Value> {
-        let (proof, request) = self.chat_binding(network, scope, task).await?;
+        let (proof, context) = self.chat_binding(network, scope, task).await?;
         ensure!(
             proof.binding.target_node == self.identity.node_id()?,
             "task is bound to another executor"
         );
-        let (session, operation, turn) = {
+        let (session, operation, operations, turn) = {
             let store = self.store.lock().await;
+            let requests = bound_dispatches(&context, &proof)?;
+            let request = bound_request(&store, &context, &proof)?
+                .context("task has no admitted execution")?;
+            let operations = bound_operations(&requests, store.operations(network)?)?;
             (
                 store
                     .session(network, &request.target_node, &request.session_id)?
@@ -501,6 +588,7 @@ impl Runtime {
                 store
                     .operation(network, &request.operation_id)?
                     .context("original operation not found")?,
+                operations,
                 store.local_value(network, &format!("turn:{}", request.operation_id))?,
             )
         };
@@ -533,7 +621,7 @@ impl Runtime {
             filtered["threads"][native] = snapshot["threads"][native].clone();
         }
         Ok(
-            json!({"session":session,"operation":operation,"turn":turn,"snapshot":filtered,"reachable":read_error.is_none() && snapshot["connection"]["state"]=="connected","read_error":read_error,"checked_at_ms":now_ms()}),
+            json!({"session":session,"operation":operation,"operations":operations,"turn":turn,"snapshot":filtered,"reachable":read_error.is_none() && snapshot["connection"]["state"]=="connected","read_error":read_error,"checked_at_ms":now_ms()}),
         )
     }
 
@@ -551,7 +639,7 @@ impl Runtime {
             matches!(action, "status" | "steer" | "interrupt" | "respond_request"),
             "unknown task control"
         );
-        let (proof, original) = self.chat_binding(&access.network_id, scope, task).await?;
+        let (proof, context) = self.chat_binding(&access.network_id, scope, task).await?;
         for (key, expected) in [
             ("network_id", access.network_id.as_str()),
             ("target_node", proof.binding.target_node.as_str()),
@@ -601,13 +689,26 @@ impl Runtime {
         }
         let session: ExecutionSession = serde_json::from_value(status["session"].clone())?;
         let operation: OperationRecord = serde_json::from_value(status["operation"].clone())?;
+        let requests = bound_dispatches(&context, &proof)?;
+        let original = requests
+            .iter()
+            .find(|request| request.operation_id == operation.request.operation_id)
+            .context("executor status has no dispatched task operation")?;
         ensure!(
             session.network_id == access.network_id
                 && session.target_node == proof.binding.target_node
                 && session.session_id == proof.binding.session_id
-                && same_business_request(&operation.request, &original),
+                && operation.state != OperationState::Rejected
+                && matches!(original.action["type"].as_str(), Some("open" | "send"))
+                && same_business_request(&operation.request, original),
             "executor status does not match the original task binding"
         );
+        for record in status_records(&status)? {
+            ensure!(
+                matches_dispatch(&requests, &record)?,
+                "executor status contains an operation outside this task binding"
+            );
+        }
         self.store.lock().await.local_set(
             &access.network_id,
             &session_cache_key(&session.target_node, &session.session_id),
@@ -801,7 +902,7 @@ mod tests {
                 },
             ));
         }
-        assert!(bound_request(&store, &context, &proof).is_err());
+        assert!(bound_request(&store, &context, &proof)?.is_none());
         let observed = EventBody::ExecutionObserved {
             operation_id: "winner".into(),
             task_id: Some("task".into()),
@@ -811,7 +912,7 @@ mod tests {
             detail: json!({}),
         };
         context.events.push(event("other-node", observed.clone()));
-        assert!(bound_request(&store, &context, &proof).is_err());
+        assert!(bound_request(&store, &context, &proof)?.is_none());
         context.events.push(event("executor", observed));
         assert_eq!(
             bound_request(&store, &context, &proof)?
@@ -819,6 +920,151 @@ mod tests {
                 .operation_id,
             "winner"
         );
+        let mut unadmitted = bound_dispatches(&context, &proof)?[0].clone();
+        unadmitted.operation_id = "newer-unadmitted-send".into();
+        unadmitted.expected_revision = 9;
+        context.events.push(event(
+            "scheduler",
+            EventBody::DispatchRecorded {
+                operation_id: unadmitted.operation_id.clone(),
+                task_id: unadmitted.task_id.clone(),
+                target_node: unadmitted.target_node.clone(),
+                session_id: unadmitted.session_id.clone(),
+                action: json!(unadmitted),
+            },
+        ));
+        assert_eq!(
+            bound_request(&store, &context, &proof)?
+                .unwrap()
+                .operation_id,
+            "winner"
+        );
+        context.events.push(event(
+            "executor",
+            EventBody::ExecutionObserved {
+                operation_id: "rejected".into(),
+                task_id: Some("task".into()),
+                target_node: "executor".into(),
+                session_id: "session".into(),
+                status: "running".into(),
+                detail: json!({}),
+            },
+        ));
+        assert!(bound_request(&store, &context, &proof).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_controls_survive_status_cache_without_replacing_the_primary_operation() -> Result<()>
+    {
+        let proof: SignedBinding = serde_json::from_value(
+            json!({"signature":"signature","binding":{"network_id":"network","conversation_id":"chat","task_ref":"creation","task_id":"task","authority_node":"scheduler","generation":1,"target_node":"executor","session_id":"session","open_spec":{"type":"open","executor":"codex","cwd":"/tmp"},"previous_binding_hash":null,"previous_seal":null}}),
+        )?;
+        let primary: OperationRequest = serde_json::from_value(
+            json!({"operation_id":"send","network_id":"network","conversation_id":"chat","task_id":"task","target_node":"executor","session_id":"session","expected_revision":1,"basis_heads":[],"action":{"type":"send","text":"work"},"resources":[],"binding":proof}),
+        )?;
+        let mut control = primary.clone();
+        control.operation_id = "unknown-control".into();
+        control.expected_revision = 2;
+        control.action = json!({"type":"interrupt","turn_id":"turn"});
+        let dispatch = |request: &OperationRequest| Event {
+            version: 1,
+            network_id: request.network_id.clone(),
+            scope_id: request.conversation_id.clone(),
+            author: "scheduler".into(),
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 0,
+            body: EventBody::DispatchRecorded {
+                operation_id: request.operation_id.clone(),
+                task_id: request.task_id.clone(),
+                target_node: request.target_node.clone(),
+                session_id: request.session_id.clone(),
+                action: json!(request),
+            },
+            blobs: vec![],
+        };
+        let mut context = Context {
+            network_id: "network".into(),
+            scope_id: "chat".into(),
+            heads: vec![],
+            events: vec![dispatch(&primary), dispatch(&control)],
+            missing: MissingDependencies::default(),
+        };
+        context.events.push(Event {
+            author: "executor".into(),
+            body: EventBody::ExecutionObserved {
+                operation_id: primary.operation_id.clone(),
+                task_id: primary.task_id.clone(),
+                target_node: primary.target_node.clone(),
+                session_id: primary.session_id.clone(),
+                status: "running".into(),
+                detail: json!({}),
+            },
+            ..dispatch(&primary)
+        });
+        let primary_record = OperationRecord {
+            request: primary.clone(),
+            state: OperationState::Running,
+            result: Value::Null,
+        };
+        let control_record = OperationRecord {
+            request: control.clone(),
+            state: OperationState::Unknown,
+            result: json!({"error":"connection lost"}),
+        };
+        let mut records = vec![primary_record.clone(), control_record.clone()];
+        for field in [
+            "network_id",
+            "conversation_id",
+            "task_id",
+            "target_node",
+            "session_id",
+            "binding",
+        ] {
+            let mut unrelated = serde_json::to_value(&control)?;
+            unrelated["operation_id"] = json!(format!("other-{field}"));
+            if field == "binding" {
+                unrelated["binding"]["binding"]["generation"] = json!(2);
+            } else {
+                unrelated[field] = json!("other");
+            }
+            let unrelated: OperationRequest = serde_json::from_value(unrelated)?;
+            context.events.push(dispatch(&unrelated));
+            records.push(OperationRecord {
+                request: unrelated,
+                state: OperationState::Unknown,
+                result: Value::Null,
+            });
+        }
+        let requests = bound_dispatches(&context, &proof)?;
+        let exposed = bound_operations(&requests, records)?;
+        assert_eq!(
+            exposed,
+            vec![primary_record.clone(), control_record.clone()]
+        );
+        let cached = json!({"operation":primary_record,"operations":exposed});
+        assert_eq!(
+            bound_operations(&requests, status_records(&cached)?)?,
+            exposed
+        );
+        assert_eq!(
+            status_records(&json!({"operation":primary_record}))?,
+            vec![primary_record.clone()]
+        );
+        assert_eq!(
+            bound_request(&Store::open(":memory:")?, &context, &proof)?.unwrap(),
+            primary
+        );
+        let mut wrong_body = control_record.clone();
+        wrong_body.request.action = json!({"type":"interrupt","turn_id":"other-turn"});
+        assert!(matches_dispatch(&requests, &wrong_body).is_err());
+        let mut foreign = control_record;
+        foreign.request.operation_id = "not-dispatched".into();
+        assert!(!matches_dispatch(&requests, &foreign)?);
+        context.events.push(dispatch(&wrong_body.request));
+        assert!(bound_dispatches(&context, &proof).is_err());
         Ok(())
     }
 
