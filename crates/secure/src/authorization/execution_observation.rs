@@ -297,6 +297,15 @@ impl ExecutionObservationChallenge {
             issued_at_ms >= value.verified_at_ms,
             "observation challenge clock moved backwards",
         )?;
+        Self::bound_to(value, nonce, issued_at_ms, expires_at_ms)
+    }
+
+    fn bound_to(
+        value: &VerifiedExecutionObservationCurrent,
+        nonce: Nonce,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<Self> {
         validate_window(issued_at_ms, expires_at_ms, issued_at_ms)?;
         require(
             expires_at_ms - issued_at_ms <= REMOTE_READ_MAX_AGE_MS,
@@ -631,6 +640,8 @@ impl VerifiedPolicySet {
         let source = self.verify_execution_observation_source(&original.handoff, now_ms)?;
         let mut usage = source.proof_usage().clone();
         usage.record_signed(&original.invocation)?;
+        usage.record_historical_handoff(original)?;
+        usage.enforce_limits()?;
         Ok(usage)
     }
 
@@ -811,7 +822,7 @@ impl VerifiedPolicySet {
         let challenge = &proof.challenge;
         require(
             *challenge
-                == ExecutionObservationChallenge::new(
+                == ExecutionObservationChallenge::bound_to(
                     value,
                     challenge.nonce.clone(),
                     challenge.issued_at_ms,
@@ -1252,6 +1263,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_task_title("task")
+        }
+
+        fn with_task_title(task_title: &str) -> Self {
             let mut project = Network::new(0);
             let mut executor = Network::new(20);
             let mut state = project.state.clone();
@@ -1261,7 +1276,7 @@ mod tests {
             state.resources.extend(executor.state.resources.clone());
             state.grants.extend(executor.state.grants.clone());
             state.roots.extend(executor.state.roots.clone());
-            let task_body = json!({"method":"create_task","space_id":project.project.space,"resource_id":project.project.resource,"authorization_id":"create-task","conversation_id":"chat","task_id":"task","title":"task","goal":"goal","acceptance":"acceptance"});
+            let task_body = json!({"method":"create_task","space_id":project.project.space,"resource_id":project.project.resource,"authorization_id":"create-task","conversation_id":"chat","task_id":"task","title":task_title,"goal":"goal","acceptance":"acceptance"});
             let (proof, _) = admission(
                 &state,
                 &project,
@@ -1279,7 +1294,7 @@ mod tests {
                 proof,
                 EventBody::TaskCreated {
                     task_id: "task".into(),
-                    title: "task".into(),
+                    title: task_title.into(),
                     goal: "goal".into(),
                     acceptance: "acceptance".into(),
                 },
@@ -1618,6 +1633,92 @@ mod tests {
     }
 
     #[test]
+    fn observation_challenge_remains_valid_when_the_freshness_rpc_reverifies_later() {
+        let fixture = Fixture::new();
+        let wire = fixture.observe(NOW);
+        let first = fixture
+            .state
+            .verify_execution_observation(&wire, &fixture.original, &fixture.transport(), NOW)
+            .unwrap();
+        let proof = fixture.freshness(first.current(), NOW);
+        let later = NOW + 1;
+        let current = fixture
+            .state
+            .verify_execution_observation_current(&wire, &fixture.transport(), later)
+            .unwrap();
+        fixture
+            .state
+            .verify_execution_observation_current_freshness(&current, &proof, later)
+            .unwrap();
+        let full = fixture
+            .state
+            .verify_execution_observation(&wire, &fixture.original, &fixture.transport(), later)
+            .unwrap();
+        fixture
+            .state
+            .verify_execution_observation_freshness(&full, &proof, later)
+            .unwrap();
+        assert!(
+            ExecutionObservationChallenge::new(
+                &current,
+                proof.challenge.nonce.clone(),
+                NOW,
+                proof.challenge.expires_at_ms,
+            )
+            .is_err()
+        );
+        let mut changed = proof.clone();
+        changed.challenge.request_hash = ObjectHash::body(&"another request").unwrap();
+        assert!(
+            fixture
+                .state
+                .verify_execution_observation_current_freshness(&current, &changed, later)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .state
+                .verify_execution_observation_current_freshness(
+                    &current,
+                    &proof,
+                    proof.challenge.expires_at_ms,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn observation_rejects_the_union_of_bounded_current_and_historical_proofs_over_64kib() {
+        let fixture = Fixture::with_task_title(&"t".repeat(12_000));
+        let target = ExecutionObservationTarget::from_original(&fixture.original).unwrap();
+        let history = fixture
+            .state
+            .observation_source_usage(&target, &fixture.original, NOW)
+            .unwrap();
+        assert!(history.counts().authorization_bytes < MAX_PROOF_BYTES);
+        assert!(canonical(&fixture.original).unwrap().len() < MAX_PROOF_BYTES);
+        let attempt = fixture.state.build_execution_observation_request(
+            &fixture.original,
+            &fixture.project.client,
+            &fixture.resolver_grant,
+            &fixture.execution_grant,
+            "observe-large-history",
+            NOW,
+            NOW + 1_000,
+        );
+        let result = attempt.and_then(|request| {
+            fixture.state.sign_execution_observation(
+                &request,
+                &fixture.original,
+                &fixture.project.node,
+                NOW,
+                NOW + 1_000,
+            )
+        });
+        assert_eq!(result.unwrap_err(), AuthorizationError::BudgetExceeded);
+    }
+
+    #[test]
     fn current_gate_does_not_claim_a_local_handoff_and_full_gate_binds_exact_original() {
         let fixture = Fixture::new();
         let mut wire = fixture.observe(NOW);
@@ -1813,6 +1914,56 @@ mod tests {
             .state
             .verify_execution_observation_request(&request, &fixture.original, NOW)
             .unwrap();
+        if let Ok(path) = std::env::var("VIBEFACE_EXECUTION_OBSERVATION_VECTOR") {
+            use std::io::Write;
+            let wire = fixture
+                .state
+                .sign_execution_observation(
+                    &request,
+                    &fixture.original,
+                    &fixture.project.node,
+                    NOW,
+                    NOW + 1_000,
+                )
+                .unwrap();
+            let verified = fixture
+                .state
+                .verify_execution_observation(&wire, &fixture.original, &fixture.transport(), NOW)
+                .unwrap();
+            let freshness = fixture.freshness(verified.current(), NOW);
+            let vector = json!({
+                "original_json": original,
+                "execution_grant": fixture.execution_grant,
+                "authorization_id": "observe-wasm",
+                "signer_fixture_key_byte": 3,
+                "project_pins_json": project_pins,
+                "project_bundle_json": project_bundle,
+                "execution_pins_json": execution_pins,
+                "execution_bundle_json": execution_bundle,
+                "now": NOW,
+                "reference_request": request,
+                "reference_wire": wire,
+                "reference_freshness": freshness,
+                "expected_target": verified.target(),
+                "expected_heads": verified.heads(),
+            });
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            file.write_all(serde_json::to_string(&vector).unwrap().as_bytes())
+                .unwrap();
+        }
         assert!(
             sign_execution_observation_request(
                 &original,
