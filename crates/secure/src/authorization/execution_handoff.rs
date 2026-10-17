@@ -70,6 +70,20 @@ impl ExecutionHandoffChallenge {
         expires_at_ms: u64,
     ) -> Result<Self> {
         require(
+            issued_at_ms >= handoff.verified_at_ms,
+            "handoff challenge clock moved backwards",
+        )?;
+        Self::bound_to(handoff, stage, nonce, issued_at_ms, expires_at_ms)
+    }
+
+    fn bound_to(
+        handoff: &VerifiedExecutionHandoff,
+        stage: CheckStage,
+        nonce: Nonce,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<Self> {
+        require(
             (handoff.submission.phase == AuthorizationPhase::Admission
                 && stage == CheckStage::Admit)
                 || (handoff.submission.phase == AuthorizationPhase::Operation
@@ -78,8 +92,7 @@ impl ExecutionHandoffChallenge {
         )?;
         validate_window(issued_at_ms, expires_at_ms, issued_at_ms)?;
         require(
-            issued_at_ms >= handoff.verified_at_ms
-                && expires_at_ms - issued_at_ms <= EXECUTION_LEASE_MS,
+            expires_at_ms - issued_at_ms <= EXECUTION_LEASE_MS,
             "invalid execution handoff challenge lifetime",
         )?;
         Ok(Self {
@@ -489,7 +502,7 @@ impl VerifiedPolicySet {
     ) -> Result<VerifiedExecutionFreshness> {
         self.check_execution_handoff_current(handoff, now_ms)?;
         let challenge = &proof.challenge;
-        let expected = ExecutionHandoffChallenge::new(
+        let expected = ExecutionHandoffChallenge::bound_to(
             handoff,
             challenge.stage,
             challenge.nonce.clone(),
@@ -610,6 +623,30 @@ impl SignedObject for ExecutionHandoffReceipt {
     const DOMAIN: &'static str = "execution-handoff-receipt-v2";
 }
 
+pub fn verify_execution_handoff_receipt_signature(
+    wire: &SignedExecutionHandoff,
+    receipt: &Signed<ExecutionHandoffReceipt>,
+    result: &Value,
+) -> Result<()> {
+    receipt.verify_signature()?;
+    let (event, proof, _, binding) = original_dispatch(&wire.handoff)?;
+    let value = &receipt.payload;
+    require(
+        receipt.issuer == wire.handoff.target_public_key
+            && value.version == AUTH_VERSION
+            && value.operation_id == proof.invocation.payload.operation_id
+            && value.original_space_id.as_str() == event.network_id
+            && value.execution_space_id == wire.handoff.execution_resource.space
+            && value.handoff_hash == wire.hash()?
+            && value.target == wire.handoff.execution_audience.device
+            && value.target == DeviceId::from_key(&receipt.issuer)
+            && value.session_id == binding.binding.session_id
+            && value.binding_generation == binding.binding.generation
+            && value.result_hash == ObjectHash::body(result)?,
+        "execution handoff result signature mismatch",
+    )
+}
+
 impl VerifiedPolicySet {
     pub fn verify_execution_handoff_receipt(
         &self,
@@ -619,7 +656,7 @@ impl VerifiedPolicySet {
         now_ms: u64,
     ) -> Result<()> {
         self.check_execution_handoff_current(handoff, now_ms)?;
-        receipt.verify_signature()?;
+        verify_execution_handoff_receipt_signature(&handoff.wire, receipt, result)?;
         let value = &receipt.payload;
         require(
             receipt.issuer == handoff.wire.handoff.target_public_key
