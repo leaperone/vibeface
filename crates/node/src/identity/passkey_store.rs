@@ -10,7 +10,7 @@ use vibeface_secure::{
     authorization::{
         AUTH_VERSION, AccountDocument, AccountId, AccountRight, AuthenticatorManagementIntent,
         AuthenticatorRecord, DeviceId, JournalEntry, Nonce, ObjectHash, PolicyDomain, PolicyStamp,
-        Signed, VerifiedPolicySet,
+        PublicKey, Signed, VerifiedPolicySet,
         enrollment::{
             AuthenticatorEnrollmentIntent, DeviceEnrollmentIntent, verify_authenticator_enrollment,
             verify_passkey_device_enrollment, verify_passkey_enrollment_request,
@@ -420,6 +420,7 @@ fn intent_retry(
     connection: &Connection,
     account: &AccountId,
     intent_hash: &ObjectHash,
+    issuer: &PublicKey,
     context: &PasskeyContext,
     purpose: PasskeyPurpose,
     now_ms: u64,
@@ -443,6 +444,40 @@ fn intent_retry(
         "passkey intent cannot change its target, RP, or purpose"
     );
     if let Some(receipt) = read_receipt(connection, account, &id, None)? {
+        let proposal = receipt
+            .journal
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                JournalEntry::AccountCommit(committed) => Some(&committed.proposal),
+                _ => None,
+            })
+            .context("passkey receipt is missing its committed account policy")?;
+        let accepted_issuer = match purpose {
+            PasskeyPurpose::RegisterAuthenticator => &proposal.issuer,
+            PasskeyPurpose::EnrollDevice => {
+                &proposal
+                    .payload
+                    .device_enrollment
+                    .as_ref()
+                    .context("passkey receipt is missing its enrollment intent")?
+                    .intent
+                    .issuer
+            }
+            PasskeyPurpose::ManageAuthenticators => {
+                &proposal
+                    .payload
+                    .authenticator_approval
+                    .as_ref()
+                    .context("passkey receipt is missing its management intent")?
+                    .intent
+                    .issuer
+            }
+        };
+        ensure!(
+            issuer == accepted_issuer,
+            "passkey retry was signed by another actor"
+        );
         return Ok(Some(PasskeyPreparation::Completed { receipt }));
     }
     ensure!(
@@ -602,6 +637,53 @@ fn assertion_ledger(
 }
 
 impl Store {
+    pub(crate) fn reject_passkey_policy_bypass(
+        &self,
+        entries: &[JournalEntry],
+        local_target: &DeviceId,
+    ) -> Result<()> {
+        for entry in entries {
+            let (hash, document) = match entry {
+                JournalEntry::Authenticator(record) => (record.hash()?, None),
+                JournalEntry::AccountCommit(committed) => (
+                    committed.proposal.hash()?,
+                    Some(&committed.proposal.payload),
+                ),
+                JournalEntry::Account(proposal) => (proposal.hash()?, Some(&proposal.payload)),
+                _ => continue,
+            };
+            let accepted: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM policy_journal WHERE entry_hash=?)",
+                params![hash.as_str()],
+                |row| row.get(0),
+            )?;
+            if accepted {
+                continue;
+            }
+            let Some(document) = document else {
+                bail!("new authenticators require atomic passkey registration completion");
+            };
+            let previous = self.policy.verified().account(&document.account);
+            let new_device = document.device_enrollment.as_ref().filter(|proof| {
+                previous.and_then(|d| d.device_enrollment.as_ref()) != Some(*proof)
+            });
+            let new_approval = document.authenticator_approval.as_ref().filter(|proof| {
+                previous.and_then(|d| d.authenticator_approval.as_ref()) != Some(*proof)
+            });
+            let target = new_device
+                .map(|proof| &proof.assertion.pending.envelope().target)
+                .or_else(|| new_approval.map(|proof| &proof.assertion.pending.envelope().target));
+            if let Some(target) = target {
+                ensure!(
+                    target == local_target,
+                    "new passkey policy belongs to another node; use authenticated history import"
+                );
+                bail!("new passkey policy requires atomic passkey completion");
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare_passkey_registration(
         &mut self,
         intent: &Signed<AuthenticatorEnrollmentIntent>,
@@ -614,6 +696,7 @@ impl Store {
             &self.connection,
             &intent.payload.account,
             &hash,
+            &intent.issuer,
             context,
             PasskeyPurpose::RegisterAuthenticator,
             now_ms,
@@ -676,6 +759,7 @@ impl Store {
             &self.connection,
             &intent.payload.account,
             &hash,
+            &intent.issuer,
             context,
             PasskeyPurpose::EnrollDevice,
             now_ms,
@@ -720,6 +804,7 @@ impl Store {
             &self.connection,
             &intent.payload.account,
             &hash,
+            &intent.issuer,
             context,
             PasskeyPurpose::ManageAuthenticators,
             now_ms,
@@ -863,6 +948,10 @@ impl Store {
         );
         require_current_heads(self.policy.verified(), envelope)?;
         let record = registration_delta(self.policy.verified(), &pending, &completion.journal)?;
+        ensure!(
+            account_proposal(&completion.journal[1])?.issuer == completion.intent.issuer,
+            "passkey registration completion changed its approving actor"
+        );
         ensure!(
             record.payload.not_before_ms == intent.credential_not_before_ms
                 && record.payload.expires_at_ms == intent.credential_expires_at_ms,
@@ -1694,6 +1783,17 @@ mod tests {
             PasskeyReceiptKind::AuthenticatorRegistered { .. }
         ));
         let counts = f.counts();
+        let outsider = Signed::sign(registration.intent.payload.clone(), &key(8)).unwrap();
+        assert!(
+            f.store
+                .prepare_passkey_registration(&outsider, &f.context, NOW)
+                .is_err()
+        );
+        assert!(
+            f.store
+                .reject_passkey_policy_bypass(&registration.journal, &f.context.target)
+                .is_ok()
+        );
         assert_eq!(
             f.store
                 .complete_passkey_registration(&registration, &f.context, NOW + 600_000)
@@ -1718,6 +1818,11 @@ mod tests {
         assert_eq!(f.counts(), counts);
         let device = key(5);
         let completion = f.enroll_device(&device, 2);
+        assert!(
+            f.store
+                .reject_passkey_policy_bypass(&completion.journal, &f.context.target)
+                .is_err()
+        );
         let receipt = f
             .store
             .complete_passkey_device(&completion, &f.context, NOW)
@@ -1757,6 +1862,11 @@ mod tests {
         let mut f = Fixture::new();
         let registration = f.registration();
         let before = f.counts();
+        assert!(
+            f.store
+                .reject_passkey_policy_bypass(&registration.journal, &f.context.target)
+                .is_err()
+        );
         let original =
             read_pending(&f.store.connection, &f.account, &registration.pending_id).unwrap();
         assert!(
@@ -1795,7 +1905,8 @@ mod tests {
         f.store
             .complete_passkey_registration(&registration, &f.context, NOW)
             .unwrap();
-        let completion = f.enroll_device(&key(5), 2);
+        let device = key(5);
+        let completion = f.enroll_device(&device, 2);
         let before = f.counts();
         let head = f.head();
         f.store.connection.execute_batch("CREATE TEMP TRIGGER reject_passkey_receipt BEFORE INSERT ON passkey_receipts BEGIN SELECT RAISE(ABORT,'receipt rejected'); END").unwrap();
@@ -1827,8 +1938,38 @@ mod tests {
         f.store
             .complete_passkey_registration(&registration, &f.context, NOW)
             .unwrap();
-        let completion = f.enroll_device(&key(5), 2);
+        let device = key(5);
+        let completion = f.enroll_device(&device, 2);
         let hash = completion_hash(&completion).unwrap();
+        let mut forged_document = account_proposal(&completion.journal[0])
+            .unwrap()
+            .payload
+            .clone();
+        forged_document
+            .device_enrollment
+            .as_mut()
+            .unwrap()
+            .assertion
+            .state
+            .sign_count = 0;
+        let mut forged = completion.clone();
+        forged.journal = vec![f.account_commit(forged_document, &device, 5)];
+        assert!(
+            f.store
+                .complete_passkey_device(&forged, &f.context, NOW)
+                .is_err()
+        );
+        let prepared = f
+            .store
+            .prepare_passkey_device_completion(&completion, &f.context, hash.clone(), NOW)
+            .unwrap();
+        let counts = f.counts();
+        assert!(
+            f.store
+                .commit_passkey_completion(prepared, NOW + 100_000)
+                .is_err()
+        );
+        assert_eq!(f.counts(), counts);
         let prepared = f
             .store
             .prepare_passkey_device_completion(&completion, &f.context, hash.clone(), NOW)
