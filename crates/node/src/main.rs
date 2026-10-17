@@ -27,6 +27,8 @@ use vibeface_node::{
     update::{self, Update},
 };
 
+mod service;
+
 #[derive(Parser)]
 #[command(version, about = "Personal device network for local coding agents")]
 struct Cli {
@@ -40,6 +42,10 @@ enum Action {
     Init(Box<Init>),
     /// Start this node with its configured roles.
     Serve(DataDir),
+    /// Check this local node through its private maintenance socket.
+    Status(Access),
+    /// Manage this user's installed node service and update timer.
+    Service(service::Service),
     /// Display this node's trusted frontend entry and initial pairing capability.
     Access(Access),
     /// Select a release channel, check, or apply a managed update.
@@ -186,10 +192,67 @@ async fn main() -> Result<()> {
             }
         }
         Action::Access(options) => access(options),
+        Action::Status(options) => status(options).await,
+        Action::Service(options) => service::run(options).await,
         Action::Update(options) => update::run(options).await,
         Action::Pair(options) => pair(options).await,
         Action::Tool { name, json } => call_tool(name, json).await,
     }
+}
+
+async fn status(options: Access) -> Result<()> {
+    let data = fs::canonicalize(&options.data.data_dir)
+        .context("initialized data directory is required; run vibeface-node init first")?;
+    let configuration = Config::load(&data)?;
+    let node_id = config::identity(&data)?.node_id()?;
+    let health = maintenance::probe(&data).await.and_then(|health| {
+        ensure!(
+            health.node_id == node_id,
+            "running node identity does not match this data directory"
+        );
+        Ok(health)
+    });
+    let state = match &health {
+        Ok(_) => "running",
+        Err(error)
+            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                )
+            }) =>
+        {
+            "stopped"
+        }
+        Err(_) => "unavailable",
+    };
+    let error = health.as_ref().err().map(|error| format!("{error:#}"));
+    if options.json {
+        println!(
+            "{}",
+            json!({
+                "status":state, "node_id":node_id, "data_dir":data,
+                "listen":configuration.listen, "roles":configuration.roles,
+                "version":health.as_ref().ok().map(|health| &health.version),
+                "cli_version":env!("CARGO_PKG_VERSION"), "error":error,
+            })
+        );
+    } else {
+        println!(
+            "Node: {node_id}\nStatus: {state}\nListen: {}\nData: {}",
+            configuration.listen,
+            data.display()
+        );
+        if let Ok(health) = &health {
+            println!("Version: {}", health.version);
+        }
+        if let Some(error) = error {
+            println!("Detail: {error}");
+        }
+    }
+    health
+        .map(|_| ())
+        .context("node is not reachable through its private maintenance socket")
 }
 
 fn init(options: Init) -> Result<()> {
@@ -735,6 +798,29 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["vibeface-node", "access", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface-node", "status", "--json"]).is_ok());
+        for action in [
+            "install",
+            "start",
+            "stop",
+            "restart",
+            "status",
+            "uninstall",
+            "install-updater",
+            "uninstall-updater",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "vibeface-node",
+                    "service",
+                    action,
+                    "--data-dir",
+                    "/private/node data"
+                ])
+                .is_ok()
+            );
+        }
+        assert!(Cli::try_parse_from(["vibeface-node", "service", "unknown"]).is_err());
         assert!(
             Cli::try_parse_from([
                 "vibeface-node",
