@@ -537,6 +537,10 @@ pub fn verify_remote_execution(
 }
 
 impl VerifiedRemoteExecution {
+    pub(super) fn policy_state(&self) -> &VerifiedPolicySet {
+        &self.state
+    }
+
     fn checked_observation(
         &self,
         actual_json: &str,
