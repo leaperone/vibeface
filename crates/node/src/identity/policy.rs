@@ -1219,6 +1219,55 @@ impl crate::runtime::Runtime {
         params: &Value,
     ) -> Result<Value> {
         PublicKey::parse(noise_public_key)?;
+        if method == "execution_service_register" {
+            let initial = {
+                let mut store = self.store.lock().await;
+                store.governance_command(
+                    &self.identity,
+                    noise_public_key,
+                    method,
+                    params,
+                    crate::runtime::now_ms() as u64,
+                )
+            };
+            match initial {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    if !matches!(
+                        error.downcast_ref::<vibeface_secure::authorization::AuthorizationError>(),
+                        Some(vibeface_secure::authorization::AuthorizationError::NeedFreshness(_))
+                    ) {
+                        return Err(error);
+                    }
+                }
+            }
+            let request: vibeface_secure::authorization::execution_service::ExecutionServiceRegistrationRequest =
+                serde_json::from_value(params.clone())?;
+            let challenge = {
+                let mut store = self.store.lock().await;
+                store.execution_service_registration_challenge(
+                    &self.identity,
+                    noise_public_key,
+                    params,
+                    crate::runtime::now_ms() as u64,
+                )?
+            };
+            let proof = self
+                .collect_freshness_challenge(
+                    request.intent.payload.source_project.space.as_str(),
+                    &challenge,
+                )
+                .await?;
+            let mut store = self.store.lock().await;
+            return store.governance_command_with_registration_freshness(
+                &self.identity,
+                noise_public_key,
+                method,
+                params,
+                crate::runtime::now_ms() as u64,
+                Some(&proof),
+            );
+        }
         let mut store = self.store.lock().await;
         let now_ms = crate::runtime::now_ms() as u64;
         match method {
