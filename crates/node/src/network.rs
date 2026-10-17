@@ -767,10 +767,6 @@ impl NetworkHub {
         self.state.lock().await.active_relays.insert(url.to_owned());
         let record = self.local_record().await?;
         send_control(&mut socket, &Control::Publish { record }).await?;
-        ensure!(
-            matches!(receive_control(&mut socket).await?, Control::Published),
-            "relay accepted reservation but not reachability publication"
-        );
         for entry in &self.config.bootstrap_urls {
             if entry != url {
                 let _ = self.publish_at(entry).await;
