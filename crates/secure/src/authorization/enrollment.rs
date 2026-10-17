@@ -468,13 +468,15 @@ pub struct AccountDevicePolicyRequest {
 pub struct PreparedAccountDeviceChange {
     request: AccountDevicePolicyRequest,
     pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
+    bundle: Option<ClientAuthorizationBundle>,
+    account_journal: Vec<JournalEntry>,
 }
 #[derive(Clone, Debug)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct VerifiedAccountDeviceChange {
     pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
+    bundle: Option<ClientAuthorizationBundle>,
+    account_journal: Vec<JournalEntry>,
     scope: Option<ClientScope>,
 }
 
@@ -635,7 +637,8 @@ pub fn prepare_account_device_enrollment(
         Ok(PreparedAccountDeviceChange {
             request,
             pins,
-            bundle,
+            bundle: Some(bundle),
+            account_journal: Vec::new(),
         })
     };
     prepare().map_err(|e| e.to_string())
@@ -658,28 +661,39 @@ pub fn prepare_passkey_device_enrollment(
             certificate: decode_signed(signed_certificate_json.as_bytes())?,
             assertion: parse(assertion_proof_json)?,
         };
-        let verified = verify_passkey_device_enrollment(&state, &proof, now)?;
-        require(
-            PublicKey::of(new_device) == *verified.issuer(),
-            "passkey enrollment new-device signer mismatch",
-        )?;
-        let mut d = next_document(&state, verified.account())?;
-        d.devices.push(verified.certificate().hash()?);
-        d.devices.sort();
-        d.device_enrollment = Some(proof.clone());
-        let request = AccountDevicePolicyRequest {
-            proposal: Signed::sign(d, new_device)?,
-            nonce: verified.certificate().payload.nonce.clone(),
-            change: AccountDeviceChange::Passkey(proof),
-        };
-        validate_device_request(&mut state, &request, now)?;
+        let request = prepare_passkey_request(&mut state, proof, new_device, now)?;
         Ok(PreparedAccountDeviceChange {
             request,
             pins,
-            bundle,
+            bundle: Some(bundle),
+            account_journal: Vec::new(),
         })
     };
     prepare().map_err(|e| e.to_string())
+}
+
+fn prepare_passkey_request(
+    state: &mut VerifiedPolicySet,
+    proof: PasskeyEnrollmentProof,
+    new_device: &Identity,
+    now: u64,
+) -> Result<AccountDevicePolicyRequest> {
+    let verified = verify_passkey_device_enrollment(state, &proof, now)?;
+    require(
+        PublicKey::of(new_device) == *verified.issuer(),
+        "passkey enrollment new-device signer mismatch",
+    )?;
+    let mut document = next_document(state, verified.account())?;
+    document.devices.push(verified.certificate().hash()?);
+    document.devices.sort();
+    document.device_enrollment = Some(proof.clone());
+    let request = AccountDevicePolicyRequest {
+        proposal: Signed::sign(document, new_device)?,
+        nonce: verified.certificate().payload.nonce.clone(),
+        change: AccountDeviceChange::Passkey(proof),
+    };
+    validate_device_request(state, &request, now)?;
+    Ok(request)
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = prepareAccountDeviceRevocation))]
 pub fn prepare_account_device_revocation(
@@ -705,7 +719,8 @@ pub fn prepare_account_device_revocation(
         Ok(PreparedAccountDeviceChange {
             request,
             pins,
-            bundle,
+            bundle: Some(bundle),
+            account_journal: Vec::new(),
         })
     };
     prepare().map_err(|e| e.to_string())
@@ -818,22 +833,23 @@ pub fn finish_account_device_change(
     committed_json: &str,
     now_ms: f64,
 ) -> crate::Result<VerifiedAccountDeviceChange> {
-    let finish = || -> Result<(ClientAuthorizationBundle, Vec<PolicyPin>, Option<PublicKey>)> {
+    let finish = || -> Result<(Option<ClientAuthorizationBundle>, Vec<JournalEntry>, Vec<PolicyPin>, Option<PublicKey>)> {
         let now = time(now_ms)?;
         let committed: Committed<AccountDocument> = parse(committed_json)?;
         require(
             committed.proposal == prepared.request.proposal,
             "policy commit belongs to another device request",
         )?;
-        let mut state = replay_policies(&prepared.pins, &prepared.bundle.journal)?;
+        let journal = prepared.bundle.as_ref().map(|bundle| bundle.journal.as_slice()).unwrap_or(&prepared.account_journal);
+        let replay_pins: Vec<_> = prepared.pins.iter().filter(|pin| prepared.bundle.is_some()
+            || pin.domain == PolicyDomain::Account(prepared.request.proposal.payload.account.clone())).cloned().collect();
+        let mut state = replay_policies(&replay_pins, journal)?;
         validate_device_request(&mut state, &prepared.request, now)?;
         let head = state.install_account_committed(committed.clone(), now)?;
-        let mut bundle = prepared.bundle.clone();
+        let mut journal = journal.to_vec();
         let key = match &prepared.request.change {
             AccountDeviceChange::Enrollment { certificate, .. } => {
-                bundle
-                    .journal
-                    .push(JournalEntry::Device(certificate.clone()));
+                journal.push(JournalEntry::Device(certificate.clone()));
                 Some(certificate.payload.public_key.clone())
             }
             AccountDeviceChange::Passkey(proof) => {
@@ -841,17 +857,21 @@ pub fn finish_account_device_change(
             }
             AccountDeviceChange::Revocation(_) => None,
         };
-        bundle.journal.push(JournalEntry::AccountCommit(committed));
+        journal.push(JournalEntry::AccountCommit(committed));
+        let bundle = prepared.bundle.as_ref().map(|bundle| ClientAuthorizationBundle {
+            journal: journal.clone(), grant_leaf: bundle.grant_leaf.clone(),
+        });
         let mut pins = prepared.pins.clone();
         for pin in &mut pins {
             if pin.domain == head.domain {
                 pin.minimum_head = Some(head.clone());
             }
         }
-        Ok((bundle, pins, key))
+        let account_journal = if bundle.is_none() { journal } else { Vec::new() };
+        Ok((bundle, account_journal, pins, key))
     };
-    let (bundle, pins, key) = finish().map_err(|e| e.to_string())?;
-    let scope = if let Some(key) = key {
+    let (bundle, account_journal, pins, key) = finish().map_err(|e| e.to_string())?;
+    let scope = if let (Some(key), Some(bundle)) = (key, bundle.as_ref()) {
         let state = replay_policies(&pins, &bundle.journal).map_err(|e| e.to_string())?;
         let space = &state
             .grant(&bundle.grant_leaf)
@@ -876,6 +896,7 @@ pub fn finish_account_device_change(
     Ok(VerifiedAccountDeviceChange {
         pins,
         bundle,
+        account_journal,
         scope,
     })
 }
@@ -883,7 +904,18 @@ pub fn finish_account_device_change(
 impl VerifiedAccountDeviceChange {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = bundleJson))]
     pub fn bundle_json(&self) -> crate::Result<String> {
-        encode(&self.bundle)
+        encode(
+            self.bundle
+                .as_ref()
+                .ok_or("account-only change has no business authorization bundle")?,
+        )
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = accountJournalJson))]
+    pub fn account_journal_json(&self) -> crate::Result<String> {
+        if self.bundle.is_some() {
+            return Err("client change uses bundleJson".to_owned());
+        }
+        encode(&self.account_journal)
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = pinsJson))]
     pub fn pins_json(&self) -> crate::Result<String> {
@@ -1434,7 +1466,7 @@ mod tests {
         fn from_result(result: &VerifiedAccountDeviceChange) -> Self {
             Self {
                 pins: result.pins.clone(),
-                bundle: result.bundle.clone(),
+                bundle: result.bundle.clone().unwrap(),
             }
         }
     }
@@ -1953,7 +1985,10 @@ mod tests {
         assert_eq!(budget.external_signatures.len(), 1);
         assert_eq!(budget.signatures.len(), 4);
         let result = f.accept(&p);
-        assert_eq!(result.bundle.journal.len(), f.bundle.journal.len() + 1);
+        assert_eq!(
+            result.bundle.as_ref().unwrap().journal.len(),
+            f.bundle.journal.len() + 1
+        );
         let state = Fixture::from_result(&result).state();
         let account = state.account(&f.account()).unwrap();
         assert!(
@@ -1972,6 +2007,124 @@ mod tests {
         assert_eq!(
             result.scope.unwrap().device_id,
             proof.certificate.payload.device
+        );
+    }
+
+    #[test]
+    fn passkey_offer_finish_has_an_account_journal_without_inventing_business_authority() {
+        let f = Fixture::new();
+        let offer_json = create_device_enrollment_offer(
+            &key(3),
+            f.account().as_str(),
+            "https://node.example",
+            &key(4).public_key_hex(),
+            "[]",
+            END as f64,
+            &f.pins_json(),
+            &f.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let offer = verify_device_enrollment_offer(&offer_json, NOW as f64).unwrap();
+        let proof = f.passkey_proof(5);
+        let signed = sign_passkey_enrollment_intent_from_offer(
+            &encode(&proof.intent.payload).unwrap(),
+            &key(5),
+            &offer,
+            NOW as f64,
+        )
+        .unwrap();
+        assert_eq!(
+            parse::<Signed<DeviceEnrollmentIntent>>(&signed).unwrap(),
+            proof.intent
+        );
+        let qualified =
+            verify_passkey_enrollment_request_from_offer(&signed, &offer, NOW as f64).unwrap();
+        let certificate = sign_passkey_enrollment_possession(
+            &qualified,
+            &key(5),
+            proof.certificate.payload.nonce.as_str(),
+            NOW as f64,
+        )
+        .unwrap();
+        let prepared = prepare_passkey_device_enrollment_from_offer(
+            &signed,
+            &certificate,
+            &encode(&proof.assertion).unwrap(),
+            &key(5),
+            &offer,
+            NOW as f64,
+        )
+        .unwrap();
+        let result = f.accept(&prepared);
+        assert!(result.bundle_json().is_err());
+        assert_eq!(result.scope_json().unwrap(), "null");
+        let journal_json = result.account_journal_json().unwrap();
+        assert!(!journal_json.contains("grant_leaf"));
+        let journal: Vec<JournalEntry> = parse(&journal_json).unwrap();
+        assert_eq!(
+            journal.len(),
+            parse::<Signed<EnrollmentOffer>>(&offer_json)
+                .unwrap()
+                .payload
+                .manager_journal
+                .len()
+                + 1
+        );
+        assert!(journal.iter().all(|entry| matches!(
+            entry,
+            JournalEntry::AccountGenesis(_)
+                | JournalEntry::Account(_)
+                | JournalEntry::AccountCommit(_)
+                | JournalEntry::Device(_)
+                | JournalEntry::Authenticator(_)
+        )));
+        let account_pins: Vec<_> = result
+            .pins
+            .iter()
+            .filter(|pin| pin.domain == PolicyDomain::Account(f.account()))
+            .cloned()
+            .collect();
+        assert!(
+            replay_policies(&account_pins, &journal)
+                .unwrap()
+                .find_device(&proof.certificate.payload.device)
+                .is_ok()
+        );
+        let full_prepared = prepare_passkey_device_enrollment(
+            &signed,
+            &certificate,
+            &encode(&proof.assertion).unwrap(),
+            &key(5),
+            &f.pins_json(),
+            &f.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let full_result = f.accept(&full_prepared);
+        assert!(
+            verify_client_authorization(
+                &full_result.bundle_json().unwrap(),
+                &result.pins_json().unwrap(),
+                f.account().as_str(),
+                SpaceId::personal(&f.account()).as_str(),
+                &key(5).public_key_hex(),
+                NOW as f64
+            )
+            .is_ok()
+        );
+        let mut invalid = proof.assertion;
+        invalid.state.sign_count = 2;
+        assert!(
+            prepare_passkey_device_enrollment_from_offer(
+                &signed,
+                &certificate,
+                &encode(&invalid).unwrap(),
+                &key(5),
+                &offer,
+                NOW as f64
+            )
+            .is_err()
         );
     }
 
@@ -2004,7 +2157,9 @@ mod tests {
         .unwrap();
         let passkey_result = f.accept(&passkey);
         let committed = |result: &VerifiedAccountDeviceChange| {
-            let Some(JournalEntry::AccountCommit(value)) = result.bundle.journal.last() else {
+            let Some(JournalEntry::AccountCommit(value)) =
+                result.bundle.as_ref().unwrap().journal.last()
+            else {
                 panic!("missing committed device change")
             };
             value.clone()

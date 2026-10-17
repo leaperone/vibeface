@@ -397,3 +397,74 @@ pub fn verify_account_enrollment_from_offer(
     };
     verify().map_err(|error| error.to_string())
 }
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = signPasskeyEnrollmentIntentFromOffer))]
+pub fn sign_passkey_enrollment_intent_from_offer(
+    intent_json: &str,
+    new_device: &Identity,
+    offer: &VerifiedEnrollmentOffer,
+    now_ms: f64,
+) -> crate::Result<String> {
+    let sign = || -> Result<Signed<DeviceEnrollmentIntent>> {
+        let now = time(now_ms)?;
+        let intent: DeviceEnrollmentIntent = parse(intent_json)?;
+        let state = intent_state_from_offer(offer, &intent, &PublicKey::of(new_device), now)?;
+        let signed = Signed::sign(intent, new_device)?;
+        verify_passkey_enrollment_request(&state, &signed, now)?;
+        Ok(signed)
+    };
+    encode(&sign().map_err(|error| error.to_string())?)
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyPasskeyEnrollmentRequestFromOffer))]
+pub fn verify_passkey_enrollment_request_from_offer(
+    signed_json: &str,
+    offer: &VerifiedEnrollmentOffer,
+    now_ms: f64,
+) -> crate::Result<VerifiedPasskeyEnrollmentRequest> {
+    let verify = || -> Result<VerifiedPasskeyEnrollmentRequest> {
+        let now = time(now_ms)?;
+        let signed: Signed<DeviceEnrollmentIntent> = decode_signed(signed_json.as_bytes())?;
+        let state = intent_state_from_offer(
+            offer,
+            &signed.payload,
+            &signed.payload.new_device_public_key,
+            now,
+        )?;
+        verify_passkey_enrollment_request(&state, &signed, now)
+    };
+    verify().map_err(|error| error.to_string())
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = preparePasskeyDeviceEnrollmentFromOffer))]
+pub fn prepare_passkey_device_enrollment_from_offer(
+    signed_intent_json: &str,
+    signed_certificate_json: &str,
+    assertion_proof_json: &str,
+    new_device: &Identity,
+    offer: &VerifiedEnrollmentOffer,
+    now_ms: f64,
+) -> crate::Result<PreparedAccountDeviceChange> {
+    let prepare = || -> Result<PreparedAccountDeviceChange> {
+        let now = time(now_ms)?;
+        let proof = PasskeyEnrollmentProof {
+            intent: decode_signed(signed_intent_json.as_bytes())?,
+            certificate: decode_signed(signed_certificate_json.as_bytes())?,
+            assertion: parse(assertion_proof_json)?,
+        };
+        let mut state = intent_state_from_offer(
+            offer,
+            &proof.intent.payload,
+            &PublicKey::of(new_device),
+            now,
+        )?;
+        let request = prepare_passkey_request(&mut state, proof, new_device, now)?;
+        Ok(PreparedAccountDeviceChange {
+            request,
+            pins: offer.signed.payload.pins.clone(),
+            bundle: None,
+            account_journal: offer.signed.payload.manager_journal.clone(),
+        })
+    };
+    prepare().map_err(|error| error.to_string())
+}
