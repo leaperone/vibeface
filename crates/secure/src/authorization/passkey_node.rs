@@ -167,6 +167,7 @@ pub fn verify_node_passkey_state(
     signed_json: &str,
     trusted_pending: &VerifiedNodePasskeyPending,
     proof_json: &str,
+    expected_browser_response_json: &str,
     now_ms: f64,
 ) -> crate::Result<VerifiedNodePasskeyState> {
     let verify = || -> Result<VerifiedNodePasskeyState> {
@@ -192,8 +193,10 @@ pub fn verify_node_passkey_state(
             "passkey state changed its original challenge lifetime",
         )?;
         let proof: PasskeyAssertionProof = parse(proof_json)?;
+        let expected: crate::webauthn::AssertionResponse = parse(expected_browser_response_json)?;
         require(
             proof.pending == statement.pending
+                && proof.response == expected
                 && proof.record.hash()? == statement.record_hash
                 && proof.record.payload.credential_id == statement.credential_id
                 && proof.response.raw_id == statement.credential_id
@@ -472,60 +475,139 @@ mod tests {
     fn signed_node_state_rejects_replaced_counters_records_responses_and_challenges() {
         let f = Fixture::new();
         let trusted = f.verify_pending(&f.pending).unwrap();
-        let verified =
-            verify_node_passkey_state(&json(&f.state), &trusted, &json(&f.proof), NOW as f64)
-                .unwrap();
+        let verified = verify_node_passkey_state(
+            &json(&f.state),
+            &trusted,
+            &json(&f.proof),
+            &json(&f.proof.response),
+            NOW as f64,
+        )
+        .unwrap();
         assert_eq!(
             verified.trusted_state_json().unwrap(),
             "{\"sign_count\":1,\"backup_state\":false}"
         );
-        let mut changed = f.proof.clone();
-        changed.state.sign_count = 0;
-        assert!(
-            verify_node_passkey_state(&json(&f.state), &trusted, &json(&changed), NOW as f64)
-                .is_err()
-        );
-        let mut changed = f.proof.clone();
-        changed.response.client_extension_results = serde_json::json!({"another":true});
-        assert!(
-            verify_node_passkey_state(&json(&f.state), &trusted, &json(&changed), NOW as f64)
-                .is_err()
-        );
-        let mut changed = f.proof.clone();
-        changed.record.payload.expires_at_ms -= 1;
-        assert!(
-            verify_node_passkey_state(&json(&f.state), &trusted, &json(&changed), NOW as f64)
-                .is_err()
-        );
-        let mut changed = f.state.payload.clone();
-        changed.record_hash = ObjectHash::body(&"different record").unwrap();
-        let changed = Signed::sign(changed, &f.node).unwrap();
-        assert!(
-            verify_node_passkey_state(&json(&changed), &trusted, &json(&f.proof), NOW as f64)
-                .is_err()
-        );
-        let changed = Signed::sign(f.state.payload.clone(), &key(8)).unwrap();
-        assert!(
-            verify_node_passkey_state(&json(&changed), &trusted, &json(&f.proof), NOW as f64)
-                .is_err()
-        );
-        let mut changed = f.state.clone();
-        changed.payload.state.sign_count = 0;
-        assert!(
-            verify_node_passkey_state(&json(&changed), &trusted, &json(&f.proof), NOW as f64)
-                .is_err()
-        );
-        let other = Fixture::new();
-        let other_pending = other.verify_pending(&other.pending).unwrap();
-        assert!(
-            verify_node_passkey_state(&json(&f.state), &other_pending, &json(&f.proof), NOW as f64)
-                .is_err()
+        let another_response = crate::webauthn::tests::assertion(
+            &f.proof.pending,
+            crate::webauthn::tests::auth(&f.proof.pending, 0x0d, 3),
+            crate::webauthn::tests::client(&f.proof.pending, "webauthn.get"),
+            Some(f.proof.pending.user_handle().to_owned()),
         );
         assert!(
             verify_node_passkey_state(
                 &json(&f.state),
                 &trusted,
                 &json(&f.proof),
+                &json(&another_response),
+                NOW as f64,
+            )
+            .is_err()
+        );
+        let mut substituted_proof = f.proof.clone();
+        substituted_proof.response = another_response;
+        let mut substituted_state = f.state.payload.clone();
+        substituted_state.response_hash = ObjectHash::body(&substituted_proof.response).unwrap();
+        let substituted_state = Signed::sign(substituted_state, &f.node).unwrap();
+        assert!(
+            verify_node_passkey_state(
+                &json(&substituted_state),
+                &trusted,
+                &json(&substituted_proof),
+                &json(&f.proof.response),
+                NOW as f64,
+            )
+            .is_err()
+        );
+        let mut changed = f.proof.clone();
+        changed.state.sign_count = 0;
+        assert!(
+            verify_node_passkey_state(
+                &json(&f.state),
+                &trusted,
+                &json(&changed),
+                &json(&f.proof.response),
+                NOW as f64
+            )
+            .is_err()
+        );
+        let mut changed = f.proof.clone();
+        changed.response.client_extension_results = serde_json::json!({"another":true});
+        assert!(
+            verify_node_passkey_state(
+                &json(&f.state),
+                &trusted,
+                &json(&changed),
+                &json(&f.proof.response),
+                NOW as f64
+            )
+            .is_err()
+        );
+        let mut changed = f.proof.clone();
+        changed.record.payload.expires_at_ms -= 1;
+        assert!(
+            verify_node_passkey_state(
+                &json(&f.state),
+                &trusted,
+                &json(&changed),
+                &json(&f.proof.response),
+                NOW as f64
+            )
+            .is_err()
+        );
+        let mut changed = f.state.payload.clone();
+        changed.record_hash = ObjectHash::body(&"different record").unwrap();
+        let changed = Signed::sign(changed, &f.node).unwrap();
+        assert!(
+            verify_node_passkey_state(
+                &json(&changed),
+                &trusted,
+                &json(&f.proof),
+                &json(&f.proof.response),
+                NOW as f64
+            )
+            .is_err()
+        );
+        let changed = Signed::sign(f.state.payload.clone(), &key(8)).unwrap();
+        assert!(
+            verify_node_passkey_state(
+                &json(&changed),
+                &trusted,
+                &json(&f.proof),
+                &json(&f.proof.response),
+                NOW as f64
+            )
+            .is_err()
+        );
+        let mut changed = f.state.clone();
+        changed.payload.state.sign_count = 0;
+        assert!(
+            verify_node_passkey_state(
+                &json(&changed),
+                &trusted,
+                &json(&f.proof),
+                &json(&f.proof.response),
+                NOW as f64
+            )
+            .is_err()
+        );
+        let other = Fixture::new();
+        let other_pending = other.verify_pending(&other.pending).unwrap();
+        assert!(
+            verify_node_passkey_state(
+                &json(&f.state),
+                &other_pending,
+                &json(&f.proof),
+                &json(&f.proof.response),
+                NOW as f64
+            )
+            .is_err()
+        );
+        assert!(
+            verify_node_passkey_state(
+                &json(&f.state),
+                &trusted,
+                &json(&f.proof),
+                &json(&f.proof.response),
                 (NOW + 100_000) as f64
             )
             .is_err()
