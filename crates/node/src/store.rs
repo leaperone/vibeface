@@ -844,11 +844,30 @@ impl Store {
             !busy,
             "cannot seal an unresolved execution; reconcile unknown results first"
         );
-        let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations o JOIN local_values v ON v.network_id=o.network_id AND v.key='completion:' || o.operation_id WHERE o.network_id=? AND o.target_node=? AND o.session_id=?)",params![binding.network_id,binding.target_node,binding.session_id],|r|r.get(0))?;
-        ensure!(
-            !pending,
-            "execution completion must be durable and flushed before sealing"
-        );
+        let pending = {
+            let mut statement=tx.prepare("SELECT o.operation_id,o.state FROM operations o JOIN local_values v ON v.network_id=o.network_id AND v.key='completion:' || o.operation_id WHERE o.network_id=? AND o.target_node=? AND o.session_id=?")?;
+            statement
+                .query_map(
+                    params![binding.network_id, binding.target_node, binding.session_id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !pending.is_empty() {
+            let events = load_events_from(&tx, &binding.network_id)?;
+            for (operation, state) in pending {
+                let state: OperationState = serde_json::from_str(&state)?;
+                let expected = serde_json::to_value(state)?
+                    .as_str()
+                    .context("invalid operation state")?
+                    .to_owned();
+                ensure!(events.values().any(|stored|stored.status == "ready" && stored.event.author == binding.target_node
+                    && stored.event.scope_id == binding.conversation_id
+                    && matches!(&stored.event.body,EventBody::ExecutionObserved{operation_id,target_node,session_id,status,..}
+                        if operation_id == &operation && target_node == &binding.target_node && session_id == &binding.session_id && status == &expected)),
+                    "execution completion must be durable before sealing");
+            }
+        }
         let session:Option<String>=tx.query_row("SELECT record FROM execution_sessions WHERE network_id=? AND target_node=? AND session_id=?",params![binding.network_id,binding.target_node,binding.session_id],|r|r.get(0)).optional()?;
         let revision = if let Some(session) = session {
             let session: ExecutionSession = serde_json::from_str(&session)?;
@@ -2327,6 +2346,27 @@ mod tests {
             "work",
             OperationState::Failed,
             json!({"verified":"external execution stopped"}),
+        )?;
+        store.local_set(
+            &network,
+            "completion:work",
+            &json!({"state":"failed","result":"done"}),
+        )?;
+        assert!(store.seal_binding(&owner, proof).is_err());
+        store.append_event(
+            &owner,
+            &network,
+            "conversation",
+            EventBody::ExecutionObserved {
+                operation_id: "work".into(),
+                task_id: request.task_id.clone(),
+                target_node: request.target_node.clone(),
+                session_id: request.session_id.clone(),
+                status: "failed".into(),
+                detail: json!({"verified":"external execution stopped"}),
+            },
+            vec![],
+            3,
         )?;
         let seal = store.seal_binding(&owner, proof)?;
         assert_eq!(store.seal_binding(&owner, proof)?, seal);

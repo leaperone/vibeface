@@ -346,6 +346,11 @@ mod tests {
                     .then(|| crypto::digest(&serde_json::to_vec(&event).unwrap()))
             }).unwrap()
         };
+        // A durable execution result can migrate while its automatic follow-up is waiting for an Agent.
+        node.store
+            .lock()
+            .await
+            .seal_binding(&node.identity, request.binding.as_ref().unwrap())?;
         drop(node);
         let mut config = Config::load(&dir)?;
         config.manager = Some(config::ManagerSettings {
