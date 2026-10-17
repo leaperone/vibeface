@@ -299,8 +299,9 @@ pub async fn run(
         let facts = node.current_facts(network, &conversation).await?;
         let (tasks, targets) = {
             let store = node.store.lock().await;
-            let targets = store.trust_bundle(network)?.context("missing network trust")?.project()?.members.into_iter()
-                .filter(|n| n.kind == crate::identity::IdentityKind::Node && n.node_roles.contains(&NodeRole::Executor)).map(|n| n.subject_id).collect::<Vec<_>>();
+            let view = store.trust_bundle(network)?.context("missing network trust")?.project()?;
+            let targets = view.members.into_iter()
+                .filter(|n| !view.revoked.contains(&n.subject_id) && n.kind == crate::identity::IdentityKind::Node && n.node_roles.contains(&NodeRole::Executor)).map(|n| n.subject_id).collect::<Vec<_>>();
             (serde_json::to_value(store.tasks(network, &conversation)?)?, targets)
         };
         let prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &node.config.roots)?;
