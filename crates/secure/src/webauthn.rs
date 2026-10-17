@@ -1362,6 +1362,7 @@ pub(crate) mod tests {
             origins: vec![proof.relying_party().origin().to_owned()],
             user_handle: proof.user_handle().to_owned(),
             backup_eligible: proof.backup_eligible(),
+            client_enrollment: crate::authorization::PasskeyClientEnrollment::AccountClient,
             issued_under: initial.clone(),
             not_before_ms: NOW,
             expires_at_ms: NOW + 1000000,
