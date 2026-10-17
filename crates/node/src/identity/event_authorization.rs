@@ -562,24 +562,6 @@ pub(crate) fn current_event_authorization(
         .verify_operation_authorization(&admitted, &facts, &transport, now_ms)?)
 }
 
-fn ensure_persisted_admission(connection: &Connection, proof: &AdmissionProof) -> Result<()> {
-    let i = &proof.invocation.payload;
-    let stored: (String, String, String, String, String, u64) = connection.query_row(
-        "SELECT signed_invocation,source_body,transport,admission_challenge,admission_receipts,admitted_at_ms FROM accepted_authorizations WHERE space_id=? AND authorization_id=?",
-        params![i.resource.space.as_str(), i.operation_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
-    )?;
-    ensure!(
-        serde_json::from_str::<Value>(&stored.0)? == serde_json::to_value(&proof.invocation)?
-            && serde_json::from_str::<Value>(&stored.1)? == proof.source_body
-            && serde_json::from_str::<Value>(&stored.2)? == serde_json::to_value(&proof.transport)?
-            && serde_json::from_str::<Value>(&stored.3)? == serde_json::to_value(&proof.challenge)?
-            && serde_json::from_str::<Value>(&stored.4)? == serde_json::to_value(&proof.receipts)?
-            && stored.5 == proof.admitted_at_ms,
-        "event admission differs from durable authorization"
-    );
-    Ok(())
-}
-
 fn append_admitted_events_in(
     connection: &Connection,
     policy: &PolicyState,
@@ -588,7 +570,7 @@ fn append_admitted_events_in(
     batch: Vec<(String, EventBody, Vec<BlobRef>)>,
     now_ms: u64,
 ) -> Result<Vec<SignedEvent>> {
-    ensure_persisted_admission(connection, proof)?;
+    super::admission::validate_persisted_admission(connection, proof)?;
     let transport = proof.transport.clone().into_evidence();
     let expected = expected_events(
         &proof.source_body,
@@ -888,7 +870,7 @@ impl Store {
             );
         }
         let proof = admission(&source_event.event);
-        ensure_persisted_admission(&tx, proof)?;
+        super::admission::validate_persisted_admission(&tx, proof)?;
         let signed = append_event_in(
             &tx,
             &self.policy,
@@ -1090,6 +1072,15 @@ mod tests {
             vec![],
             NOW as i64,
         )?;
+        let shared = vibeface_secure::authorization::events::verify_signed_event(
+            &serde_json::to_string(&event)?,
+            fixture.auth.resource().space.as_str(),
+            fixture.auth.resource().resource.as_str(),
+            &fixture.node.public_key_hex()?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(shared.hash(), event.hash);
+        assert_eq!(shared.context_hash(), &ObjectHash::body(&event)?);
         assert_eq!(
             store.connection.query_row(
                 "SELECT resource_id FROM conversations WHERE conversation_id='chat'",
