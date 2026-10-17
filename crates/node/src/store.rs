@@ -2438,7 +2438,56 @@ fn import_legacy_scheduler_job(
     let Some(value) = scheduler_load::<Value>(connection, network, &legacy_key)? else {
         return Ok(());
     };
-    let kind = validated_scheduler_trigger(connection, network, conversation, trigger, target)?;
+    ensure!(
+        value["trigger"].as_str() == Some(trigger),
+        "legacy invocation trigger does not match its ledger key"
+    );
+    let encoded: String = connection
+        .query_row(
+            "SELECT envelope FROM events WHERE network_id=? AND hash=? AND status='ready'",
+            params![network, trigger],
+            |row| row.get(0),
+        )
+        .optional()?
+        .context("legacy scheduler trigger is missing or not ready")?;
+    let envelope: SignedEvent = serde_json::from_str(&encoded)?;
+    let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+    let public_key: String = connection
+        .query_row(
+            "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
+            params![network, event.author],
+            |row| row.get(0),
+        )
+        .optional()?
+        .context("legacy scheduler author has no historical Node identity")?;
+    let event = verify_signed_event(network, &envelope, &public_key)?;
+    ensure!(
+        envelope.hash == trigger && event.scope_id == conversation,
+        "legacy scheduler trigger belongs to another conversation or identity"
+    );
+    // The existing local ledger proves prior admission; importing a terminal never grants new authority.
+    let kind = match event.body {
+        EventBody::MessagePosted {
+            role,
+            scheduler_node,
+            ..
+        } if role == "user" => {
+            ensure!(
+                scheduler_node.as_deref() == Some(target),
+                "legacy message is addressed to another scheduler"
+            );
+            TriggerKind::Human
+        }
+        EventBody::ExecutionObserved { status, .. }
+            if matches!(
+                status.as_str(),
+                "completed" | "succeeded" | "failed" | "rejected" | "interrupted"
+            ) =>
+        {
+            TriggerKind::Autonomous
+        }
+        _ => bail!("invalid legacy scheduler trigger"),
+    };
     let mut session = load_scheduler_session(connection, network, conversation, target)?;
     let attempt = ManagerAttempt {
         id: format!("legacy-{}", digest(legacy_key.as_bytes())),
@@ -3587,6 +3636,98 @@ mod tests {
                 .len(),
             2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_scheduler_migration_survives_gateway_revocation_or_role_removal() -> Result<()> {
+        for revoked in [true, false] {
+            let current = LocalIdentity::generate();
+            let retired = LocalIdentity::generate();
+            let network = current.fixture_network_id()?;
+            let target = current.node_id()?;
+            let mut store = memory(&current, Some(&retired))?;
+            conversation(&mut store, &current)?;
+            let mut legacy = Vec::new();
+            for state in ["completed", "failed", "running", "unknown"] {
+                let event = store.append_event(
+                    &retired,
+                    &network,
+                    "conversation",
+                    EventBody::MessagePosted {
+                        message_id: state.into(),
+                        role: "user".into(),
+                        text: state.into(),
+                        scheduler_node: Some(target.clone()),
+                    },
+                    vec![],
+                    2,
+                )?;
+                let key = format!(
+                    "scheduler:invocation:{}",
+                    digest(&serde_json::to_vec(&("conversation", &event.hash))?)
+                );
+                store.local_set(&network, &key, &json!({"state":state,"boot":"old-boot","trigger":event.hash,"message_id":format!("legacy-{state}")}))?;
+                legacy.push((event.hash, state));
+            }
+            let mut retired_certificate = retired.certificate(vec![NodeRole::Replica])?;
+            retired_certificate.revoked = revoked;
+            store.install_trust_bundle(
+                &network,
+                &current.sign_network_fixture(
+                    2,
+                    vec![current.certificate(roles())?, retired_certificate],
+                )?,
+            )?;
+            assert!(
+                store
+                    .authorize_node(&network, &retired.node_id()?, Some(NodeRole::Gateway))
+                    .is_err()
+            );
+            assert!(
+                store
+                    .enqueue_trigger(&network, "conversation", &legacy[0].0, &target)
+                    .is_err()
+            );
+            let new_message =
+                admitted_message(&mut store, &current, "new-authorized-message", &target)?;
+            store.recover_scheduler_jobs(&network, &target, "new-boot")?;
+            for (trigger, original) in legacy {
+                let job = store
+                    .scheduler_job(&network, "conversation", &trigger, &target)?
+                    .unwrap();
+                assert_eq!(
+                    job.state.name(),
+                    if matches!(original, "running" | "unknown") {
+                        "unknown"
+                    } else {
+                        original
+                    }
+                );
+                if matches!(job.state, JobState::Unknown { .. }) {
+                    store.fence_manager_unknown(
+                        &network,
+                        "conversation",
+                        &target,
+                        &trigger,
+                        &job.state.attempt().unwrap().id,
+                    )?;
+                }
+            }
+            let claimed = store
+                .claim_next(&network, "conversation", &target, "new-boot", "sdk")?
+                .unwrap();
+            assert_eq!(claimed.job.trigger, new_message.hash);
+            assert!(claimed.job.state.attempt().unwrap().read_only);
+            assert_eq!(
+                store
+                    .scheduler_jobs(&network, "conversation", &target)?
+                    .iter()
+                    .filter(|job| matches!(job.state, JobState::Queued))
+                    .count(),
+                0
+            );
+        }
         Ok(())
     }
 
