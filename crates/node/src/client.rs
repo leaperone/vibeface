@@ -522,7 +522,9 @@ async fn dispatch(
                 new_subject_signature: pair.new_subject_signature,
             })?;
             let state = node.identities.store_signed_grant(event)?;
-            node.install_membership(state).await?;
+            let network_id = state.genesis.network_id.clone();
+            node.install_membership(state.clone()).await?;
+            announce_membership(node, &network_id, &state).await;
             authentication(node, session).await
         }
         "pair_status" => {
@@ -591,7 +593,9 @@ async fn dispatch(
             );
             let mut state = node.membership_state().await?;
             state.append(event)?;
-            node.install_membership(state).await?;
+            let network_id = state.genesis.network_id.clone();
+            node.install_membership(state.clone()).await?;
+            announce_membership(node, &network_id, &state).await;
             authentication(node, session).await
         }
         "recovery_challenge" => recovery_challenge(node, session, &params).await,
@@ -778,6 +782,13 @@ fn grant_event(review: &crate::identity::local::PairReview) -> Result<Governance
         },
         signature: String::new(),
     })
+}
+
+async fn announce_membership(node: &Runtime, network_id: &str, state: &NetworkState) {
+    let _ = node
+        .hub
+        .broadcast(network_id, json!({"type":"trust","state":state}))
+        .await;
 }
 async fn recovery_challenge(
     node: &Runtime,
