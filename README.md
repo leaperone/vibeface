@@ -23,7 +23,23 @@ flowchart LR
 
 Rust 核心负责认证、路由、DAG 同步、SQLite 存储、执行去重和通知。Cursor SDK 管理 Agent 通过原生自定义工具回调操作 Node，不需要 MCP。Codex 执行器通过 App Server 协议接收指令并上报事件。
 
-## 在本机开始
+## 安装与开始
+
+主程序是 Rust 二进制 CLI `vibeface-node`。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64（glibc），运行网页不需要 Node.js。首次安装选最新正式版：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash
+```
+
+当前尚无正式版，需要显式选择 Nightly：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --channel nightly
+```
+
+以上入口在本 PR 合并后可用。安装器验证完整包及 SHA256，不创建身份、启动服务或配置自动更新；没有 Stable 时也不会自动改装 Nightly。安装、初始化和通过 CLI 管理节点见 [安装说明](docs/install.md)。现有安装请使用 `vibeface-node update apply`，不要重复运行首次安装器。
+
+## 从源码开始
 
 从源码构建需要 Rust 1.89+、Node.js 22.12+、pnpm 11.9.0 和 wasm-bindgen-cli 0.2.129。运行编码任务前，安装并登录需要的执行器。
 
@@ -58,6 +74,7 @@ A 把任务派发到 B 后，B 在接单前取得所需上下文。A 离线时�
 
 ## 安装、协议与验证
 
+- [首次安装与 CLI 管理](docs/install.md) 包括 Stable/Nightly 一行安装、初始化、状态和后台服务命令。
 - [部署与使用 Node](docs/node.md) 包括局域网、公网中继、SDK、后台运行和制品安装。
 - [Node 协议参考](docs/node-protocol.md) 包括 HTTP、事件 DAG、操作状态和通知确认。
 - [构建与发布](docs/releasing.md) 说明 Linux x64（`x86_64-unknown-linux-gnu`）、Linux ARM64（`aarch64-unknown-linux-gnu`）和 macOS Apple Silicon（`aarch64-apple-darwin`）三个包、SHA256、Stable 与 Nightly 更新渠道，以及 stable/nightly/rc tag 规则。PR 与 `main` 的 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 只生成 Actions 制品；公开版本见 [Releases](https://github.com/leaperone/vibeface/releases)，nightly 与 rc 为预发布。
