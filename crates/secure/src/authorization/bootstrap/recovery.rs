@@ -1894,6 +1894,34 @@ mod tests {
         )
         .unwrap();
         let after = replay_policies(installed.pins(), &installed.bundle().journal).unwrap();
+        let recovered_scope: ClientScope =
+            serde_json::from_str(&completed.scope_json().unwrap()).unwrap();
+        let c_projection = after
+            .client_authorization_projection(
+                installed.pins(),
+                &installed.bundle().journal,
+                &recovered_scope.account_id,
+                &recovered_scope.space_id,
+                &PublicKey::of(&key(6)),
+                &installed.bundle().grant_leaf,
+                RESTORE as u64,
+            )
+            .unwrap();
+        let c_auth = verify_client_authorization(
+            &encode(&c_projection).unwrap(),
+            &completed.pins_json().unwrap(),
+            recovered_scope.account_id.as_str(),
+            recovered_scope.space_id.as_str(),
+            &key(6).public_key_hex(),
+            RESTORE,
+        )
+        .unwrap();
+        assert_eq!(c_auth.audience_public_key(), &PublicKey::of(&key(7)));
+        assert_eq!(c_auth.resources().len(), 1);
+        assert_eq!(
+            c_auth.resources()[0].payload.host,
+            ServiceId::from_key(&PublicKey::of(&key(7)))
+        );
         let selections: serde_json::Value =
             serde_json::from_str(&completed.source_read_selections_json().unwrap()).unwrap();
         assert_eq!(selections.as_array().unwrap().len(), 2);

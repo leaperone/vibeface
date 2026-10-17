@@ -185,6 +185,18 @@ impl VerifiedPolicySet {
                 if required {
                     objects.insert(hash.clone());
                 }
+                if !next.payload.devices.contains(hash)
+                    && let Some(old) = self.devices.get(hash)
+                    && !next.payload.revoked_devices.contains(&old.payload.device)
+                {
+                    for replacement in &next.payload.devices {
+                        if self.devices.get(replacement).is_some_and(|certificate| {
+                            certificate.payload.device == old.payload.device
+                        }) {
+                            objects.insert(replacement.clone());
+                        }
+                    }
+                }
             }
             if committed && daily {
                 objects.extend(
