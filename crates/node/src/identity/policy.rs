@@ -1126,9 +1126,9 @@ impl crate::runtime::Runtime {
         method: &str,
         params: &Value,
     ) -> Result<Value> {
-        let now_ms = crate::runtime::now_ms() as u64;
         PublicKey::parse(noise_public_key)?;
         let mut store = self.store.lock().await;
+        let now_ms = crate::runtime::now_ms() as u64;
         match method {
             "status" => Ok(
                 json!({"initialized":!store.trusted_policy_pins().is_empty(),"node_id":self.identity.node_id()?,
