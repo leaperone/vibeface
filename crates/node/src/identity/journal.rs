@@ -536,6 +536,42 @@ impl PolicyState {
         self.prepare(pins, journal, now_ms, true)
     }
 
+    pub(crate) fn prepare_team_creation(
+        &self,
+        verified: &vibeface_secure::authorization::governance::VerifiedTeamCreationRequest,
+        now_ms: u64,
+    ) -> Result<PreparedPolicyUpdate> {
+        let request = verified.request();
+        ensure!(
+            request.issued_at_ms <= now_ms && now_ms < verified.expires_at_ms(),
+            "team creation request expired"
+        );
+        ensure!(
+            verified
+                .expected_heads()
+                .iter()
+                .all(|head| self.state.head(&head.domain) == Some(head)),
+            "team creation source policy changed"
+        );
+        let pin = &request.team_pin;
+        ensure!(
+            pin.domain == PolicyDomain::Space(SpaceId::team(&pin.genesis_root))
+                && pin.domain == PolicyDomain::Space(request.team_project.space.clone())
+                && self.state.head(&pin.domain).is_none()
+                && self
+                    .pins
+                    .iter()
+                    .all(|existing| existing.domain != pin.domain),
+            "team creation requires a new team policy domain"
+        );
+        self.prepare(
+            std::slice::from_ref(pin),
+            &request.journal_delta,
+            now_ms,
+            false,
+        )
+    }
+
     fn prepare(
         &self,
         pins: &[PolicyPin],
@@ -1335,6 +1371,96 @@ mod tests {
         for head in &expected {
             assert_eq!(historical.head(&head.domain), Some(head));
         }
+    }
+
+    #[test]
+    fn team_creation_requires_current_verified_source_and_a_new_domain() -> Result<()> {
+        use crate::identity::test_support::{TestNetwork, now};
+        use vibeface_secure::authorization::governance;
+
+        let network = TestNetwork::new()?;
+        let mut store = network.memory()?;
+        let at = now();
+        let prepared = governance::prepare_team_creation(
+            &key(8),
+            &network.client,
+            network.account.as_str(),
+            &network.node.public_key_hex()?,
+            PublicKey::of(&network.recovery).as_str(),
+            network.resource.as_str(),
+            &serde_json::to_string(&network.pins)?,
+            &serde_json::to_string(&network.bundle)?,
+            (at + 1_000_000) as f64,
+            at as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let signed = serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
+        let verified = governance::verify_team_creation_request(
+            store.policy.verified(),
+            &network.bundle,
+            &network.pins,
+            &signed,
+            at,
+        )?;
+        assert!(
+            store
+                .policy
+                .prepare_team_creation(&verified, at - 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .policy
+                .prepare_team_creation(&verified, verified.expires_at_ms())
+                .is_err()
+        );
+        assert!(
+            store
+                .policy
+                .prepare_network_update(&verified.request().journal_delta, at)
+                .is_err()
+        );
+        let account_head = store
+            .policy
+            .verified()
+            .head(&PolicyDomain::Account(network.account.clone()))
+            .unwrap()
+            .clone();
+        let mut account = store
+            .policy
+            .verified()
+            .account(&network.account)
+            .unwrap()
+            .clone();
+        account.previous = Some(account_head);
+        account.sequence += 1;
+        let stale = store
+            .policy
+            .prepare_network_update(
+                &[JournalEntry::Account(Signed::sign(account, &network.root)?)],
+                at,
+            )?
+            .after;
+        assert!(stale.prepare_team_creation(&verified, at).is_err());
+        let update = store.policy.prepare_team_creation(&verified, at)?;
+        let tx = store.connection.transaction()?;
+        let accepted = commit_in(&tx, &update)?;
+        tx.commit()?;
+        assert!(
+            accepted
+                .verified()
+                .space(&verified.request().team_project.space)
+                .is_some()
+        );
+        for pin in &network.pins {
+            assert!(accepted.pins().contains(pin));
+        }
+        assert!(accepted.prepare_team_creation(&verified, at).is_err());
+        assert_eq!(
+            PolicyState::load(&store.connection)?.heads(),
+            accepted.heads()
+        );
+        Ok(())
     }
 
     #[test]
