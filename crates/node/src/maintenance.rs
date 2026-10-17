@@ -95,12 +95,22 @@ impl Gate {
         })
     }
     fn commit(&self, pending: &Path) -> Result<()> {
+        self.commit_with_sync(pending, |parent| {
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })
+    }
+    fn commit_with_sync(
+        &self,
+        pending: &Path,
+        sync: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         ensure!(
             state.mode != Mode::Maintenance,
             "another maintenance lease is active"
         );
-        match std::fs::symlink_metadata(pending) {
+        let synced = match std::fs::symlink_metadata(pending) {
             Ok(metadata) => {
                 ensure!(
                     metadata.is_file()
@@ -114,15 +124,14 @@ impl Gate {
                     "update activation has not been confirmed"
                 );
                 std::fs::remove_file(pending)?;
-                std::fs::File::open(pending.parent().context("update journal has no parent")?)?
-                    .sync_all()?;
+                sync(pending.parent().context("update journal has no parent")?)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => return Err(error.into()),
-        }
+        };
         state.mode = Mode::Open;
         self.changed.notify_waiters();
-        Ok(())
+        synced
     }
 }
 impl Drop for WorkGuard {
@@ -405,6 +414,25 @@ mod tests {
         config::{self, Config},
         crypto::LocalIdentity,
     };
+
+    #[test]
+    fn confirmed_unlink_sync_failure_does_not_leave_unrecoverable_maintenance() -> Result<()> {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("commit-sync-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let pending = dir.join("update-pending.json");
+        crate::config::private_write(&pending, br#"{"phase":"confirmed"}"#)?;
+        let gate = Arc::new(Gate::new(true));
+        assert!(gate.enter().is_err());
+        let result = gate.commit_with_sync(&pending, |_| bail!("injected directory sync failure"));
+        assert!(result.is_err());
+        assert!(!pending.exists());
+        assert!(gate.enter().is_ok());
+        gate.commit(&pending)?;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn active_work_refuses_maintenance_and_nested_guards_are_safe() -> Result<()> {

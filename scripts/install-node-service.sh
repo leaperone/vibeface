@@ -175,6 +175,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=infinity
 ExecStart="$(systemd_exec_escape "$binary")" update apply --automatic --data-dir "$(systemd_exec_escape "$data_dir")"
 WorkingDirectory=$(systemd_path_escape "$(dirname "$binary")")
 StandardOutput=append:$(systemd_path_escape "$data_dir/update.stdout.log")
