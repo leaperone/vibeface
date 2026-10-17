@@ -1218,6 +1218,17 @@ impl crate::runtime::Runtime {
                 store.recovery_node_possession(&self.identity, noise_public_key, params, now_ms)
             }
             "recover" => store.recover_account(&self.identity, noise_public_key, params, now_ms),
+            "cross_node_recovery_context"
+            | "cross_node_recovery_source_possession"
+            | "cross_node_recovery_possession"
+            | "cross_node_recovery_commit"
+            | "cross_node_recovery_install" => store.cross_node_recovery_command(
+                &self.identity,
+                noise_public_key,
+                method,
+                params,
+                now_ms,
+            ),
             "authenticate" => store.authenticate_account(noise_public_key, params, now_ms),
             "device_directory" => {
                 let authenticated = store.authenticate_account(noise_public_key, params, now_ms)?;
