@@ -1303,6 +1303,7 @@ mod tests {
                         Action::ExecutionSend,
                         Action::ExecutionSubmit,
                         Action::ExecutionResolve,
+                        Action::OperationStatusRead,
                         Action::OperationResolve,
                     ],
                     audience: target,
@@ -1808,6 +1809,40 @@ mod tests {
         resolver_bundle.grant_leaf = resolver_grant.clone();
         let resolver_selection = json!({"execution_resource":f.execution,"execution_grant":resolver_grant,
             "target_public_key":f.executor.node.public_key_hex()?});
+        let execution_share = verify_directional_grant_snapshot(
+            &serde_json::to_string(&cb)?,
+            &serde_json::to_string(&f.executor.pins)?,
+            (now() + 3) as f64,
+        )
+        .map_err(anyhow::Error::msg)?
+        .share_json();
+        let resolution_share = verify_directional_grant_snapshot(
+            &serde_json::to_string(&resolver_bundle)?,
+            &serde_json::to_string(&f.executor.pins)?,
+            (now() + 3) as f64,
+        )
+        .map_err(anyhow::Error::msg)?
+        .share_json();
+        let candidate: Value = serde_json::from_str(
+            &inspect_remote_execution_share(&execution_share).map_err(anyhow::Error::msg)?,
+        )?;
+        assert_eq!(
+            candidate["actions"],
+            json!([
+                "execution_open",
+                "execution_send",
+                "execution_submit",
+                "operation_status_read"
+            ])
+        );
+        assert_eq!(candidate["trust"], "unverified");
+        let candidate: Value = serde_json::from_str(
+            &inspect_remote_execution_share(&resolution_share).map_err(anyhow::Error::msg)?,
+        )?;
+        assert_eq!(
+            candidate["actions"],
+            json!(["execution_resolve", "operation_resolve"])
+        );
         let resolver = verify_remote_execution(
             &client,
             &serde_json::to_string(&f.project.bundle)?,
@@ -1911,7 +1946,9 @@ mod tests {
                 "executionBundle":cb,"executionPins":f.executor.pins,"selection":selection,"context":raw,"binding":binding,
                 "browserBody":body,"browserInvocation":auth.signed_invocation(),"actual":result,"receipt":receipt,
                 "resolverBundle":resolver_bundle,"resolverSelection":resolver_selection,"resolverIntent":intent,
-                "resolverPrepare":signed_prepare,"shareRequest":signed_share}),
+                "resolverPrepare":signed_prepare,"shareRequest":signed_share,
+                "executionShare":serde_json::from_str::<Value>(&execution_share)?,
+                "resolutionShare":serde_json::from_str::<Value>(&resolution_share)?}),
             )?;
         }
         let snapshot: Value = serde_json::from_str(

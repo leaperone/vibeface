@@ -222,6 +222,68 @@ struct RemoteExecutionSelection {
     execution_grant: ObjectHash,
 }
 
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = inspectRemoteExecutionShare))]
+pub fn inspect_remote_execution_share(share_json: &str) -> crate::Result<String> {
+    (|| -> Result<String> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Share {
+            version: u16,
+            kind: String,
+            authorization: ClientAuthorizationBundle,
+            selection: RemoteExecutionSelection,
+        }
+        require(
+            share_json.len() <= 1_048_576,
+            "execution share is too large",
+        )?;
+        let share: Share = serde_json::from_str(share_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid execution share"))?;
+        require(
+            share.version == AUTH_VERSION
+                && share.kind == "vibeface-remote-execution"
+                && share.authorization.grant_leaf == share.selection.execution_grant,
+            "share selection differs from its Grant leaf",
+        )?;
+        let mut selected = None;
+        for entry in &share.authorization.journal {
+            if let JournalEntry::Grant(grant) = entry {
+                if grant.hash()? == share.selection.execution_grant {
+                    require(selected.is_none(), "duplicate selected execution Grant")?;
+                    selected = Some(grant);
+                }
+            }
+        }
+        let signed = selected.ok_or(AuthorizationError::InvalidProof(
+            "selected execution Grant is missing",
+        ))?;
+        signed.verify_signature()?;
+        let grant = &signed.payload;
+        require(
+            grant.scope == ResourceScope::Exact(share.selection.execution_resource.clone())
+                && grant.audience.device == DeviceId::from_key(&share.selection.target_public_key)
+                && grant.remaining_delegations == 0
+                && grant.expires_at_ms < u64::MAX
+                && (remote_actions(&grant.actions, false) || remote_actions(&grant.actions, true))
+                && grant.constraints.context.workspace_resource.as_ref()
+                    == Some(&share.selection.execution_resource.resource)
+                && grant
+                    .constraints
+                    .context
+                    .execution_session
+                    .as_ref()
+                    .is_some_and(|session| session.target == grant.audience.device),
+            "share candidate is not an exact execution or resolution Grant",
+        )?;
+        serde_json::to_string(
+            &serde_json::json!({"selection":share.selection,"context":grant.constraints.context,
+            "actions":grant.actions,"expires_at_ms":grant.expires_at_ms,"trust":"unverified"}),
+        )
+        .map_err(|_| AuthorizationError::InvalidProof("share candidate encoding failed"))
+    })()
+    .map_err(|error| error.to_string())
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct VerifiedDirectionalGrantSnapshot {
