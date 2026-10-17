@@ -810,13 +810,22 @@ async fn receive_secure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::test_support::{TestNetwork, now};
     use axum::{
         Router,
         extract::{State as AxumState, WebSocketUpgrade},
         routing::get,
     };
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use tokio::{net::TcpListener, task::JoinHandle};
+    use vibeface_secure::{
+        Identity,
+        authorization::{
+            Actor, DeviceCertificate, DeviceId, DeviceUse, JournalEntry, Nonce, PolicyDomain,
+            PublicKey, ServiceId, Signed,
+        },
+    };
 
     fn roles() -> Vec<NodeRole> {
         vec![
@@ -828,17 +837,57 @@ mod tests {
         ]
     }
     fn hub(
-        owner: &LocalIdentity,
+        owner: &TestNetwork,
         identity: &LocalIdentity,
         nodes: &[&LocalIdentity],
     ) -> Result<(Arc<PeerHub>, mpsc::Receiver<Inbound>)> {
-        let network = owner.fixture_network_id()?;
-        let mut store = Store::open(":memory:")?;
-        let certificates = nodes
-            .iter()
-            .map(|node| node.certificate(roles()))
-            .collect::<Result<Vec<_>>>()?;
-        store.install_trust_bundle(&network, &owner.sign_network_fixture(1, certificates)?)?;
+        let mut store = owner.memory()?;
+        for node in nodes {
+            if node.node_id()? == owner.node.node_id()? {
+                continue;
+            }
+            let key = PublicKey::parse(&node.public_key_hex()?)?;
+            let device =
+                Identity::from_secret_hex(&node.secret_key_hex).map_err(anyhow::Error::msg)?;
+            let head = store
+                .authorization_state()
+                .head(&PolicyDomain::Account(owner.account.clone()))
+                .context("account head missing")?
+                .clone();
+            let mut certificate = DeviceCertificate {
+                version: vibeface_secure::authorization::AUTH_VERSION,
+                owner: PolicyDomain::Account(owner.account.clone()),
+                subject: Actor::Service(ServiceId::from_key(&key)),
+                device: DeviceId::from_key(&key),
+                public_key: key.clone(),
+                uses: vec![DeviceUse::Noise, DeviceUse::ServiceInvocation],
+                possession: None,
+                enrollment_grant: None,
+                issued_under: head.clone(),
+                nonce: Nonce::from_bytes(Sha256::digest(key.as_str().as_bytes()).into()),
+                not_before_ms: now(),
+                expires_at_ms: now() + 1_000_000,
+            };
+            certificate.prove_possession(&device)?;
+            let certificate = Signed::sign(certificate, &owner.root)?;
+            let mut document = store
+                .authorization_state()
+                .account(&owner.account)
+                .context("account missing")?
+                .clone();
+            document.previous = Some(head);
+            document.sequence += 1;
+            document.devices.push(certificate.hash()?);
+            document.devices.sort();
+            store.install_policy_journal(
+                &[
+                    JournalEntry::Device(certificate),
+                    JournalEntry::Account(Signed::sign(document, &owner.root)?),
+                ],
+                now(),
+            )?;
+        }
+        store.save_local_device(owner.space.as_str(), identity)?;
         Ok(PeerHub::new(
             identity.clone(),
             Arc::new(Mutex::new(store)),
@@ -846,14 +895,44 @@ mod tests {
         ))
     }
 
+    fn revoke_service(owner: &TestNetwork, store: &mut Store, node: &LocalIdentity) -> Result<()> {
+        if node.node_id()? == owner.node.node_id()? {
+            return owner.revoke_node(store);
+        }
+        let device = DeviceId::from_key(&PublicKey::parse(&node.public_key_hex()?)?);
+        let mut document = store
+            .authorization_state()
+            .account(&owner.account)
+            .context("account missing")?
+            .clone();
+        document.previous = store
+            .authorization_state()
+            .head(&PolicyDomain::Account(owner.account.clone()))
+            .cloned();
+        document.sequence += 1;
+        document.revoked_devices.push(device.clone());
+        document.revoked_devices.sort();
+        document.devices.retain(|hash| {
+            store
+                .authorization_state()
+                .device(hash)
+                .is_none_or(|certificate| certificate.payload.device != device)
+        });
+        store.install_policy_journal(
+            &[JournalEntry::Account(Signed::sign(document, &owner.root)?)],
+            now() + 1,
+        )
+    }
+
     #[tokio::test]
-    async fn forwarding_requires_both_enabled_and_certified_relay_role() -> Result<()> {
+    async fn forwarding_requires_enabled_relay_and_active_service_membership() -> Result<()> {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let c = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let (sender, _) = hub(&a, &a, &[&a, &b, &c])?;
-        let (enabled, _) = hub(&a, &b, &[&a, &b, &c])?;
+        let owner = TestNetwork::with_node(a.clone())?;
+        let network = owner.space.to_string();
+        let (sender, _) = hub(&owner, &a, &[&a, &b, &c])?;
+        let (enabled, _) = hub(&owner, &b, &[&a, &b, &c])?;
         let (disabled, mut inbound) =
             PeerHub::new(b.clone(), enabled.store.clone(), &[NodeRole::Replica]);
         let (send, mut receive) = mpsc::channel(4);
@@ -894,20 +973,12 @@ mod tests {
             .receive_packet(&network, &a.node_id()?, packet)
             .await?;
         assert_eq!(inbound.try_recv()?.payload, json!("local"));
-        let mut restricted = b.certificate(roles())?;
-        restricted.roles.retain(|r| r != &NodeRole::Relay);
-        enabled.store.lock().await.install_trust_bundle(
-            &network,
-            &a.sign_network_fixture(
-                2,
-                vec![a.certificate(roles())?, restricted, c.certificate(roles())?],
-            )?,
-        )?;
+        revoke_service(&owner, &mut *enabled.store.lock().await, &b)?;
         let packet = sender.packet(
             &network,
             Some(c.node_id()?),
             Kind::Request,
-            json!("no certificate"),
+            json!("revoked service"),
             None,
         )?;
         enabled
@@ -921,9 +992,10 @@ mod tests {
     async fn signed_packets_are_network_bound_deduped_and_revocation_checked() -> Result<()> {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let (sender, _) = hub(&a, &a, &[&a, &b])?;
-        let (receiver, mut inbound) = hub(&a, &b, &[&a, &b])?;
+        let owner = TestNetwork::with_node(a.clone())?;
+        let network = owner.space.to_string();
+        let (sender, _) = hub(&owner, &a, &[&a, &b])?;
+        let (receiver, mut inbound) = hub(&owner, &b, &[&a, &b])?;
         let packet = sender.packet(
             &network,
             Some(b.node_id()?),
@@ -942,7 +1014,11 @@ mod tests {
         assert!(inbound.try_recv().is_err());
         assert!(
             receiver
-                .receive_packet(&b.fixture_network_id()?, &a.node_id()?, packet.clone())
+                .receive_packet(
+                    &TestNetwork::new()?.space.to_string(),
+                    &a.node_id()?,
+                    packet.clone()
+                )
                 .await
                 .is_err()
         );
@@ -956,12 +1032,7 @@ mod tests {
         assert_eq!(received.origin, a.node_id()?);
         assert_eq!(received.payload, json!({"operation_id":"once"}));
         assert!(inbound.try_recv().is_err());
-        let mut revoked = a.certificate(roles())?;
-        revoked.revoked = true;
-        receiver.store.lock().await.install_trust_bundle(
-            &network,
-            &a.sign_network_fixture(2, vec![revoked, b.certificate(roles())?])?,
-        )?;
+        revoke_service(&owner, &mut *receiver.store.lock().await, &a)?;
         let packet = sender.packet(
             &network,
             Some(b.node_id()?),
@@ -978,15 +1049,15 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_member_packet_is_dropped_without_closing_trusted_link() -> Result<()> {
-        let owner = LocalIdentity::generate();
+        let owner = TestNetwork::new()?;
         let known = LocalIdentity::generate();
         let unknown = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
-        let (receiver, mut inbound) = hub(&owner, &known, &[&owner, &known])?;
-        let (sender, _) = hub(&owner, &unknown, &[&owner, &known, &unknown])?;
+        let network = owner.space.to_string();
+        let (receiver, mut inbound) = hub(&owner, &known, &[&owner.node, &known])?;
+        let (sender, _) = hub(&owner, &unknown, &[&owner.node, &known, &unknown])?;
         let (send, _) = mpsc::channel(1);
         receiver.state.lock().await.links.insert(
-            (network.clone(), owner.node_id()?),
+            (network.clone(), owner.node.node_id()?),
             Link {
                 id: "trusted".into(),
                 outbound: true,
@@ -1001,7 +1072,7 @@ mod tests {
             None,
         )?;
         receiver
-            .receive_packet(&network, &owner.node_id()?, packet)
+            .receive_packet(&network, &owner.node.node_id()?, packet)
             .await?;
         assert!(inbound.try_recv().is_err());
         assert!(
@@ -1010,7 +1081,7 @@ mod tests {
                 .lock()
                 .await
                 .links
-                .contains_key(&(network, owner.node_id()?))
+                .contains_key(&(network, owner.node.node_id()?))
         );
         Ok(())
     }
@@ -1020,10 +1091,11 @@ mod tests {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let c = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let (requester, _) = hub(&a, &a, &[&a, &b, &c])?;
-        let (expected, _) = hub(&a, &b, &[&a, &b, &c])?;
-        let (other, _) = hub(&a, &c, &[&a, &b, &c])?;
+        let owner = TestNetwork::with_node(a.clone())?;
+        let network = owner.space.to_string();
+        let (requester, _) = hub(&owner, &a, &[&a, &b, &c])?;
+        let (expected, _) = hub(&owner, &b, &[&a, &b, &c])?;
+        let (other, _) = hub(&owner, &c, &[&a, &b, &c])?;
         let request_id = Uuid::new_v4().to_string();
         let (reply, mut receive) = oneshot::channel();
         requester.state.lock().await.pending.insert(
@@ -1066,16 +1138,23 @@ mod tests {
     fn packet_shape_rejects_stale_unbounded_and_unsigned_changes() -> Result<()> {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
-        let (hub, _) = hub(&a, &a, &[&a, &b])?;
+        let owner = TestNetwork::with_node(a.clone())?;
+        let (hub, _) = hub(&owner, &a, &[&a, &b])?;
         let packet = hub.packet(
-            &a.fixture_network_id()?,
+            owner.space.as_str(),
             Some(b.node_id()?),
             Kind::Request,
             json!("ok"),
             None,
         )?;
+        let encoded = serde_json::to_value(&packet.body)?;
+        assert_eq!(encoded["space_id"], owner.space.as_str());
+        assert!(encoded.get("network_id").is_none());
         let now = now_ms()?;
         let mut body = packet.body.clone();
+        body.version = 1;
+        assert!(validate_body(&body, now).is_err());
+        body = packet.body.clone();
         body.created_at_ms = now - MAX_AGE_MS - 1;
         assert!(validate_body(&body, now).is_err());
         body.created_at_ms = now + MAX_FUTURE_MS + 1;
@@ -1096,7 +1175,7 @@ mod tests {
         );
         assert!(
             hub.packet(
-                &a.fixture_network_id()?,
+                owner.space.as_str(),
                 Some(b.node_id()?),
                 Kind::Request,
                 json!("x".repeat(MAX_PACKET_BYTES)),
@@ -1155,19 +1234,19 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_handshake_rejects_an_untrusted_node() -> Result<()> {
-        let owner = LocalIdentity::generate();
+        let owner = TestNetwork::new()?;
         let outsider = LocalIdentity::generate();
-        let (server, _) = hub(&owner, &owner, &[&owner])?;
-        let (client, _) = hub(&owner, &outsider, &[&owner, &outsider])?;
+        let (server, _) = hub(&owner, &owner.node, &[&owner.node])?;
+        let (client, _) = hub(&owner, &outsider, &[&owner.node, &outsider])?;
         let mut tasks = Tasks(Vec::new());
         let url = serve(server.clone(), &mut tasks).await?;
         let result = tokio::time::timeout(
             Duration::from_secs(3),
-            client.connect(owner.fixture_network_id()?, url),
+            client.connect(owner.space.to_string(), url),
         )
         .await?;
         assert!(result.is_err());
-        assert!(server.online(&owner.fixture_network_id()?).await.is_empty());
+        assert!(server.online(owner.space.as_str()).await.is_empty());
         Ok(())
     }
 
@@ -1177,10 +1256,11 @@ mod tests {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let c = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let (ha, mut ra) = hub(&a, &a, &[&a, &b, &c])?;
-        let (hb, mut rb) = hub(&a, &b, &[&a, &b, &c])?;
-        let (hc, mut rc) = hub(&a, &c, &[&a, &b, &c])?;
+        let owner = TestNetwork::with_node(a.clone())?;
+        let network = owner.space.to_string();
+        let (ha, mut ra) = hub(&owner, &a, &[&a, &b, &c])?;
+        let (hb, mut rb) = hub(&owner, &b, &[&a, &b, &c])?;
+        let (hc, mut rc) = hub(&owner, &c, &[&a, &b, &c])?;
         let mut tasks = Tasks(Vec::new());
         let url_a = serve(ha.clone(), &mut tasks).await?;
         let url_b = serve(hb.clone(), &mut tasks).await?;
