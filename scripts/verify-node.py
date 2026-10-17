@@ -1551,7 +1551,14 @@ def phase1_acceptance(options):
                 (network, time.strftime("%Y-%m-%d", time.gmtime()), 100))
         human, _ = send(a.client, name, "human-after-autonomous-budget")
         wait_for("human chat ignores exhausted autonomous budget", lambda: completed(human))
-        passed("human chat remains available after the autonomous budget is exhausted")
+        wait_for("remote entry knows the budget-test conversation", lambda: conversation(c.client, name))
+        remote_human, _ = send(c.client, name, "remote-human-after-autonomous-budget")
+        wait_for("verified remote human chat also ignores exhausted autonomous budget", lambda: completed(remote_human))
+        with sqlite3.connect(f"file:{a.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+            used = connection.execute("SELECT used FROM budget_days WHERE network_id=? AND day=?",
+                                      (network, time.strftime("%Y-%m-%d", time.gmtime()))).fetchone()[0]
+        require(used == 100, "local and remote human chat do not consume or reset existing autonomous usage")
+        passed("local and remote human chat remain available without consuming or resetting exhausted autonomous budget")
         before = len(calls())
         wait_for("third entry has imported the last human message", lambda:
                  any(message["message_id"] == "human-after-autonomous-budget" for message in conversation(c.client, name)["messages"]))
