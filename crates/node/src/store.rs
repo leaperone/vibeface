@@ -1,71 +1,363 @@
 use crate::{
-    crypto::{LocalIdentity, digest, verify_signed_event},
+    crypto::{LocalIdentity, digest},
     identity::NetworkState,
     model::*,
 };
-use anyhow::{Context as _, Result, bail, ensure};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use anyhow::{Context as _, Result, ensure};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Component, Path},
+    fs::{self, OpenOptions},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Component, Path, PathBuf},
 };
 
-const INITIAL_SCHEMA: &str = include_str!("../migrations/202610160001_initial.sql");
+const INITIAL_SCHEMA: &str = include_str!("../migrations/202610180001_initial.sql");
 
 pub struct Store {
-    connection: Connection,
+    pub(crate) connection: Connection,
+    pub(crate) policy: crate::identity::journal::PolicyState,
 }
+fn verify_schema(connection: &Connection) -> Result<()> {
+    let metadata: (String, u32, u32, String, String) = connection.query_row(
+        "SELECT format_id,data_epoch,layout_version,schema_fingerprint,initialization_state FROM schema_metadata WHERE singleton=1",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    ).context("database uses another format; existing data was preserved")?;
+    ensure!(
+        metadata
+            == (
+                crate::config::FORMAT_ID.into(),
+                crate::config::DATA_EPOCH,
+                crate::config::LAYOUT_VERSION,
+                digest(INITIAL_SCHEMA.as_bytes()),
+                "ready".into()
+            ),
+        "database uses another format; existing data was preserved"
+    );
+    let version: u32 = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    ensure!(
+        version == 0,
+        "unexpected SQLite schema version; existing data was preserved"
+    );
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(INITIAL_SCHEMA)?;
+    ensure!(
+        schema_objects(connection)? == schema_objects(&expected)?,
+        "database schema does not match this format; existing data was preserved"
+    );
+    Ok(())
+}
+
+fn schema_objects(connection: &Connection) -> Result<Vec<(String, String, String, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name",
+    )?;
+    Ok(statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn validate_persisted_state(connection: &Connection) -> Result<()> {
+    let policy = crate::identity::journal::PolicyState::load(connection)?;
+    let mut statement = connection.prepare("SELECT space_id,revision,bundle FROM spaces")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut seen = BTreeSet::new();
+    for row in rows {
+        let (space, revision, encoded) = row?;
+        let id = vibeface_secure::authorization::SpaceId::parse(&space)?;
+        let current = policy
+            .verified()
+            .space_history(&id)
+            .and_then(|history| history.last())
+            .context("stored space has no pinned policy")?;
+        ensure!(
+            serde_json::to_string(current)? == encoded && current.payload.sequence == revision,
+            "stored space projection differs from verified policy"
+        );
+        seen.insert(id);
+        load_events_from(connection, &space)?;
+    }
+    let expected: BTreeSet<_> = policy
+        .pins()
+        .iter()
+        .filter_map(|pin| match &pin.domain {
+            vibeface_secure::authorization::PolicyDomain::Space(space) => Some(space.clone()),
+            _ => None,
+        })
+        .collect();
+    ensure!(seen == expected, "stored space projection is incomplete");
+    crate::identity::policy::validate_resource_projections(connection)?;
+    crate::identity::admission::validate_persisted_authorizations(connection, &policy)?;
+    Ok(())
+}
+
+fn private_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let sidecar = PathBuf::from(name);
+        if let Ok(meta) = fs::symlink_metadata(&sidecar) {
+            ensure!(
+                meta.is_file() && !meta.file_type().is_symlink(),
+                "database sidecar must be a regular file"
+            );
+            fs::set_permissions(sidecar, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenPurpose {
+    Ready,
+    Initialize,
+}
+
+fn prepare_database(path: &Path, purpose: OpenPurpose) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .context("database requires a private directory")?;
+    if !parent.exists() {
+        fs::create_dir_all(parent)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    crate::config::verify_private_dir(parent)?;
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            ensure!(
+                meta.is_file() && !meta.file_type().is_symlink(),
+                "database must be a regular file"
+            );
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let mut name = path.as_os_str().to_owned();
+                name.push(suffix);
+                if let Ok(meta) = fs::symlink_metadata(PathBuf::from(name)) {
+                    ensure!(
+                        meta.is_file() && !meta.file_type().is_symlink(),
+                        "database sidecar must be a regular file"
+                    );
+                }
+            }
+            if meta.len() > 0 && purpose == OpenPurpose::Ready {
+                let mut uri = reqwest::Url::from_file_path(path.canonicalize()?)
+                    .map_err(|_| anyhow::anyhow!("invalid database path"))?;
+                uri.query_pairs_mut().append_pair("immutable", "1");
+                let connection = Connection::open_with_flags(
+                    uri.as_str(),
+                    OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | OpenFlags::SQLITE_OPEN_URI
+                        | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )?;
+                let tables: i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |r| r.get(0))?;
+                if tables > 0 {
+                    verify_schema(&connection)?;
+                } else {
+                    let version: u32 =
+                        connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
+                    ensure!(
+                        version == 0,
+                        "database uses another format; existing data was preserved"
+                    );
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+pub(crate) fn install_trust_bundle_in(
+    connection: &Connection,
+    network_id: &str,
+    state: &NetworkState,
+) -> Result<bool> {
+    ensure!(
+        state.genesis.network_id == network_id,
+        "membership belongs to another personal network"
+    );
+    state.project()?;
+    let previous: Option<String> = connection
+        .query_row(
+            "SELECT bundle FROM spaces WHERE space_id=?",
+            [network_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let merged = if let Some(previous) = &previous {
+        serde_json::from_str::<NetworkState>(previous)?.merge(state)?
+    } else {
+        state.clone()
+    };
+    let encoded = serde_json::to_string(&merged)?;
+    if previous.as_ref() == Some(&encoded) {
+        return Ok(false);
+    }
+    connection.execute("INSERT INTO spaces(space_id,revision,bundle) VALUES(?,?,?) ON CONFLICT(space_id) DO UPDATE SET revision=excluded.revision,bundle=excluded.bundle", params![network_id, merged.epoch(), encoded])?;
+    for member in merged.historical_nodes()? {
+        let old: Option<String> = connection
+            .query_row(
+                "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
+                params![network_id, member.subject_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            old.as_ref().is_none_or(|key| key == &member.public_key),
+            "historical Node identity key changed"
+        );
+        connection.execute(
+            "INSERT OR IGNORE INTO node_certificates(space_id,node_id,public_key) VALUES(?,?,?)",
+            params![network_id, member.subject_id, member.public_key],
+        )?;
+    }
+    Ok(true)
+}
+
 #[derive(Clone)]
-struct StoredEvent {
-    envelope: SignedEvent,
-    event: Event,
-    status: String,
+pub(crate) struct StoredEvent {
+    pub(crate) envelope: SignedEvent,
+    pub(crate) event: Event,
+    pub(crate) status: String,
 }
 
 impl Store {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        if path != Path::new(":memory:")
-            && let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
-        {
-            let existed = parent.exists();
-            std::fs::create_dir_all(parent)?;
-            #[cfg(unix)]
-            if !existed {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    pub fn verify_existing_database(path: &Path) -> Result<()> {
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!("data format database is missing; existing data was preserved")
+            }
+            Err(error) => return Err(error.into()),
+        };
+        ensure!(
+            meta.is_file() && !meta.file_type().is_symlink(),
+            "database must be a regular file"
+        );
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            if let Ok(meta) = fs::symlink_metadata(PathBuf::from(name)) {
+                ensure!(
+                    meta.is_file() && !meta.file_type().is_symlink(),
+                    "database sidecar must be a regular file"
+                );
             }
         }
-        let connection = Connection::open(path)?;
-        #[cfg(unix)]
-        if path != Path::new(":memory:") {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        ensure!(
+            meta.len() > 0,
+            "data format database is empty; existing data was preserved"
+        );
+        let mut uri = reqwest::Url::from_file_path(path.canonicalize()?)
+            .map_err(|_| anyhow::anyhow!("invalid database path"))?;
+        uri.query_pairs_mut().append_pair("immutable", "1");
+        let connection = Connection::open_with_flags(
+            uri.as_str(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        verify_schema(&connection)
+    }
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        Self::verify_existing_database(path)?;
+        let connection = Connection::open_with_flags(
+            path.canonicalize()?,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        let version: u32 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        match version {
-            0 => {
-                let tables:i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get(0))?;
-                ensure!(tables == 0, "unversioned database is not supported");
-                connection.execute_batch(&format!("BEGIN IMMEDIATE;{INITIAL_SCHEMA}COMMIT;"))?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        verify_schema(&connection)?;
+        validate_persisted_state(&connection)?;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            if let Ok(metadata) = fs::symlink_metadata(PathBuf::from(name)) {
+                ensure!(
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.permissions().mode() & 0o077 == 0,
+                    "database sidecar must remain private"
+                );
             }
-            2 => {}
-            _ => bail!("unsupported database schema version {version}"),
         }
-        let mut store = Self { connection };
-        // Reject incompatible membership before recovery changes operations or rebuilds projections.
-        for network in store.networks()? {
-            store
-                .trust_bundle(&network)?
-                .context("membership is missing")?
-                .project()?;
+        let policy = crate::identity::journal::PolicyState::load(&connection)?;
+        Ok(Self { connection, policy })
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_for(path.as_ref(), OpenPurpose::Ready)
+    }
+
+    pub fn initialize(path: &Path) -> Result<Self> {
+        Self::open_for(path, OpenPurpose::Initialize)
+    }
+
+    fn open_for(path: &Path, purpose: OpenPurpose) -> Result<Self> {
+        let memory = path == Path::new(":memory:");
+        if !memory {
+            prepare_database(path, purpose)?;
         }
+        let canonical = if memory {
+            None
+        } else {
+            Some(path.canonicalize()?)
+        };
+        let path = canonical.as_deref().unwrap_or(path);
+        let connection = if memory {
+            Connection::open_in_memory()?
+        } else {
+            Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?
+        };
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        let tables: i64 = connection.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |r| r.get(0),
+        )?;
+        if tables == 0 {
+            let tx =
+                rusqlite::Transaction::new_unchecked(&connection, TransactionBehavior::Immediate)?;
+            tx.execute_batch(INITIAL_SCHEMA)?;
+            tx.execute(
+                "INSERT INTO schema_metadata(singleton,format_id,data_epoch,layout_version,schema_fingerprint,initialization_state) VALUES(1,?,?,?,?,'ready')",
+                params![crate::config::FORMAT_ID, crate::config::DATA_EPOCH, crate::config::LAYOUT_VERSION, digest(INITIAL_SCHEMA.as_bytes())],
+            )?;
+            tx.commit()?;
+        }
+        verify_schema(&connection)?;
+        validate_persisted_state(&connection)?;
+        if !memory {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            private_sidecars(path)?;
+        }
+        let policy = crate::identity::journal::PolicyState::load(&connection)?;
+        let mut store = Self { connection, policy };
         store
             .connection
-            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
+            .pragma_update(None, "journal_mode", "WAL")?;
+        if !memory {
+            private_sidecars(path)?;
+        }
         store.recover_running()?;
         for network in store.networks()? {
             store.rebuild_projections(&network)?;
@@ -73,53 +365,18 @@ impl Store {
         Ok(store)
     }
     pub fn install_trust_bundle(&mut self, network_id: &str, state: &NetworkState) -> Result<bool> {
-        ensure!(
-            state.genesis.network_id == network_id,
-            "membership belongs to another personal network"
-        );
-        state.project()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous: Option<String> = tx
-            .query_row(
-                "SELECT bundle FROM networks WHERE network_id=?",
-                [network_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let merged = if let Some(previous) = &previous {
-            serde_json::from_str::<NetworkState>(previous)?.merge(state)?
-        } else {
-            state.clone()
-        };
-        let encoded = serde_json::to_string(&merged)?;
-        if previous.as_ref() == Some(&encoded) {
-            return Ok(false);
-        }
-        tx.execute("INSERT INTO networks(network_id,revision,bundle) VALUES(?,?,?) ON CONFLICT(network_id) DO UPDATE SET revision=excluded.revision,bundle=excluded.bundle",params![network_id,merged.epoch(),encoded])?;
-        for member in merged.historical_nodes()? {
-            let old: Option<String> = tx
-                .query_row(
-                    "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
-                    params![network_id, member.subject_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            ensure!(
-                old.as_ref().is_none_or(|key| key == &member.public_key),
-                "historical Node identity key changed"
-            );
-            tx.execute("INSERT OR IGNORE INTO node_certificates(network_id,node_id,public_key) VALUES(?,?,?)",params![network_id,member.subject_id,member.public_key])?;
-        }
+        let changed = install_trust_bundle_in(&tx, network_id, state)?;
         tx.commit()?;
-        Ok(true)
+        Ok(changed)
     }
     pub fn trust_bundle(&self, network_id: &str) -> Result<Option<NetworkState>> {
         optional_json(
             self.connection
                 .query_row(
-                    "SELECT bundle FROM networks WHERE network_id=?",
+                    "SELECT bundle FROM spaces WHERE space_id=?",
                     [network_id],
                     |r| r.get(0),
                 )
@@ -134,31 +391,26 @@ impl Store {
     ) -> Result<NodeCertificate> {
         authorize_node_from(&self.connection, network_id, node_id, role)
     }
-    pub fn save_local_identity(
-        &mut self,
-        network_id: &str,
-        identity: &LocalIdentity,
-    ) -> Result<()> {
+    pub fn save_local_device(&mut self, network_id: &str, identity: &LocalIdentity) -> Result<()> {
         let node_id = identity.node_id()?;
-        self.authorize_node(network_id, &node_id, None)?;
-        self.connection.execute("INSERT INTO local_identities(network_id,node_id,identity) VALUES(?,?,?) ON CONFLICT(network_id,node_id) DO UPDATE SET identity=excluded.identity",params![network_id,node_id,serde_json::to_string(identity)?])?;
+        let certificate = self.authorize_node(network_id, &node_id, None)?;
+        self.connection.execute(
+            "INSERT INTO local_devices(space_id,device_id,public_key) VALUES(?,?,?) ON CONFLICT(space_id,device_id) DO UPDATE SET public_key=excluded.public_key",
+            params![network_id, node_id, certificate.public_key],
+        )?;
         Ok(())
     }
-    pub fn local_identity(&self, network_id: &str, node_id: &str) -> Result<Option<LocalIdentity>> {
-        optional_json(
-            self.connection
-                .query_row(
-                    "SELECT identity FROM local_identities WHERE network_id=? AND node_id=?",
-                    params![network_id, node_id],
-                    |r| r.get(0),
-                )
-                .optional()?,
-        )
+    pub fn is_local_device(&self, network_id: &str, node_id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM local_devices WHERE space_id=? AND device_id=?",
+            params![network_id, node_id],
+            |r| r.get::<_, i64>(0),
+        )? == 1)
     }
     fn public_key(&self, network_id: &str, author: &str) -> Result<String> {
         self.connection
             .query_row(
-                "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
+                "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
                 params![network_id, author],
                 |r| r.get(0),
             )
@@ -166,9 +418,16 @@ impl Store {
             .context("unknown historical event author")
     }
     pub fn verify_event(&self, network_id: &str, envelope: &SignedEvent) -> Result<Event> {
-        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
-        let key = self.public_key(network_id, &event.author)?;
-        verify_signed_event(network_id, envelope, &key)
+        let event = crate::identity::event_authorization::verify_event_envelope(
+            &self.policy,
+            network_id,
+            envelope,
+        )?;
+        ensure!(
+            event.network_id == network_id,
+            "event belongs to another space"
+        );
+        Ok(event)
     }
     pub fn ingest_event(
         &mut self,
@@ -182,7 +441,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old: Option<String> = tx
             .query_row(
-                "SELECT envelope FROM events WHERE network_id=? AND hash=?",
+                "SELECT envelope FROM events WHERE space_id=? AND hash=?",
                 params![network_id, envelope.hash],
                 |r| r.get(0),
             )
@@ -190,12 +449,12 @@ impl Store {
         if let Some(old) = old {
             ensure!(old == encoded, "conflicting envelope for event hash");
         } else {
-            tx.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'pending')",params![network_id,envelope.hash,event.scope_id,event.author,event.sequence,encoded])?;
+            tx.execute("INSERT INTO events(space_id,resource_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?,'pending')",params![network_id,event.resource_id.as_str(),envelope.hash,event.scope_id,event.author,event.sequence,encoded])?;
         }
         rebuild_projections_from(&tx, network_id)?;
         tx.commit()?;
         let status: String = self.connection.query_row(
-            "SELECT status FROM events WHERE network_id=? AND hash=?",
+            "SELECT status FROM events WHERE space_id=? AND hash=?",
             params![network_id, envelope.hash],
             |r| r.get(0),
         )?;
@@ -207,61 +466,14 @@ impl Store {
     }
     pub fn append_event(
         &mut self,
-        identity: &LocalIdentity,
-        network_id: &str,
-        scope_id: &str,
-        body: EventBody,
-        blobs: Vec<BlobRef>,
-        created_at_ms: i64,
+        _identity: &LocalIdentity,
+        _network_id: &str,
+        _scope_id: &str,
+        _body: EventBody,
+        _blobs: Vec<BlobRef>,
+        _created_at_ms: i64,
     ) -> Result<SignedEvent> {
-        let author = identity.node_id()?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authorize_node_from(&tx, network_id, &author, None)?;
-        let events = load_events_from(&tx, network_id)?;
-        let heads = heads_from_events(&events, scope_id);
-        for hash in closure_hashes(&events, &heads) {
-            let stored = events.get(&hash).context("scope has missing history")?;
-            ensure!(
-                stored.status == "ready",
-                "scope has incomplete or conflicting history"
-            );
-            for blob in &stored.event.blobs {
-                ensure!(
-                    has_blob_from(&tx, network_id, blob)?,
-                    "scope has missing blob content"
-                );
-            }
-        }
-        let sequence:u64=tx.query_row("SELECT COALESCE(MAX(sequence),0)+1 FROM events WHERE network_id=? AND scope_id=? AND author=?",params![network_id,scope_id,author],|r|r.get(0))?;
-        let previous: Option<String> = if sequence == 1 {
-            None
-        } else {
-            Some(tx.query_row("SELECT hash FROM events WHERE network_id=? AND scope_id=? AND author=? AND sequence=? AND status='ready'",params![network_id,scope_id,author,sequence-1],|r|r.get(0))?)
-        };
-        for blob in &blobs {
-            ensure!(
-                has_blob_from(&tx, network_id, blob)?,
-                "required blob missing"
-            );
-        }
-        let envelope = identity.sign_event(Event {
-            version: WIRE_VERSION,
-            network_id: network_id.into(),
-            scope_id: scope_id.into(),
-            author: author.clone(),
-            sequence,
-            previous,
-            parents: heads,
-            created_at_ms,
-            body,
-            blobs,
-        })?;
-        tx.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'ready')",params![network_id,envelope.hash,scope_id,author,sequence,serde_json::to_string(&envelope)?])?;
-        rebuild_projections_from(&tx, network_id)?;
-        tx.commit()?;
-        Ok(envelope)
+        anyhow::bail!("events require a signed invocation and current admission proof")
     }
     fn load_events(&self, network_id: &str) -> Result<BTreeMap<String, StoredEvent>> {
         load_events_from(&self.connection, network_id)
@@ -270,7 +482,7 @@ impl Store {
         optional_json(
             self.connection
                 .query_row(
-                    "SELECT envelope FROM events WHERE network_id=? AND hash=?",
+                    "SELECT envelope FROM events WHERE space_id=? AND hash=?",
                     params![network_id, hash],
                     |r| r.get(0),
                 )
@@ -411,7 +623,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT INTO blobs(network_id,hash,size,content) VALUES(?,?,?,?) ON CONFLICT(network_id,hash) DO UPDATE SET size=excluded.size,content=excluded.content",
+            "INSERT INTO blobs(space_id,hash,size,content) VALUES(?,?,?,?) ON CONFLICT(space_id,hash) DO UPDATE SET size=excluded.size,content=excluded.content",
             params![network_id, expected.hash, expected.size, content],
         )?;
         rebuild_projections_from(&tx, network_id)?;
@@ -422,7 +634,7 @@ impl Store {
         let content: Option<Vec<u8>> = self
             .connection
             .query_row(
-                "SELECT content FROM blobs WHERE network_id=? AND hash=?",
+                "SELECT content FROM blobs WHERE space_id=? AND hash=?",
                 params![network_id, hash],
                 |r| r.get(0),
             )
@@ -447,7 +659,7 @@ impl Store {
         Ok(())
     }
     pub fn conversations(&self, network_id: &str) -> Result<Vec<Conversation>> {
-        let mut statement=self.connection.prepare("SELECT conversation_id,title FROM conversations WHERE network_id=? ORDER BY conversation_id")?;
+        let mut statement=self.connection.prepare("SELECT conversation_id,title FROM conversations WHERE space_id=? ORDER BY conversation_id")?;
         let rows = statement.query_map([network_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -464,7 +676,7 @@ impl Store {
         Ok(result)
     }
     pub fn messages(&self, network_id: &str, scope_id: &str) -> Result<Vec<Message>> {
-        let mut statement=self.connection.prepare("SELECT message_id,role,text,event_hash,created_at_ms FROM messages WHERE network_id=? AND conversation_id=? ORDER BY ordinal")?;
+        let mut statement=self.connection.prepare("SELECT message_id,role,text,event_hash,created_at_ms FROM messages WHERE space_id=? AND conversation_id=? ORDER BY ordinal")?;
         Ok(statement
             .query_map(params![network_id, scope_id], |r| {
                 Ok(Message {
@@ -478,7 +690,7 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
     pub fn tasks(&self, network_id: &str, scope_id: &str) -> Result<Vec<Task>> {
-        let mut statement=self.connection.prepare("SELECT task_id,conversation_id,title,goal,acceptance,status,detail,event_hash FROM tasks WHERE network_id=? AND conversation_id=? ORDER BY task_id")?;
+        let mut statement=self.connection.prepare("SELECT task_id,conversation_id,title,goal,acceptance,status,detail,event_hash FROM tasks WHERE space_id=? AND conversation_id=? ORDER BY task_id")?;
         Ok(statement
             .query_map(params![network_id, scope_id], |r| {
                 Ok(Task {
@@ -498,7 +710,7 @@ impl Store {
         optional_json(
             self.connection
                 .query_row(
-                    "SELECT value FROM local_values WHERE network_id=? AND key=?",
+                    "SELECT value FROM local_values WHERE space_id=? AND key=?",
                     params![network_id, key],
                     |r| r.get(0),
                 )
@@ -506,12 +718,12 @@ impl Store {
         )
     }
     pub fn local_set(&mut self, network_id: &str, key: &str, value: &Value) -> Result<()> {
-        self.connection.execute("INSERT INTO local_values(network_id,key,value) VALUES(?,?,?) ON CONFLICT(network_id,key) DO UPDATE SET value=excluded.value",params![network_id,key,serde_json::to_string(value)?])?;
+        self.connection.execute("INSERT INTO local_values(space_id,key,value) VALUES(?,?,?) ON CONFLICT(space_id,key) DO UPDATE SET value=excluded.value",params![network_id,key,serde_json::to_string(value)?])?;
         Ok(())
     }
     pub fn local_delete(&mut self, network_id: &str, key: &str) -> Result<()> {
         self.connection.execute(
-            "DELETE FROM local_values WHERE network_id=? AND key=?",
+            "DELETE FROM local_values WHERE space_id=? AND key=?",
             params![network_id, key],
         )?;
         Ok(())
@@ -522,10 +734,10 @@ impl Store {
         target_node: &str,
         session_id: &str,
     ) -> Result<Option<ExecutionSession>> {
-        optional_json(self.connection.query_row("SELECT record FROM execution_sessions WHERE network_id=? AND target_node=? AND session_id=?",params![network_id,target_node,session_id],|r|r.get(0)).optional()?)
+        optional_json(self.connection.query_row("SELECT record FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",params![network_id,target_node,session_id],|r|r.get(0)).optional()?)
     }
     pub fn sessions(&self, network_id: &str) -> Result<Vec<ExecutionSession>> {
-        let mut statement=self.connection.prepare("SELECT record FROM execution_sessions WHERE network_id=? ORDER BY target_node,session_id")?;
+        let mut statement=self.connection.prepare("SELECT record FROM execution_sessions WHERE space_id=? ORDER BY target_node,session_id")?;
         let rows = statement.query_map([network_id], |r| r.get::<_, String>(0))?;
         rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
     }
@@ -541,7 +753,7 @@ impl Store {
                 "session revision rollback"
             );
         }
-        let changed=self.connection.execute("INSERT INTO execution_sessions(network_id,target_node,session_id,revision,record) VALUES(?,?,?,?,?) ON CONFLICT(network_id,target_node,session_id) DO UPDATE SET revision=excluded.revision,record=excluded.record WHERE excluded.revision>=execution_sessions.revision",params![network_id,session.target_node,session.session_id,session.revision,serde_json::to_string(session)?])?;
+        let changed=self.connection.execute("INSERT INTO execution_sessions(space_id,target_node,session_id,revision,record) VALUES(?,?,?,?,?) ON CONFLICT(space_id,target_node,session_id) DO UPDATE SET revision=excluded.revision,record=excluded.record WHERE excluded.revision>=execution_sessions.revision",params![network_id,session.target_node,session.session_id,session.revision,serde_json::to_string(session)?])?;
         ensure!(changed == 1, "session revision rollback");
         Ok(())
     }
@@ -553,7 +765,7 @@ impl Store {
         let row: Option<(String, String, String)> = self
             .connection
             .query_row(
-                "SELECT request,state,result FROM operations WHERE network_id=? AND operation_id=?",
+                "SELECT request,state,result FROM operations WHERE space_id=? AND operation_id=?",
                 params![network_id, operation_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -569,7 +781,7 @@ impl Store {
     }
     pub fn operations(&self, network_id: &str) -> Result<Vec<OperationRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT operation_id FROM operations WHERE network_id=? ORDER BY operation_id",
+            "SELECT operation_id FROM operations WHERE space_id=? ORDER BY operation_id",
         )?;
         let ids = statement
             .query_map([network_id], |r| r.get::<_, String>(0))?
@@ -596,21 +808,27 @@ impl Store {
             .context("task creation envelope is missing")
     }
 
-    fn verify_binding_creation(&self, proof: &crate::binding::SignedBinding) -> Result<()> {
+    pub(crate) fn verify_binding_creation(
+        &self,
+        proof: &crate::binding::SignedBinding,
+    ) -> Result<()> {
         let binding = &proof.binding;
         let key = self.public_key(&binding.network_id, &binding.authority_node)?;
         crate::binding::verify_binding(proof, &key)?;
         self.verify_binding_task(binding, true)
     }
 
-    fn verify_historical_binding(&self, proof: &crate::binding::SignedBinding) -> Result<()> {
+    pub(crate) fn verify_historical_binding(
+        &self,
+        proof: &crate::binding::SignedBinding,
+    ) -> Result<()> {
         let binding = &proof.binding;
         let key = self.public_key(&binding.network_id, &binding.authority_node)?;
         crate::binding::verify_binding(proof, &key)?;
         self.verify_binding_task(binding, false)
     }
 
-    fn verify_binding_task(
+    pub(crate) fn verify_binding_task(
         &self,
         binding: &crate::binding::TaskBinding,
         require_current_executor: bool,
@@ -717,14 +935,14 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ready: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE network_id=? AND hash=? AND status='ready')",
+            "SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND hash=? AND status='ready')",
             params![binding.network_id, binding.task_ref],
             |r| r.get(0),
         )?;
         ensure!(ready, "task creation changed before binding confirmation");
         let current: Option<String> = tx
             .query_row(
-                "SELECT value FROM local_values WHERE network_id=? AND key=?",
+                "SELECT value FROM local_values WHERE space_id=? AND key=?",
                 params![binding.network_id, current_key],
                 |r| r.get(0),
             )
@@ -749,14 +967,14 @@ impl Store {
         }
         let unsigned = serde_json::json!({"binding":binding,"signature":null});
         tx.execute(
-            "INSERT OR IGNORE INTO local_values(network_id,key,value) VALUES(?,?,?)",
+            "INSERT OR IGNORE INTO local_values(space_id,key,value) VALUES(?,?,?)",
             params![
                 binding.network_id,
                 record_key,
                 serde_json::to_string(&unsigned)?
             ],
         )?;
-        tx.execute("INSERT INTO local_values(network_id,key,value) VALUES(?,?,?) ON CONFLICT(network_id,key) DO UPDATE SET value=excluded.value",params![binding.network_id,current_key,serde_json::to_string(&hash)?])?;
+        tx.execute("INSERT INTO local_values(space_id,key,value) VALUES(?,?,?) ON CONFLICT(space_id,key) DO UPDATE SET value=excluded.value",params![binding.network_id,current_key,serde_json::to_string(&hash)?])?;
         tx.commit()?;
         // No binding proof leaves this Node before its unique value is durable.
         let proof = crate::binding::sign_binding(identity, binding)?;
@@ -766,6 +984,116 @@ impl Store {
             &serde_json::to_value(&proof)?,
         )?;
         Ok(proof)
+    }
+
+    pub fn bind_task_authorized(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &vibeface_secure::authorization::VerifiedAuthorization,
+        proof: &crate::identity::policy::FreshnessProof,
+        transport: &vibeface_secure::authorization::TransportEvidence,
+        source_body: &Value,
+        now_ms: u64,
+    ) -> Result<crate::binding::SignedBinding> {
+        use vibeface_secure::authorization::Action;
+        ensure!(
+            auth.action() == Action::ExecutionOpen && source_body["method"] == "bind_execution",
+            "initial binding requires an execution-open invocation"
+        );
+        let required = |field: &str| {
+            source_body[field]
+                .as_str()
+                .with_context(|| format!("{field} is required"))
+        };
+        let space = auth.resource().space.as_str();
+        let scope = required("conversation_id")?;
+        let task_id = required("task_id")?;
+        let creation = self.task_creation(space, scope, task_id)?;
+        ensure!(
+            creation.hash == required("task_ref")?,
+            "binding refers to another task creation"
+        );
+        let task = self.verify_event(space, &creation)?;
+        ensure!(
+            task.resource_id == auth.resource().resource && task.author == identity.node_id()?,
+            "task authority or resource mismatch"
+        );
+        let binding = crate::binding::TaskBinding {
+            network_id: space.to_owned(),
+            conversation_id: scope.to_owned(),
+            task_ref: creation.hash,
+            task_id: task_id.to_owned(),
+            authority_node: task.author,
+            generation: 1,
+            target_node: required("target_node")?.to_owned(),
+            session_id: required("session_id")?.to_owned(),
+            open_spec: serde_json::json!({"type":"open","executor":required("executor")?,"cwd":required("cwd")?}),
+            previous_binding_hash: None,
+            previous_seal: None,
+        };
+        self.verify_binding_task(&binding, true)?;
+        let facts = self.request_facts(source_body, auth.audience())?;
+        let checked = self.policy.verified().verify_invocation(
+            auth.signed_invocation(),
+            &facts,
+            transport,
+            now_ms,
+        )?;
+        ensure!(
+            checked.invocation_hash() == auth.invocation_hash(),
+            "binding invocation changed"
+        );
+        self.policy
+            .verified()
+            .verify_freshness(auth, &proof.challenge, &proof.receipts, now_ms)?;
+        let signed = crate::binding::sign_binding(identity, &binding)?;
+        let hash = crate::binding::binding_hash(&binding)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_key = format!("task-binding-current:{}", binding.task_ref);
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT value FROM local_values WHERE space_id=? AND key=?",
+                params![space, current_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(current) = current {
+            let current: String = serde_json::from_str(&current)?;
+            ensure!(
+                current == hash,
+                "task is already bound; changing it requires execution-rebind authorization"
+            );
+            return Ok(signed);
+        }
+        let ready: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND hash=? AND resource_id=? AND status='ready')",
+            params![space,binding.task_ref,auth.resource().resource.as_str()], |row| row.get(0))?;
+        ensure!(ready, "task creation changed before binding");
+        crate::identity::admission::consume_authorization_in(
+            &tx,
+            &self.policy,
+            auth,
+            proof,
+            transport,
+            source_body,
+            None,
+            now_ms,
+        )?;
+        tx.execute(
+            "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
+            params![
+                space,
+                format!("task-binding-record:{hash}"),
+                serde_json::to_string(&signed)?
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
+            params![space, current_key, serde_json::to_string(&hash)?],
+        )?;
+        tx.commit()?;
+        Ok(signed)
     }
 
     pub fn install_binding(&mut self, proof: &crate::binding::SignedBinding) -> Result<()> {
@@ -782,7 +1110,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current: Option<String> = tx
             .query_row(
-                "SELECT value FROM local_values WHERE network_id=? AND key=?",
+                "SELECT value FROM local_values WHERE space_id=? AND key=?",
                 params![binding.network_id, current_key],
                 |r| r.get(0),
             )
@@ -791,7 +1119,7 @@ impl Store {
             let current: String = serde_json::from_str(&current)?;
             if current != hash {
                 let record: String = tx.query_row(
-                    "SELECT value FROM local_values WHERE network_id=? AND key=?",
+                    "SELECT value FROM local_values WHERE space_id=? AND key=?",
                     params![binding.network_id, format!("task-binding-record:{current}")],
                     |r| r.get(0),
                 )?;
@@ -805,7 +1133,7 @@ impl Store {
                 if binding.generation < previous.generation {
                     // Historical proof may be retained, but must never move the current fence backwards.
                     tx.execute(
-                        "INSERT OR IGNORE INTO local_values(network_id,key,value) VALUES(?,?,?)",
+                        "INSERT OR IGNORE INTO local_values(space_id,key,value) VALUES(?,?,?)",
                         params![
                             binding.network_id,
                             format!("task-binding-record:{hash}"),
@@ -821,11 +1149,11 @@ impl Store {
                 );
             }
         }
-        tx.execute("INSERT INTO local_values(network_id,key,value) VALUES(?,?,?) ON CONFLICT(network_id,key) DO UPDATE SET value=excluded.value",params![binding.network_id,format!("task-binding-record:{hash}"),serde_json::to_string(proof)?])?;
-        tx.execute("INSERT INTO local_values(network_id,key,value) VALUES(?,?,?) ON CONFLICT(network_id,key) DO UPDATE SET value=excluded.value",params![binding.network_id,current_key,serde_json::to_string(&hash)?])?;
+        tx.execute("INSERT INTO local_values(space_id,key,value) VALUES(?,?,?) ON CONFLICT(space_id,key) DO UPDATE SET value=excluded.value",params![binding.network_id,format!("task-binding-record:{hash}"),serde_json::to_string(proof)?])?;
+        tx.execute("INSERT INTO local_values(space_id,key,value) VALUES(?,?,?) ON CONFLICT(space_id,key) DO UPDATE SET value=excluded.value",params![binding.network_id,current_key,serde_json::to_string(&hash)?])?;
         if let Some(seal) = &binding.previous_seal {
             tx.execute(
-                "INSERT OR IGNORE INTO local_values(network_id,key,value) VALUES(?,?,?)",
+                "INSERT OR IGNORE INTO local_values(space_id,key,value) VALUES(?,?,?)",
                 params![
                     binding.network_id,
                     format!("task-binding-seal:{}", seal.seal.binding_hash),
@@ -863,7 +1191,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<String> = tx
             .query_row(
-                "SELECT value FROM local_values WHERE network_id=? AND key=?",
+                "SELECT value FROM local_values WHERE space_id=? AND key=?",
                 params![binding.network_id, key],
                 |r| r.get(0),
             )
@@ -876,13 +1204,13 @@ impl Store {
             self.local_set(&binding.network_id, &key, &serde_json::to_value(&signed)?)?;
             return Ok(signed);
         }
-        let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE network_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"'))",params![binding.network_id,binding.target_node,binding.session_id],|r|r.get(0))?;
+        let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE space_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"'))",params![binding.network_id,binding.target_node,binding.session_id],|r|r.get(0))?;
         ensure!(
             !busy,
             "cannot seal an unresolved execution; reconcile unknown results first"
         );
         let pending = {
-            let mut statement=tx.prepare("SELECT o.operation_id,o.state FROM operations o JOIN local_values v ON v.network_id=o.network_id AND v.key='completion:' || o.operation_id WHERE o.network_id=? AND o.target_node=? AND o.session_id=?")?;
+            let mut statement=tx.prepare("SELECT o.operation_id,o.state FROM operations o JOIN local_values v ON v.space_id=o.space_id AND v.key='completion:' || o.operation_id WHERE o.space_id=? AND o.target_node=? AND o.session_id=?")?;
             statement
                 .query_map(
                     params![binding.network_id, binding.target_node, binding.session_id],
@@ -905,7 +1233,7 @@ impl Store {
                     "execution completion must be durable before sealing");
             }
         }
-        let session:Option<String>=tx.query_row("SELECT record FROM execution_sessions WHERE network_id=? AND target_node=? AND session_id=?",params![binding.network_id,binding.target_node,binding.session_id],|r|r.get(0)).optional()?;
+        let session:Option<String>=tx.query_row("SELECT record FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",params![binding.network_id,binding.target_node,binding.session_id],|r|r.get(0)).optional()?;
         let revision = if let Some(session) = session {
             let session: ExecutionSession = serde_json::from_str(&session)?;
             ensure!(
@@ -923,7 +1251,7 @@ impl Store {
             final_revision: revision,
         };
         tx.execute(
-            "INSERT INTO local_values(network_id,key,value) VALUES(?,?,?)",
+            "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
             params![
                 binding.network_id,
                 key,
@@ -1080,7 +1408,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old: Option<(String, String, String)> = tx
             .query_row(
-                "SELECT request,state,result FROM operations WHERE network_id=? AND operation_id=?",
+                "SELECT request,state,result FROM operations WHERE space_id=? AND operation_id=?",
                 params![network_id, request.operation_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -1096,15 +1424,15 @@ impl Store {
         validate_operation_binding_from(&tx, request)?;
         for event in &complete.events {
             let hash = digest(serde_json::to_string(event)?.as_bytes());
-            let ready:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE network_id=? AND hash=? AND status='ready')",params![network_id,hash],|r|r.get(0))?;
+            let ready:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND hash=? AND status='ready')",params![network_id,hash],|r|r.get(0))?;
             ensure!(ready, "context changed during admission");
         }
-        let revision:Option<u64>=tx.query_row("SELECT revision FROM execution_sessions WHERE network_id=? AND target_node=? AND session_id=?",params![network_id,request.target_node,request.session_id],|r|r.get(0)).optional()?;
+        let revision:Option<u64>=tx.query_row("SELECT revision FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",params![network_id,request.target_node,request.session_id],|r|r.get(0)).optional()?;
         ensure!(
             revision.unwrap_or(0) == request.expected_revision,
             "stale execution session revision"
         );
-        let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE network_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"') AND (?=0 OR control=1))",params![network_id,request.target_node,request.session_id,control],|r|r.get(0))?;
+        let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE space_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"') AND (?=0 OR control=1))",params![network_id,request.target_node,request.session_id,control],|r|r.get(0))?;
         ensure!(!busy, "execution session has an unresolved operation");
         {
             let mut statement =
@@ -1119,9 +1447,9 @@ impl Store {
                 );
             }
         }
-        tx.execute("INSERT INTO operations(network_id,operation_id,target_node,session_id,request,state,control,result) VALUES(?,?,?,?,?,'\"accepted\"',?,'null')",params![network_id,request.operation_id,request.target_node,request.session_id,encoded,control])?;
+        tx.execute("INSERT INTO operations(space_id,operation_id,target_node,session_id,request,state,control,result) VALUES(?,?,?,?,?,'\"accepted\"',?,'null')",params![network_id,request.operation_id,request.target_node,request.session_id,encoded,control])?;
         for resource in resources {
-            tx.execute("INSERT INTO resource_reservations(network_id,operation_id,target_node,resource) VALUES(?,?,?,?)",params![network_id,request.operation_id,request.target_node,resource])?;
+            tx.execute("INSERT INTO resource_reservations(space_id,operation_id,target_node,resource) VALUES(?,?,?,?)",params![network_id,request.operation_id,request.target_node,resource])?;
         }
         tx.commit()?;
         Ok(OperationRecord {
@@ -1139,7 +1467,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let encoded: String = tx.query_row(
-            "SELECT request FROM operations WHERE network_id=? AND operation_id=?",
+            "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
             params![network_id, operation_id],
             |r| r.get(0),
         )?;
@@ -1151,7 +1479,7 @@ impl Store {
             &request.target_node,
             Some(NodeRole::Executor),
         )?;
-        let revision:Option<u64>=tx.query_row("SELECT revision FROM execution_sessions WHERE network_id=? AND target_node=? AND session_id=?",params![network_id,request.target_node,request.session_id],|r|r.get(0)).optional()?;
+        let revision:Option<u64>=tx.query_row("SELECT revision FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",params![network_id,request.target_node,request.session_id],|r|r.get(0)).optional()?;
         ensure!(
             revision.unwrap_or(0) == request.expected_revision,
             "execution session changed before claim"
@@ -1177,7 +1505,7 @@ impl Store {
                 );
             }
         }
-        let changed=tx.execute("UPDATE operations SET state='\"running\"' WHERE network_id=? AND operation_id=? AND state='\"accepted\"'",params![network_id,operation_id])?;
+        let changed=tx.execute("UPDATE operations SET state='\"running\"' WHERE space_id=? AND operation_id=? AND state='\"accepted\"'",params![network_id,operation_id])?;
         ensure!(
             changed == 1,
             "operation is not accepted or has already been claimed"
@@ -1202,7 +1530,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<(String, String, String)> = tx
             .query_row(
-                "SELECT request,state,result FROM operations WHERE network_id=? AND operation_id=?",
+                "SELECT request,state,result FROM operations WHERE space_id=? AND operation_id=?",
                 params![network_id, operation_id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -1227,7 +1555,7 @@ impl Store {
             "operation has not started"
         );
         tx.execute(
-            "UPDATE operations SET state=?,result=? WHERE network_id=? AND operation_id=?",
+            "UPDATE operations SET state=?,result=? WHERE space_id=? AND operation_id=?",
             params![
                 serde_json::to_string(&state)?,
                 serde_json::to_string(&result)?,
@@ -1237,14 +1565,14 @@ impl Store {
         )?;
         if state.terminal() {
             tx.execute(
-                "DELETE FROM resource_reservations WHERE network_id=? AND operation_id=?",
+                "DELETE FROM resource_reservations WHERE space_id=? AND operation_id=?",
                 params![network_id, operation_id],
             )?;
-            let session:Option<String>=tx.query_row("SELECT record FROM execution_sessions WHERE network_id=? AND target_node=? AND session_id=?",params![network_id,request.target_node,request.session_id],|r|r.get(0)).optional()?;
+            let session:Option<String>=tx.query_row("SELECT record FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",params![network_id,request.target_node,request.session_id],|r|r.get(0)).optional()?;
             if let Some(session) = session {
                 let mut session: ExecutionSession = serde_json::from_str(&session)?;
                 session.revision = session.revision.max(request.expected_revision + 1);
-                tx.execute("UPDATE execution_sessions SET revision=?,record=? WHERE network_id=? AND target_node=? AND session_id=?",params![session.revision,serde_json::to_string(&session)?,network_id,request.target_node,request.session_id])?;
+                tx.execute("UPDATE execution_sessions SET revision=?,record=? WHERE space_id=? AND target_node=? AND session_id=?",params![session.revision,serde_json::to_string(&session)?,network_id,request.target_node,request.session_id])?;
             }
         }
         tx.commit()?;
@@ -1255,11 +1583,23 @@ impl Store {
         })
     }
     pub fn recover_running(&mut self) -> Result<usize> {
-        let count = self.connection.execute(
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let count = tx.execute(
             "UPDATE operations SET state='\"unknown\"' WHERE state='\"running\"'",
             [],
         )?;
-        self.connection.execute("UPDATE continuation_claims SET record=json_set(record,'$.state','unknown') WHERE json_extract(record,'$.state')='running'",[])?;
+        tx.execute("UPDATE continuation_claims SET record=json_set(record,'$.state','unknown') WHERE json_extract(record,'$.state')='running'",[])?;
+        tx.execute(
+            "UPDATE local_values SET value=json_set(value,'$.state','unknown') WHERE key GLOB 'scheduler:invocation:*' AND json_extract(value,'$.state')='running'",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE local_values SET value=json_set(value,'$.active.state','unknown','$.native_id',NULL) WHERE key GLOB 'scheduler:session:*' AND json_extract(value,'$.active.state') IN ('running','unknown')",
+            [],
+        )?;
+        tx.commit()?;
         Ok(count)
     }
     pub fn claim_continuation(
@@ -1280,7 +1620,7 @@ impl Store {
             "continuation requires an execution result"
         );
         ensure!(
-            self.local_identity(network_id, &event.author)?.is_some(),
+            self.is_local_device(network_id, &event.author)?,
             "continuation must be claimed at its event-producing Node"
         );
         ensure!(
@@ -1300,7 +1640,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         authorize_node_from(&tx, network_id, scheduler_node, Some(NodeRole::Scheduler))?;
         authorize_node_from(&tx, network_id, &event.author, None)?;
-        let changed=tx.execute("INSERT OR IGNORE INTO continuation_claims(network_id,result_event_hash,policy_version,record) VALUES(?,?,?,?)",params![network_id,result_event_hash,policy_version,serde_json::to_string(&claim)?])?;
+        let changed=tx.execute("INSERT OR IGNORE INTO continuation_claims(space_id,result_event_hash,policy_version,record) VALUES(?,?,?,?)",params![network_id,result_event_hash,policy_version,serde_json::to_string(&claim)?])?;
         ensure!(
             changed == 1,
             "continuation has already been claimed; reconcile its original attempt"
@@ -1314,7 +1654,7 @@ impl Store {
         result_event_hash: &str,
         policy_version: &str,
     ) -> Result<Option<ContinuationClaim>> {
-        optional_json(self.connection.query_row("SELECT record FROM continuation_claims WHERE network_id=? AND result_event_hash=? AND policy_version=?",params![network_id,result_event_hash,policy_version],|r|r.get(0)).optional()?)
+        optional_json(self.connection.query_row("SELECT record FROM continuation_claims WHERE space_id=? AND result_event_hash=? AND policy_version=?",params![network_id,result_event_hash,policy_version],|r|r.get(0)).optional()?)
     }
     pub fn finish_continuation(
         &mut self,
@@ -1332,7 +1672,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let record:String=tx.query_row("SELECT record FROM continuation_claims WHERE network_id=? AND result_event_hash=? AND policy_version=?",params![network_id,result_event_hash,policy_version],|r|r.get(0))?;
+        let record:String=tx.query_row("SELECT record FROM continuation_claims WHERE space_id=? AND result_event_hash=? AND policy_version=?",params![network_id,result_event_hash,policy_version],|r|r.get(0))?;
         let mut claim: ContinuationClaim = serde_json::from_str(&record)?;
         ensure!(
             claim.scheduler_node == scheduler_node,
@@ -1347,7 +1687,7 @@ impl Store {
         }
         claim.state = state.into();
         claim.result = result;
-        tx.execute("UPDATE continuation_claims SET record=? WHERE network_id=? AND result_event_hash=? AND policy_version=?",params![serde_json::to_string(&claim)?,network_id,result_event_hash,policy_version])?;
+        tx.execute("UPDATE continuation_claims SET record=? WHERE space_id=? AND result_event_hash=? AND policy_version=?",params![serde_json::to_string(&claim)?,network_id,result_event_hash,policy_version])?;
         tx.commit()?;
         Ok(claim)
     }
@@ -1366,7 +1706,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old: Option<String> = tx
             .query_row(
-                "SELECT record FROM notification_outbox WHERE network_id=? AND notification_id=?",
+                "SELECT record FROM notification_outbox WHERE space_id=? AND notification_id=?",
                 params![network_id, notification.notification_id],
                 |r| r.get(0),
             )
@@ -1375,7 +1715,7 @@ impl Store {
             ensure!(old == encoded, "notification ID reused with different body");
         } else {
             tx.execute(
-                "INSERT INTO notification_outbox(network_id,notification_id,record) VALUES(?,?,?)",
+                "INSERT INTO notification_outbox(space_id,notification_id,record) VALUES(?,?,?)",
                 params![network_id, notification.notification_id, encoded],
             )?;
         }
@@ -1387,7 +1727,7 @@ impl Store {
         network_id: &str,
         client_id: &str,
     ) -> Result<Vec<Notification>> {
-        let mut statement=self.connection.prepare("SELECT n.record FROM notification_outbox n WHERE n.network_id=? AND NOT EXISTS(SELECT 1 FROM notification_acks a WHERE a.network_id=n.network_id AND a.notification_id=n.notification_id AND a.client_id=?) ORDER BY n.notification_id")?;
+        let mut statement=self.connection.prepare("SELECT n.record FROM notification_outbox n WHERE n.space_id=? AND (n.derived=0 OR EXISTS(SELECT 1 FROM events e WHERE e.space_id=n.space_id AND e.hash=json_extract(n.record,'$.event_hash') AND e.status='ready')) AND NOT EXISTS(SELECT 1 FROM notification_acks a WHERE a.space_id=n.space_id AND a.notification_id=n.notification_id AND a.client_id=?) ORDER BY n.notification_id")?;
         let rows =
             statement.query_map(params![network_id, client_id], |r| r.get::<_, String>(0))?;
         rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
@@ -1399,9 +1739,9 @@ impl Store {
         client_id: &str,
     ) -> Result<()> {
         ensure!(!client_id.is_empty(), "client ID is required");
-        let exists:bool=self.connection.query_row("SELECT EXISTS(SELECT 1 FROM notification_outbox WHERE network_id=? AND notification_id=?)",params![network_id,notification_id],|r|r.get(0))?;
+        let exists:bool=self.connection.query_row("SELECT EXISTS(SELECT 1 FROM notification_outbox WHERE space_id=? AND notification_id=?)",params![network_id,notification_id],|r|r.get(0))?;
         ensure!(exists, "unknown notification");
-        self.connection.execute("INSERT INTO notification_acks(network_id,notification_id,client_id,event_hash) VALUES(?,?,?,'') ON CONFLICT(network_id,notification_id,client_id) DO UPDATE SET event_hash=''",params![network_id,notification_id,client_id])?;
+        self.connection.execute("INSERT INTO notification_acks(space_id,notification_id,client_id,event_hash) VALUES(?,?,?,'') ON CONFLICT(space_id,notification_id,client_id) DO UPDATE SET event_hash=''",params![network_id,notification_id,client_id])?;
         Ok(())
     }
     pub fn budget_usage(&self, network_id: &str, day: &str, limit: u64) -> Result<BudgetUsage> {
@@ -1409,7 +1749,7 @@ impl Store {
         let used = self
             .connection
             .query_row(
-                "SELECT used FROM budget_days WHERE network_id=? AND day=?",
+                "SELECT used FROM budget_days WHERE space_id=? AND day=?",
                 params![network_id, day],
                 |r| r.get(0),
             )
@@ -1438,7 +1778,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let used: u64 = tx
             .query_row(
-                "SELECT used FROM budget_days WHERE network_id=? AND day=?",
+                "SELECT used FROM budget_days WHERE space_id=? AND day=?",
                 params![network_id, day],
                 |r| r.get(0),
             )
@@ -1446,7 +1786,7 @@ impl Store {
             .unwrap_or(0);
         let next = used.checked_add(units).context("budget overflow")?;
         ensure!(next <= limit, "daily model budget exhausted");
-        tx.execute("INSERT INTO budget_days(network_id,day,used) VALUES(?,?,?) ON CONFLICT(network_id,day) DO UPDATE SET used=excluded.used",params![network_id,day,next])?;
+        tx.execute("INSERT INTO budget_days(space_id,day,used) VALUES(?,?,?) ON CONFLICT(space_id,day) DO UPDATE SET used=excluded.used",params![network_id,day,next])?;
         tx.commit()?;
         Ok(BudgetUsage {
             day: day.into(),
@@ -1457,7 +1797,7 @@ impl Store {
     pub fn networks(&self) -> Result<Vec<NetworkId>> {
         let mut statement = self
             .connection
-            .prepare("SELECT network_id FROM networks ORDER BY network_id")?;
+            .prepare("SELECT space_id FROM spaces ORDER BY space_id")?;
         Ok(statement
             .query_map([], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?)
@@ -1465,13 +1805,14 @@ impl Store {
     pub fn scopes(&self, network_id: &str) -> Result<Vec<ScopeId>> {
         let mut statement = self
             .connection
-            .prepare("SELECT DISTINCT scope_id FROM events WHERE network_id=? ORDER BY scope_id")?;
+            .prepare("SELECT DISTINCT scope_id FROM events WHERE space_id=? ORDER BY scope_id")?;
         Ok(statement
             .query_map([network_id], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
-fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result<()> {
+pub(crate) fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result<()> {
+    let policy = crate::identity::journal::PolicyState::load(connection)?;
     let mut events = load_events_from(connection, network_id)?;
     let mut author_sequences: BTreeMap<(String, String, u64), Vec<String>> = BTreeMap::new();
     for (hash, e) in &events {
@@ -1532,27 +1873,27 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
                 break;
             }
         }
-        if blobs_complete {
+        if blobs_complete
+            && matches!(
+                crate::identity::event_authorization::validate_event_evidence(
+                    &policy, connection, &e.event, &events,
+                )?,
+                crate::identity::event_authorization::EventEvidenceStatus::Valid
+            )
+        {
             events.get_mut(hash).unwrap().status = "ready".into();
         }
     }
     for (hash, e) in &events {
         connection.execute(
-            "UPDATE events SET status=? WHERE network_id=? AND hash=?",
+            "UPDATE events SET status=? WHERE space_id=? AND hash=?",
             params![e.status, network_id, hash],
         )?;
     }
-    connection.execute("DELETE FROM conversations WHERE network_id=?", [network_id])?;
-    connection.execute("DELETE FROM messages WHERE network_id=?", [network_id])?;
-    connection.execute("DELETE FROM tasks WHERE network_id=?", [network_id])?;
-    connection.execute(
-        "DELETE FROM notification_outbox WHERE network_id=? AND derived=1",
-        [network_id],
-    )?;
-    connection.execute(
-        "DELETE FROM notification_acks WHERE network_id=? AND event_hash!=''",
-        [network_id],
-    )?;
+    connection.execute("DELETE FROM messages WHERE space_id=?", [network_id])?;
+    connection.execute("DELETE FROM tasks WHERE space_id=?", [network_id])?;
+    connection.execute("DELETE FROM conversations WHERE space_id=?", [network_id])?;
+    let mut projected_notifications = BTreeSet::new();
     for (ordinal, hash) in ordered.iter().enumerate() {
         let stored = &events[hash];
         if stored.status != "ready" {
@@ -1561,7 +1902,7 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
         let event = &stored.event;
         match &event.body {
             EventBody::ConversationCreated { title } => {
-                connection.execute("INSERT OR IGNORE INTO conversations(network_id,conversation_id,title) VALUES(?,?,?)",params![network_id,event.scope_id,title])?;
+                connection.execute("INSERT OR IGNORE INTO conversations(space_id,resource_id,conversation_id,title) VALUES(?,?,?,?)",params![network_id,event.resource_id.as_str(),event.scope_id,title])?;
             }
             EventBody::MessagePosted {
                 message_id,
@@ -1569,7 +1910,7 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
                 text,
                 ..
             } => {
-                connection.execute("INSERT INTO messages(network_id,conversation_id,event_hash,message_id,role,text,created_at_ms,ordinal) VALUES(?,?,?,?,?,?,?,?)",params![network_id,event.scope_id,hash,message_id,role,text,event.created_at_ms,ordinal])?;
+                connection.execute("INSERT INTO messages(space_id,conversation_id,event_hash,message_id,role,text,created_at_ms,ordinal) VALUES(?,?,?,?,?,?,?,?)",params![network_id,event.scope_id,hash,message_id,role,text,event.created_at_ms,ordinal])?;
             }
             EventBody::TaskCreated {
                 task_id,
@@ -1577,14 +1918,14 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
                 goal,
                 acceptance,
             } => {
-                connection.execute("INSERT OR IGNORE INTO tasks(network_id,conversation_id,task_id,title,goal,acceptance,status,detail,event_hash) VALUES(?,?,?,?,?,?,'open','',?)",params![network_id,event.scope_id,task_id,title,goal,acceptance,hash])?;
+                connection.execute("INSERT OR IGNORE INTO tasks(space_id,conversation_id,task_id,title,goal,acceptance,status,detail,event_hash) VALUES(?,?,?,?,?,?,'open','',?)",params![network_id,event.scope_id,task_id,title,goal,acceptance,hash])?;
             }
             EventBody::TaskChanged {
                 task_id,
                 status,
                 detail,
             } => {
-                connection.execute("UPDATE tasks SET status=?,detail=?,event_hash=? WHERE network_id=? AND conversation_id=? AND task_id=?",params![status,detail,hash,network_id,event.scope_id,task_id])?;
+                connection.execute("UPDATE tasks SET status=?,detail=?,event_hash=? WHERE space_id=? AND conversation_id=? AND task_id=?",params![status,detail,hash,network_id,event.scope_id,task_id])?;
             }
             EventBody::NotificationRaised {
                 notification_id,
@@ -1598,13 +1939,15 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
                     text: text.clone(),
                     event_hash: hash.clone(),
                 };
-                connection.execute("INSERT OR IGNORE INTO notification_outbox(network_id,notification_id,record,derived) VALUES(?,?,?,1)",params![network_id,notification_id,serde_json::to_string(&notification)?])?;
+                if projected_notifications.insert(notification_id.clone()) {
+                    connection.execute("INSERT INTO notification_outbox(space_id,notification_id,record,derived) VALUES(?,?,?,1) ON CONFLICT(space_id,notification_id) DO UPDATE SET record=excluded.record WHERE notification_outbox.derived=1",params![network_id,notification_id,serde_json::to_string(&notification)?])?;
+                }
             }
             EventBody::NotificationAcknowledged {
                 notification_id,
                 client_id,
             } => {
-                connection.execute("INSERT OR IGNORE INTO notification_acks(network_id,notification_id,client_id,event_hash) VALUES(?,?,?,?)",params![network_id,notification_id,client_id,hash])?;
+                connection.execute("INSERT OR IGNORE INTO notification_acks(space_id,notification_id,client_id,event_hash) VALUES(?,?,?,?)",params![network_id,notification_id,client_id,hash])?;
             }
             _ => {}
         }
@@ -1615,25 +1958,38 @@ fn authorize_node_from(
     connection: &Connection,
     network_id: &str,
     node_id: &str,
-    role: Option<NodeRole>,
+    _role: Option<NodeRole>,
 ) -> Result<NodeCertificate> {
-    let encoded: String = connection
-        .query_row(
-            "SELECT bundle FROM networks WHERE network_id=?",
-            [network_id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .context("unknown network")?;
-    let state: NetworkState = serde_json::from_str(&encoded)?;
-    let view = state.project()?;
+    use vibeface_secure::authorization::{DeviceId, PublicKey, SpaceId};
+    let key: String = connection.query_row(
+        "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
+        params![network_id, node_id],
+        |row| row.get(0),
+    )?;
     ensure!(
-        view.network_id == network_id,
-        "stored membership network mismatch"
+        crate::crypto::fingerprint(&key)? == node_id,
+        "Node certificate projection mismatch"
     );
-    view.authorize_node(node_id, role)?.certificate()
+    let policy = crate::identity::journal::PolicyState::load(connection)?;
+    let public_key = PublicKey::parse(&key)?;
+    let certificate = policy.verified().verify_service_device(
+        &SpaceId::parse(network_id)?,
+        &DeviceId::from_key(&public_key),
+        crate::runtime::now_ms() as u64,
+    )?;
+    ensure!(
+        certificate.payload.public_key == public_key,
+        "Node certificate key mismatch"
+    );
+    Ok(NodeCertificate {
+        node_id: node_id.to_owned(),
+        public_key: key,
+        roles: vec![],
+        revoked: false,
+    })
 }
-fn validate_operation_binding_from(
+
+pub(crate) fn validate_operation_binding_from(
     connection: &Connection,
     request: &OperationRequest,
 ) -> Result<()> {
@@ -1659,7 +2015,7 @@ fn validate_operation_binding_from(
         );
     }
     let ready: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM events WHERE network_id=? AND hash=? AND status='ready')",
+        "SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND hash=? AND status='ready')",
         params![binding.network_id, binding.task_ref],
         |r| r.get(0),
     )?;
@@ -1667,7 +2023,7 @@ fn validate_operation_binding_from(
     let hash = crate::binding::binding_hash(binding)?;
     let current: Option<String> = connection
         .query_row(
-            "SELECT value FROM local_values WHERE network_id=? AND key=?",
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
             params![
                 request.network_id,
                 format!("task-binding-current:{}", binding.task_ref)
@@ -1685,7 +2041,7 @@ fn validate_operation_binding_from(
         "task binding is missing or superseded"
     );
     let sealed: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM local_values WHERE network_id=? AND key=?)",
+        "SELECT EXISTS(SELECT 1 FROM local_values WHERE space_id=? AND key=?)",
         params![request.network_id, format!("task-binding-seal:{hash}")],
         |r| r.get(0),
     )?;
@@ -1696,7 +2052,10 @@ fn validate_operation_binding_from(
     Ok(())
 }
 
-fn heads_from_events(events: &BTreeMap<String, StoredEvent>, scope_id: &str) -> Vec<String> {
+pub(crate) fn heads_from_events(
+    events: &BTreeMap<String, StoredEvent>,
+    scope_id: &str,
+) -> Vec<String> {
     let mut heads: BTreeSet<String> = events
         .iter()
         .filter(|(_, e)| e.event.scope_id == scope_id)
@@ -1709,12 +2068,12 @@ fn heads_from_events(events: &BTreeMap<String, StoredEvent>, scope_id: &str) -> 
     }
     heads.into_iter().collect()
 }
-fn load_events_from(
+pub(crate) fn load_events_from(
     connection: &Connection,
     network_id: &str,
 ) -> Result<BTreeMap<String, StoredEvent>> {
     let mut query = connection
-        .prepare("SELECT hash,envelope,status,scope_id,author,sequence FROM events WHERE network_id=? ORDER BY hash")?;
+        .prepare("SELECT hash,envelope,status,scope_id,author,sequence,resource_id FROM events WHERE space_id=? ORDER BY hash")?;
     let rows = query.query_map([network_id], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -1723,22 +2082,23 @@ fn load_events_from(
             r.get::<_, String>(3)?,
             r.get::<_, String>(4)?,
             r.get::<_, u64>(5)?,
+            r.get::<_, String>(6)?,
         ))
     })?;
     let mut result = BTreeMap::new();
+    let policy = crate::identity::journal::PolicyState::load(connection)?;
     for row in rows {
-        let (hash, envelope, status, scope, author, sequence) = row?;
+        let (hash, envelope, status, scope, author, sequence, resource) = row?;
         let envelope: SignedEvent = serde_json::from_str(&envelope)?;
         ensure!(envelope.hash == hash, "stored event hash mismatch");
-        let body: Event = serde_json::from_str(&envelope.canonical_body)?;
-        let public_key: String = connection.query_row(
-            "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
-            params![network_id, body.author],
-            |r| r.get(0),
+        let event = crate::identity::event_authorization::verify_event_envelope(
+            &policy, network_id, &envelope,
         )?;
-        let event = verify_signed_event(network_id, &envelope, &public_key)?;
         ensure!(
-            event.scope_id == scope && event.author == author && event.sequence == sequence,
+            event.scope_id == scope
+                && event.author == author
+                && event.sequence == sequence
+                && event.resource_id.as_str() == resource,
             "stored event metadata does not match signed body"
         );
         result.insert(
@@ -1750,13 +2110,33 @@ fn load_events_from(
             },
         );
     }
+    for stored in result.values() {
+        let evidence = crate::identity::event_authorization::validate_event_evidence(
+            &policy,
+            connection,
+            &stored.event,
+            &result,
+        )?;
+        ensure!(
+            stored.status != "ready"
+                || matches!(
+                    evidence,
+                    crate::identity::event_authorization::EventEvidenceStatus::Valid
+                ),
+            "ready event has incomplete admission or causal evidence"
+        );
+    }
     Ok(result)
 }
 
-fn has_blob_from(connection: &Connection, network_id: &str, blob: &BlobRef) -> Result<bool> {
+pub(crate) fn has_blob_from(
+    connection: &Connection,
+    network_id: &str,
+    blob: &BlobRef,
+) -> Result<bool> {
     let content: Option<Vec<u8>> = connection
         .query_row(
-            "SELECT content FROM blobs WHERE network_id=? AND hash=? AND size=?",
+            "SELECT content FROM blobs WHERE space_id=? AND hash=? AND size=?",
             params![network_id, blob.hash, blob.size],
             |r| r.get(0),
         )
@@ -1771,7 +2151,10 @@ fn optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>
 fn dependencies(event: &Event) -> impl Iterator<Item = &String> {
     event.parents.iter().chain(event.previous.iter())
 }
-fn closure_hashes(events: &BTreeMap<String, StoredEvent>, heads: &[String]) -> BTreeSet<String> {
+pub(crate) fn closure_hashes(
+    events: &BTreeMap<String, StoredEvent>,
+    heads: &[String],
+) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
     let mut stack = heads.to_vec();
     while let Some(hash) = stack.pop() {
@@ -1818,7 +2201,7 @@ fn topological(events: &BTreeMap<String, StoredEvent>, closure: &BTreeSet<String
     }
     ordered
 }
-fn canonical_resource(resource: &str) -> Result<String> {
+pub(crate) fn canonical_resource(resource: &str) -> Result<String> {
     ensure!(resource.len() <= 4096, "resource path too long");
     let path = Path::new(resource);
     ensure!(path.is_absolute(), "resource paths must be absolute");
@@ -1852,7 +2235,7 @@ fn canonical_resource(resource: &str) -> Result<String> {
         .map(str::to_string)
         .context("resource path must be UTF-8")
 }
-fn paths_overlap(left: &str, right: &str) -> bool {
+pub(crate) fn paths_overlap(left: &str, right: &str) -> bool {
     let left = Path::new(left);
     let right = Path::new(right);
     left.starts_with(right) || right.starts_with(left)
@@ -1892,7 +2275,7 @@ mod tests {
             &owner.fixture_network_id()?,
             &owner.sign_network_fixture(1, nodes)?,
         )?;
-        store.save_local_identity(&owner.fixture_network_id()?, owner)?;
+        store.save_local_device(&owner.fixture_network_id()?, owner)?;
         Ok(store)
     }
     fn conversation(store: &mut Store, owner: &LocalIdentity) -> Result<SignedEvent> {
@@ -2062,7 +2445,7 @@ mod tests {
         )?;
         store.ingest_event(&network, &event)?;
         store.connection.execute(
-            "UPDATE blobs SET content=? WHERE network_id=? AND hash=?",
+            "UPDATE blobs SET content=? WHERE space_id=? AND hash=?",
             params![b"tampered".as_slice(), network, blob.hash],
         )?;
         assert!(store.get_blob(&network, &blob.hash).is_err());
@@ -2254,7 +2637,7 @@ mod tests {
         let mut event = conversation(&mut store, &a)?;
         event.canonical_body = event.canonical_body.replace("work", "tampered");
         store.connection.execute(
-            "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
+            "UPDATE events SET envelope=? WHERE space_id=? AND hash=?",
             params![serde_json::to_string(&event)?, network, event.hash],
         )?;
         assert!(store.context(&network, "conversation", &[]).is_err());
@@ -2865,6 +3248,63 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn replicated_notification_conflicts_converge_and_keep_acknowledgments() -> Result<()> {
+        let a = LocalIdentity::generate();
+        let b = LocalIdentity::generate();
+        let network = a.fixture_network_id()?;
+        let mut left = memory(&a, Some(&b))?;
+        let mut right = memory(&a, Some(&b))?;
+        conversation(&mut left, &a)?;
+        right.import_snapshot(&network, &left.export_snapshot(&network, "conversation")?)?;
+        let first = left.append_event(
+            &a,
+            &network,
+            "conversation",
+            EventBody::NotificationRaised {
+                notification_id: "same-id".into(),
+                kind: "approval".into(),
+                text: "left".into(),
+            },
+            vec![],
+            2,
+        )?;
+        let second = right.append_event(
+            &b,
+            &network,
+            "conversation",
+            EventBody::NotificationRaised {
+                notification_id: "same-id".into(),
+                kind: "approval".into(),
+                text: "right".into(),
+            },
+            vec![],
+            2,
+        )?;
+        left.ingest_event(&network, &second)?;
+        right.ingest_event(&network, &first)?;
+        let notices = left.pending_notifications(&network, "phone")?;
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices, right.pending_notifications(&network, "phone")?);
+        left.ack_notification(&network, "same-id", "phone")?;
+        left.rebuild_projections(&network)?;
+        assert!(left.pending_notifications(&network, "phone")?.is_empty());
+        assert_eq!(left.pending_notifications(&network, "laptop")?, notices);
+        let mut conflicting: Event = serde_json::from_str(&first.canonical_body)?;
+        conflicting.body = EventBody::NotificationRaised {
+            notification_id: "same-id".into(),
+            kind: "approval".into(),
+            text: "equivocation".into(),
+        };
+        let conflicting = a.sign_event(conflicting)?;
+        left.ingest_event(&network, &conflicting)?;
+        let remaining = left.pending_notifications(&network, "laptop")?;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].event_hash, second.hash);
+        assert!(left.pending_notifications(&network, "phone")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn incompatible_membership_is_rejected_before_recovery_mutates_operations() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
             "vibeface-membership-preflight-{}",
@@ -2884,7 +3324,7 @@ mod tests {
         store.claim_operation(&network, "running")?;
         drop(store);
         let connection = Connection::open(&db)?;
-        connection.execute("UPDATE networks SET bundle='{}'", [])?;
+        connection.execute("UPDATE spaces SET bundle='{}'", [])?;
         drop(connection);
         assert!(Store::open(&db).is_err());
         let connection = Connection::open(&db)?;
@@ -2905,7 +3345,7 @@ mod tests {
     #[test]
     fn reopening_keeps_unknown_effects_reserved_and_rejects_future_schema() -> Result<()> {
         let root = std::env::temp_dir().join(format!("vibeface-core-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root)?;
+        crate::config::private_dir(&root)?;
         let db = root.join("node.sqlite3");
         let a = LocalIdentity::generate();
         let network = a.fixture_network_id()?;
@@ -2935,6 +3375,120 @@ mod tests {
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
+    #[test]
+    fn read_only_access_keeps_live_operations_and_projections_unchanged() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("vibeface-readonly-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&root)?;
+        let db = root.join("node.sqlite3");
+        let owner = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut live = Store::open(&db)?;
+        live.install_trust_bundle(
+            &network,
+            &owner.sign_network_fixture(1, vec![owner.certificate(roles())?])?,
+        )?;
+        let event = conversation(&mut live, &owner)?;
+        let operation = request(&mut live, &owner, "running", vec![event.hash])?;
+        live.accept_operation(&network, &operation)?;
+        live.claim_operation(&network, "running")?;
+        {
+            let access = Store::open_read_only(&db)?;
+            assert!(access.has_network()?);
+            assert_eq!(
+                access.operation(&network, "running")?.unwrap().state,
+                OperationState::Running
+            );
+            assert_eq!(access.conversations(&network)?.len(), 1);
+            assert!(
+                access
+                    .connection
+                    .execute("DELETE FROM operations", [])
+                    .is_err()
+            );
+        }
+        for suffix in ["-wal", "-shm"] {
+            let path = root.join(format!("node.sqlite3{suffix}"));
+            assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(
+            live.operation(&network, "running")?.unwrap().state,
+            OperationState::Running
+        );
+        let reserved: u64 = live.connection.query_row(
+            "SELECT COUNT(*) FROM resource_reservations WHERE operation_id='running'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(reserved, operation.resources.len() as u64);
+        assert_eq!(live.conversations(&network)?.len(), 1);
+        drop(live);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn schema_and_signed_state_are_validated_before_recovery() -> Result<()> {
+        for (mutation, structural) in [
+            ("DROP TABLE tasks", true),
+            ("DROP INDEX events_author_sequence", true),
+            ("CREATE TABLE identity_network (state TEXT)", true),
+            ("UPDATE events SET envelope='{}'", false),
+            ("UPDATE spaces SET bundle='{}'", false),
+        ] {
+            let root = std::env::temp_dir()
+                .join(format!("vibeface-schema-drift-{}", uuid::Uuid::new_v4()));
+            crate::config::private_dir(&root)?;
+            let db = root.join("node.sqlite3");
+            let owner = LocalIdentity::generate();
+            let network = owner.fixture_network_id()?;
+            {
+                let mut store = Store::open(&db)?;
+                store.install_trust_bundle(
+                    &network,
+                    &owner.sign_network_fixture(1, vec![owner.certificate(roles())?])?,
+                )?;
+                let event = conversation(&mut store, &owner)?;
+                let operation = request(&mut store, &owner, "running", vec![event.hash])?;
+                store.accept_operation(&network, &operation)?;
+                store.claim_operation(&network, "running")?;
+            }
+            {
+                let connection = Connection::open(&db)?;
+                connection.execute_batch(mutation)?;
+            }
+            let snapshot = || -> Result<BTreeMap<String, (Vec<u8>, u32)>> {
+                let mut files = BTreeMap::new();
+                for entry in fs::read_dir(&root)? {
+                    let entry = entry?;
+                    files.insert(
+                        entry.file_name().to_string_lossy().into_owned(),
+                        (
+                            fs::read(entry.path())?,
+                            entry.metadata()?.permissions().mode(),
+                        ),
+                    );
+                }
+                Ok(files)
+            };
+            let before = snapshot()?;
+            assert_eq!(Store::verify_existing_database(&db).is_err(), structural);
+            assert!(Store::open(&db).is_err());
+            if structural {
+                assert_eq!(snapshot()?, before);
+            }
+            let connection = Connection::open(&db)?;
+            let state: String = connection.query_row(
+                "SELECT state FROM operations WHERE operation_id='running'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(state, "\"running\"");
+            drop(connection);
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn resource_normalization_follows_symlinks_before_parent_components() -> Result<()> {

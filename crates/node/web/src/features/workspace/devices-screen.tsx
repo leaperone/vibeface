@@ -6,7 +6,7 @@ import { useWorkspace } from "./context"
 export function DevicesScreen() {
   const workspace = useWorkspace()
   return (
-    <section aria-label="我的设备" hidden={workspace.view !== "devices"}>
+    <section className="workspace-screen" aria-label="我的设备" hidden={workspace.view !== "devices"}>
       <DeviceControls />
     </section>
   )

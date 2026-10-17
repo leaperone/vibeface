@@ -2,13 +2,24 @@
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{future::Future, path::PathBuf, time::Duration};
-use tokio::sync::mpsc;
+use std::{
+    collections::BTreeMap,
+    future::Future,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+use tokio::sync::{Mutex, mpsc};
 use vibeface_bridge::codex::{CodexClient, CodexError};
 use vibeface_protocol::{Command, RpcId};
 
+#[path = "engine_isolation.rs"]
+mod isolation;
 #[path = "engine_process.rs"]
 mod process;
+use isolation::DockerIsolation;
+pub(crate) use isolation::IsolatedProcess as ManagerProcess;
+pub use isolation::{ExecutionContext, ExecutionEgressConfig, ExecutionIsolationConfig};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +36,10 @@ pub struct ExecutorConfig {
     pub claude_bin: PathBuf,
     pub cursor_bin: PathBuf,
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub execution_isolation: Option<ExecutionIsolationConfig>,
+    #[serde(skip)]
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for ExecutorConfig {
@@ -34,6 +49,8 @@ impl Default for ExecutorConfig {
             claude_bin: "claude".into(),
             cursor_bin: "cursor-agent".into(),
             timeout_secs: 600,
+            execution_isolation: None,
+            data_dir: None,
         }
     }
 }
@@ -120,27 +137,55 @@ impl EngineError {
 #[derive(Clone)]
 pub struct Engine {
     config: ExecutorConfig,
-    codex: Option<CodexClient>,
+    codex: Arc<OnceLock<CodexClient>>,
     events: mpsc::UnboundedSender<Value>,
+    isolation: Option<DockerIsolation>,
+    manager_isolation: Option<DockerIsolation>,
+    codex_contexts: Arc<Mutex<BTreeMap<(Option<String>, String), ExecutionContext>>>,
+    personal_turns: Arc<Mutex<BTreeMap<(String, String, String), (String, String)>>>,
 }
 
 impl Engine {
     pub fn new(config: ExecutorConfig, events: mpsc::UnboundedSender<Value>) -> Self {
-        let socket = config.codex_socket.clone().or_else(|| {
-            std::env::var_os("HOME").map(|home| {
-                PathBuf::from(home).join(".codex/app-server-control/app-server-control.sock")
-            })
-        });
-        let codex = socket.map(|socket| CodexClient::start(socket, events.clone()));
+        let codex_contexts = Arc::new(Mutex::new(BTreeMap::new()));
+        let codex = Arc::new(OnceLock::new());
+        let isolation = config
+            .execution_isolation
+            .clone()
+            .zip(config.data_dir.clone())
+            .map(|(settings, data_dir)| DockerIsolation::new(settings, data_dir));
+        let manager_isolation = config
+            .execution_isolation
+            .clone()
+            .zip(config.data_dir.clone())
+            .map(|(settings, data_dir)| DockerIsolation::manager(settings, data_dir));
         Self {
             config,
             codex,
             events,
+            isolation,
+            manager_isolation,
+            codex_contexts,
+            personal_turns: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
+    fn personal_codex(&self) -> Result<&CodexClient> {
+        let socket = self
+            .config
+            .codex_socket
+            .clone()
+            .context("personal Codex socket is not configured")?;
+        Ok(self.codex.get_or_init(|| {
+            CodexClient::start(
+                socket,
+                codex_events(self.events.clone(), self.codex_contexts.clone(), None),
+            )
+        }))
+    }
+
     pub async fn snapshot(&self) -> Value {
-        match &self.codex {
+        match self.codex.get() {
             Some(codex) => codex.snapshot().await,
             None => {
                 json!({"connection":{"state":"unconfigured"},"threads":{},"pending_requests":[]})
@@ -149,12 +194,92 @@ impl Engine {
     }
 
     pub(crate) async fn read_turn(&self, native_id: &str, turn_id: &str) -> Result<Option<Value>> {
+        let codex = self.codex.get().context("Codex socket is not configured")?;
+        Self::read_turn_from(codex, native_id, turn_id).await
+    }
+
+    pub async fn snapshot_authorized(&self, context: &ExecutionContext) -> Result<Value> {
+        if context.shared {
+            return Ok(self
+                .isolation
+                .as_ref()
+                .context("shared execution isolation is not configured")?
+                .existing_codex(context)
+                .await?
+                .0
+                .snapshot()
+                .await);
+        }
+        Ok(self
+            .codex
+            .get()
+            .context("personal Provider is not connected")?
+            .snapshot()
+            .await)
+    }
+
+    pub async fn read_turn_authorized(
+        &self,
+        context: &ExecutionContext,
+        native_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<Value>> {
+        let codex = self.existing_authorized_codex(context, native_id).await?;
+        Self::read_turn_from(&codex, native_id, turn_id).await
+    }
+
+    pub async fn read_session_authorized(
+        &self,
+        context: &ExecutionContext,
+        native_id: &str,
+    ) -> Result<Value> {
+        let codex = self.existing_authorized_codex(context, native_id).await?;
+        codex
+            .execute(&Command::ReadThread {
+                thread_id: native_id.into(),
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))
+    }
+
+    async fn existing_authorized_codex(
+        &self,
+        context: &ExecutionContext,
+        native_id: &str,
+    ) -> Result<CodexClient> {
+        vibeface_protocol::validate_id(native_id).map_err(anyhow::Error::msg)?;
+        let (codex, generation) = if context.shared {
+            let (codex, generation) = self
+                .isolation
+                .as_ref()
+                .context("shared execution isolation is not configured")?
+                .existing_codex(context)
+                .await?;
+            (codex, Some(generation))
+        } else {
+            (
+                self.codex
+                    .get()
+                    .context("personal Provider is not connected")?
+                    .clone(),
+                None,
+            )
+        };
+        let bindings = self.codex_contexts.lock().await;
+        let bound = bindings
+            .get(&(generation, native_id.to_owned()))
+            .context("native session has no trusted execution binding")?;
+        ensure_same_host_scope(bound, context)?;
+        Ok(codex)
+    }
+
+    async fn read_turn_from(
+        codex: &CodexClient,
+        native_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<Value>> {
         vibeface_protocol::validate_id(native_id).map_err(anyhow::Error::msg)?;
         vibeface_protocol::validate_id(turn_id).map_err(anyhow::Error::msg)?;
-        let codex = self
-            .codex
-            .as_ref()
-            .context("Codex socket is not configured")?;
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut cursor = None;
             let mut seen = std::collections::BTreeSet::new();
@@ -187,8 +312,167 @@ impl Engine {
         .context("Codex turn lookup timed out")?
     }
 
-    pub async fn execute<F, Fut>(
+    pub(crate) async fn prepare_manager(
         &self,
+        context: &ExecutionContext,
+        workspace: &std::path::Path,
+    ) -> Result<ManagerProcess> {
+        self.manager_isolation
+            .as_ref()
+            .context("management requires configured process isolation")?
+            .prepare(context, workspace)
+            .await
+    }
+
+    pub async fn renew_manager(
+        &self,
+        context: &ExecutionContext,
+        lease_expires_at_ms: u64,
+    ) -> Result<()> {
+        self.manager_isolation
+            .as_ref()
+            .context("management process isolation is not configured")?
+            .renew(context, lease_expires_at_ms)
+            .await
+    }
+
+    pub async fn cancel_manager(&self, context: &ExecutionContext) -> Result<Vec<String>> {
+        self.manager_isolation
+            .as_ref()
+            .context("management process isolation is not configured")?
+            .cancel(context)
+            .await
+    }
+
+    pub async fn complete_manager(&self, context: &ExecutionContext) -> Result<()> {
+        self.manager_isolation
+            .as_ref()
+            .context("management process isolation is not configured")?
+            .complete(context)
+            .await
+    }
+
+    pub async fn cancel_operation(&self, context: &ExecutionContext) -> Result<Vec<String>> {
+        ensure!(
+            context.shared,
+            "host execution cannot confirm operation cancellation; preserve unknown state"
+        );
+        self.isolation
+            .as_ref()
+            .context("shared execution isolation is not configured")?
+            .cancel(context)
+            .await
+    }
+
+    pub async fn affected_operations(&self, context: &ExecutionContext) -> Vec<String> {
+        match &self.isolation {
+            Some(isolation) if context.shared => isolation.affected(context).await,
+            _ => vec![context.operation_id.clone()],
+        }
+    }
+
+    pub async fn complete_operation(&self, context: &ExecutionContext) -> Result<()> {
+        if let Some(isolation) = &self.isolation {
+            isolation.complete(context).await?;
+        }
+        self.codex_contexts.lock().await.retain(|_, bound| {
+            bound.space_id != context.space_id
+                || bound.resource_id != context.resource_id
+                || bound.operation_id != context.operation_id
+        });
+        self.personal_turns
+            .lock()
+            .await
+            .remove(&personal_turn_key(context));
+        Ok(())
+    }
+
+    pub async fn cancel_personal_turn(
+        &self,
+        context: &ExecutionContext,
+        native_id: &str,
+        turn_id: &str,
+    ) -> Result<()> {
+        ensure!(
+            !context.shared,
+            "personal cancellation cannot target shared execution"
+        );
+        vibeface_protocol::validate_id(native_id).map_err(anyhow::Error::msg)?;
+        vibeface_protocol::validate_id(turn_id).map_err(anyhow::Error::msg)?;
+        let codex = self
+            .codex
+            .get()
+            .context("personal Provider is not connected; cancellation was not confirmed")?;
+        let bindings = self.codex_contexts.lock().await;
+        let bound = bindings
+            .get(&(None, native_id.to_owned()))
+            .context("native session has no trusted execution binding")?;
+        ensure_same_host_scope(bound, context)?;
+        ensure!(
+            bound.operation_id == context.operation_id,
+            "native session belongs to another operation"
+        );
+        drop(bindings);
+        ensure!(
+            self.personal_turns
+                .lock()
+                .await
+                .get(&personal_turn_key(context))
+                == Some(&(native_id.to_owned(), turn_id.to_owned())),
+            "turn does not match the original operation"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let terminal = |turn: &Value| {
+                matches!(
+                    turn["status"].as_str(),
+                    Some("completed" | "failed" | "interrupted")
+                )
+            };
+            let observed = Self::read_turn_from(codex, native_id, turn_id)
+                .await?
+                .context("original turn is not present; cancellation was not confirmed")?;
+            if terminal(&observed) {
+                return Ok(());
+            }
+            codex
+                .execute(&Command::InterruptTurn {
+                    thread_id: native_id.into(),
+                    turn_id: turn_id.into(),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            loop {
+                if let Some(turn) = Self::read_turn_from(codex, native_id, turn_id).await? {
+                    if terminal(&turn) {
+                        return Ok(());
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("personal turn stop was not confirmed; preserve unknown state")?
+    }
+
+    pub async fn renew_operation(
+        &self,
+        context: &ExecutionContext,
+        lease_expires_at_ms: u64,
+    ) -> Result<()> {
+        ensure!(
+            context.shared,
+            "host execution has no isolated lease watchdog"
+        );
+        self.isolation
+            .as_ref()
+            .context("shared execution isolation is not configured")?
+            .renew(context, lease_expires_at_ms)
+            .await
+    }
+
+    pub async fn execute_authorized<F, Fut>(
+        &self,
+        context: &ExecutionContext,
         session: &ExecutorSession,
         action: EngineAction,
         persist_native: F,
@@ -216,22 +500,131 @@ impl Engine {
             vibeface_protocol::validate_id(id)
                 .map_err(|error| EngineError::rejected(session, error))?;
         }
+        let isolated = if context.shared {
+            let isolation = self.isolation.as_ref().ok_or_else(|| {
+                EngineError::rejected(session, "shared execution isolation is not configured")
+            })?;
+            if session.executor == ExecutorKind::CursorAgent
+                && self
+                    .config
+                    .execution_isolation
+                    .as_ref()
+                    .is_some_and(|settings| settings.egress.is_some())
+            {
+                return Err(EngineError::rejected(
+                    session,
+                    "shared Cursor execution has no verified restricted model gateway transport",
+                ));
+            }
+            Some(
+                isolation
+                    .prepare(context, &session.cwd)
+                    .await
+                    .map_err(|error| EngineError::rejected(session, error.to_string()))?,
+            )
+        } else {
+            None
+        };
         if session.executor != ExecutorKind::Codex {
-            return process::execute(
+            let result = process::execute(
                 &self.config,
                 session,
                 action,
                 persist_native,
-                self.events.clone(),
+                scoped_events(
+                    self.events.clone(),
+                    context.clone(),
+                    isolated
+                        .as_ref()
+                        .map(|process| process.container_id().to_owned()),
+                ),
+                isolated.as_ref(),
             )
             .await;
+            if context.shared {
+                if result.as_ref().is_err_and(|error| error.uncertain) {
+                    let _ = self.cancel_operation(context).await;
+                } else {
+                    if let Err(error) = self.complete_operation(context).await {
+                        return Err(EngineError {
+                            uncertain: true,
+                            native_session_id: result
+                                .as_ref()
+                                .ok()
+                                .and_then(|result| result.native_session_id.clone())
+                                .or_else(|| session.native_session_id.clone()),
+                            message: format!(
+                                "isolated execution cleanup could not be confirmed: {error}"
+                            ),
+                        });
+                    }
+                }
+            }
+            return result;
         }
-        let codex = self
-            .codex
+        let isolated_codex = if context.shared {
+            Some(
+                self.isolation
+                    .as_ref()
+                    .unwrap()
+                    .codex(
+                        context,
+                        isolated.as_ref().unwrap(),
+                        codex_events(
+                            self.events.clone(),
+                            self.codex_contexts.clone(),
+                            Some(isolated.as_ref().unwrap().container_id().to_owned()),
+                        ),
+                    )
+                    .await
+                    .map_err(|error| EngineError::rejected(session, error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let codex = match isolated_codex.as_ref() {
+            Some(codex) => codex,
+            None => self
+                .personal_codex()
+                .map_err(|error| EngineError::rejected(session, error.to_string()))?,
+        };
+        let container_id = isolated
             .as_ref()
-            .ok_or_else(|| EngineError::rejected(session, "Codex socket is not configured"))?;
+            .map(|process| process.container_id().to_owned());
+        if let Some(id) = &session.native_session_id {
+            let mut bindings = self.codex_contexts.lock().await;
+            let key = (container_id.clone(), id.clone());
+            if let Some(bound) = bindings.get(&key) {
+                ensure_same_host_scope(bound, context)
+                    .map_err(|error| EngineError::rejected(session, error.to_string()))?;
+            }
+            if matches!(action, EngineAction::Send { .. }) || !bindings.contains_key(&key) {
+                bindings.insert(key, context.clone());
+            }
+        }
+        {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let state = codex.snapshot().await;
+                    if state["connection"]["state"] == "connected" {
+                        break;
+                    }
+                    if state["connection"]["state"] == "disconnected"
+                        && state["connection"]["error"].is_string()
+                    {
+                        anyhow::bail!("isolated Codex failed to connect");
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .map_err(|_| EngineError::rejected(session, "isolated Codex initialization timed out"))?
+            .map_err(|error| EngineError::rejected(session, error.to_string()))?;
+        }
         let mut native = session.native_session_id.clone();
         let mut sent = false;
+        let running_turn = matches!(action, EngineAction::Send { .. });
         let operation = async {
             if matches!(action, EngineAction::Open {}) && native.is_some() {
                 return Err(EngineError::rejected(
@@ -243,7 +636,12 @@ impl Engine {
             if native.is_none()
                 && matches!(action, EngineAction::Open {} | EngineAction::Send { .. })
             {
-                let cwd = session.cwd.to_str().ok_or_else(|| {
+                let cwd = if context.shared {
+                    Some("/project")
+                } else {
+                    session.cwd.to_str()
+                }
+                .ok_or_else(|| {
                     EngineError::rejected(session, "execution directory must be UTF-8")
                 })?;
                 sent = true;
@@ -269,6 +667,10 @@ impl Engine {
                         native_session_id: native.clone(),
                         message: format!("persist Codex session before send: {error}"),
                     })?;
+                self.codex_contexts
+                    .lock()
+                    .await
+                    .insert((container_id.clone(), id.into()), context.clone());
                 opened = Some(reply);
                 sent = false;
             }
@@ -328,16 +730,122 @@ impl Engine {
                 result,
             })
         };
-        match tokio::time::timeout(Duration::from_secs(self.config.timeout_secs), operation).await {
-            Ok(result) => result,
-            Err(_) => Err(EngineError {
-                uncertain: sent,
-                native_session_id: native,
-                message: "Codex command timed out; reconcile its native session before retrying"
-                    .into(),
-            }),
+        let result =
+            match tokio::time::timeout(Duration::from_secs(self.config.timeout_secs), operation)
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(EngineError {
+                    uncertain: sent,
+                    native_session_id: native.clone(),
+                    message:
+                        "Codex command timed out; reconcile its native session before retrying"
+                            .into(),
+                }),
+            };
+        if !context.shared && running_turn {
+            if let Ok(reply) = &result {
+                if let (Some(native), Some(turn)) = (
+                    &reply.native_session_id,
+                    reply.result["turn"]["id"].as_str(),
+                ) {
+                    vibeface_protocol::validate_id(turn).map_err(|error| EngineError {
+                        uncertain: true,
+                        native_session_id: Some(native.clone()),
+                        message: error,
+                    })?;
+                    self.personal_turns.lock().await.insert(
+                        personal_turn_key(context),
+                        (native.clone(), turn.to_owned()),
+                    );
+                }
+            }
         }
+        if context.shared {
+            if result.as_ref().is_err_and(|error| error.uncertain) {
+                let _ = self.cancel_operation(context).await;
+            } else if !running_turn || result.is_err() {
+                if let Err(error) = self.complete_operation(context).await {
+                    return Err(EngineError {
+                        uncertain: true,
+                        native_session_id: native,
+                        message: format!(
+                            "isolated execution cleanup could not be confirmed: {error}"
+                        ),
+                    });
+                }
+            }
+        }
+        result
     }
+}
+
+fn ensure_same_host_scope(left: &ExecutionContext, right: &ExecutionContext) -> Result<()> {
+    ensure!(
+        left.space_id == right.space_id && left.resource_id == right.resource_id,
+        "native host session is bound to a different space or resource"
+    );
+    Ok(())
+}
+
+fn personal_turn_key(context: &ExecutionContext) -> (String, String, String) {
+    (
+        context.space_id.to_string(),
+        context.resource_id.to_string(),
+        context.operation_id.clone(),
+    )
+}
+
+fn scoped_event(event: &Value, context: &ExecutionContext, container_id: Option<&str>) -> Value {
+    json!({"execution_context":{"space_id":context.space_id,"resource_id":context.resource_id,"operation_id":context.operation_id,"container_id":container_id},"event":event})
+}
+
+fn codex_events(
+    output: mpsc::UnboundedSender<Value>,
+    contexts: Arc<Mutex<BTreeMap<(Option<String>, String), ExecutionContext>>>,
+    container_id: Option<String>,
+) -> mpsc::UnboundedSender<Value> {
+    let (events, mut incoming) = mpsc::unbounded_channel::<Value>();
+    tokio::spawn(async move {
+        while let Some(event) = incoming.recv().await {
+            let contexts = contexts.lock().await;
+            let thread = event["params"]["threadId"]
+                .as_str()
+                .or_else(|| event["params"]["thread"]["id"].as_str());
+            if let Some(context) =
+                thread.and_then(|thread| contexts.get(&(container_id.clone(), thread.to_owned())))
+            {
+                let _ = output.send(scoped_event(&event, context, container_id.as_deref()));
+            } else if event["method"] == "bridge.codex_disconnected" {
+                for ((source, _), context) in contexts
+                    .iter()
+                    .filter(|((source, _), _)| source == &container_id)
+                {
+                    let _ = output.send(scoped_event(&event, context, source.as_deref()));
+                }
+            }
+        }
+    });
+    events
+}
+
+fn scoped_events(
+    output: mpsc::UnboundedSender<Value>,
+    context: ExecutionContext,
+    container_id: Option<String>,
+) -> mpsc::UnboundedSender<Value> {
+    let (events, mut incoming) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = incoming.recv().await {
+            if output
+                .send(scoped_event(&event, &context, container_id.as_deref()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    events
 }
 
 fn codex_error(error: CodexError, native_session_id: Option<String>) -> EngineError {
@@ -351,6 +859,58 @@ fn codex_error(error: CodexError, native_session_id: Option<String>) -> EngineEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn codex_events_use_trusted_thread_and_container_bindings() -> Result<()> {
+        use vibeface_secure::authorization::{ResourceId, SpaceId};
+        let context = ExecutionContext {
+            space_id: SpaceId::parse(&format!("spc2_{}", "1".repeat(64)))?,
+            resource_id: ResourceId::parse(&format!("res2_{}", "2".repeat(64)))?,
+            operation_id: "first-operation".into(),
+            shared: true,
+            lease_expires_at_ms: 0,
+        };
+        let mut other = context.clone();
+        other.operation_id = "second-operation".into();
+        let contexts = Arc::new(Mutex::new(BTreeMap::from([
+            (
+                (Some("container-a".into()), "same-thread".into()),
+                context.clone(),
+            ),
+            (
+                (Some("container-b".into()), "same-thread".into()),
+                other.clone(),
+            ),
+        ])));
+        let (output, mut received) = mpsc::unbounded_channel();
+        let source = codex_events(output, contexts.clone(), Some("container-a".into()));
+        source.send(json!({"execution_context":{"operation_id":"forged"},"method":"turn/completed","params":{"threadId":"same-thread"}}))?;
+        let first = tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await?
+            .context("event missing")?;
+        assert_eq!(
+            first["execution_context"]["operation_id"],
+            "first-operation"
+        );
+        assert_eq!(first["execution_context"]["container_id"], "container-a");
+        contexts
+            .lock()
+            .await
+            .insert((Some("container-a".into()), "same-thread".into()), other);
+        source.send(json!({"method":"turn/completed","params":{"threadId":"same-thread"}}))?;
+        let second = tokio::time::timeout(Duration::from_secs(1), received.recv())
+            .await?
+            .context("event missing")?;
+        assert_eq!(
+            second["execution_context"]["operation_id"],
+            "second-operation"
+        );
+        assert_eq!(
+            second["execution_context"]["space_id"],
+            context.space_id.as_str()
+        );
+        Ok(())
+    }
     #[tokio::test]
     async fn turn_lookup_pages_until_the_exact_native_turn() -> Result<()> {
         use futures_util::{SinkExt, StreamExt};
@@ -408,6 +968,11 @@ mod tests {
             },
             events,
         );
+        assert_eq!(
+            engine.snapshot().await["connection"]["state"],
+            "unconfigured"
+        );
+        engine.personal_codex()?;
         tokio::time::timeout(Duration::from_secs(3), async {
             while engine.snapshot().await["connection"]["state"] != "connected" {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -454,5 +1019,219 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    fn personal_context() -> ExecutionContext {
+        use vibeface_secure::authorization::{ResourceId, SpaceId};
+        ExecutionContext {
+            space_id: SpaceId::parse(&format!("spc2_{}", "a".repeat(64))).unwrap(),
+            resource_id: ResourceId::parse(&format!("res2_{}", "b".repeat(64))).unwrap(),
+            operation_id: "personal-operation".into(),
+            shared: false,
+            lease_expires_at_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_never_initializes_a_personal_provider() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("vfr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let socket = dir.join("codex.sock");
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        let (events, _) = mpsc::unbounded_channel();
+        let engine = Engine::new(
+            ExecutorConfig {
+                codex_socket: Some(socket),
+                ..ExecutorConfig::default()
+            },
+            events,
+        );
+        let context = personal_context();
+        assert!(engine.snapshot_authorized(&context).await.is_err());
+        assert!(
+            engine
+                .read_turn_authorized(&context, "native", "turn")
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .read_session_authorized(&context, "native")
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .cancel_personal_turn(&context, "native", "turn")
+                .await
+                .is_err()
+        );
+        assert!(engine.codex.get().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn personal_cancellation_interrupts_only_the_original_turn_and_confirms_terminal()
+    -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let dir = std::env::temp_dir().join(format!("vfc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let socket = dir.join("codex.sock");
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut ws = tokio_tungstenite::accept_async(stream).await?;
+            let init: Value =
+                serde_json::from_str(ws.next().await.context("initialize missing")??.to_text()?)?;
+            ws.send(Message::Text(
+                json!({"id":init["id"],"result":{}}).to_string().into(),
+            ))
+            .await?;
+            let initialized: Value =
+                serde_json::from_str(ws.next().await.context("initialized missing")??.to_text()?)?;
+            ensure!(
+                initialized["method"] == "initialized",
+                "initialize handshake missing"
+            );
+            let steps = [
+                ("thread/start", json!({"thread":{"id":"original-native"}})),
+                (
+                    "turn/start",
+                    json!({"turn":{"id":"original-turn","status":"inProgress"}}),
+                ),
+                (
+                    "thread/read",
+                    json!({"thread":{"id":"original-native","turns":[]}}),
+                ),
+                (
+                    "thread/turns/list",
+                    json!({"data":[{"id":"original-turn","status":"inProgress"}],"nextCursor":null}),
+                ),
+                ("turn/interrupt", json!({})),
+                (
+                    "thread/turns/list",
+                    json!({"data":[{"id":"original-turn","status":"inProgress"}],"nextCursor":null}),
+                ),
+                (
+                    "thread/turns/list",
+                    json!({"data":[{"id":"original-turn","status":"interrupted"}],"nextCursor":null}),
+                ),
+                (
+                    "thread/turns/list",
+                    json!({"data":[{"id":"original-turn","status":"interrupted"}],"nextCursor":null}),
+                ),
+            ];
+            for (method, result) in steps {
+                let request: Value = serde_json::from_str(
+                    ws.next()
+                        .await
+                        .context("expected request missing")??
+                        .to_text()?,
+                )?;
+                ensure!(
+                    request["method"] == method,
+                    "unexpected Provider request: {}",
+                    request["method"]
+                );
+                if method != "thread/start" {
+                    ensure!(
+                        request["params"]["threadId"] == "original-native",
+                        "wrong native session targeted"
+                    );
+                }
+                if method == "turn/interrupt" {
+                    ensure!(
+                        request["params"]["turnId"] == "original-turn",
+                        "wrong turn interrupted"
+                    );
+                }
+                ws.send(Message::Text(
+                    json!({"id":request["id"],"result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let (events, _) = mpsc::unbounded_channel();
+        let engine = Engine::new(
+            ExecutorConfig {
+                codex_socket: Some(socket),
+                ..ExecutorConfig::default()
+            },
+            events,
+        );
+        let context = personal_context();
+        let result = engine
+            .execute_authorized(
+                &context,
+                &ExecutorSession {
+                    executor: ExecutorKind::Codex,
+                    cwd: dir.clone(),
+                    native_session_id: None,
+                },
+                EngineAction::Send {
+                    text: "fixed original operation".into(),
+                },
+                |_| async { Ok(()) },
+            )
+            .await?;
+        assert_eq!(result.native_session_id.as_deref(), Some("original-native"));
+        assert_eq!(result.result["turn"]["id"], "original-turn");
+        let mut wrong_scope = context.clone();
+        wrong_scope.space_id =
+            vibeface_secure::authorization::SpaceId::parse(&format!("spc2_{}", "c".repeat(64)))?;
+        let mut wrong_operation = context.clone();
+        wrong_operation.operation_id = "unrelated-operation".into();
+        for bad in [&wrong_scope, &wrong_operation] {
+            assert!(
+                engine
+                    .cancel_personal_turn(bad, "original-native", "original-turn")
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            engine
+                .cancel_personal_turn(&context, "wrong-native", "original-turn")
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .cancel_personal_turn(&context, "original-native", "wrong-turn")
+                .await
+                .is_err()
+        );
+        assert!(
+            engine
+                .read_session_authorized(&wrong_scope, "original-native")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            engine
+                .read_session_authorized(&context, "original-native")
+                .await?["thread"]["id"],
+            "original-native"
+        );
+        engine
+            .cancel_personal_turn(&context, "original-native", "original-turn")
+            .await?;
+        engine
+            .cancel_personal_turn(&context, "original-native", "original-turn")
+            .await?;
+        tokio::time::timeout(Duration::from_secs(2), server).await???;
+        drop(engine);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

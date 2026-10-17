@@ -18,13 +18,13 @@ command = "node --check crates/node/sdk/codex-manager.mjs && node --check crates
 
 [[domain_check]]
 name = "Delivery scripts and workflow"
-trigger_paths = ["install.sh", "scripts/*.sh", ".github/workflows/**"]
-command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh && bash install.sh --self-test && actionlint .github/workflows/ci.yml"
+trigger_paths = ["install.sh", "scripts/*.sh", "scripts/execution/**", ".github/workflows/**"]
+command = "bash -n install.sh && bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/verify-schema.sh scripts/build-execution-image.sh && shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh scripts/verify-schema.sh scripts/build-execution-image.sh && bash install.sh --self-test && actionlint .github/workflows/ci.yml"
 
 [[domain_check]]
-name = "Migration integrity"
-trigger_paths = ["crates/node/migrations/**", "crates/node/identity-migrations/**"]
-command = "atlas migrate validate --dir file://crates/node/migrations && atlas migrate validate --dir file://crates/node/identity-migrations"
+name = "Fresh schema integrity"
+trigger_paths = ["crates/node/schema.hcl", "crates/node/migrations/**", "scripts/verify-schema.sh"]
+command = "bash scripts/verify-schema.sh"
 
 [review]
 extra_checklist = "Check command deduplication, uncertain write results, device connection ownership, local socket permissions, and manager token budgets. A public Node may also schedule or execute; no permanent coordinator or task owner. Verify network and conversation scoping, complete DAG context and no side effects from replay."

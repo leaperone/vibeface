@@ -1,4 +1,4 @@
-use crate::runtime::{Access, Runtime};
+use crate::runtime::Runtime;
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
@@ -297,7 +297,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     (!token.is_empty() && token.trim() == token).then_some(token)
 }
 
-async fn bearer_access(app: &App, headers: &HeaderMap) -> ApiResult<Access> {
+async fn bearer_access(app: &App, headers: &HeaderMap) -> ApiResult<crate::model::AgentSession> {
     let token = bearer(headers).ok_or_else(ApiError::auth)?;
     app.node
         .authorize_bearer(token)

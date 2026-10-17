@@ -13,7 +13,7 @@ use std::{
 
 fn fixture() -> Result<(
     PathBuf,
-    IdentityStore,
+    Store,
     LocalIdentity,
     LocalIdentity,
     LocalIdentity,
@@ -22,7 +22,7 @@ fn fixture() -> Result<(
     let root_dir = std::env::temp_dir().join(format!("vibeface-identity-tests-{}", random_id()));
     fs::create_dir_all(&root_dir)?;
     fs::set_permissions(&root_dir, fs::Permissions::from_mode(0o700))?;
-    let store = IdentityStore::open(&root_dir.join("identity.sqlite3"))?;
+    let store = Store::open(&root_dir.join("node.sqlite3"))?;
     let root = LocalIdentity::generate();
     let node = LocalIdentity::generate();
     let admin = LocalIdentity::generate();
@@ -41,7 +41,7 @@ fn fixture() -> Result<(
 }
 
 fn invite_request(
-    store: &IdentityStore,
+    store: &Store,
     admin: &LocalIdentity,
     capability: &str,
     manage: bool,
@@ -73,7 +73,7 @@ fn bootstrap_capability_is_private_one_time_and_requires_the_named_manager() -> 
     let root_dir = std::env::temp_dir().join(format!("vibeface-bootstrap-{}", random_id()));
     fs::create_dir_all(&root_dir)?;
     fs::set_permissions(&root_dir, fs::Permissions::from_mode(0o700))?;
-    let store = IdentityStore::open(&root_dir.join("identity.sqlite3"))?;
+    let store = Store::open(&root_dir.join("node.sqlite3"))?;
     let cap = store.bootstrap_capability()?;
     assert!(store.bootstrap_capability().is_err());
     let root = LocalIdentity::generate();
@@ -104,6 +104,52 @@ fn bootstrap_capability_is_private_one_time_and_requires_the_named_manager() -> 
                 &admin.node_id()?
             )
             .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn bootstrap_governance_certificates_and_capability_commit_atomically() -> Result<()> {
+    let store = Store::open(":memory:")?;
+    let capability = store.bootstrap_capability()?;
+    let root = LocalIdentity::generate();
+    let admin = LocalIdentity::generate();
+    let node = LocalIdentity::generate();
+    let state = NetworkState::new(Genesis::create(
+        &root,
+        vec![
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node, "node", vec![NodeRole::Replica])?,
+        ],
+    )?)?;
+    store.connection.execute_batch("CREATE TEMP TRIGGER reject_certificate BEFORE INSERT ON node_certificates BEGIN SELECT RAISE(ABORT,'injected write failure'); END;")?;
+    assert!(
+        store
+            .bootstrap_network(state.clone(), &capability.capability, &admin.node_id()?)
+            .is_err()
+    );
+    assert!(!store.has_network()?);
+    store.verify_bootstrap_capability(&capability.capability)?;
+    let certificates: u64 =
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM node_certificates", [], |r| r.get(0))?;
+    assert_eq!(certificates, 0);
+    store
+        .connection
+        .execute_batch("DROP TRIGGER reject_certificate;")?;
+    store.bootstrap_network(state.clone(), &capability.capability, &admin.node_id()?)?;
+    assert_eq!(store.public_state()?, state);
+    assert!(
+        store
+            .verify_bootstrap_capability(&capability.capability)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .authorize_node(&state.genesis.network_id, &node.node_id()?, None)?
+            .public_key,
+        node.public_key_hex()?
     );
     Ok(())
 }
@@ -187,10 +233,10 @@ fn management_grants_and_private_path_boundaries_are_rejected() -> Result<()> {
     let public_dir = std::env::temp_dir().join(format!("vibeface-public-{}", random_id()));
     fs::create_dir_all(&public_dir)?;
     fs::set_permissions(&public_dir, fs::Permissions::from_mode(0o755))?;
-    assert!(IdentityStore::open(&public_dir.join("identity.sqlite3")).is_err());
+    assert!(Store::open(&public_dir.join("node.sqlite3")).is_err());
     let link = dir.join("link.sqlite3");
-    symlink(store.path(), &link)?;
-    assert!(IdentityStore::open(&link).is_err());
+    symlink(dir.join("node.sqlite3"), &link)?;
+    assert!(Store::open(&link).is_err());
     Ok(())
 }
 

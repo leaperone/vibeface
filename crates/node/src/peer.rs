@@ -82,6 +82,7 @@ struct Pending {
 #[serde(deny_unknown_fields)]
 struct Hello {
     version: u32,
+    #[serde(rename = "space_id")]
     network_id: NetworkId,
     node_id: NodeId,
 }
@@ -97,6 +98,7 @@ enum Kind {
 #[serde(deny_unknown_fields)]
 struct Body {
     version: u32,
+    #[serde(rename = "space_id")]
     network_id: NetworkId,
     origin: NodeId,
     target: Option<NodeId>,
@@ -270,7 +272,11 @@ impl PeerHub {
         let store = self.store.lock().await;
         candidates
             .into_iter()
-            .filter(|node| store.authorize_node(network, node, None).is_ok())
+            .filter(|node| {
+                store
+                    .authorize_transport_node(node, crate::runtime::now_ms() as u64)
+                    .is_ok()
+            })
             .collect()
     }
 
@@ -279,7 +285,7 @@ impl PeerHub {
             .store
             .lock()
             .await
-            .authorize_node(network, node, None)?
+            .authorize_transport_node(node, crate::runtime::now_ms() as u64)?
             .public_key)
     }
 
@@ -293,7 +299,7 @@ impl PeerHub {
 
     async fn check_hello(&self, hello: &Hello, network: Option<&str>) -> Result<String> {
         ensure!(hello.version == WIRE_VERSION, "unsupported peer version");
-        check_hex_id(&hello.network_id)?;
+        vibeface_secure::authorization::SpaceId::parse(&hello.network_id)?;
         check_hex_id(&hello.node_id)?;
         ensure!(
             network.is_none_or(|n| n == hello.network_id),
@@ -313,7 +319,7 @@ impl PeerHub {
             false,
             &self.identity.secret_key_hex,
             None,
-            b"vibeface:peer:v1",
+            b"vibeface:peer:v2",
         ))?;
         let first = receive_binary(socket, MAX_HANDSHAKE_BYTES).await?;
         ensure!(
@@ -346,7 +352,7 @@ impl PeerHub {
             true,
             &self.identity.secret_key_hex,
             target,
-            b"vibeface:peer:v1",
+            b"vibeface:peer:v2",
         ))?;
         send_binary(socket, secure(handshake.write(&[]))?).await?;
         let second = receive_binary(socket, MAX_HANDSHAKE_BYTES).await?;
@@ -727,7 +733,7 @@ fn validate_body(body: &Body, now: i64) -> Result<()> {
         body.version == WIRE_VERSION,
         "unsupported peer packet version"
     );
-    check_hex_id(&body.network_id)?;
+    vibeface_secure::authorization::SpaceId::parse(&body.network_id)?;
     check_hex_id(&body.origin)?;
     if let Some(target) = &body.target {
         check_hex_id(target)?;

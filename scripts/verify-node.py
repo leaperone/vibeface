@@ -34,6 +34,9 @@ import urllib.request
 import uuid
 
 
+DATA_FORMAT = {"format": "vibeface-node", "data_epoch": 3, "layout_version": 1}
+
+
 def require(condition, description):
     if not condition:
         raise AssertionError(description)
@@ -68,6 +71,28 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+def data_directory_snapshot(directory):
+    snapshot = {}
+    for path in (directory, *sorted(directory.rglob("*"))):
+        content = (os.readlink(path) if path.is_symlink()
+                   else file_sha256(path) if path.is_file() else None)
+        snapshot[str(path.relative_to(directory))] = (path.lstat().st_mode, content)
+    return snapshot
+
+
+def verify_current_data_format(directory):
+    require(json.loads((directory / "data-epoch.json").read_text()) == DATA_FORMAT,
+            "fresh node declares exactly the current format, data epoch and layout")
+    require(sorted(path.name for path in directory.glob("*.sqlite3")) == ["node.sqlite3"],
+            "identity and business state use one SQLite database")
+    with sqlite3.connect(f"file:{directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+        metadata = connection.execute("SELECT format_id,data_epoch,layout_version,initialization_state FROM schema_metadata").fetchall()
+        require(metadata == [("vibeface-node", 3, 1, "ready")],
+                "database initialization is ready and matches the current directory format")
+        require(connection.execute("PRAGMA foreign_key_check").fetchall() == [],
+                "current database has no broken foreign keys")
+
+
 def maintenance(node, command):
     stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stream.settimeout(5)
@@ -99,6 +124,18 @@ def verify_cli_status(node, running):
     require(status["status"] == ("running" if running else "stopped") and status["node_id"] == node.node_id,
             "CLI status pins the initialized local node in both running and stopped states")
     require(node.access["capability"] not in result.stdout, "CLI status never exposes bootstrap capability")
+
+
+def verify_live_access(node, operation_id):
+    before = operation(node.client, node, operation_id)
+    require(before["state"] == "running", "access probe begins with a real running execution")
+    result = subprocess.run([str(node.binary), "access", "--json", "--data-dir", str(node.directory)],
+                            capture_output=True, text=True, timeout=10)
+    require(result.returncode == 0, "access CLI reads the live node without taking its directory lock")
+    require(json.loads(result.stdout) == {"url": node.url, "node_id": node.node_id, "capability": None},
+            "initialized access returns only the pinned entry and no bootstrap capability")
+    require(operation(node.client, node, operation_id) == before,
+            "access CLI leaves the running operation and its deduplication record unchanged")
 
 
 def verify_maintenance(node):
@@ -210,6 +247,7 @@ def verify_direct_start(run, binary):
                     "direct startup and restart preserve the exact identity, config, bootstrap and epoch")
     capability = json.loads((directory / "bootstrap.json").read_text())["capability"]
     require(capability.encode() not in log_path.read_bytes(), "startup never prints the bootstrap capability")
+    verify_current_data_format(directory)
 
 
 class RelayCapture:
@@ -565,6 +603,7 @@ class Node:
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
         require(result.returncode == 0, f"{name}: CLI initialization succeeds")
+        verify_current_data_format(self.directory)
         self.configure(claude_bin=str(fixture), timeout_secs=60)
         result = subprocess.run([str(binary), "access", "--json", "--data-dir", str(self.directory)],
                                 capture_output=True, timeout=15)
@@ -736,7 +775,7 @@ def verify_snapshot(snapshot):
 def verify_blobs(node, network):
     connection = sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True)
     try:
-        rows = connection.execute("SELECT hash,size,content FROM blobs WHERE network_id=?", (network,)).fetchall()
+        rows = connection.execute("SELECT hash,size,content FROM blobs WHERE space_id=?", (network,)).fetchall()
         for digest, size, content in rows:
             require(size == len(content) and hashlib.sha256(content).hexdigest() == digest,
                     "replicated blob length and digest match")
@@ -859,46 +898,98 @@ def verify_web_assets(node, module):
             require(crypto_headers.get_content_type() == "application/wasm", "browser WASM has the correct MIME type")
 
 
-def verify_incompatible_data(run, binary, workspace, fixture, helper, module):
-    node = Node(run, "INCOMPATIBLE", binary, workspace, fixture, helper, module)
-    marker = node.directory / "data-epoch.json"
-    private_json(marker, {"data_epoch": 1})
-    database = node.directory / "node.sqlite3"
-    with sqlite3.connect(database) as connection:
-        connection.execute("PRAGMA user_version=1")
-        connection.execute("CREATE TABLE preserved(value TEXT)")
-        connection.execute("INSERT INTO preserved VALUES('keep this data')")
-    protected = [database, node.directory / "identity.json", node.directory / "config.json",
-                 node.directory / "identity.sqlite3", node.directory / "bootstrap.json"]
-    for missing_marker in (False, True):
-        if missing_marker:
+def verify_incompatible_data(run, binary, workspace):
+    directory = run / "INCOMPATIBLE"
+    result = subprocess.run([str(binary), "init", "--data-dir", str(directory), "--root", str(workspace)],
+                            capture_output=True, timeout=45)
+    require(result.returncode == 0, "format boundary fixture initializes through the real CLI")
+    verify_current_data_format(directory)
+    (directory / "node.lock").unlink(missing_ok=True)
+    provider = directory / "provider-probe"
+    provider.write_text(f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(directory / 'provider-started')!r}).touch()\n")
+    provider.chmod(0o700)
+    configuration = json.loads((directory / "config.json").read_text())
+    for key in ("codex_bin", "claude_bin", "cursor_bin"):
+        configuration[key] = str(provider)
+    private_json(directory / "config.json", configuration)
+    marker = directory / "data-epoch.json"
+
+    def rejected_startup():
+        for command in ([str(binary), "serve", "--data-dir", str(directory)],
+                        [str(binary), "--data-dir", str(directory)]):
+            before = data_directory_snapshot(directory)
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       start_new_session=True)
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+                require(process.returncode != 0 and any(
+                    word in (stdout + stderr).lower() for word in (b"format", b"epoch", b"layout", b"legacy")),
+                        "incompatible data rejects startup before opening stores or providers")
+                require(data_directory_snapshot(directory) == before,
+                        "rejected startup preserves every directory entry, mode and file byte, including SQLite sidecars")
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=5)
+
+    for value in ({"data_epoch": 2}, None, {**DATA_FORMAT, "format": "other-node"},
+                  {**DATA_FORMAT, "layout_version": 2}):
+        if value is None:
             marker.unlink()
-        checked = protected + ([] if missing_marker else [marker])
-        before = {path: file_sha256(path) for path in checked}
-        process = subprocess.Popen([str(binary), "serve", "--data-dir", str(node.directory)],
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-        try:
-            stdout, stderr = process.communicate(timeout=10)
-            require(process.returncode != 0 and (missing_marker or b"epoch" in (stdout + stderr).lower()),
-                    "incompatible or missing data epoch rejects startup before opening stores or providers")
-            require(all(file_sha256(path) == digest for path, digest in before.items()),
-                    "rejected startup preserves data, identity, config and epoch marker byte for byte")
-            require(not missing_marker or not marker.exists(), "rejected startup does not invent a data epoch")
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                process.wait(timeout=5)
+        else:
+            private_json(marker, value)
+        rejected_startup()
+    private_json(marker, DATA_FORMAT)
+    database = directory / "node.sqlite3"
+    current_database = run / "current-format.sqlite3"
+    database.rename(current_database)
+    rejected_startup()
+    database.touch()
+    rejected_startup()
+    database.unlink()
+    old_layout = sqlite3.connect(database)
+    try:
+        old_layout.execute("PRAGMA journal_mode=WAL")
+        old_layout.execute("PRAGMA user_version=2")
+        old_layout.execute("CREATE TABLE networks(network_id TEXT PRIMARY KEY, bundle TEXT)")
+        old_layout.execute("INSERT INTO networks VALUES('legacy-personal-network','preserved legacy bundle')")
+        old_layout.commit()
+        old_layout.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        require((directory / "node.sqlite3-wal").exists(), "old-layout fixture includes a live WAL")
+        rejected_startup()
+    finally:
+        old_layout.close()
+    database.unlink()
+    current_database.rename(database)
+    legacy_path = directory / "identity.sqlite3"
+    legacy = sqlite3.connect(legacy_path)
+    try:
+        legacy.execute("PRAGMA journal_mode=WAL")
+        legacy.execute("PRAGMA user_version=2")
+        legacy.execute("CREATE TABLE preserved(value TEXT)")
+        legacy.execute("INSERT INTO preserved VALUES('keep this old identity database')")
+        legacy.commit()
+        require((directory / "identity.sqlite3-wal").exists(), "legacy fixture includes a live WAL")
+        rejected_startup()
+        private_json(marker, {"data_epoch": 2})
+        rejected_startup()
+    finally:
+        legacy.close()
+    private_json(marker, DATA_FORMAT)
+    legacy_path.unlink()
+    legacy_path.symlink_to(run / "missing-identity-database")
+    rejected_startup()
 
 
 def clear_private_binding_cache(node, run, network):
     require(node.name == "C" and node.directory.parent == run and node.process is None,
             "binding cache reset is limited to this stopped private acceptance node")
     with sqlite3.connect(node.directory / "node.sqlite3") as connection:
-        before = connection.execute("SELECT hash,envelope FROM events WHERE network_id=? ORDER BY hash", (network,)).fetchall()
-        deleted = connection.execute("DELETE FROM local_values WHERE network_id=? AND (key LIKE 'task-binding-current:%' OR key LIKE 'task-binding-record:%')", (network,)).rowcount
-        require(connection.execute("SELECT hash,envelope FROM events WHERE network_id=? ORDER BY hash", (network,)).fetchall() == before,
+        before = connection.execute("SELECT hash,envelope FROM events WHERE space_id=? ORDER BY hash", (network,)).fetchall()
+        deleted = connection.execute("DELETE FROM local_values WHERE space_id=? AND (key LIKE 'task-binding-current:%' OR key LIKE 'task-binding-record:%')", (network,)).rowcount
+        require(connection.execute("SELECT hash,envelope FROM events WHERE space_id=? ORDER BY hash", (network,)).fetchall() == before,
                 "fresh scheduler simulation retains every signed DAG event byte")
-        require(connection.execute("SELECT COUNT(*) FROM local_values WHERE network_id=? AND (key LIKE 'task-binding-current:%' OR key LIKE 'task-binding-record:%')", (network,)).fetchone()[0] == 0,
+        require(connection.execute("SELECT COUNT(*) FROM local_values WHERE space_id=? AND (key LIKE 'task-binding-current:%' OR key LIKE 'task-binding-record:%')", (network,)).fetchone()[0] == 0,
                 "fresh scheduler has no task binding current or record cache")
     return deleted
 
@@ -1098,8 +1189,8 @@ def acceptance(options):
         for name in ("A", "B", "C", "R"):
             nodes.append(Node(run, name, binary, workspace, fixture, helper, module))
         a, b, c, relay = nodes
-        verify_incompatible_data(run, binary, workspace, fixture, helper, module)
-        passed("incompatible data epoch refuses startup without changing existing files")
+        verify_incompatible_data(run, binary, workspace)
+        passed("legacy epoch, missing marker, wrong format and layout refuse startup without directory or provider changes")
         for node in nodes:
             node.configure(codex_bin=options.codex_bin)
         capture = RelayCapture(relay.port)
@@ -1189,7 +1280,7 @@ def acceptance(options):
         require(b"Keep this context after A disconnects." not in b"".join(capture.payloads),
                 "public relay cannot see the private message present on C")
         with sqlite3.connect(f"file:{relay.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-            require(connection.execute("SELECT COUNT(*) FROM events WHERE network_id=?", (network,)).fetchone()[0] == 0,
+            require(connection.execute("SELECT COUNT(*) FROM events WHERE space_id=?", (network,)).fetchone()[0] == 0,
                     "foreign relay stores no private business events")
         report["relay_capture"] = {"frames": len(capture.payloads), "plaintext_canary_found": False}
         passed("foreign relay transports protected history without plaintext context or private replicas")
@@ -1292,6 +1383,7 @@ def acceptance(options):
         unknown = request(network, conversation, b, "fixture-unknown-send", "fixture-main", {"type": "send", "text": json.dumps({"label": "unknown", "gate": str(run / "never-complete")})}, revision=session["revision"], task=task)
         dispatch(c.client, unknown)
         wait_for("interrupted fixture is executing", lambda: len(invocations(run, "unknown")) == 1)
+        verify_live_access(b, unknown["operation_id"])
         lease, state = maintenance(b, "acquire")
         lease.close()
         require(state["status"] == "busy", "running execution postpones updates")
@@ -1301,6 +1393,13 @@ def acceptance(options):
         b.client.authenticate()
         record = wait_for("running operation recovers as Unknown", lambda: unknown_record(b.client, b, unknown["operation_id"]))
         require(record["state"] == "unknown", "restart does not report success")
+        b.stop()
+        b.start()
+        b.client.connect()
+        b.client.authenticate()
+        verify_current_data_format(b.directory)
+        require(operation(b.client, b, unknown["operation_id"]) == record,
+                "another current-format restart preserves the exact Unknown deduplication record")
         lease, state = maintenance(b, "acquire")
         lease.close()
         require(state["status"] == "busy", "Unknown execution postpones updates")
@@ -1334,8 +1433,8 @@ def acceptance(options):
             nodes.append(fresh)
             fresh.configure(roles=["gateway", "replica"], codex_bin=options.codex_bin)
             backup = recover_fresh_node(fresh, backup, a.backup_password)
-        require(backup["recovery_epoch"] == 4, "epoch 2 and epoch 3 backups both restore on independent fresh nodes")
-        passed("epoch 2 and 3 encrypted backups restore fresh nodes at higher epochs without fabricating history")
+        require(backup["recovery_epoch"] == 4, "authorization epochs 2 and 3 restore on independent fresh nodes")
+        passed("current-format encrypted backups restore fresh nodes at higher authorization epochs without fabricating history")
         verify_no_model_budget(nodes)
         require(len(invocations(run)) == 3, "recovery never replays previously accepted execution")
         passed("ordinary notifications, history replay and identity recovery use no management-model budget")

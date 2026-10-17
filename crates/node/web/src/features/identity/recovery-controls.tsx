@@ -1,11 +1,18 @@
 import { useRef, useState } from 'react'
+import { ChevronDown } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Card } from '@/components/ui/card'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { messageOf } from '@/lib/node'
 import { passphrase } from '@/lib/secure'
 import { useDevice } from './context'
 
-const input = 'min-h-11 w-full rounded-lg border border-input bg-background px-3 py-2 text-base'
-const button = 'min-h-11 rounded-lg border border-border px-4 py-2 text-sm font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50'
-const panel = 'space-y-4 rounded-xl border border-border bg-card p-5'
+const input = 'min-h-10'
+const button = 'min-h-10'
+const panel = 'gap-4 p-5'
+const disclosure = 'h-auto min-h-14 w-full justify-between gap-3 rounded-none px-5 py-4 text-left whitespace-normal [&[data-state=open]>svg]:rotate-180'
 function field(form: HTMLFormElement, name: string) { const element = form.elements.namedItem(name); return element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value : '' }
 function fileOf(form: HTMLFormElement) { const element = form.elements.namedItem('bundle'); const file = element instanceof HTMLInputElement ? element.files?.[0] : null; if (!file) throw new Error('请选择完整账户恢复包。'); return file }
 
@@ -22,7 +29,7 @@ export function RecoveryReview() {
     try { await action() } catch (cause) { setError(messageOf(cause)) }
     finally { pending.current = false; setBusy(false) }
   }
-  return <section className={panel} aria-labelledby="recovery-review-title">
+  return <Card className={panel} aria-labelledby="recovery-review-title">
     <h2 id="recovery-review-title" className="font-semibold">{review.kind === 'bootstrap' ? '保存恢复包并创建账户' : '保存更新恢复包并恢复账户'}</h2>
     <dl className="space-y-2 text-xs"><div><dt>账户</dt><dd className="break-all font-mono">{review.accountId}</dd></div><div><dt>个人空间</dt><dd className="break-all font-mono">{review.spaceId}</dd></div></dl>
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
@@ -35,13 +42,13 @@ export function RecoveryReview() {
       void run(() => review.kind === 'bootstrap' ? device.confirmBootstrap(saved) : device.confirmRecovery(saved))
     }}>
       <p className="text-sm text-muted-foreground">完整恢复包包含加密的账户根、恢复密钥和可信连接信息。请下载并独立保存口令，确认后才提交。</p>
-      <button className={button} type="button" disabled={busy} onClick={() => void run(async () => device.downloadBackup())}>下载完整账户恢复包</button>
+      <Button className={button} type="button" disabled={busy} onClick={() => void run(async () => device.downloadBackup())}>下载完整账户恢复包</Button>
       <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" name="saved" required disabled={busy} />我已保存恢复包，并妥善保存口令</label>
-      <button className={button} type="submit" disabled={busy}>{review.kind === 'bootstrap' ? '确认并创建账户' : '确认撤销旧权限并恢复'}</button>
+      <Button className={button} type="submit" disabled={busy}>{review.kind === 'bootstrap' ? '确认并创建账户' : '确认撤销旧权限并恢复'}</Button>
     </form>
-    <button className={button} type="button" onClick={device.cancelSensitive}>{busy ? '取消等待并清除敏感材料' : '取消并清除敏感材料'}</button>
+    <Button className={button} type="button" onClick={device.cancelSensitive}>{busy ? '取消等待并清除敏感材料' : '取消并清除敏感材料'}</Button>
     {busy && <p className="text-xs text-muted-foreground">已提交的操作无法通过取消撤回。断线或取消后请先重新连接核对结果。</p>}
-  </section>
+  </Card>
 }
 
 function serviceAction(action: string) {
@@ -69,11 +76,12 @@ export function RecoveryControls() {
   }
   return <div className="space-y-5">
     {device.ready && device.review && <RecoveryReview />}
-    <section className={panel} aria-labelledby="restore-title">
-      <h2 id="restore-title" className="font-semibold">使用完整账户恢复包</h2>
+    {error && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error}</p>}
+    {(busy || status) && <p role="status" className="text-sm text-muted-foreground">{busy ? '正在验证账户包与目标 Node…' : status}</p>}
+    <Card className="gap-0 py-0"><Collapsible>
+      <CollapsibleTrigger asChild><Button variant="ghost" className={disclosure} type="button"><span className="font-semibold">使用完整账户恢复包</span><ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform" /></Button></CollapsibleTrigger>
+      <CollapsibleContent forceMount className="space-y-4 px-5 pb-5 data-[state=closed]:hidden">
       <p className="text-sm text-muted-foreground">先为恢复创建新的独立设备配置。入口和根信任从加密包内验证取得，恢复不会迁移聊天和工程文件。</p>
-      {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-      <p role="status" className="text-sm text-muted-foreground">{busy ? '正在验证账户包与目标 Node…' : status}</p>
       <form className="space-y-3" onSubmit={event => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
@@ -81,14 +89,16 @@ export function RecoveryControls() {
           finally { form.reset() }
         })
       }}><fieldset disabled={busy || !!device.review} className="space-y-3">
-        <label className="grid gap-1 text-sm">完整账户恢复包<input className={input} type="file" name="bundle" accept="application/json,.json" required /></label>
-        <label className="grid gap-1 text-sm">恢复包口令<input className={input} type="password" name="password" autoComplete="off" required /></label>
-        <details><summary className="cursor-pointer py-2 text-sm">更换原 Node 的入口地址</summary><div className="space-y-2 pt-2"><p className="text-sm text-muted-foreground">使用从原 Node 本机或可信渠道取得的连接卡。Node 公钥必须与恢复包内保存的身份相同。</p><label className="grid gap-1 text-sm">原 Node 连接卡<textarea className={`${input} min-h-24 font-mono text-xs`} name="connection_card" autoComplete="off" spellCheck={false} /></label></div></details>
-        <button className={button} type="submit">解锁并核对恢复授权</button>
+        <label className="grid gap-1 text-sm">完整账户恢复包<Input className={input} type="file" name="bundle" accept="application/json,.json" required /></label>
+        <label className="grid gap-1 text-sm">恢复包口令<Input className={input} type="password" name="password" autoComplete="off" required /></label>
+        <details><summary className="cursor-pointer py-2 text-sm">更换原 Node 的入口地址</summary><div className="space-y-2 pt-2"><p className="text-sm text-muted-foreground">使用从原 Node 本机或可信渠道取得的连接卡。Node 公钥必须与恢复包内保存的身份相同。</p><label className="grid gap-1 text-sm">原 Node 连接卡<Textarea className={`${input} min-h-24 font-mono text-xs`} name="connection_card" autoComplete="off" spellCheck={false} /></label></div></details>
+        <Button className={button} type="submit">解锁并核对恢复授权</Button>
       </fieldset></form>
-    </section>
-    <section className={panel} aria-labelledby="reencrypt-title">
-      <h2 id="reencrypt-title" className="font-semibold">更换恢复包口令</h2>
+      </CollapsibleContent>
+    </Collapsible></Card>
+    <Card className="gap-0 py-0"><Collapsible>
+      <CollapsibleTrigger asChild><Button variant="ghost" className={disclosure} type="button"><span className="font-semibold">更换恢复包口令</span><ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform" /></Button></CollapsibleTrigger>
+      <CollapsibleContent forceMount className="space-y-4 px-5 pb-5 data-[state=closed]:hidden">
       <p className="text-sm text-muted-foreground">生成使用新口令的文件。原文件仍可用原口令解锁，请分别保管。</p>
       <form className="space-y-3" onSubmit={event => {
         event.preventDefault(); const form = event.currentTarget
@@ -97,12 +107,13 @@ export function RecoveryControls() {
           finally { form.reset() }
         }, '新的完整账户恢复包已下载。')
       }}><fieldset disabled={busy || !!device.review} className="space-y-3">
-        <label className="grid gap-1 text-sm">完整账户恢复包<input className={input} type="file" name="bundle" accept="application/json,.json" required /></label>
-        <label className="grid gap-1 text-sm">原口令<input className={input} type="password" name="old_password" autoComplete="off" required /></label>
-        <label className="grid gap-1 text-sm">新口令，至少 12 个字符<input className={input} type="password" name="password" minLength={12} autoComplete="new-password" required /></label>
-        <label className="grid gap-1 text-sm">再次填写新口令<input className={input} type="password" name="confirmation" minLength={12} autoComplete="new-password" required /></label>
-        <button className={button} type="submit">下载使用新口令的恢复包</button>
+        <label className="grid gap-1 text-sm">完整账户恢复包<Input className={input} type="file" name="bundle" accept="application/json,.json" required /></label>
+        <label className="grid gap-1 text-sm">原口令<Input className={input} type="password" name="old_password" autoComplete="off" required /></label>
+        <label className="grid gap-1 text-sm">新口令，至少 12 个字符<Input className={input} type="password" name="password" minLength={12} autoComplete="new-password" required /></label>
+        <label className="grid gap-1 text-sm">再次填写新口令<Input className={input} type="password" name="confirmation" minLength={12} autoComplete="new-password" required /></label>
+        <Button className={button} type="submit">下载使用新口令的恢复包</Button>
       </fieldset></form>
-    </section>
+      </CollapsibleContent>
+    </Collapsible></Card>
   </div>
 }

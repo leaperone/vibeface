@@ -1,24 +1,103 @@
 //! Management SDKs receive visible context and explicit Node capabilities.
+use crate::engine::{Engine, ExecutionContext};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    future::Future,
-    path::{Path, PathBuf},
-    process::Stdio,
-    time::Duration,
-};
+use std::{collections::BTreeMap, future::Future, path::PathBuf, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
-use vibeface_bridge::agent::{
-    self, AgentResult, CustomToolConfig, SdkAgentConfig, ToolCallbackConfig,
-};
+use vibeface_bridge::agent::{AgentResult, CustomToolConfig};
 
 const MAX_LINE: usize = 1_048_576;
 const MAX_STREAM: usize = 16_777_216;
+
+fn validate_callback(config: &ManagerConfig) -> Result<()> {
+    if config.custom_tools.is_empty() {
+        return Ok(());
+    }
+    let url = reqwest::Url::parse(
+        config
+            .tool_callback_url
+            .as_deref()
+            .context("manager tools require a scoped Node callback")?,
+    )?;
+    let ip = url
+        .host_str()
+        .context("Node callback host missing")?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()?;
+    ensure!(
+        url.scheme() == "http"
+            && ip.is_loopback()
+            && url.port().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "manager callback must be a fixed loopback HTTP origin"
+    );
+    let token = config
+        .tool_callback_token
+        .as_deref()
+        .context("manager tools require a scoped callback token")?;
+    ensure!(
+        (32..=4096).contains(&token.len()) && !token.chars().any(char::is_control),
+        "invalid manager callback token"
+    );
+    Ok(())
+}
+
+async fn call_tool(config: &ManagerConfig, message: &Value) -> Result<Value> {
+    let name = message["name"].as_str().context("tool name missing")?;
+    let call = message["call_id"]
+        .as_str()
+        .context("tool call ID missing")?;
+    vibeface_protocol::validate_id(call).map_err(anyhow::Error::msg)?;
+    ensure!(
+        config.custom_tools.contains_key(name)
+            && message["arguments"].is_object()
+            && message.as_object().is_some_and(|object| object
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "name" | "call_id" | "arguments"))),
+        "manager tool is outside its fixed catalog"
+    );
+    validate_callback(config)?;
+    let url = reqwest::Url::parse(
+        config
+            .tool_callback_url
+            .as_deref()
+            .context("manager callback missing")?,
+    )?
+    .join("api/tools")?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let mut response = client
+        .post(url)
+        .bearer_auth(config.tool_callback_token.as_deref().unwrap())
+        .json(&json!({"name":name,"arguments":message["arguments"],"call_id":call}))
+        .send()
+        .await?;
+    ensure!(
+        response.status().is_success(),
+        "scoped Node callback rejected manager tool"
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            body.len() + chunk.len() <= MAX_LINE,
+            "manager tool result exceeded its limit"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).context("Node callback returned invalid JSON")
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -34,37 +113,23 @@ pub struct ManagerConfig {
     pub workspace: PathBuf,
     pub model: String,
     pub timeout_secs: u64,
-    pub cursor_sdk_bin: PathBuf,
-    pub node_bin: PathBuf,
-    pub codex_bin: PathBuf,
-    pub codex_sdk_script: PathBuf,
     #[serde(default)]
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_callback_url: Option<String>,
     #[serde(skip)]
     pub tool_callback_token: Option<String>,
-    pub tool_cli: Option<PathBuf>,
-    #[serde(skip)]
-    pub tool_env: BTreeMap<String, String>,
 }
 
 impl Default for ManagerConfig {
     fn default() -> Self {
         Self {
-            kind: ManagerKind::CursorSdk,
+            kind: ManagerKind::CodexSdk,
             workspace: ".".into(),
             model: "auto".into(),
             timeout_secs: 600,
-            cursor_sdk_bin: "cursor-sdk-bridge".into(),
-            node_bin: "node".into(),
-            codex_bin: "codex".into(),
-            codex_sdk_script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("sdk/codex-manager.mjs"),
             custom_tools: BTreeMap::new(),
             tool_callback_url: None,
             tool_callback_token: None,
-            tool_cli: None,
-            tool_env: BTreeMap::new(),
         }
     }
 }
@@ -82,7 +147,9 @@ impl std::fmt::Display for ManagerError {
 }
 impl std::error::Error for ManagerError {}
 
-pub async fn run_manager<F, P, PF>(
+pub async fn run_manager_authorized<F, P, PF>(
+    engine: &Engine,
+    context: &ExecutionContext,
     config: &ManagerConfig,
     prompt: &str,
     previous_session_id: Option<&str>,
@@ -94,6 +161,10 @@ where
     P: FnMut(Value) -> PF,
     PF: Future<Output = Result<()>>,
 {
+    ensure!(
+        config.kind == ManagerKind::CodexSdk,
+        "this management SDK has no verified isolated model and tool transport"
+    );
     ensure!(config.timeout_secs > 0, "manager timeout must be positive");
     ensure!(
         !prompt.trim().is_empty() && prompt.len() <= 65_536,
@@ -102,59 +173,47 @@ where
     if let Some(id) = previous_session_id {
         vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
     }
-    match config.kind {
-        ManagerKind::CursorSdk => {
-            let callback = match (&config.tool_callback_url, &config.tool_callback_token) {
-                (Some(url), Some(token)) => Some(ToolCallbackConfig {
-                    url: url.clone(),
-                    auth_token: token.clone(),
-                }),
-                (None, None) => None,
-                _ => return Err(anyhow!("custom tool callback requires both URL and token")),
-            };
-            agent::run_sdk(
-                &SdkAgentConfig {
-                    executable: config.cursor_sdk_bin.clone(),
-                    workspace: config.workspace.clone(),
-                    timeout_secs: config.timeout_secs,
-                    model: config.model.clone(),
-                    custom_tools: config.custom_tools.clone(),
-                    tool_callback: callback,
-                },
-                prompt,
-                previous_session_id,
-                persist_session,
-                progress,
-            )
-            .await
-            .map_err(|error| {
-                if let Some(sdk) = error.downcast_ref::<agent::AgentRunError>() {
-                    ManagerError {
-                        uncertain: sdk.uncertain,
-                        session_id: sdk.session_id.clone(),
-                        message: sdk.to_string(),
-                    }
-                    .into()
-                } else {
-                    error
+    validate_callback(config)?;
+    let isolated = engine.prepare_manager(context, &config.workspace).await?;
+    let mut command = isolated.command("node");
+    command.arg("/opt/vibeface/sdk/codex-manager.mjs");
+    let result = run_codex(
+        config,
+        command,
+        "/project",
+        "/usr/local/bin/codex",
+        prompt,
+        previous_session_id,
+        persist_session,
+        progress,
+    )
+    .await;
+    match &result {
+        Ok(_) => {
+            if let Err(error) = engine.complete_manager(context).await {
+                return Err(ManagerError {
+                    uncertain: true,
+                    session_id: result
+                        .as_ref()
+                        .ok()
+                        .and_then(|result| result.session_id.clone()),
+                    message: format!("manager process stop was not confirmed: {error}"),
                 }
-            })
+                .into());
+            }
         }
-        ManagerKind::CodexSdk => {
-            run_codex(
-                config,
-                prompt,
-                previous_session_id,
-                persist_session,
-                progress,
-            )
-            .await
+        Err(_) => {
+            let _ = engine.cancel_manager(context).await;
         }
     }
+    result
 }
 
 async fn run_codex<F, P, PF>(
     config: &ManagerConfig,
+    mut command: Command,
+    cwd: &str,
+    codex: &str,
     prompt: &str,
     session_id: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
@@ -165,20 +224,6 @@ where
     P: FnMut(Value) -> PF,
     PF: Future<Output = Result<()>>,
 {
-    ensure!(
-        config.workspace.is_absolute() && config.workspace.is_dir(),
-        "manager workspace must be an existing absolute directory"
-    );
-    ensure!(
-        config.codex_sdk_script.is_file(),
-        "Codex SDK sidecar is missing"
-    );
-    let codex = resolve_executable(&config.codex_bin)?;
-    let tool_cli = config
-        .tool_cli
-        .as_ref()
-        .map(|path| resolve_executable(path))
-        .transpose()?;
     let mut native = session_id.map(str::to_owned);
     let mut persist = Some(persist_session);
     if let Some(id) = &native {
@@ -190,14 +235,7 @@ where
                 message: format!("persist Codex SDK session before resume: {error}"),
             })?;
     }
-    let mut command = Command::new(&config.node_bin);
-    let provider_keys = provider_environment_keys()?;
     command
-        .arg(&config.codex_sdk_script)
-        .env(
-            "VIBEFACE_CODEX_PROVIDER_ENV_KEYS",
-            serde_json::to_string(&provider_keys)?,
-        )
         .current_dir(&config.workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -228,8 +266,8 @@ where
     let mut sent = false;
     let secrets = secret_values(config);
     let operation = async {
-        write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":native,"cwd":config.workspace,"model":config.model,"codex_path":codex,
-            "tool_cli":tool_cli,"tool_env":config.tool_env})).await?;
+        write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":native,"cwd":cwd,"model":config.model,"codex_path":codex,
+            "tools":config.custom_tools.keys().collect::<Vec<_>>()})).await?;
         let mut reader = BufReader::new(stdout);
         let ready = read_message(&mut reader).await?;
         ensure!(
@@ -266,6 +304,18 @@ where
                         .await?;
                 }
                 Some("event") => progress(message["event"].clone()).await?,
+                Some("tool_call") => {
+                    let reply = call_tool(config, &message).await;
+                    let result = match reply {
+                        Ok(value) => value,
+                        Err(_) => json!({"error":"Node tool rejected or unavailable"}),
+                    };
+                    write_message(
+                        &mut stdin,
+                        &json!({"type":"tool_result","call_id":message["call_id"],"result":result}),
+                    )
+                    .await?;
+                }
                 Some("result") => {
                     ensure!(
                         native.is_some() && message["session_id"].as_str() == native.as_deref(),
@@ -328,23 +378,6 @@ where
     })
 }
 
-fn resolve_executable(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        ensure!(path.is_file(), "configured executable is missing");
-        return Ok(path.to_path_buf());
-    }
-    ensure!(
-        path.components().count() == 1,
-        "executable must be an absolute path or a PATH command"
-    );
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|directory| directory.join(path))
-        .find(|candidate| candidate.is_file())
-        .context("configured executable was not found on PATH")
-}
-
 async fn write_message(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     value: &Value,
@@ -369,99 +402,11 @@ async fn read_message(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Value>
     serde_json::from_slice(&bytes).context("Codex SDK emitted invalid JSON")
 }
 fn secret_values(config: &ManagerConfig) -> Vec<String> {
-    let mut values: Vec<_> = config
-        .tool_env
-        .values()
-        .filter(|value| value.len() >= 8)
-        .cloned()
-        .collect();
+    let mut values = Vec::new();
     if let Some(token) = &config.tool_callback_token {
         values.push(token.clone());
     }
-    values.extend(
-        std::env::vars()
-            .filter(|(key, value)| {
-                value.len() >= 8
-                    && (key.ends_with("_KEY")
-                        || key.ends_with("_TOKEN")
-                        || key.ends_with("_SECRET")
-                        || key.ends_with("_PASSWORD"))
-            })
-            .map(|(_, value)| value),
-    );
-    if config.kind == ManagerKind::CodexSdk
-        && let Ok(keys) = provider_environment_keys()
-    {
-        values.extend(
-            keys.iter()
-                .filter_map(|key| std::env::var(key).ok())
-                .filter(|value| !value.is_empty()),
-        );
-    }
     values
-}
-fn provider_environment_keys() -> Result<Vec<String>> {
-    let home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".codex")));
-    let Some(home) = home else {
-        return Ok(vec![]);
-    };
-    let path = home.join("config.toml");
-    if !path.exists() {
-        return Ok(vec![]);
-    }
-    ensure!(
-        std::fs::metadata(&path)?.len() <= 1_048_576,
-        "Codex configuration is too large"
-    );
-    provider_keys_from_config(&std::fs::read_to_string(path)?)
-}
-fn provider_keys_from_config(source: &str) -> Result<Vec<String>> {
-    let config: toml::Value =
-        toml::from_str(source).context("invalid Codex provider configuration")?;
-    let profile = config
-        .get("profile")
-        .and_then(toml::Value::as_str)
-        .and_then(|p| config.get("profiles")?.get(p));
-    let provider = profile
-        .and_then(|p| p.get("model_provider"))
-        .or_else(|| config.get("model_provider"))
-        .and_then(toml::Value::as_str);
-    let Some(provider) = provider.and_then(|p| config.get("model_providers")?.get(p)) else {
-        return Ok(vec![]);
-    };
-    let mut keys = vec![];
-    if let Some(key) = provider.get("env_key").and_then(toml::Value::as_str) {
-        keys.push(key.to_owned());
-    }
-    if let Some(headers) = provider
-        .get("env_http_headers")
-        .and_then(toml::Value::as_table)
-    {
-        for value in headers.values() {
-            keys.push(
-                value
-                    .as_str()
-                    .context("invalid provider header environment key")?
-                    .to_owned(),
-            );
-        }
-    }
-    ensure!(keys.len() <= 64, "too many provider environment keys");
-    for key in &keys {
-        ensure!(
-            !key.is_empty()
-                && key.len() <= 256
-                && key.bytes().enumerate().all(|(i, c)| c == b'_'
-                    || c.is_ascii_alphabetic()
-                    || (i > 0 && c.is_ascii_digit())),
-            "invalid provider environment key"
-        );
-    }
-    keys.sort();
-    keys.dedup();
-    Ok(keys)
 }
 fn redact_string(mut text: String, secrets: &[String]) -> String {
     for secret in secrets.iter().filter(|value| !value.is_empty()) {
@@ -491,22 +436,6 @@ fn redact(value: Value, secrets: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn provider_environment_uses_only_selected_profile_and_header_keys() -> Result<()> {
-        let config = "model_provider='unused'\nprofile='local'\n[profiles.local]\nmodel_provider='active'\n[model_providers.active]\nenv_key='CUSTOM_API_KEY'\nenv_http_headers={X-Test='HEADER_TOKEN'}\n[model_providers.unused]\nenv_key='UNRELATED_SECRET'";
-        assert_eq!(
-            provider_keys_from_config(config)?,
-            vec!["CUSTOM_API_KEY", "HEADER_TOKEN"]
-        );
-        assert!(
-            provider_keys_from_config(
-                "model_provider='p'\n[model_providers.p]\nenv_key='invalid-name'"
-            )
-            .is_err()
-        );
-        assert!(provider_keys_from_config("model='default'")?.is_empty());
-        Ok(())
-    }
     #[tokio::test]
     async fn sdk_frames_require_newline_and_valid_bounded_json() {
         assert_eq!(
@@ -545,15 +474,17 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
         let config = ManagerConfig {
             kind: ManagerKind::CodexSdk,
             workspace: directory.clone(),
-            node_bin: "/bin/sh".into(),
-            codex_bin: "/usr/bin/true".into(),
-            codex_sdk_script: script,
             timeout_secs: 5,
             ..ManagerConfig::default()
         };
         let marker = directory.join("persisted");
-        let result = run_manager(
+        let mut command = Command::new("/bin/sh");
+        command.arg(&script);
+        let result = run_codex(
             &config,
+            command,
+            directory.to_str().unwrap(),
+            "/usr/bin/true",
             "fixture",
             None,
             move |id| async move {
@@ -567,8 +498,13 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
         .unwrap();
         assert_eq!(result.session_id.as_deref(), Some("fixture-native"));
         assert_eq!(result.output, "done");
-        let error = run_manager(
+        let mut command = Command::new("/bin/sh");
+        command.arg(&script);
+        let error = run_codex(
             &config,
+            command,
+            directory.to_str().unwrap(),
+            "/usr/bin/true",
             "fixture",
             None,
             |_| async { anyhow::bail!("fixture storage failed") },
@@ -587,14 +523,309 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
     fn callback_credentials_are_not_serialized() {
         let config = ManagerConfig {
             tool_callback_token: Some("secret-token".into()),
-            tool_env: BTreeMap::from([("TOKEN".into(), "other-secret".into())]),
             ..ManagerConfig::default()
         };
         let encoded = serde_json::to_string(&config).unwrap();
-        assert!(!encoded.contains("secret-token") && !encoded.contains("other-secret"));
+        assert!(!encoded.contains("secret-token"));
         assert_eq!(
             redact(json!({"nested":["secret-token"]}), &secret_values(&config)),
             json!({"nested":["[redacted]"]})
         );
+    }
+
+    #[tokio::test]
+    async fn callbacks_require_fixed_loopback_origin_and_the_exact_catalog() {
+        let mut config = ManagerConfig {
+            custom_tools: BTreeMap::from([(
+                "nodes".into(),
+                CustomToolConfig {
+                    description: None,
+                    input_schema: json!({"type":"object"}),
+                    output_schema: None,
+                },
+            )]),
+            tool_callback_token: Some("fixture-scoped-callback-token-1234567890".into()),
+            ..ManagerConfig::default()
+        };
+        for url in [
+            "http://example.com:1234/",
+            "http://127.0.0.1:1234/private",
+            "http://127.0.0.1:1234/?next=x",
+            "http://user@127.0.0.1:1234/",
+            "https://127.0.0.1:1234/",
+        ] {
+            config.tool_callback_url = Some(url.into());
+            assert!(validate_callback(&config).is_err());
+        }
+        for url in ["http://127.0.0.1:1234/", "http://[::1]:1234/"] {
+            config.tool_callback_url = Some(url.into());
+            assert!(validate_callback(&config).is_ok());
+        }
+        assert!(
+            call_tool(
+                &config,
+                &json!({"type":"tool_call","call_id":"fixture","name":"forbidden","arguments":{}})
+            )
+            .await
+            .is_err()
+        );
+        assert!(call_tool(&config, &json!({"type":"tool_call","call_id":"fixture","name":"nodes","arguments":{},"url":"http://example.com"})).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the Manager fixture image with the pinned real SDK and local Docker"]
+    async fn isolated_manager_tools_and_process_lifecycle_are_scoped() -> Result<()> {
+        use crate::engine::{ExecutionIsolationConfig, ExecutorConfig};
+        use axum::{Json, Router, routing::post};
+        use sha2::{Digest, Sha256};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use vibeface_secure::authorization::{ResourceId, SpaceId};
+        let root = PathBuf::from(std::env::var("VIBEFACE_ISOLATION_TEST_ROOT")?)
+            .join(uuid::Uuid::new_v4().to_string());
+        let data = root.join("node");
+        let project = root.join("project");
+        crate::config::private_dir(&data)?;
+        std::fs::create_dir(&project)?;
+        std::fs::write(project.join("visible"), "visible")?;
+        let secret = root.join("host-secret");
+        std::fs::write(&secret, "fixture-host-secret")?;
+        std::os::unix::fs::symlink(&secret, project.join("escape"))?;
+        let token = "fixture-scoped-callback-token-1234567890";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let router = Router::new().route(
+            "/api/tools",
+            post(
+                move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let observed = observed.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], format!("Bearer {token}"));
+                        assert_eq!(body["name"], "nodes");
+                        assert_eq!(body["arguments"], json!({}));
+                        assert!(
+                            body["call_id"]
+                                .as_str()
+                                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+                        );
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"scope":"fixture-manager-scope"}))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let callback = format!("http://{}/", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let engine = Engine::new(
+            ExecutorConfig {
+                execution_isolation: Some(ExecutionIsolationConfig {
+                    image: std::env::var("VIBEFACE_ISOLATION_TEST_IMAGE")?,
+                    docker_bin: std::env::var("VIBEFACE_ISOLATION_TEST_DOCKER")?.into(),
+                    egress: None,
+                }),
+                data_dir: Some(data.clone()),
+                ..ExecutorConfig::default()
+            },
+            events,
+        );
+        let config = ManagerConfig {
+            kind: ManagerKind::CodexSdk,
+            workspace: project.clone(),
+            model: "fixture-model".into(),
+            timeout_secs: 20,
+            custom_tools: BTreeMap::from([(
+                "nodes".into(),
+                CustomToolConfig {
+                    description: None,
+                    input_schema: json!({"type":"object"}),
+                    output_schema: None,
+                },
+            )]),
+            tool_callback_url: Some(callback.clone()),
+            tool_callback_token: Some(token.into()),
+        };
+        let mut contexts = Vec::new();
+        for (index, operation) in ["manager-complete", "manager-cancel", "manager-expire"]
+            .into_iter()
+            .enumerate()
+        {
+            contexts.push(ExecutionContext {
+                space_id: SpaceId::parse(&format!("spc2_{}", "a".repeat(64)))?,
+                resource_id: ResourceId::parse(&format!(
+                    "res2_{}",
+                    (index + 1).to_string().repeat(64)
+                ))?,
+                operation_id: operation.into(),
+                shared: true,
+                lease_expires_at_ms: vibeface_protocol::now_ms() + 30_000,
+            });
+        }
+        let home = |context: &ExecutionContext| {
+            let key = hex::encode(Sha256::digest(format!(
+                "manager\0{}\0{}\0{}",
+                context.space_id, context.resource_id, context.operation_id
+            )));
+            data.join("execution").join(key).join("home")
+        };
+        let outcome = async {
+            let prompt = format!("manager_fixture={}", json!({"secret":secret,"scope":"fixture-manager-scope","callback":callback}));
+            let result = run_manager_authorized(&engine, &contexts[0], &config, &prompt, None, |id| async move { ensure!(id == "fixture-manager-native", "unexpected native session"); Ok(()) }, |_| async { Ok(()) }).await?;
+            let proof: Value = serde_json::from_str(&result.output)?;
+            ensure!(proof.as_object().is_some_and(|p| p.len() == 11 && p.values().all(|v| v == true)), "Manager isolation proof failed: {proof}");
+            ensure!(calls.load(Ordering::SeqCst) == 1, "unexpected Node tool calls");
+            tokio::time::sleep(Duration::from_millis(3300)).await;
+            ensure!(!home(&contexts[0]).join("background-write").exists(), "terminal Manager left a background process");
+            ensure!(!project.join("changed").exists(), "Manager changed its read-only project");
+            let mut negative = Vec::new();
+            for (index, cancel) in [(1, true), (2, false)] {
+                let mut context = contexts[index].clone();
+                context.lease_expires_at_ms = vibeface_protocol::now_ms() + if cancel { 30_000 } else { 5000 };
+                let process = engine.prepare_manager(&context, &project).await?;
+                let waiting = home(&context).join("waiting");
+                let prompt = "manager_fixture={\"wait\":true}";
+                let run = run_manager_authorized(&engine, &context, &config, prompt, None, |_| async { Ok(()) }, |_| async { Ok(()) });
+                let stop = async {
+                    tokio::time::timeout(Duration::from_secs(4), async {
+                        while !waiting.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
+                    }).await?;
+                    if cancel { engine.cancel_manager(&context).await?; }
+                    Ok::<_, anyhow::Error>(())
+                };
+                let (result, stopped) = tokio::join!(run, stop);
+                stopped?;
+                let error = result.err().context("stopped Manager unexpectedly succeeded")?;
+                ensure!(error.downcast_ref::<ManagerError>().is_some_and(|e| e.uncertain), "stopped Manager did not preserve Unknown: {error}");
+                let status = process.command("true").status().await?;
+                ensure!(!status.success(), "stopped Manager container still accepts execution");
+                negative.push(json!({"cause":if cancel {"cancel"} else {"lease_expiry"},"unknown":true,"container_stopped":true}));
+            }
+            println!("manager-proof={}", json!({"sdk":"@openai/codex-sdk 0.163.0","cli":"deterministic fixture, no real model","isolation":proof,"callback_calls":calls.load(Ordering::SeqCst),"background_process_removed":true,"stop_cases":negative}));
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        for context in &contexts {
+            let _ = engine.cancel_manager(context).await;
+            let _ = engine.complete_manager(context).await;
+        }
+        server.abort();
+        std::fs::remove_dir_all(root)?;
+        outcome
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the real isolated SDK image and a trusted live model gateway"]
+    async fn production_manager_returns_a_marker_from_the_real_scoped_node_tool() -> Result<()> {
+        use crate::engine::{ExecutionEgressConfig, ExecutionIsolationConfig, ExecutorConfig};
+        use axum::{Json, Router, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use vibeface_secure::authorization::{ResourceId, SpaceId};
+        let root = PathBuf::from(std::env::var("VIBEFACE_ISOLATION_TEST_ROOT")?)
+            .join(uuid::Uuid::new_v4().to_string());
+        let data = root.join("node");
+        let project = root.join("project");
+        crate::config::private_dir(&data)?;
+        std::fs::create_dir(&project)?;
+        let marker = format!("manager-model-tool-{}", uuid::Uuid::new_v4());
+        let returned = marker.clone();
+        let token = "fixture-scoped-callback-token-1234567890";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let router = Router::new().route(
+            "/api/tools",
+            post(
+                move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let observed = observed.clone();
+                    let returned = returned.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], format!("Bearer {token}"));
+                        assert_eq!(body["name"], "nodes");
+                        assert_eq!(body["arguments"], json!({}));
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"marker":returned,"nodes":[]}))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let callback = format!("http://{}/", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let engine = Engine::new(
+            ExecutorConfig {
+                execution_isolation: Some(ExecutionIsolationConfig {
+                    image: std::env::var("VIBEFACE_ISOLATION_TEST_IMAGE")?,
+                    docker_bin: std::env::var("VIBEFACE_ISOLATION_TEST_DOCKER")?.into(),
+                    egress: Some(ExecutionEgressConfig {
+                        gateway_container: std::env::var("VIBEFACE_ISOLATION_TEST_GATEWAY")?,
+                        gateway_port: 8080,
+                        codex_model: "gpt-6.1-sol".into(),
+                    }),
+                }),
+                data_dir: Some(data),
+                ..ExecutorConfig::default()
+            },
+            events,
+        );
+        let config = ManagerConfig {
+            kind: ManagerKind::CodexSdk,
+            workspace: project,
+            model: "gpt-6.1-sol".into(),
+            timeout_secs: 90,
+            custom_tools: BTreeMap::from([(
+                "nodes".into(),
+                CustomToolConfig {
+                    description: None,
+                    input_schema: json!({"type":"object"}),
+                    output_schema: None,
+                },
+            )]),
+            tool_callback_url: Some(callback),
+            tool_callback_token: Some(token.into()),
+        };
+        let context = ExecutionContext {
+            space_id: SpaceId::parse(&format!("spc2_{}", "d".repeat(64)))?,
+            resource_id: ResourceId::parse(&format!("res2_{}", "e".repeat(64)))?,
+            operation_id: "real-manager-model-operation".into(),
+            shared: true,
+            lease_expires_at_ms: vibeface_protocol::now_ms() + 30_000,
+        };
+        let outcome = async {
+            let persisted = root.join("observed-native-session.json");
+            let record = persisted.clone();
+            let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = progress.clone();
+            let run = run_manager_authorized(&engine, &context, &config, "Use your command-execution tool to run '/opt/vibeface/sdk/codex-manager.mjs' tool nodes --json '{}' exactly once. Read its JSON result. Reply with exactly the marker field from that real result. Do not invent the marker. Do not read files, change files, use network tools or run other commands.", None, move |id| async move { crate::config::private_write(&record, &serde_json::to_vec(&id)?)?; Ok(()) }, move |event| { captured.lock().unwrap().push(event); async { Ok(()) } });
+            tokio::pin!(run);
+            let result = loop {
+                tokio::select! {
+                    result = &mut run => break result,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        engine.renew_manager(&context, vibeface_protocol::now_ms() + 30_000).await?;
+                    }
+                }
+            };
+            let observed = json!({"output":result.as_ref().ok().map(|r| r.output.as_str()),"error":result.as_ref().err().map(ToString::to_string),"expected_marker":marker,"callback_calls":calls.load(Ordering::SeqCst),"events":*progress.lock().unwrap()});
+            if let Ok(path) = std::env::var("VIBEFACE_MANAGER_MODEL_EVIDENCE") {
+                crate::config::private_write(std::path::Path::new(&path), &serde_json::to_vec_pretty(&observed)?)?;
+            }
+            let result = result?;
+            println!("manager-real-model-observed={}", json!({"output":result.output,"callback_calls":calls.load(Ordering::SeqCst)}));
+            ensure!(result.output.trim() == marker, "real Manager did not return the real tool marker");
+            ensure!(calls.load(Ordering::SeqCst) == 1, "real Manager tool call count differed from one");
+            ensure!(result.session_id.is_some() && serde_json::from_slice::<String>(&std::fs::read(&persisted)?)? == *result.session_id.as_ref().unwrap(), "real Manager session was not durably observed before continuing");
+            println!("manager-real-model-proof={}", json!({"model":"gpt-6.1-sol","sdk":"0.163.0","output":result.output.trim(),"marker_was_absent_from_prompt":true,"model_turns":1,"node_tool_calls":1,"native_session_persisted":true,"terminal_container_stop_confirmed":true,"actual_node_authorization":false}));
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        let _ = engine.cancel_manager(&context).await;
+        let _ = engine.complete_manager(&context).await;
+        server.abort();
+        std::fs::remove_dir_all(root)?;
+        outcome
     }
 }

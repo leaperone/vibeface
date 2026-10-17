@@ -5,99 +5,30 @@ pub type NetworkId = String;
 pub type NodeId = String;
 pub type EventHash = String;
 pub type ScopeId = String;
-pub const WIRE_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSession {
+    pub space_id: vibeface_secure::authorization::SpaceId,
+    pub resource_id: vibeface_secure::authorization::ResourceId,
+    pub service: vibeface_secure::authorization::ServiceId,
+    pub device: vibeface_secure::authorization::DeviceId,
+    pub conversation_id: String,
+    pub sdk_session: vibeface_secure::authorization::SessionRef,
+    pub grant_leaf: vibeface_secure::authorization::ObjectHash,
+    pub initiator: vibeface_secure::authorization::Actor,
+    pub initiating_grant: Option<vibeface_secure::authorization::ObjectHash>,
+    pub parent_invocation: vibeface_secure::authorization::ObjectHash,
+    pub expected_policies: Vec<vibeface_secure::authorization::PolicyStamp>,
+    pub expires_at_ms: u64,
+}
+pub const WIRE_VERSION: u32 = 2;
 pub const MAX_EVENT_BYTES: usize = 1_048_576;
 pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(deny_unknown_fields)]
-pub struct BlobRef {
-    pub hash: String,
-    pub size: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum EventBody {
-    ConversationCreated {
-        title: String,
-    },
-    MessagePosted {
-        message_id: String,
-        role: String,
-        text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        scheduler_node: Option<NodeId>,
-    },
-    TaskCreated {
-        task_id: String,
-        title: String,
-        goal: String,
-        acceptance: String,
-    },
-    TaskChanged {
-        task_id: String,
-        status: String,
-        detail: String,
-    },
-    DispatchRecorded {
-        operation_id: String,
-        task_id: Option<String>,
-        target_node: NodeId,
-        session_id: String,
-        action: Value,
-    },
-    ExecutionObserved {
-        operation_id: String,
-        task_id: Option<String>,
-        target_node: NodeId,
-        session_id: String,
-        status: String,
-        detail: Value,
-    },
-    DecisionRecorded {
-        decision_id: String,
-        text: String,
-        effective_constraints: Vec<String>,
-        tool_configuration: Value,
-    },
-    NotificationRaised {
-        notification_id: String,
-        kind: String,
-        text: String,
-    },
-    NotificationAcknowledged {
-        notification_id: String,
-        client_id: String,
-    },
-    ContextCheckpoint {
-        summary: String,
-        covered_heads: Vec<EventHash>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct Event {
-    pub version: u32,
-    pub network_id: NetworkId,
-    pub scope_id: ScopeId,
-    pub author: NodeId,
-    pub sequence: u64,
-    pub previous: Option<EventHash>,
-    pub parents: Vec<EventHash>,
-    pub created_at_ms: i64,
-    pub body: EventBody,
-    pub blobs: Vec<BlobRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct SignedEvent {
-    pub hash: EventHash,
-    pub canonical_body: String,
-    pub signature: String,
-}
+pub use vibeface_secure::authorization::events::{
+    AdmissionProof, BlobRef, Event, EventBody, EventCause, SignedEvent, StoredTransport,
+};
 
 pub use vibeface_secure::membership::{NodeCertificate, NodeRole, validate_role_dependencies};
 
@@ -116,6 +47,7 @@ impl MissingDependencies {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub version: u32,
+    #[serde(rename = "space_id")]
     pub network_id: NetworkId,
     pub scope_id: ScopeId,
     pub heads: Vec<EventHash>,
@@ -124,6 +56,7 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Context {
+    #[serde(rename = "space_id")]
     pub network_id: NetworkId,
     pub scope_id: ScopeId,
     pub heads: Vec<EventHash>,
@@ -161,6 +94,7 @@ pub struct Task {
 #[serde(deny_unknown_fields)]
 pub struct OperationRequest {
     pub operation_id: String,
+    #[serde(rename = "space_id")]
     pub network_id: NetworkId,
     pub conversation_id: ScopeId,
     pub task_id: Option<String>,
@@ -197,6 +131,7 @@ pub struct OperationRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionSession {
+    #[serde(rename = "space_id")]
     pub network_id: NetworkId,
     pub target_node: NodeId,
     pub session_id: String,
@@ -234,4 +169,113 @@ pub struct IngestOutcome {
     pub hash: EventHash,
     pub status: String,
     pub missing: MissingDependencies,
+}
+
+pub fn authorization_action(
+    body: &Value,
+) -> anyhow::Result<vibeface_secure::authorization::Action> {
+    use vibeface_secure::authorization::Action;
+
+    Ok(match body["method"].as_str() {
+        Some("context") if body["blob_hash"].is_string() => Action::AttachmentRead,
+        Some("conversations" | "conversation" | "context") => Action::ConversationRead,
+        Some("nodes" | "session" | "operation") => Action::OperationStatusRead,
+        Some("create_conversation") => Action::ConversationCreate,
+        Some("bind_execution") => Action::ExecutionOpen,
+        Some("replica_inventory" | "replica_event" | "replica_blob") => Action::ReplicaRead,
+        Some("message") => Action::MessageAppend,
+        Some("create_task") => Action::TaskCreate,
+        Some("agent_start" | "agent_result" | "agent_notification") => Action::AgentStart,
+        Some("update_task") => match body["status"].as_str() {
+            Some("accepted") => Action::TaskAccept,
+            Some("cancelled") => Action::TaskCancel,
+            Some("open" | "working" | "blocked" | "needs_review") => Action::TaskProgress,
+            _ => anyhow::bail!("invalid task status"),
+        },
+        Some("seal_execution" | "rebind_execution") => Action::ExecutionRebind,
+        Some("notifications") => Action::NotificationRead,
+        Some("ack") => Action::NotificationAck,
+        Some("export") => Action::Export,
+        Some("reconcile") => Action::OperationReconcile,
+        Some("resolve_unknown") => Action::OperationResolve,
+        Some("operate") => match body["request"]["action"]["type"].as_str() {
+            Some("open") => Action::ExecutionOpen,
+            Some("read") => Action::OperationStatusRead,
+            Some("send") => Action::ExecutionSend,
+            Some("steer") => Action::ExecutionSteer,
+            Some("interrupt") => Action::ExecutionInterrupt,
+            Some("respond_request") => Action::ExecutionRespondApproval,
+            _ => anyhow::bail!("unknown operation action"),
+        },
+        _ => anyhow::bail!("unknown method"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use vibeface_secure::authorization::Action;
+
+    #[test]
+    fn authorization_actions_distinguish_privileged_task_outcomes() -> anyhow::Result<()> {
+        for (status, expected) in [
+            ("accepted", Action::TaskAccept),
+            ("cancelled", Action::TaskCancel),
+            ("open", Action::TaskProgress),
+            ("working", Action::TaskProgress),
+            ("blocked", Action::TaskProgress),
+            ("needs_review", Action::TaskProgress),
+        ] {
+            assert_eq!(
+                authorization_action(&json!({"method":"update_task", "status":status}))?,
+                expected
+            );
+        }
+        assert!(authorization_action(&json!({"method":"update_task", "status":"done"})).is_err());
+        assert!(authorization_action(&json!({"method":"update_task"})).is_err());
+        assert!(authorization_action(&json!({"method":"unknown"})).is_err());
+        assert_eq!(
+            authorization_action(&json!({"method":"bind_execution"}))?,
+            Action::ExecutionOpen
+        );
+        assert_eq!(
+            authorization_action(&json!({"method":"context","blob_hash":"a"}))?,
+            Action::AttachmentRead
+        );
+        assert_eq!(
+            authorization_action(&json!({"method":"replica_event"}))?,
+            Action::ReplicaRead
+        );
+        assert!(authorization_action(&json!({"method":"replica_push"})).is_err());
+        assert!(authorization_action(&Value::Null).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn authorization_actions_match_nested_execution_requests() -> anyhow::Result<()> {
+        for (kind, expected) in [
+            ("open", Action::ExecutionOpen),
+            ("read", Action::OperationStatusRead),
+            ("send", Action::ExecutionSend),
+            ("steer", Action::ExecutionSteer),
+            ("interrupt", Action::ExecutionInterrupt),
+            ("respond_request", Action::ExecutionRespondApproval),
+        ] {
+            assert_eq!(
+                authorization_action(
+                    &json!({"method":"operate", "request":{"action":{"type":kind}}})
+                )?,
+                expected
+            );
+        }
+        assert!(
+            authorization_action(
+                &json!({"method":"operate", "request":{"action":{"type":"unknown"}}})
+            )
+            .is_err()
+        );
+        assert!(authorization_action(&json!({"method":"operate"})).is_err());
+        Ok(())
+    }
 }

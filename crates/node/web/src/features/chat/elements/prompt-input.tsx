@@ -1,4 +1,6 @@
 import { useRef, type ChangeEvent, type KeyboardEvent } from 'react'
+import { ArrowUpIcon } from 'lucide-react'
+import { Spinner } from '@/components/ui/spinner'
 import { isSubmitKey } from '../protocol'
 
 import {
@@ -29,7 +31,7 @@ export function PromptInput({
       ref={formRef}
       onSubmit={(event) => {
         event.preventDefault()
-        if (disabled || busy) return
+        if (disabled || busy || !value.trim()) return
         onSubmit()
       }}
     >
@@ -42,8 +44,9 @@ export function PromptInput({
           value={value}
           placeholder="描述目标，或询问某个任务的进展…"
           aria-label="给调度 Agent 发消息"
-          aria-describedby="manager-hint"
-          className="min-h-14 p-3"
+          aria-describedby={hint ? 'manager-hint' : undefined}
+          title="Enter 发送，Shift+Enter 换行"
+          className="min-h-14 max-h-[min(12rem,30dvh)] overflow-y-auto p-3"
           onChange={(event: ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)}
           onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
             if (isSubmitKey(event.nativeEvent)) {
@@ -57,16 +60,16 @@ export function PromptInput({
             type="submit"
             variant="default"
             size="icon-sm"
-            disabled={disabled || busy}
+            disabled={disabled || busy || !value.trim()}
             aria-busy={busy || undefined}
             aria-label="发送消息"
-            className="ml-auto rounded-full"
+            className="ms-auto size-10 rounded-full"
           >
-            发送消息
+            {busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
           </InputGroupButton>
         </InputGroupAddon>
       </InputGroup>
-      <p id="manager-hint">{hint}</p>
+      {hint ? <p id="manager-hint">{hint}</p> : null}
     </form>
   )
 }

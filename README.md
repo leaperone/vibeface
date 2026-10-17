@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh 
 vibeface
 ```
 
-首次运行仅在不存在或为空的数据目录中初始化，默认使用 `~/.vibeface` 并监听 `127.0.0.1:4790`，不授予执行目录或启用管理 Agent。已有节点使用原身份和配置启动。安装和 CLI 管理见 [安装说明](docs/install.md)。受管安装使用 `vibeface update apply`；包协议 1 的旧预览版需按 [手动更换程序](docs/releasing.md#手动建立受管安装或更换程序) 一次性切换，不重新初始化身份。
+首次运行仅在不存在或为空的数据目录中初始化，默认使用 `~/.vibeface` 并监听 `127.0.0.1:4790`，不授予执行目录或启用管理 Agent。当前格式的已有节点使用原身份和配置启动。旧格式目录在任何数据库写入或 Provider 启动前拒绝，原目录保持不变。安装和 CLI 管理见 [安装说明](docs/install.md)。受管安装使用 `vibeface update apply`；旧版程序和数据的处理见 [手动更换程序](docs/releasing.md#手动建立受管安装或更换程序)。
 
 ## 从源码开始
 
@@ -60,7 +60,7 @@ cargo build --release -p vibeface --locked
 ./target/release/vibeface serve --data-dir "$HOME/.vibeface"
 ```
 
-`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、`identity.sqlite3`、一次性 `bootstrap.json` 和 `data-epoch.json`（当前数据格式 epoch 为 2），不注册网站账号，也不保存个人根私钥。业务历史在进程打开后写入同目录的 `node.sqlite3`。`serve` 和 `pair` 用目录锁独占该目录。
+`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和唯一数据库 `node.sqlite3`，不注册网站账号，也不保存个人根私钥。目录标记为 `{"format":"vibeface-node","data_epoch":3,"layout_version":1}`。身份授权和业务状态共用这一个数据库，不导入旧库。`serve` 和 `pair` 用目录锁独占该目录。
 
 ```sh
 ./target/release/vibeface access --data-dir "$HOME/.vibeface"

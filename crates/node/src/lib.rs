@@ -11,6 +11,7 @@ pub mod manager;
 pub mod model;
 pub mod network;
 pub mod peer;
+pub mod replication;
 pub mod runtime;
 pub mod scheduler;
 pub mod store;

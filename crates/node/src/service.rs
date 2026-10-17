@@ -56,6 +56,7 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
         binary.display()
     );
     if matches!(action, Action::Install | Action::Start | Action::Restart) {
+        config::verify_data_format(data)?;
         config::Config::load(data)?;
     }
     let mut command = Command::new(root.join("current/scripts/install-node-service.sh"));
@@ -95,7 +96,13 @@ mod tests {
         std::fs::write(package.join("vibeface"), b"binary").unwrap();
         std::os::unix::fs::symlink(&package, root.join("current")).unwrap();
         let data = root.join("data with spaces");
-        std::fs::create_dir(&data).unwrap();
+        config::private_dir(&data).unwrap();
+        config::private_write(
+            &data.join("data-epoch.json"),
+            &serde_json::to_vec(&config::data_format()).unwrap(),
+        )
+        .unwrap();
+        drop(vibeface::store::Store::open(data.join("node.sqlite3")).unwrap());
         let project = root.join("project");
         std::fs::create_dir(&project).unwrap();
         config::Config::local(

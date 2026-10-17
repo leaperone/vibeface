@@ -28,7 +28,7 @@ bash scripts/build-web-crypto.sh
 
 ## 初始化首台设备
 
-直接运行 `./vibeface` 即可启动本机节点。首次运行仅在不存在或为空的数据目录中初始化，默认目录是 `$HOME/.vibeface`，不授予执行目录或启用管理 Agent。根 `--data-dir` 可选择数据目录；有子命令时使用子命令自己的 `--data-dir`，两种位置不能混用。显式 `serve` 要求已初始化。
+直接运行 `./vibeface` 即可启动本机节点。首次运行仅在不存在或为空的数据目录中初始化，默认目录是 `$HOME/.vibeface`，不授予执行目录或启用管理 Agent。根 `--data-dir` 可选择数据目录；有子命令时使用子命令自己的 `--data-dir`，两种位置不能混用。显式 `serve` 要求已初始化且采用当前数据格式。旧目录在任何数据库写入、恢复处理或 Provider 启动前拒绝，不自动转换或清空。
 
 `--root` 指向允许编码执行器使用的现有绝对目录，可重复指定。省略时没有允许的执行目录。
 
@@ -51,7 +51,7 @@ bash scripts/build-web-crypto.sh
 
 默认只监听本机。`http://127.0.0.1:4790`、`http://localhost:4790` 和本机字面地址 `http://0.0.0.0:4790` 可用于打开服务。保存密钥的网页客户端必须处于浏览器认可的安全上下文，推荐使用 `http://localhost:4790` 或可信 HTTPS 页面。
 
-`init` 不覆盖现有身份和配置。默认数据目录为 `$HOME/.vibeface`，包含本机身份、配置、私有授权记录和 `node.sqlite3`。不同 Node 使用独立数据目录，同一目录同时只允许运行一个进程。
+`init` 不覆盖现有身份和配置。默认数据目录为 `$HOME/.vibeface`，包含本机身份、配置、一次性接入材料、格式标记和唯一数据库 `node.sqlite3`。身份授权与业务状态共用这个数据库。`data-epoch.json` 为 `{"format":"vibeface-node","data_epoch":3,"layout_version":1}`。不同 Node 使用独立数据目录，同一目录同时只允许运行一个进程。
 
 ## 配置管理 Agent
 
@@ -277,4 +277,4 @@ vibeface service uninstall --data-dir "$HOME/.vibeface"
 
 停掉 Node 后备份完整数据目录，保留 SQLite 数据库及未合并的 WAL。模型 key、本机私钥和 SDK session 留在本机，不进入共享 DAG。完整目录备份含敏感信息，按本机凭证保管。不要复制运行中的 SQLite 文件来实现节点同步。
 
-业务存储使用 `rusqlite`，没有 ORM。schema 和 Atlas 校验清单位于 `crates/node/migrations/`。Atlas 只管理 SQL 文件，不负责节点同步。数据格式 epoch 为 `2`，启动和更新都不得隐式转换或清空不兼容的数据目录。监控历史正文、附件和服务日志的磁盘占用。
+存储使用 `rusqlite`，没有 ORM。Atlas 声明位于 `crates/node/schema.hcl`，唯一初始 SQL 为 `crates/node/migrations/202610180001_initial.sql`，同目录的 `atlas.sum` 校验文件完整性。`bash scripts/verify-schema.sh` 在私有空 SQLite 库中应用初始 SQL，再比较 Atlas 声明。运行程序使用内嵌的同一份 SQL，不需要安装 Atlas。Atlas 不负责节点同步。数据格式 epoch 为 `3`，layout version 为 `1`，与授权或恢复 epoch 分开。启动和更新不转换或清空旧目录，旧目录须保留给对应版本。监控历史正文、附件和服务日志的磁盘占用。

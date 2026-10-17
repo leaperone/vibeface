@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage: package-node.sh [--skip-build] [--target RUST_TARGET] [--output DIRECTORY]
 
-Builds and packages the node binary, SDK sidecar sources, docs, and user service installer.
+Builds and packages the node binary, SDK sidecar sources, execution image recipe, docs, and user service installer.
 The default output is .artifacts/packages. Provider runtimes and credentials are not bundled.
 USAGE
 }
@@ -63,11 +63,13 @@ staging="$(mktemp -d "$output/.vibeface-package.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 name="vibeface-$version-$target"
 package="$staging/$name"
-mkdir -p "$package/sidecars" "$package/scripts" "$package/web"
+mkdir -p "$package/sidecars" "$package/scripts/execution" "$package/web"
 cp "$binary" "$package/vibeface"
-printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":2,"data_epoch":2}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
+printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":2,"data_epoch":3}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
 cp "$crypto/vibeface_secure.js" "$crypto/vibeface_secure_bg.wasm" "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
+cp "$repo/scripts/build-execution-image.sh" "$package/scripts/"
+cp "$repo/scripts/execution/Dockerfile" "$package/scripts/execution/"
 cp "$repo/README.md" "$package/"
 cp -R "$repo/docs" "$package/docs"
 if [[ -f "$repo/LICENSE" ]]; then cp "$repo/LICENSE" "$package/"; fi
@@ -84,10 +86,12 @@ The archive contains the Rust node binary and SDK sidecar sources. Install the p
 - The Codex SDK sidecar needs Node.js 18 or newer. Run `npm ci --omit=dev` in `sidecars/` before using it.
 - Cursor scheduling needs the official Cursor SDK bridge executable and CURSOR_API_KEY in the service environment.
 - Claude and Cursor CLI execution need their respective authenticated executables.
+- Shared execution needs Docker and an immutable Linux image built with `bash scripts/build-execution-image.sh`. The included recipe installs real Codex 0.163.0, Claude Code 2.1.296, Node.js and Python 3. It contains no provider credentials.
+- Set `execution_isolation.image` to the emitted `sha256:` image ID and `docker_bin` to the absolute Docker CLI path. Model egress uses the separately configured scoped gateway, never a host HOME or upstream key in the execution container. Shared Cursor model egress is currently rejected.
 
 Use absolute provider and sidecar paths in `config.json` when running a background service. No credentials, provider runtimes, or npm dependencies are included.
 REQUIREMENTS
-tar -czf "$output/$name.tar.gz" -C "$staging" "$name"
+COPYFILE_DISABLE=1 tar -czf "$output/$name.tar.gz" -C "$staging" "$name"
 cd "$output"
 if command -v sha256sum >/dev/null; then
   sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"

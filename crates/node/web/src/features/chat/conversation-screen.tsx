@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
+import { ChevronDownIcon } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { useWorkspace } from '@/features/workspace/context'
 import { ActionButton, DetailList } from '@/features/workspace/present'
 import { Chat } from './elements/chat'
@@ -15,7 +18,7 @@ export function ConversationScreen() {
   const messages = data?.messages ?? []
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const sendDisabled = !workspace.writable || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
-  const hint = messagePending ? '先核对原消息，再发送新内容。' : composerHint(gate)
+  const hint = messagePending ? '先核对原消息，再发送新内容。' : workspace.writeNotice || composerHint(gate)
 
   useEffect(() => {
     if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)
@@ -42,25 +45,38 @@ export function ConversationScreen() {
   return (
     <section className="conversation-screen" aria-label="调度会话">
       <Chat
+        key={conversationId}
         messages={messages}
-        emptyTitle={data ? '从你的目标开始' : '准备好继续工作'}
-        emptyDetail={data ? '告诉调度 Agent 要做什么，也可以先创建一张工单。' : '新建会话，或从左侧选择已有会话。'}
+        emptyTitle={data ? '想完成什么？' : '选择一个会话'}
+        emptyDetail={data ? '发一条消息，开始与调度 Agent 协作。' : '从会话列表中选择，或新建会话。'}
       />
       {messagePending ? (
-        <section aria-label="待核对消息">
-          <h3>原消息尚未确认</h3>
-          <DetailList pairs={[
-            ['消息编号', messagePending.message_id],
-            ['原调度设备', messagePending.scheduler_node],
-            ['内容', messagePending.text],
-          ]} />
-          <p>刷新可核对原消息。重试会保留原编号、内容和调度设备。</p>
-          <ActionButton action={() => workspace.run(() => workspace.refresh())}>核对原消息</ActionButton>
-          <ActionButton disabled={!workspace.writable || messageBusy || workspace.incomplete} action={() => workspace.run(async () => {
-            await workspace.sendMessage(messagePending.text)
-            clearSentDraft(messagePending.conversation_id, messagePending.text)
-          })}>重试原消息</ActionButton>
-          <ActionButton disabled={!workspace.writable || messageBusy} action={() => workspace.run(() => workspace.releaseMessagePending())}>核对未提交并解除</ActionButton>
+        <section className="pending-message" aria-label="待核对消息">
+          <h3>{messageBusy ? '正在提交消息…' : '消息发送结果待核对'}</h3>
+          <Collapsible className="pending-message-details">
+            <CollapsibleTrigger asChild>
+              <Button variant="ghost" size="sm" className="group -ms-2">
+                查看原消息
+                <ChevronDownIcon aria-hidden="true" className="group-data-[state=open]:rotate-180" />
+              </Button>
+            </CollapsibleTrigger>
+            <CollapsibleContent>
+              <DetailList pairs={[
+                ['消息编号', messagePending.message_id],
+                ['原调度设备', messagePending.scheduler_node],
+                ['内容', messagePending.text],
+              ]} />
+              <p>重试会保留原编号、内容和调度设备。</p>
+            </CollapsibleContent>
+          </Collapsible>
+          <div className="pending-message-actions">
+            <ActionButton variant="default" disabled={messageBusy} action={() => workspace.run(() => workspace.refresh())}>核对原消息</ActionButton>
+            <ActionButton disabled={!workspace.writable || messageBusy || workspace.incomplete} action={() => workspace.run(async () => {
+              await workspace.sendMessage(messagePending.text)
+              clearSentDraft(messagePending.conversation_id, messagePending.text)
+            })}>重试原消息</ActionButton>
+            <ActionButton variant="ghost" disabled={!workspace.writable || messageBusy} action={() => workspace.run(() => workspace.releaseMessagePending())}>核对未提交并解除</ActionButton>
+          </div>
         </section>
       ) : null}
       <PromptInput

@@ -28,7 +28,7 @@ export function Chat({
 }) {
   if (messages.length === 0) {
     return (
-      <Empty className="h-full">
+      <Empty className="min-h-0 overflow-y-auto">
         <EmptyHeader>
           <EmptyTitle>{emptyTitle}</EmptyTitle>
           <EmptyDescription>{emptyDetail}</EmptyDescription>
@@ -39,9 +39,9 @@ export function Chat({
 
   return (
     <MessageScrollerProvider autoScroll>
-      <MessageScroller>
-        <MessageScrollerViewport>
-          <MessageScrollerContent aria-label="聊天记录" className="gap-6">
+      <MessageScroller className="h-auto min-h-24 flex-1">
+        <MessageScrollerViewport aria-label="聊天记录">
+          <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-6 px-4 py-6 sm:px-6">
             {messages.map((message) => (
               <MessageScrollerItem
                 key={messageKey(message)}
@@ -53,7 +53,7 @@ export function Chat({
             ))}
           </MessageScrollerContent>
         </MessageScrollerViewport>
-        <MessageScrollerButton />
+        <MessageScrollerButton aria-label="回到最新消息" />
       </MessageScroller>
     </MessageScrollerProvider>
   )
