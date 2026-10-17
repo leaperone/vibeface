@@ -2,6 +2,7 @@
 
 pub mod authenticators;
 pub mod bootstrap;
+pub mod directory;
 pub mod projection;
 pub mod services;
 use crate::{Identity, membership::canonical_json};

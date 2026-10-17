@@ -55,7 +55,7 @@ struct NodePossessionRequest {
     node_certificate: DeviceCertificate,
 }
 
-fn timestamp(value: f64) -> Result<u64> {
+pub(super) fn timestamp(value: f64) -> Result<u64> {
     require(
         value.is_finite()
             && value >= 0.0
