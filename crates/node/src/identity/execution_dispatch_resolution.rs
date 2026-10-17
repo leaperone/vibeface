@@ -1,5 +1,8 @@
 use super::{
-    admission::{admission_for_operation_from, consume_execution_dispatch_in},
+    admission::{
+        admission_for_operation_from, check_operation_reservations_in,
+        consume_execution_dispatch_in,
+    },
     execution_dispatch::{VerifiedDispatchFacts, check_destination_heads_in},
     execution_handoff::resolution_resolver_from,
     journal::PolicyState,
@@ -297,6 +300,7 @@ impl Store {
             "resolution targets another Project or local host"
         );
         validate_operation_binding_from(&tx, &stored.request)?;
+        check_operation_reservations_in(&tx, &stored)?;
         dispatch.revalidate(&tx, &current, body, auth.audience(), now_ms)?;
         let admitted = consume_execution_dispatch_in(
             &tx, &current, auth, proof, transport, body, None, now_ms, dispatch,
@@ -435,6 +439,7 @@ impl Store {
             "Project operation is no longer unknown"
         );
         validate_operation_binding_from(&tx, &stored.request)?;
+        check_operation_reservations_in(&tx, &stored)?;
         let local = PublicKey::parse(&identity.public_key_hex()?)?;
         ensure!(
             DeviceId::from_key(&local) == account.invocation.payload.audience.device,

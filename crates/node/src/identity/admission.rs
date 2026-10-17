@@ -539,13 +539,14 @@ fn persisted_admission_facts(
                 manager_field(body, "executor")?.to_owned(),
             )
         };
-        let key: String = if method == "bind_execution" && body.get("execution_resource").is_some() {
+        let key: String = if method == "bind_execution" && body.get("execution_resource").is_some()
+        {
             use vibeface_secure::authorization::{DeviceId, PublicKey};
             let _: ResourceRef = serde_json::from_value(body["execution_resource"].clone())?;
             let _: ObjectHash = serde_json::from_value(body["execution_grant"].clone())?;
             let key: PublicKey = serde_json::from_value(body["target_public_key"].clone())?;
-            let certificate = state
-                .verify_transport_device(&DeviceId::from_key(&key), proof.admitted_at_ms)?;
+            let certificate =
+                state.verify_transport_device(&DeviceId::from_key(&key), proof.admitted_at_ms)?;
             ensure!(
                 certificate.payload.public_key == key,
                 "historical execution target differs from its independent certificate"
@@ -943,6 +944,13 @@ fn check_operation_authorization_in(
             && facts.context == invocation.context,
         "operation request facts changed before commit"
     );
+    check_operation_reservations_in(connection, operation)
+}
+
+pub(super) fn check_operation_reservations_in(
+    connection: &Connection,
+    operation: &OperationRecord,
+) -> Result<()> {
     let reservations = connection.prepare(
         "SELECT target_node,resource FROM resource_reservations WHERE space_id=? AND operation_id=? ORDER BY resource",
     )?.query_map(params![operation.request.network_id, operation.request.operation_id],
