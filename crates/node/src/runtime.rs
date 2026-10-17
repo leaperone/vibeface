@@ -3,6 +3,7 @@ use crate::{
     config::{self, Config},
     crypto::{self, LocalIdentity},
     engine::{Engine, EngineAction, ExecutorConfig, ExecutorKind, ExecutorSession},
+    maintenance::{Busy, Gate},
     model::*,
     peer::{Inbound, PeerHub},
     store::Store,
@@ -1372,6 +1373,86 @@ mod tests {
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
+    #[tokio::test]
+    async fn maintenance_waits_for_local_outcomes_and_completion_but_not_remote_operations()
+    -> Result<()> {
+        let dir = fixture()?;
+        let node = Runtime::open(&dir).await?;
+        let owner = LocalIdentity::generate();
+        let remote = LocalIdentity::generate();
+        let network = owner.network_id()?;
+        {
+            let mut store = node.store.lock().await;
+            store.install_trust_bundle(
+                &network,
+                &owner.sign_trust_bundle(
+                    1,
+                    vec![
+                        node.identity.certificate(node.config.roles.clone())?,
+                        remote.certificate(vec![NodeRole::Executor])?,
+                    ],
+                )?,
+            )?;
+            store.save_local_identity(&network, &node.identity)?;
+        }
+        node.append(
+            &network,
+            "chat",
+            EventBody::ConversationCreated {
+                title: "test".into(),
+            },
+        )
+        .await?;
+        node.maintenance_idle().await?;
+        let request = queued(
+            &node,
+            &network,
+            "local",
+            json!({"type":"send","text":"test"}),
+        )
+        .await?;
+        assert!(
+            node.maintenance_idle()
+                .await
+                .unwrap_err()
+                .downcast_ref::<Busy>()
+                .is_some()
+        );
+        node.store.lock().await.claim_operation(&network, "local")?;
+        assert!(node.maintenance_idle().await.is_err());
+        node.store.lock().await.finish_operation(
+            &network,
+            "local",
+            OperationState::Unknown,
+            json!({}),
+        )?;
+        assert!(node.maintenance_idle().await.is_err());
+        node.store.lock().await.finish_operation(
+            &network,
+            "local",
+            OperationState::Succeeded,
+            json!({}),
+        )?;
+        node.maintenance_idle().await?;
+        node.store
+            .lock()
+            .await
+            .local_set(&network, "completion:local", &json!({}))?;
+        assert!(node.maintenance_idle().await.is_err());
+        {
+            let mut store = node.store.lock().await;
+            store.local_delete(&network, "completion:local")?;
+            let mut remote_request = request;
+            remote_request.operation_id = "remote".into();
+            remote_request.target_node = remote.node_id()?;
+            remote_request.resources.clear();
+            store.accept_operation(&network, &remote_request)?;
+        }
+        node.maintenance_idle().await?;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 }
 #[derive(Clone)]
 pub struct Update {
@@ -1387,6 +1468,7 @@ pub struct Runtime {
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
     pub tool_url: std::sync::OnceLock<String>,
+    pub maintenance: Arc<Gate>,
     completion_lock: Mutex<()>,
     pub engine: Engine,
     _codex_process: Option<tokio::process::Child>,
@@ -1646,6 +1728,7 @@ impl Runtime {
             events,
             agent_tokens: Mutex::new(HashMap::new()),
             tool_url: std::sync::OnceLock::new(),
+            maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             completion_lock: Mutex::new(()),
             engine,
             _codex_process: codex_process,
@@ -1719,6 +1802,21 @@ impl Runtime {
                 }
             }
         });
+        if self.maintenance.is_open() {
+            self.recover_operations().await?;
+        } else {
+            let node = self.clone();
+            tokio::spawn(async move {
+                let _work = node.maintenance.enter_when_open().await;
+                if let Err(error) = node.recover_operations().await {
+                    tracing::warn!(%error, "deferred operation recovery failed");
+                }
+            });
+        }
+        Ok(())
+    }
+    async fn recover_operations(self: &Arc<Self>) -> Result<()> {
+        let _work = self.maintenance.enter()?;
         let networks = self.store.lock().await.networks()?;
         for network in networks {
             self.flush_completions(&network).await?;
@@ -1741,7 +1839,37 @@ impl Runtime {
         }
         Ok(())
     }
+    pub(crate) async fn maintenance_idle(&self) -> Result<()> {
+        let local = self.identity.node_id()?;
+        let store = self.store.lock().await;
+        for network in store.networks()? {
+            for operation in store.operations(&network)? {
+                if operation.request.target_node != local {
+                    continue;
+                }
+                ensure!(
+                    operation.state.terminal(),
+                    Busy(format!(
+                        "local operation {} is {:?}",
+                        operation.request.operation_id, operation.state
+                    ))
+                );
+                ensure!(
+                    store
+                        .local_value(
+                            &network,
+                            &format!("completion:{}", operation.request.operation_id)
+                        )?
+                        .is_none(),
+                    Busy("execution completion is pending".into())
+                );
+            }
+            crate::scheduler::maintenance_idle(&store, &network)?;
+        }
+        Ok(())
+    }
     pub async fn register(&self, username: &str, password: &str) -> Result<Account> {
+        let _work = self.maintenance.enter()?;
         ensure!(
             self.config.roles.contains(&NodeRole::Gateway),
             "this node does not accept registration"
@@ -1785,6 +1913,7 @@ impl Runtime {
         self.agent_tokens.lock().await.get(token).cloned()
     }
     pub async fn pair(&self, input: Value) -> Result<Value> {
+        let _work = self.maintenance.enter()?;
         let code = field(&input, "code")?;
         let public_key = field(&input, "public_key")?;
         let node_id = field(&input, "node_id")?;
@@ -1942,6 +2071,7 @@ impl Runtime {
         Ok(reply)
     }
     pub async fn sync_all(&self, network: &str) -> Result<()> {
+        let _work = self.maintenance.enter()?;
         let peers = self.hub.online(network).await;
         let local = self.identity.node_id()?;
         futures_util::stream::iter(peers.into_iter().filter(|p| p != &local))
@@ -2044,6 +2174,7 @@ impl Runtime {
         json!({"roots":self.config.roots,"executors":["codex","claude_code","cursor_agent"],"manager":self.config.manager.as_ref().map(|m|m.provider.clone())})
     }
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
+        let _work = self.maintenance.enter()?;
         let network = &access.network_id;
         self.store
             .lock()
@@ -2198,7 +2329,7 @@ impl Runtime {
                 };
                 if target == self.identity.node_id()? {
                     self.require_role(network, NodeRole::Scheduler).await?;
-                    self.spawn_scheduler(network.clone(), scope, trigger.clone());
+                    self.spawn_scheduler(network.clone(), scope, trigger.clone())?;
                     Ok(json!({"state":"accepted","trigger":trigger}))
                 } else {
                     self.peer_request(
@@ -2458,6 +2589,7 @@ impl Runtime {
         args: Value,
         _call_id: &str,
     ) -> Result<Value> {
+        let _work = self.maintenance.enter()?;
         ensure!(!access.human, "tool endpoint requires a scoped Agent token");
         let scope = access
             .conversation_id
@@ -2589,6 +2721,7 @@ impl Runtime {
         access: Access,
         request: OperationRequest,
     ) -> Result<Value> {
+        let _work = self.maintenance.enter()?;
         ensure!(
             request.network_id == access.network_id,
             "operation belongs to another network"
@@ -2684,6 +2817,7 @@ impl Runtime {
         mut request: OperationRequest,
         human: bool,
     ) -> Result<Value> {
+        let _work = self.maintenance.enter()?;
         self.require_role(&request.network_id, NodeRole::Executor)
             .await?;
         ensure!(
@@ -2848,6 +2982,7 @@ impl Runtime {
         }
     }
     async fn execute_operation(self: Arc<Self>, request: OperationRequest) -> Result<()> {
+        let _work = self.maintenance.enter()?;
         let action = self.engine_action(&request.action)?;
         let preparation: Result<ExecutionSession> = async {
             self.require_role(&request.network_id, NodeRole::Executor)
@@ -2992,6 +3127,7 @@ impl Runtime {
         state: OperationState,
         result: Value,
     ) -> Result<()> {
+        let _work = self.maintenance.enter()?;
         let _completion = self.completion_lock.lock().await;
         let status = serde_json::to_value(&state)?.as_str().unwrap().to_owned();
         let completion_key = format!("completion:{}", request.operation_id);
@@ -3106,6 +3242,7 @@ impl Runtime {
         Ok(())
     }
     async fn flush_completions(self: &Arc<Self>, network: &str) -> Result<()> {
+        let _work = self.maintenance.enter()?;
         let operations = self.store.lock().await.operations(network)?;
         for operation in operations {
             let key = format!("completion:{}", operation.request.operation_id);
@@ -3215,7 +3352,14 @@ impl Runtime {
             .lock()
             .await
             .authorize_node(network, &message.origin, None)?;
-        match field(input, "type")? {
+        let kind = field(input, "type")?;
+        let _work = (!matches!(
+            kind,
+            "capabilities" | "inventory" | "event" | "blob" | "operation"
+        ))
+        .then(|| self.maintenance.enter())
+        .transpose()?;
+        match kind {
             "capabilities" => Ok(self.capabilities()),
             "inventory" => {
                 self.require_role(network, NodeRole::Replica).await?;
@@ -3347,7 +3491,7 @@ impl Runtime {
                         &trigger,
                     )?;
                 }
-                self.spawn_scheduler(network.clone(), scope, trigger);
+                self.spawn_scheduler(network.clone(), scope, trigger)?;
                 Ok(json!({"state":"accepted"}))
             }
             "manager_status" => {
@@ -3379,6 +3523,7 @@ impl Runtime {
         }
     }
     async fn observe_engine(self: &Arc<Self>, event: Value) -> Result<()> {
+        let _work = self.maintenance.enter_when_open().await;
         let cli_progress = event["kind"] == "executor_progress";
         let method = event["method"].as_str().unwrap_or(if cli_progress {
             "executor/progress"
@@ -3591,9 +3736,16 @@ impl Runtime {
             json!({"operation":self.store.lock().await.operation(network,&operation.request.operation_id)?}),
         )
     }
-    fn spawn_scheduler(self: &Arc<Self>, network: String, scope: String, trigger: String) {
+    fn spawn_scheduler(
+        self: &Arc<Self>,
+        network: String,
+        scope: String,
+        trigger: String,
+    ) -> Result<()> {
+        let work = self.maintenance.enter()?;
         let node = self.clone();
         tokio::spawn(async move {
+            let _work = work;
             let access = Access {
                 network_id: network.clone(),
                 human: false,
@@ -3615,12 +3767,14 @@ impl Runtime {
                     .await;
             }
         });
+        Ok(())
     }
     async fn maybe_followup(
         self: &Arc<Self>,
         request: &OperationRequest,
         result_hash: &str,
     ) -> Result<bool> {
+        let work = self.maintenance.enter()?;
         let Some(task) = &request.task_id else {
             return Ok(true);
         };
@@ -3705,6 +3859,7 @@ impl Runtime {
         let request = request.clone();
         let result_hash = result_hash.to_owned();
         tokio::spawn(async move {
+            let _work = work;
             let access = Access {
                 network_id: request.network_id.clone(),
                 human: false,
