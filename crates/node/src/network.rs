@@ -977,6 +977,10 @@ async fn dial_direct(
     None
 }
 
+pub async fn connect_direct(url: &str, service: Service) -> Result<NetworkSocket> {
+    connect_service(url, Control::Direct { service }).await
+}
+
 async fn connect_service(url: &str, control: Control) -> Result<NetworkSocket> {
     let (mut socket, _) = open_control(url).await?;
     send_control(&mut socket, &control).await?;
@@ -1224,15 +1228,10 @@ mod tests {
         send_frame(&mut caller_socket, Message::Binary(first.into())).await?;
         let first = next_binary(&mut incoming.socket).await?;
         server.read(&first).map_err(anyhow::Error::msg)?;
-        let second = server
-            .write(b"authenticated target")
-            .map_err(anyhow::Error::msg)?;
+        let second = server.write(&[]).map_err(anyhow::Error::msg)?;
         send_frame(&mut incoming.socket, Message::Binary(second.into())).await?;
         let second = next_binary(&mut caller_socket).await?;
-        assert_eq!(
-            client.read(&second).map_err(anyhow::Error::msg)?,
-            b"authenticated target"
-        );
+        assert_eq!(client.read(&second).map_err(anyhow::Error::msg)?, b"");
         let third = client
             .write(b"authenticated caller")
             .map_err(anyhow::Error::msg)?;

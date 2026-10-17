@@ -823,7 +823,7 @@ mod tests {
             .iter()
             .map(|node| node.certificate(roles()))
             .collect::<Result<Vec<_>>>()?;
-        store.install_trust_bundle(&network, &owner.sign_trust_bundle(1, certificates)?)?;
+        store.install_trust_bundle(&network, &owner.sign_network_fixture(1, certificates)?)?;
         Ok(PeerHub::new(
             identity.clone(),
             Arc::new(Mutex::new(store)),
@@ -883,7 +883,7 @@ mod tests {
         restricted.roles.retain(|r| r != &NodeRole::Relay);
         enabled.store.lock().await.install_trust_bundle(
             &network,
-            &a.sign_trust_bundle(
+            &a.sign_network_fixture(
                 2,
                 vec![a.certificate(roles())?, restricted, c.certificate(roles())?],
             )?,
@@ -945,7 +945,7 @@ mod tests {
         revoked.revoked = true;
         receiver.store.lock().await.install_trust_bundle(
             &network,
-            &a.sign_trust_bundle(2, vec![revoked, b.certificate(roles())?])?,
+            &a.sign_network_fixture(2, vec![revoked, b.certificate(roles())?])?,
         )?;
         let packet = sender.packet(
             &network,
