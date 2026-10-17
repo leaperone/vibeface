@@ -20,6 +20,9 @@ use vibeface_secure::authorization::{
     task_binding::SignedBinding,
 };
 
+#[path = "execution_observation.rs"]
+mod observation;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionContext {
@@ -707,8 +710,8 @@ fn stored_from(
         );
     } else {
         ensure!(
-            !stored.state.terminal(),
-            "terminal handoff has no signed result receipt"
+            !stored.state.terminal() && stored.result.is_null(),
+            "handoff result has no signed result receipt"
         );
     }
     Ok(Some(stored))
@@ -3582,6 +3585,153 @@ pub(crate) mod tests {
             })
         }
 
+        fn observation(
+            &mut self,
+        ) -> Result<(
+            execution_observation::SignedExecutionObservation,
+            execution_observation::ExecutionObservationFreshness,
+        )> {
+            use execution_observation::*;
+            let original: Event =
+                serde_json::from_str(&self.wire.handoff.project_dispatch.canonical_body)?;
+            let original = capsule_admission(&original)?;
+            let mut context = original.invocation.payload.context.clone();
+            context.sdk_session = None;
+            let account = self.grant(
+                true,
+                Actor::Account(self.executor.account.clone()),
+                vec![Action::OperationResolve],
+                original.invocation.payload.resource.clone(),
+                original.invocation.payload.audience.clone(),
+                context.clone(),
+            )?;
+            context.workspace_resource =
+                Some(self.wire.handoff.execution_resource.resource.clone());
+            let execution = self.grant(
+                false,
+                Actor::Service(original.invocation.payload.audience.service.clone()),
+                vec![Action::ExecutionResolve, Action::OperationResolve],
+                self.wire.handoff.execution_resource.clone(),
+                self.wire.handoff.execution_audience.clone(),
+                context,
+            )?;
+            let request = self
+                .store
+                .policy
+                .verified()
+                .build_execution_observation_request(
+                    &self.wire,
+                    &self.executor.client,
+                    &account.hash()?,
+                    &execution.hash()?,
+                    "explicit-observation",
+                    now() + 50,
+                    now() + 10_050,
+                )?;
+            let signer = Identity::from_secret_hex(&self.project.node.secret_key_hex)
+                .map_err(anyhow::Error::msg)?;
+            let wire = self.store.policy.verified().sign_execution_observation(
+                &request,
+                &self.wire,
+                &signer,
+                now() + 51,
+                now() + 10_050,
+            )?;
+            let challenge = self.store.issue_execution_observation_challenge(
+                &self.executor.node,
+                &wire,
+                &self.transport,
+                now() + 52,
+            )?;
+            let mut receipts = self.store.sign_execution_observation_receipts(
+                &challenge,
+                &self.project.node,
+                now() + 52,
+            )?;
+            receipts.extend(self.store.sign_execution_observation_receipts(
+                &challenge,
+                &self.executor.node,
+                now() + 52,
+            )?);
+            Ok((
+                wire,
+                ExecutionObservationFreshness {
+                    challenge,
+                    receipts,
+                },
+            ))
+        }
+
+        fn deep_grant(
+            &mut self,
+            owner_project: bool,
+            template: Grant,
+            last: Actor,
+            intermediaries: &[TestNetwork],
+        ) -> Result<ObjectHash> {
+            let owner = if owner_project {
+                &self.project
+            } else {
+                &self.executor
+            };
+            let mut parent = None;
+            for depth in 0..MAX_DELEGATION_DEPTH {
+                let stamp = self
+                    .store
+                    .policy
+                    .verified()
+                    .head(&PolicyDomain::Space(owner.space.clone()))
+                    .unwrap()
+                    .clone();
+                let mut grant = template.clone();
+                grant.issued_under = stamp.clone();
+                grant.parent = parent;
+                grant.remaining_delegations = (MAX_DELEGATION_DEPTH - depth) as u8;
+                if depth + 1 == MAX_DELEGATION_DEPTH && matches!(last, Actor::Service(_)) {
+                    grant.remaining_delegations = 0;
+                }
+                grant.grantee = Grantee::Actor(if depth + 1 == MAX_DELEGATION_DEPTH {
+                    last.clone()
+                } else if let Some(intermediary) = intermediaries.get(depth) {
+                    Actor::Account(intermediary.account.clone())
+                } else {
+                    Actor::Account(owner.account.clone())
+                });
+                grant.nonce = Nonce::random()?;
+                let signed = Signed::sign(
+                    grant,
+                    if depth == 0 {
+                        &owner.root
+                    } else if let Some(intermediary) = intermediaries.get(depth - 1) {
+                        &intermediary.client
+                    } else {
+                        &owner.client
+                    },
+                )?;
+                let hash = signed.hash()?;
+                let mut document = self
+                    .store
+                    .policy
+                    .verified()
+                    .space(&owner.space)
+                    .unwrap()
+                    .clone();
+                document.previous = Some(stamp);
+                document.sequence += 1;
+                document.grants.push(hash.clone());
+                document.grants.sort();
+                self.store.install_policy_journal(
+                    &[
+                        JournalEntry::Grant(signed),
+                        JournalEntry::Space(Signed::sign(document, &owner.root)?),
+                    ],
+                    now(),
+                )?;
+                parent = Some(hash);
+            }
+            Ok(parent.unwrap())
+        }
+
         fn resign_resolution_account(
             &self,
             wire: &mut SignedExecutionHandoffResolution,
@@ -3772,6 +3922,660 @@ pub(crate) mod tests {
             )?;
             Ok(proof)
         }
+    }
+
+    #[test]
+    fn independent_current_observation_survives_original_revocation_without_operation_writes()
+    -> Result<()> {
+        for sdk in [false, true] {
+            let mut fixture = if sdk {
+                Fixture::sdk()?
+            } else {
+                Fixture::new()?
+            };
+            fixture.start_unknown()?;
+            fixture.project.revoke_client(&mut fixture.store)?;
+            let mut revoked_grants = vec![(
+                &fixture.executor,
+                fixture.wire.invocation.payload.grant_leaf.clone(),
+            )];
+            if sdk {
+                let event: Event =
+                    serde_json::from_str(&fixture.wire.handoff.project_dispatch.canonical_body)?;
+                revoked_grants.push((
+                    &fixture.project,
+                    capsule_admission(&event)?
+                        .invocation
+                        .payload
+                        .grant_leaf
+                        .clone(),
+                ));
+            }
+            for (owner, grant) in revoked_grants {
+                let stamp = fixture
+                    .store
+                    .policy
+                    .verified()
+                    .head(&PolicyDomain::Space(owner.space.clone()))
+                    .unwrap()
+                    .clone();
+                let mut document = fixture
+                    .store
+                    .policy
+                    .verified()
+                    .space(&owner.space)
+                    .unwrap()
+                    .clone();
+                document.previous = Some(stamp);
+                document.sequence += 1;
+                document.grants.retain(|hash| hash != &grant);
+                fixture.store.install_policy_journal(
+                    &[JournalEntry::Space(Signed::sign(document, &owner.root)?)],
+                    now() + 7,
+                )?;
+            }
+            let (wire, proof) = fixture.observation()?;
+            let changes = fixture.store.connection.total_changes();
+            let verification =
+                vibeface_secure::signature_verification::SignatureVerification::new();
+            let result = verification
+                .run(|| {
+                    fixture.store.observe_execution_handoff(
+                        &fixture.executor.node,
+                        &wire,
+                        &proof,
+                        &fixture.transport,
+                        now() + 53,
+                    )
+                })?
+                .context("accepted operation was not observed")?;
+            assert_eq!(result.receipt.payload.state, ExecutionHandoffState::Unknown);
+            verify_execution_handoff_receipt_signature(
+                &fixture.wire,
+                &result.receipt,
+                &result.result,
+            )?;
+            assert_eq!(changes, fixture.store.connection.total_changes());
+            let mut missing = proof.clone();
+            missing.receipts.pop();
+            assert!(
+                fixture
+                    .store
+                    .observe_execution_handoff(
+                        &fixture.executor.node,
+                        &wire,
+                        &missing,
+                        &fixture.transport,
+                        now() + 53,
+                    )
+                    .is_err()
+            );
+            let wrong_peer = TransportEvidence::VerifiedPeer {
+                origin: DeviceId::from_key(&PublicKey::of(&fixture.executor.client)),
+            };
+            assert!(
+                fixture
+                    .store
+                    .observe_execution_handoff(
+                        &fixture.executor.node,
+                        &wire,
+                        &proof,
+                        &wrong_peer,
+                        now() + 53,
+                    )
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .store
+                    .observe_execution_handoff(
+                        &fixture.executor.node,
+                        &wire,
+                        &proof,
+                        &fixture.transport,
+                        proof.challenge.expires_at_ms,
+                    )
+                    .is_err()
+            );
+            let mut unissued = proof.clone();
+            unissued.challenge.nonce = Nonce::random()?;
+            unissued.receipts = fixture.store.sign_execution_observation_receipts(
+                &unissued.challenge,
+                &fixture.project.node,
+                now() + 52,
+            )?;
+            unissued
+                .receipts
+                .extend(fixture.store.sign_execution_observation_receipts(
+                    &unissued.challenge,
+                    &fixture.executor.node,
+                    now() + 52,
+                )?);
+            assert!(
+                fixture
+                    .store
+                    .observe_execution_handoff(
+                        &fixture.executor.node,
+                        &wire,
+                        &unissued,
+                        &fixture.transport,
+                        now() + 53,
+                    )
+                    .is_err()
+            );
+            assert_eq!(changes, fixture.store.connection.total_changes());
+            for mutation in [
+                "DELETE FROM execution_handoff_reservations",
+                "UPDATE execution_handoff_sessions SET binding=json_set(binding,'$.binding.generation',2)",
+                "UPDATE execution_handoffs SET result='{\"native_session_id\":\"private-provider-id\"}'",
+                "DELETE FROM execution_handoff_nonces",
+                "UPDATE local_values SET value=json_set(value,'$.stage','admit') WHERE key GLOB 'execution-observation:*'",
+                "UPDATE local_values SET value=json_set(value,'$.payload.deadline_ms',0) WHERE key GLOB 'execution-handoff-lease:*'",
+            ] {
+                fixture
+                    .store
+                    .connection
+                    .execute_batch("SAVEPOINT observation_tamper")?;
+                fixture.store.connection.execute(mutation, [])?;
+                let tampered_changes = fixture.store.connection.total_changes();
+                assert!(
+                    fixture
+                        .store
+                        .observe_execution_handoff(
+                            &fixture.executor.node,
+                            &wire,
+                            &proof,
+                            &fixture.transport,
+                            now() + 53,
+                        )
+                        .is_err(),
+                    "{mutation}"
+                );
+                assert_eq!(tampered_changes, fixture.store.connection.total_changes());
+                fixture
+                    .store
+                    .connection
+                    .execute_batch("ROLLBACK TO observation_tamper; RELEASE observation_tamper")?;
+            }
+            println!(
+                "OBSERVATION_STORE_USAGE {}",
+                json!({"case": if sdk {"sdk_actor_revoked"} else {"account_actor_revoked"}, "actual":verification.counts()})
+            );
+            fixture.executor.revoke_client(&mut fixture.store)?;
+            let changes = fixture.store.connection.total_changes();
+            assert!(
+                fixture
+                    .store
+                    .observe_execution_handoff(
+                        &fixture.executor.node,
+                        &wire,
+                        &proof,
+                        &fixture.transport,
+                        now() + 54,
+                    )
+                    .is_err()
+            );
+            assert_eq!(changes, fixture.store.connection.total_changes());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn observation_requires_local_checkpoint_and_current_freshness_even_when_absent() -> Result<()>
+    {
+        let mut fixture = Fixture::new()?;
+        let (wire, proof) = fixture.observation()?;
+        let changes = fixture.store.connection.total_changes();
+        assert!(
+            fixture
+                .store
+                .observe_execution_handoff(
+                    &fixture.executor.node,
+                    &wire,
+                    &proof,
+                    &fixture.transport,
+                    now() + 53,
+                )?
+                .is_none()
+        );
+        let mut missing = proof.clone();
+        missing.receipts.pop();
+        assert!(
+            fixture
+                .store
+                .observe_execution_handoff(
+                    &fixture.executor.node,
+                    &wire,
+                    &missing,
+                    &fixture.transport,
+                    now() + 53,
+                )
+                .is_err()
+        );
+        assert_eq!(changes, fixture.store.connection.total_changes());
+        Ok(())
+    }
+
+    #[test]
+    fn production_admission_rejects_oversized_metadata_and_excess_historical_receipts_without_writes()
+    -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let signer = Identity::from_secret_hex(&fixture.project.node.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        for oversized_resources in [false, true] {
+            let mut wire = fixture.wire.clone();
+            let mut event: Event =
+                serde_json::from_str(&wire.handoff.project_dispatch.canonical_body)?;
+            let EventCause::Invocation { admission } = &mut event.cause else {
+                unreachable!()
+            };
+            if oversized_resources {
+                let root = fixture.executor.project.to_str().unwrap();
+                let mut resources = vec![root.to_owned()];
+                resources.extend(
+                    (1..128).map(|index| format!("{root}/resource-{index}-{}", "x".repeat(320))),
+                );
+                admission.source_body["request"]["resources"] = json!(resources);
+                let mut invocation = admission.invocation.payload.clone();
+                invocation.body_hash = ObjectHash::body(&admission.source_body)?;
+                invocation.nonce = Nonce::random()?;
+                admission.invocation = Signed::sign(invocation.clone(), &fixture.project.client)?;
+                let facts = RequestFacts {
+                    resource: invocation.resource,
+                    action: invocation.action,
+                    audience: invocation.audience,
+                    operation_id: invocation.operation_id,
+                    body_hash: invocation.body_hash,
+                    context: invocation.context,
+                };
+                let auth = fixture.store.policy.verified().verify_invocation(
+                    &admission.invocation,
+                    &facts,
+                    &admission.transport.clone().into_evidence(),
+                    now(),
+                )?;
+                admission.challenge = FreshnessChallenge::new(
+                    &auth,
+                    CheckStage::Admit,
+                    Nonce::random()?,
+                    now(),
+                    now() + 10_000,
+                )?;
+                admission.receipts = fixture.store.sign_current_receipts(
+                    &admission.challenge,
+                    &fixture.project.node,
+                    now(),
+                )?;
+                admission
+                    .receipts
+                    .extend(fixture.store.sign_current_receipts(
+                        &admission.challenge,
+                        &fixture.executor.node,
+                        now(),
+                    )?);
+                fixture.store.policy.verified().verify_freshness(
+                    &auth,
+                    &admission.challenge,
+                    &admission.receipts,
+                    now(),
+                )?;
+                let EventBody::DispatchRecorded { action, .. } = &mut event.body else {
+                    unreachable!()
+                };
+                *action = admission.source_body["request"].clone();
+            } else {
+                let mut receipt = admission.receipts[0].payload.clone();
+                for index in 0..=MAX_POLICY_DOMAINS {
+                    receipt.issued_at_ms = now() + index as u64;
+                    admission
+                        .receipts
+                        .push(Signed::sign(receipt.clone(), &signer)?);
+                }
+            }
+            wire.handoff.project_dispatch = fixture.project.node.sign_event(event)?;
+            wire.handoff.attest_source(&signer)?;
+            let mut invocation = wire.invocation.payload.clone();
+            invocation.body_hash = ObjectHash::body(&wire.handoff)?;
+            wire.invocation = Signed::sign(invocation, &signer)?;
+            wire.invocation.verify_signature()?;
+            wire.handoff
+                .source_attestation
+                .as_ref()
+                .unwrap()
+                .verify_signature()?;
+            let before = fixture.store.connection.total_changes();
+            let error = fixture
+                .store
+                .issue_execution_handoff_challenge(
+                    &wire,
+                    &fixture.transport,
+                    CheckStage::Admit,
+                    now(),
+                )
+                .unwrap_err();
+            if oversized_resources {
+                assert!(
+                    matches!(
+                        error.downcast_ref::<AuthorizationError>(),
+                        Some(AuthorizationError::BudgetExceeded)
+                    ),
+                    "{error:#}"
+                );
+            } else {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("too many historical admission items"),
+                    "{error:#}"
+                );
+            }
+            assert_eq!(before, fixture.store.connection.total_changes());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn production_admission_rejects_union_of_individually_legal_depth_eight_grants_without_writes()
+    -> Result<()> {
+        for intermediary in [false, true] {
+            let mut fixture = Fixture::new()?;
+            let intermediaries = if intermediary {
+                let networks = vec![
+                    TestNetwork::new()?,
+                    TestNetwork::new()?,
+                    TestNetwork::new()?,
+                ];
+                for network in &networks {
+                    network.install(&mut fixture.store)?;
+                }
+                networks
+            } else {
+                Vec::new()
+            };
+            let project_template = fixture
+                .store
+                .policy
+                .verified()
+                .grant(&fixture.project.bundle.grant_leaf)
+                .unwrap()
+                .payload
+                .clone();
+            let execution_template = fixture
+                .store
+                .policy
+                .verified()
+                .grant(&fixture.wire.invocation.payload.grant_leaf)
+                .unwrap()
+                .payload
+                .clone();
+            let project_leaf = fixture.deep_grant(
+                true,
+                project_template,
+                Actor::Account(fixture.project.account.clone()),
+                &[],
+            )?;
+            let execution_leaf = fixture.deep_grant(
+                false,
+                execution_template,
+                fixture.wire.invocation.payload.actor.clone(),
+                &intermediaries,
+            )?;
+            let mut event: Event =
+                serde_json::from_str(&fixture.wire.handoff.project_dispatch.canonical_body)?;
+            let EventCause::Invocation { admission } = &mut event.cause else {
+                unreachable!()
+            };
+            admission.source_body["execution_grant"] = json!(execution_leaf);
+            let mut invocation = admission.invocation.payload.clone();
+            invocation.grant_leaf = project_leaf.clone();
+            invocation.body_hash = ObjectHash::body(&admission.source_body)?;
+            invocation.expected_policies.clear();
+            invocation.nonce = Nonce::random()?;
+            let facts = RequestFacts {
+                resource: invocation.resource.clone(),
+                action: invocation.action,
+                audience: invocation.audience.clone(),
+                operation_id: invocation.operation_id.clone(),
+                body_hash: invocation.body_hash.clone(),
+                context: invocation.context.clone(),
+            };
+            let transport = admission.transport.clone().into_evidence();
+            admission.invocation = Signed::sign(invocation.clone(), &fixture.project.client)?;
+            let policy = fixture.store.policy.verified();
+            let auth =
+                match policy.verify_invocation(&admission.invocation, &facts, &transport, now()) {
+                    Err(AuthorizationError::NeedPolicySync(expected)) => {
+                        invocation.expected_policies = expected;
+                        admission.invocation = Signed::sign(invocation, &fixture.project.client)?;
+                        policy.verify_invocation(
+                            &admission.invocation,
+                            &facts,
+                            &transport,
+                            now(),
+                        )?
+                    }
+                    result => result?,
+                };
+            admission.challenge = FreshnessChallenge::new(
+                &auth,
+                CheckStage::Admit,
+                Nonce::random()?,
+                now(),
+                now() + 10_000,
+            )?;
+            admission.receipts = fixture.store.sign_current_receipts(
+                &admission.challenge,
+                &fixture.project.node,
+                now(),
+            )?;
+            admission
+                .receipts
+                .extend(fixture.store.sign_current_receipts(
+                    &admission.challenge,
+                    &fixture.executor.node,
+                    now(),
+                )?);
+            let fresh =
+                policy.verify_freshness(&auth, &admission.challenge, &admission.receipts, now())?;
+            let admitted = policy.admit_operation(&auth, &fresh, now())?;
+            let original =
+                policy.verify_operation_authorization(&admitted, &facts, &transport, now())?;
+            let mut original_usage = ExecutionProofUsage::default();
+            original_usage.record_authorization(&original)?;
+            original_usage.enforce_limits()?;
+            assert_eq!(
+                original_usage.counts().max_chain_depth,
+                MAX_DELEGATION_DEPTH
+            );
+            fixture.wire.handoff.project_dispatch = fixture.project.node.sign_event(event)?;
+            let signer = Identity::from_secret_hex(&fixture.project.node.secret_key_hex)
+                .map_err(anyhow::Error::msg)?;
+            fixture.wire.handoff.attest_source(&signer)?;
+            let facts = execution_submission_facts(&fixture.wire.handoff, &original)?;
+            let Actor::Service(service) = &fixture.wire.invocation.payload.actor else {
+                unreachable!()
+            };
+            let descriptor =
+                policy.verify_service_grant(service, &execution_leaf, &facts, now())?;
+            let mut invocation = fixture.wire.invocation.payload.clone();
+            invocation.grant_leaf = execution_leaf;
+            invocation.body_hash = facts.body_hash.clone();
+            invocation.expected_policies = descriptor.heads().to_vec();
+            invocation.initiator = descriptor.initiator().clone();
+            invocation.initiating_grant = descriptor.initiating_grant().cloned();
+            invocation.nonce = Nonce::random()?;
+            fixture.wire.invocation = Signed::sign(invocation, &signer)?;
+            let submission = policy.verify_invocation(
+                &fixture.wire.invocation,
+                &facts,
+                &fixture.transport,
+                now(),
+            )?;
+            let mut submission_usage = ExecutionProofUsage::default();
+            submission_usage.record_authorization(&submission)?;
+            submission_usage.enforce_limits()?;
+            assert_eq!(
+                submission_usage.counts().max_chain_depth,
+                MAX_DELEGATION_DEPTH
+            );
+            let mut initial_union = original_usage.clone();
+            initial_union.merge(&submission_usage);
+            initial_union.record_handoff(&fixture.wire)?;
+            let before_issue = fixture.store.connection.total_changes();
+            let issue_verification =
+                vibeface_secure::signature_verification::SignatureVerification::new();
+            let issued = issue_verification.run(|| {
+                fixture.store.issue_execution_handoff_challenge(
+                    &fixture.wire,
+                    &fixture.transport,
+                    CheckStage::Admit,
+                    now(),
+                )
+            });
+            if !intermediaries.is_empty() {
+                assert!(
+                    initial_union.counts().unique_signed_objects > MAX_PROOF_OBJECTS,
+                    "{:?}",
+                    initial_union.counts()
+                );
+                assert!(matches!(
+                    initial_union.enforce_limits(),
+                    Err(AuthorizationError::BudgetExceeded)
+                ));
+                let error = issued.unwrap_err();
+                assert!(
+                    matches!(
+                        error.downcast_ref::<AuthorizationError>(),
+                        Some(AuthorizationError::BudgetExceeded)
+                    ),
+                    "{error:#}"
+                );
+                assert_eq!(before_issue, fixture.store.connection.total_changes());
+                println!(
+                    "HANDOFF_OVEROBJECT_USAGE {}",
+                    json!({"original":original_usage.counts(),"submission":submission_usage.counts(),"union":initial_union.counts(),"actual":issue_verification.counts()})
+                );
+                continue;
+            }
+            let challenge = issued?;
+            let mut receipts = fixture.store.sign_execution_handoff_receipts(
+                &challenge,
+                &fixture.project.node,
+                now(),
+            )?;
+            receipts.extend(fixture.store.sign_execution_handoff_receipts(
+                &challenge,
+                &fixture.executor.node,
+                now(),
+            )?);
+            let proof = ExecutionHandoffFreshness {
+                challenge,
+                receipts,
+            };
+            let original = original_capsule_authorization(
+                fixture.store.policy.verified(),
+                &fixture.wire.handoff,
+                now(),
+            )?;
+            let full = fixture.store.policy.verified().verify_execution_handoff(
+                &fixture.wire,
+                &original,
+                &fixture.transport,
+                None,
+                now(),
+            )?;
+            let mut union_usage = full.proof_usage().clone();
+            union_usage.record_metadata(&proof.challenge)?;
+            for receipt in &proof.receipts {
+                union_usage.record_signed(receipt)?;
+            }
+            assert!(
+                union_usage.counts().unique_signed_objects > MAX_PROOF_OBJECTS
+                    || union_usage.counts().unique_signatures > MAX_PROOF_SIGNATURES
+            );
+            assert!(matches!(
+                union_usage.enforce_limits(),
+                Err(AuthorizationError::BudgetExceeded)
+            ));
+            let before = fixture.store.connection.total_changes();
+            let verification =
+                vibeface_secure::signature_verification::SignatureVerification::new();
+            let error = verification
+                .run(|| {
+                    fixture.store.accept_execution_handoff(
+                        &fixture.executor.node,
+                        &fixture.wire,
+                        &proof,
+                        &fixture.transport,
+                        now(),
+                    )
+                })
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<AuthorizationError>(),
+                    Some(AuthorizationError::BudgetExceeded)
+                ),
+                "{error:#}"
+            );
+            assert_eq!(before, fixture.store.connection.total_changes());
+            println!(
+                "HANDOFF_OVERBUDGET_USAGE {}",
+                json!({"original":original_usage.counts(),"submission":submission_usage.counts(),"union":union_usage.counts(),"actual":verification.counts()})
+            );
+            let mut ninth = fixture
+                .store
+                .policy
+                .verified()
+                .grant(&project_leaf)
+                .unwrap()
+                .payload
+                .clone();
+            ninth.parent = Some(project_leaf);
+            ninth.remaining_delegations = 0;
+            ninth.issued_under = fixture
+                .store
+                .policy
+                .verified()
+                .head(&PolicyDomain::Space(fixture.project.space.clone()))
+                .unwrap()
+                .clone();
+            ninth.nonce = Nonce::random()?;
+            let ninth = Signed::sign(ninth, &fixture.project.client)?;
+            let mut document = fixture
+                .store
+                .policy
+                .verified()
+                .space(&fixture.project.space)
+                .unwrap()
+                .clone();
+            document.previous = Some(
+                fixture
+                    .store
+                    .policy
+                    .verified()
+                    .head(&PolicyDomain::Space(fixture.project.space.clone()))
+                    .unwrap()
+                    .clone(),
+            );
+            document.sequence += 1;
+            document.grants.push(ninth.hash()?);
+            document.grants.sort();
+            let before = fixture.store.connection.total_changes();
+            let error = fixture
+                .store
+                .install_policy_journal(
+                    &[
+                        JournalEntry::Grant(ninth),
+                        JournalEntry::Space(Signed::sign(document, &fixture.project.root)?),
+                    ],
+                    now(),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("depth"), "{error:#}");
+            assert_eq!(before, fixture.store.connection.total_changes());
+        }
+        Ok(())
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use super::{
-    StoredHandoff, public_execution_result, session_from, signed_receipt, stored_from,
-    verify_local_handoff_checkpoint,
+    StoredHandoff, lease_checkpoint_key, public_execution_result, session_from, signed_receipt,
+    stored_from, verify_local_handoff_checkpoint,
 };
 use crate::{crypto::LocalIdentity, model::Event, store::Store};
 use anyhow::{Context, Result, ensure};
@@ -12,7 +12,9 @@ use vibeface_secure::{
         Signed, TransportEvidence, VerifiedPolicySet,
         events::StoredTransport,
         execution_handoff::{
-            ExecutionHandoffResult, verify_execution_handoff_admission_checkpoint,
+            ExecutionHandoffLeaseReceipt, ExecutionHandoffResult,
+            verify_execution_handoff_admission_checkpoint,
+            verify_execution_handoff_lease_checkpoint,
         },
         execution_observation::{
             ExecutionObservationChallenge, ExecutionObservationFreshness,
@@ -321,8 +323,26 @@ impl Store {
             .verify_execution_observation_freshness(&full, proof, now_ms)?;
         let mut usage = fresh.proof_usage().clone();
         usage.merge(checkpoint.proof_usage());
-        if let Some(lease) = &stored.lease {
-            usage.record_metadata(lease)?;
+        if let Some((lease, verified_at, deadline)) = &stored.lease {
+            let encoded: String = tx
+                .query_row(
+                    "SELECT value FROM local_values WHERE space_id=? AND key=?",
+                    params![
+                        stored.wire.handoff.execution_resource.space.as_str(),
+                        lease_checkpoint_key(&stored.wire, lease)?
+                    ],
+                    |row| row.get(0),
+                )
+                .context("observed lease has no immutable checkpoint")?;
+            let receipt: Signed<ExecutionHandoffLeaseReceipt> = serde_json::from_str(&encoded)?;
+            usage.merge(&verify_execution_handoff_lease_checkpoint(
+                &stored.wire,
+                &stored.admission_receipt,
+                lease,
+                *verified_at,
+                *deadline,
+                &receipt,
+            )?);
         }
         if let Some(previous) = &stored.receipt {
             usage.record_signed(previous)?;
@@ -330,6 +350,16 @@ impl Store {
         usage.record_signed(&receipt)?;
         usage.record_actual_signature_counts(signature_scope.counts());
         usage.enforce_limits()?;
+        #[cfg(test)]
+        println!(
+            "OBSERVATION_PROOF_USAGE {}",
+            serde_json::json!({
+                "case":if stored.wire.handoff.sdk_origin.is_some() {"sdk_original"} else {"account_original"},
+                "observation_wire_json_bytes":serde_json::to_vec(wire)?.len(),
+                "freshness_json_bytes":serde_json::to_vec(proof)?.len(),
+                "proof":usage.counts(),
+            })
+        );
         let observation = ExecutionHandoffResult {
             handoff: stored.wire,
             receipt,
