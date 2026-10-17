@@ -311,9 +311,10 @@ for await (const line of createInterface({input:process.stdin})) {
     if (input.op === 'identity') result = exposed(identity(input.identity || 'client'));
     else if (input.op === 'sign') result = identity(input.identity || 'client').sign(input.domain, encoder.encode(typeof input.payload === 'string' ? input.payload : JSON.stringify(input.payload)));
     else if (input.op === 'backup') {
-      const root = identity('root');
-      const payload = encoder.encode(JSON.stringify({version:1,network_id:root.nodeId(),root_secret_key:root.secretHex(),genesis:input.state.genesis,recovery_epoch:1,decryption_keys:[]}));
-      try { result = {version:1,network_id:root.nodeId(),recovery_epoch:1,envelope:JSON.parse(decoder.decode(recoverySeal(payload,input.password)))}; }
+      const root = identity(input.identity || 'root');
+      const epoch = input.recovery_epoch || 1;
+      const payload = encoder.encode(JSON.stringify({version:1,network_id:root.nodeId(),root_secret_key:root.secretHex(),genesis:input.state.genesis,recovery_epoch:epoch,decryption_keys:[]}));
+      try { result = {version:1,network_id:root.nodeId(),recovery_epoch:epoch,envelope:JSON.parse(decoder.decode(recoverySeal(payload,input.password)))}; }
       finally { payload.fill(0); }
     }
     else if (input.op === 'recover_material') {
@@ -712,6 +713,60 @@ def verify_incompatible_data(run, binary, workspace, fixture, helper, module):
                 process.wait(timeout=5)
 
 
+def clear_private_binding_cache(node, run, network):
+    require(node.name == "C" and node.directory.parent == run and node.process is None,
+            "binding cache reset is limited to this stopped private acceptance node")
+    with sqlite3.connect(node.directory / "node.sqlite3") as connection:
+        before = connection.execute("SELECT hash,envelope FROM events WHERE network_id=? ORDER BY hash", (network,)).fetchall()
+        deleted = connection.execute("DELETE FROM local_values WHERE network_id=? AND (key LIKE 'task-binding-current:%' OR key LIKE 'task-binding-record:%')", (network,)).rowcount
+        require(deleted > 0, "fresh scheduler simulation removes existing local binding cache")
+        require(connection.execute("SELECT hash,envelope FROM events WHERE network_id=? ORDER BY hash", (network,)).fetchall() == before,
+                "fresh scheduler simulation retains every signed DAG event byte")
+        require(connection.execute("SELECT COUNT(*) FROM local_values WHERE network_id=? AND (key LIKE 'task-binding-current:%' OR key LIKE 'task-binding-record:%')", (network,)).fetchone()[0] == 0,
+                "fresh scheduler has no task binding current or record cache")
+    return deleted
+
+
+def recover_fresh_node(node, backup, password):
+    node.start()
+    node.client.connect(node.node_id)
+    material = node.client.command("recover_material", backup=backup, password=password)
+    state = {"genesis": material["genesis"], "checkpoint": None, "events": []}
+    challenge = node.client.call("recovery_challenge", {"network_id": material["network_id"],
+                                 "owner_public_key": material["genesis"]["owner_public_key"],
+                                 "genesis": material["genesis"]})
+    signature = node.client.command("sign", identity="recovered", **challenge["signing"])
+    params = {"challenge_id": challenge["challenge_id"], "signature": signature,
+              "recovery_epoch": material["recovery_epoch"], "state": state}
+    node.client.call("recovery_context", params, status=400)
+    context = node.client.call("recovery_context", {**params, "capability": node.access["capability"]})
+    require(context["view"]["network_id"] == backup["network_id"], "fresh recovery proves the original root network")
+    identity = node.client.command("identity")
+    info = node.client.call("info")
+    members = [
+        {**identity, "kind": "client", "name": "Fresh recovery manager", "node_roles": [], "manage": True},
+        {"subject_id": info["node_id"], "public_key": info["public_key"], "kind": "node", "name": node.name,
+         "node_roles": sorted(info["roles"]), "manage": False},
+    ]
+    members.sort(key=lambda member: member["subject_id"])
+    prepared = node.client.call("prepare_recovery", {"challenge_id": challenge["challenge_id"], "members": members})
+    require(prepared["checkpoint"]["epoch"] == backup["recovery_epoch"] + 1,
+            "fresh recovery advances beyond the backed-up recovery epoch")
+    prepared["checkpoint"]["signature"] = node.client.command("sign", identity="recovered", **prepared["signing"])
+    result = node.client.call("recover", {"challenge_id": challenge["challenge_id"], "checkpoint": prepared["checkpoint"],
+                                          "capability": node.access["capability"]})
+    node.client.network_id = backup["network_id"]
+    require(result["principal"]["can_manage"] and result["view"]["epoch"] == backup["recovery_epoch"] + 1,
+            "fresh node restores independent management at the next recovery epoch")
+    node.client.authenticate()
+    require(node.client.rpc("conversations")["conversations"] == [],
+            "root-only recovery does not invent unavailable business history")
+    updated = node.client.command("backup", identity="recovered", state=result["state"],
+                                  recovery_epoch=result["view"]["epoch"], password=password)
+    private_json(node.directory / "recovery-package.json", updated)
+    return updated
+
+
 def verify_recovery(node, other, nodes, network):
     wrong = other.command("recover_material", backup=node.backup,
                           password="wrong-acceptance-passphrase", check=False)
@@ -767,6 +822,8 @@ def verify_recovery(node, other, nodes, network):
         if peer is node or peer.name == "C":
             continue
         wait_for("authorized peer installs recovered management epoch", lambda: peer.client.call("directory")["view"]["epoch"] == result["view"]["epoch"])
+    return other.command("backup", identity="recovered", state=result["state"],
+                         recovery_epoch=result["view"]["epoch"], password=node.backup_password)
 
 
 def verify_binding_race(a, b, c, network, conversation, workspace):
@@ -973,6 +1030,15 @@ def acceptance(options):
         send = request(network, conversation, b, "fixture-delayed-send", "fixture-main", {"type": "send", "text": json.dumps({"label": "delayed", "gate": str(gate), "result_size": 280000})}, revision=session["revision"], task=task)
         dispatch(a.client, send)
         wait_for("fixture invocation begins", lambda: len(invocations(run, "delayed")) == 1)
+        wait_for("accepted dispatch and message at C", lambda: shared_history(c.client, conversation, task))
+        c.stop()
+        deleted_bindings = clear_private_binding_cache(c, run, network)
+        a.stop()
+        c.start()
+        c.client.connect()
+        c.client.authenticate()
+        wait_for("fresh C reconnects to original executor B", lambda: any(item["node_id"] == b.node_id and item["online"] for item in c.client.rpc("nodes")["nodes"]))
+        require(a.process is None, "binding authority A remains offline during fresh C continuation")
         dispatch(c.client, send)
         stale = copy.deepcopy(send)
         stale["operation_id"] = "stale-concurrent"
@@ -981,8 +1047,8 @@ def acceptance(options):
         dispatch(c.client, overlap, status=400)
         stream = Events(c.client)
         stream.start()
-        wait_for("accepted dispatch and message at C", lambda: shared_history(c.client, conversation, task))
-        a.stop()
+        report["fresh_scheduler"] = {"authority_offline": True, "binding_cache_rows_removed": deleted_bindings,
+                                     "explicit_task_id": task, "original_target": b.node_id}
         gate.touch(mode=0o600)
         wait_for("B finishes while A is offline", lambda: succeeded(c.client, b, "fixture-delayed-send"))
         notification = "result:fixture-delayed-send:succeeded"
@@ -995,7 +1061,7 @@ def acceptance(options):
         wait_for("large result blob replicated to C", lambda: verify_blobs(c, network) >= 1)
         count = verify_snapshot(c.client.rpc("export", conversation_id=conversation))
         require(count > 5, "export contains conversation, dispatch and result history")
-        passed("A goes offline; C restores context, queries B and receives live/durable completion", "real_nodes_with_stream_json_fixture")
+        passed("A goes offline; fresh C restores binding from DAG and continues original B without replay", "real_nodes_with_stream_json_fixture")
         passed("session CAS, overlapping-directory exclusion and execution deduplication", "real_nodes_with_stream_json_fixture")
         passed("large attachment copies with matching content hash and complete DAG closure")
         stream.close()
@@ -1060,8 +1126,15 @@ def acceptance(options):
         require(len(invocations(run)) == 3, "sync/restart/revocation never creates extra executor calls")
         passed("known revocation rejects further cross-node data and execution access")
         recovery_client = Client(a.url, helper, module)
-        verify_recovery(a, recovery_client, [a, b, c], network)
+        backup = verify_recovery(a, recovery_client, [a, b, c], network)
         passed("encrypted recovery rejects wrong or missing material and restores independent management without losing history")
+        for name in ("FRESH-EPOCH-2", "FRESH-EPOCH-3"):
+            fresh = Node(run, name, binary, workspace, fixture, helper, module)
+            nodes.append(fresh)
+            fresh.configure(roles=["gateway", "replica"], codex_bin=options.codex_bin)
+            backup = recover_fresh_node(fresh, backup, a.backup_password)
+        require(backup["recovery_epoch"] == 4, "epoch 2 and epoch 3 backups both restore on independent fresh nodes")
+        passed("epoch 2 and 3 encrypted backups restore fresh nodes at higher epochs without fabricating history")
         verify_no_model_budget(nodes)
         require(len(invocations(run)) == 3, "recovery never replays previously accepted execution")
         passed("ordinary notifications, history replay and identity recovery use no management-model budget")
