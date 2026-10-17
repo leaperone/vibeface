@@ -1054,6 +1054,10 @@ table "execution_handoffs" {
     unique  = true
     columns = [column.execution_space_id, column.invocation_hash]
   }
+  index "handoffs_original_operation_once" {
+    unique  = true
+    columns = [column.original_space_id, column.operation_id]
+  }
   check {
     expr = "(admitted_at_ms >= 0)"
   }

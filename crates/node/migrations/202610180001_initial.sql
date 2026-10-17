@@ -93,6 +93,8 @@ CREATE TABLE `execution_handoffs` (`execution_space_id` text NOT NULL, `original
 CREATE UNIQUE INDEX `handoffs_dispatch_once` ON `execution_handoffs` (`execution_space_id`, `handoff_hash`);
 -- Create index "handoffs_invocation_once" to table: "execution_handoffs"
 CREATE UNIQUE INDEX `handoffs_invocation_once` ON `execution_handoffs` (`execution_space_id`, `invocation_hash`);
+-- Create index "handoffs_original_operation_once" to table: "execution_handoffs"
+CREATE UNIQUE INDEX `handoffs_original_operation_once` ON `execution_handoffs` (`original_space_id`, `operation_id`);
 -- Create "execution_handoff_challenges" table
 CREATE TABLE `execution_handoff_challenges` (`execution_space_id` text NOT NULL, `nonce` text NOT NULL, `original_space_id` text NOT NULL, `operation_id` text NOT NULL, `handoff_hash` text NOT NULL, `stage` text NOT NULL, `challenge` text NOT NULL, `expires_at_ms` integer NOT NULL, `consumed` integer NOT NULL DEFAULT 0, PRIMARY KEY (`execution_space_id`, `nonce`), CONSTRAINT `execution_handoff_challenges_fk_0` FOREIGN KEY (`original_space_id`) REFERENCES `spaces` (`space_id`), CONSTRAINT `execution_handoff_challenges_fk_1` FOREIGN KEY (`execution_space_id`) REFERENCES `spaces` (`space_id`), CHECK (stage IN ('admit','start','renew')), CHECK (expires_at_ms >= 0), CHECK (consumed IN (0,1)));
 -- Create "execution_handoff_nonces" table
