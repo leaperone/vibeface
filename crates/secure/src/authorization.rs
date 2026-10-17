@@ -1,6 +1,10 @@
 //! Typed, root-approved policy and single-path capability verification.
 
+pub mod authenticator_management;
 pub mod authenticators;
+pub use authenticator_management::{
+    AuthenticatorManagementIntent, AuthenticatorPolicyApproval, VerifiedAuthenticatorManagement,
+};
 pub mod bootstrap;
 pub mod directory;
 pub mod projection;
@@ -368,6 +372,7 @@ pub struct AccountDocument {
     pub devices: Vec<ObjectHash>,
     pub revoked_devices: Vec<DeviceId>,
     pub authenticators: Vec<ObjectHash>,
+    pub authenticator_approval: Option<AuthenticatorPolicyApproval>,
     pub root_acceptance: Option<Signature>,
     pub recovery_approvals: Vec<KeyApproval>,
 }
@@ -377,6 +382,7 @@ impl AccountDocument {
         let mut document = self.clone();
         document.root_acceptance = None;
         document.recovery_approvals.clear();
+        document.authenticator_approval = None;
         canonical(&document)
     }
     pub fn accept_root(&mut self, next_root: &Identity) -> Result<()> {
@@ -971,6 +977,7 @@ pub struct VerifiedPolicySet {
 struct Budget {
     objects: BTreeSet<ObjectHash>,
     signatures: BTreeSet<(PublicKey, String, ObjectHash, Signature)>,
+    external_signatures: BTreeSet<ObjectHash>,
     bytes: usize,
     expires_at_ms: u64,
     steps: usize,
@@ -981,6 +988,7 @@ impl Default for Budget {
         Self {
             objects: BTreeSet::new(),
             signatures: BTreeSet::new(),
+            external_signatures: BTreeSet::new(),
             bytes: 0,
             expires_at_ms: u64::MAX,
             steps: 0,
@@ -1005,13 +1013,22 @@ impl Budget {
         )) {
             return Ok(());
         }
-        if self.signatures.len() >= MAX_PROOF_SIGNATURES {
+        if self.signatures.len() + self.external_signatures.len() >= MAX_PROOF_SIGNATURES {
             return Err(AuthorizationError::BudgetExceeded);
         }
         crate::verify(key.as_str(), domain, bytes, signature.as_str())
             .map_err(|_| AuthorizationError::InvalidProof("invalid object signature"))?;
         self.signatures
             .insert((key.clone(), domain.to_owned(), hash, signature.clone()));
+        Ok(())
+    }
+    fn external_signature(&mut self, hash: ObjectHash) -> Result<()> {
+        if !self.external_signatures.contains(&hash) {
+            if self.signatures.len() + self.external_signatures.len() >= MAX_PROOF_SIGNATURES {
+                return Err(AuthorizationError::BudgetExceeded);
+            }
+            self.external_signatures.insert(hash);
+        }
         Ok(())
     }
     fn expires(&mut self, deadline: u64) {
@@ -1236,7 +1253,8 @@ impl VerifiedPolicySet {
                 && d.devices.is_empty()
                 && d.revoked_devices.is_empty()
                 && d.enrollment.is_empty()
-                && d.authenticators.is_empty(),
+                && d.authenticators.is_empty()
+                && d.authenticator_approval.is_none(),
             "invalid account genesis",
         )?;
         self.validate_account(d)?;
@@ -1326,6 +1344,10 @@ impl VerifiedPolicySet {
                 &mut budget,
             )?;
         } else {
+            require(
+                d.authenticator_approval.is_none(),
+                "unexpected root authenticator approval",
+            )?;
             let bytes = d.governance_bytes()?;
             validate_root_transition(
                 &signed.issuer,
@@ -2734,6 +2756,7 @@ mod tests {
                     devices: vec![],
                     revoked_devices: vec![],
                     authenticators: vec![],
+                    authenticator_approval: None,
                     root_acceptance: None,
                     recovery_approvals: vec![],
                 },
@@ -4924,9 +4947,7 @@ impl VerifiedPolicySet {
         budget: &mut Budget,
     ) -> Result<()> {
         let d = &signed.payload;
-        if d.authenticators != previous.authenticators {
-            return Err(AuthorizationError::UserPresenceRequired);
-        }
+        self.authorize_authenticator_delta(signed, previous, at, budget)?;
         let device = DeviceId::from_key(&signed.issuer);
         let certificate = self.find_device(&device)?;
         require(
@@ -4987,6 +5008,8 @@ impl VerifiedPolicySet {
         expected.sequence = d.sequence;
         expected.devices = d.devices.clone();
         expected.revoked_devices = d.revoked_devices.clone();
+        expected.authenticators = d.authenticators.clone();
+        expected.authenticator_approval = d.authenticator_approval.clone();
         require(
             *d == expected,
             "account device changed root-controlled policy",

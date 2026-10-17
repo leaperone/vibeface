@@ -98,7 +98,7 @@ impl VerifiedPolicySet {
     pub fn authenticator(&self, hash: &ObjectHash) -> Option<&Signed<AuthenticatorRecord>> {
         self.authenticators.get(hash)
     }
-    fn validate_authenticator(
+    pub(super) fn validate_authenticator(
         &self,
         signed: &Signed<AuthenticatorRecord>,
         now_ms: u64,
@@ -121,10 +121,24 @@ impl VerifiedPolicySet {
         )?;
         validate_window(record.not_before_ms, record.expires_at_ms, now_ms)?;
         let root = self.historical_root(&record.issued_under)?;
-        require(
-            signed.issuer == root,
-            "authenticator enrollment requires root approval",
-        )?;
+        if signed.issuer != root {
+            let hash = signed.hash()?;
+            let registered = self
+                .account(&record.account)
+                .is_some_and(|a| a.authenticators.contains(&hash));
+            if !registered {
+                let expires = self.validate_authenticator_manager(
+                    &record.account,
+                    &signed.issuer,
+                    now_ms,
+                    &mut Budget::default(),
+                )?;
+                require(
+                    record.expires_at_ms <= expires,
+                    "authenticator exceeds manager authority expiry",
+                )?;
+            }
+        }
         signed.verify_signature()
     }
     pub fn install_authenticator(
