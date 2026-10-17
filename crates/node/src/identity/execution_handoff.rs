@@ -2775,6 +2775,73 @@ mod tests {
                 )
                 .is_err()
         );
+        let mut altered = fixture.wire.clone();
+        let mut event: Event =
+            serde_json::from_str(&altered.handoff.project_dispatch.canonical_body)?;
+        let EventCause::Invocation { admission } = &mut event.cause else {
+            unreachable!()
+        };
+        admission.source_body["conversation_id"] = json!("another-conversation");
+        let mut invocation = admission.invocation.payload.clone();
+        invocation.body_hash = ObjectHash::body(&admission.source_body)?;
+        invocation.nonce = Nonce::random()?;
+        admission.invocation = Signed::sign(invocation.clone(), &signer)?;
+        let facts = RequestFacts {
+            resource: invocation.resource,
+            action: invocation.action,
+            audience: invocation.audience,
+            operation_id: invocation.operation_id,
+            body_hash: invocation.body_hash,
+            context: invocation.context,
+        };
+        let auth = fixture.store.policy.verified().verify_invocation(
+            &admission.invocation,
+            &facts,
+            &admission.transport.clone().into_evidence(),
+            now(),
+        )?;
+        admission.challenge = FreshnessChallenge::new(
+            &auth,
+            CheckStage::Admit,
+            Nonce::random()?,
+            now(),
+            now() + 10_000,
+        )?;
+        admission.receipts = fixture.store.sign_current_receipts(
+            &admission.challenge,
+            &fixture.project.node,
+            now(),
+        )?;
+        admission
+            .receipts
+            .extend(fixture.store.sign_current_receipts(
+                &admission.challenge,
+                &fixture.executor.node,
+                now(),
+            )?);
+        fixture.store.policy.verified().verify_freshness(
+            &auth,
+            &admission.challenge,
+            &admission.receipts,
+            now(),
+        )?;
+        altered.handoff.project_dispatch = fixture.project.node.sign_event(event)?;
+        altered.handoff.attest_source(&signer)?;
+        resign_carrier(&mut altered)?;
+        let error = fixture
+            .store
+            .issue_execution_handoff_challenge(
+                &altered,
+                &fixture.transport,
+                CheckStage::Admit,
+                now(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("capsule operation scope changed")
+        );
         Ok(())
     }
 
