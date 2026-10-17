@@ -1,3 +1,5 @@
+mod dispatch;
+
 use crate::identity::policy::FreshnessProof;
 use crate::{
     config::{self, Config},
@@ -1353,6 +1355,7 @@ pub struct Runtime {
     pub tool_url: std::sync::OnceLock<String>,
     pub maintenance: Arc<Gate>,
     completion_lock: Mutex<()>,
+    execution_dispatch_polls: Mutex<BTreeSet<(String, String)>>,
     execution_leases: Mutex<BTreeSet<(String, String)>>,
     pub engine: Engine,
     _codex_process: Mutex<Option<tokio::process::Child>>,
@@ -1777,6 +1780,12 @@ impl Runtime {
         );
         id(&body, "authorization_id")?;
         authorization_action(&body)?;
+        if self.is_execution_metadata(&body)? {
+            return Ok(body);
+        }
+        if self.is_execution_dispatch(&body)? {
+            return self.normalize_execution_dispatch(body).await;
+        }
         if body["method"] == "message" {
             if body.get("scheduler_node").is_none() {
                 body["scheduler_node"] = json!(self.identity.node_id()?);
@@ -1949,11 +1958,43 @@ impl Runtime {
             .normalize_request_body(&prepared.resource().space, prepared.raw_body().clone())
             .await?;
         let now = now_ms() as u64;
-        let facts = self
-            .store
-            .lock()
-            .await
-            .request_facts(&body, prepared.audience())?;
+        let facts = {
+            let store = self.store.lock().await;
+            if self.is_execution_metadata(&body)? {
+                ensure!(
+                    prepared.execution_destination().is_none(),
+                    "metadata prepare cannot select executable C authority"
+                );
+                ensure!(
+                    matches!(original.actor, Actor::Account(_)),
+                    "Project execution metadata requires an account actor"
+                );
+                self.authorization_facts(&store, &body, prepared.audience(), now)?
+            } else if let Some(selected) = prepared.execution_destination() {
+                ensure!(
+                    self.is_execution_dispatch(&body)?,
+                    "remote prepare lost its destination"
+                );
+                let dispatch = store.execution_dispatch_facts(&body, prepared.audience(), now)?;
+                let current = dispatch.destination();
+                ensure!(
+                    current.resource() == selected.resource()
+                        && current.audience() == selected.audience()
+                        && current.public_key() == selected.public_key()
+                        && current.grant_leaf() == selected.grant_leaf()
+                        && current.heads() == selected.heads(),
+                    "normalization changed the independently verified execution destination"
+                );
+                selected.check_facts(dispatch.facts())?;
+                dispatch.facts().clone()
+            } else {
+                ensure!(
+                    !self.is_execution_dispatch(&body)?,
+                    "prepare has no verified execution destination"
+                );
+                store.request_facts(&body, prepared.audience())?
+            }
+        };
         ensure!(
             facts.resource == *prepared.resource()
                 && facts.action == prepared.action()
@@ -2049,6 +2090,11 @@ impl Runtime {
     ) -> Result<Access> {
         let space = SpaceId::parse(field(&body, "space_id")?)?;
         let audience = self.audience()?;
+        ensure!(
+            !self.is_execution_metadata(&body)?
+                || matches!(invocation.payload.actor, Actor::Account(_)),
+            "Project execution metadata requires an account actor"
+        );
         let authorization = {
             let store = self.store.lock().await;
             let raw = vibeface_secure::authorization::RequestFacts {
@@ -2071,8 +2117,8 @@ impl Runtime {
                 &transport,
                 now_ms() as u64,
             )?;
-            let facts = store
-                .request_facts(&body, &audience)
+            let facts = self
+                .authorization_facts(&store, &body, &audience, now_ms() as u64)
                 .map_err(|_| anyhow::anyhow!("request facts do not match authorization"))?;
             store.authorize_request(&invocation, &facts, &transport, now_ms() as u64)?
         };
@@ -2221,6 +2267,7 @@ impl Runtime {
             tool_url: std::sync::OnceLock::new(),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             completion_lock: Mutex::new(()),
+            execution_dispatch_polls: Mutex::new(BTreeSet::new()),
             execution_leases: Mutex::new(BTreeSet::new()),
             engine,
             _codex_process: Mutex::new(None),
@@ -2733,10 +2780,15 @@ impl Runtime {
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         access.require_body(&input)?;
+        ensure!(
+            !self.is_execution_metadata(&input)? || access.account_actor(),
+            "Project execution metadata requires an account actor"
+        );
         let network = &access.network_id;
         {
             let store = self.store.lock().await;
-            let facts = store.request_facts(&input, &self.audience()?)?;
+            let facts =
+                self.authorization_facts(&store, &input, &self.audience()?, now_ms() as u64)?;
             store.authorize_request(
                 access.authorization.signed_invocation(),
                 &facts,
@@ -3146,14 +3198,32 @@ impl Runtime {
                 Ok(json!({"events":appended}))
             }
             "bind_execution" => {
-                let binding = self.store.lock().await.bind_task_authorized(
-                    &self.identity,
-                    &access.authorization,
-                    &access.freshness,
-                    &access.transport,
-                    &access.body,
-                    now_ms() as u64,
-                )?;
+                let mut store = self.store.lock().await;
+                let binding = if self.is_execution_dispatch(&input)? {
+                    let dispatch = store.execution_dispatch_facts(
+                        &input,
+                        access.authorization.audience(),
+                        now_ms() as u64,
+                    )?;
+                    store.bind_execution_dispatch(
+                        &self.identity,
+                        &dispatch,
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        &access.body,
+                        now_ms() as u64,
+                    )?
+                } else {
+                    store.bind_task_authorized(
+                        &self.identity,
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        &access.body,
+                        now_ms() as u64,
+                    )?
+                };
                 Ok(json!({"binding":binding}))
             }
             "seal_execution" => {
@@ -3176,6 +3246,11 @@ impl Runtime {
             }
             "session" => {
                 let target = field(&input, "target_node")?;
+                if target != self.identity.node_id()? {
+                    return self
+                        .remote_session_status(&access, target, field(&input, "session_id")?)
+                        .await;
+                }
                 ensure!(
                     target == self.identity.node_id()?,
                     "query the target service directly"
@@ -3191,6 +3266,11 @@ impl Runtime {
             }
             "operation" => {
                 let target = field(&input, "target_node")?;
+                if target != self.identity.node_id()? {
+                    return self
+                        .remote_operation_status(&access, target, field(&input, "operation_id")?)
+                        .await;
+                }
                 ensure!(
                     target == self.identity.node_id()?,
                     "query the target service directly"
@@ -3275,15 +3355,21 @@ impl Runtime {
                     &access.transport,
                     now_ms() as u64,
                 )?;
-                self.reconcile(
-                    network,
-                    field(&input, "target_node")?,
-                    field(&input, "operation_id")?,
-                )
-                .await
+                let target = field(&input, "target_node")?;
+                if target != self.identity.node_id()? {
+                    self.remote_operation_status(&access, target, field(&input, "operation_id")?)
+                        .await
+                } else {
+                    self.reconcile(network, target, field(&input, "operation_id")?)
+                        .await
+                }
             }
             "resolve_unknown" => {
                 ensure!(access.account_actor(), "resolution requires the user");
+                ensure!(
+                    field(&input, "target_node")? == self.identity.node_id()?,
+                    "resolve remote execution at its target and reconcile its signed receipt"
+                );
                 self.resolve_unknown(&access, &input).await
             }
             _ => bail!("unknown method"),
@@ -3618,23 +3704,18 @@ impl Runtime {
             serde_json::to_value(&request)? == access.body["request"],
             "execution request differs from signed body"
         );
+        if self.is_execution_dispatch(&access.body)? {
+            return self.dispatch_execution(&access, request).await;
+        }
+        ensure!(
+            request.target_node == self.identity.node_id()?,
+            "ordinary execution must target its authorized audience"
+        );
         self.store
             .lock()
             .await
             .validate_operation_binding(&request)?;
-        if request.target_node == self.identity.node_id()? {
-            self.admit_operation(request, &access).await
-        } else {
-            self.peer_request(
-                &access.network_id,
-                &request.target_node,
-                json!({
-                    "type":"execute","authorization_body":access.body,
-                    "invocation":access.authorization.signed_invocation(),
-                }),
-            )
-            .await
-        }
+        self.admit_operation(request, &access).await
     }
     async fn admit_operation(
         self: &Arc<Self>,
