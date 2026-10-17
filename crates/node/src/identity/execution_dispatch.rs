@@ -75,7 +75,10 @@ pub(crate) fn validate_remote_resource_path(value: &str) -> Result<&str> {
     Ok(value)
 }
 
-pub(super) fn check_destination_heads_in(connection: &Connection, heads: &[PolicyStamp]) -> Result<()> {
+pub(super) fn check_destination_heads_in(
+    connection: &Connection,
+    heads: &[PolicyStamp],
+) -> Result<()> {
     for stamp in heads {
         let (kind, id) = match &stamp.domain {
             PolicyDomain::Account(id) => ("account", id.as_str()),
@@ -106,7 +109,10 @@ pub(super) fn dispatch_facts_from(
     now_ms: u64,
 ) -> Result<VerifiedDispatchFacts> {
     ensure!(
-        matches!(body["method"].as_str(), Some("operate" | "bind_execution" | "resolve_unknown")),
+        matches!(
+            body["method"].as_str(),
+            Some("operate" | "bind_execution" | "resolve_unknown")
+        ),
         "remote dispatch method is not supported"
     );
     let project = ResourceRef {
@@ -140,6 +146,153 @@ pub(super) fn dispatch_facts_from(
 }
 
 impl Store {
+    pub fn execution_dispatch_targets(
+        &self,
+        session: &crate::model::AgentSession,
+        task_id: &str,
+        executor: &str,
+        action: Action,
+        now_ms: u64,
+    ) -> Result<Vec<Value>> {
+        use vibeface_secure::authorization::{Actor, EventRef, InvocationContext};
+        ensure!(
+            matches!(
+                action,
+                Action::ExecutionOpen
+                    | Action::ExecutionSend
+                    | Action::ExecutionSteer
+                    | Action::ExecutionInterrupt
+                    | Action::ExecutionRespondApproval
+            ),
+            "target discovery requires a concrete execution action"
+        );
+        let stored = self
+            .local_value(
+                session.space_id.as_str(),
+                &format!("agent-session:{}", session.sdk_session.session_id),
+            )?
+            .context("target discovery has no persisted SDK session")?;
+        ensure!(
+            stored == serde_json::to_value(session)?
+                && now_ms < session.expires_at_ms
+                && session.sdk_session.target == session.device,
+            "target discovery changed its current SDK delegation"
+        );
+        let origin = self.agent_origin(session, now_ms)?;
+        let creation =
+            self.task_creation(session.space_id.as_str(), &session.conversation_id, task_id)?;
+        let event = self.verify_event(session.space_id.as_str(), &creation)?;
+        ensure!(
+            event.resource_id == session.resource_id,
+            "target discovery refers to another Project task"
+        );
+        let task_ref = EventRef::parse(&creation.hash)?;
+        if let Some((current_task, current_ref)) = &origin.task {
+            ensure!(
+                current_task == task_id && current_ref == &task_ref,
+                "continuation target discovery escaped its own task"
+            );
+        } else {
+            let crate::model::EventCause::Invocation { admission } = &event.cause else {
+                anyhow::bail!("SDK task has no admitted creation");
+            };
+            ensure!(
+                admission.invocation.payload.actor == Actor::Service(session.service.clone())
+                    && admission.invocation.payload.context.sdk_session.as_ref()
+                        == Some(&session.sdk_session)
+                    && admission.source_body["parent_invocation"].as_str()
+                        == Some(session.parent_invocation.as_str()),
+                "initial SDK discovery can select only its own created task"
+            );
+        }
+        let binding = self.task_binding(session.space_id.as_str(), &creation.hash)?;
+        if let Some(binding) = &binding {
+            self.verify_historical_binding(binding)?;
+            ensure!(
+                binding.binding.open_spec["executor"] == executor,
+                "target discovery changed the confirmed executor"
+            );
+        }
+        let project = ResourceRef {
+            space: session.space_id.clone(),
+            resource: session.resource_id.clone(),
+        };
+        let audience = Audience {
+            service: session.service.clone(),
+            device: session.device.clone(),
+        };
+        let mut targets = Vec::new();
+        for pin in self.policy.pins() {
+            let PolicyDomain::Space(space) = &pin.domain else {
+                continue;
+            };
+            let Some(document) = self.policy.verified().space(space) else {
+                continue;
+            };
+            for grant in &document.grants {
+                let Some(leaf) = self.policy.verified().grant(grant) else {
+                    continue;
+                };
+                let vibeface_secure::authorization::ResourceScope::Exact(resource) =
+                    &leaf.payload.scope
+                else {
+                    continue;
+                };
+                let constraints = &leaf.payload.constraints.context;
+                let Some(selected_session) = &constraints.execution_session else {
+                    continue;
+                };
+                if constraints.task.as_ref() != Some(&task_ref)
+                    || constraints.conversation.as_deref() != Some(session.conversation_id.as_str())
+                    || constraints.executor_kind.as_deref() != Some(executor)
+                {
+                    continue;
+                }
+                let Ok(certificate) = self.policy.verified().verify_service_device(
+                    space,
+                    &selected_session.target,
+                    now_ms,
+                ) else {
+                    continue;
+                };
+                let context = InvocationContext {
+                    conversation: Some(session.conversation_id.clone()),
+                    task: Some(task_ref.clone()),
+                    sdk_session: None,
+                    execution_session: Some(selected_session.clone()),
+                    executor_kind: Some(executor.into()),
+                    workspace_resource: Some(project.resource.clone()),
+                };
+                let Ok(destination) = self.policy.verified().verify_execution_destination(
+                    &project,
+                    &audience,
+                    resource,
+                    &certificate.payload.public_key,
+                    grant,
+                    &context,
+                    action,
+                    now_ms,
+                ) else {
+                    continue;
+                };
+                let target = crate::crypto::fingerprint(destination.public_key().as_str())?;
+                if binding.as_ref().is_some_and(|binding| {
+                    binding.binding.target_node != target
+                        || binding.binding.session_id != selected_session.session_id
+                }) {
+                    continue;
+                }
+                targets.push(json!({"execution_resource":resource,"target_public_key":destination.public_key(),
+                    "execution_grant":grant,"target_node":target,"session_id":selected_session.session_id,
+                    "executor":executor,"task_id":task_id,"task_ref":task_ref,
+                    "cwd":binding.as_ref().and_then(|binding|binding.binding.open_spec["cwd"].as_str())}));
+            }
+        }
+        targets.sort_by_key(|value| value.to_string());
+        targets.dedup();
+        Ok(targets)
+    }
+
     pub fn execution_dispatch_metadata_facts(
         &self,
         body: &Value,
