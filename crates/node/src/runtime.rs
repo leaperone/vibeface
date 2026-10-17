@@ -904,6 +904,26 @@ mod tests {
                 .is_err()
         );
         drop(public);
+        let extra_dir = fixture()?;
+        let mut cfg = Config::load(&extra_dir)?;
+        cfg.allowed_origins = vec!["https://node.example".into()];
+        cfg.save(&extra_dir)?;
+        let extra = Runtime::open(&extra_dir).await?;
+        let account = extra.register("remote", "a-valid-remote-password").await?;
+        assert!(
+            extra
+                .store
+                .lock()
+                .await
+                .authorize_node(
+                    &account.network_id,
+                    &extra.identity.node_id()?,
+                    Some(NodeRole::Executor),
+                )
+                .is_err()
+        );
+        drop(extra);
+        std::fs::remove_dir_all(extra_dir)?;
         std::fs::remove_dir_all(dir)?;
         std::fs::remove_dir_all(public_dir)?;
         Ok(())
