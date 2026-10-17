@@ -930,3 +930,601 @@ impl VerifiedPolicySet {
         )
     }
 }
+
+pub fn verify_execution_session_snapshot<'a>(
+    receipt: &'a Signed<ExecutionHandoffReceipt>,
+    project: &ResourceRef,
+    execution: &ResourceRef,
+    target_key: &PublicKey,
+    binding: &SignedBinding,
+    project_key: &PublicKey,
+    now_ms: u64,
+) -> Result<&'a ExecutionSessionSnapshot> {
+    receipt.verify_signature()?;
+    verify_binding(binding, project_key.as_str()).map_err(invalid_shape)?;
+    let value = &receipt.payload;
+    let session = value
+        .session
+        .as_ref()
+        .ok_or(AuthorizationError::InvalidProof(
+            "executor receipt has no session snapshot",
+        ))?;
+    require(
+        receipt.issuer == *target_key
+            && value.version == AUTH_VERSION
+            && value.original_space_id == project.space
+            && value.execution_space_id == execution.space
+            && value.target == DeviceId::from_key(target_key)
+            && value.session_id == binding.binding.session_id
+            && value.binding_generation == binding.binding.generation
+            && session.original_project == *project
+            && session.execution_resource == *execution
+            && binding.binding.network_id == project.space.as_str()
+            && binding.binding.authority_node == DeviceId::from_key(project_key).as_str()
+            && session.task.as_str() == binding.binding.task_ref
+            && session.binding_hash == binding_hash(&binding.binding).map_err(invalid_shape)?
+            && session.binding_generation == binding.binding.generation
+            && session.target == value.target
+            && session.target.as_str() == binding.binding.target_node
+            && session.session_id == binding.binding.session_id
+            && binding.binding.open_spec["executor"].as_str() == Some(session.executor.as_str())
+            && binding.binding.open_spec["cwd"].as_str() == Some(session.cwd.as_str())
+            && !session.state.is_empty()
+            && session.state.len() <= 128
+            && value.issued_at_ms <= now_ms
+            && now_ms < session.expires_at_ms
+            && session.expires_at_ms - value.issued_at_ms <= EXECUTION_LEASE_MS,
+        "executor session snapshot differs from the pinned scope, key, binding or clock",
+    )?;
+    Ok(session)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionHandoffResolution {
+    pub version: u16,
+    pub unknown: ExecutionHandoffResult,
+    pub account_admission: AdmissionProof,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SignedExecutionHandoffResolution {
+    pub resolution: ExecutionHandoffResolution,
+    pub invocation: Signed<Invocation>,
+}
+
+impl SignedExecutionHandoffResolution {
+    pub fn hash(&self) -> Result<ObjectHash> {
+        require(
+            canonical(self)?.len() <= MAX_EXECUTION_HANDOFF_BYTES,
+            "execution resolution is too large",
+        )?;
+        ObjectHash::body(self)
+    }
+}
+
+pub fn execution_resolution_account_facts(
+    value: &ExecutionHandoffResolution,
+) -> Result<RequestFacts> {
+    require(
+        value.version == AUTH_VERSION,
+        "invalid execution resolution version",
+    )?;
+    let unknown = &value.unknown;
+    verify_execution_handoff_receipt_signature(
+        &unknown.handoff,
+        &unknown.receipt,
+        &unknown.result,
+    )?;
+    let (event, original, request, binding) = original_dispatch(&unknown.handoff.handoff)?;
+    let proof = &value.account_admission;
+    let body = &proof.source_body;
+    let fields = body.as_object().ok_or(AuthorizationError::InvalidProof(
+        "invalid resolution source",
+    ))?;
+    require(
+        fields.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "method"
+                    | "space_id"
+                    | "resource_id"
+                    | "authorization_id"
+                    | "operation_id"
+                    | "conversation_id"
+                    | "task_id"
+                    | "task_ref"
+                    | "target_node"
+                    | "session_id"
+                    | "outcome"
+                    | "evidence"
+                    | "execution_resource"
+                    | "target_public_key"
+                    | "execution_grant"
+                    | "original_handoff_hash"
+                    | "original_body_hash"
+                    | "unknown_receipt_hash"
+            )
+        }),
+        "resolution cannot disclose unrelated fields",
+    )?;
+    let outcome = body["outcome"].as_str().unwrap_or_default();
+    let evidence = body["evidence"].as_str().unwrap_or_default();
+    require(
+        unknown.receipt.payload.state == ExecutionHandoffState::Unknown
+            && unknown.receipt.payload.issued_at_ms <= proof.admitted_at_ms
+            && matches!(proof.invocation.payload.actor, Actor::Account(_))
+            && proof.invocation.payload.context.sdk_session.is_none()
+            && body["method"] == "resolve_unknown"
+            && body["space_id"].as_str() == Some(event.network_id.as_str())
+            && body["resource_id"].as_str() == Some(event.resource_id.as_str())
+            && body["authorization_id"].as_str()
+                == Some(proof.invocation.payload.operation_id.as_str())
+            && proof.invocation.payload.operation_id != original.invocation.payload.operation_id
+            && body["operation_id"].as_str()
+                == Some(original.invocation.payload.operation_id.as_str())
+            && body["conversation_id"].as_str() == Some(event.scope_id.as_str())
+            && body["task_id"] == request["task_id"]
+            && body["task_ref"].as_str() == Some(binding.binding.task_ref.as_str())
+            && body["target_node"].as_str() == Some(binding.binding.target_node.as_str())
+            && body["session_id"].as_str() == Some(binding.binding.session_id.as_str())
+            && body["execution_resource"]
+                == serde_json::to_value(&unknown.handoff.handoff.execution_resource)
+                    .map_err(invalid_shape)?
+            && body["target_public_key"]
+                == serde_json::to_value(&unknown.handoff.handoff.target_public_key)
+                    .map_err(invalid_shape)?
+            && body["original_handoff_hash"].as_str() == Some(unknown.handoff.hash()?.as_str())
+            && body["original_body_hash"].as_str()
+                == Some(original.invocation.payload.body_hash.as_str())
+            && body["unknown_receipt_hash"].as_str() == Some(unknown.receipt.hash()?.as_str())
+            && matches!(outcome, "succeeded" | "failed" | "rejected")
+            && evidence.trim().len() >= 12
+            && evidence.len() <= 65_536,
+        "resolution differs from the accepted operation, unknown receipt or Account intent",
+    )?;
+    ObjectHash::parse(body["execution_grant"].as_str().unwrap_or_default())?;
+    let context = InvocationContext {
+        conversation: Some(event.scope_id),
+        task: Some(EventRef::parse(&binding.binding.task_ref)?),
+        sdk_session: None,
+        execution_session: Some(SessionRef {
+            target: unknown.handoff.handoff.execution_audience.device.clone(),
+            session_id: binding.binding.session_id,
+        }),
+        executor_kind: binding.binding.open_spec["executor"]
+            .as_str()
+            .map(str::to_owned),
+        workspace_resource: Some(event.resource_id.clone()),
+    };
+    Ok(RequestFacts {
+        resource: ResourceRef {
+            space: SpaceId::parse(&event.network_id)?,
+            resource: event.resource_id,
+        },
+        action: Action::OperationResolve,
+        audience: proof.invocation.payload.audience.clone(),
+        operation_id: proof.invocation.payload.operation_id.clone(),
+        body_hash: ObjectHash::body(body)?,
+        context,
+    })
+}
+
+pub fn execution_resolution_facts(
+    value: &ExecutionHandoffResolution,
+    resolver: &VerifiedAuthorization,
+) -> Result<RequestFacts> {
+    let account = execution_resolution_account_facts(value)?;
+    require(
+        resolver.signed_invocation() == &value.account_admission.invocation
+            && resolver.resource() == &account.resource
+            && resolver.action() == Action::OperationResolve
+            && resolver.body_hash() == &account.body_hash
+            && resolver.signed_invocation().payload.context == account.context,
+        "execution resolution has another Account authorization",
+    )?;
+    Ok(RequestFacts {
+        resource: value.unknown.handoff.handoff.execution_resource.clone(),
+        action: Action::ExecutionResolve,
+        audience: value.unknown.handoff.handoff.execution_audience.clone(),
+        operation_id: account.operation_id,
+        body_hash: ObjectHash::body(value)?,
+        context: account.context,
+    })
+}
+
+pub fn execution_resolution_result(value: &ExecutionHandoffResolution) -> Result<Value> {
+    execution_resolution_account_facts(value)?;
+    let (_, original, _, _) = original_dispatch(&value.unknown.handoff.handoff)?;
+    Ok(serde_json::json!({
+        "resolver": value.account_admission.invocation.payload.actor,
+        "invocation_hash": value.account_admission.invocation.hash()?,
+        "evidence": value.account_admission.source_body["evidence"],
+        "resolution_id": value.account_admission.invocation.payload.operation_id,
+        "original_actor": original.invocation.payload.actor,
+        "original_invocation_hash": original.invocation.hash()?,
+        "unknown_receipt_hash": value.unknown.receipt.hash()?,
+    }))
+}
+
+#[derive(Clone, Debug)]
+pub struct VerifiedExecutionResolution {
+    wire: SignedExecutionHandoffResolution,
+    hash: ObjectHash,
+    resolver: VerifiedAuthorization,
+    submission: VerifiedAuthorization,
+    dependencies: Vec<PolicyStamp>,
+    verified_at_ms: u64,
+}
+impl VerifiedExecutionResolution {
+    pub fn wire(&self) -> &SignedExecutionHandoffResolution {
+        &self.wire
+    }
+    pub fn hash(&self) -> &ObjectHash {
+        &self.hash
+    }
+    pub fn resolver(&self) -> &VerifiedAuthorization {
+        &self.resolver
+    }
+    pub fn submission(&self) -> &VerifiedAuthorization {
+        &self.submission
+    }
+    pub fn dependencies(&self) -> &[PolicyStamp] {
+        &self.dependencies
+    }
+    pub fn expires_at_ms(&self) -> u64 {
+        self.resolver
+            .expires_at_ms()
+            .min(self.submission.expires_at_ms())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct VerifiedExecutionResolutionAdmission {
+    resolution_hash: ObjectHash,
+    submission: VerifiedAdmission,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionHandoffResolutionChallenge {
+    pub version: u16,
+    pub resolution_hash: ObjectHash,
+    pub resolver_invocation_hash: ObjectHash,
+    pub submission_invocation_hash: ObjectHash,
+    pub policies: Vec<PolicyStamp>,
+    pub nonce: Nonce,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+impl sealed::Sealed for ExecutionHandoffResolutionChallenge {}
+impl SignedObject for ExecutionHandoffResolutionChallenge {
+    const DOMAIN: &'static str = "execution-handoff-resolution-challenge-v2";
+}
+impl ExecutionHandoffResolutionChallenge {
+    pub fn new(
+        value: &VerifiedExecutionResolution,
+        nonce: Nonce,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<Self> {
+        require(
+            issued_at_ms >= value.verified_at_ms,
+            "resolution challenge clock moved backwards",
+        )?;
+        Self::bound_to(value, nonce, issued_at_ms, expires_at_ms)
+    }
+
+    fn bound_to(
+        value: &VerifiedExecutionResolution,
+        nonce: Nonce,
+        issued_at_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<Self> {
+        validate_window(issued_at_ms, expires_at_ms, issued_at_ms)?;
+        require(
+            expires_at_ms - issued_at_ms <= EXECUTION_LEASE_MS,
+            "resolution challenge is too long",
+        )?;
+        Ok(Self {
+            version: AUTH_VERSION,
+            resolution_hash: value.hash.clone(),
+            resolver_invocation_hash: value.resolver.invocation_hash().clone(),
+            submission_invocation_hash: value.submission.invocation_hash().clone(),
+            policies: value.dependencies.clone(),
+            nonce,
+            issued_at_ms,
+            expires_at_ms,
+        })
+    }
+    pub fn hash(&self) -> Result<ObjectHash> {
+        Ok(ObjectHash(format!(
+            "h2_{}",
+            digest(Self::DOMAIN, &canonical(self)?)
+        )))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionHandoffResolutionFreshness {
+    pub challenge: ExecutionHandoffResolutionChallenge,
+    pub receipts: Vec<Signed<FreshnessReceipt>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionHandoffResolutionReceipt {
+    pub version: u16,
+    pub resolution_hash: ObjectHash,
+    pub handoff_receipt_hash: ObjectHash,
+    pub issued_at_ms: u64,
+}
+impl sealed::Sealed for ExecutionHandoffResolutionReceipt {}
+impl SignedObject for ExecutionHandoffResolutionReceipt {
+    const DOMAIN: &'static str = "execution-handoff-resolution-receipt-v2";
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionHandoffResolutionResult {
+    pub resolution: SignedExecutionHandoffResolution,
+    pub handoff_receipt: Signed<ExecutionHandoffReceipt>,
+    pub result: Value,
+    pub receipt: Signed<ExecutionHandoffResolutionReceipt>,
+}
+
+pub fn verify_execution_resolution_receipt_signature(
+    value: &ExecutionHandoffResolutionResult,
+) -> Result<()> {
+    value.receipt.verify_signature()?;
+    let resolution = &value.resolution;
+    verify_execution_handoff_receipt_signature(
+        &resolution.resolution.unknown.handoff,
+        &value.handoff_receipt,
+        &value.result,
+    )?;
+    require(
+        value.receipt.issuer
+            == resolution
+                .resolution
+                .unknown
+                .handoff
+                .handoff
+                .target_public_key
+            && value.receipt.payload.version == AUTH_VERSION
+            && value.receipt.payload.resolution_hash == resolution.hash()?
+            && value.receipt.payload.handoff_receipt_hash == value.handoff_receipt.hash()?
+            && value.receipt.payload.issued_at_ms == value.handoff_receipt.payload.issued_at_ms
+            && value.receipt.payload.issued_at_ms
+                >= resolution.resolution.account_admission.admitted_at_ms
+            && serde_json::to_value(value.handoff_receipt.payload.state).map_err(invalid_shape)?
+                == resolution.resolution.account_admission.source_body["outcome"]
+            && value.result == execution_resolution_result(&resolution.resolution)?,
+        "execution resolution receipt differs from the explicit Account decision",
+    )
+}
+
+impl VerifiedPolicySet {
+    pub fn verify_execution_resolution(
+        &self,
+        wire: &SignedExecutionHandoffResolution,
+        resolver: &VerifiedAuthorization,
+        transport: &TransportEvidence,
+        admitted: Option<&VerifiedExecutionResolutionAdmission>,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionResolution> {
+        self.check_current(resolver, now_ms)?;
+        let hash = wire.hash()?;
+        let facts = execution_resolution_facts(&wire.resolution, resolver)?;
+        require(
+            wire.resolution.account_admission.admitted_at_ms <= now_ms,
+            "Account resolution admission is from the future",
+        )?;
+        let project = self
+            .resource(&resolver.resource().space, &resolver.resource().resource)
+            .ok_or(AuthorizationError::InvalidProof(
+                "missing resolution Project",
+            ))?;
+        let execution = self
+            .resource(&facts.resource.space, &facts.resource.resource)
+            .ok_or(AuthorizationError::InvalidProof(
+                "missing resolution ExecutionService",
+            ))?;
+        let project_device = self.find_device(&resolver.audience().device)?;
+        let target = self.find_device(&facts.audience.device)?;
+        require(
+            project.payload.kind == ResourceKind::Project
+                && project.payload.host == resolver.audience().service
+                && execution.payload.kind == ResourceKind::ExecutionService
+                && execution.payload.host == facts.audience.service
+                && project.payload.host != execution.payload.host
+                && wire.invocation.payload.actor == Actor::Service(project.payload.host.clone())
+                && wire.invocation.payload.device == resolver.audience().device
+                && wire.invocation.payload.presenter == resolver.audience().device
+                && wire.invocation.issuer == project_device.payload.public_key
+                && project_device
+                    .payload
+                    .uses
+                    .contains(&DeviceUse::ServiceInvocation)
+                && target.payload.public_key
+                    == wire.resolution.unknown.handoff.handoff.target_public_key
+                && target.payload.subject == Actor::Service(facts.audience.service.clone())
+                && matches!(transport, TransportEvidence::VerifiedPeer{origin} if origin == &resolver.audience().device),
+            "resolution requires the current Project host and actual peer origin",
+        )?;
+        let submission = if let Some(admitted) = admitted {
+            require(
+                admitted.resolution_hash == hash
+                    && admitted.submission.signed_invocation() == &wire.invocation,
+                "resolution admission belongs to another request",
+            )?;
+            self.verify_operation_authorization(&admitted.submission, &facts, transport, now_ms)?
+        } else {
+            self.verify_invocation(&wire.invocation, &facts, transport, now_ms)?
+        };
+        let leaf = &self
+            .grants
+            .get(&wire.invocation.payload.grant_leaf)
+            .ok_or(AuthorizationError::InvalidProof(
+                "missing explicit executor resolution grant",
+            ))?
+            .payload;
+        require(
+            wire.resolution.account_admission.source_body["execution_grant"].as_str()
+                == Some(wire.invocation.payload.grant_leaf.as_str())
+                && leaf.scope == ResourceScope::Exact(facts.resource.clone())
+                && leaf.grantee == Grantee::Actor(wire.invocation.payload.actor.clone())
+                && leaf.remaining_delegations == 0
+                && leaf.actions.len() == 2
+                && leaf.actions.contains(&Action::ExecutionResolve)
+                && leaf.actions.contains(&Action::OperationResolve)
+                && leaf.not_before_ms < leaf.expires_at_ms
+                && leaf.expires_at_ms < u64::MAX
+                && leaf.constraints.context == facts.context,
+            "executor resolution grant must bind only explicit resolution and this task/session",
+        )?;
+        let mut dependencies = BTreeMap::new();
+        for stamp in resolver
+            .dependencies()
+            .iter()
+            .chain(submission.dependencies())
+        {
+            require(
+                dependencies
+                    .get(&stamp.domain)
+                    .is_none_or(|prior| prior == stamp),
+                "resolution combines inconsistent policy heads",
+            )?;
+            dependencies.insert(stamp.domain.clone(), stamp.clone());
+        }
+        require(
+            dependencies.len() <= MAX_POLICY_DOMAINS,
+            "resolution has too many policy domains",
+        )?;
+        Ok(VerifiedExecutionResolution {
+            wire: wire.clone(),
+            hash,
+            resolver: resolver.clone(),
+            submission,
+            dependencies: dependencies.into_values().collect(),
+            verified_at_ms: now_ms,
+        })
+    }
+
+    pub fn verify_execution_resolution_freshness(
+        &self,
+        value: &VerifiedExecutionResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+        now_ms: u64,
+    ) -> Result<u64> {
+        self.check_current(&value.resolver, now_ms)?;
+        self.check_current(&value.submission, now_ms)?;
+        let challenge = &proof.challenge;
+        require(
+            *challenge
+                == ExecutionHandoffResolutionChallenge::bound_to(
+                    value,
+                    challenge.nonce.clone(),
+                    challenge.issued_at_ms,
+                    challenge.expires_at_ms,
+                )?,
+            "execution resolution challenge mismatch",
+        )?;
+        validate_window(challenge.issued_at_ms, challenge.expires_at_ms, now_ms)?;
+        require(
+            proof.receipts.len() == value.dependencies.len(),
+            "resolution requires both current authority closures",
+        )?;
+        let hash = challenge.hash()?;
+        let mut seen = BTreeSet::new();
+        let mut budget = Budget::default();
+        let mut expiry = challenge.expires_at_ms.min(value.expires_at_ms());
+        for signed in &proof.receipts {
+            budget.verify(signed)?;
+            let receipt = &signed.payload;
+            require(
+                receipt.version == AUTH_VERSION
+                    && receipt.challenge_hash == hash
+                    && value.dependencies.contains(&receipt.current)
+                    && seen.insert(receipt.current.domain.clone()),
+                "resolution freshness receipt mismatch",
+            )?;
+            let authority = match &receipt.current.domain {
+                PolicyDomain::Account(id) => self.account(id).map(|d| &d.authority),
+                PolicyDomain::Space(id) => self.space(id).map(|d| &d.authority),
+            }
+            .ok_or(AuthorizationError::InvalidProof(
+                "missing resolution authority",
+            ))?;
+            if self
+                .devices
+                .values()
+                .any(|cert| cert.payload.device == authority.device)
+            {
+                self.find_device(&authority.device)?;
+            }
+            require(
+                signed.issuer == authority.public_key
+                    && receipt.issued_at_ms >= challenge.issued_at_ms
+                    && receipt.expires_at_ms <= challenge.expires_at_ms,
+                "resolution receipt is not from its current authority",
+            )?;
+            validate_window(receipt.issued_at_ms, receipt.expires_at_ms, now_ms)?;
+            expiry = expiry.min(receipt.expires_at_ms);
+        }
+        Ok(expiry)
+    }
+
+    pub fn admit_execution_resolution(
+        &self,
+        value: &VerifiedExecutionResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionResolutionAdmission> {
+        self.verify_execution_resolution_freshness(value, proof, now_ms)?;
+        require(
+            value.submission.phase == AuthorizationPhase::Admission,
+            "resolution was already admitted",
+        )?;
+        Ok(VerifiedExecutionResolutionAdmission {
+            resolution_hash: value.hash.clone(),
+            submission: VerifiedAdmission {
+                invocation: value.wire.invocation.clone(),
+                admitted_at_ms: now_ms,
+            },
+        })
+    }
+
+    pub fn verify_execution_resolution_ack(
+        &self,
+        result: &ExecutionHandoffResolutionResult,
+        resolver: &VerifiedAuthorization,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionResolution> {
+        verify_execution_resolution_receipt_signature(result)?;
+        require(
+            result.receipt.payload.issued_at_ms <= now_ms
+                && result.receipt.payload.issued_at_ms
+                    >= result.resolution.invocation.payload.not_before_ms,
+            "resolution acknowledgement has an invalid clock",
+        )?;
+        let admission = VerifiedExecutionResolutionAdmission {
+            resolution_hash: result.resolution.hash()?,
+            submission: VerifiedAdmission {
+                invocation: result.resolution.invocation.clone(),
+                admitted_at_ms: result.receipt.payload.issued_at_ms,
+            },
+        };
+        self.verify_execution_resolution(
+            &result.resolution,
+            resolver,
+            &TransportEvidence::VerifiedPeer {
+                origin: result.resolution.invocation.payload.presenter.clone(),
+            },
+            Some(&admission),
+            now_ms,
+        )
+    }
+}
