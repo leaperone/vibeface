@@ -1,6 +1,8 @@
 "use client"
 
 import { useState } from "react"
+import { ChevronDownIcon, PlusIcon } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -10,7 +12,7 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Textarea } from "@/components/ui/textarea"
 import { useWorkspace } from "./context"
 import { stateNames } from "./labels"
-import { DetailList, EmptyState, StatusBadge, SubmitButton } from "./present"
+import { DetailList, StatusBadge, SubmitButton } from "./present"
 import { newId } from "./storage"
 import type { TaskRecord } from "./types"
 
@@ -25,62 +27,70 @@ export function TasksScreen() {
   const tasks = workspace.data?.tasks ?? []
 
   return (
-    <section aria-label="工单" hidden={workspace.view !== "tasks"}>
-      <div>
-        <h2>把目标写清楚</h2>
-        <p>执行器结束一轮，工单仍需按验收条件确认。</p>
-      </div>
-      {tasks.length ? tasks.map((task) => (
-        <TaskCard key={task.task_id} task={task} conversationId={workspace.conversationId} />
-      )) : <EmptyState title="还没有工单" detail="写下目标和验收条件，再与调度 Agent 讨论。" />}
-      <Collapsible open={open} onOpenChange={setOpen}>
-        <CollapsibleTrigger>新建工单</CollapsibleTrigger>
-        <CollapsibleContent>
-          <form key={pending?.task_id ?? workspace.conversationId}
-            onSubmit={(event) => {
-              event.preventDefault()
-              const form = event.currentTarget
-              if (!form.reportValidity()) return
-              setBusy(true)
-              void workspace.run(async () => {
-                await workspace.createTask({
-                  taskId: newId(),
-                  title: String(new FormData(form).get("title") ?? "").trim(),
-                  goal: String(new FormData(form).get("goal") ?? "").trim(),
-                  acceptance: String(new FormData(form).get("acceptance") ?? "").trim(),
-                  autoFollowup: pending?.auto_followup ?? autoFollowup,
-                })
-                form.reset()
-                setAutoFollowup(false)
-                setOpen(false)
-              }).finally(() => setBusy(false))
-            }}
-          >
-            <FieldGroup>
-              <Field>
-                <FieldLabel htmlFor="task-title">标题</FieldLabel>
-                <Input defaultValue={pending?.title ?? ""} readOnly={Boolean(pending)} id="task-title" name="title" required maxLength={200} />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="task-goal">目标</FieldLabel>
-                <Textarea defaultValue={pending?.goal ?? ""} readOnly={Boolean(pending)} id="task-goal" name="goal" rows={3} required maxLength={50000} />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="task-acceptance">验收条件</FieldLabel>
-                <Textarea defaultValue={pending?.acceptance ?? ""} readOnly={Boolean(pending)} id="task-acceptance" name="acceptance" rows={3} required maxLength={50000} />
-              </Field>
-              <Field>
-                <div className="flex items-center gap-2">
-                  <Checkbox id="task-followup" disabled={Boolean(pending) || !workspace.canAutoFollowup} checked={pending?.auto_followup ?? autoFollowup} onCheckedChange={(checked: boolean | "indeterminate") => setAutoFollowup(checked === true)} />
-                  <FieldLabel htmlFor="task-followup">完成执行后，让调度 Agent 继续检查</FieldLabel>
-                </div>
-                {!workspace.canAutoFollowup ? <p>当前入口未启用接入角色，无法授权自动继续检查。</p> : null}
-              </Field>
-              <SubmitButton busy={busy}>创建工单</SubmitButton>
-            </FieldGroup>
-          </form>
+    <section className="workspace-screen space-y-5" aria-label="工单" hidden={workspace.view !== "tasks"}>
+      <Collapsible open={open || Boolean(pending)} onOpenChange={setOpen}>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-lg font-semibold">工单 <span className="text-sm font-normal text-muted-foreground">{tasks.length}</span></h2>
+          <CollapsibleTrigger asChild disabled={Boolean(pending) || !workspace.conversationId}>
+            <Button type="button"><PlusIcon />{pending ? "工单待确认" : open ? "收起表单" : "新建工单"}</Button>
+          </CollapsibleTrigger>
+        </div>
+        <CollapsibleContent forceMount className="pt-4 data-[state=closed]:hidden">
+          <Card>
+            <CardContent className="space-y-4">
+              {pending ? <p role="status" className="text-sm text-amber-700 dark:text-amber-400">创建结果待确认。保留原内容重试，不会新建重复工单。</p> : null}
+              <form key={pending?.task_id ?? workspace.conversationId}
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  const form = event.currentTarget
+                  if (!form.reportValidity()) return
+                  setBusy(true)
+                  void workspace.run(async () => {
+                    await workspace.createTask({
+                      taskId: pending?.task_id ?? newId(),
+                      title: String(new FormData(form).get("title") ?? "").trim(),
+                      goal: String(new FormData(form).get("goal") ?? "").trim(),
+                      acceptance: String(new FormData(form).get("acceptance") ?? "").trim(),
+                      autoFollowup: pending?.auto_followup ?? autoFollowup,
+                    })
+                    form.reset()
+                    setAutoFollowup(false)
+                    setOpen(false)
+                  }).finally(() => setBusy(false))
+                }}
+              >
+                <FieldGroup>
+                  <Field>
+                    <FieldLabel htmlFor="task-title">标题</FieldLabel>
+                    <Input defaultValue={pending?.title ?? ""} readOnly={Boolean(pending)} id="task-title" name="title" required maxLength={200} />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="task-goal">目标</FieldLabel>
+                    <Textarea defaultValue={pending?.goal ?? ""} readOnly={Boolean(pending)} id="task-goal" name="goal" rows={3} required maxLength={50000} />
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="task-acceptance">验收条件</FieldLabel>
+                    <Textarea defaultValue={pending?.acceptance ?? ""} readOnly={Boolean(pending)} id="task-acceptance" name="acceptance" rows={3} required maxLength={50000} />
+                  </Field>
+                  <Field>
+                    <div className="flex items-center gap-2">
+                      <Checkbox id="task-followup" disabled={Boolean(pending) || !workspace.canAutoFollowup} checked={pending?.auto_followup ?? autoFollowup} onCheckedChange={(checked: boolean | "indeterminate") => setAutoFollowup(checked === true)} />
+                      <FieldLabel htmlFor="task-followup">完成执行后，让调度 Agent 继续检查</FieldLabel>
+                    </div>
+                    {!workspace.canAutoFollowup ? <p className="text-sm text-muted-foreground">当前入口未启用接入角色，无法自动检查。</p> : null}
+                  </Field>
+                  <SubmitButton busy={busy}>{pending ? "重试确认创建" : "创建工单"}</SubmitButton>
+                </FieldGroup>
+              </form>
+            </CardContent>
+          </Card>
         </CollapsibleContent>
       </Collapsible>
+      <div className="grid gap-4">
+        {tasks.length ? tasks.map((task) => (
+          <TaskCard key={task.task_id} task={task} conversationId={workspace.conversationId} />
+        )) : <p className="py-10 text-center text-sm text-muted-foreground">{workspace.conversationId ? "还没有工单，创建一个目标开始。" : "先选择或新建会话，再创建工单。"}</p>}
+      </div>
     </section>
   )
 }
@@ -91,15 +101,25 @@ function TaskCard({ task, conversationId }: { task: TaskRecord; conversationId: 
   const status = taskStatuses.find((value) => value === task.status) ?? "open"
   return (
     <Card>
-      <CardHeader>
-        <CardTitle>{task.title || "未命名工单"}</CardTitle>
+      <CardHeader className="flex flex-wrap items-start justify-between gap-3">
+        <CardTitle className="min-w-0 flex-1 break-words">{task.title || "未命名工单"}</CardTitle>
         <StatusBadge value={task.status} label={task.status === "accepted" ? "已验收" : undefined} />
       </CardHeader>
       <CardContent>
-        <DetailList pairs={[["目标", task.goal], ["验收条件", task.acceptance], ["进展", task.detail || "暂无进展"]]} />
+        {task.detail ? <p className="line-clamp-3 whitespace-pre-line break-words text-sm text-muted-foreground">{task.detail}</p> : null}
         <Collapsible>
-          <CollapsibleTrigger>更新工单状态</CollapsibleTrigger>
-          <CollapsibleContent>
+          <CollapsibleTrigger asChild>
+            <Button type="button" variant="ghost" className="h-auto min-h-9 gap-2 px-0 text-muted-foreground [&[data-state=open]>svg]:rotate-180">查看详情<ChevronDownIcon className="size-4 shrink-0 transition-transform" /></Button>
+          </CollapsibleTrigger>
+          <CollapsibleContent className="pt-3">
+            <DetailList pairs={[["目标", task.goal], ["验收条件", task.acceptance], ["完整进展", task.detail || "暂无进展"]]} />
+          </CollapsibleContent>
+        </Collapsible>
+        <Collapsible>
+          <CollapsibleTrigger asChild>
+            <Button type="button" variant="ghost" className="h-auto min-h-9 gap-2 px-0 text-muted-foreground [&[data-state=open]>svg]:rotate-180">更新工单状态<ChevronDownIcon className="size-4 shrink-0 transition-transform" /></Button>
+          </CollapsibleTrigger>
+          <CollapsibleContent className="pt-3">
             <form
               onSubmit={(event) => {
                 event.preventDefault()
