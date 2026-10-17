@@ -4225,11 +4225,11 @@ impl Runtime {
             }
             "resolve_unknown" => {
                 ensure!(access.account_actor(), "resolution requires the user");
-                ensure!(
-                    field(&input, "target_node")? == self.identity.node_id()?,
-                    "resolve remote execution at its target and reconcile its signed receipt"
-                );
-                self.resolve_unknown(&access, &input).await
+                if self.is_execution_resolution(&input)? {
+                    self.resolve_execution_dispatch(&access).await
+                } else {
+                    self.resolve_unknown(&access, &input).await
+                }
             }
             _ => bail!("unknown method"),
         }

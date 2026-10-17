@@ -674,6 +674,83 @@ impl Runtime {
         Ok(())
     }
 
+    pub(super) async fn resolve_execution_dispatch(
+        self: &Arc<Self>,
+        access: &Access,
+    ) -> Result<Value> {
+        use vibeface_secure::authorization::execution_handoff::{
+            ExecutionHandoffResolutionResult, ExecutionHandoffTerminalReconciliationResult,
+            ExecutionResolutionPurpose,
+        };
+        ensure!(
+            access.account_actor(),
+            "remote execution resolution requires the user"
+        );
+        let (wire, _) = {
+            let mut store = self.store.lock().await;
+            access.verification.run(|| {
+                let dispatch = store.execution_dispatch_facts(
+                    &access.body,
+                    access.authorization.audience(),
+                    now_ms() as u64,
+                )?;
+                store.prepare_execution_dispatch_resolution(
+                    &self.identity,
+                    &dispatch,
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    &access.body,
+                    now_ms() as u64,
+                )
+            })?
+        };
+        let response = self.peer_request(
+            &access.network_id,
+            field(&access.body, "target_node")?,
+            json!({"type":"execution_handoff_resolve","resolution":wire}),
+        ).await.context("remote resolution outcome is unconfirmed; reconcile its original authorization before retrying")?;
+        let operation = {
+            let mut store = self.store.lock().await;
+            access.verification.run(|| match wire.resolution.purpose {
+                ExecutionResolutionPurpose::ResolveUnknown => {
+                    let result: ExecutionHandoffResolutionResult =
+                        serde_json::from_value(response)?;
+                    ensure!(
+                        result.resolution == wire,
+                        "executor changed the admitted resolution"
+                    );
+                    store.apply_execution_dispatch_resolution(
+                        &self.identity,
+                        &result,
+                        now_ms() as u64,
+                    )
+                }
+                ExecutionResolutionPurpose::ReconcileTerminal => {
+                    let result: ExecutionHandoffTerminalReconciliationResult =
+                        serde_json::from_value(response)?;
+                    ensure!(
+                        result.reconciliation == wire,
+                        "executor changed the admitted terminal reconciliation"
+                    );
+                    store.apply_execution_dispatch_terminal_reconciliation(
+                        &self.identity,
+                        &result,
+                        now_ms() as u64,
+                    )
+                }
+            })?
+        };
+        self.publish_changed(&access.network_id, &operation.request.conversation_id, "");
+        if operation.state.terminal() {
+            self.complete_execution_dispatch(&operation, &access.verification)
+                .await?;
+        }
+        let store = self.store.lock().await;
+        let operation = execution_operation_view(&store, &operation)?;
+        Ok(json!({"execution_source":operation["execution_source"],"operation":operation}))
+    }
+
     pub(super) async fn remote_operation_status(
         &self,
         access: &Access,
