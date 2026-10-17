@@ -3536,7 +3536,7 @@ mod tests {
         network.admit(&mut live, &request)?;
         network.claim(&mut live, "running")?;
         let access = Store::open_read_only(&db)?;
-        assert!(access.has_network()?);
+        assert!(!access.trusted_policy_pins().is_empty());
         assert_eq!(
             access
                 .operation(network.space.as_str(), "running")?

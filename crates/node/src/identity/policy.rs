@@ -39,7 +39,7 @@ pub(crate) fn request_facts_from(
     let action = crate::model::authorization_action(body)?;
     let method = text("method")?;
     let operation_id = text("authorization_id")?.to_owned();
-    let request = if method == "operate" {
+    let mut request = if method == "operate" {
         Some(serde_json::from_value::<crate::model::OperationRequest>(
             body["request"].clone(),
         )?)
@@ -72,9 +72,18 @@ pub(crate) fn request_facts_from(
                     "operation conversation mismatch"
                 );
             }
-            conversation = Some(operation.conversation_id);
+            ensure!(
+                operation.network_id == space.as_str()
+                    && operation.operation_id == text("operation_id")?,
+                "stored operation scope differs"
+            );
+            conversation = Some(operation.conversation_id.clone());
+            request = Some(operation);
         } else {
-            ensure!(method == "operation", "operation is unavailable");
+            ensure!(
+                matches!(method, "operation" | "reconcile"),
+                "operation is unavailable"
+            );
         }
     }
     if method == "ack" {
@@ -92,7 +101,7 @@ pub(crate) fn request_facts_from(
         }
         conversation = Some(notification.conversation_id);
     }
-    if method == "session" && conversation.is_none() {
+    if method == "session" {
         let mut statement = connection.prepare(
             "SELECT request FROM operations WHERE space_id=? AND target_node=? AND session_id=? ORDER BY operation_id",
         )?;
@@ -108,12 +117,58 @@ pub(crate) fn request_facts_from(
                     "ambiguous session conversation"
                 );
             }
-            conversation = Some(operation.conversation_id);
+            if let Some(previous) = &request {
+                ensure!(
+                    previous.task_id == operation.task_id && previous.binding == operation.binding,
+                    "ambiguous session task binding"
+                );
+            }
+            conversation = Some(operation.conversation_id.clone());
+            request = Some(operation);
         }
         ensure!(
             conversation.is_some(),
             "session has no admitted resource context"
         );
+    }
+    if let Some(request) = &request {
+        for (field, expected) in [
+            ("target_node", request.target_node.as_str()),
+            ("session_id", request.session_id.as_str()),
+        ] {
+            if let Some(value) = body[field].as_str() {
+                ensure!(
+                    value == expected,
+                    "request session differs from admitted operation"
+                );
+            }
+        }
+        if let Some(task) = body["task_id"].as_str() {
+            ensure!(
+                request.task_id.as_deref() == Some(task),
+                "request task differs from admitted operation"
+            );
+        }
+        if !body["binding"].is_null() {
+            ensure!(
+                serde_json::from_value::<crate::binding::SignedBinding>(body["binding"].clone())?
+                    .eq(request
+                        .binding
+                        .as_ref()
+                        .context("operation binding is missing")?),
+                "request binding differs from admitted operation"
+            );
+        }
+        if let Some(cwd) = body["cwd"].as_str() {
+            ensure!(
+                request
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.binding.open_spec["cwd"].as_str())
+                    == Some(cwd),
+                "request directory differs from admitted binding"
+            );
+        }
     }
     let stored_resource: Option<String> = if let Some(scope) = &conversation {
         connection
@@ -323,7 +378,12 @@ impl Store {
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
-    fn authenticate_account(&self, principal: &str, params: &Value, now_ms: u64) -> Result<Value> {
+    pub(crate) fn authenticate_account(
+        &self,
+        principal: &str,
+        params: &Value,
+        now_ms: u64,
+    ) -> Result<Value> {
         ensure!(
             params["device_public_key"].as_str() == Some(principal),
             "account device differs from Noise identity"
@@ -956,11 +1016,14 @@ pub(crate) fn project_policy_in(
                 JournalEntry::Device(certificate)
                     if matches!(certificate.payload.subject, Actor::Service(_)) =>
                 {
+                    let certificate_hash = certificate.hash()?;
                     let associated = match &certificate.payload.owner {
                         PolicyDomain::Space(owner) => owner == space,
                         PolicyDomain::Account(owner) => matches!(&current.payload.root,
                             vibeface_secure::authorization::SpaceRoot::Personal { owner: account, .. } if account == owner),
-                    };
+                    } || history
+                        .iter()
+                        .any(|document| document.payload.devices.contains(&certificate_hash));
                     if associated {
                         let node =
                             crate::crypto::fingerprint(certificate.payload.public_key.as_str())?;
@@ -1093,8 +1156,22 @@ impl crate::runtime::Runtime {
             "policy_commit" => {
                 let entries: Vec<JournalEntry> = serde_json::from_value(params["journal"].clone())?;
                 // Public signed updates prove their own exact authority; new roots are never learned here.
+                store.reject_passkey_policy_bypass(
+                    &entries,
+                    &DeviceId::from_key(&PublicKey::parse(&self.identity.public_key_hex()?)?),
+                )?;
                 store.install_policy_journal(&entries, now_ms)?;
                 Ok(json!({"accepted":true}))
+            }
+            "enrollment_offer_publish"
+            | "enrollment_offer_get"
+            | "enrollment_request"
+            | "enrollment_pending"
+            | "enrollment_approve"
+            | "enrollment_possession"
+            | "enrollment_status"
+            | "account_device_commit" => {
+                store.enrollment_command(&self.identity, noise_public_key, method, params, now_ms)
             }
             _ => anyhow::bail!("unknown identity method"),
         }
