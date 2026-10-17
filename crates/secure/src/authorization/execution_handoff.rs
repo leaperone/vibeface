@@ -1159,7 +1159,18 @@ pub fn execution_resolution_facts(
         audience: value.observation.handoff.handoff.execution_audience.clone(),
         operation_id: account.operation_id,
         body_hash: ObjectHash::body(value)?,
-        context: account.context,
+        context: InvocationContext {
+            workspace_resource: Some(
+                value
+                    .observation
+                    .handoff
+                    .handoff
+                    .execution_resource
+                    .resource
+                    .clone(),
+            ),
+            ..account.context
+        },
     })
 }
 
