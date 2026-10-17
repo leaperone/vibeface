@@ -315,12 +315,15 @@ export function WorkspaceProvider({
     if (!booted || !clientId) return
     const epoch = epochRef.current
     void refreshRef.current().catch(showError)
-    const close = openEvents(clientId, () => {
-      liveRef.current = true
-      setConnectionOnline(true)
-      setConnectionText("实时连接已建立")
-      scheduleRefresh()
-    })
+    const close = openEvents(
+      clientId,
+      () => scheduleRefresh(),
+      (online) => {
+        liveRef.current = online
+        setConnectionOnline(online)
+        setConnectionText(online ? "实时连接已建立" : "实时连接中断 · 正在重连")
+      },
+    )
     const timer = window.setInterval(() => { void refreshRef.current().catch(showError) }, 15000)
     const onOnline = () => scheduleRefresh()
     const onVisible = () => {
