@@ -1,4 +1,4 @@
-.conversation-screen { display: flex; flex: 1; min-height: 0; min-width: 0; flex-direction: column; overflow: hidden; }
+.conversation-screen { display: flex; flex: 1; min-height: 0; min-width: 0; flex-direction: column; overflow-y: auto; overscroll-behavior: contain; }
 .conversation-screen [data-slot="message-header"] { display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem; }
 .conversation-screen [data-align="end"] > [data-slot="message-content"] > [data-slot="message-header"] { justify-content: flex-end; }
 .conversation-screen [data-slot="bubble-content"] { white-space: pre-wrap; overflow-wrap: anywhere; }
