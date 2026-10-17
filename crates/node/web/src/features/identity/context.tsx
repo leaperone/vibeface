@@ -10,13 +10,17 @@ import type { ConnectionEntry, EntryInfo, Member, MembershipView, NodeRole, Pair
 import type { AuthenticationTrust } from '@/lib/secure'
 import { prepareRpc } from '@/lib/rpc-action'
 import type { AuthorizationTrust } from '@/lib/authorization'
-import { mergeAuthorizationTrust, parseAuthorizationTrust, verifyScopedAuthentication } from '@/lib/authorization'
+import { mergeAuthorizationTrust, parseAuthorizationTrust, subscriptionRenewalDelay, verifyScopedAuthentication } from '@/lib/authorization'
 import { Identity, downloadPackage, openPackage, sealPackage, verifiedView, verifyRecoveryResult, verifyState } from '@/lib/secure'
 
 type Phase = 'initializing' | 'blocked' | 'vault_empty' | 'vault_locked' | 'vault_unavailable' | 'key_lost' | 'disconnected' | 'connecting' | 'unpaired' | 'ready'
 type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
 type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (members: Member[]) => Promise<void> }
-type Session = { authorization?: ReturnType<typeof verifyScopedAuthentication>; channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number }
+type Session = { renewal?: number; authorization?: ReturnType<typeof verifyScopedAuthentication>; channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number }
+function releaseSession(active: Session | null) {
+  if (active?.renewal !== undefined) window.clearTimeout(active.renewal)
+  active?.authorization?.release()
+}
 type DeviceContextValue = {
   identity: PublicIdentity | null; vaults: VaultProfile[]; spaces: AuthorizationTrust[]; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; pairs: PairReceipt[]; waiting: WaitingPair | null; review: Review | null; initialInvitation: string
@@ -88,7 +92,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     cancelSensitive()
     connecting.current?.abort(); connecting.current = null
     const previous = session.current; session.current = null
-    previous?.authorization?.release(); previous?.channel.close()
+    releaseSession(previous); previous?.channel.close()
     listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setInfo(null); setEntry(null)
     waitingRef.current = null; setWaiting(null); setPhase('disconnected'); setError('')
   }, [cancelSensitive])
@@ -132,26 +136,43 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       return verified
     })
     if (session.current !== active) { authorization.release(); throw changed() }
-    active.authorization?.release(); active.authorization = authorization
+    releaseSession(active); active.authorization = authorization
     saveEntry(active.entry)
     store(profileKey('last-entry'), active.entry)
-    try { await request('subscribe') }
+    async function signedCall(method: string, params: Record<string, unknown> = {}, channelMethod = 'rpc') {
+      if (session.current !== active) throw changed()
+      if (['notifications', 'ack'].includes(method)) {
+        if (params.client_id !== undefined && params.client_id !== authorization.scope.device_id) throw new Error('通知请求属于其他设备，已拒绝签名。')
+        params = { ...params, client_id: authorization.scope.device_id }
+      }
+      const prepared = prepareRpc({ method, params, spaceId: authorization.scope.space_id, authorizationId: crypto.randomUUID() })
+      const body = record(JSON.parse(JSON.stringify(prepared.body)))
+      const template = record(await request('prepare_invocation', { body }))
+      const normalized = record(template.body)
+      if (!same(normalized, body)) throw new Error('节点准备的请求与当前操作不同。请核对最终路径、目标和权限后重新提交。')
+      const invocation = record(JSON.parse(authorization.sign(JSON.stringify(record(template.invocation)), JSON.stringify(normalized), prepared.action, prepared.authorizationId)))
+      const result = await callSession(active, channelMethod, normalized, invocation)
+      if (channelMethod === 'subscribe') {
+        const expiresAt = integer(record(invocation.payload).expires_at_ms)
+        const delay = subscriptionRenewalDelay(expiresAt, Date.now())
+        if (active.renewal !== undefined) window.clearTimeout(active.renewal)
+        active.renewal = window.setTimeout(() => {
+          if (session.current !== active) return
+          void signedCall('conversations', {}, 'subscribe').catch(error => {
+            if (session.current !== active) return
+            active.channel.close(); setError(messageOf(error))
+          })
+        }, delay)
+      }
+      return result
+    }
+    try { await signedCall('conversations', {}, 'subscribe') }
     catch (error) { authorization.release(); if (active.authorization === authorization) active.authorization = undefined; throw error }
     const connection: ReadyConnection = {
       generation: active.generation, entry: active.entry, scope: authorization.scope, audience: authorization.audience, info: active.info,
       authorization: { enrollmentRights: authorization.enrollmentRights, actions: authorization.actions, authorityEpoch: authorization.authorityEpoch },
       request: (method, params) => { if (session.current !== active) return Promise.reject(changed()); return request(method, params) },
-      rpc: async (method, params) => {
-        if (session.current !== active) throw changed()
-        const prepared = prepareRpc({ method, params: params ?? {}, spaceId: authorization.scope.space_id, authorizationId: crypto.randomUUID() })
-        const bodyJson = JSON.stringify(prepared.body)
-        const body = record(JSON.parse(bodyJson))
-        const template = record(await request('prepare_invocation', { body }))
-        const normalized = record(template.body)
-        if (!same(normalized, body)) throw new Error('节点准备的请求与当前操作不同。请核对最终路径、目标和权限后重新提交。')
-        const invocation = record(JSON.parse(authorization.sign(JSON.stringify(record(template.invocation)), JSON.stringify(normalized), prepared.action, prepared.authorizationId)))
-        return callSession(active, 'rpc', normalized, invocation)
-      },
+      rpc: (method, params) => signedCall(method, params),
       subscribe(listener) { if (session.current !== active) return () => {}; listeners.current.add(listener); return () => { listeners.current.delete(listener) } },
       isCurrent: () => session.current === active && generation.current === active.generation,
     }
@@ -168,7 +189,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         onEvent(value) { const event = record(value); if (version === generation.current && event.type === 'changed') for (const listener of listeners.current) listener() },
         onClose(reason) {
           if (version !== generation.current) return
-          generation.current += 1; session.current?.authorization?.release(); session.current = null; cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setWaiting(null); waitingRef.current = null; setPhase('disconnected'); setError(messageOf(reason))
+          generation.current += 1; releaseSession(session.current); session.current = null; cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setWaiting(null); waitingRef.current = null; setPhase('disconnected'); setError(messageOf(reason))
         },
       })
       if (version !== generation.current) { channel.close(); throw changed() }
@@ -452,7 +473,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     clientVaultStatus().then(status => {
       if (mounted) { setVaults(status.profiles); setPhase(status.status === 'locked' ? 'vault_locked' : status.status === 'key_lost' ? 'key_lost' : status.status === 'unavailable' ? 'vault_unavailable' : 'vault_empty'); if (status.status === 'unavailable') setError(status.error) }
     }).catch(cause => { if (mounted) { setPhase('blocked'); setError(messageOf(cause)) } })
-    return () => { mounted = false; generation.current += 1; lockClient(); sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.authorization?.release(); previous?.channel.close(); listeners.current.clear() }
+    return () => { mounted = false; generation.current += 1; lockClient(); sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; releaseSession(previous); previous?.channel.close(); listeners.current.clear() }
   }, [])
   useEffect(() => {
     if (!waiting?.accepted) return

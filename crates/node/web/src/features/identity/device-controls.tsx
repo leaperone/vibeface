@@ -104,7 +104,7 @@ export function DeviceControls() {
           <div><dt className="text-muted-foreground">目标节点指纹</dt><dd className="break-all font-mono">{ready.entry.node_id}</dd></div>
         </>}
       </dl>
-      <button type="button" className={button} disabled={busy} onClick={() => void run(device.backupVault, '加密设备备份已下载。请另行保存口令。')}>下载加密设备备份</button>
+      <button type="button" className={button} disabled={busy} onClick={() => void run(device.backupVault, '设备密钥备份已下载。请另行保存口令，重新连接还需要可信连接卡。')}>下载设备密钥备份</button>
       {ready && <button type="button" className={button} disabled={busy} onClick={() => device.disconnect()}>断开连接</button>}
     </section>
 

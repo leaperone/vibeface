@@ -90,3 +90,9 @@ export function verifyScopedAuthentication(value: unknown, own: PublicIdentity, 
     }
   } catch (error) { verified.free(); throw error }
 }
+
+export function subscriptionRenewalDelay(expiresAt: number, now: number) {
+  const remaining = expiresAt - now
+  if (remaining <= 0) throw new Error('订阅授权已过期，请重新连接。')
+  return Math.min(60000, Math.floor(remaining / 2))
+}

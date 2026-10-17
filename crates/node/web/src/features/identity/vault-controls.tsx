@@ -50,7 +50,8 @@ export function VaultControls() {
     </fieldset></form>
     {device.vaults.length > 0 && <Button type="button" variant="ghost" disabled={busy} onClick={() => { setCreating(!creating); setError('') }}>{creating ? '返回已有设备配置' : '为其他账户创建独立设备配置'}</Button>}
     <details className="space-y-3">
-      <summary className="cursor-pointer py-2 text-sm">恢复此浏览器的加密设备备份</summary>
+      <summary className="cursor-pointer py-2 text-sm">恢复设备密钥备份</summary>
+      <p className="text-sm text-muted-foreground">这只恢复设备密钥。恢复后仍需可信连接卡进入原账户，账户恢复请使用单独的加密恢复包。</p>
       <form className="space-y-3" onSubmit={event => {
         event.preventDefault()
         const form = event.currentTarget
@@ -58,7 +59,7 @@ export function VaultControls() {
           const data = new FormData(form)
           const file = data.get('vault')
           const password = data.get('password')
-          if (!(file instanceof File) || !file.size || file.size > 16384) throw new Error('选择不超过 16 KiB 的加密设备备份。')
+          if (!(file instanceof File) || !file.size || file.size > 16384) throw new Error('选择不超过 16 KiB 的加密设备密钥备份。')
           if (typeof password !== 'string') throw new Error('请输入备份口令。')
           try {
             const vault: unknown = JSON.parse(await file.text())
@@ -66,7 +67,7 @@ export function VaultControls() {
           } finally { form.reset() }
         })
       }}><fieldset disabled={busy || unavailable} className="space-y-3">
-        <div className="space-y-1"><Label htmlFor="vault-file">加密设备备份</Label><Input id="vault-file" type="file" name="vault" accept="application/json,.json" required /></div>
+        <div className="space-y-1"><Label htmlFor="vault-file">设备密钥备份</Label><Input id="vault-file" type="file" name="vault" accept="application/json,.json" required /></div>
         <div className="space-y-1"><Label htmlFor="vault-restore-password">备份口令</Label><Input id="vault-restore-password" type="password" name="password" autoComplete="current-password" required /></div>
         <Button type="submit" variant="outline">恢复加密设备仓库</Button>
       </fieldset></form>

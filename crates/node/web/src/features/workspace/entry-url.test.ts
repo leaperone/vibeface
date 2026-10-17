@@ -185,6 +185,9 @@ test("locking during initialization releases candidates and preserves temporary 
 test("saved policy heads cannot move backwards or replace an account root", async () => {
   const source = await readFile(new URL("../../lib/authorization.ts", import.meta.url), "utf8")
   const boundary = await import(`data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(source.replace(/^import .*\n/gm, ""))).toString("base64")}`)
+  assert.equal(boundary.subscriptionRenewalDelay(120000, 0), 60000)
+  assert.equal(boundary.subscriptionRenewalDelay(1000, 800), 100)
+  assert.throws(() => boundary.subscriptionRenewalDelay(1000, 1000))
   const domain = { kind: "account", id: `acc2_${"a".repeat(64)}` }
   const firstHead = { domain, authority_epoch: 1, sequence: 1, head: `h2_${"1".repeat(64)}` }
   const latestHead = { ...firstHead, sequence: 2, head: `h2_${"2".repeat(64)}` }
