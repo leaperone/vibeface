@@ -1148,7 +1148,10 @@ impl Store {
             challenge.version == AUTH_VERSION
                 && matches!(
                     challenge.stage,
-                    CheckStage::Admit | CheckStage::Start | CheckStage::Renew
+                    CheckStage::Admit
+                        | CheckStage::Start
+                        | CheckStage::Renew
+                        | CheckStage::RemoteRead
                 )
                 && challenge.issued_at_ms <= now_ms
                 && now_ms < challenge.expires_at_ms
@@ -1302,6 +1305,42 @@ impl Store {
         let stored = stored_from(&self.connection, &execution, &original_space, &operation_id)?
             .context("accepted handoff was not persisted")?;
         dto(&self.connection, identity, &stored, now_ms)
+    }
+
+    pub fn authorize_execution_handoff_read(
+        &self,
+        auth: &VerifiedExecutionHandoff,
+        proof: &ExecutionHandoffFreshness,
+        now_ms: u64,
+    ) -> Result<()> {
+        ensure!(
+            proof.challenge.stage == CheckStage::RemoteRead,
+            "handoff read requires its own freshness purpose"
+        );
+        let (execution, original, operation) = scope(auth.wire())?;
+        let stored = stored_from(&self.connection, &execution, &original, &operation)?
+            .context("handoff read has no prior acceptance")?;
+        ensure!(
+            stored.wire == *auth.wire(),
+            "handoff read changed its original request"
+        );
+        reconstruct_handoff(&self.connection, &self.policy, &stored)?;
+        check_policy_heads_in(
+            &self.connection,
+            self.policy.verified(),
+            auth.original(),
+            now_ms,
+        )?;
+        check_policy_heads_in(
+            &self.connection,
+            self.policy.verified(),
+            auth.submission(),
+            now_ms,
+        )?;
+        self.policy
+            .verified()
+            .verify_execution_handoff_freshness(auth, proof, now_ms)?;
+        verify_challenge_record(&self.connection, auth.wire(), proof, false)
     }
 
     pub fn claim_execution_handoff(

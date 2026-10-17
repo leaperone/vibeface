@@ -194,7 +194,10 @@ impl ExecutionHandoffChallenge {
             (handoff.submission.phase == AuthorizationPhase::Admission
                 && stage == CheckStage::Admit)
                 || (handoff.submission.phase == AuthorizationPhase::Operation
-                    && matches!(stage, CheckStage::Start | CheckStage::Renew)),
+                    && matches!(
+                        stage,
+                        CheckStage::Start | CheckStage::Renew | CheckStage::RemoteRead
+                    )),
             "handoff stage does not match admission state",
         )?;
         validate_window(issued_at_ms, expires_at_ms, issued_at_ms)?;
