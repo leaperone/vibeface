@@ -1887,14 +1887,24 @@ def acceptance(options):
 
 
 def shared_history(client, conversation, task, dispatched=None):
+    actual = None
+    if dispatched:
+        status = client.rpc("task_control", conversation_id=conversation, task_id=task, action="status",
+                            target_node=dispatched["target_node"], session_id=dispatched["session_id"])
+        actual = status["operation"]["request"]
+        require(all(actual.get(key) == value for key, value in dispatched.items() if key != "resources"),
+                "read-only task status returns the exact original dispatch body")
+        proof = actual.get("binding") or {}
+        binding = proof.get("binding", {})
+        require(bool(proof.get("signature")) and all(binding.get(key) == dispatched[key] for key in
+                    ("network_id", "conversation_id", "task_id", "target_node", "session_id")),
+                "read-only task status stays on the original task binding")
     result = client.rpc("conversation", conversation_id=conversation)
     if dispatched:
         record = next((item for item in result["operations"] if item["request"]["operation_id"] == dispatched["operation_id"]), None)
         if not record or not record["request"].get("binding"):
             return None
-        actual = record["request"]
-        if any(actual[key] != dispatched[key] for key in ("target_node", "session_id", "task_id", "action")):
-            return None
+        require(record["request"] == actual, "snapshot retains the original dispatch returned by explicit read-only status")
     return result if (any(m["message_id"] == "message-original" for m in result["messages"])
                       and any(t["task_id"] == task for t in result["tasks"])
                       and not any(result["missing"].values())) else None
