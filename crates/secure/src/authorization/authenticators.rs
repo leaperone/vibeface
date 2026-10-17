@@ -3,6 +3,12 @@
 use super::*;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PasskeyClientEnrollment {
+    AccountClient,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthenticatorRecord {
     pub version: u16,
@@ -13,6 +19,7 @@ pub struct AuthenticatorRecord {
     pub origins: Vec<String>,
     pub user_handle: String,
     pub backup_eligible: bool,
+    pub client_enrollment: PasskeyClientEnrollment,
     pub issued_under: PolicyStamp,
     pub not_before_ms: u64,
     pub expires_at_ms: u64,
@@ -213,6 +220,7 @@ mod tests {
             origins: vec!["https://example.com".into()],
             user_handle: "A".repeat(43),
             backup_eligible: true,
+            client_enrollment: PasskeyClientEnrollment::AccountClient,
             issued_under: f
                 .state
                 .head(&PolicyDomain::Account(f.account.clone()))

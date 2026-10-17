@@ -5,7 +5,7 @@ pub mod bootstrap;
 pub mod projection;
 pub mod services;
 use crate::{Identity, membership::canonical_json};
-pub use authenticators::{AuthenticatorRecord, VerifiedAuthenticator};
+pub use authenticators::{AuthenticatorRecord, PasskeyClientEnrollment, VerifiedAuthenticator};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
