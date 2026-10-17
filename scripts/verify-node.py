@@ -333,6 +333,7 @@ for await (const line of createInterface({input:process.stdin})) {
   } catch (error) { process.stdout.write(`${JSON.stringify({ok:false,error:String(error)})}\n`); }
 }
 for (const connection of connections.values()) connection.close();
+for (const key of keys.values()) key.free();
 """
 
 
@@ -527,6 +528,9 @@ class Node:
             review = wait_for(f"{self.name} signed CLI pairing review", pending)
             owner.client.approve(review["request_id"])
             stdout, stderr = process.communicate(timeout=40)
+            log = self.directory / "pair-cli.log"
+            log.write_bytes(stdout + stderr)
+            log.chmod(0o600)
             require(process.returncode == 0, f"{self.name}: pinned CLI pairing completes after management approval")
         finally:
             if process.poll() is None:
@@ -857,6 +861,8 @@ def acceptance(options):
         require(len({node.client.command("identity")["subject_id"] for node in (a, b, c)}) == 3,
                 "each client installation owns an independent identity")
         require(c.client.network_id == b.client.network_id == network, "independent local clients use the same paired network")
+        phone = c.client.command("identity")["subject_id"]
+        laptop = b.client.command("identity")["subject_id"]
         passed("three independent nodes pair and route through a foreign public relay")
 
         other = relay.client
@@ -937,7 +943,7 @@ def acceptance(options):
         gate.touch(mode=0o600)
         wait_for("B finishes while A is offline", lambda: succeeded(c.client, b, "fixture-delayed-send"))
         notification = "result:fixture-delayed-send:succeeded"
-        wait_for("C receives durable B result notification", lambda: any(n["notification_id"] == notification for n in c.client.rpc("notifications", client_id="phone")["notifications"]))
+        wait_for("C receives durable B result notification", lambda: any(n["notification_id"] == notification for n in c.client.rpc("notifications", client_id=phone)["notifications"]))
         wait_for("C receives live event stream update", lambda: len(stream.lines) > 0)
         after = c.client.rpc("conversation", conversation_id=conversation)
         require(next(item for item in after["tasks"] if item["task_id"] == task)["status"] != "accepted", "turn completion never accepts a task")
@@ -952,9 +958,11 @@ def acceptance(options):
         stream.close()
         stream = None
 
-        c.client.rpc("ack", notification_id=notification, client_id="phone")
-        require(all(n["notification_id"] != notification for n in c.client.rpc("notifications", client_id="phone")["notifications"]), "ACK removes notification for same client")
-        require(any(n["notification_id"] == notification for n in c.client.rpc("notifications", client_id="laptop")["notifications"]), "ACK does not consume another client delivery")
+        c.client.rpc("notifications", client_id=laptop, status=403)
+        c.client.rpc("ack", notification_id=notification, client_id=laptop, status=403)
+        c.client.rpc("ack", notification_id=notification, client_id=phone)
+        require(all(n["notification_id"] != notification for n in c.client.rpc("notifications", client_id=phone)["notifications"]), "ACK removes notification for same client")
+        require(any(n["notification_id"] == notification for n in b.client.rpc("notifications", client_id=laptop)["notifications"]), "ACK does not consume another client delivery")
         session = c.client.rpc("session", target_node=b.node_id, session_id="fixture-main")["session"]
         offline_gate = run / "complete-offline"
         offline = request(network, conversation, b, "fixture-offline-send", "fixture-main", {"type": "send", "text": json.dumps({"label": "offline", "gate": str(offline_gate)})}, revision=session["revision"], task=task)
@@ -966,8 +974,8 @@ def acceptance(options):
         c.start()
         c.client.connect()
         c.client.authenticate()
-        wait_for("persistent notification delivered after reconnect", lambda: any(n["notification_id"] == "result:fixture-offline-send:succeeded" for n in c.client.rpc("notifications", client_id="phone")["notifications"]))
-        require(all(n["notification_id"] != notification for n in c.client.rpc("notifications", client_id="phone")["notifications"]), "client ACK remains durable after restart")
+        wait_for("persistent notification delivered after reconnect", lambda: any(n["notification_id"] == "result:fixture-offline-send:succeeded" for n in c.client.rpc("notifications", client_id=phone)["notifications"]))
+        require(all(n["notification_id"] != notification for n in c.client.rpc("notifications", client_id=phone)["notifications"]), "client ACK remains durable after restart")
         passed("offline notifications replay after reconnect and per-client ACK persists", "real_nodes_with_stream_json_fixture")
 
         session = c.client.rpc("session", target_node=b.node_id, session_id="fixture-main")["session"]
