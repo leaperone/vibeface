@@ -1031,6 +1031,80 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn shared_execution_session_is_projected_once_for_multiple_bound_tasks() -> Result<()> {
+        let dir = fixture()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let network = conversation(&node).await?;
+        let local = node.identity.node_id()?;
+        for task_id in ["a-old", "b-new"] {
+            task(&node, &network, task_id, false).await?;
+            let mut store = node.store.lock().await;
+            let creation = store.task_creation(&network, "chat", task_id)?;
+            store.bind_task(
+                &node.identity,
+                &crate::binding::TaskBinding {
+                    network_id: network.clone(),
+                    conversation_id: "chat".into(),
+                    task_ref: creation.hash,
+                    task_id: task_id.into(),
+                    authority_node: local.clone(),
+                    generation: 1,
+                    target_node: local.clone(),
+                    session_id: "shared".into(),
+                    open_spec: json!({"type":"open","executor":"codex","cwd":dir}),
+                    previous_binding_hash: None,
+                    previous_seal: None,
+                },
+            )?;
+        }
+        node.store.lock().await.upsert_session(
+            &network,
+            &ExecutionSession {
+                network_id: network.clone(),
+                target_node: local.clone(),
+                session_id: "shared".into(),
+                revision: 0,
+                state: "idle".into(),
+                executor: "codex".into(),
+                cwd: dir.to_string_lossy().into_owned(),
+                native_session_id: None,
+            },
+        )?;
+        let snapshot = node
+            .rpc(
+                Access {
+                    network_id: network,
+                    human: true,
+                    conversation_id: None,
+                    manager: None,
+                },
+                json!({"method":"conversation","conversation_id":"chat"}),
+            )
+            .await?;
+        assert_eq!(
+            snapshot["tasks"].as_array().context("tasks missing")?.len(),
+            2
+        );
+        assert_eq!(
+            snapshot["sessions"]
+                .as_array()
+                .context("sessions missing")?
+                .len(),
+            1
+        );
+        assert!(
+            snapshot["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|task| task["binding"]["session_id"] == "shared")
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn task_retry_requires_explicit_versioned_grant_without_reopening() -> Result<()> {
         use crate::store::followup::FollowupMode;
         let dir = fixture()?;

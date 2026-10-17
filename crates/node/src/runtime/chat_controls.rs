@@ -331,6 +331,7 @@ impl Runtime {
         }
         let mut tasks = Vec::new();
         let mut sessions = Vec::new();
+        let mut session_ids = BTreeSet::new();
         let mut operations = Vec::new();
         let local_operations = store.operations(network)?;
         for task in store.tasks(network, scope)? {
@@ -461,7 +462,9 @@ impl Runtime {
                 if let Some(request) = request {
                     projected["operation_id"] = json!(request.operation_id);
                 }
-                if let Some(session) = session {
+                if let Some(session) = session
+                    && session_ids.insert((session.target_node.clone(), session.session_id.clone()))
+                {
                     sessions.push(json!(session));
                 }
                 operations.extend(records.into_iter().map(|operation| json!(operation)));
