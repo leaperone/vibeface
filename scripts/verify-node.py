@@ -1039,12 +1039,6 @@ def acceptance(options):
         c.client.authenticate()
         wait_for("fresh C reconnects to original executor B", lambda: any(item["node_id"] == b.node_id and item["online"] for item in c.client.rpc("nodes")["nodes"]))
         require(a.process is None, "binding authority A remains offline during fresh C continuation")
-        dispatch(c.client, send)
-        stale = copy.deepcopy(send)
-        stale["operation_id"] = "stale-concurrent"
-        dispatch(c.client, stale, status=400)
-        overlap = request(network, conversation, b, "overlapping-path", "overlapping-session", {"type": "open", "executor": "claude_code", "cwd": str(child_workspace)})
-        dispatch(c.client, overlap, status=400)
         stream = Events(c.client)
         stream.start()
         report["fresh_scheduler"] = {"authority_offline": True, "binding_cache_rows_removed": deleted_bindings,
@@ -1061,8 +1055,7 @@ def acceptance(options):
         wait_for("large result blob replicated to C", lambda: verify_blobs(c, network) >= 1)
         count = verify_snapshot(c.client.rpc("export", conversation_id=conversation))
         require(count > 5, "export contains conversation, dispatch and result history")
-        passed("A goes offline; fresh C restores binding from DAG and continues original B without replay", "real_nodes_with_stream_json_fixture")
-        passed("session CAS, overlapping-directory exclusion and execution deduplication", "real_nodes_with_stream_json_fixture")
+        passed("A goes offline; fresh C restores context and receives original B completion without replay", "real_nodes_with_stream_json_fixture")
         passed("large attachment copies with matching content hash and complete DAG closure")
         stream.close()
         stream = None
@@ -1075,8 +1068,17 @@ def acceptance(options):
         session = c.client.rpc("session", target_node=b.node_id, session_id="fixture-main")["session"]
         offline_gate = run / "complete-offline"
         offline = request(network, conversation, b, "fixture-offline-send", "fixture-main", {"type": "send", "text": json.dumps({"label": "offline", "gate": str(offline_gate)})}, revision=session["revision"], task=task)
+        require(a.process is None, "fresh C submits new explicit-task work while authority A stays offline")
         dispatch(c.client, offline)
         wait_for("second fixture invocation", lambda: len(invocations(run, "offline")) == 1)
+        dispatch(c.client, offline)
+        stale = copy.deepcopy(offline)
+        stale["operation_id"] = "stale-concurrent"
+        dispatch(c.client, stale, status=400)
+        overlap = request(network, conversation, b, "overlapping-path", "overlapping-session", {"type": "open", "executor": "claude_code", "cwd": str(child_workspace)})
+        dispatch(c.client, overlap, status=400)
+        passed("fresh C derives the binding from DAG and dispatches new work to original B with A offline", "real_nodes_with_stream_json_fixture")
+        passed("session CAS, overlapping-directory exclusion and execution deduplication", "real_nodes_with_stream_json_fixture")
         c.stop()
         offline_gate.touch(mode=0o600)
         wait_for("B completes without any connected client", lambda: succeeded(b.client, b, "fixture-offline-send"))
