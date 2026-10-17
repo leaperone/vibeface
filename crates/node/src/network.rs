@@ -503,36 +503,33 @@ impl NetworkHub {
     }
     pub async fn dial(&self, target: &str, service: Service) -> Result<NetworkSocket> {
         check_id(target)?;
-        let records = self.resolve(target).await?;
-        let mut direct = self
-            .state
-            .lock()
-            .await
-            .candidates
-            .get(target)
-            .cloned()
-            .unwrap_or_default();
-        direct.extend(records.iter().flat_map(|record| record.direct_urls.clone()));
-        let failures = {
+        let now = now_secs()?;
+        let (cached, failures) = {
             let mut state = self.state.lock().await;
             state
                 .failed_routes
                 .retain(|_, at| at.elapsed() < Duration::from_secs(30));
-            state.failed_routes.clone()
+            let mut urls = state.candidates.get(target).cloned().unwrap_or_default();
+            if let Some(record) = state
+                .records
+                .get(target)
+                .filter(|record| record.expires_at > now)
+            {
+                urls.extend(record.direct_urls.clone());
+            }
+            (urls, state.failed_routes.clone())
         };
         let mut seen = HashSet::new();
-        for url in direct
-            .into_iter()
-            .filter(|url| seen.insert(url.clone()))
-            .take(MAX_URLS * 2)
-        {
-            let route = format!("direct:{url}");
-            if failures.contains_key(&(target.to_owned(), route.clone())) {
-                continue;
-            }
-            if let Ok(socket) = connect_service(&url, Control::Direct { service }).await {
-                return Ok(NetworkSocket::Routed(Box::new(socket), route));
-            }
+        if let Some(socket) = dial_direct(cached, target, service, &failures, &mut seen).await {
+            return Ok(socket);
+        }
+        let records = self.resolve(target).await?;
+        let direct = records
+            .iter()
+            .flat_map(|record| record.direct_urls.clone())
+            .collect();
+        if let Some(socket) = dial_direct(direct, target, service, &failures, &mut seen).await {
+            return Ok(socket);
         }
         let mut seen = HashSet::new();
         for url in records
@@ -943,18 +940,43 @@ async fn relay_frame(
                 *window = Instant::now();
                 *window_bytes = 0;
             }
+            if *window_bytes + data.len() > CIRCUIT_BYTES_PER_SECOND {
+                tokio::time::sleep(Duration::from_secs(1).saturating_sub(window.elapsed())).await;
+                *window = Instant::now();
+                *window_bytes = 0;
+            }
             *bytes += data.len();
             *window_bytes += data.len();
-            ensure!(
-                *bytes <= CIRCUIT_BYTE_LIMIT && *window_bytes <= CIRCUIT_BYTES_PER_SECOND,
-                "relay byte budget exceeded"
-            );
+            ensure!(*bytes <= CIRCUIT_BYTE_LIMIT, "relay byte budget exceeded");
             send_frame(destination, Message::Binary(data)).await
         }
         Message::Ping(_) | Message::Pong(_) => Ok(()),
         _ => bail!("relay accepts only encrypted binary frames"),
     }
 }
+async fn dial_direct(
+    urls: Vec<String>,
+    target: &str,
+    service: Service,
+    failures: &HashMap<(String, String), Instant>,
+    seen: &mut HashSet<String>,
+) -> Option<NetworkSocket> {
+    for url in urls
+        .into_iter()
+        .filter(|url| seen.insert(url.clone()))
+        .take(MAX_URLS * 2)
+    {
+        let route = format!("direct:{url}");
+        if failures.contains_key(&(target.to_owned(), route.clone())) {
+            continue;
+        }
+        if let Ok(socket) = connect_service(&url, Control::Direct { service }).await {
+            return Some(NetworkSocket::Routed(Box::new(socket), route));
+        }
+    }
+    None
+}
+
 async fn connect_service(url: &str, control: Control) -> Result<NetworkSocket> {
     let (mut socket, _) = open_control(url).await?;
     send_control(&mut socket, &control).await?;
