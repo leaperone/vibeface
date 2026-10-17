@@ -843,7 +843,7 @@ pub fn verify_assertion_json(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{Identity, authorization::PolicyDomain};
     use coset::CoseKeyBuilder;
@@ -897,7 +897,7 @@ mod tests {
     fn key() -> SigningKey {
         SigningKey::from_bytes((&[42; 32]).into()).unwrap()
     }
-    fn cose() -> Vec<u8> {
+    pub(crate) fn cose() -> Vec<u8> {
         let point = key().verifying_key().to_encoded_point(false);
         CoseKeyBuilder::new_ec2_pub_key(
             iana::EllipticCurve::P_256,
@@ -909,10 +909,10 @@ mod tests {
         .to_vec()
         .unwrap()
     }
-    fn client(p: &PendingPasskey, ceremony: &str) -> Vec<u8> {
+    pub(crate) fn client(p: &PendingPasskey, ceremony: &str) -> Vec<u8> {
         serde_json::to_vec(&json!({"type":ceremony,"challenge":p.challenge().unwrap(),"origin":p.relying_party.origin,"crossOrigin":false})).unwrap()
     }
-    fn auth(p: &PendingPasskey, flags: u8, counter: u32) -> Vec<u8> {
+    pub(crate) fn auth(p: &PendingPasskey, flags: u8, counter: u32) -> Vec<u8> {
         let mut result = Sha256::digest(p.relying_party.rp_id.as_bytes()).to_vec();
         result.push(flags);
         result.extend_from_slice(&counter.to_be_bytes());
@@ -941,7 +941,7 @@ mod tests {
             client_extension_results: json!({}),
         }
     }
-    fn assertion(
+    pub(crate) fn assertion(
         _p: &PendingPasskey,
         data: Vec<u8>,
         client: Vec<u8>,
