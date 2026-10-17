@@ -1,13 +1,13 @@
 -- Create "schema_metadata" table
 CREATE TABLE `schema_metadata` (`singleton` integer NOT NULL, `format_id` text NOT NULL, `data_epoch` integer NOT NULL, `layout_version` integer NOT NULL, `schema_fingerprint` text NOT NULL, `initialization_state` text NOT NULL, PRIMARY KEY (`singleton`), CONSTRAINT `metadata_singleton` CHECK (singleton = 1), CONSTRAINT `metadata_versions` CHECK (data_epoch > 0 AND layout_version > 0), CONSTRAINT `metadata_initialized` CHECK (initialization_state = 'ready'));
 -- Create "spaces" table
-CREATE TABLE `spaces` (`space_id` text NOT NULL, `revision` integer NOT NULL, `bundle` text NOT NULL, PRIMARY KEY (`space_id`), CONSTRAINT `space_revision` CHECK (revision > 0));
+CREATE TABLE `spaces` (`space_id` text NOT NULL, `revision` integer NOT NULL, `bundle` text NOT NULL, PRIMARY KEY (`space_id`), CONSTRAINT `space_revision` CHECK (revision >= 0));
 -- Create "node_certificates" table
 CREATE TABLE `node_certificates` (`space_id` text NOT NULL, `node_id` text NOT NULL, `public_key` text NOT NULL, PRIMARY KEY (`space_id`, `node_id`), CONSTRAINT `node_certificates_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`));
 -- Create "local_devices" table
 CREATE TABLE `local_devices` (`space_id` text NOT NULL, `device_id` text NOT NULL, `public_key` text NOT NULL, PRIMARY KEY (`space_id`, `device_id`), CONSTRAINT `local_devices_certificate` FOREIGN KEY (`space_id`, `device_id`) REFERENCES `node_certificates` (`space_id`, `node_id`));
 -- Create "events" table
-CREATE TABLE `events` (`space_id` text NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `author` text NOT NULL, `sequence` integer NOT NULL, `envelope` text NOT NULL, `status` text NOT NULL, PRIMARY KEY (`space_id`, `hash`), CONSTRAINT `events_author` FOREIGN KEY (`space_id`, `author`) REFERENCES `node_certificates` (`space_id`, `node_id`), CONSTRAINT `event_sequence` CHECK (sequence > 0), CONSTRAINT `event_status` CHECK (status IN ('pending', 'ready', 'conflict', 'invalid')));
+CREATE TABLE `events` (`space_id` text NOT NULL, `resource_id` text NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `author` text NOT NULL, `sequence` integer NOT NULL, `envelope` text NOT NULL, `status` text NOT NULL, PRIMARY KEY (`space_id`, `hash`), CONSTRAINT `events_author` FOREIGN KEY (`space_id`, `author`) REFERENCES `node_certificates` (`space_id`, `node_id`), CONSTRAINT `events_resource` FOREIGN KEY (`space_id`, `resource_id`) REFERENCES `resource_records` (`space_id`, `resource_id`), CONSTRAINT `event_sequence` CHECK (sequence > 0), CONSTRAINT `event_status` CHECK (status IN ('pending', 'ready', 'conflict', 'invalid')));
 -- Create index "events_author_sequence" to table: "events"
 CREATE INDEX `events_author_sequence` ON `events` (`space_id`, `scope_id`, `author`, `sequence`);
 -- Create index "events_scope" to table: "events"
@@ -15,7 +15,7 @@ CREATE INDEX `events_scope` ON `events` (`space_id`, `scope_id`);
 -- Create "blobs" table
 CREATE TABLE `blobs` (`space_id` text NOT NULL, `hash` text NOT NULL, `size` integer NOT NULL, `content` blob NOT NULL, PRIMARY KEY (`space_id`, `hash`), CONSTRAINT `blobs_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`), CONSTRAINT `blob_nonnegative_size` CHECK (size >= 0));
 -- Create "conversations" table
-CREATE TABLE `conversations` (`space_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NOT NULL, PRIMARY KEY (`space_id`, `conversation_id`), CONSTRAINT `conversations_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`));
+CREATE TABLE `conversations` (`space_id` text NOT NULL, `resource_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NOT NULL, PRIMARY KEY (`space_id`, `conversation_id`), CONSTRAINT `conversations_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`), CONSTRAINT `conversations_resource` FOREIGN KEY (`space_id`, `resource_id`) REFERENCES `resource_records` (`space_id`, `resource_id`));
 -- Create "messages" table
 CREATE TABLE `messages` (`space_id` text NOT NULL, `conversation_id` text NOT NULL, `event_hash` text NOT NULL, `message_id` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `ordinal` integer NOT NULL, PRIMARY KEY (`space_id`, `event_hash`), CONSTRAINT `messages_source` FOREIGN KEY (`space_id`, `event_hash`) REFERENCES `events` (`space_id`, `hash`));
 -- Create "tasks" table
@@ -54,31 +54,31 @@ CREATE TABLE `identity_pair_requests` (`space_id` text NOT NULL, `request_id` te
 CREATE UNIQUE INDEX `pair_requests_invite_once` ON `identity_pair_requests` (`space_id`, `invite_id`);
 -- Create "identity_pair_reviews" table
 CREATE TABLE `identity_pair_reviews` (`space_id` text NOT NULL, `invite_id` text NOT NULL, `review` text NOT NULL, `review_hash` text NOT NULL, `inviter_signature` text NOT NULL, `new_subject_signature` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`space_id`, `invite_id`), CONSTRAINT `pair_reviews_request` FOREIGN KEY (`space_id`, `invite_id`) REFERENCES `identity_pair_requests` (`space_id`, `invite_id`));
--- Create "accounts" table
-CREATE TABLE `accounts` (`account_id` text NOT NULL, `root_public_key` text NOT NULL, `public_record` text NOT NULL, PRIMARY KEY (`account_id`));
--- Create "devices" table
-CREATE TABLE `devices` (`space_id` text NOT NULL, `device_id` text NOT NULL, `account_id` text NOT NULL, `kind` text NOT NULL, `public_key` text NOT NULL, `certificate` text NOT NULL, PRIMARY KEY (`space_id`, `device_id`), CONSTRAINT `devices_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`), CONSTRAINT `devices_account` FOREIGN KEY (`account_id`) REFERENCES `accounts` (`account_id`), CONSTRAINT `device_kind` CHECK (kind IN ('node', 'client')));
--- Create "members" table
-CREATE TABLE `members` (`space_id` text NOT NULL, `account_id` text NOT NULL, `role` text NOT NULL, `signed_record` text NOT NULL, PRIMARY KEY (`space_id`, `account_id`), CONSTRAINT `members_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`), CONSTRAINT `members_account` FOREIGN KEY (`account_id`) REFERENCES `accounts` (`account_id`), CONSTRAINT `member_role` CHECK (role IN ('owner', 'admin', 'member')));
--- Create "resources" table
-CREATE TABLE `resources` (`space_id` text NOT NULL, `resource_id` text NOT NULL, `owner_account_id` text NOT NULL, `host_node_id` text NOT NULL, `kind` text NOT NULL, PRIMARY KEY (`space_id`, `resource_id`), CONSTRAINT `resources_owner` FOREIGN KEY (`owner_account_id`) REFERENCES `accounts` (`account_id`), CONSTRAINT `resources_host` FOREIGN KEY (`space_id`, `host_node_id`) REFERENCES `devices` (`space_id`, `device_id`), CONSTRAINT `resource_kind` CHECK (kind IN ('agent', 'relay', 'storage')));
--- Create "grants" table
-CREATE TABLE `grants` (`space_id` text NOT NULL, `grant_id` text NOT NULL, `resource_id` text NOT NULL, `grantee_account_id` text NOT NULL, `parent_grant_id` text NULL, `action` text NOT NULL, `signed_envelope` text NOT NULL, PRIMARY KEY (`space_id`, `grant_id`), CONSTRAINT `grants_resource` FOREIGN KEY (`space_id`, `resource_id`) REFERENCES `resources` (`space_id`, `resource_id`), CONSTRAINT `grants_grantee` FOREIGN KEY (`grantee_account_id`) REFERENCES `accounts` (`account_id`), CONSTRAINT `grants_parent` FOREIGN KEY (`space_id`, `parent_grant_id`) REFERENCES `grants` (`space_id`, `grant_id`));
--- Create "policy_events" table
-CREATE TABLE `policy_events` (`space_id` text NOT NULL, `hash` text NOT NULL, `authority_epoch` integer NOT NULL, `sequence` integer NOT NULL, `signed_envelope` text NOT NULL, PRIMARY KEY (`space_id`, `hash`), CONSTRAINT `policy_events_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`), CONSTRAINT `policy_monotonic_values` CHECK (authority_epoch > 0 AND sequence > 0));
--- Create index "policy_accepted_sequence" to table: "policy_events"
-CREATE UNIQUE INDEX `policy_accepted_sequence` ON `policy_events` (`space_id`, `authority_epoch`, `sequence`);
--- Create index "policy_head_reference" to table: "policy_events"
-CREATE UNIQUE INDEX `policy_head_reference` ON `policy_events` (`space_id`, `authority_epoch`, `sequence`, `hash`);
--- Create "policy_heads" table
-CREATE TABLE `policy_heads` (`space_id` text NOT NULL, `authority_epoch` integer NOT NULL, `sequence` integer NOT NULL, `head_hash` text NOT NULL, PRIMARY KEY (`space_id`), CONSTRAINT `policy_heads_event` FOREIGN KEY (`space_id`, `authority_epoch`, `sequence`, `head_hash`) REFERENCES `policy_events` (`space_id`, `authority_epoch`, `sequence`, `hash`));
--- Create "authorization_decisions" table
-CREATE TABLE `authorization_decisions` (`space_id` text NOT NULL, `operation_id` text NOT NULL, `policy_hash` text NOT NULL, `actor_account_id` text NOT NULL, `receipt` text NOT NULL, PRIMARY KEY (`space_id`, `operation_id`), CONSTRAINT `decisions_operation` FOREIGN KEY (`space_id`, `operation_id`) REFERENCES `operations` (`space_id`, `operation_id`), CONSTRAINT `decisions_policy` FOREIGN KEY (`space_id`, `policy_hash`) REFERENCES `policy_events` (`space_id`, `hash`), CONSTRAINT `decisions_actor` FOREIGN KEY (`actor_account_id`) REFERENCES `accounts` (`account_id`));
 -- Create "event_dependencies" table
 CREATE TABLE `event_dependencies` (`space_id` text NOT NULL, `child_hash` text NOT NULL, `parent_hash` text NOT NULL, PRIMARY KEY (`space_id`, `child_hash`, `parent_hash`), CONSTRAINT `dependencies_child` FOREIGN KEY (`space_id`, `child_hash`) REFERENCES `events` (`space_id`, `hash`));
 -- Create "event_blobs" table
 CREATE TABLE `event_blobs` (`space_id` text NOT NULL, `event_hash` text NOT NULL, `blob_hash` text NOT NULL, PRIMARY KEY (`space_id`, `event_hash`, `blob_hash`), CONSTRAINT `event_blobs_event` FOREIGN KEY (`space_id`, `event_hash`) REFERENCES `events` (`space_id`, `hash`));
--- Create "resource_claims" table
-CREATE TABLE `resource_claims` (`space_id` text NOT NULL, `resource_id` text NOT NULL, `operation_id` text NOT NULL, PRIMARY KEY (`space_id`, `resource_id`), CONSTRAINT `claims_resource` FOREIGN KEY (`space_id`, `resource_id`) REFERENCES `resources` (`space_id`, `resource_id`), CONSTRAINT `claims_operation` FOREIGN KEY (`space_id`, `operation_id`) REFERENCES `operations` (`space_id`, `operation_id`));
 -- Create "nonce_receipts" table
 CREATE TABLE `nonce_receipts` (`space_id` text NOT NULL, `nonce` text NOT NULL, `body_hash` text NOT NULL, `request_body` text NOT NULL, `operation_id` text NOT NULL, `receipt` text NOT NULL, PRIMARY KEY (`space_id`, `nonce`), CONSTRAINT `nonces_operation_body` FOREIGN KEY (`space_id`, `operation_id`, `request_body`) REFERENCES `operations` (`space_id`, `operation_id`, `request`));
+-- Create "policy_pins" table
+CREATE TABLE `policy_pins` (`domain_kind` text NOT NULL, `domain_id` text NOT NULL, `genesis_root` text NOT NULL, `minimum_head` text NULL, PRIMARY KEY (`domain_kind`, `domain_id`), CONSTRAINT `policy_pins_kind` CHECK (domain_kind IN ('account', 'space')));
+-- Create "policy_journal" table
+CREATE TABLE `policy_journal` (`ordinal` integer NOT NULL, `entry_hash` text NOT NULL, `entry` text NOT NULL, `accepted_at_ms` integer NOT NULL, PRIMARY KEY (`ordinal`), CONSTRAINT `policy_journal_accepted_at` CHECK (accepted_at_ms >= 0));
+-- Create index "policy_journal_entry_hash" to table: "policy_journal"
+CREATE UNIQUE INDEX `policy_journal_entry_hash` ON `policy_journal` (`entry_hash`);
+-- Create "current_policy_heads" table
+CREATE TABLE `current_policy_heads` (`domain_kind` text NOT NULL, `domain_id` text NOT NULL, `authority_epoch` integer NOT NULL, `sequence` integer NOT NULL, `head_hash` text NOT NULL, PRIMARY KEY (`domain_kind`, `domain_id`), CONSTRAINT `current_policy_heads_kind` CHECK (domain_kind IN ('account', 'space')), CONSTRAINT `current_policy_heads_version` CHECK (authority_epoch >= 0 AND sequence >= 0));
+-- Create "authorization_challenges" table
+CREATE TABLE `authorization_challenges` (`space_id` text NOT NULL, `nonce` text NOT NULL, `invocation_hash` text NOT NULL, `stage` text NOT NULL, `challenge` text NOT NULL, `expires_at_ms` integer NOT NULL, `consumed` integer NOT NULL DEFAULT 0, PRIMARY KEY (`space_id`, `nonce`), CONSTRAINT `authorization_challenges_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`), CONSTRAINT `authorization_challenges_stage` CHECK (stage IN ('remote_read', 'admit', 'start', 'renew')), CONSTRAINT `authorization_challenges_expiry` CHECK (expires_at_ms >= 0), CONSTRAINT `authorization_challenges_consumed` CHECK (consumed IN (0,1)));
+-- Create "accepted_authorizations" table
+CREATE TABLE `accepted_authorizations` (`space_id` text NOT NULL, `authorization_id` text NOT NULL, `invocation_hash` text NOT NULL, `invocation_body_hash` text NOT NULL, `actor_kind` text NOT NULL, `actor_id` text NOT NULL, `device_id` text NOT NULL, `resource_id` text NOT NULL, `action` text NOT NULL, `grant_leaf` text NOT NULL, `signed_invocation` text NOT NULL, `source_body` text NOT NULL, `transport` text NOT NULL, `admission_challenge` text NOT NULL, `admission_receipts` text NOT NULL, `admitted_at_ms` integer NOT NULL, `operation_id` text NULL, PRIMARY KEY (`space_id`, `authorization_id`), CONSTRAINT `accepted_authorizations_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`), CONSTRAINT `accepted_authorizations_actor` CHECK (actor_kind IN ('account', 'service')), CONSTRAINT `accepted_authorizations_admitted_at` CHECK (admitted_at_ms >= 0));
+-- Create index "accepted_authorizations_invocation" to table: "accepted_authorizations"
+CREATE UNIQUE INDEX `accepted_authorizations_invocation` ON `accepted_authorizations` (`space_id`, `invocation_hash`);
+-- Create "authorization_nonces" table
+CREATE TABLE `authorization_nonces` (`space_id` text NOT NULL, `device_id` text NOT NULL, `nonce` text NOT NULL, `authorization_id` text NOT NULL, `body_hash` text NOT NULL, PRIMARY KEY (`space_id`, `device_id`, `nonce`), CONSTRAINT `authorization_nonces_authorization` FOREIGN KEY (`space_id`, `authorization_id`) REFERENCES `accepted_authorizations` (`space_id`, `authorization_id`));
+-- Create "resource_records" table
+CREATE TABLE `resource_records` (`space_id` text NOT NULL, `resource_id` text NOT NULL, `record_hash` text NOT NULL, `kind` text NOT NULL, `host_service_id` text NOT NULL, `signed_record` text NOT NULL, PRIMARY KEY (`space_id`, `resource_id`), CONSTRAINT `resource_records_space` FOREIGN KEY (`space_id`) REFERENCES `spaces` (`space_id`), CONSTRAINT `resource_records_kind` CHECK (kind IN ('space_control', 'project', 'execution_service')));
+-- Create index "resource_records_hash" to table: "resource_records"
+CREATE UNIQUE INDEX `resource_records_hash` ON `resource_records` (`space_id`, `record_hash`);
+-- Create "policy_nonces" table
+CREATE TABLE `policy_nonces` (`domain_kind` text NOT NULL, `domain_id` text NOT NULL, `nonce` text NOT NULL, `entry_hash` text NOT NULL, PRIMARY KEY (`domain_kind`, `domain_id`, `nonce`), CONSTRAINT `policy_nonces_entry` FOREIGN KEY (`entry_hash`) REFERENCES `policy_journal` (`entry_hash`), CONSTRAINT `policy_nonces_kind` CHECK (domain_kind IN ('account', 'space')));

@@ -49,7 +49,7 @@ table "spaces" {
     columns = [column.space_id]
   }
   check "space_revision" {
-    expr = "revision > 0"
+    expr = "revision >= 0"
   }
 }
 
@@ -98,6 +98,9 @@ table "events" {
   column "space_id" {
     type = text
   }
+  column "resource_id" {
+    type = text
+  }
   column "hash" {
     type = text
   }
@@ -135,6 +138,10 @@ table "events" {
   check "event_status" {
     expr = "status IN ('pending', 'ready', 'conflict', 'invalid')"
   }
+  foreign_key "events_resource" {
+    columns = [column.space_id, column.resource_id]
+    ref_columns = [table.resource_records.column.space_id, table.resource_records.column.resource_id]
+  }
 }
 
 table "blobs" {
@@ -168,6 +175,9 @@ table "conversations" {
   column "space_id" {
     type = text
   }
+  column "resource_id" {
+    type = text
+  }
   column "conversation_id" {
     type = text
   }
@@ -180,6 +190,10 @@ table "conversations" {
   foreign_key "conversations_space" {
     columns = [column.space_id]
     ref_columns = [table.spaces.column.space_id]
+  }
+  foreign_key "conversations_resource" {
+    columns = [column.space_id, column.resource_id]
+    ref_columns = [table.resource_records.column.space_id, table.resource_records.column.resource_id]
   }
 }
 
@@ -638,256 +652,6 @@ table "identity_pair_reviews" {
   }
 }
 
-table "accounts" {
-  schema = schema.main
-  column "account_id" {
-    type = text
-  }
-  column "root_public_key" {
-    type = text
-  }
-  column "public_record" {
-    type = text
-  }
-  primary_key {
-    columns = [column.account_id]
-  }
-}
-
-table "devices" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "device_id" {
-    type = text
-  }
-  column "account_id" {
-    type = text
-  }
-  column "kind" {
-    type = text
-  }
-  column "public_key" {
-    type = text
-  }
-  column "certificate" {
-    type = text
-  }
-  primary_key {
-    columns = [column.space_id, column.device_id]
-  }
-  foreign_key "devices_space" {
-    columns = [column.space_id]
-    ref_columns = [table.spaces.column.space_id]
-  }
-  foreign_key "devices_account" {
-    columns = [column.account_id]
-    ref_columns = [table.accounts.column.account_id]
-  }
-  check "device_kind" {
-    expr = "kind IN ('node', 'client')"
-  }
-}
-
-table "members" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "account_id" {
-    type = text
-  }
-  column "role" {
-    type = text
-  }
-  column "signed_record" {
-    type = text
-  }
-  primary_key {
-    columns = [column.space_id, column.account_id]
-  }
-  foreign_key "members_space" {
-    columns = [column.space_id]
-    ref_columns = [table.spaces.column.space_id]
-  }
-  foreign_key "members_account" {
-    columns = [column.account_id]
-    ref_columns = [table.accounts.column.account_id]
-  }
-  check "member_role" {
-    expr = "role IN ('owner', 'admin', 'member')"
-  }
-}
-
-table "resources" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "resource_id" {
-    type = text
-  }
-  column "owner_account_id" {
-    type = text
-  }
-  column "host_node_id" {
-    type = text
-  }
-  column "kind" {
-    type = text
-  }
-  primary_key {
-    columns = [column.space_id, column.resource_id]
-  }
-  foreign_key "resources_owner" {
-    columns = [column.owner_account_id]
-    ref_columns = [table.accounts.column.account_id]
-  }
-  foreign_key "resources_host" {
-    columns = [column.space_id, column.host_node_id]
-    ref_columns = [table.devices.column.space_id, table.devices.column.device_id]
-  }
-  check "resource_kind" {
-    expr = "kind IN ('agent', 'relay', 'storage')"
-  }
-}
-
-table "grants" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "grant_id" {
-    type = text
-  }
-  column "resource_id" {
-    type = text
-  }
-  column "grantee_account_id" {
-    type = text
-  }
-  column "parent_grant_id" {
-    type = text
-    null = true
-  }
-  column "action" {
-    type = text
-  }
-  column "signed_envelope" {
-    type = text
-  }
-  primary_key {
-    columns = [column.space_id, column.grant_id]
-  }
-  foreign_key "grants_resource" {
-    columns = [column.space_id, column.resource_id]
-    ref_columns = [table.resources.column.space_id, table.resources.column.resource_id]
-  }
-  foreign_key "grants_grantee" {
-    columns = [column.grantee_account_id]
-    ref_columns = [table.accounts.column.account_id]
-  }
-  foreign_key "grants_parent" {
-    columns = [column.space_id, column.parent_grant_id]
-    ref_columns = [table.grants.column.space_id, table.grants.column.grant_id]
-  }
-}
-
-table "policy_events" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "hash" {
-    type = text
-  }
-  column "authority_epoch" {
-    type = integer
-  }
-  column "sequence" {
-    type = integer
-  }
-  column "signed_envelope" {
-    type = text
-  }
-  primary_key {
-    columns = [column.space_id, column.hash]
-  }
-  index "policy_accepted_sequence" {
-    unique = true
-    columns = [column.space_id, column.authority_epoch, column.sequence]
-  }
-  index "policy_head_reference" {
-    unique = true
-    columns = [column.space_id, column.authority_epoch, column.sequence, column.hash]
-  }
-  foreign_key "policy_events_space" {
-    columns = [column.space_id]
-    ref_columns = [table.spaces.column.space_id]
-  }
-  check "policy_monotonic_values" {
-    expr = "authority_epoch > 0 AND sequence > 0"
-  }
-}
-
-table "policy_heads" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "authority_epoch" {
-    type = integer
-  }
-  column "sequence" {
-    type = integer
-  }
-  column "head_hash" {
-    type = text
-  }
-  primary_key {
-    columns = [column.space_id]
-  }
-  foreign_key "policy_heads_event" {
-    columns = [column.space_id, column.authority_epoch, column.sequence, column.head_hash]
-    ref_columns = [table.policy_events.column.space_id, table.policy_events.column.authority_epoch, table.policy_events.column.sequence, table.policy_events.column.hash]
-  }
-}
-
-table "authorization_decisions" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "operation_id" {
-    type = text
-  }
-  column "policy_hash" {
-    type = text
-  }
-  column "actor_account_id" {
-    type = text
-  }
-  column "receipt" {
-    type = text
-  }
-  primary_key {
-    columns = [column.space_id, column.operation_id]
-  }
-  foreign_key "decisions_operation" {
-    columns = [column.space_id, column.operation_id]
-    ref_columns = [table.operations.column.space_id, table.operations.column.operation_id]
-  }
-  foreign_key "decisions_policy" {
-    columns = [column.space_id, column.policy_hash]
-    ref_columns = [table.policy_events.column.space_id, table.policy_events.column.hash]
-  }
-  foreign_key "decisions_actor" {
-    columns = [column.actor_account_id]
-    ref_columns = [table.accounts.column.account_id]
-  }
-}
-
 table "event_dependencies" {
   schema = schema.main
   column "space_id" {
@@ -928,30 +692,6 @@ table "event_blobs" {
   }
 }
 
-table "resource_claims" {
-  schema = schema.main
-  column "space_id" {
-    type = text
-  }
-  column "resource_id" {
-    type = text
-  }
-  column "operation_id" {
-    type = text
-  }
-  primary_key {
-    columns = [column.space_id, column.resource_id]
-  }
-  foreign_key "claims_resource" {
-    columns = [column.space_id, column.resource_id]
-    ref_columns = [table.resources.column.space_id, table.resources.column.resource_id]
-  }
-  foreign_key "claims_operation" {
-    columns = [column.space_id, column.operation_id]
-    ref_columns = [table.operations.column.space_id, table.operations.column.operation_id]
-  }
-}
-
 table "nonce_receipts" {
   schema = schema.main
   column "space_id" {
@@ -978,5 +718,285 @@ table "nonce_receipts" {
   foreign_key "nonces_operation_body" {
     columns = [column.space_id, column.operation_id, column.request_body]
     ref_columns = [table.operations.column.space_id, table.operations.column.operation_id, table.operations.column.request]
+  }
+}
+
+table "policy_pins" {
+  schema = schema.main
+  column "domain_kind" {
+    type = text
+  }
+  column "domain_id" {
+    type = text
+  }
+  column "genesis_root" {
+    type = text
+  }
+  column "minimum_head" {
+    type = text
+    null = true
+  }
+  primary_key {
+    columns = [column.domain_kind, column.domain_id]
+  }
+  check "policy_pins_kind" {
+    expr = "domain_kind IN ('account', 'space')"
+  }
+}
+
+table "policy_journal" {
+  schema = schema.main
+  column "ordinal" {
+    type = integer
+  }
+  column "entry_hash" {
+    type = text
+  }
+  column "entry" {
+    type = text
+  }
+  column "accepted_at_ms" {
+    type = integer
+  }
+  primary_key {
+    columns = [column.ordinal]
+  }
+  index "policy_journal_entry_hash" {
+    unique = true
+    columns = [column.entry_hash]
+  }
+  check "policy_journal_accepted_at" {
+    expr = "accepted_at_ms >= 0"
+  }
+}
+
+table "current_policy_heads" {
+  schema = schema.main
+  column "domain_kind" {
+    type = text
+  }
+  column "domain_id" {
+    type = text
+  }
+  column "authority_epoch" {
+    type = integer
+  }
+  column "sequence" {
+    type = integer
+  }
+  column "head_hash" {
+    type = text
+  }
+  primary_key {
+    columns = [column.domain_kind, column.domain_id]
+  }
+  check "current_policy_heads_kind" {
+    expr = "domain_kind IN ('account', 'space')"
+  }
+  check "current_policy_heads_version" {
+    expr = "authority_epoch >= 0 AND sequence >= 0"
+  }
+}
+
+table "authorization_challenges" {
+  schema = schema.main
+  column "space_id" {
+    type = text
+  }
+  column "nonce" {
+    type = text
+  }
+  column "invocation_hash" {
+    type = text
+  }
+  column "stage" {
+    type = text
+  }
+  column "challenge" {
+    type = text
+  }
+  column "expires_at_ms" {
+    type = integer
+  }
+  column "consumed" {
+    type = integer
+    default = 0
+  }
+  primary_key {
+    columns = [column.space_id, column.nonce]
+  }
+  foreign_key "authorization_challenges_space" {
+    columns = [column.space_id]
+    ref_columns = [table.spaces.column.space_id]
+  }
+  check "authorization_challenges_stage" {
+    expr = "stage IN ('remote_read', 'admit', 'start', 'renew')"
+  }
+  check "authorization_challenges_expiry" {
+    expr = "expires_at_ms >= 0"
+  }
+  check "authorization_challenges_consumed" {
+    expr = "consumed IN (0,1)"
+  }
+}
+
+table "accepted_authorizations" {
+  schema = schema.main
+  column "space_id" {
+    type = text
+  }
+  column "authorization_id" {
+    type = text
+  }
+  column "invocation_hash" {
+    type = text
+  }
+  column "invocation_body_hash" {
+    type = text
+  }
+  column "actor_kind" {
+    type = text
+  }
+  column "actor_id" {
+    type = text
+  }
+  column "device_id" {
+    type = text
+  }
+  column "resource_id" {
+    type = text
+  }
+  column "action" {
+    type = text
+  }
+  column "grant_leaf" {
+    type = text
+  }
+  column "signed_invocation" {
+    type = text
+  }
+  column "source_body" {
+    type = text
+  }
+  column "transport" {
+    type = text
+  }
+  column "admission_challenge" {
+    type = text
+  }
+  column "admission_receipts" {
+    type = text
+  }
+  column "admitted_at_ms" {
+    type = integer
+  }
+  column "operation_id" {
+    type = text
+    null = true
+  }
+  primary_key {
+    columns = [column.space_id, column.authorization_id]
+  }
+  index "accepted_authorizations_invocation" {
+    unique = true
+    columns = [column.space_id, column.invocation_hash]
+  }
+  foreign_key "accepted_authorizations_space" {
+    columns = [column.space_id]
+    ref_columns = [table.spaces.column.space_id]
+  }
+  check "accepted_authorizations_actor" {
+    expr = "actor_kind IN ('account', 'service')"
+  }
+  check "accepted_authorizations_admitted_at" {
+    expr = "admitted_at_ms >= 0"
+  }
+}
+
+table "authorization_nonces" {
+  schema = schema.main
+  column "space_id" {
+    type = text
+  }
+  column "device_id" {
+    type = text
+  }
+  column "nonce" {
+    type = text
+  }
+  column "authorization_id" {
+    type = text
+  }
+  column "body_hash" {
+    type = text
+  }
+  primary_key {
+    columns = [column.space_id, column.device_id, column.nonce]
+  }
+  foreign_key "authorization_nonces_authorization" {
+    columns = [column.space_id, column.authorization_id]
+    ref_columns = [table.accepted_authorizations.column.space_id, table.accepted_authorizations.column.authorization_id]
+  }
+}
+
+table "resource_records" {
+  schema = schema.main
+  column "space_id" {
+    type = text
+  }
+  column "resource_id" {
+    type = text
+  }
+  column "record_hash" {
+    type = text
+  }
+  column "kind" {
+    type = text
+  }
+  column "host_service_id" {
+    type = text
+  }
+  column "signed_record" {
+    type = text
+  }
+  primary_key {
+    columns = [column.space_id, column.resource_id]
+  }
+  index "resource_records_hash" {
+    unique = true
+    columns = [column.space_id, column.record_hash]
+  }
+  foreign_key "resource_records_space" {
+    columns = [column.space_id]
+    ref_columns = [table.spaces.column.space_id]
+  }
+  check "resource_records_kind" {
+    expr = "kind IN ('space_control', 'project', 'execution_service')"
+  }
+}
+
+table "policy_nonces" {
+  schema = schema.main
+  column "domain_kind" {
+    type = text
+  }
+  column "domain_id" {
+    type = text
+  }
+  column "nonce" {
+    type = text
+  }
+  column "entry_hash" {
+    type = text
+  }
+  primary_key {
+    columns = [column.domain_kind, column.domain_id, column.nonce]
+  }
+  foreign_key "policy_nonces_entry" {
+    columns = [column.entry_hash]
+    ref_columns = [table.policy_journal.column.entry_hash]
+  }
+  check "policy_nonces_kind" {
+    expr = "domain_kind IN ('account', 'space')"
   }
 }
