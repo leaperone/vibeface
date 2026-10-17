@@ -252,6 +252,8 @@ async fn dispatch(
             let principal = current_view(node, session)
                 .await?
                 .principal(&session.subject_id)?;
+            let mut params = params;
+            bind_client_identity(&mut params, &principal.subject_id)?;
             node.rpc(
                 Access {
                     network_id: principal.network_id,
@@ -806,6 +808,42 @@ fn authorized_recovery<'a>(session: &'a mut Session, params: &Value) -> Result<&
     ensure!(recovery.authorized, "prove root ownership before recovery");
     Ok(recovery)
 }
+fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
+    fn validate(value: &Value, subject: &str) -> Result<()> {
+        match value {
+            Value::Object(fields) => {
+                if let Some(client) = fields.get("client_id") {
+                    ensure!(
+                        client.as_str() == Some(subject),
+                        "client_id differs from authenticated client"
+                    );
+                }
+                for value in fields.values() {
+                    validate(value, subject)?;
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    validate(value, subject)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    validate(input, subject)?;
+    if matches!(
+        input["method"].as_str(),
+        Some("message" | "presence" | "notifications" | "ack")
+    ) {
+        input
+            .as_object_mut()
+            .context("RPC input must be an object")?
+            .insert("client_id".to_owned(), Value::String(subject.to_owned()));
+    }
+    Ok(())
+}
+
 fn client_endpoint(value: &str) -> Result<String> {
     let mut url = reqwest::Url::parse(value)?;
     let scheme = match url.scheme() {
@@ -933,6 +971,34 @@ async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rpc_client_identity_is_bound_to_the_noise_principal() {
+        let mut input = json!({"method":"notifications"});
+        bind_client_identity(&mut input, "actual-client").unwrap();
+        assert_eq!(input["client_id"], "actual-client");
+        assert!(
+            bind_client_identity(
+                &mut json!({"method":"ack","client_id":"another-client"}),
+                "actual-client"
+            )
+            .is_err()
+        );
+        assert!(
+            bind_client_identity(
+                &mut json!({"method":"operate","request":{"client_id":"another-client"}}),
+                "actual-client"
+            )
+            .is_err()
+        );
+        assert!(
+            bind_client_identity(
+                &mut json!({"method":"message","client_id":"actual-client"}),
+                "actual-client"
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn channel_requests_require_bounded_ids_and_object_params() {
         let mut request = Request {
