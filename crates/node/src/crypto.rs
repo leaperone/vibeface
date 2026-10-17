@@ -337,7 +337,7 @@ mod tests {
             operation_id: "test".into(),
             body_hash: invocation.payload.body_hash.clone(),
             audience,
-            presenter: device,
+            presenter: device.clone(),
             policies: vec![],
             nonce: Nonce::from_bytes([2; 32]),
             issued_at_ms: 0,
@@ -349,6 +349,7 @@ mod tests {
             challenge,
             receipts: vec![],
             admitted_at_ms: 0,
+            transport: StoredTransport::DirectNoise { device },
         })
     }
     #[test]

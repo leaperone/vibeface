@@ -6,7 +6,8 @@ pub type NodeId = String;
 pub type EventHash = String;
 pub type ScopeId = String;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentSession {
     pub space_id: vibeface_secure::authorization::SpaceId,
     pub service: vibeface_secure::authorization::ServiceId,
@@ -92,6 +93,63 @@ pub enum EventBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StoredTransport {
+    DirectNoise {
+        device: vibeface_secure::authorization::DeviceId,
+    },
+    GatewayNoise {
+        device: vibeface_secure::authorization::DeviceId,
+        gateway: vibeface_secure::authorization::DeviceId,
+    },
+    VerifiedPeer {
+        origin: vibeface_secure::authorization::DeviceId,
+    },
+    LocalAgentAdapter {
+        service: vibeface_secure::authorization::ServiceId,
+        session: vibeface_secure::authorization::SessionRef,
+    },
+}
+
+impl From<&vibeface_secure::authorization::TransportEvidence> for StoredTransport {
+    fn from(value: &vibeface_secure::authorization::TransportEvidence) -> Self {
+        use vibeface_secure::authorization::TransportEvidence;
+        match value {
+            TransportEvidence::DirectNoise { device } => Self::DirectNoise {
+                device: device.clone(),
+            },
+            TransportEvidence::GatewayNoise { device, gateway } => Self::GatewayNoise {
+                device: device.clone(),
+                gateway: gateway.clone(),
+            },
+            TransportEvidence::VerifiedPeer { origin } => Self::VerifiedPeer {
+                origin: origin.clone(),
+            },
+            TransportEvidence::LocalAgentAdapter { service, session } => Self::LocalAgentAdapter {
+                service: service.clone(),
+                session: session.clone(),
+            },
+        }
+    }
+}
+
+impl StoredTransport {
+    pub(crate) fn into_evidence(self) -> vibeface_secure::authorization::TransportEvidence {
+        use vibeface_secure::authorization::TransportEvidence;
+        match self {
+            Self::DirectNoise { device } => TransportEvidence::DirectNoise { device },
+            Self::GatewayNoise { device, gateway } => {
+                TransportEvidence::GatewayNoise { device, gateway }
+            }
+            Self::VerifiedPeer { origin } => TransportEvidence::VerifiedPeer { origin },
+            Self::LocalAgentAdapter { service, session } => {
+                TransportEvidence::LocalAgentAdapter { service, session }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AdmissionProof {
     pub invocation:
@@ -102,6 +160,7 @@ pub struct AdmissionProof {
         vibeface_secure::authorization::Signed<vibeface_secure::authorization::FreshnessReceipt>,
     >,
     pub admitted_at_ms: u64,
+    pub transport: StoredTransport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -289,9 +348,12 @@ pub fn authorization_action(
     use vibeface_secure::authorization::Action;
 
     Ok(match body["method"].as_str() {
+        Some("context") if body["blob_hash"].is_string() => Action::AttachmentRead,
         Some("conversations" | "conversation" | "context") => Action::ConversationRead,
         Some("nodes" | "session" | "operation") => Action::OperationStatusRead,
         Some("create_conversation") => Action::ConversationCreate,
+        Some("bind_execution") => Action::ExecutionOpen,
+        Some("replica_inventory" | "replica_event" | "replica_blob") => Action::ReplicaRead,
         Some("message") => Action::MessageAppend,
         Some("create_task") => Action::TaskCreate,
         Some("update_task") => match body["status"].as_str() {
@@ -343,6 +405,19 @@ mod tests {
         assert!(authorization_action(&json!({"method":"update_task", "status":"done"})).is_err());
         assert!(authorization_action(&json!({"method":"update_task"})).is_err());
         assert!(authorization_action(&json!({"method":"unknown"})).is_err());
+        assert_eq!(
+            authorization_action(&json!({"method":"bind_execution"}))?,
+            Action::ExecutionOpen
+        );
+        assert_eq!(
+            authorization_action(&json!({"method":"context","blob_hash":"a"}))?,
+            Action::AttachmentRead
+        );
+        assert_eq!(
+            authorization_action(&json!({"method":"replica_event"}))?,
+            Action::ReplicaRead
+        );
+        assert!(authorization_action(&json!({"method":"replica_push"})).is_err());
         assert!(authorization_action(&Value::Null).is_err());
         Ok(())
     }
