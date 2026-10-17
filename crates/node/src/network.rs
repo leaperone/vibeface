@@ -1236,6 +1236,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_keeps_newest_cache_when_bootstraps_return_different_revisions() -> Result<()> {
+        let target = LocalIdentity::generate();
+        let target_id = target.node_id()?;
+        let (owner, _) = NetworkHub::new(target.clone(), NetworkConfig::default());
+        let template = owner.local_record().await?;
+        let now = now_secs()?;
+        let make_record = |age: i64, port: u16| -> Result<Reachability> {
+            let mut record = template.clone();
+            record.issued_at = now - age;
+            record.expires_at = record.issued_at + RECORD_TTL_SECS;
+            record.direct_urls = vec![format!("ws://127.0.0.1:{port}/api/network/ws")];
+            record.signature = target.sign_payload("reachability", &record.unsigned()?)?;
+            record.verify(now)?;
+            Ok(record)
+        };
+        let stale = make_record(60, 4701)?;
+        let fresh = make_record(40, 4702)?;
+        let newest = make_record(20, 4703)?;
+        let (stale_directory, _) =
+            NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        let (fresh_directory, _) =
+            NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        stale_directory.publish(stale.clone()).await?;
+        fresh_directory.publish(fresh.clone()).await?;
+        let mut tasks = JoinSet::new();
+        let stale_url = serve(stale_directory, &mut tasks).await?;
+        let fresh_url = serve(fresh_directory, &mut tasks).await?;
+        for bootstrap_urls in [
+            vec![fresh_url.clone(), stale_url.clone()],
+            vec![stale_url, fresh_url],
+        ] {
+            for cached in [None, Some(newest.clone())] {
+                let (resolver, _) = NetworkHub::new(
+                    LocalIdentity::generate(),
+                    NetworkConfig {
+                        bootstrap_urls: bootstrap_urls.clone(),
+                        ..Default::default()
+                    },
+                );
+                if let Some(record) = &cached {
+                    resolver.publish(record.clone()).await?;
+                }
+                let records = resolver.resolve(&target_id).await?;
+                let expected = cached.as_ref().unwrap_or(&fresh);
+                assert_eq!(
+                    records.first().map(|record| &record.signature),
+                    Some(&expected.signature)
+                );
+                assert!(
+                    records
+                        .iter()
+                        .any(|record| record.signature == fresh.signature)
+                );
+                assert!(
+                    records
+                        .iter()
+                        .any(|record| record.signature == stale.signature)
+                );
+                assert_eq!(
+                    resolver
+                        .lookup_local(&target_id)
+                        .await?
+                        .context("resolved record was not cached")?
+                        .signature,
+                    expected.signature
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn unrelated_relay_carries_native_noise_after_direct_failure() -> Result<()> {
         let mut tasks = JoinSet::new();
         let relay_identity = LocalIdentity::generate();
