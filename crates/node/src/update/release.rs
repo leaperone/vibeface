@@ -169,7 +169,7 @@ async fn resolve_release(
     version: Version,
 ) -> Result<Release> {
     let target = host_target()?;
-    let name = format!("vibeface-node-{version}-{target}.tar.gz");
+    let name = format!("vibeface-{version}-{target}.tar.gz");
     let asset = unique_asset(&release.assets, &name)?;
     let checksum = unique_asset(&release.assets, &format!("{name}.sha256"))?;
     ensure!(
@@ -260,7 +260,7 @@ fn trusted_url(url: &Url) -> bool {
 
 fn client() -> Result<Client> {
     Client::builder()
-        .user_agent(concat!("vibeface-node/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("vibeface/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(180))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
@@ -332,7 +332,7 @@ pub async fn stage(release: &Release, install_root: &Path) -> Result<PathBuf> {
         tag_commit(&client, &release.tag).await? == release.source_commit,
         "release tag changed since update check"
     );
-    let name = format!("vibeface-node-{}-{}", release.version, release.target);
+    let name = format!("vibeface-{}-{}", release.version, release.target);
     let archive_name = format!("{name}.tar.gz");
     let checksum = get_bytes(&client, &release.checksum_url, 4096).await?;
     let digest = checksum_digest(&checksum, &archive_name)?;
@@ -351,7 +351,7 @@ pub async fn stage(release: &Release, install_root: &Path) -> Result<PathBuf> {
         tokio::task::spawn_blocking(move || unpack(&archive_path, &unpack_root, &expected_name))
             .await??;
     verify_build(&package, release)?;
-    verify_binary(&package.join("vibeface-node"), &release.version).await?;
+    verify_binary(&package.join("vibeface"), &release.version).await?;
     let destination = releases.join(release.version.to_string());
     match fs::symlink_metadata(&destination) {
         Ok(metadata) => {
@@ -395,10 +395,7 @@ fn validate_release(release: &Release) -> Result<()> {
         (1..=MAX_ARCHIVE).contains(&release.archive_size),
         "release archive size exceeds limit"
     );
-    let name = format!(
-        "vibeface-node-{}-{}.tar.gz",
-        release.version, release.target
-    );
+    let name = format!("vibeface-{}-{}.tar.gz", release.version, release.target);
     ensure!(
         release.archive_url == asset_url(&release.tag, &name),
         "unexpected release archive URL"
@@ -613,11 +610,11 @@ fn verify_build(package: &Path, release: &Release) -> Result<()> {
         "package build identity does not match the official release tag"
     );
     ensure!(
-        build.update_protocol == 1 && build.data_epoch == 2,
+        build.update_protocol == 2 && build.data_epoch == 2,
         "package requires an unsupported update protocol or data epoch"
     );
     for file in [
-        "vibeface-node",
+        "vibeface",
         "README.md",
         "RUNTIME-REQUIREMENTS.md",
         "sidecars/package.json",
@@ -635,11 +632,7 @@ fn verify_build(package: &Path, release: &Release) -> Result<()> {
         );
     }
     ensure!(
-        fs::metadata(package.join("vibeface-node"))?
-            .permissions()
-            .mode()
-            & 0o111
-            != 0,
+        fs::metadata(package.join("vibeface"))?.permissions().mode() & 0o111 != 0,
         "package binary is not executable"
     );
     Ok(())
@@ -676,7 +669,7 @@ async fn verify_binary(binary: &Path, version: &Version) -> Result<()> {
     .await
     .context("packaged binary version check timed out")??;
     ensure!(
-        std::str::from_utf8(&output)?.trim_end() == format!("vibeface-node {version}"),
+        std::str::from_utf8(&output)?.trim_end() == format!("vibeface {version}"),
         "packaged binary version does not match release"
     );
     Ok(())
@@ -941,7 +934,7 @@ mod tests {
             checksum_url: String::new(),
             archive_size: 1,
         };
-        let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": 1, "data_epoch": 2});
+        let build = serde_json::json!({"version": release.version.to_string(), "target": release.target, "source_commit": release.source_commit, "update_protocol": 2, "data_epoch": 2});
         for dir in [&package, &copy] {
             for file in [
                 "README.md",
@@ -962,15 +955,14 @@ mod tests {
             )
             .unwrap();
             fs::write(
-                dir.join("vibeface-node"),
-                b"#!/bin/sh\nprintf 'vibeface-node 0.0.2\\n'\n",
+                dir.join("vibeface"),
+                b"#!/bin/sh\nprintf 'vibeface 0.0.2\\n'\n",
             )
             .unwrap();
-            fs::set_permissions(dir.join("vibeface-node"), fs::Permissions::from_mode(0o755))
-                .unwrap();
+            fs::set_permissions(dir.join("vibeface"), fs::Permissions::from_mode(0o755)).unwrap();
         }
         verify_build(&package, &release).unwrap();
-        verify_binary(&package.join("vibeface-node"), &release.version)
+        verify_binary(&package.join("vibeface"), &release.version)
             .await
             .unwrap();
         assert!(tree(&package).unwrap() == tree(&copy).unwrap());
@@ -1000,6 +992,16 @@ mod tests {
         )
         .unwrap();
         assert!(verify_build(&package, &release).is_err());
+        for unsupported_protocol in [1, 3] {
+            let mut unsupported_build = build.clone();
+            unsupported_build["update_protocol"] = serde_json::json!(unsupported_protocol);
+            fs::write(
+                package.join("BUILD-INFO.json"),
+                serde_json::to_vec(&unsupported_build).unwrap(),
+            )
+            .unwrap();
+            assert!(verify_build(&package, &release).is_err());
+        }
         for unsupported_epoch in [1, 3] {
             let mut unsupported_build = build.clone();
             unsupported_build["data_epoch"] = serde_json::json!(unsupported_epoch);
@@ -1011,7 +1013,7 @@ mod tests {
             assert!(verify_build(&package, &release).is_err());
         }
         assert!(
-            verify_binary(&package.join("vibeface-node"), &Version::new(0, 0, 3))
+            verify_binary(&package.join("vibeface"), &Version::new(0, 0, 3))
                 .await
                 .is_err()
         );

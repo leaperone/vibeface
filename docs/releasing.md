@@ -4,7 +4,7 @@
 
 ## 可下载的包
 
-每个平台的 Actions artifact 包含 `vibeface-node-<version>-<target>.tar.gz` 和同名 `.sha256`。三种包均在对应架构的原生 runner 构建，解包后运行 Node 多进程验收，不调用模型。
+每个平台的 Actions artifact 包含 `vibeface-<version>-<target>.tar.gz` 和同名 `.sha256`。三种包均在对应架构的原生 runner 构建，解包后运行 Node 多进程验收，不调用模型。
 
 | 平台 | Rust target | 构建和验收环境 |
 | --- | --- | --- |
@@ -15,11 +15,11 @@
 Linux 包依赖 glibc，未在旧版发行版验收。macOS 包没有 Apple 开发者签名或 notarization。根据设备选择包，在存放包的目录先校验再解压：
 
 ```sh
-shasum -a 256 -c vibeface-node-<version>-<target>.tar.gz.sha256
-tar -xzf vibeface-node-<version>-<target>.tar.gz
-cd vibeface-node-<version>-<target>
-./vibeface-node --version
-./vibeface-node --help
+shasum -a 256 -c vibeface-<version>-<target>.tar.gz.sha256
+tar -xzf vibeface-<version>-<target>.tar.gz
+cd vibeface-<version>-<target>
+./vibeface --version
+./vibeface --help
 ```
 
 包内有 Rust 程序、SDK sidecar 源码、浏览器密码学 JS/WASM、文档、用户级服务安装脚本和 `BUILD-INFO.json`，不含身份、配置、数据库、Provider 程序、模型凭证或 npm 依赖。干净 Git 提交的正常构建会记录版本、target 和源码提交；`--skip-build` 或未提交源码构建的 `source_commit` 为 `null`，不能作为提交身份的证明。
@@ -77,11 +77,11 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序和随包 sidecar，不覆盖身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。使用 Codex SDK 时，更新器在停服务前按新包的 lock 安装 sidecar 依赖，需要可用的 npm；安装失败保留现版，不复制旧 `node_modules`。Cursor SDK 不需要这一步。
 
-`BUILD-INFO.json` 声明 `update_protocol=1` 和 `data_epoch=2`。更新器只安装与本机存储 epoch 一致的包。账号数据库格式不属于 epoch 2，不能让自动更新覆盖该数据目录，也不在启动时隐式转换或清空。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
+`BUILD-INFO.json` 声明 `update_protocol=2` 和 `data_epoch=2`。包协议 2 要求同名 `vibeface` 程序和制品，不接受旧包布局；数据格式与 HTTP、DAG 协议没有因此变化。更新器只安装与本机存储 epoch 一致的包。账号数据库格式不属于 epoch 2，不能让自动更新覆盖该数据目录，也不在启动时隐式转换或清空。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
 
 ## 首次安装
 
-公开安装入口为仓库根 `install.sh`。默认选择最新 Stable，显式 `--channel nightly` 选择最新 Nightly；按数值版本比较，忽略 rc 和 draft，不使用 `/releases/latest` 获取 Nightly。当前只有 Nightly，Stable 安装会明确失败。命令和后续 CLI 管理见 [安装说明](install.md)；脚本 URL 在包含它的 PR 合并后才可用。
+公开安装入口为仓库根 `install.sh`。默认选择最新 Stable，显式 `--channel nightly` 选择最新 Nightly；按数值版本比较，忽略 rc 和 draft，不使用 `/releases/latest` 获取 Nightly。当前只有 Nightly，Stable 安装会明确失败。命令和后续 CLI 管理见 [安装说明](install.md)。
 
 安装器只依赖 Bash、curl、tar、gzip、系统文本工具及 `sha256sum` 或 `shasum`，不需要 jq、Python、Node.js 或 Rust。它解析公开 Releases 和 tag 对应的源码提交，下载完整包与准确同名的 SHA256，校验版本、target、源码身份、协议和 data epoch，并拒绝危险包路径、符号链接和特殊文件。校验通过后建立 `releases/<version>`、`current` 与用户 bin 链接，不覆盖已有安装、身份或服务。
 
@@ -89,11 +89,15 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 ## 手动建立受管安装或更换程序
 
-先停止 Node 用户服务，确认进程退出，再备份完整数据目录。备份包括身份和历史，应保持私密。不要让新旧程序同时使用同一数据目录。
+包协议 1 的旧预览版不能自动升级到包协议 2，新更新器也不接管旧包布局。下面的一次性操作保留数据和身份，不在程序中提供旧命令别名或旧包兼容层。
+
+先停用旧更新定时服务，备份 `current` 目标、用户服务定义和私有启动脚本。确认维护状态空闲且无结果未知操作后，再停止 Node 用户服务并等待目录锁释放，然后备份完整数据目录。备份包括身份和历史，应保持私密。不要强行结束任务，也不要让新旧程序同时使用同一数据目录。
 
 校验并解压新包到受管安装根目录下的独立目录，通过 `current` 符号链接选择程序。例如，先将解压后的包移动到 `$HOME/.local/share/vibeface/releases/<version>`，再创建指向它的 `$HOME/.local/share/vibeface/current`。保留整个包，不单独复制 Rust binary；更新器需要同包的脚本、sidecar 和 `BUILD-INFO.json`。
 
-用 `current/vibeface-node` 前台启动并核对设备身份和历史，随后按 [后台运行说明](node.md#作为后台应用运行) 安装指向这一固定路径的用户服务。停止前台进程后再启动用户服务，不更改原数据目录。已有私有凭证启动脚本时，保留它，并让它通过 `current` 启动 Node。
+原子切换 `current` 后，建立 `~/.local/bin/vibeface` 到 `current/vibeface` 的链接。旧 CLI 链接只有在确认属于该受管安装时才可移除，不覆盖用户自有文件。使用原数据目录前台启动并核对设备身份和历史，随后按 [后台运行说明](node.md#作为后台应用运行) 配置指向这一固定路径的用户服务。Linux 服务名是 `vibeface.service`，先卸载旧服务定义，避免双进程。停止前台进程后再启动用户服务，不更改原数据目录。
+
+已有私有凭证启动脚本时，保留内容和私有权限，仅将末端启动路径改为 `current/vibeface`。不要用 `service install` 覆盖凭证脚本。核对新服务的 PID、版本、设备身份、历史及本机健康状态，再恢复原更新渠道和自动更新策略。
 
 确认新程序可用后，再执行 `update configure` 设置渠道和自动更新。普通 `cargo install` 或直接复制 binary 不构成受管安装，更新器会要求先建立完整包与 `current` 链接。
 

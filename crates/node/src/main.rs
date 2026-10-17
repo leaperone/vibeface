@@ -7,12 +7,12 @@ use serde_json::{Value, json};
 use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-use vibeface_node::{
+use vibeface::{
     api,
     client::Client,
     config::{self, Config, ManagerSettings},
@@ -29,11 +29,20 @@ use vibeface_node::{
 
 mod service;
 
+const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4790);
+
 #[derive(Parser)]
-#[command(version, about = "Personal device network for local coding agents")]
+#[command(
+    version,
+    about = "Personal device network for local coding agents. Run without a command to start this node.",
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
+    /// Data directory for direct startup. Subcommands accept their own --data-dir.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
     #[command(subcommand)]
-    command: Action,
+    command: Option<Action>,
 }
 
 #[derive(Subcommand)]
@@ -87,7 +96,7 @@ impl Manager {
 struct Init {
     #[command(flatten)]
     data: DataDir,
-    #[arg(long, default_value = "127.0.0.1:4790")]
+    #[arg(long, default_value_t = DEFAULT_LISTEN)]
     listen: SocketAddr,
     #[arg(long)]
     public_url: Option<String>,
@@ -181,11 +190,24 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let command = match cli.command {
+        Some(command) => command,
+        None => {
+            let data_dir = cli.data_dir.unwrap_or_else(config::default_dir);
+            prepare_start(&data_dir)?;
+            Action::Serve(DataDir { data_dir })
+        }
+    };
+    match command {
         Action::Init(options) => init(*options),
         Action::Serve(options) => {
             let runtime = Arc::new(Runtime::open(&options.data_dir).await?);
             runtime.start().await?;
+            eprintln!(
+                "Web: {}\nRun vibeface access with the same --data-dir for the trusted browser entry.",
+                runtime.config.public_url
+            );
             tokio::select! {
                 result = api::serve(runtime.clone()) => result,
                 result = maintenance::serve(runtime, options.data_dir) => result,
@@ -200,9 +222,27 @@ async fn main() -> Result<()> {
     }
 }
 
+fn prepare_start(dir: &Path) -> Result<()> {
+    let empty = match dir.symlink_metadata() {
+        Ok(metadata) => {
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "data directory must not be a symbolic link"
+            );
+            fs::read_dir(dir)?.next().is_none()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error.into()),
+    };
+    if empty {
+        initialize(dir, Config::local(DEFAULT_LISTEN, vec![], false))?;
+    }
+    Ok(())
+}
+
 async fn status(options: Access) -> Result<()> {
     let data = fs::canonicalize(&options.data.data_dir)
-        .context("initialized data directory is required; run vibeface-node init first")?;
+        .context("initialized data directory is required; run vibeface init first")?;
     let configuration = Config::load(&data)?;
     let node_id = config::identity(&data)?.node_id()?;
     let health = maintenance::probe(&data).await.and_then(|health| {
@@ -257,21 +297,6 @@ async fn status(options: Access) -> Result<()> {
 
 fn init(options: Init) -> Result<()> {
     let dir = &options.data.data_dir;
-    ensure!(
-        !dir.join("identity.json").exists() && !dir.join("config.json").exists(),
-        "node already initialized; existing identity and configuration were preserved"
-    );
-    ensure!(
-        !dir.symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink()),
-        "data directory must not be a symbolic link"
-    );
-    if dir.exists() {
-        ensure!(
-            fs::read_dir(dir)?.next().is_none(),
-            "initialization requires an empty data directory; existing data was preserved"
-        );
-    }
     let roots: Vec<_> = options
         .roots
         .iter()
@@ -322,6 +347,25 @@ fn init(options: Init) -> Result<()> {
                     .join("sidecars/codex-manager.mjs"),
             },
         });
+    }
+    initialize(dir, configuration)
+}
+
+fn initialize(dir: &Path, configuration: Config) -> Result<()> {
+    ensure!(
+        !dir.join("identity.json").exists() && !dir.join("config.json").exists(),
+        "node already initialized; existing identity and configuration were preserved"
+    );
+    ensure!(
+        !dir.symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink()),
+        "data directory must not be a symbolic link"
+    );
+    if dir.exists() {
+        ensure!(
+            fs::read_dir(dir)?.next().is_none(),
+            "initialization requires an empty data directory; existing data was preserved"
+        );
     }
     configuration.validate()?;
     let identity = LocalIdentity::generate();
@@ -773,11 +817,103 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_direct_start_keeps_data_directory_arguments_unambiguous() {
+        let default = Cli::try_parse_from(["vibeface"]).unwrap();
+        assert!(default.command.is_none() && default.data_dir.is_none());
+        let direct = Cli::try_parse_from(["vibeface", "--data-dir", "/private/node data"]).unwrap();
+        assert!(direct.command.is_none());
+        assert_eq!(direct.data_dir.unwrap(), Path::new("/private/node data"));
+        let explicit =
+            Cli::try_parse_from(["vibeface", "serve", "--data-dir", "/private/node data"]).unwrap();
+        let Some(Action::Serve(options)) = explicit.command else {
+            panic!("expected explicit serve")
+        };
+        assert!(explicit.data_dir.is_none());
+        assert_eq!(options.data_dir, Path::new("/private/node data"));
+        for arguments in [
+            vec!["vibeface", "--data-dir", "/one", "serve"],
+            vec![
+                "vibeface",
+                "--data-dir",
+                "/one",
+                "serve",
+                "--data-dir",
+                "/two",
+            ],
+            vec!["vibeface", "--unknown"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_start_initializes_empty_directories_and_preserves_existing_identity() {
+        let root = std::env::temp_dir().join(format!("vibeface-direct-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        for name in ["missing", "empty"] {
+            let dir = root.join(name);
+            if name == "empty" {
+                fs::create_dir(&dir).unwrap();
+            }
+            prepare_start(&dir).unwrap();
+            let mut configuration = Config::load(&dir).unwrap();
+            assert_eq!(configuration.listen, "127.0.0.1:4790".parse().unwrap());
+            assert_eq!(configuration.public_url, "http://127.0.0.1:4790");
+            assert!(configuration.roots.is_empty() && configuration.manager.is_none());
+            assert!(!configuration.allow_insecure_lan && !configuration.network.mdns);
+            assert!(configuration.network.bootstrap_urls.is_empty());
+            assert!(configuration.network.advertise_urls.is_empty());
+            assert!(!configuration.network.relay_enabled);
+            configuration.timeout_secs = 1234;
+            configuration.save(&dir).unwrap();
+            let identity = fs::read(dir.join("identity.json")).unwrap();
+            let config = fs::read(dir.join("config.json")).unwrap();
+            let node_id = config::identity(&dir).unwrap().node_id().unwrap();
+            prepare_start(&dir).unwrap();
+            assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
+            assert_eq!(fs::read(dir.join("config.json")).unwrap(), config);
+            let runtime = Runtime::open(&dir).await.unwrap();
+            assert_eq!(runtime.identity.node_id().unwrap(), node_id);
+            assert_eq!(runtime.config.timeout_secs, 1234);
+            drop(runtime);
+            fs::write(dir.join("config.json"), b"invalid configuration").unwrap();
+            prepare_start(&dir).unwrap();
+            assert!(Runtime::open(&dir).await.is_err());
+            assert_eq!(fs::read(dir.join("identity.json")).unwrap(), identity);
+            assert_eq!(
+                fs::read(dir.join("config.json")).unwrap(),
+                b"invalid configuration"
+            );
+        }
+        let uninitialized = root.join("uninitialized");
+        fs::create_dir(&uninitialized).unwrap();
+        fs::write(uninitialized.join("existing-data"), b"preserve me").unwrap();
+        prepare_start(&uninitialized).unwrap();
+        assert!(Runtime::open(&uninitialized).await.is_err());
+        assert_eq!(
+            fs::read(uninitialized.join("existing-data")).unwrap(),
+            b"preserve me"
+        );
+        assert!(!uninitialized.join("identity.json").exists());
+        let file = root.join("file");
+        fs::write(&file, b"preserve file").unwrap();
+        assert!(prepare_start(&file).is_err());
+        #[cfg(unix)]
+        for target in [root.join("empty"), root.join("absent")] {
+            let link = root.join("link");
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            assert!(prepare_start(&link).is_err());
+            fs::remove_file(link).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cli_requires_one_invitation_and_supports_accountless_flags() {
-        assert!(Cli::try_parse_from(["vibeface-node", "pair"]).is_err());
+        assert!(Cli::try_parse_from(["vibeface", "pair"]).is_err());
         assert!(
             Cli::try_parse_from([
-                "vibeface-node",
+                "vibeface",
                 "pair",
                 "--invite",
                 "abc",
@@ -788,7 +924,7 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from([
-                "vibeface-node",
+                "vibeface",
                 "pair",
                 "--invite",
                 "abc",
@@ -797,8 +933,8 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["vibeface-node", "access", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["vibeface-node", "status", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface", "access", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface", "status", "--json"]).is_ok());
         for action in [
             "install",
             "start",
@@ -811,7 +947,7 @@ mod tests {
         ] {
             assert!(
                 Cli::try_parse_from([
-                    "vibeface-node",
+                    "vibeface",
                     "service",
                     action,
                     "--data-dir",
@@ -820,10 +956,10 @@ mod tests {
                 .is_ok()
             );
         }
-        assert!(Cli::try_parse_from(["vibeface-node", "service", "unknown"]).is_err());
+        assert!(Cli::try_parse_from(["vibeface", "service", "unknown"]).is_err());
         assert!(
             Cli::try_parse_from([
-                "vibeface-node",
+                "vibeface",
                 "init",
                 "--bootstrap-url",
                 "wss://relay.test/api/network/ws",
@@ -836,7 +972,7 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from([
-                "vibeface-node",
+                "vibeface",
                 "init",
                 "--manager",
                 "cursor_sdk",
@@ -845,7 +981,7 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["vibeface-node", "tool", "dispatch", "--json", "{}"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface", "tool", "dispatch", "--json", "{}"]).is_ok());
     }
 
     #[test]
@@ -885,7 +1021,7 @@ mod tests {
 
     #[test]
     fn pairing_review_binds_the_exact_local_request() {
-        use vibeface_node::{identity::local::InvitePayload, model::NodeRole};
+        use vibeface::{identity::local::InvitePayload, model::NodeRole};
         let device = LocalIdentity::generate();
         let member = Member::node(&device, "Build Node", vec![NodeRole::Replica]).unwrap();
         let invite = InviteEnvelope {
@@ -960,9 +1096,8 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("existing-data"), b"original").unwrap();
         let parsed =
-            Cli::try_parse_from(["vibeface-node", "init", "--data-dir", dir.to_str().unwrap()])
-                .unwrap();
-        let Action::Init(options) = parsed.command else {
+            Cli::try_parse_from(["vibeface", "init", "--data-dir", dir.to_str().unwrap()]).unwrap();
+        let Some(Action::Init(options)) = parsed.command else {
             panic!("expected init")
         };
         assert!(init(*options).is_err());

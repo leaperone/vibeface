@@ -382,7 +382,7 @@ async function run(input, reader, secrets) {
   });
   const threadOptions = {
     model: input.model,
-    threadSource: "vibeface-node-manager",
+    threadSource: "vibeface-manager",
     workingDirectory: cwd,
     skipGitRepoCheck: true,
     approvalPolicy: "never",

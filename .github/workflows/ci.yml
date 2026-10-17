@@ -107,7 +107,7 @@ jobs:
           cargo metadata --no-deps --format-version 1 --locked > "$RUNNER_TEMP/cargo-metadata.json"
           python3 - "$RUNNER_TEMP/cargo-metadata.json" <<'PY'
           import datetime, json, os, re, sys
-          package = next(p for p in json.load(open(sys.argv[1]))["packages"] if p["name"] == "vibeface-node")
+          package = next(p for p in json.load(open(sys.argv[1]))["packages"] if p["name"] == "vibeface")
           version = package["version"]
           number = r"(?:0|[1-9][0-9]*)"
           match = re.fullmatch(rf"{number}\.{number}\.{number}(?:-(nightly)\.([0-9]{{8}})\.([1-9][0-9]*)|-(rc)\.([1-9][0-9]*))?", version)
@@ -215,21 +215,21 @@ jobs:
           import json, os, pathlib, subprocess, sys
           info = json.load(open(sys.argv[1]))
           assert set(info) == {"version", "target", "source_commit", "update_protocol", "data_epoch"}
-          assert info["update_protocol"] == 1 and info["data_epoch"] == 2
+          assert info["update_protocol"] == 2 and info["data_epoch"] == 2
           assert info["source_commit"] == os.environ["GITHUB_SHA"]
           assert info["target"] == os.environ["PACKAGE_TARGET"]
-          binary = pathlib.Path(sys.argv[1]).parent / "vibeface-node"
+          binary = pathlib.Path(sys.argv[1]).parent / "vibeface"
           web = binary.parent / "web"
           assert (web / "vibeface_secure.js").stat().st_size > 0
           assert (web / "vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm")
-          assert subprocess.check_output([str(binary), "--version"], text=True).strip() == f'vibeface-node {info["version"]}'
+          assert subprocess.check_output([str(binary), "--version"], text=True).strip() == f'vibeface {info["version"]}'
           PY
-          "$package/vibeface-node" --help
+          "$package/vibeface" --help
           printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
       - name: Verify unpacked Node processes without model calls
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
-        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface-node" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --skip-codex
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-node --skip-codex
       - name: Verify packaged SDK lockfile without model calls
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         working-directory: ${{ steps.unpack.outputs.package }}/sidecars
@@ -290,7 +290,7 @@ jobs:
           [[ "${#archives[@]}" == 3 && "${#checksums[@]}" == 3 && "${#files[@]}" == 6 ]]
           for archive in "${archives[@]}"; do
             name="$(basename "$archive")"
-            [[ "$name" == "vibeface-node-$VERSION-"* ]]
+            [[ "$name" == "vibeface-$VERSION-"* ]]
             (cd packages && sha256sum -c "$name.sha256")
           done
       - name: Upload complete draft and publish

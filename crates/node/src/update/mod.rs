@@ -297,11 +297,11 @@ fn manifest(package: &Path) -> Result<Manifest> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
         .context("this package needs a manual bootstrap to the updater-enabled release")?;
     ensure!(
-        manifest.update_protocol == 1 && manifest.data_epoch == 2,
+        manifest.update_protocol == 2 && manifest.data_epoch == 2,
         "package does not support the current updater and data compatibility epoch; manual upgrade required"
     );
     ensure!(
-        fs::symlink_metadata(package.join("vibeface-node"))?.is_file(),
+        fs::symlink_metadata(package.join("vibeface"))?.is_file(),
         "package binary is missing"
     );
     ensure!(
@@ -338,7 +338,7 @@ async fn configure_timer(policy: &Policy, data: &Path) -> Result<()> {
         command
             .arg("install-updater")
             .arg("--binary")
-            .arg(policy.install_root.join("current/vibeface-node"));
+            .arg(policy.install_root.join("current/vibeface"));
     } else {
         command.arg("uninstall-updater");
     }
@@ -650,10 +650,7 @@ async fn prepare_firewall(data: &Path, root: &Path, candidate: &Path) -> Result<
             state.contains("State = 1"),
             "unknown application firewall state; update deferred"
         );
-        for binary in [
-            candidate.join("vibeface-node"),
-            root.join("current/vibeface-node"),
-        ] {
+        for binary in [candidate.join("vibeface"), root.join("current/vibeface")] {
             checked(
                 Command::new(tool).arg("--add").arg(&binary),
                 "retain this node's application firewall permission",
@@ -733,7 +730,7 @@ impl Service {
         #[cfg(target_os = "linux")]
         {
             let output = Command::new("systemctl")
-                .args(["--user", "cat", "vibeface-node.service"])
+                .args(["--user", "cat", "vibeface.service"])
                 .output()
                 .await?;
             ensure!(
@@ -790,7 +787,7 @@ impl ServiceControl for Service {
         #[cfg(target_os = "linux")]
         {
             checked(
-                Command::new("systemctl").args(["--user", "stop", "vibeface-node.service"]),
+                Command::new("systemctl").args(["--user", "stop", "vibeface.service"]),
                 "stop node service",
             )
             .await
@@ -828,7 +825,7 @@ impl ServiceControl for Service {
         #[cfg(target_os = "linux")]
         {
             checked(
-                Command::new("systemctl").args(["--user", "start", "vibeface-node.service"]),
+                Command::new("systemctl").args(["--user", "start", "vibeface.service"]),
                 "start node service",
             )
             .await
@@ -879,11 +876,11 @@ mod tests {
     fn package(root: &Path, version: &str) -> PathBuf {
         let directory = root.join("releases").join(version);
         fs::create_dir_all(directory.join("scripts")).unwrap();
-        fs::write(directory.join("vibeface-node"), b"binary").unwrap();
+        fs::write(directory.join("vibeface"), b"binary").unwrap();
         fs::write(directory.join("scripts/install-node-service.sh"), b"script").unwrap();
         fs::write(
             directory.join("BUILD-INFO.json"),
-            format!(r#"{{"version":"{version}","update_protocol":1,"data_epoch":2}}"#),
+            format!(r#"{{"version":"{version}","update_protocol":2,"data_epoch":2}}"#),
         )
         .unwrap();
         directory
@@ -909,11 +906,17 @@ mod tests {
         assert_eq!(managed_install_root(&data).unwrap(), root);
         switch(&root, &new).unwrap();
         assert_eq!(installed(&root).unwrap(), new);
-        assert!(old.join("vibeface-node").is_file());
+        assert!(old.join("vibeface").is_file());
         let outside = sandbox();
         let escaped = package(&outside, "2.0.0");
         assert!(switch(&root, &escaped).is_err());
         assert_eq!(installed(&root).unwrap(), new);
+        fs::write(
+            old.join("BUILD-INFO.json"),
+            r#"{"version":"1.0.0","update_protocol":1,"data_epoch":2}"#,
+        )
+        .unwrap();
+        assert!(manifest(&old).is_err());
         fs::write(old.join("BUILD-INFO.json"), r#"{"version":"1.0.0"}"#).unwrap();
         assert!(manifest(&old).is_err());
         fs::remove_dir_all(root).unwrap();

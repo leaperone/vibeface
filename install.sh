@@ -10,7 +10,7 @@ Usage: install.sh [--channel stable|nightly] [--install-root DIRECTORY] [--bin-d
 
 Install the latest published Vibeface release for this platform (default: stable).
 No account, provider, node data, background service, or automatic update is configured.
-Existing installations must use vibeface-node update apply instead.
+Existing installations must use vibeface update apply instead.
 USAGE
 }
 
@@ -136,7 +136,7 @@ check_archive() {
 
 verify_package() {
   local package="$1" version="$2" target="$3" commit="$4" scratch="$5" entry
-  for entry in vibeface-node BUILD-INFO.json README.md RUNTIME-REQUIREMENTS.md \
+  for entry in vibeface BUILD-INFO.json README.md RUNTIME-REQUIREMENTS.md \
     sidecars/package.json sidecars/package-lock.json sidecars/codex-manager.mjs \
     scripts/install-node-service.sh docs/node.md docs/releasing.md \
     web/vibeface_secure.js web/vibeface_secure_bg.wasm; do
@@ -146,10 +146,10 @@ verify_package() {
   json_fields "$package/BUILD-INFO.json" object > "$scratch/build-fields" || fail 'invalid BUILD-INFO.json'
   awk -F '\t' -v version="$version" -v target="$target" -v commit="$commit" '
     { info[$2]=$3 }
-    END { exit !(info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]=="1" && info["data_epoch"]=="2") }
+    END { exit !(info["version"]==version && info["target"]==target && info["source_commit"]==commit && info["update_protocol"]=="2" && info["data_epoch"]=="2") }
   ' "$scratch/build-fields" || fail 'BUILD-INFO does not match the release, platform, source commit, or data epoch'
-  [[ -x "$package/vibeface-node" ]] || fail 'packaged CLI is not executable'
-  [[ $("$package/vibeface-node" --version) == "vibeface-node $version" ]] || fail 'packaged CLI version does not match the release'
+  [[ -x "$package/vibeface" ]] || fail 'packaged CLI is not executable'
+  [[ $("$package/vibeface" --version) == "vibeface $version" ]] || fail 'packaged CLI version does not match the release'
 }
 
 install_release() (
@@ -172,8 +172,8 @@ install_release() (
   done
   [[ $channel == stable || $channel == nightly ]] || fail 'channel must be stable or nightly'
   [[ $install_root == /* && $bin_dir == /* && $install_root != *$'\n'* && $bin_dir != *$'\n'* ]] || fail 'installation directories must be absolute paths without newlines'
-  [[ ! -e "$install_root/current" && ! -L "$install_root/current" ]] || fail 'current already exists; use vibeface-node update apply'
-  [[ ! -e "$bin_dir/vibeface-node" && ! -L "$bin_dir/vibeface-node" ]] || fail 'vibeface-node already exists in the bin directory; use update apply for a managed installation'
+  [[ ! -e "$install_root/current" && ! -L "$install_root/current" ]] || fail 'current already exists; use vibeface update apply'
+  [[ ! -e "$bin_dir/vibeface" && ! -L "$bin_dir/vibeface" ]] || fail 'vibeface already exists in the bin directory; use update apply for a managed installation'
   case "$(uname -s)/$(uname -m)" in
     Darwin/arm64|Darwin/aarch64) target=aarch64-apple-darwin ;;
     Linux/x86_64|Linux/amd64) target=x86_64-unknown-linux-gnu ;;
@@ -188,7 +188,7 @@ install_release() (
   scratch=$(mktemp -d "${TMPDIR:-/tmp}/vibeface-install.XXXXXX")
   trap '
     if ! "$complete"; then
-      if "$made_bin" && [[ -L "$bin_dir/vibeface-node" && $(readlink "$bin_dir/vibeface-node") == "$install_root/current/vibeface-node" ]]; then rm "$bin_dir/vibeface-node"; fi
+      if "$made_bin" && [[ -L "$bin_dir/vibeface" && $(readlink "$bin_dir/vibeface") == "$install_root/current/vibeface" ]]; then rm "$bin_dir/vibeface"; fi
       if "$made_current" && [[ -L "$install_root/current" && $(readlink "$install_root/current") == "releases/$version" ]]; then rm "$install_root/current"; fi
       if [[ -n $destination ]]; then rm -rf "$destination"; fi
     fi
@@ -212,7 +212,7 @@ install_release() (
     fail 'no published Nightly release'
   fi
   version=${tag#v}
-  package="vibeface-node-$version-$target"
+  package="vibeface-$version-$target"
   archive="$package.tar.gz"
   fetch "https://api.github.com/repos/leaperone/vibeface/commits/$tag" "$scratch/commit.json" 4194304
   json_fields "$scratch/commit.json" object > "$scratch/commit-fields" || fail 'invalid release commit response'
@@ -240,19 +240,18 @@ install_release() (
   bin_dir=$(cd "$bin_dir" && pwd -P)
   mkdir "$install_root/.install-lock" || fail 'another installer is active; no changes made'
   lock="$install_root/.install-lock"
-  [[ ! -e "$install_root/current" && ! -L "$install_root/current" && ! -e "$bin_dir/vibeface-node" && ! -L "$bin_dir/vibeface-node" ]] || fail 'installation appeared during download; use update apply'
+  [[ ! -e "$install_root/current" && ! -L "$install_root/current" && ! -e "$bin_dir/vibeface" && ! -L "$bin_dir/vibeface" ]] || fail 'installation appeared during download; use update apply'
   [[ ! -e "$install_root/releases/$version" && ! -L "$install_root/releases/$version" ]] || fail 'release directory already exists; it was preserved'
   destination="$install_root/releases/$version"
   mv "$scratch/unpack/$package" "$destination" || fail 'cannot stage the verified release'
   ln -s "releases/$version" "$install_root/current" || fail 'cannot create the current release link'
   made_current=true
-  ln -s "$install_root/current/vibeface-node" "$bin_dir/vibeface-node" || fail 'cannot create the CLI link'
+  ln -s "$install_root/current/vibeface" "$bin_dir/vibeface" || fail 'cannot create the CLI link'
   made_bin=true
   complete=true
-  printf 'Installed %s at %s\n' "$tag" "$bin_dir/vibeface-node"
-  printf 'No node data or services were created. Next:\n  %q init --root /absolute/path/to/projects\n' "$bin_dir/vibeface-node"
-  printf '  %q update configure --install-root %q --channel %s --automatic false\n' "$bin_dir/vibeface-node" "$install_root" "$channel"
-  printf '  %q serve\n' "$bin_dir/vibeface-node"
+  printf 'Installed %s at %s\n' "$tag" "$bin_dir/vibeface"
+  printf 'No node data or services were created. Start your local node:\n  %q\n' "$bin_dir/vibeface"
+  printf 'After initialization, select its update channel:\n  %q update configure --install-root %q --channel %s --automatic false\n' "$bin_dir/vibeface" "$install_root" "$channel"
   # shellcheck disable=SC2016 # Print the PATH expression for the user to evaluate.
   case ":$PATH:" in *":$bin_dir:"*) ;; *) printf 'Add your bin directory to PATH, or use the absolute CLI path above:\n  export PATH=%q:"$PATH"\n' "$bin_dir" ;; esac
 )
@@ -291,7 +290,7 @@ if [[ $1 == -s ]]; then cat "$VIBEFACE_INSTALL_FIXTURE/os"; else cat "$VIBEFACE_
 MOCK
   cat > "$fixture/bin/ln" <<'MOCK'
 #!/usr/bin/env bash
-if [[ -f "$VIBEFACE_INSTALL_FIXTURE/fail-link" && ${2:-} == */current/vibeface-node ]]; then exit 1; fi
+if [[ -f "$VIBEFACE_INSTALL_FIXTURE/fail-link" && ${2:-} == */current/vibeface ]]; then exit 1; fi
 exec "$VIBEFACE_INSTALL_REAL_LN" "$@"
 MOCK
   chmod +x "$fixture/bin/curl" "$fixture/bin/uname" "$fixture/bin/ln"
@@ -317,7 +316,7 @@ JSON
   [[ $(select_release "$fixture/fields" nightly) == v0.0.1-nightly.20261017.10 ]] || fail 'self-test: Nightly numeric sorting or channel isolation'
   version=0.0.1-nightly.20261017.10
   target=x86_64-unknown-linux-gnu
-  package="vibeface-node-$version-$target"
+  package="vibeface-$version-$target"
   mkdir -p "$fixture/source/$package"
   local entry
   for entry in README.md RUNTIME-REQUIREMENTS.md sidecars/package.json sidecars/package-lock.json \
@@ -326,10 +325,10 @@ JSON
     mkdir -p "$fixture/source/$package/$(dirname "$entry")"
     printf 'test fixture\n' > "$fixture/source/$package/$entry"
   done
-  printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":2}\n' \
+  printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":2,"data_epoch":2}\n' \
     "$version" "$target" > "$fixture/source/$package/BUILD-INFO.json"
-  printf '#!/bin/sh\nprintf "vibeface-node %s\\n"\n' "$version" > "$fixture/source/$package/vibeface-node"
-  chmod +x "$fixture/source/$package/vibeface-node"
+  printf '#!/bin/sh\nprintf "vibeface %s\\n"\n' "$version" > "$fixture/source/$package/vibeface"
+  chmod +x "$fixture/source/$package/vibeface"
   repack_fixture() {
     tar -czf "$fixture/package.tar.gz" -C "$fixture/source" "$package"
     printf '%s  %s.tar.gz\n' "$(sha256 "$fixture/package.tar.gz")" "$package" > "$fixture/checksum"
@@ -344,9 +343,9 @@ JSON
   case_dir="$test_dir/success"
   mkdir "$case_dir"
   bash "$script" --channel nightly --install-root "$case_dir/root" --bin-dir "$case_dir/bin" > "$case_dir/output"
-  [[ $("$case_dir/bin/vibeface-node" --version) == "vibeface-node $version" ]] || fail 'self-test: installed CLI'
+  [[ $("$case_dir/bin/vibeface" --version) == "vibeface $version" ]] || fail 'self-test: installed CLI'
   [[ $(readlink "$case_dir/root/current") == "releases/$version" ]] || fail 'self-test: current layout'
-  [[ $(readlink "$case_dir/bin/vibeface-node") == "$case_dir/root/current/vibeface-node" ]] || fail 'self-test: bin layout'
+  [[ $(readlink "$case_dir/bin/vibeface") == "$case_dir/root/current/vibeface" ]] || fail 'self-test: bin layout'
   [[ -f "$case_dir/root/releases/$version/scripts/install-node-service.sh" ]] || fail 'self-test: incomplete package'
   expect_failure nightly 'current already exists'
   [[ $(readlink "$case_dir/root/current") == "releases/$version" ]] || fail 'self-test: existing installation changed'
@@ -354,9 +353,9 @@ JSON
   for platform in aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-unknown-linux-gnu; do
     old_package="$package"
     target="$platform"
-    package="vibeface-node-$version-$target"
+    package="vibeface-$version-$target"
     if [[ $old_package != "$package" ]]; then mv "$fixture/source/$old_package" "$fixture/source/$package"; fi
-    printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":2}\n' \
+    printf '{"version":"%s","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":2,"data_epoch":2}\n' \
       "$version" "$target" > "$fixture/source/$package/BUILD-INFO.json"
     case "$target" in
       aarch64-apple-darwin) printf 'Darwin\n' > "$fixture/os"; printf 'arm64\n' > "$fixture/arch" ;;
@@ -398,16 +397,25 @@ JSON
   printf '%s  %s.tar.gz\n' "$(sha256 "$fixture/package.tar.gz")" "$package" > "$fixture/checksum"
   expect_failure nightly 'archive contains unsafe or duplicate paths'
   repack_fixture
+  case_dir="$test_dir/package-protocol"
+  mkdir "$case_dir"
+  sed 's/"update_protocol":2/"update_protocol":1/' "$fixture/source/$package/BUILD-INFO.json" > "$fixture/unsupported-build"
+  cp "$fixture/unsupported-build" "$fixture/source/$package/BUILD-INFO.json"
+  repack_fixture
+  expect_failure nightly 'BUILD-INFO does not match'
+  sed 's/"update_protocol":1/"update_protocol":2/' "$fixture/source/$package/BUILD-INFO.json" > "$fixture/supported-build"
+  cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
+  repack_fixture
   case_dir="$test_dir/manifest"
   mkdir "$case_dir"
-  printf '{"version":"wrong","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":1,"data_epoch":2}\n' "$target" > "$fixture/source/$package/BUILD-INFO.json"
+  printf '{"version":"wrong","target":"%s","source_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","update_protocol":2,"data_epoch":2}\n' "$target" > "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
   expect_failure nightly 'BUILD-INFO does not match'
   case_dir="$test_dir/bin-conflict"
   mkdir -p "$case_dir/bin"
-  printf 'preserve me\n' > "$case_dir/bin/vibeface-node"
+  printf 'preserve me\n' > "$case_dir/bin/vibeface"
   expect_failure nightly 'already exists in the bin directory'
-  [[ $(cat "$case_dir/bin/vibeface-node") == 'preserve me' ]] || fail 'self-test: bin conflict changed'
+  [[ $(cat "$case_dir/bin/vibeface") == 'preserve me' ]] || fail 'self-test: bin conflict changed'
   case_dir="$test_dir/no-stable"
   mkdir "$case_dir"
   printf '[{"tag_name":"v%s","draft":false,"prerelease":true}]\n' "$version" > "$fixture/releases.json"

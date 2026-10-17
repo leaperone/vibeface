@@ -4,8 +4,8 @@ umask 077
 
 usage() {
   cat <<'USAGE'
-Usage: install-node-service.sh install --binary /absolute/vibeface-node --data-dir /absolute/data
-       install-node-service.sh install-updater --binary /install-root/current/vibeface-node --data-dir /absolute/data
+Usage: install-node-service.sh install --binary /absolute/vibeface --data-dir /absolute/data
+       install-node-service.sh install-updater --binary /install-root/current/vibeface --data-dir /absolute/data
        install-node-service.sh start|stop|restart|status [--data-dir /absolute/data]
        install-node-service.sh uninstall-updater|uninstall [--data-dir /absolute/data]
 
@@ -201,7 +201,7 @@ PLIST
     ;;
   Linux)
     service_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-    service="$service_dir/vibeface-node.service"
+    service="$service_dir/vibeface.service"
     update_service="$service_dir/vibeface-update.service"
     update_timer="$service_dir/vibeface-update.timer"
     check_service_data() {
@@ -217,10 +217,10 @@ PLIST
       [[ "$count" == 1 && "$start" == ExecStart=*" $expected --data-dir \"$(systemd_exec_escape "$data_dir")\"" ]] || different_data
     }
     case "$action" in
-      start|stop|restart) check_service_data "$service" vibeface-node.service serve ;;
+      start|stop|restart) check_service_data "$service" vibeface.service serve ;;
       uninstall-updater) check_service_data "$update_service" vibeface-update.service 'update apply --automatic' ;;
       install|install-updater|status|uninstall)
-        check_service_data "$service" vibeface-node.service serve
+        check_service_data "$service" vibeface.service serve
         check_service_data "$update_service" vibeface-update.service 'update apply --automatic'
         ;;
     esac
@@ -286,17 +286,17 @@ UNIT
           chmod 600 "$temp"
           mv "$temp" "$service"
           systemctl --user daemon-reload
-          systemctl --user enable --now vibeface-node.service
+          systemctl --user enable --now vibeface.service
           printf 'Installed %s\n' "$service"
         fi
         ;;
       start|stop|restart)
         [[ -f "$service" ]] || { echo 'Installed node service is required.' >&2; exit 1; }
-        systemctl --user "$action" vibeface-node.service
+        systemctl --user "$action" vibeface.service
         ;;
       status)
         status_code=0
-        systemctl --user --no-pager status vibeface-node.service || status_code=$?
+        systemctl --user --no-pager status vibeface.service || status_code=$?
         if ! systemctl --user --no-pager status vibeface-update.timer; then
           if [[ -f "$update_timer" ]]; then
             printf 'Updater is installed but its timer is not active.\n'
@@ -312,7 +312,7 @@ UNIT
         systemctl --user stop vibeface-update.service >/dev/null 2>&1 || true
         rm -f "$update_service" "$update_timer"
         if [[ "$action" == uninstall ]]; then
-          systemctl --user disable --now vibeface-node.service >/dev/null 2>&1 || true
+          systemctl --user disable --now vibeface.service >/dev/null 2>&1 || true
           rm -f "$service"
         fi
         systemctl --user daemon-reload
