@@ -761,6 +761,119 @@ pub(crate) mod tests {
                 .status,
             "accepted"
         );
+        drop(store);
+        task(&network, &node, "wrongpayload", false).await?;
+        let before = node
+            .store
+            .lock()
+            .await
+            .context(network.space.as_str(), "conversation", &[])?
+            .events
+            .len();
+        for empty in [false, true] {
+            let mut body = network.body("create_task", "conversation");
+            let task_id = if empty { "active" } else { "wrongpayload" };
+            body["task_id"] = json!(task_id);
+            body["title"] = json!(task_id);
+            body["goal"] = json!(if empty {
+                "complete the requested work"
+            } else {
+                "substitute another task goal"
+            });
+            body["acceptance"] = json!("the user verifies the result");
+            body["auto_followup"] = json!(true);
+            let access = access(&network, &node, &body).await?;
+            let events = if empty {
+                vec![]
+            } else {
+                vec![(
+                    "conversation".into(),
+                    EventBody::DecisionRecorded {
+                        decision_id: format!("auto:{task_id}"),
+                        text: format!(
+                            "User enabled bounded automatic follow-up for task {task_id}"
+                        ),
+                        effective_constraints: vec![format!("auto_followup:{task_id}")],
+                        tool_configuration: json!({"auto_followup":task_id}),
+                    },
+                    vec![],
+                )]
+            };
+            let mut store = node.store.lock().await;
+            assert!(
+                store
+                    .append_authorized_events(
+                        &node.identity,
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        &body,
+                        events,
+                        now_ms()
+                    )
+                    .is_err()
+            );
+            let accepted:bool=store.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM accepted_authorizations WHERE space_id=? AND authorization_id=?)",
+                rusqlite::params![network.space.as_str(),body["authorization_id"].as_str().unwrap()],|row|row.get(0))?;
+            assert!(!accepted);
+            assert_eq!(
+                store
+                    .context(network.space.as_str(), "conversation", &[])?
+                    .events
+                    .len(),
+                before
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn service_decision_text_cannot_grant_account_followup_authority() -> Result<()> {
+        let (network, node) = runtime_fixture().await?;
+        task(&network, &node, "spoofed", false).await?;
+        let session = agent(&network, &node).await?;
+        let text = "User enabled bounded automatic follow-up for task spoofed";
+        node.record_agent_result(&session,json!({
+            "authorization_id":"spoofed-followup-result","decision_id":"auto:spoofed","text":text,
+            "effective_constraints":["auto_followup:spoofed"],"tool_configuration":{"auto_followup":"spoofed"},
+            "message_id":"actual-manager-result","output":"normal management output","blobs":[],
+        })).await?;
+        {
+            let store = node.store.lock().await;
+            let events = store
+                .context(network.space.as_str(), "conversation", &[])?
+                .events;
+            assert_eq!(events.iter().filter(|event|matches!(&event.body,EventBody::DecisionRecorded{decision_id,..} if decision_id=="auto:spoofed")
+                && matches!(&event.cause,EventCause::Invocation{admission} if matches!(admission.invocation.payload.actor,Actor::Service(_)))).count(),1);
+            assert!(!followup_authorized(
+                &store,
+                network.space.as_str(),
+                "conversation",
+                "spoofed"
+            )?);
+        }
+        task(&network, &node, "spoofed", true).await?;
+        let mut store = node.store.lock().await;
+        assert!(followup_authorized(
+            &store,
+            network.space.as_str(),
+            "conversation",
+            "spoofed"
+        )?);
+        let events = store
+            .context(network.space.as_str(), "conversation", &[])?
+            .events;
+        assert_eq!(events.iter().filter(|event|matches!(&event.body,EventBody::TaskCreated{task_id,..} if task_id=="spoofed")).count(),1);
+        assert_eq!(events.iter().filter(|event|matches!(&event.body,EventBody::DecisionRecorded{decision_id,..} if decision_id=="auto:spoofed")
+            && matches!(&event.cause,EventCause::Invocation{admission} if matches!(admission.invocation.payload.actor,Actor::Account(_)))).count(),1);
+        network.revoke_client(&mut store)?;
+        assert!(!followup_authorized(
+            &store,
+            network.space.as_str(),
+            "conversation",
+            "spoofed"
+        )?);
         Ok(())
     }
 
@@ -1247,12 +1360,14 @@ fn require_task_write(
 }
 
 fn followup_authorized(store: &Store, network: &str, scope: &str, task: &str) -> Result<bool> {
-    if store
+    let Some(task) = store
         .tasks(network, scope)?
-        .iter()
-        .find(|t| t.task_id == task)
-        .is_none_or(|task| matches!(task.status.as_str(), "accepted" | "cancelled"))
-    {
+        .into_iter()
+        .find(|record| record.task_id == task)
+    else {
+        return Ok(false);
+    };
+    if matches!(task.status.as_str(), "accepted" | "cancelled") {
         return Ok(false);
     }
     let context = store.context(network, scope, &[])?;
@@ -1260,17 +1375,43 @@ fn followup_authorized(store: &Store, network: &str, scope: &str, task: &str) ->
         context.missing.is_complete(),
         "follow-up context is incomplete"
     );
-    Ok(context.events.iter().any(|event| {
-        event.scope_id == scope
-            && matches!(&event.body, EventBody::DecisionRecorded {
-                decision_id, effective_constraints, tool_configuration, ..
-            } if decision_id == &format!("auto:{task}")
-                && effective_constraints.contains(&format!("auto_followup:{task}"))
-                && tool_configuration["auto_followup"] == task)
-            && store
-                .authorize_node(network, &event.author, Some(NodeRole::Gateway))
-                .is_ok()
-    }))
+    let events = crate::store::load_events_from(&store.connection, network)?;
+    for event in &context.events {
+        if event.scope_id != scope
+            || !matches!(&event.body,EventBody::DecisionRecorded {decision_id,effective_constraints,tool_configuration,..}
+            if decision_id==&format!("auto:{}",task.task_id)
+                && effective_constraints.contains(&format!("auto_followup:{}",task.task_id))
+                && tool_configuration["auto_followup"]==task.task_id)
+        {
+            continue;
+        }
+        let EventCause::Invocation { admission } = &event.cause else {
+            continue;
+        };
+        let source = &admission.source_body;
+        if !matches!(admission.invocation.payload.actor, Actor::Account(_))
+            || source["method"] != "create_task"
+            || source["auto_followup"] != true
+            || source["task_id"] != task.task_id
+            || source["title"] != task.title
+            || source["goal"] != task.goal
+            || source["acceptance"] != task.acceptance
+        {
+            continue;
+        }
+        if crate::identity::event_authorization::current_event_authorization(
+            &store.policy,
+            &store.connection,
+            event,
+            &events,
+            now_ms() as u64,
+        )
+        .is_ok_and(|auth| matches!(auth.actor(), Actor::Account(_)))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn require_executor_followup(
@@ -1327,10 +1468,17 @@ fn require_executor_followup(
                 && session == session_id
                 && store
                     .authorize_node(network, &dispatch.author, None)
-                    .is_ok_and(|author| {
-                        author.roles.contains(&NodeRole::Gateway)
-                            || author.roles.contains(&NodeRole::Scheduler)
-                    })
+                    .is_ok()
+                && crate::identity::event_authorization::current_event_authorization(
+                    &store.policy,
+                    &store.connection,
+                    dispatch,
+                    &events,
+                    now_ms() as u64,
+                )
+                .is_ok_and(|auth| {
+                    auth.action() == vibeface_secure::authorization::Action::ExecutionSend
+                })
                 && serde_json::from_value::<OperationRequest>(action.clone()).is_ok_and(|request| {
                     request.network_id == network
                         && request.conversation_id == scope
@@ -2717,15 +2865,19 @@ impl Runtime {
                         vec![],
                     ));
                 }
-                let appended = store.append_authorized_events(
-                    &self.identity,
-                    &access.authorization,
-                    &access.freshness,
-                    &access.transport,
-                    &access.body,
-                    events,
-                    now_ms(),
-                )?;
+                let appended = if events.is_empty() {
+                    Vec::new()
+                } else {
+                    store.append_authorized_events(
+                        &self.identity,
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        &access.body,
+                        events,
+                        now_ms(),
+                    )?
+                };
                 for event in &appended {
                     self.publish_changed(network, &scope, &event.hash);
                 }

@@ -864,7 +864,84 @@ fn append_admitted_events_in(
 ) -> Result<Vec<SignedEvent>> {
     super::admission::validate_persisted_admission(connection, proof)?;
     let transport = proof.transport.clone().into_evidence();
-    let expected = expected_events(&proof.source_body, &proof.invocation, &transport)?;
+    let mut expected = expected_events(&proof.source_body, &proof.invocation, &transport)?;
+    ensure!(
+        !batch.is_empty(),
+        "empty event batch has no authorized mutation"
+    );
+    if proof.source_body["method"] == "create_task" {
+        let scope = source_scope(&proof.source_body)?;
+        let space = proof.invocation.payload.resource.space.as_str();
+        let resource = &proof.invocation.payload.resource.resource;
+        let events = load_events_from(connection, space)?;
+        let task_id = text(&proof.source_body, "task_id")?;
+        let existing=events.values().filter(|stored| stored.status=="ready"
+            && stored.event.scope_id==scope && &stored.event.resource_id==resource
+            && matches!(&stored.event.body,EventBody::TaskCreated{task_id:id,..} if id==task_id)).collect::<Vec<_>>();
+        ensure!(existing.len() <= 1, "task has ambiguous creation history");
+        if let Some(created) = existing.first() {
+            let (requested, blobs) = expected
+                .first()
+                .context("task creation request has no event")?;
+            ensure!(
+                &created.event.body == requested && &created.event.blobs == blobs,
+                "task retry differs from its original creation"
+            );
+            ensure!(
+                validate_event_evidence(policy, connection, &created.event, &events)?
+                    == EventEvidenceStatus::Valid,
+                "task creation has incomplete authorization evidence"
+            );
+            ensure!(
+                verify_event_envelope(policy, space, &created.envelope)? == created.event,
+                "task creation envelope differs from its admitted event"
+            );
+            expected.remove(0);
+            let mut missing = Vec::new();
+            for (body, blobs) in expected {
+                let mut authorized = false;
+                for prior in events.values().filter(|stored| {
+                    stored.status == "ready"
+                        && stored.event.scope_id == scope
+                        && &stored.event.resource_id == resource
+                        && stored.event.body == body
+                        && stored.event.blobs == blobs
+                }) {
+                    let EventCause::Invocation { admission } = &prior.event.cause else {
+                        continue;
+                    };
+                    let old = &admission.source_body;
+                    if !matches!(admission.invocation.payload.actor, Actor::Account(_))
+                        || old["method"] != "create_task"
+                        || old["auto_followup"] != true
+                        || ["task_id", "title", "goal", "acceptance"]
+                            .iter()
+                            .any(|key| old[*key] != proof.source_body[*key])
+                    {
+                        continue;
+                    }
+                    ensure!(
+                        verify_event_envelope(policy, space, &prior.envelope)? == prior.event
+                            && validate_event_evidence(policy, connection, &prior.event, &events)?
+                                == EventEvidenceStatus::Valid,
+                        "existing task decision has incomplete authorization evidence"
+                    );
+                    authorized |= current_event_authorization(
+                        policy,
+                        connection,
+                        &prior.event,
+                        &events,
+                        now_ms,
+                    )
+                    .is_ok();
+                }
+                if !authorized {
+                    missing.push((body, blobs));
+                }
+            }
+            expected = missing;
+        }
+    }
     ensure!(
         batch.len() == expected.len()
             && batch.iter().zip(&expected).all(
