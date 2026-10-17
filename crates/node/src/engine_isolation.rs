@@ -128,8 +128,8 @@ impl DockerIsolation {
     fn key(&self, context: &ExecutionContext) -> String {
         if self.project_read_only {
             hash(&format!(
-                "manager\0{}\0{}",
-                context.space_id, context.resource_id
+                "manager\0{}\0{}\0{}",
+                context.space_id, context.resource_id, context.operation_id
             ))
         } else {
             Self::scope_key(context)
@@ -1208,10 +1208,14 @@ mod tests {
             shared: true,
             lease_expires_at_ms: vibeface_protocol::now_ms() + 30_000,
         };
+        let mut other_manager = context.clone();
+        other_manager.operation_id = "another-manager-agent-start".into();
         let result = async {
             let writable = executor.prepare(&context, &project).await?;
             let readonly = manager.prepare(&context, &project).await?;
+            let other_readonly = manager.prepare(&other_manager, &project).await?;
             ensure!(writable.id != readonly.id && writable.name != readonly.name, "Manager reused executor generation");
+            ensure!(readonly.id != other_readonly.id && readonly.name != other_readonly.name, "different AgentStarts reused a Manager generation");
             let mut write = writable.command("node");
             write.args(["-e", "require('node:fs').writeFileSync('/home/vibeface/executor-private','private');require('node:fs').writeFileSync('/project/executor-visible','visible')"]);
             checked_output(write, "write executor positive controls").await?;
@@ -1221,11 +1225,18 @@ mod tests {
             let mut reverse = writable.command("node");
             reverse.args(["-e", "if(require('node:fs').existsSync('/home/vibeface/manager-private'))process.exit(1)"]);
             checked_output(reverse, "verify executor cannot read Manager HOME").await?;
-            println!("manager-executor-proof={}", serde_json::json!({"same_space_resource":true,"distinct_container_ids":true,"distinct_homes":true,"executor_project_write_positive":true,"manager_project_read_positive":true,"manager_project_write_denied":true}));
+            let mut cross = other_readonly.command("node");
+            cross.args(["-e", "const fs=require('node:fs');if(fs.existsSync('/home/vibeface/manager-private'))process.exit(1);fs.writeFileSync('/home/vibeface/other-manager-private','private')"]);
+            checked_output(cross, "verify another AgentStart cannot read Manager HOME").await?;
+            let mut cross_reverse = readonly.command("node");
+            cross_reverse.args(["-e", "if(require('node:fs').existsSync('/home/vibeface/other-manager-private'))process.exit(1)"]);
+            checked_output(cross_reverse, "verify Manager cannot read another AgentStart HOME").await?;
+            println!("manager-executor-proof={}", serde_json::json!({"same_space_resource":true,"distinct_container_ids":true,"distinct_homes":true,"executor_project_write_positive":true,"manager_project_read_positive":true,"manager_project_write_denied":true,"different_agent_starts_isolated":true}));
             Ok::<_, anyhow::Error>(())
         }.await;
         let _ = executor.complete(&context).await;
         let _ = manager.complete(&context).await;
+        let _ = manager.complete(&other_manager).await;
         std::fs::remove_dir_all(root)?;
         result
     }

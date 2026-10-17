@@ -666,8 +666,8 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
         }
         let home = |context: &ExecutionContext| {
             let key = hex::encode(Sha256::digest(format!(
-                "manager\0{}\0{}",
-                context.space_id, context.resource_id
+                "manager\0{}\0{}\0{}",
+                context.space_id, context.resource_id, context.operation_id
             )));
             data.join("execution").join(key).join("home")
         };
@@ -710,6 +710,112 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
             let _ = engine.cancel_manager(context).await;
             let _ = engine.complete_manager(context).await;
         }
+        server.abort();
+        std::fs::remove_dir_all(root)?;
+        outcome
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the real isolated SDK image and a trusted live model gateway"]
+    async fn production_manager_returns_a_marker_from_the_real_scoped_node_tool() -> Result<()> {
+        use crate::engine::{ExecutionEgressConfig, ExecutionIsolationConfig, ExecutorConfig};
+        use axum::{Json, Router, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use vibeface_secure::authorization::{ResourceId, SpaceId};
+        let root = PathBuf::from(std::env::var("VIBEFACE_ISOLATION_TEST_ROOT")?)
+            .join(uuid::Uuid::new_v4().to_string());
+        let data = root.join("node");
+        let project = root.join("project");
+        crate::config::private_dir(&data)?;
+        std::fs::create_dir(&project)?;
+        let marker = format!("manager-model-tool-{}", uuid::Uuid::new_v4());
+        let returned = marker.clone();
+        let token = "fixture-scoped-callback-token-1234567890";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let router = Router::new().route(
+            "/api/tools",
+            post(
+                move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let observed = observed.clone();
+                    let returned = returned.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], format!("Bearer {token}"));
+                        assert_eq!(body["name"], "nodes");
+                        assert_eq!(body["arguments"], json!({}));
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({"marker":returned,"nodes":[]}))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let callback = format!("http://{}/", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let (events, _) = tokio::sync::mpsc::unbounded_channel();
+        let engine = Engine::new(
+            ExecutorConfig {
+                execution_isolation: Some(ExecutionIsolationConfig {
+                    image: std::env::var("VIBEFACE_ISOLATION_TEST_IMAGE")?,
+                    docker_bin: std::env::var("VIBEFACE_ISOLATION_TEST_DOCKER")?.into(),
+                    egress: Some(ExecutionEgressConfig {
+                        gateway_container: std::env::var("VIBEFACE_ISOLATION_TEST_GATEWAY")?,
+                        gateway_port: 8080,
+                        codex_model: "gpt-6.1-sol".into(),
+                    }),
+                }),
+                data_dir: Some(data),
+                ..ExecutorConfig::default()
+            },
+            events,
+        );
+        let config = ManagerConfig {
+            kind: ManagerKind::CodexSdk,
+            workspace: project,
+            model: "gpt-6.1-sol".into(),
+            timeout_secs: 90,
+            custom_tools: BTreeMap::from([(
+                "nodes".into(),
+                CustomToolConfig {
+                    description: None,
+                    input_schema: json!({"type":"object"}),
+                    output_schema: None,
+                },
+            )]),
+            tool_callback_url: Some(callback),
+            tool_callback_token: Some(token.into()),
+        };
+        let context = ExecutionContext {
+            space_id: SpaceId::parse(&format!("spc2_{}", "d".repeat(64)))?,
+            resource_id: ResourceId::parse(&format!("res2_{}", "e".repeat(64)))?,
+            operation_id: "real-manager-model-operation".into(),
+            shared: true,
+            lease_expires_at_ms: vibeface_protocol::now_ms() + 30_000,
+        };
+        let outcome = async {
+            let persisted = root.join("observed-native-session.json");
+            let record = persisted.clone();
+            let run = run_manager_authorized(&engine, &context, &config, "Use your command-execution tool to run '/opt/vibeface/sdk/codex-manager.mjs' tool nodes --json '{}' exactly once. Read its JSON result. Reply with exactly the marker field from that real result. Do not invent the marker. Do not read files, change files, use network tools or run other commands.", None, move |id| async move { crate::config::private_write(&record, &serde_json::to_vec(&id)?)?; Ok(()) }, |_| async { Ok(()) });
+            tokio::pin!(run);
+            let result = loop {
+                tokio::select! {
+                    result = &mut run => break result?,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        engine.renew_manager(&context, vibeface_protocol::now_ms() + 30_000).await?;
+                    }
+                }
+            };
+            ensure!(result.output.trim() == marker, "real Manager did not return the real tool marker");
+            ensure!(calls.load(Ordering::SeqCst) == 1, "real Manager tool call count differed from one");
+            ensure!(result.session_id.is_some() && serde_json::from_slice::<String>(&std::fs::read(&persisted)?)? == *result.session_id.as_ref().unwrap(), "real Manager session was not durably observed before continuing");
+            println!("manager-real-model-proof={}", json!({"model":"gpt-6.1-sol","sdk":"0.163.0","output":result.output.trim(),"marker_was_absent_from_prompt":true,"model_turns":1,"node_tool_calls":1,"native_session_persisted":true,"terminal_container_stop_confirmed":true,"actual_node_authorization":false}));
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        let _ = engine.cancel_manager(&context).await;
+        let _ = engine.complete_manager(&context).await;
         server.abort();
         std::fs::remove_dir_all(root)?;
         outcome

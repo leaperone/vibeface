@@ -219,19 +219,19 @@ function childEnvironment(socket) {
   return env;
 }
 
-function managerPrompt(prompt, toolCli) {
+function managerPrompt(prompt, toolCli, allowedTools) {
   if (toolCli === undefined) return prompt;
   const executable = `'${toolCli.replaceAll("'", "'\"'\"'")}'`;
   const tools = [
     ["nodes", {}, "List reachable execution nodes, capabilities and allowed roots."],
     ["context", { offset: 0, limit: 20 }, "Page original conversation events. For referenced blobs, add blob_hash; offset counts bytes and limit counts KiB."],
     ["create_task", { task_id: "stable-id", title: "title", goal: "goal", acceptance: "human acceptance criteria" }, "Create a task. Reuse its task_id when retrying."],
-    ["open_execution", { operation_id: "stable-id", session_id: "stable-id", target_node: "node-id", executor: "codex", cwd: "/allowed/root" }, "Open an execution session. executor is codex, cursor_agent or claude_code. task_id is optional."],
-    ["send_execution", { operation_id: "stable-id", session_id: "existing-id", target_node: "node-id", expected_revision: 0, text: "task instructions" }, "Send to an existing session at its current revision. task_id is optional. Reconcile unknown results before any resend."],
+    ["open_execution", { operation_id: "stable-id", task_id: "selected-task-id", session_id: "stable-id", target_node: "node-id", executor: "codex", cwd: "/allowed/root" }, "Open an execution session for a selected Task. executor is codex, cursor_agent or claude_code. task_id is required. The Node verifies the Task binding; never invent authorization proofs."],
+    ["send_execution", { operation_id: "stable-id", task_id: "selected-task-id", session_id: "existing-id", target_node: "node-id", expected_revision: 0, text: "task instructions" }, "Send to the selected Task's existing session at its current revision. task_id is required. The Node verifies the Task binding. Reconcile unknown results before any resend."],
     ["execution_status", { target_node: "node-id", session_id: "existing-id" }, "Read actual execution status without sending work or approving anything."],
     ["update_task", { task_id: "existing-id", status: "working", detail: "progress" }, "Record progress. status is open, working, blocked or needs_review. Only the human may accept or cancel tasks."],
   ];
-  const catalog = tools.map(([name, args, description]) => `${name} ${JSON.stringify(args)}\n${description}`).join("\n\n");
+  const catalog = tools.filter(([name]) => allowedTools.includes(name)).map(([name, args, description]) => `${name} ${JSON.stringify(args)}\n${description}`).join("\n\n");
   const result = `Node tool access is available through your command-execution tool. Run this executable with a tool name and one shell-quoted JSON object:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor example, run ${executable} tool nodes --json '{}'. The CLI uses the private local tool channel and prints a JSON result. The Node callback credentials remain outside this process. Use these Node tools to manage tasks and execution; do not use MCP, edit project files or launch executors directly. Conversation and network scope are supplied by the CLI. Use the real results and report errors instead of claiming a failed call succeeded.\n\nAvailable tool arguments and meanings follow. Replace example values with the requested values.\n${catalog}\n\n${prompt}`;
   if (bytes(result) > MAX_PROMPT_BYTES) throw new ProtocolError("management prompt with Node tool instructions exceeded the size limit");
   return result;
@@ -391,7 +391,7 @@ async function run(input, reader, secrets) {
   const toolCli = input.tools.length === 0 ? undefined : fileURLToPath(import.meta.url);
   const tools = await startToolChannel(input.tools);
   try {
-    const prompt = managerPrompt(input.prompt, toolCli);
+    const prompt = managerPrompt(input.prompt, toolCli, input.tools);
 
     const codex = new Codex({
       codexPathOverride: codexPath,
