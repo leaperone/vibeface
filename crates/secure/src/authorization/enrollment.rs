@@ -1485,6 +1485,13 @@ mod tests {
         )
         .unwrap();
         let signed: Signed<EnrollmentOffer> = parse(&json).unwrap();
+        let mut changed_signature = signed.clone();
+        changed_signature.signature = Signature::parse(&"00".repeat(64)).unwrap();
+        assert_ne!(
+            enrollment_offer_hash(&signed).unwrap(),
+            enrollment_offer_hash(&changed_signature).unwrap()
+        );
+        assert!(verify_enrollment_offer(&changed_signature, NOW).is_err());
         assert!(signed.payload.manager_journal.iter().all(|entry| matches!(
             entry,
             JournalEntry::AccountGenesis(_)
@@ -1921,9 +1928,7 @@ mod tests {
         let verified_offer = verify_device_enrollment_offer(&offer, NOW as f64).unwrap();
         assert_eq!(
             verified_offer.offer_hash().unwrap(),
-            parse::<Signed<EnrollmentOffer>>(&offer)
-                .unwrap()
-                .hash()
+            ObjectHash::body(&parse::<Signed<EnrollmentOffer>>(&offer).unwrap())
                 .unwrap()
                 .to_string()
         );

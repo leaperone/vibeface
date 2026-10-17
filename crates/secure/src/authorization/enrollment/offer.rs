@@ -38,7 +38,7 @@ pub struct VerifiedEnrollmentOffer {
 }
 
 pub fn enrollment_offer_hash(offer: &Signed<EnrollmentOffer>) -> Result<ObjectHash> {
-    offer.hash()
+    ObjectHash::body(offer)
 }
 
 pub fn decode_enrollment_offer(bytes: &[u8]) -> Result<Signed<EnrollmentOffer>> {
