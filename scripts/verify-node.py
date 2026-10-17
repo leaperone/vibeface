@@ -521,11 +521,12 @@ class Node:
             self.log.close()
             self.log = None
 
-    def pair(self, owner, network):
+    def pair(self, owner, network, *, relay_url=None):
         network_config = json.loads((self.directory / "config.json").read_text())["network"]
         invitation = owner.client.invite("node", ["gateway", "relay", "replica", "scheduler", "executor"])
         path = self.directory / "pair-invitation.json"
-        private_json(path, {"url": owner.url, "node_id": owner.node_id, "invite": invitation})
+        private_json(path, {"url": relay_url or owner.url, "node_id": owner.node_id,
+                            "relay": relay_url is not None, "invite": invitation})
         process = subprocess.Popen([str(self.binary), "pair", "--data-dir", str(self.directory),
                                     "--invite-file", str(path), "--name", f"Node {self.name}"],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -949,7 +950,9 @@ def acceptance(options):
         passed("local aliases and explicit entries validate Host/Origin without account cookies", "real_http_origin_boundaries")
 
         b.pair(a, network)
-        c.pair(a, network)
+        wait_for("A reserves its public relay route",
+                 lambda: b'{"type":"reserved"}' in capture.payloads)
+        c.pair(a, network, relay_url=capture.url)
         b.start()
         c.start()
         b.client.connect()
