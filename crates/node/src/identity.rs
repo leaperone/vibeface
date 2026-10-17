@@ -655,6 +655,10 @@ impl NetworkState {
                 GovernanceAction::Grant { member } => {
                     member.validate()?;
                     ensure!(
+                        member.public_key != self.genesis.owner_public_key,
+                        "recovery root cannot be a daily device or client identity"
+                    );
+                    ensure!(
                         !member.manage,
                         "management clients require a root checkpoint"
                     );
@@ -1171,6 +1175,25 @@ mod tests {
         let root_member = Member::client(&root, "unsafe client", true)?;
         assert!(Genesis::create(&root, vec![root_member.clone()]).is_err());
         assert!(RootCheckpoint::create(&root, 2, vec![root_member]).is_err());
+        let (root, admin, _, mut state) = setup()?;
+        assert!(
+            state
+                .append(GovernanceEvent::grant(
+                    &admin,
+                    &state.project()?,
+                    Member::client(&root, "root client", false)?,
+                )?)
+                .is_err()
+        );
+        assert!(
+            state
+                .append(GovernanceEvent::grant(
+                    &admin,
+                    &state.project()?,
+                    Member::node(&root, "root Node", vec![NodeRole::Replica])?,
+                )?)
+                .is_err()
+        );
         Ok(())
     }
 
