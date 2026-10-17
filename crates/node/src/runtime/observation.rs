@@ -214,7 +214,12 @@ pub(super) fn execution_progress(event: &Value) -> Value {
             }
         }
         if content["type"] == "assistant" {
-            let body = &content["message"]["content"];
+            let message = &content["message"];
+            let body = message
+                .get("content")
+                .or_else(|| message.get("text"))
+                .or_else(|| content.get("text"))
+                .unwrap_or(message);
             let text = body.as_str().map(String::from).or_else(|| {
                 body.as_array().map(|blocks| {
                     blocks
@@ -601,6 +606,18 @@ mod tests {
             &json!({"kind":"executor_progress","event":{"type":"assistant","message":{"content":[{"type":"text","text":"第一行"},{"type":"text","text":"第二行"},{"type":"tool_use","input":{"secret":"private-value"}}]}}}),
         );
         assert_eq!(cli["text"], "第一行\n第二行");
+        assert_eq!(
+            execution_progress(
+                &json!({"kind":"executor_progress","event":{"type":"assistant","message":"working"}})
+            )["text"],
+            "working"
+        );
+        assert_eq!(
+            execution_progress(
+                &json!({"kind":"executor_progress","event":{"type":"assistant","message":{"text":"working"}}})
+            )["text"],
+            "working"
+        );
         let tool = execution_progress(
             &json!({"method":"item/completed","params":{"item":{"id":"tool","type":"commandExecution","command":"private-value","output":"private-value"}}}),
         );
