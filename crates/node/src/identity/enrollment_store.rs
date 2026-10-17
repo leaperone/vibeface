@@ -1,7 +1,7 @@
 use super::{journal, policy::project_policy_in};
 use crate::{crypto::LocalIdentity, store::Store};
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use vibeface_secure::authorization::{
@@ -42,6 +42,236 @@ enum EnrollmentPhase {
         certificate: DeviceCertificate,
         completion: Value,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevicePolicyCompletion {
+    committed: Committed<AccountDocument>,
+    journal_delta: Vec<JournalEntry>,
+}
+
+fn validate_possession(
+    intent: &DeviceEnrollmentIntent,
+    nonce: &Nonce,
+    certificate: &DeviceCertificate,
+) -> Result<()> {
+    use vibeface_secure::authorization::{Actor, DeviceUse};
+    let mut uses = vec![DeviceUse::Noise, DeviceUse::AccountInvocation];
+    if intent
+        .requested_rights
+        .contains(&AccountRight::EnrollDevice)
+    {
+        uses.push(DeviceUse::EnrollDevice);
+    }
+    ensure!(
+        certificate.version == AUTH_VERSION
+            && certificate.uses == uses
+            && certificate.enrollment_grant.is_none()
+            && certificate.device == DeviceId::from_key(&intent.new_device_public_key)
+            && certificate.public_key == intent.new_device_public_key
+            && certificate.owner == PolicyDomain::Account(intent.account.clone())
+            && certificate.subject == Actor::Account(intent.account.clone())
+            && certificate.nonce == *nonce
+            && certificate.not_before_ms == intent.certificate_not_before_ms
+            && certificate.expires_at_ms == intent.certificate_expires_at_ms
+            && intent.expected_heads.contains(&certificate.issued_under),
+        "device possession differs from approved intent"
+    );
+    vibeface_secure::verify(
+        certificate.public_key.as_str(),
+        "device-possession-v2",
+        &certificate.possession_bytes()?,
+        certificate
+            .possession
+            .as_ref()
+            .context("device possession proof is missing")?
+            .as_str(),
+    )
+    .map_err(anyhow::Error::msg)
+}
+
+fn accepted_policy_entry(connection: &Connection, entry: &JournalEntry) -> Result<()> {
+    let hash = match entry {
+        JournalEntry::Device(value) => value.hash()?,
+        JournalEntry::AccountCommit(value) => value.proposal.hash()?,
+        _ => bail!("unexpected device policy completion object"),
+    };
+    let stored: String = connection.query_row(
+        "SELECT entry FROM policy_journal WHERE entry_hash=?",
+        [hash.as_str()],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        serde_json::from_str::<JournalEntry>(&stored)? == *entry,
+        "device policy completion differs from accepted journal"
+    );
+    Ok(())
+}
+
+fn validate_completion(
+    connection: &Connection,
+    value: &Value,
+    request: &AccountDevicePolicyRequest,
+) -> Result<()> {
+    let completion: DevicePolicyCompletion = serde_json::from_value(value.clone())?;
+    ensure!(
+        completion.committed.proposal == request.proposal
+            && completion.committed.commit.payload.nonce == request.nonce,
+        "device policy receipt differs from requested proposal"
+    );
+    let mut expected = Vec::new();
+    if let AccountDeviceChange::Enrollment { certificate, .. } = &request.change {
+        expected.push(JournalEntry::Device(certificate.clone()));
+    }
+    expected.push(JournalEntry::AccountCommit(completion.committed));
+    ensure!(
+        completion.journal_delta == expected,
+        "device policy receipt contains unrelated objects"
+    );
+    for entry in &expected {
+        accepted_policy_entry(connection, entry)?;
+    }
+    Ok(())
+}
+
+fn validate_enrollment_record(connection: &Connection, record: &EnrollmentRecord) -> Result<()> {
+    let account = &record.unsigned_intent.account;
+    let space = SpaceId::personal(account);
+    ensure!(
+        record.request_id
+            == ObjectHash::body(&(record.offer_hash.clone(), &record.unsigned_intent))?
+            && record.new_device_public_key == record.unsigned_intent.new_device_public_key,
+        "stored enrollment intent differs from its request hash"
+    );
+    let encoded: String = connection.query_row(
+        "SELECT value FROM local_values WHERE space_id=? AND key=?",
+        params![space.as_str(), offer_key(&record.offer_hash)],
+        |row| row.get(0),
+    )?;
+    let signed = offer::decode_enrollment_offer(encoded.as_bytes())?;
+    ensure!(
+        signed.payload.account == *account
+            && offer::enrollment_offer_hash(&signed)? == record.offer_hash
+            && record.expires_at_ms == signed.payload.expires_at_ms,
+        "stored enrollment offer binding differs"
+    );
+    let at = record.unsigned_intent.certificate_not_before_ms;
+    let verified =
+        offer::verify_device_enrollment_offer(&encoded, at as f64).map_err(anyhow::Error::msg)?;
+    offer::verify_device_enrollment_intent_for_offer(
+        &verified,
+        &serde_json::to_string(&record.unsigned_intent)?,
+        record.new_device_public_key.as_str(),
+        at as f64,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let (intent, certificate, completion) = match &record.phase {
+        EnrollmentPhase::Requested => return Ok(()),
+        EnrollmentPhase::Approved { intent } => (intent, None, None),
+        EnrollmentPhase::Possessed {
+            intent,
+            certificate,
+        } => (intent, Some(certificate), None),
+        EnrollmentPhase::Completed {
+            intent,
+            certificate,
+            completion,
+        } => (intent, Some(certificate), Some(completion)),
+    };
+    ensure!(
+        intent.payload == record.unsigned_intent && intent.issuer == signed.issuer,
+        "stored manager approval differs"
+    );
+    offer::verify_account_enrollment_from_offer(
+        &serde_json::to_string(intent)?,
+        &verified,
+        at as f64,
+    )
+    .map_err(anyhow::Error::msg)?;
+    if let Some(certificate) = certificate {
+        validate_possession(&record.unsigned_intent, &record.nonce, certificate)?;
+    }
+    if let Some(completion) = completion {
+        let parsed: DevicePolicyCompletion = serde_json::from_value(completion.clone())?;
+        let [
+            JournalEntry::Device(signed_certificate),
+            JournalEntry::AccountCommit(_),
+        ] = parsed.journal_delta.as_slice()
+        else {
+            bail!("stored enrollment completion lacks exact certificate and policy");
+        };
+        ensure!(
+            Some(&signed_certificate.payload) == certificate
+                && signed_certificate.issuer == intent.issuer,
+            "stored completion certificate differs from approved possession"
+        );
+        let request = AccountDevicePolicyRequest {
+            proposal: parsed.committed.proposal,
+            change: AccountDeviceChange::Enrollment {
+                intent: intent.clone(),
+                certificate: signed_certificate.clone(),
+            },
+            nonce: record.nonce.clone(),
+        };
+        validate_completion(connection, completion, &request)?;
+        let receipt_key = format!("device-policy-receipt:{}", ObjectHash::body(&request)?);
+        let receipt: String = connection.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![space.as_str(), receipt_key],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            serde_json::from_str::<Value>(&receipt)? == *completion,
+            "stored enrollment completion differs from durable receipt"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_enrollment_storage(
+    connection: &Connection,
+    policy: &journal::PolicyState,
+) -> Result<()> {
+    let mut statement=connection.prepare("SELECT space_id,key,value FROM local_values WHERE key GLOB 'enrollment-offer:*' OR key GLOB 'enrollment-request:*'")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (space, key, encoded) = row?;
+        if let Some(hash) = key.strip_prefix("enrollment-offer:") {
+            let signed = offer::decode_enrollment_offer(encoded.as_bytes())?;
+            ensure!(
+                space == SpaceId::personal(&signed.payload.account).as_str()
+                    && offer::enrollment_offer_hash(&signed)?.as_str() == hash,
+                "stored offer key differs from signed offer"
+            );
+            offer::verify_enrollment_offer(&signed, signed.payload.issued_at_ms)?;
+            for pin in &signed.payload.pins {
+                ensure!(
+                    policy
+                        .pins()
+                        .iter()
+                        .any(|trusted| trusted.domain == pin.domain
+                            && trusted.genesis_root == pin.genesis_root),
+                    "stored offer policy root is not trusted"
+                );
+            }
+        } else {
+            let record: EnrollmentRecord = serde_json::from_str(&encoded)?;
+            ensure!(
+                space == SpaceId::personal(&record.unsigned_intent.account).as_str()
+                    && key == request_key(&record.request_id),
+                "stored enrollment row scope differs"
+            );
+            validate_enrollment_record(connection, &record)?;
+        }
+    }
+    Ok(())
 }
 
 fn text<'a>(params: &'a Value, name: &str) -> Result<&'a str> {
@@ -149,6 +379,7 @@ impl Store {
             |row| row.get(0),
         )?;
         let record: EnrollmentRecord = serde_json::from_str(&encoded)?;
+        validate_enrollment_record(&self.connection, &record)?;
         ensure!(
             record.request_id == *hash && record.unsigned_intent.account == *account,
             "enrollment request scope changed"
@@ -332,6 +563,7 @@ impl Store {
                 let mut records = Vec::new();
                 for row in rows {
                     let record: EnrollmentRecord = serde_json::from_str(&row?)?;
+                    validate_enrollment_record(&self.connection, &record)?;
                     if record.offer_hash == hash {
                         records.push(record);
                     }
@@ -381,40 +613,7 @@ impl Store {
                         } if old == &certificate => return Ok(serde_json::to_value(record)?),
                         _ => bail!("enrollment manager approval is required"),
                     };
-                    let i = &record.unsigned_intent;
-                    let mut uses = vec![
-                        vibeface_secure::authorization::DeviceUse::Noise,
-                        vibeface_secure::authorization::DeviceUse::AccountInvocation,
-                    ];
-                    if i.requested_rights.contains(&AccountRight::EnrollDevice) {
-                        uses.push(vibeface_secure::authorization::DeviceUse::EnrollDevice);
-                    }
-                    ensure!(
-                        certificate.version == AUTH_VERSION
-                            && certificate.uses == uses
-                            && certificate.enrollment_grant.is_none()
-                            && certificate.device == DeviceId::from_key(&i.new_device_public_key)
-                            && certificate.public_key == i.new_device_public_key
-                            && certificate.owner == PolicyDomain::Account(account.clone())
-                            && certificate.subject
-                                == vibeface_secure::authorization::Actor::Account(account.clone())
-                            && certificate.nonce == record.nonce
-                            && certificate.not_before_ms == i.certificate_not_before_ms
-                            && certificate.expires_at_ms == i.certificate_expires_at_ms
-                            && i.expected_heads.contains(&certificate.issued_under),
-                        "device possession differs from approved intent"
-                    );
-                    vibeface_secure::verify(
-                        principal,
-                        "device-possession-v2",
-                        &certificate.possession_bytes()?,
-                        certificate
-                            .possession
-                            .as_ref()
-                            .context("device possession proof is missing")?
-                            .as_str(),
-                    )
-                    .map_err(anyhow::Error::msg)?;
+                    validate_possession(&record.unsigned_intent, &record.nonce, &certificate)?;
                     record.phase = EnrollmentPhase::Possessed {
                         intent,
                         certificate,
@@ -457,7 +656,9 @@ impl Store {
             )
             .optional()?;
         if let Some(receipt) = receipt {
-            return Ok(serde_json::from_str(&receipt)?);
+            let value = serde_json::from_str(&receipt)?;
+            validate_completion(&self.connection, &value, &request)?;
+            return Ok(value);
         }
         let mut pending = None;
         if let AccountDeviceChange::Enrollment {
@@ -1088,6 +1289,200 @@ mod tests {
             )?,
             32
         );
+        let later = now() + 60_001;
+        let replacement = offer::create_device_enrollment_offer(
+            &flow.network.client,
+            flow.network.account.as_str(),
+            "https://node.example.test",
+            &flow.network.node.public_key_hex()?,
+            "[]",
+            (later + 60_000) as f64,
+            &serde_json::to_string(&flow.network.pins)?,
+            &serde_json::to_string(&flow.network.bundle)?,
+            later as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let published = flow.call(
+            &flow.network.client.public_key_hex(),
+            "enrollment_offer_publish",
+            &json!({"offer":serde_json::from_str::<Value>(&replacement)?}),
+            later,
+        )?;
+        flow.hash = published["offer_hash"].clone();
+        let verified = offer::verify_device_enrollment_offer(&replacement, later as f64)
+            .map_err(anyhow::Error::msg)?;
+        flow.intent = offer::create_device_enrollment_intent_from_offer(
+            &verified,
+            &flow.device,
+            later as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let result = flow.call(
+            &flow.device.public_key_hex(),
+            "enrollment_request",
+            &flow.request_params()?,
+            later,
+        )?;
+        assert_eq!(result["status"], "requested");
+        assert_eq!(
+            flow.store.connection.query_row(
+                "SELECT count(*) FROM local_values WHERE key GLOB 'enrollment-request:*'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            33
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn another_valid_offer_cannot_approve_or_inspect_an_existing_request() -> Result<()> {
+        let mut flow = Flow::new(false)?;
+        flow.request()?;
+        let other = offer::create_device_enrollment_offer(
+            &flow.network.client,
+            flow.network.account.as_str(),
+            "https://node.example.test",
+            &flow.network.node.public_key_hex()?,
+            "[]",
+            (now() + 60_000) as f64,
+            &serde_json::to_string(&flow.network.pins)?,
+            &serde_json::to_string(&flow.network.bundle)?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let published = flow.call(
+            &flow.network.client.public_key_hex(),
+            "enrollment_offer_publish",
+            &json!({"offer":serde_json::from_str::<Value>(&other)?}),
+            now(),
+        )?;
+        let mut reference = flow.reference();
+        reference["offer_hash"] = published["offer_hash"].clone();
+        let before = flow.snapshot()?;
+        assert!(
+            flow.call(
+                &flow.device.public_key_hex(),
+                "enrollment_status",
+                &reference,
+                now()
+            )
+            .is_err()
+        );
+        reference["intent"] = serde_json::from_str(&flow.approval()?)?;
+        assert!(
+            flow.call(
+                &flow.network.client.public_key_hex(),
+                "enrollment_approve",
+                &reference,
+                now()
+            )
+            .is_err()
+        );
+        assert_eq!(flow.snapshot()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn completed_enrollment_status_obeys_the_new_device_revocation_and_certificate_expiry()
+    -> Result<()> {
+        let mut flow = Flow::new(false)?;
+        flow.request()?;
+        flow.approve()?;
+        flow.possess()?;
+        let params = flow.commit_params()?;
+        let manager = flow.network.client.public_key_hex();
+        flow.call(&manager, "account_device_commit", &params, now())?;
+        let key = flow.device.public_key_hex();
+        assert!(
+            flow.call(&key, "enrollment_status", &flow.reference(), now() + 60_001)
+                .is_err()
+        );
+        assert_eq!(
+            flow.call(
+                &manager,
+                "enrollment_status",
+                &flow.reference(),
+                now() + 60_001
+            )?["status"],
+            "completed"
+        );
+        let snapshot = flow.store.authenticate_account(
+            &manager,
+            &json!({"account_id":flow.network.account,
+            "space_id":flow.network.space,"device_public_key":manager}),
+            now(),
+        )?;
+        let revoke = enrollment::prepare_account_device_revocation(
+            flow.network.account.as_str(),
+            DeviceId::from_key(&PublicKey::of(&flow.device)).as_str(),
+            &flow.network.client,
+            &serde_json::to_string(&snapshot["pins"])?,
+            &serde_json::to_string(&snapshot["authorization"])?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        flow.call(
+            &manager,
+            "account_device_commit",
+            &json!({"request":serde_json::from_str::<Value>(
+            &revoke.request_json().map_err(anyhow::Error::msg)?)?}),
+            now(),
+        )?;
+        let before = flow.snapshot()?;
+        assert!(
+            flow.call(&key, "enrollment_status", &flow.reference(), now())
+                .is_err()
+        );
+        assert_eq!(
+            flow.call(&manager, "enrollment_status", &flow.reference(), now())?["status"],
+            "completed"
+        );
+        assert_eq!(flow.snapshot()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn changed_pending_intent_is_rejected_when_read() -> Result<()> {
+        let mut flow = Flow::new(false)?;
+        flow.request()?;
+        let changed = Identity::generate()
+            .map_err(anyhow::Error::msg)?
+            .public_key_hex();
+        let id = ObjectHash::parse(flow.record["request_id"].as_str().unwrap())?;
+        flow.store.connection.execute("UPDATE local_values SET value=json_set(value,'$.unsigned_intent.new_device_public_key',?) WHERE key=?",
+            params![changed,request_key(&id)])?;
+        assert!(
+            flow.call(
+                &flow.device.public_key_hex(),
+                "enrollment_status",
+                &flow.reference(),
+                now()
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn changed_completed_receipt_is_rejected_before_restart_recovery() -> Result<()> {
+        let mut flow = Flow::new(true)?;
+        flow.request()?;
+        flow.approve()?;
+        flow.possess()?;
+        let params = flow.commit_params()?;
+        flow.call(
+            &flow.network.client.public_key_hex(),
+            "account_device_commit",
+            &params,
+            now(),
+        )?;
+        let id = ObjectHash::parse(flow.record["request_id"].as_str().unwrap())?;
+        flow.store.connection.execute(
+            "UPDATE local_values SET value=json_set(value,'$.completion',json(?)) WHERE key=?",
+            params![json!({"forged":true}).to_string(), request_key(&id)],
+        )?;
+        assert!(flow.restart().is_err());
         Ok(())
     }
 

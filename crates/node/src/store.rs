@@ -95,6 +95,8 @@ fn validate_persisted_state(connection: &Connection) -> Result<()> {
     ensure!(seen == expected, "stored space projection is incomplete");
     crate::identity::policy::validate_resource_projections(connection)?;
     crate::identity::admission::validate_persisted_authorizations(connection, &policy)?;
+    crate::identity::enrollment_store::validate_enrollment_storage(connection, &policy)?;
+    crate::identity::execution_handoff::validate_execution_handoff_storage(connection, &policy)?;
     Ok(())
 }
 
@@ -1097,10 +1099,11 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let count = tx.execute(
+        let mut count = tx.execute(
             "UPDATE operations SET state='\"unknown\"' WHERE state='\"running\"'",
             [],
         )?;
+        count += crate::identity::execution_handoff::recover_execution_handoffs_in(&tx)?;
         tx.execute("UPDATE continuation_claims SET record=json_set(record,'$.state','unknown') WHERE json_extract(record,'$.state')='running'",[])?;
         tx.execute(
             "UPDATE local_values SET value=json_set(value,'$.state','unknown') WHERE key GLOB 'scheduler:invocation:*' AND json_extract(value,'$.state')='running'",
