@@ -123,7 +123,7 @@ pub enum AuthenticationCeremony {
 }
 
 /// Only restore this state from trusted pending storage, never from an RPC response body.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PendingPasskey {
     envelope: EnrollmentEnvelope,
@@ -258,7 +258,7 @@ pub struct AttestationResponse {
     #[serde(default)]
     pub transports: Vec<String>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssertionResponse {
     pub id: String,
@@ -269,7 +269,7 @@ pub struct AssertionResponse {
     #[serde(default)]
     pub client_extension_results: serde_json::Value,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthenticatorAssertion {
     #[serde(rename = "clientDataJSON")]
@@ -797,7 +797,7 @@ pub fn verify_registration_json(
         timestamp(now_ms)?,
     )
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PasskeyAssertionProof {
     pub pending: PendingPasskey,
