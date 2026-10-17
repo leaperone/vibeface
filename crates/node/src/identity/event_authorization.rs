@@ -15,9 +15,9 @@ use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use vibeface_secure::authorization::{
-    Actor, DeviceUse, Invocation, InvocationContext, ObjectHash, PolicyDomain, PublicKey,
-    RequestFacts, ResourceId, ResourceKind, ResourceRef, SessionRef, Signed, SpaceId,
-    TransportEvidence, VerifiedAuthorization, VerifiedPolicySet,
+    Actor, DeviceId, DeviceUse, Invocation, InvocationContext, ObjectHash, PolicyDomain,
+    PolicyStamp, PublicKey, RequestFacts, ResourceId, ResourceKind, ResourceRef, SessionRef,
+    Signed, SpaceId, TransportEvidence, VerifiedAuthorization, VerifiedPolicySet,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -38,27 +38,34 @@ fn text<'a>(body: &'a Value, field: &str) -> Result<&'a str> {
         .with_context(|| format!("{field} is required"))
 }
 
+fn policy_devices<'a>(
+    state: &'a VerifiedPolicySet,
+    stamp: &PolicyStamp,
+) -> Option<&'a [ObjectHash]> {
+    match &stamp.domain {
+        PolicyDomain::Account(id) => state
+            .account_history(id)
+            .and_then(|history| {
+                history
+                    .iter()
+                    .find(|document| document.hash().ok().as_ref() == Some(&stamp.head))
+            })
+            .map(|document| document.payload.devices.as_slice()),
+        PolicyDomain::Space(id) => state
+            .space_history(id)
+            .and_then(|history| {
+                history
+                    .iter()
+                    .find(|document| document.hash().ok().as_ref() == Some(&stamp.head))
+            })
+            .map(|document| document.payload.devices.as_slice()),
+    }
+}
+
 fn audience_key(state: &VerifiedPolicySet, proof: &AdmissionProof) -> Result<PublicKey> {
     let audience = &proof.invocation.payload.audience;
     for stamp in &proof.challenge.policies {
-        let devices = match &stamp.domain {
-            PolicyDomain::Account(id) => state
-                .account_history(id)
-                .and_then(|history| {
-                    history
-                        .iter()
-                        .find(|document| document.hash().ok().as_ref() == Some(&stamp.head))
-                })
-                .map(|document| document.payload.devices.as_slice()),
-            PolicyDomain::Space(id) => state
-                .space_history(id)
-                .and_then(|history| {
-                    history
-                        .iter()
-                        .find(|document| document.hash().ok().as_ref() == Some(&stamp.head))
-                })
-                .map(|document| document.payload.devices.as_slice()),
-        };
+        let devices = policy_devices(state, stamp);
         for hash in devices.into_iter().flatten() {
             if let Some(certificate) = state.device(hash)
                 && certificate.payload.device == audience.device
@@ -73,6 +80,28 @@ fn audience_key(state: &VerifiedPolicySet, proof: &AdmissionProof) -> Result<Pub
         }
     }
     bail!("event audience device is missing from admitted policy")
+}
+
+fn execution_device(
+    state: &VerifiedPolicySet,
+    proof: &AdmissionProof,
+    node: &str,
+) -> Result<DeviceId> {
+    for stamp in &proof.challenge.policies {
+        for hash in policy_devices(state, stamp).into_iter().flatten() {
+            if let Some(certificate) = state.device(hash)
+                && crypto::fingerprint(certificate.payload.public_key.as_str())? == node
+            {
+                ensure!(
+                    matches!(certificate.payload.subject, Actor::Service(_))
+                        && certificate.payload.uses.contains(&DeviceUse::Noise),
+                    "execution target is not a registered service device"
+                );
+                return Ok(DeviceId::from_key(&certificate.payload.public_key));
+            }
+        }
+    }
+    bail!("execution target is absent from admitted policy devices")
 }
 
 pub(crate) fn verify_event_envelope(
@@ -411,15 +440,11 @@ fn historical_facts(
                 && request.operation_id == text(body, "authorization_id")?,
             "operation authorization scope mismatch"
         );
-        context.sdk_session = Some(SessionRef {
-            target: proof.invocation.payload.audience.device.clone(),
+        context.execution_session = Some(SessionRef {
+            target: execution_device(state, proof, &request.target_node)?,
             session_id: request.session_id.clone(),
         });
         context.executor_kind = request.action["executor"].as_str().map(str::to_owned);
-        ensure!(
-            request.target_node == crypto::fingerprint(audience_key(state, proof)?.as_str())?,
-            "execution targets another service device"
-        );
         if context.executor_kind.is_none() {
             let executors: BTreeSet<_> = ancestors
                 .iter()
@@ -451,8 +476,48 @@ fn historical_facts(
                 return Ok(None);
             }
         }
-    } else if !body["sdk_session"].is_null() {
-        context.sdk_session = Some(serde_json::from_value(body["sdk_session"].clone())?);
+    } else if matches!(text(body, "method")?, "bind_execution" | "rebind_execution") {
+        context.execution_session = Some(SessionRef {
+            target: execution_device(state, proof, text(body, "target_node")?)?,
+            session_id: text(body, "session_id")?.into(),
+        });
+        context.executor_kind = Some(text(body, "executor")?.into());
+    }
+    if !body["sdk_session"].is_null() {
+        let Actor::Service(service) = &proof.invocation.payload.actor else {
+            bail!("account invocation cannot claim an SDK session")
+        };
+        let session: SessionRef = serde_json::from_value(body["sdk_session"].clone())?;
+        ensure!(
+            session.target == proof.invocation.payload.device,
+            "SDK session targets another invocation device"
+        );
+        ensure!(
+            proof.transport.clone().into_evidence()
+                == TransportEvidence::LocalAgentAdapter {
+                    service: service.clone(),
+                    session: session.clone()
+                },
+            "SDK session does not have an observed service adapter"
+        );
+        let parent_hash = ObjectHash::parse(text(body, "parent_invocation")?)?;
+        let Some(parent) = events.get(&session.session_id) else {
+            return Ok(None);
+        };
+        ensure!(
+            ancestors.contains(&parent.envelope.hash)
+                && parent.event.scope_id == scope
+                && parent.event.resource_id == resource
+                && matches!(&parent.event.body,EventBody::MessagePosted { role, .. } if role == "user")
+                && matches!(&parent.event.cause, EventCause::Invocation { .. })
+                && matches!(
+                    admission(&parent.event).invocation.payload.actor,
+                    Actor::Account(_)
+                )
+                && admission(&parent.event).invocation.hash()? == parent_hash,
+            "SDK session has no matching causal account message admission"
+        );
+        context.sdk_session = Some(session);
     }
     Ok(Some(RequestFacts {
         resource: ResourceRef { space, resource },
@@ -483,6 +548,71 @@ fn event_slot(body: &EventBody) -> String {
         EventBody::NotificationAcknowledged { .. } => "notification_acknowledged".into(),
         EventBody::ContextCheckpoint { .. } => "context_checkpoint".into(),
     }
+}
+
+fn validate_sdk_parent(
+    policy: &PolicyState,
+    state: &VerifiedPolicySet,
+    event: &Event,
+    events: &BTreeMap<String, StoredEvent>,
+    facts: &RequestFacts,
+) -> Result<()> {
+    let Some(session) = &facts.context.sdk_session else {
+        return Ok(());
+    };
+    let proof = admission(event);
+    let Actor::Service(service) = &proof.invocation.payload.actor else {
+        bail!("SDK session requires a service actor")
+    };
+    let parent = events
+        .get(&session.session_id)
+        .context("SDK parent event is missing")?;
+    ensure!(
+        verify_event_envelope(policy, &event.network_id, &parent.envelope)? == parent.event,
+        "SDK parent event differs from signed envelope"
+    );
+    let parent_proof = admission(&parent.event);
+    ensure!(
+        u64::try_from(parent.event.created_at_ms)? == parent_proof.admitted_at_ms
+            && expected_events(
+                &parent_proof.source_body,
+                &parent_proof.invocation,
+                &parent_proof.transport.clone().into_evidence()
+            )?
+            .iter()
+            .any(|(body, blobs)| body == &parent.event.body && blobs == &parent.event.blobs),
+        "SDK parent content differs from the admitted account request"
+    );
+    let parent_state = policy.historical(
+        &parent_proof.challenge.policies,
+        parent_proof.admitted_at_ms,
+    )?;
+    let parent_ancestors =
+        dependency_closure(&parent.event, events)?.context("SDK parent history is incomplete")?;
+    let parent_facts = historical_facts(&parent_state, &parent.event, events, &parent_ancestors)?
+        .context("SDK parent resource history is incomplete")?;
+    let transport = parent_proof.transport.clone().into_evidence();
+    let admitted = reconstruct_admission(policy, parent_proof, &parent_facts, &transport)?;
+    let current_parent = state.verify_operation_authorization(
+        &admitted,
+        &parent_facts,
+        &transport,
+        proof.admitted_at_ms,
+    )?;
+    let delegated = state.verify_service_delegation(
+        &current_parent,
+        service,
+        &proof.invocation.payload.grant_leaf,
+        facts,
+        proof.admitted_at_ms,
+    )?;
+    ensure!(
+        delegated.device() == &proof.invocation.payload.device
+            && delegated.initiator() == &proof.invocation.payload.initiator
+            && delegated.initiating_grant() == proof.invocation.payload.initiating_grant.as_ref(),
+        "SDK service invocation differs from the admitted account delegation"
+    );
+    Ok(())
 }
 
 fn validate_derived(event: &Event, source: &Event) -> Result<()> {
@@ -595,6 +725,7 @@ pub(crate) fn validate_event_evidence(
     };
     let transport = proof.transport.clone().into_evidence();
     reconstruct_admission(policy, proof, &facts, &transport)?;
+    validate_sdk_parent(policy, &state, event, events, &facts)?;
     match &event.cause {
         EventCause::Invocation { .. } => {
             ensure!(
@@ -676,6 +807,49 @@ pub(crate) fn current_event_authorization(
     Ok(policy
         .verified()
         .verify_operation_authorization(&admitted, &facts, &transport, now_ms)?)
+}
+
+pub(crate) fn persisted_admission_facts(
+    connection: &Connection,
+    policy: &PolicyState,
+    proof: &AdmissionProof,
+) -> Result<Option<RequestFacts>> {
+    let events = load_events_from(connection, proof.invocation.payload.resource.space.as_str())?;
+    let mut facts = None;
+    for stored in events.values() {
+        if !matches!(&stored.event.cause,EventCause::Invocation { admission } if admission == proof)
+        {
+            continue;
+        }
+        ensure!(
+            verify_event_envelope(policy, &stored.event.network_id, &stored.envelope)?
+                == stored.event,
+            "accepted event evidence differs from signed envelope"
+        );
+        let expected = expected_events(
+            &proof.source_body,
+            &proof.invocation,
+            &proof.transport.clone().into_evidence(),
+        )?;
+        ensure!(
+            expected
+                .iter()
+                .any(|(body, blobs)| body == &stored.event.body && blobs == &stored.event.blobs),
+            "accepted event business content differs from signed request"
+        );
+        let state = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
+        let ancestors = dependency_closure(&stored.event, &events)?
+            .context("accepted event causal history is missing")?;
+        let current = historical_facts(&state, &stored.event, &events, &ancestors)?
+            .context("accepted event resource history is missing")?;
+        validate_sdk_parent(policy, &state, &stored.event, &events, &current)?;
+        ensure!(
+            facts.as_ref().is_none_or(|facts| facts == &current),
+            "accepted events disagree about original request facts"
+        );
+        facts = Some(current);
+    }
+    Ok(facts)
 }
 
 fn append_admitted_events_in(
@@ -923,7 +1097,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let admitted = super::admission::consume_authorization_in(
             &tx,
-            self.policy.verified(),
+            &self.policy,
             auth,
             proof,
             transport,
@@ -1202,7 +1376,7 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let admission = consume_authorization_in(
             &tx,
-            &fixture.state,
+            &fixture.policy,
             &fixture.auth,
             &proof,
             &fixture.transport,
@@ -1416,6 +1590,17 @@ mod tests {
             .action(),
             Action::TaskProgress
         );
+        fixture
+            .connection
+            .execute("UPDATE events SET status='conflict'", [])?;
+        fixture.connection.execute("DELETE FROM tasks", [])?;
+        fixture
+            .connection
+            .execute("DELETE FROM conversations", [])?;
+        assert_eq!(
+            persisted_admission_facts(&fixture.connection, &fixture.policy, admission(&event))?,
+            Some(facts)
+        );
         let mut forged = event.clone();
         forged.cause = EventCause::Derived {
             admission: admission(&event).clone(),
@@ -1491,7 +1676,7 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let original = consume_authorization_in(
             &tx,
-            &fixture.state,
+            &fixture.policy,
             &fixture.auth,
             &original_freshness,
             &fixture.transport,
@@ -1503,6 +1688,44 @@ mod tests {
             params![request.network_id,request.operation_id,request.target_node,request.session_id,serde_json::to_string(&request)?])?;
         let dispatch = append_admitted_dispatch_in(&tx, &fixture.node, &original, &request, NOW)?;
         tx.commit()?;
+        let dispatch_event =
+            verify_event_envelope(&fixture.policy, &request.network_id, &dispatch)?;
+        let dispatch_events = load_events_from(&fixture.connection, &request.network_id)?;
+        let historical = fixture
+            .policy
+            .historical(&original.challenge.policies, NOW)?;
+        let dispatch_facts = historical_facts(
+            &historical,
+            &dispatch_event,
+            &dispatch_events,
+            &dependency_closure(&dispatch_event, &dispatch_events)?.unwrap(),
+        )?
+        .unwrap();
+        assert!(dispatch_facts.context.sdk_session.is_none());
+        assert_eq!(
+            dispatch_facts.context.execution_session,
+            Some(SessionRef {
+                target: DeviceId::from_key(&PublicKey::parse(&fixture.node.public_key_hex()?)?),
+                session_id: request.session_id.clone(),
+            })
+        );
+        let mut account_claiming_sdk = dispatch_event.clone();
+        match &mut account_claiming_sdk.cause {
+            EventCause::Invocation { admission } => {
+                admission.source_body["sdk_session"] =
+                    json!({"target":fixture.auth.device(),"session_id":"forged-sdk"})
+            }
+            _ => bail!("expected admitted dispatch"),
+        }
+        assert!(
+            historical_facts(
+                &historical,
+                &account_claiming_sdk,
+                &dispatch_events,
+                &dependency_closure(&dispatch_event, &dispatch_events)?.unwrap()
+            )
+            .is_err()
+        );
         fixture.body = json!({"method":"resolve_unknown","space_id":fixture.auth.resource().space,"resource_id":fixture.auth.resource().resource,"authorization_id":"resolve_1",
             "conversation_id":"chat","operation_id":"open_1","target_node":target,"session_id":"s1","task_id":"t1","task_ref":task.hash,
             "outcome":"succeeded","evidence":"verified external process and side effects"});
@@ -1515,7 +1738,7 @@ mod tests {
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let resolution = consume_authorization_in(
                 &tx,
-                &fixture.state,
+                &fixture.policy,
                 &fixture.auth,
                 &proof,
                 &fixture.transport,
@@ -1552,7 +1775,7 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let resolution = consume_authorization_in(
             &tx,
-            &fixture.state,
+            &fixture.policy,
             &fixture.auth,
             &proof,
             &fixture.transport,
@@ -1712,6 +1935,224 @@ mod tests {
         event.parents.sort();
         assert!(
             validate_event_evidence(&fixture.policy, &fixture.connection, &event, &all).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_device_uses_registered_target_key_instead_of_audience() -> Result<()> {
+        use vibeface_secure::authorization::{DeviceCertificate, ServiceId};
+        let mut fixture = Fixture::new()?;
+        let root = Identity::from_secret_hex(&hex::encode([1; 32])).map_err(anyhow::Error::msg)?;
+        let target =
+            Identity::from_secret_hex(&hex::encode([7; 32])).map_err(anyhow::Error::msg)?;
+        let account = match fixture.auth.actor() {
+            Actor::Account(account) => account.clone(),
+            _ => bail!("fixture needs account actor"),
+        };
+        let domain = PolicyDomain::Account(account.clone());
+        let mut certificate = DeviceCertificate {
+            version: vibeface_secure::authorization::AUTH_VERSION,
+            owner: domain.clone(),
+            subject: Actor::Service(ServiceId::from_key(&PublicKey::of(&target))),
+            device: DeviceId::from_key(&PublicKey::of(&target)),
+            public_key: PublicKey::of(&target),
+            uses: vec![DeviceUse::Noise, DeviceUse::ServiceInvocation],
+            possession: None,
+            enrollment_grant: None,
+            issued_under: fixture.state.head(&domain).unwrap().clone(),
+            nonce: Nonce::random()?,
+            not_before_ms: 0,
+            expires_at_ms: 1_000_000,
+        };
+        certificate.prove_possession(&target)?;
+        let certificate = Signed::sign(certificate, &root)?;
+        let hash = fixture.state.install_device(certificate.clone(), NOW)?;
+        let mut document = fixture.state.account(&account).unwrap().clone();
+        document.previous = fixture.state.head(&domain).cloned();
+        document.sequence += 1;
+        document.devices.push(hash);
+        document.devices.sort();
+        let document = Signed::sign(document, &root)?;
+        fixture.state.install_account(document.clone())?;
+        let prepared = fixture.policy.prepare_network_update(
+            &[
+                JournalEntry::Device(certificate),
+                JournalEntry::Account(document),
+            ],
+            NOW,
+        )?;
+        let tx = fixture
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        fixture.policy = super::super::journal::commit_in(&tx, &prepared)?;
+        tx.commit()?;
+        resign(&mut fixture)?;
+        let freshness = fixture.proof()?;
+        let tx = fixture
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let admitted = consume_authorization_in(
+            &tx,
+            &fixture.policy,
+            &fixture.auth,
+            &freshness,
+            &fixture.transport,
+            &fixture.body,
+            None,
+            NOW,
+        )?;
+        let device = execution_device(&fixture.state, &admitted, &target.node_id())?;
+        assert_eq!(device, DeviceId::from_key(&PublicKey::of(&target)));
+        assert_ne!(device, fixture.auth.audience().device);
+        assert!(
+            execution_device(
+                &fixture.state,
+                &admitted,
+                &LocalIdentity::generate().node_id()?
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sdk_event_reconstructs_the_original_account_message_and_service_delegation() -> Result<()> {
+        use crate::identity::test_support::{TestNetwork, now};
+        use vibeface_secure::authorization::{AUTH_VERSION, CheckStage, ServiceId};
+        let network = TestNetwork::new()?;
+        let mut store = network.memory()?;
+        network.conversation(&mut store, "sdk")?;
+        let trigger = network.message(&mut store, "sdk", "perform bounded work")?;
+        let node_key = PublicKey::parse(&network.node.public_key_hex()?)?;
+        let service = ServiceId::from_key(&node_key);
+        let session = SessionRef {
+            target: DeviceId::from_key(&node_key),
+            session_id: trigger.hash.clone(),
+        };
+        let descriptor = store.agent_grant(
+            network.space.as_str(),
+            "sdk",
+            &service,
+            &session,
+            &trigger.hash,
+            now(),
+        )?;
+        let mut body = network.body("agent_notification", "sdk");
+        body["sdk_session"] = serde_json::to_value(&session)?;
+        body["parent_invocation"] = json!(descriptor.parent_invocation);
+        body["notification_id"] = json!("bounded-sdk-notice");
+        body["kind"] = json!("manager_attention");
+        body["text"] = json!("bounded SDK result");
+        let audience = vibeface_secure::authorization::Audience {
+            service: service.clone(),
+            device: session.target.clone(),
+        };
+        let facts = store.request_facts(&body, &audience)?;
+        let invocation = Signed::sign(
+            Invocation {
+                version: AUTH_VERSION,
+                actor: Actor::Service(service.clone()),
+                device: descriptor.device.clone(),
+                initiator: descriptor.initiator,
+                initiating_grant: descriptor.initiating_grant,
+                resource: facts.resource.clone(),
+                action: facts.action,
+                audience,
+                presenter: descriptor.device,
+                operation_id: facts.operation_id.clone(),
+                body_hash: facts.body_hash.clone(),
+                grant_leaf: descriptor.grant_leaf,
+                expected_policies: descriptor.expected_policies,
+                context: facts.context.clone(),
+                nonce: Nonce::random()?,
+                not_before_ms: now(),
+                expires_at_ms: now() + 10_000,
+            },
+            &Identity::from_secret_hex(&network.node.secret_key_hex).map_err(anyhow::Error::msg)?,
+        )?;
+        let transport = TransportEvidence::LocalAgentAdapter {
+            service,
+            session: session.clone(),
+        };
+        let auth = store.authorize_request(&invocation, &facts, &transport, now())?;
+        let freshness = network.freshness(&mut store, &auth, CheckStage::Admit, now())?;
+        let checked = store.authorization_state().verify_freshness(
+            &auth,
+            &freshness.challenge,
+            &freshness.receipts,
+            now(),
+        )?;
+        store
+            .authorization_state()
+            .admit_operation(&auth, &checked, now())?;
+        let proof = AdmissionProof {
+            invocation,
+            source_body: body,
+            challenge: freshness.challenge,
+            receipts: freshness.receipts,
+            admitted_at_ms: now(),
+            transport: crate::model::StoredTransport::from(&transport),
+        };
+        let parent: Event = serde_json::from_str(&trigger.canonical_body)?;
+        let envelope = network.node.sign_event(Event {
+            version: WIRE_VERSION,
+            network_id: network.space.to_string(),
+            resource_id: network.resource.clone(),
+            cause: EventCause::Invocation { admission: proof },
+            scope_id: "sdk".into(),
+            author: network.node.node_id()?,
+            sequence: parent.sequence + 1,
+            previous: Some(trigger.hash.clone()),
+            parents: vec![trigger.hash],
+            created_at_ms: now() as i64,
+            body: EventBody::NotificationRaised {
+                notification_id: "bounded-sdk-notice".into(),
+                kind: "manager_attention".into(),
+                text: "bounded SDK result".into(),
+            },
+            blobs: vec![],
+        })?;
+        let event = verify_event_envelope(&store.policy, network.space.as_str(), &envelope)?;
+        let events = load_events_from(&store.connection, network.space.as_str())?;
+        assert_eq!(
+            validate_event_evidence(&store.policy, &store.connection, &event, &events)?,
+            EventEvidenceStatus::Valid
+        );
+        assert!(
+            persisted_admission_facts(&store.connection, &store.policy, admission(&event))?
+                .is_none()
+        );
+        assert_eq!(facts.context.sdk_session, Some(session));
+        assert!(facts.context.execution_session.is_none());
+        let historical = store
+            .policy
+            .historical(&admission(&event).challenge.policies, now())?;
+        let ancestors = dependency_closure(&event, &events)?.unwrap();
+        let mut changed = event.clone();
+        match &mut changed.cause {
+            EventCause::Invocation { admission } => {
+                admission.source_body["parent_invocation"] =
+                    json!(ObjectHash::body(&"wrong parent")?)
+            }
+            _ => bail!("expected SDK invocation event"),
+        }
+        assert!(historical_facts(&historical, &changed, &events, &ancestors).is_err());
+        let mut tampered_parent_events = events.clone();
+        let trigger_event = tampered_parent_events
+            .get_mut(&facts.context.sdk_session.as_ref().unwrap().session_id)
+            .unwrap();
+        if let EventBody::MessagePosted { text, .. } = &mut trigger_event.event.body {
+            *text = "replaced trigger content".into();
+        }
+        assert!(
+            validate_event_evidence(
+                &store.policy,
+                &store.connection,
+                &event,
+                &tampered_parent_events
+            )
+            .is_err()
         );
         Ok(())
     }
