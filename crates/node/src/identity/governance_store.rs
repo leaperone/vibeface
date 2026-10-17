@@ -277,7 +277,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let policy = journal::PolicyState::load(&tx)?;
+        let policy = journal::PolicyState::reload_verified(&tx, &self.policy)?;
         let challenge = execution_service::execution_service_registration_challenge(
             policy.verified(),
             &request,
@@ -464,12 +464,20 @@ impl Store {
                     receipt::<SpaceCommitResponse>(&tx, &key, &request_hash, &principal)?
                 {
                     check_space_receipt(&response, &request, &node)?;
-                    let policy = journal::PolicyState::load(&tx)?;
+                    let policy = if registration.is_some() {
+                        journal::PolicyState::reload_verified(&tx, &self.policy)?
+                    } else {
+                        journal::PolicyState::load(&tx)?
+                    };
                     tx.commit()?;
                     self.policy = policy;
                     return Ok(serde_json::to_value(response)?);
                 }
-                let policy = journal::PolicyState::load(&tx)?;
+                let policy = if registration.is_some() {
+                    journal::PolicyState::reload_verified(&tx, &self.policy)?
+                } else {
+                    journal::PolicyState::load(&tx)?
+                };
                 let state = policy.verified();
                 let (commit_heads, authorization_expiry, execution_root) =
                     if let Some(registration) = &registration {
