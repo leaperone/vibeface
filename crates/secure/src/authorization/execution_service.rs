@@ -225,6 +225,7 @@ pub fn verify_execution_service_source_management(
     node: &PublicKey,
     now: u64,
 ) -> Result<()> {
+    let _signature_scope = ScopedSignatureVerification::new();
     authorization(
         state,
         account,
@@ -327,6 +328,7 @@ pub fn project_execution_service_selection(
     node: &PublicKey,
     now: u64,
 ) -> Result<ExecutionServiceSelection> {
+    let _signature_scope = ScopedSignatureVerification::new();
     verify_management_parent(state, account, signer, resource, parent, node, now)?;
     let authorization = state.client_authorization_projection(
         pins,

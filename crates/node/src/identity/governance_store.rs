@@ -310,21 +310,31 @@ impl Store {
         let source = state
             .space(&params.source_project.space)
             .context("unknown execution source space")?;
-        let allowed = source.grants.iter().any(|leaf| {
-            state
+        let mut allowed = false;
+        for leaf in &source.grants {
+            if !state
                 .grant(leaf)
                 .is_some_and(|grant| grant.payload.actions.contains(&Action::ResourceManage))
-                && execution_service::verify_execution_service_source_management(
-                    state,
-                    &params.account_id,
-                    &principal,
-                    &params.source_project,
-                    leaf,
-                    &node,
-                    now_ms,
-                )
-                .is_ok()
-        });
+            {
+                continue;
+            }
+            match execution_service::verify_execution_service_source_management(
+                state,
+                &params.account_id,
+                &principal,
+                &params.source_project,
+                leaf,
+                &node,
+                now_ms,
+            ) {
+                Ok(()) => {
+                    allowed = true;
+                    break;
+                }
+                Err(error @ AuthorizationError::BudgetExceeded) => return Err(error.into()),
+                Err(_) => {}
+            }
+        }
         ensure!(
             allowed,
             "execution selection requires current physical owner resource management"
@@ -371,7 +381,7 @@ impl Store {
                 source_root(&tx, &resource)? == root,
                 "execution source mapping changed"
             );
-            if let Ok(selection) = execution_service::project_execution_service_selection(
+            match execution_service::project_execution_service_selection(
                 state,
                 policy.pins(),
                 &journal,
@@ -383,7 +393,9 @@ impl Store {
                 &node,
                 now_ms,
             ) {
-                selections.push(selection);
+                Ok(selection) => selections.push(selection),
+                Err(error @ AuthorizationError::BudgetExceeded) => return Err(error.into()),
+                Err(_) => {}
             }
         }
         ensure!(
