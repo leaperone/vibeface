@@ -104,10 +104,10 @@ def verify_maintenance(node):
     node.start()
     opened = node.client.command("connect", url=node.url, node_id=node.node_id, check=False)
     if opened["ok"]:
-        denied = node.client.command("request", method="authenticate",
-                                     params={"network_id": node.client.network_id}, check=False)
+        denied = node.client.command("request", method="rpc",
+                                     params={"method": "nodes"}, check=False)
         require(not denied["ok"] or (denied["result"].get("error") and not denied["result"].get("result")),
-                "pending startup cannot authorize a business channel")
+                "pending startup cannot admit business RPC")
     commit, value = maintenance(node, "commit")
     commit.close()
     require(value["status"] == "error", "pending marker prevents premature commit")
@@ -666,6 +666,19 @@ def verify_no_model_budget(nodes):
             connection.close()
 
 
+def verify_web_assets(node, module):
+    for path in (module, module.with_name("vibeface_secure_bg.wasm")):
+        request = urllib.request.Request(node.url + "/generated/" + path.name, headers={"Origin": node.url})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            content = response.read(8 * 1024 * 1024 + 1)
+            require(response.status == 200 and len(content) <= 8 * 1024 * 1024,
+                    "embedded browser cryptography is served within size limits")
+            require(hashlib.sha256(content).hexdigest() == file_sha256(path),
+                    "served browser cryptography matches the verified package resource")
+            if path.suffix == ".wasm":
+                require(response.headers.get_content_type() == "application/wasm", "browser WASM has the correct MIME type")
+
+
 def verify_incompatible_data(run, binary, workspace, fixture, helper, module):
     node = Node(run, "INCOMPATIBLE", binary, workspace, fixture, helper, module)
     marker = node.directory / "data-epoch.json"
@@ -686,7 +699,7 @@ def verify_incompatible_data(run, binary, workspace, fixture, helper, module):
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         try:
             stdout, stderr = process.communicate(timeout=10)
-            require(process.returncode != 0 and b"epoch" in (stdout + stderr).lower(),
+            require(process.returncode != 0 and (missing_marker or b"epoch" in (stdout + stderr).lower()),
                     "incompatible or missing data epoch rejects startup before opening stores or providers")
             require(all(file_sha256(path) == digest for path, digest in before.items()),
                     "rejected startup preserves data, identity, config and epoch marker byte for byte")
@@ -734,7 +747,11 @@ def verify_recovery(node, other, nodes, network):
     other.network_id = network
     require(result["principal"]["can_manage"] and result["view"]["epoch"] > view["epoch"],
             "root recovery establishes an independent manager in a higher epoch")
-    require(other.rpc("conversations")["conversations"], "recovering identity preserves stored business history")
+    history = other.rpc("conversation", conversation_id="acceptance-conversation")
+    require(any(message["message_id"] == "message-original"
+                and message["text"] == "Keep this context after A disconnects."
+                for message in history["messages"]),
+            "root recovery retains the exact existing private conversation")
     rejected = node.client.command("request", method="directory", check=False)
     if rejected["ok"]:
         require(rejected["result"].get("error") and not rejected["result"].get("result"),
@@ -851,6 +868,8 @@ def acceptance(options):
         for path in ("/api/register", "/api/login", "/api/rpc"):
             a.client.request(path, {}, status=404)
         network = a.bootstrap()
+        verify_web_assets(a, module)
+        passed("served browser cryptography matches the packaged JS/WASM resources")
         a.client.request("/api/tools", {"name": "nodes", "arguments": {}, "call_id": "human-call"}, status=401)
         passed("independent client/root identity, local bootstrap capability and encrypted authorization")
 

@@ -109,6 +109,7 @@ jobs:
         run: |
           node --check crates/node/sdk/codex-manager.mjs
           node --check crates/node/web/app.js
+          node --check crates/node/web/transport.js
           node --check scripts/crypto-client.mjs
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
