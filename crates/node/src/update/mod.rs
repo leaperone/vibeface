@@ -194,10 +194,11 @@ pub async fn run(options: Update) -> Result<()> {
             let service = Service::load(&data).await?;
             let lease = match maintenance::acquire(&data).await {
                 Ok(lease) => lease,
-                Err(error) => {
+                Err(error) if error.downcast_ref::<maintenance::Busy>().is_some() => {
                     println!("Update deferred; the node could not become idle: {error:#}");
                     return Ok(());
                 }
+                Err(error) => return Err(error.context("request node maintenance")),
             };
             ensure!(
                 lease.health.version == current.to_string(),
