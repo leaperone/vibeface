@@ -32,7 +32,7 @@ const CONSTRAINTS: &[&str] = &[
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum InvocationState {
+pub(crate) enum InvocationState {
     Running,
     Completed,
     Failed,
@@ -40,18 +40,18 @@ enum InvocationState {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Invocation {
-    state: InvocationState,
-    boot: String,
-    trigger: String,
-    message_id: String,
+pub(crate) struct Invocation {
+    pub(crate) state: InvocationState,
+    pub(crate) boot: String,
+    pub(crate) trigger: String,
+    pub(crate) message_id: String,
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct LocalSession {
-    native_id: Option<String>,
-    sdk_config: Option<String>,
-    active: Option<Invocation>,
+pub(crate) struct LocalSession {
+    pub(crate) native_id: Option<String>,
+    pub(crate) sdk_config: Option<String>,
+    pub(crate) active: Option<Invocation>,
 }
 
 fn boot_id() -> &'static str {
@@ -59,7 +59,7 @@ fn boot_id() -> &'static str {
     BOOT.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
-fn key(kind: &str, conversation: &str, trigger: &str) -> String {
+pub(crate) fn key(kind: &str, conversation: &str, trigger: &str) -> String {
     format!(
         "scheduler:{kind}:{}",
         digest(&serde_json::to_vec(&(conversation, trigger)).expect("string tuple serializes"))
