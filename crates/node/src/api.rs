@@ -35,7 +35,7 @@ const AUTH_ATTEMPTS: u32 = 20;
 #[derive(Clone)]
 struct App {
     node: Arc<Runtime>,
-    site: Option<Site>,
+    sites: Vec<Site>,
     attempts: Arc<Mutex<HashMap<IpAddr, (Instant, u32)>>>,
 }
 
@@ -110,6 +110,13 @@ impl IntoResponse for ApiError {
 
 pub async fn serve(node: Arc<Runtime>) -> Result<()> {
     let site = Site::parse(&node.config.public_url)?;
+    let sites = node
+        .config
+        .browser_origins()?
+        .into_iter()
+        .map(|origin| Site::parse(&origin))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(!sites.is_empty(), "at least one browser origin is required");
     ensure!(
         site.secure || node.config.listen.ip().is_loopback() || node.config.allow_insecure_lan,
         "non-loopback HTTP requires allow_insecure_lan; use HTTPS for public access"
@@ -125,7 +132,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         async {
             axum::serve(
                 listener,
-                router(node).into_make_service_with_connect_info::<SocketAddr>(),
+                router_with_sites(node, sites).into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
         },
@@ -143,7 +150,7 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
 fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
     let app = App {
         node,
-        site: Some(site),
+        sites: vec![site],
         attempts: Arc::new(Mutex::new(HashMap::new())),
     };
     Router::new()
@@ -158,8 +165,24 @@ fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
 }
 
 pub fn router(node: Arc<Runtime>) -> Router {
+    let sites = node
+        .config
+        .browser_origins()
+        .ok()
+        .and_then(|origins| {
+            origins
+                .into_iter()
+                .map(|origin| Site::parse(&origin))
+                .collect::<Result<Vec<_>>>()
+                .ok()
+        })
+        .unwrap_or_default();
+    router_with_sites(node, sites)
+}
+
+fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
     let app = App {
-        site: Site::parse(&node.config.public_url).ok(),
+        sites,
         node,
         attempts: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -226,11 +249,10 @@ async fn check_boundary(
     path: &str,
     ip: IpAddr,
 ) -> ApiResult<()> {
-    let site = app
-        .site
-        .as_ref()
-        .ok_or_else(|| ApiError::internal("invalid configured public_url"))?;
-    check_site(site, headers)?;
+    let site = check_site(&app.sites, headers)?;
+    if !http_site_allowed(site, app.node.config.allow_insecure_lan, ip) {
+        return Err(ApiError::forbidden());
+    }
     let unsafe_method = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
     if unsafe_method {
         let content_type = one_header(headers, header::CONTENT_TYPE.as_str())
@@ -245,7 +267,8 @@ async fn check_boundary(
         let is_tool_or_rpc = matches!(path, "/api/rpc" | "/api/tools") || path == CALLBACK;
         let bearer_call = is_tool_or_rpc && bearer(headers).is_some();
         if !bearer_call
-            && one_header(headers, header::ORIGIN.as_str()) != Some(site.origin.as_str())
+            && !one_header(headers, header::ORIGIN.as_str())
+                .is_some_and(|origin| site.origin.eq_ignore_ascii_case(origin))
         {
             return Err(ApiError::forbidden());
         }
@@ -272,17 +295,23 @@ async fn check_boundary(
     Ok(())
 }
 
-fn check_site(site: &Site, headers: &HeaderMap) -> ApiResult<()> {
+fn check_site<'a>(sites: &'a [Site], headers: &HeaderMap) -> ApiResult<&'a Site> {
     let host = one_header(headers, header::HOST.as_str()).ok_or_else(ApiError::forbidden)?;
-    if !host.eq_ignore_ascii_case(&site.authority) {
-        return Err(ApiError::forbidden());
-    }
+    let site = sites
+        .iter()
+        .find(|site| host.eq_ignore_ascii_case(&site.authority))
+        .ok_or_else(ApiError::forbidden)?;
     if headers.contains_key(header::ORIGIN)
-        && one_header(headers, header::ORIGIN.as_str()) != Some(site.origin.as_str())
+        && !one_header(headers, header::ORIGIN.as_str())
+            .is_some_and(|origin| site.origin.eq_ignore_ascii_case(origin))
     {
         return Err(ApiError::forbidden());
     }
-    Ok(())
+    Ok(site)
+}
+
+fn http_site_allowed(site: &Site, allow_insecure_lan: bool, peer: IpAddr) -> bool {
+    site.secure || allow_insecure_lan || peer.is_loopback()
 }
 
 fn one_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -376,7 +405,11 @@ async fn register(State(app): State<App>, Json(input): Json<Credentials>) -> Api
     Ok((StatusCode::CREATED, Json(json!({"account": account}))).into_response())
 }
 
-async fn login(State(app): State<App>, Json(input): Json<Credentials>) -> ApiResult<Response> {
+async fn login(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<Credentials>,
+) -> ApiResult<Response> {
     let login = app
         .node
         .auth
@@ -385,13 +418,10 @@ async fn login(State(app): State<App>, Json(input): Json<Credentials>) -> ApiRes
         .login(&input.username, &input.password)
         .map_err(|_| ApiError::auth())?;
     let mut response = Json(json!({"account": login.account, "csrf": login.csrf})).into_response();
+    let site = check_site(&app.sites, &headers)?;
     response.headers_mut().insert(
         header::SET_COOKIE,
-        session_cookie(
-            &login.token,
-            app.site.as_ref().is_some_and(|site| site.secure),
-            false,
-        )?,
+        session_cookie(&login.token, site.secure, false)?,
     );
     Ok(response)
 }
@@ -426,10 +456,10 @@ async fn logout(State(app): State<App>, headers: HeaderMap) -> ApiResult<Respons
         .logout(&token)
         .map_err(ApiError::internal)?;
     let mut response = Json(json!({"ok": true})).into_response();
-    response.headers_mut().insert(
-        header::SET_COOKIE,
-        session_cookie("", app.site.as_ref().is_some_and(|site| site.secure), true)?,
-    );
+    let site = check_site(&app.sites, &headers)?;
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, session_cookie("", site.secure, true)?);
     Ok(response)
 }
 
@@ -605,21 +635,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn origin_and_host_block_cross_site_and_rebinding() {
-        let site = Site::parse("http://127.0.0.1:8787").unwrap();
+    fn origin_and_host_allow_fixed_local_aliases_only() {
+        let sites = [
+            "http://192.168.0.99:8787",
+            "http://localhost:8787",
+            "http://127.0.0.1:8787",
+            "http://0.0.0.0:8787",
+            "http://[::1]:8787",
+            "http://[::]:8787",
+        ]
+        .into_iter()
+        .map(|origin| Site::parse(origin).unwrap())
+        .collect::<Vec<_>>();
+
+        for site in &sites {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, site.authority.parse().unwrap());
+            headers.insert(header::ORIGIN, site.origin.parse().unwrap());
+            assert!(check_site(&sites, &headers).is_ok());
+        }
+
+        let main = &sites[0];
+        let alias = &sites[1];
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, "127.0.0.1:8787".parse().unwrap());
-        assert!(check_site(&site, &headers).is_ok());
+        headers.insert(header::HOST, main.authority.parse().unwrap());
+        headers.insert(header::ORIGIN, alias.origin.parse().unwrap());
+        assert!(check_site(&sites, &headers).is_err());
         headers.insert(header::ORIGIN, "https://hostile.invalid".parse().unwrap());
-        assert!(check_site(&site, &headers).is_err());
+        assert!(check_site(&sites, &headers).is_err());
         headers.insert(header::ORIGIN, "http://127.0.0.1:8787".parse().unwrap());
         headers.insert(header::HOST, "hostile.invalid:8787".parse().unwrap());
-        assert!(check_site(&site, &headers).is_err());
-        headers.insert(header::HOST, "127.0.0.1:8787".parse().unwrap());
+        assert!(check_site(&sites, &headers).is_err());
+        headers.insert(header::HOST, main.authority.parse().unwrap());
         headers.append(header::HOST, "hostile.invalid".parse().unwrap());
-        assert!(check_site(&site, &headers).is_err());
+        assert!(check_site(&sites, &headers).is_err());
         assert!(Site::parse("https://example.com/path").is_err());
         assert!(Site::parse("https://user:secret@example.com").is_err());
+    }
+
+    #[test]
+    fn insecure_http_sites_require_loopback_or_lan_opt_in() {
+        let http = Site::parse("http://localhost:8787").unwrap();
+        let https = Site::parse("https://node.example:8787").unwrap();
+        assert!(http_site_allowed(
+            &http,
+            false,
+            "127.0.0.1".parse().unwrap()
+        ));
+        assert!(http_site_allowed(&http, false, "::1".parse().unwrap()));
+        assert!(!http_site_allowed(
+            &http,
+            false,
+            "192.168.0.50".parse().unwrap()
+        ));
+        assert!(http_site_allowed(
+            &http,
+            true,
+            "192.168.0.50".parse().unwrap()
+        ));
+        assert!(http_site_allowed(
+            &https,
+            false,
+            "192.168.0.50".parse().unwrap()
+        ));
     }
 
     #[test]

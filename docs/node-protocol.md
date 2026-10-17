@@ -18,8 +18,9 @@
 
 | 字段 | 含义 |
 |---|---|
-| `listen` | 本机 HTTP 监听地址，默认 `127.0.0.1:4790` |
-| `public_url` | 浏览器使用的唯一 origin，公网为 HTTPS |
+| `listen` | 实际 HTTP 监听地址，默认 `127.0.0.1:4790`，决定可接入的网卡 |
+| `public_url` | 配对和展示使用的主入口 origin，公网为 HTTPS |
+| `allowed_origins` | 额外允许的浏览器 origin 数组，默认空；`init --allowed-origin` 可重复指定 |
 | `allow_insecure_lan` | 明确允许可信 LAN 上的明文 HTTP |
 | `roles` | 本机启用的 Node 角色 |
 | `roots` | 编码执行允许使用的绝对目录列表 |
@@ -49,7 +50,9 @@
 
 ## HTTP 入口
 
-`public_url` 是唯一允许的 HTTP origin。所有请求校验 `Host`，有 `Origin` 时必须与配置一致。POST 使用 `Content-Type: application/json`。普通请求正文上限为 2 MiB，自定义工具回调上限为 1 MiB。
+允许的浏览器入口由 `public_url`、`allowed_origins` 和本机 HTTP 别名组成。本机别名为 `127.0.0.1`、`localhost`、`0.0.0.0`，端口使用 `listen` 的端口；IPv6 监听还包含 `[::1]` 和 `[::]`。`0.0.0.0`、`[::]` 只作为本机字面地址使用，其他设备访问实际 LAN IP 或配置的公网入口。允许入口不会改变监听网卡或开放防火墙。
+
+显式入口必须是不含路径、查询参数或凭证的完整 HTTP 或 HTTPS origin。非本机 HTTP 入口需要 `allow_insecure_lan`；同一主机和端口不能同时配置两个 scheme，避免仅凭 `Host` 无法区分入口。所有请求校验 `Host`，有 `Origin` 时必须匹配该 `Host` 对应的同一入口，不能在两个允许入口之间混用。POST 使用 `Content-Type: application/json`。普通请求正文上限为 2 MiB，自定义工具回调上限为 1 MiB。
 
 | 路径 | 方法 | 用途 |
 |---|---|---|
@@ -68,9 +71,9 @@
 
 仅首次回环注册可取得本机配置的调度及执行角色。其条件为本机尚无账户，且监听地址与 `public_url` 都指向回环地址。其他注册只授予本机已启用的接入、中继和副本角色，不能使用托管主机的项目目录或 Agent。
 
-注册及登录正文为 `{"username":"name","password":"..."}`。登录返回 `account` 和 `csrf`，并设置 `vibeface_session` cookie。cookie 为 HttpOnly、SameSite=Strict；HTTPS origin 额外设置 Secure。会话有效期为 7 天。
+注册及登录正文为 `{"username":"name","password":"..."}`。登录返回 `account` 和 `csrf`，并设置 `vibeface_session` cookie。cookie 为 HttpOnly、SameSite=Strict；按本次请求匹配的入口判断是否添加 Secure，HTTPS 主入口不会令本机 HTTP 入口也强制使用 Secure。会话有效期为 7 天。
 
-浏览器变更请求携带 cookie、匹配的 `Origin` 和 `X-CSRF-Token`。cookie 只适用于当前 origin，切换入口重新登录。网页切换入口可携带非秘密的 conversation ID 和 basis heads。
+浏览器变更请求携带 cookie、匹配的 `Origin` 和 `X-CSRF-Token`。不同主机名独立登录，cookie 不设置共享 Domain；不要依靠 cookie 隔离同一主机的不同端口，入口校验还会验证端口和 scheme。网页切换入口可携带非秘密的 conversation ID 和 basis heads。明确的 CSRF 403 允许网页读取 `/api/me` 核对同一账户后刷新 token，原请求仅重试一次；账户变化、其他拒绝或网络错误不触发写操作重试。
 
 `/api/tools` 只接受本机 SDK 调用期间签发的短期 bearer token，权限固定到一个个人网络和业务会话。它不能替代用户登录，也不是供外部 Bot 长期保存的访问密钥。管理 Agent 无法通过该 token 创建账户、配对、撤销、审批或验收工单。
 

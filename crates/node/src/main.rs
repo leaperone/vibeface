@@ -75,6 +75,9 @@ struct Init {
     listen: SocketAddr,
     #[arg(long)]
     public_url: Option<String>,
+    /// Additional browser origins allowed to reach this node. May be repeated.
+    #[arg(long = "allowed-origin")]
+    allowed_origins: Vec<String>,
     /// Existing directories that executors may access. May be repeated.
     #[arg(long = "root")]
     roots: Vec<PathBuf>,
@@ -164,6 +167,7 @@ fn init(options: Init) -> Result<()> {
     if let Some(url) = options.public_url {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
     }
+    configuration.allowed_origins = options.allowed_origins;
     if let Some(manager) = options.manager {
         let workspace = options
             .workspace

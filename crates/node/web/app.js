@@ -33,17 +33,28 @@ async function perform(control, action) {
 }
 function bindForm(id, action) { $(id).addEventListener("submit", (event) => { event.preventDefault(); const form = event.currentTarget; if (form.reportValidity()) perform(form.querySelector('[type="submit"]'), () => action(form)); }); }
 async function api(path, payload) {
-  let response;
   const authEpoch = state.authEpoch;
-  try { response = await fetch(path, { method: payload === undefined ? "GET" : "POST", credentials: "same-origin", headers: payload === undefined ? {} : { "Content-Type": "application/json", "X-CSRF-Token": state.csrf }, body: payload === undefined ? undefined : JSON.stringify(payload) }); }
-  catch { throw new Error("连接中断，尚未确认操作结果。请刷新或核对操作记录，不要重复派发。"); }
-  const data = await response.json().catch(() => ({}));
-  if (authEpoch !== state.authEpoch) throw new Error("账户已切换，已忽略上一个账户的请求结果。");
-  if (!response.ok) {
-    if (response.status === 401 && state.account && authEpoch === state.authEpoch) showAuth();
-    const error = new Error(typeof data.error === "string" ? data.error : data.error?.message || data.message || `请求失败（${response.status}）`); error.status = response.status; throw error;
+  const account = state.account;
+  const body = payload === undefined ? undefined : JSON.stringify(payload);
+  for (let attempt = 0; ; attempt += 1) {
+    let response;
+    const csrf = state.csrf;
+    try { response = await fetch(path, { method: payload === undefined ? "GET" : "POST", credentials: "same-origin", headers: payload === undefined ? {} : { "Content-Type": "application/json", "X-CSRF-Token": csrf }, body }); }
+    catch { throw new Error("连接中断，尚未确认操作结果。请刷新或核对操作记录，不要重复派发。"); }
+    const data = await response.json().catch(() => ({}));
+    if (authEpoch !== state.authEpoch) throw new Error("账户已切换，已忽略上一个账户的请求结果。");
+    if (!response.ok) {
+      if (response.status === 403 && payload !== undefined && attempt === 0 && account?.account_id && account?.network_id) {
+        const auth = await fetch("/api/me", { method: "GET", credentials: "same-origin", mode: "same-origin" }).then((current) => current.ok ? current.json() : null).catch(() => null);
+        if (authEpoch !== state.authEpoch) throw new Error("账户已切换，已忽略上一个账户的请求结果。");
+        if (auth?.account && (auth.account.account_id !== account.account_id || auth.account.network_id !== account.network_id)) { showAuth(); throw new Error("账户已切换，请重新登录后核对原操作。"); }
+        if (auth?.account?.account_id === account.account_id && auth.account.network_id === account.network_id && typeof auth.csrf === "string" && auth.csrf && auth.csrf !== csrf) { state.csrf = auth.csrf; continue; }
+      }
+      if (response.status === 401 && state.account && authEpoch === state.authEpoch) showAuth();
+      const error = new Error(typeof data.error === "string" ? data.error : data.error?.message || data.message || `请求失败（${response.status}）`); error.status = response.status; throw error;
+    }
+    return data;
   }
-  return data;
 }
 const rpc = (method, params = {}) => api("/api/rpc", { method, ...params });
 function networkKey(key) { return `${key}.${state.account?.network_id || "anonymous"}`; }
