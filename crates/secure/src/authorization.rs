@@ -985,6 +985,7 @@ pub struct VerifiedPolicySet {
 #[derive(Clone, Debug)]
 struct Budget {
     objects: BTreeSet<ObjectHash>,
+    object_bytes: BTreeMap<ObjectHash, usize>,
     signatures: BTreeSet<(PublicKey, String, ObjectHash, Signature)>,
     external_signatures: BTreeSet<ObjectHash>,
     bytes: usize,
@@ -997,6 +998,7 @@ impl Default for Budget {
     fn default() -> Self {
         Self {
             objects: BTreeSet::new(),
+            object_bytes: BTreeMap::new(),
             signatures: BTreeSet::new(),
             external_signatures: BTreeSet::new(),
             bytes: 0,
@@ -1061,7 +1063,9 @@ impl Budget {
         }
         let hash = value.hash()?;
         if self.objects.insert(hash.clone()) {
-            self.bytes += canonical(value)?.len();
+            let object_bytes = canonical(value)?.len();
+            self.bytes += object_bytes;
+            self.object_bytes.insert(hash.clone(), object_bytes);
             if self.objects.len() > MAX_PROOF_OBJECTS || self.bytes > MAX_PROOF_BYTES {
                 return Err(AuthorizationError::BudgetExceeded);
             }
