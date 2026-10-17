@@ -511,11 +511,7 @@ impl NetworkHub {
         });
         for result in futures_util::future::join_all(queries).await {
             if let Ok(Some(record)) = result {
-                if let Err(error) = self.publish(record.clone()).await
-                    && !error.to_string().contains("older reachability record")
-                {
-                    return Err(error);
-                }
+                self.publish(record.clone()).await?;
                 records.push(record);
             }
         }

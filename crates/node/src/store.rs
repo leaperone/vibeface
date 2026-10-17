@@ -770,6 +770,10 @@ impl Store {
 
     pub fn install_binding(&mut self, proof: &crate::binding::SignedBinding) -> Result<()> {
         self.verify_binding_creation(proof)?;
+        self.install_verified_binding(proof)
+    }
+
+    fn install_verified_binding(&mut self, proof: &crate::binding::SignedBinding) -> Result<()> {
         let binding = &proof.binding;
         let hash = crate::binding::binding_hash(binding)?;
         let current_key = format!("task-binding-current:{}", binding.task_ref);
@@ -838,38 +842,7 @@ impl Store {
         proof: &crate::binding::SignedBinding,
     ) -> Result<()> {
         self.verify_historical_binding(proof)?;
-        let binding = &proof.binding;
-        let hash = crate::binding::binding_hash(binding)?;
-        let record_key = format!("task-binding-record:{hash}");
-        self.local_set(
-            &binding.network_id,
-            &record_key,
-            &serde_json::to_value(proof)?,
-        )?;
-        let current_key = format!("task-binding-current:{}", binding.task_ref);
-        let current = self.local_value(&binding.network_id, &current_key)?;
-        let should_promote = match current {
-            None => true,
-            Some(value) => {
-                let current_hash: String = serde_json::from_value(value)?;
-                let current = self
-                    .local_value(
-                        &binding.network_id,
-                        &format!("task-binding-record:{current_hash}"),
-                    )?
-                    .context("current binding record is missing")?;
-                let current: crate::binding::SignedBinding = serde_json::from_value(current)?;
-                binding.generation > current.binding.generation
-            }
-        };
-        if should_promote {
-            self.local_set(
-                &binding.network_id,
-                &current_key,
-                &serde_json::to_value(hash)?,
-            )?;
-        }
-        Ok(())
+        self.install_verified_binding(proof)
     }
 
     pub fn seal_binding(

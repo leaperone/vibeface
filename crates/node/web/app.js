@@ -417,7 +417,8 @@ async function restoreRecovery(form) {
       try {
         const selected = choices.filter((item) => item.keep.checked).map((item) => ({ ...item.member, manage: item.member.kind === "client" ? item.manage.checked : false })); selected.push(newManager); selected.sort((a, b) => a.subject_id < b.subject_id ? -1 : a.subject_id > b.subject_id ? 1 : 0);
         const prepared = await request("prepare_recovery", { challenge_id: challenge.challenge_id, members: selected });
-        if (!matchingValue(prepared.checkpoint.members, selected) || prepared.checkpoint.network_id !== opened.payload.network_id || prepared.checkpoint.epoch !== context.view.epoch + 1) throw new Error("恢复模板与确认保留的设备不一致。");
+        const expectedEpoch = Math.max(context.view.epoch, opened.payload.recovery_epoch) + 1;
+        if (!Number.isSafeInteger(expectedEpoch) || !matchingValue(prepared.checkpoint.members, selected) || prepared.checkpoint.network_id !== opened.payload.network_id || prepared.checkpoint.epoch !== expectedEpoch) throw new Error("恢复模板与确认保留的设备不一致。");
         prepared.checkpoint.signature = opened.root.sign("identity-recovery", signingBytes(prepared.signing, "identity-recovery", prepared.checkpoint));
         const auth = await request("recover", { challenge_id: challenge.challenge_id, checkpoint: prepared.checkpoint, ...(!state.info.initialized ? { state: context.state, capability } : {}) });
         opened.payload.recovery_epoch = auth.view.epoch;
