@@ -24,7 +24,7 @@ export function composerHint(input: Omit<SendGate, 'busy'>): string {
   if (input.missing) return '等待上下文补齐后再发送。'
   if (!input.managerReady || !input.schedulerNodeId) return '设备尚未配置调度 Agent。执行会话仍可直接操作。'
   if (!input.schedulerOnline) return '所选调度设备离线，请切换其他入口或设备。'
-  return '消息将交给所选设备上的调度 Agent。'
+  return ''
 }
 export function prepareSend(input: {
   conversationId: string

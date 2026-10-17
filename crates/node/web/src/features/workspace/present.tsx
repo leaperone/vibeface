@@ -1,6 +1,7 @@
 "use client"
 
 import { useState, type ReactNode } from "react"
+import { ChevronDownIcon } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
@@ -27,7 +28,7 @@ export function EmptyState({ title, detail }: { title: string; detail: string })
 
 export function DetailList({ pairs }: { pairs: Array<[string, string | undefined]> }) {
   return (
-    <dl>
+    <dl className="grid gap-3">
       {pairs.map(([key, value]) => (
         <div key={key}>
           <dt>{key}</dt>
@@ -41,8 +42,13 @@ export function DetailList({ pairs }: { pairs: Array<[string, string | undefined
 export function RawDetails({ title, value, defaultOpen = false }: { title: string; value: unknown; defaultOpen?: boolean }) {
   return (
     <Collapsible defaultOpen={defaultOpen}>
-      <CollapsibleTrigger>{title}</CollapsibleTrigger>
-      <CollapsibleContent>
+      <CollapsibleTrigger asChild>
+        <Button variant="ghost" size="sm" className="group -ms-2 h-auto min-h-8 whitespace-normal text-start">
+          {title}
+          <ChevronDownIcon aria-hidden="true" className="shrink-0 group-data-[state=open]:rotate-180" />
+        </Button>
+      </CollapsibleTrigger>
+      <CollapsibleContent className="pt-3">
         <ScrollArea>
           <pre>{textOf(value)}</pre>
         </ScrollArea>
