@@ -8,6 +8,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 use vibeface_secure::{
     Identity,
     authorization::{
+        execution_service::{self, ExecutionServiceRegistrationRequest},
         governance::{self, SpaceGovernanceRequest, TeamCreationAcceptance, TeamCreationRequest},
         *,
     },
@@ -254,6 +255,34 @@ fn check_space_receipt(
 }
 
 impl Store {
+    pub(crate) fn execution_service_registration_challenge(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        now_ms: u64,
+    ) -> Result<FreshnessChallenge> {
+        let request: ExecutionServiceRegistrationRequest = serde_json::from_value(params.clone())?;
+        ensure!(
+            request.intent.issuer.as_str() == principal,
+            "execution registration differs from Noise identity"
+        );
+        let node = PublicKey::parse(&identity.public_key_hex()?)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let policy = journal::PolicyState::load(&tx)?;
+        let challenge = execution_service::execution_service_registration_challenge(
+            policy.verified(),
+            &request,
+            &node,
+            now_ms,
+        )?;
+        source_root(&tx, &request.intent.payload.source_project)?;
+        tx.commit()?;
+        Ok(challenge)
+    }
+
     pub(crate) fn governance_command(
         &mut self,
         identity: &LocalIdentity,
@@ -261,6 +290,20 @@ impl Store {
         method: &str,
         params: &Value,
         now_ms: u64,
+    ) -> Result<Value> {
+        self.governance_command_with_registration_freshness(
+            identity, principal, method, params, now_ms, None,
+        )
+    }
+
+    pub(crate) fn governance_command_with_registration_freshness(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        method: &str,
+        params: &Value,
+        now_ms: u64,
+        registration_freshness: Option<&super::policy::FreshnessProof>,
     ) -> Result<Value> {
         ensure!(
             serde_json::to_vec(params)?.len() <= MAX_PROOF_BYTES,
@@ -367,18 +410,42 @@ impl Store {
                 self.policy = policy;
                 Ok(serde_json::to_value(response)?)
             }
-            "space_policy_commit" => {
-                let params: SpaceCommitParams = serde_json::from_value(params.clone())?;
-                let request = params.request;
+            "space_policy_commit" | "execution_service_register" => {
+                let registration: Option<ExecutionServiceRegistrationRequest> =
+                    if method == "execution_service_register" {
+                        Some(serde_json::from_value(params.clone())?)
+                    } else {
+                        None
+                    };
+                let request = if let Some(registration) = &registration {
+                    registration.intent.verify_signature()?;
+                    ensure!(
+                        registration.intent.issuer == principal,
+                        "execution registration intent differs from Noise identity"
+                    );
+                    registration.request.clone()
+                } else {
+                    serde_json::from_value::<SpaceCommitParams>(params.clone())?.request
+                };
                 request.proposal.verify_signature()?;
                 ensure!(
-                    request.proposal.issuer == principal,
+                    registration.is_some() || request.proposal.issuer == principal,
                     "governor differs from Noise identity"
                 );
-                let request_hash = ObjectHash::body(&request)?;
+                let request_hash = if let Some(registration) = &registration {
+                    ObjectHash::body(registration)?
+                } else {
+                    ObjectHash::body(&request)?
+                };
                 let key = format!(
-                    "space-governance:{}:{}",
-                    request.proposal.payload.space, request.nonce
+                    "{}:{}:{}",
+                    if registration.is_some() {
+                        "execution-service-register"
+                    } else {
+                        "space-governance"
+                    },
+                    request.proposal.payload.space,
+                    request.nonce
                 );
                 let tx = self
                     .connection
@@ -394,8 +461,61 @@ impl Store {
                 }
                 let policy = journal::PolicyState::load(&tx)?;
                 let state = policy.verified();
-                let verified =
-                    governance::verify_space_governance_request(state, &request, now_ms)?;
+                let (commit_heads, authorization_expiry, execution_root) =
+                    if let Some(registration) = &registration {
+                        let verified = execution_service::verify_execution_service_registration(
+                            state,
+                            registration,
+                            &node,
+                            now_ms,
+                        )?;
+                        if let Some(proof) = registration_freshness {
+                            execution_service::verify_execution_service_registration_freshness(
+                                state,
+                                registration,
+                                &proof.challenge,
+                                &proof.receipts,
+                                &node,
+                                now_ms,
+                            )?;
+                        } else {
+                            let remote: Vec<_> = verified
+                                .expected_heads()
+                                .iter()
+                                .filter(|head| {
+                                    let authority = match &head.domain {
+                                        PolicyDomain::Account(id) => {
+                                            state.account(id).map(|value| &value.authority)
+                                        }
+                                        PolicyDomain::Space(id) => {
+                                            state.space(id).map(|value| &value.authority)
+                                        }
+                                    };
+                                    authority.is_none_or(|authority| authority.public_key != node)
+                                })
+                                .map(|head| head.domain.clone())
+                                .collect();
+                            if !remote.is_empty() {
+                                return Err(AuthorizationError::NeedFreshness(remote).into());
+                            }
+                        }
+                        let root = source_root(&tx, &registration.intent.payload.source_project)?;
+                        (
+                            verified.commit_heads().to_vec(),
+                            verified
+                                .expires_at_ms()
+                                .min(registration.intent.payload.expires_at_ms),
+                            Some(root),
+                        )
+                    } else {
+                        let verified =
+                            governance::verify_space_governance_request(state, &request, now_ms)?;
+                        (
+                            verified.expected_heads().to_vec(),
+                            verified.expires_at_ms(),
+                            None,
+                        )
+                    };
                 let space = state
                     .space(&request.proposal.payload.space)
                     .context("space is unavailable")?;
@@ -405,7 +525,7 @@ impl Store {
                 );
                 let expires_at_ms = now_ms
                     .saturating_add(EXECUTION_LEASE_MS)
-                    .min(verified.expires_at_ms());
+                    .min(authorization_expiry);
                 let challenge = Signed::sign(
                     PolicyCommit {
                         version: AUTH_VERSION,
@@ -418,7 +538,7 @@ impl Store {
                         issued_at_ms: now_ms,
                         expires_at_ms,
                         nonce: request.nonce.clone(),
-                        dependencies: verified.expected_heads().to_vec(),
+                        dependencies: commit_heads,
                     },
                     &signer,
                 )?;
@@ -469,7 +589,32 @@ impl Store {
                 };
                 let policy = journal::commit_in(&tx, &update)?;
                 project_policy_in(&tx, &policy)?;
+                if let Some(registration) = &registration {
+                    let root = execution_root
+                        .as_ref()
+                        .context("execution root is missing")?;
+                    let resource = &registration.intent.payload.execution_resource;
+                    tx.execute(
+                        "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
+                        params![
+                            resource.space.as_str(),
+                            format!("resource-root:{}", resource.resource),
+                            serde_json::to_string(root)?
+                        ],
+                    )?;
+                }
                 save_receipt(&tx, &key, request_hash, principal, &response)?;
+                if let Some(registration) = &registration {
+                    let root = execution_root
+                        .as_ref()
+                        .context("execution root is missing")?;
+                    ensure!(
+                        source_root(&tx, &registration.intent.payload.source_project)? == *root
+                            && source_root(&tx, &registration.intent.payload.execution_resource)?
+                                == *root,
+                        "execution registration project mapping changed"
+                    );
+                }
                 tx.commit()?;
                 self.policy = policy;
                 Ok(serde_json::to_value(response)?)
@@ -624,6 +769,399 @@ mod tests {
                 })?)
         })
         .collect()
+    }
+
+    fn prepare_execution_registration(
+        network: &TestNetwork,
+        source: &ResourceRef,
+        pins: &[PolicyPin],
+        bundle: &ClientAuthorizationBundle,
+    ) -> Result<execution_service::PreparedExecutionServiceRegistration> {
+        let material = bootstrap::recovery::build_account_recovery_material(
+            &network.created,
+            &network.root,
+            &network.recovery,
+            "https://node.example",
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        execution_service::prepare_execution_service_registration(
+            &serde_json::to_string(source)?,
+            &material,
+            &network.client,
+            &serde_json::to_string(pins)?,
+            &serde_json::to_string(bundle)?,
+            &network.node.public_key_hex()?,
+            now() as f64,
+            (now() + 60_000) as f64,
+        )
+        .map_err(anyhow::Error::msg)
+    }
+
+    #[test]
+    fn execution_service_registration_maps_personal_and_team_projects_atomically() -> Result<()> {
+        for team_source in [false, true] {
+            let network = TestNetwork::new()?;
+            let path = network.directory.join("execution-registration.sqlite3");
+            let mut store = network.at(&path)?;
+            let (source, pins, bundle) = if team_source {
+                let team = create_team(&network, &mut store)?;
+                (
+                    ResourceRef {
+                        space: team.space,
+                        resource: team.resource,
+                    },
+                    team.pins,
+                    team.bundle,
+                )
+            } else {
+                (
+                    ResourceRef {
+                        space: network.space.clone(),
+                        resource: network.resource.clone(),
+                    },
+                    network.pins.clone(),
+                    network.bundle.clone(),
+                )
+            };
+            let prepared = prepare_execution_registration(&network, &source, &pins, &bundle)?;
+            let params: Value =
+                serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
+            let execution = ResourceRef {
+                space: SpaceId::parse(&prepared.space_id())?,
+                resource: ResourceId::parse(&prepared.resource_id())?,
+            };
+            assert_eq!(execution.space, SpaceId::personal(&network.account));
+            assert_ne!(execution.resource, source.resource);
+            let response = store.governance_command(
+                &network.node,
+                &network.client.public_key_hex(),
+                "execution_service_register",
+                &params,
+                now(),
+            )?;
+            assert_eq!(source_root(&store.connection, &source)?, network.project);
+            assert_eq!(source_root(&store.connection, &execution)?, network.project);
+            let record = store
+                .policy
+                .verified()
+                .resource(&execution.space, &execution.resource)
+                .context("execution resource missing")?;
+            assert_eq!(record.payload.kind, ResourceKind::ExecutionService);
+            assert_eq!(
+                record.payload.host,
+                ServiceId::from_key(&PublicKey::parse(&network.node.public_key_hex()?)?)
+            );
+            let verified = execution_service::finish_execution_service_registration(
+                &prepared,
+                &serde_json::to_string(&response["committed"])?,
+                (now() + 200_000) as f64,
+            )
+            .map_err(anyhow::Error::msg)?;
+            assert_eq!(verified.resource_id(), execution.resource.as_str());
+            assert_eq!(verified.space_id(), execution.space.as_str());
+            let result_bundle: ClientAuthorizationBundle =
+                serde_json::from_str(&verified.bundle_json().map_err(anyhow::Error::msg)?)?;
+            let parent = store
+                .policy
+                .verified()
+                .grant(&result_bundle.grant_leaf)
+                .context("execution management parent missing")?;
+            assert_eq!(
+                parent.payload.scope,
+                ResourceScope::Exact(execution.clone())
+            );
+            assert!(parent.payload.actions.contains(&Action::ExecutionSubmit));
+            assert!(parent.payload.actions.contains(&Action::ExecutionResolve));
+            assert_eq!(parent.payload.remaining_delegations, 1);
+            assert!(parent.payload.parent.is_none());
+            assert_eq!(parent.issuer, PublicKey::of(&network.root));
+            assert_eq!(
+                store.policy.verified().grant(&network.bundle.grant_leaf),
+                replay_policies(&network.pins, &network.bundle.journal)?
+                    .grant(&network.bundle.grant_leaf)
+            );
+            if team_source {
+                assert!(!result_bundle.journal.iter().any(|entry| match entry {
+                    JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) =>
+                        value.payload.space == source.space,
+                    JournalEntry::SpaceCommit(value) =>
+                        value.proposal.payload.space == source.space,
+                    _ => false,
+                }));
+            }
+            bootstrap::recovery::inspect_account_recovery_material(
+                &verified.recovery_material_json(),
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let after = replay_policies(
+                &serde_json::from_str::<Vec<PolicyPin>>(
+                    &verified.pins_json().map_err(anyhow::Error::msg)?,
+                )?,
+                &serde_json::from_str::<ClientAuthorizationBundle>(
+                    &verified.bundle_json().map_err(anyhow::Error::msg)?,
+                )?
+                .journal,
+            )?;
+            assert_eq!(
+                after.resource(&execution.space, &execution.resource),
+                store
+                    .policy
+                    .verified()
+                    .resource(&execution.space, &execution.resource)
+            );
+            let counts = row_counts(&store)?;
+            drop(store);
+            let mut reopened = Store::open(&path)?;
+            assert_eq!(
+                reopened.governance_command(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    "execution_service_register",
+                    &params,
+                    now() + 200_000
+                )?,
+                response
+            );
+            assert_eq!(row_counts(&reopened)?, counts);
+            assert_eq!(
+                source_root(&reopened.connection, &execution)?,
+                network.project
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn execution_service_registration_rejects_tampering_foreign_owner_and_missing_root()
+    -> Result<()> {
+        let network = TestNetwork::new()?;
+        let mut store = network.memory()?;
+        let source = ResourceRef {
+            space: network.space.clone(),
+            resource: network.resource.clone(),
+        };
+        let prepared =
+            prepare_execution_registration(&network, &source, &network.pins, &network.bundle)?;
+        let request: ExecutionServiceRegistrationRequest =
+            serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
+        let original = serde_json::to_value(&request)?;
+        let counts = row_counts(&store)?;
+        let stranger = Identity::generate().map_err(anyhow::Error::msg)?;
+        assert!(
+            store
+                .governance_command(
+                    &network.node,
+                    &stranger.public_key_hex(),
+                    "execution_service_register",
+                    &original,
+                    now()
+                )
+                .is_err()
+        );
+        for mutation in 0..5 {
+            let mut changed = request.clone();
+            match mutation {
+                0 => changed.intent.payload.source_project.resource = ResourceId::random()?,
+                1 => changed.intent.payload.execution_resource = source.clone(),
+                2 => changed.intent.payload.target_node_public_key = PublicKey::of(&stranger),
+                3 => {
+                    changed.intent.payload.account = AccountId::from_root(&PublicKey::of(&stranger))
+                }
+                _ => {
+                    changed.intent.payload.policy_request_hash =
+                        ObjectHash::body(&"other governance")?
+                }
+            }
+            changed.intent = Signed::sign(changed.intent.payload, &network.client)?;
+            changed.root_approval = Signed::sign(
+                execution_service::ExecutionServiceRootApproval {
+                    version: AUTH_VERSION,
+                    intent_hash: ObjectHash::body(&changed.intent)?,
+                },
+                &network.root,
+            )?;
+            assert!(
+                store
+                    .governance_command(
+                        &network.node,
+                        &network.client.public_key_hex(),
+                        "execution_service_register",
+                        &serde_json::to_value(changed)?,
+                        now()
+                    )
+                    .is_err()
+            );
+            assert_eq!(row_counts(&store)?, counts);
+        }
+        store.connection.execute(
+            "DELETE FROM local_values WHERE space_id=? AND key=?",
+            params![
+                source.space.as_str(),
+                format!("resource-root:{}", source.resource)
+            ],
+        )?;
+        let missing_root_counts = row_counts(&store)?;
+        assert!(
+            store
+                .governance_command(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    "execution_service_register",
+                    &original,
+                    now()
+                )
+                .is_err()
+        );
+        assert_eq!(row_counts(&store)?, missing_root_counts);
+        store.local_set(
+            source.space.as_str(),
+            &format!("resource-root:{}", source.resource),
+            &serde_json::json!(network.project),
+        )?;
+        assert!(
+            store
+                .governance_command(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    "execution_service_register",
+                    &original,
+                    now() + 60_000
+                )
+                .is_err()
+        );
+        assert_eq!(row_counts(&store)?, counts);
+        Ok(())
+    }
+
+    #[test]
+    fn execution_service_registration_rolls_back_mapping_and_receipt_failures() -> Result<()> {
+        let network = TestNetwork::new()?;
+        let mut store = network.memory()?;
+        let source = ResourceRef {
+            space: network.space.clone(),
+            resource: network.resource.clone(),
+        };
+        let prepared =
+            prepare_execution_registration(&network, &source, &network.pins, &network.bundle)?;
+        let request: ExecutionServiceRegistrationRequest =
+            serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
+        let original = serde_json::to_value(&request)?;
+        let execution = &request.intent.payload.execution_resource;
+        let before = row_counts(&store)?;
+        for (name, statement) in [
+            (
+                "reject_execution_mapping",
+                "CREATE TEMP TRIGGER reject_execution_mapping BEFORE INSERT ON local_values WHEN NEW.key LIKE 'resource-root:%' BEGIN SELECT RAISE(ABORT,'injected mapping failure'); END;",
+            ),
+            (
+                "reject_execution_receipt",
+                "CREATE TEMP TRIGGER reject_execution_receipt BEFORE INSERT ON identity_meta WHEN NEW.key LIKE 'execution-service-register:%' BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;",
+            ),
+        ] {
+            store.connection.execute_batch(statement)?;
+            assert!(
+                store
+                    .governance_command(
+                        &network.node,
+                        &network.client.public_key_hex(),
+                        "execution_service_register",
+                        &original,
+                        now()
+                    )
+                    .is_err()
+            );
+            assert_eq!(row_counts(&store)?, before);
+            assert!(
+                store
+                    .policy
+                    .verified()
+                    .resource(&execution.space, &execution.resource)
+                    .is_none()
+            );
+            assert!(
+                journal::PolicyState::load(&store.connection)?
+                    .verified()
+                    .resource(&execution.space, &execution.resource)
+                    .is_none()
+            );
+            store
+                .connection
+                .execute_batch(&format!("DROP TRIGGER {name}"))?;
+        }
+        let response = store.governance_command(
+            &network.node,
+            &network.client.public_key_hex(),
+            "execution_service_register",
+            &original,
+            now(),
+        )?;
+        let counts = row_counts(&store)?;
+        let mut changed = request.clone();
+        changed.intent.payload.source_project.resource = ResourceId::random()?;
+        changed.intent = Signed::sign(changed.intent.payload, &network.client)?;
+        assert!(
+            store
+                .governance_command(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    "execution_service_register",
+                    &serde_json::to_value(changed)?,
+                    now() + 200_000
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.governance_command(
+                &network.node,
+                &network.client.public_key_hex(),
+                "execution_service_register",
+                &original,
+                now() + 200_000
+            )?,
+            response
+        );
+        assert_eq!(row_counts(&store)?, counts);
+        Ok(())
+    }
+
+    #[test]
+    fn execution_service_registration_reloads_current_account_after_second_connection_revocation()
+    -> Result<()> {
+        let network = TestNetwork::new()?;
+        let path = network.directory.join("execution-revocation.sqlite3");
+        let mut store = network.at(&path)?;
+        let source = ResourceRef {
+            space: network.space.clone(),
+            resource: network.resource.clone(),
+        };
+        let prepared =
+            prepare_execution_registration(&network, &source, &network.pins, &network.bundle)?;
+        let params: Value =
+            serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
+        let mut independent = Store::open(&path)?;
+        network.revoke_client(&mut independent)?;
+        let before = row_counts(&independent)?;
+        assert!(
+            store
+                .governance_command(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    "execution_service_register",
+                    &params,
+                    now()
+                )
+                .is_err()
+        );
+        assert_eq!(row_counts(&store)?, before);
+        assert!(
+            journal::PolicyState::load(&store.connection)?
+                .verified()
+                .resource(&source.space, &ResourceId::parse(&prepared.resource_id())?,)
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]
