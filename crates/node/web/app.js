@@ -63,7 +63,7 @@ function renderEntries() {
 function changedConnection() { const error = new Error("设备连接已切换，原连接已取消。请核对当前设备与操作记录。"); error.code = "connection_changed"; return error; }
 function showConnect() {
   state.sensitiveCleanup?.(); state.sensitiveCleanup = null; state.pair = null; $("pair-status").replaceChildren(); $("pair-status").hidden = true;
-  state.authEpoch += 1; state.member = null; state.directory = null; state.data = null; state.actual.clear(); state.pendingMessages.clear(); state.pending = []; state.drafts.clear(); state.nodes = []; state.conversations = []; state.notifications = []; state.renderKey = ""; state.renderedMessages = []; state.renderedConversation = ""; $("message-text").value = ""; clearInterval(state.timer); state.timer = null; clearTimeout(state.pairTimer);
+  state.authEpoch += 1; state.member = null; state.directory = null; state.messageReadReceipt = null; state.data = null; state.actual.clear(); state.pendingMessages.clear(); state.pending = []; state.drafts.clear(); state.nodes = []; state.conversations = []; state.notifications = []; state.renderKey = ""; state.renderedMessages = []; state.renderedConversation = ""; $("message-text").value = ""; clearInterval(state.timer); state.timer = null; clearTimeout(state.pairTimer);
   state.channel?.close(); state.channel = null;
   document.activeElement?.blur();
   $("tasks").replaceChildren(); $("sessions").replaceChildren(); $("invite-result").replaceChildren(); $("invite-result").hidden = true;
@@ -125,9 +125,10 @@ async function refresh() {
     state.nodes = nodes.nodes || []; state.conversations = conversations.conversations || []; state.notifications = notifications.notifications || [];
     if (!state.conversationId && state.conversations.length) state.conversationId = state.conversations[0].conversation_id;
     if (state.conversationId) {
-      const conversationId = state.conversationId; const data = await rpc("conversation", { conversation_id: conversationId, basis_heads: frontier() });
+      const conversationId = state.conversationId; const barrier = state.pendingMessages.get(conversationId)?.rejected?.barrier; const readNode = state.entry.node_id;
+      const data = await rpc("conversation", { conversation_id: conversationId, basis_heads: frontier() });
       if (authEpoch !== state.authEpoch) return;
-      if (conversationId === state.conversationId) { state.data = data; if (!incomplete()) { const frontiers = storage.get(networkKey("frontiers"), {}); frontiers[conversationId] = data.heads || []; storage.set(networkKey("frontiers"), frontiers); } }
+      if (conversationId === state.conversationId) { state.data = data; state.messageReadReceipt = { conversation_id: conversationId, node_id: readNode, network_id: state.member.network_id, barrier }; if (!incomplete()) { const frontiers = storage.get(networkKey("frontiers"), {}); frontiers[conversationId] = data.heads || []; storage.set(networkKey("frontiers"), frontiers); } }
     } else state.data = null;
     if (state.member.can_manage) await refreshPairRequests();
     if (authEpoch === state.authEpoch) { render(); notifyBrowser(); }
@@ -144,7 +145,7 @@ function render() {
 }
 function selectConversation(id) {
   if (state.conversationId !== id) { state.drafts.set(state.conversationId, $("message-text").value); $("message-text").value = state.drafts.get(id) || ""; }
-  state.conversationId = id; storage.set(`selected-conversation.${state.member?.network_id}`, id); state.data = null; state.renderKey = "";
+  state.conversationId = id; state.messageReadReceipt = null; storage.set(`selected-conversation.${state.member?.network_id}`, id); state.data = null; state.renderKey = "";
   const url = new URL(location.href); url.searchParams.set("conversation", id); url.searchParams.delete("basis"); url.hash = ""; history.replaceState(null, "", url); render();
 }
 function renderConversations() {
@@ -211,7 +212,23 @@ async function operate(session, action, conversationId = state.conversationId) {
   catch (error) { if (authEpoch === state.authEpoch && error.status >= 400 && error.status < 500) removePending(pending.operation_id); renderPending(); throw error; }
 }
 function removePending(id) { state.pending = state.pending.filter((item) => item.operation_id !== id); storage.set(networkKey("pending"), state.pending); renderPending(); }
+function canReleasePendingMessage(pending) {
+  const receipt = state.messageReadReceipt;
+  const missing = state.data?.missing;
+  return Boolean(pending?.rejected?.barrier && state.channel && receipt?.barrier === pending.rejected.barrier && receipt.node_id === pending.rejected.node_id && receipt.node_id === state.entry?.node_id && receipt.network_id === state.member?.network_id && receipt.conversation_id === pending.conversation_id && pending.conversation_id === state.conversationId && state.data?.conversation?.conversation_id === pending.conversation_id && Array.isArray(state.data.messages) && missing && ["events", "blobs", "conflicts"].every((key) => Object.hasOwn(missing, key)) && !incomplete() && !state.data.messages.some((message) => message.message_id === pending.message_id));
+}
 function renderPending() {
+  $("message-reconciliation").replaceChildren();
+  const pendingMessage = state.pendingMessages.get(state.conversationId);
+  if (pendingMessage && !state.data?.messages?.some((message) => message.message_id === pendingMessage.message_id)) {
+    const card = el("article", "card"); card.append(el("h3", "", "这条消息尚未确认"), el("p", "unknown-note", "保留原消息编号，不会自动重发。请先刷新并核对原入口的聊天记录。"));
+    if (canReleasePendingMessage(pendingMessage)) card.append(el("p", "muted small", "原入口已返回错误，随后取得的完整会话未找到此消息。解除只会清除本地待核对记录。"), button("已核对消息未提交，解除本地待核对", () => {
+      const current = state.pendingMessages.get(state.conversationId);
+      if (current?.message_id !== pendingMessage.message_id || current.rejected?.barrier !== pendingMessage.rejected.barrier || !canReleasePendingMessage(current)) throw new Error("消息或入口状态已变化，请重新刷新核对。");
+      const next = [...state.pendingMessages].filter(([id]) => id !== state.conversationId); storage.set(networkKey("pending-messages"), next, true); state.pendingMessages = new Map(next); renderPending(); notice("已解除本地待核对记录，未重发消息。你可以修改内容后重新提交。");
+    }, "quiet"));
+    $("message-reconciliation").append(card);
+  }
   $("pending-operations").replaceChildren();
   for (const operation of state.pending.filter((item) => item.conversation_id === state.conversationId)) { const card = el("article", "card"); card.append(el("h3", "", "有一笔操作尚未确认"), el("p", "unknown-note", "不会自动重发。请向执行设备核对原操作。"), el("code", "", operation.operation_id), button("核对原操作", async () => { const record = await rpc("reconcile", { target_node: operation.target_node, operation_id: operation.operation_id }); card.append(rawDetails("核对结果", record)); const stateValue = record.state || record.operation?.state; if (["succeeded", "failed", "rejected"].includes(stateValue)) { removePending(operation.operation_id); await refresh(); } else if (stateValue === "not_found" && record.target_node === operation.target_node && record.operation === null) { card.append(el("p", "unknown-note", "执行设备当前未找到此编号。确认原请求已结束后，可解除本地待核对记录；不会重发操作。"), button("确认旧请求已结束并解除本地待核对", async () => { removePending(operation.operation_id); notice("已解除本地待核对记录，未重发操作。"); })); } else notice(`原操作状态：${stateNames[stateValue] || "暂未找到，请保持待核对"}。`); })); $("pending-operations").append(card); }
 }
@@ -560,7 +577,7 @@ $("new-conversation").addEventListener("click", () => { $("conversation-form").h
 $("cancel-conversation").addEventListener("click", () => { $("conversation-form").hidden = true; $("new-conversation").focus(); });
 bindForm("conversation-form", async (form) => { const id = form.dataset.requestId || (form.dataset.requestId = newId()); await rpc("create_conversation", { conversation_id: id, title: form.elements.title.value.trim() }); selectConversation(id); delete form.dataset.requestId; form.reset(); form.hidden = true; setView("chat"); await refresh(); $("message-text").focus(); });
 bindForm("entry-form", async (form) => { saveEntry(readEntry(form)); form.reset(); form.closest("details").open = false; notice("已保存固定设备指纹及连接路径。切换路径不会重发任务。"); });
-bindForm("message-form", async (form) => { if (!state.data || incomplete()) throw new Error("会话上下文尚未完整。"); const text = form.elements.text.value.trim(); if (!text) throw new Error("先填写消息内容。"); const previous = state.pendingMessages.get(state.conversationId); if (previous?.text && previous.text !== text) throw new Error("此会话有一条消息尚未确认，请先刷新核对原消息，再发送新内容。"); const message = { message_id: previous?.message_id || newId(), conversation_id: state.conversationId, text, scheduler_node: previous?.scheduler_node || $("scheduler-node").value || undefined }; state.pendingMessages.set(state.conversationId, message); persistPendingMessages(); const authEpoch = state.authEpoch; try { await rpc("message", { ...message, basis_heads: state.data.heads || [], scheduler_node: message.scheduler_node }); } catch (error) { if (authEpoch === state.authEpoch && error.status >= 400 && error.status < 500 && error.status !== 409) { state.pendingMessages.delete(message.conversation_id); persistPendingMessages(); } throw error; } if (authEpoch !== state.authEpoch) return; if (state.conversationId === message.conversation_id && form.elements.text.value.trim() === message.text) form.elements.text.value = ""; else if (state.drafts.get(message.conversation_id)?.trim() === message.text) state.drafts.delete(message.conversation_id); if (state.pendingMessages.get(message.conversation_id)?.message_id === message.message_id) { state.pendingMessages.delete(message.conversation_id); persistPendingMessages(); } notice("消息已提交，调度 Agent 正在处理。"); await refresh(); });
+bindForm("message-form", async (form) => { if (!state.data || incomplete()) throw new Error("会话上下文尚未完整。"); const text = form.elements.text.value.trim(); if (!text) throw new Error("先填写消息内容。"); const previous = state.pendingMessages.get(state.conversationId); if (previous?.text && previous.text !== text) throw new Error("此会话有一条消息尚未确认，请先刷新核对原消息，再发送新内容。"); const message = { message_id: previous?.message_id || newId(), conversation_id: state.conversationId, text, scheduler_node: previous?.scheduler_node || $("scheduler-node").value || undefined }; state.pendingMessages.set(state.conversationId, message); persistPendingMessages(); const authEpoch = state.authEpoch; try { await rpc("message", { ...message, basis_heads: state.data.heads || [], scheduler_node: message.scheduler_node }); } catch (error) { if (authEpoch === state.authEpoch && error.responded) { message.rejected = { barrier: newId(), node_id: state.entry.node_id }; state.pendingMessages.set(message.conversation_id, message); persistPendingMessages(); await refresh().catch(() => {}); } renderPending(); throw error; } if (authEpoch !== state.authEpoch) return; if (state.conversationId === message.conversation_id && form.elements.text.value.trim() === message.text) form.elements.text.value = ""; else if (state.drafts.get(message.conversation_id)?.trim() === message.text) state.drafts.delete(message.conversation_id); if (state.pendingMessages.get(message.conversation_id)?.message_id === message.message_id) { state.pendingMessages.delete(message.conversation_id); persistPendingMessages(); } notice("消息已提交，调度 Agent 正在处理。"); await refresh(); });
 bindForm("task-form", async (form) => { if (!state.data || incomplete()) throw new Error("先选择上下文完整的会话。"); await rpc("create_task", { conversation_id: state.conversationId, task_id: form.dataset.requestId || (form.dataset.requestId = newId()), title: form.elements.title.value.trim(), goal: form.elements.goal.value.trim(), acceptance: form.elements.acceptance.value.trim(), auto_followup: form.elements.auto_followup.checked }); delete form.dataset.requestId; form.reset(); form.closest("details").open = false; await refresh(); notice("工单已创建。"); });
 bindForm("session-form", async (form) => { const target = state.nodes.find((node) => node.node_id === form.elements.target_node.value); if (!target?.online) throw new Error("执行设备离线，请先恢复连接。"); await operate({ target_node: target.node_id, session_id: newId(), revision: 0 }, { type: "open", executor: form.elements.executor.value, cwd: form.elements.cwd.value.trim() }); form.closest("details").open = false; });
 bindForm("invite-form", async (form) => {

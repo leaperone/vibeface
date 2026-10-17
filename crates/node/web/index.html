@@ -78,6 +78,7 @@
         <div id="sync-state" class="sync-state" role="status"></div>
         <section id="view-chat" class="view chat-view" aria-label="调度会话">
           <div id="messages" class="messages" role="log" aria-label="聊天记录" aria-live="polite" aria-relevant="additions"></div>
+          <div id="message-reconciliation" class="card-list"></div>
           <form method="post" id="message-form" class="composer">
             <label for="message-text">给调度 Agent 发消息</label><textarea id="message-text" name="text" rows="3" required maxlength="100000" placeholder="描述目标，或询问某个任务的进展…"></textarea>
             <div class="composer-footer"><label class="scheduler-label">调度设备<select id="scheduler-node" name="scheduler"></select></label><button type="submit" class="primary">发送消息</button></div>

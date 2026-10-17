@@ -165,7 +165,7 @@ export async function connectDevice(entry, { onEvent, onClose } = {}) {
         const message = JSON.parse(decoder.decode(plaintext));
         if (message.id !== undefined && pending.has(message.id)) {
           const item = pending.get(message.id); pending.delete(message.id); clearTimeout(item.timer);
-          if (message.error) { const error = new Error(typeof message.error === "string" ? message.error : message.error.message || "设备拒绝此操作。"); error.status = message.error.status || message.error.code; item.reject(error); }
+          if (message.error) { const error = new Error(typeof message.error === "string" ? message.error : message.error.message || "设备拒绝此操作。"); error.status = message.error.status || message.error.code; error.responded = true; item.reject(error); }
           else item.resolve(message.result);
         } else onEvent?.(message);
       }
