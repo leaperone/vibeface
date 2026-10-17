@@ -2,6 +2,8 @@
 
 use super::*;
 
+pub const MAX_ENROLLMENT_OFFER_BYTES: usize = 1_048_576;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollmentEntry {
@@ -39,6 +41,20 @@ pub fn enrollment_offer_hash(offer: &Signed<EnrollmentOffer>) -> Result<ObjectHa
     offer.hash()
 }
 
+pub fn decode_enrollment_offer(bytes: &[u8]) -> Result<Signed<EnrollmentOffer>> {
+    require(
+        bytes.len() <= MAX_ENROLLMENT_OFFER_BYTES,
+        "enrollment offer too large",
+    )?;
+    let offer: Signed<EnrollmentOffer> = serde_json::from_slice(bytes)
+        .map_err(|_| AuthorizationError::InvalidProof("invalid enrollment offer JSON"))?;
+    require(
+        canonical(&offer)?.len() <= MAX_ENROLLMENT_OFFER_BYTES,
+        "enrollment offer too large",
+    )?;
+    Ok(offer)
+}
+
 fn account_entry(entry: &JournalEntry, account: &AccountId) -> bool {
     match entry {
         JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
@@ -70,7 +86,7 @@ pub fn verify_enrollment_offer(
     now_ms: u64,
 ) -> Result<VerifiedEnrollmentOffer> {
     require(
-        canonical(signed)?.len() <= 1_048_576,
+        canonical(signed)?.len() <= MAX_ENROLLMENT_OFFER_BYTES,
         "enrollment offer too large",
     )?;
     signed.verify_signature()?;
@@ -234,8 +250,10 @@ pub fn verify_device_enrollment_offer(
     now_ms: f64,
 ) -> crate::Result<VerifiedEnrollmentOffer> {
     let verify = || -> Result<VerifiedEnrollmentOffer> {
-        require(offer_json.len() <= 1_048_576, "enrollment offer too large")?;
-        verify_enrollment_offer(&decode_signed(offer_json.as_bytes())?, time(now_ms)?)
+        verify_enrollment_offer(
+            &decode_enrollment_offer(offer_json.as_bytes())?,
+            time(now_ms)?,
+        )
     };
     verify().map_err(|error| error.to_string())
 }

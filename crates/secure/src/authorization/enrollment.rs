@@ -1578,6 +1578,61 @@ mod tests {
     }
 
     #[test]
+    fn public_offer_roundtrips_large_valid_history_under_its_own_bound() {
+        let mut f = Fixture::new();
+        let mut state = f.state();
+        for _ in 0..40 {
+            let document =
+                Signed::sign(next_document(&state, &f.account()).unwrap(), &key(1)).unwrap();
+            let head = state.install_account(document.clone()).unwrap();
+            f.bundle.journal.push(JournalEntry::Account(document));
+            let pin = f
+                .pins
+                .iter_mut()
+                .find(|pin| pin.domain == head.domain)
+                .unwrap();
+            pin.minimum_head = Some(head);
+        }
+        let json = create_device_enrollment_offer(
+            &key(3),
+            f.account().as_str(),
+            "https://node.example",
+            &key(4).public_key_hex(),
+            "[]",
+            END as f64,
+            &f.pins_json(),
+            &f.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        assert!(json.len() > MAX_PROOF_BYTES);
+        assert!(json.len() < MAX_ENROLLMENT_OFFER_BYTES);
+        assert!(decode_signed::<EnrollmentOffer>(json.as_bytes()).is_err());
+        let verified = verify_device_enrollment_offer(&json, NOW as f64).unwrap();
+        assert_eq!(
+            verified.offer_hash().unwrap(),
+            enrollment_offer_hash(&decode_enrollment_offer(json.as_bytes()).unwrap())
+                .unwrap()
+                .to_string()
+        );
+        assert!(
+            verify_device_enrollment_offer(&" ".repeat(MAX_ENROLLMENT_OFFER_BYTES + 1), NOW as f64)
+                .is_err()
+        );
+        if let Ok(path) = std::env::var("VIBEFACE_ENROLLMENT_VECTORS") {
+            let output = std::path::Path::new(&path).with_file_name("large-offer.json");
+            std::fs::write(
+                output,
+                serde_json::to_vec(&serde_json::json!({
+                    "offer": json, "hash": verified.offer_hash().unwrap()
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn historical_root_and_recovery_keys_cannot_be_enrolled_as_daily_devices() {
         let f = Fixture::new();
         let mut state = f.state();
@@ -1783,6 +1838,17 @@ mod tests {
             NOW as f64,
         )
         .unwrap();
+        let mut budget = Budget::default();
+        authorize_passkey_delta(
+            &state,
+            &p.request.proposal,
+            state.account(&f.account()).unwrap(),
+            NOW,
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(budget.external_signatures.len(), 1);
+        assert_eq!(budget.signatures.len(), 4);
         let result = f.accept(&p);
         assert_eq!(result.bundle.journal.len(), f.bundle.journal.len() + 1);
         let state = Fixture::from_result(&result).state();
@@ -1804,6 +1870,77 @@ mod tests {
             result.scope.unwrap().device_id,
             proof.certificate.payload.device
         );
+    }
+
+    #[test]
+    fn native_wasm_device_change_vectors() {
+        let f = Fixture::new();
+        let manager = f.manager(5, vec![]);
+        let joined = f.accept(&manager);
+        let joined_fixture = Fixture::from_result(&joined);
+        let revoke = prepare_account_device_revocation(
+            f.account().as_str(),
+            DeviceId::from_key(&PublicKey::of(&key(5))).as_str(),
+            &key(1),
+            &joined_fixture.pins_json(),
+            &joined_fixture.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let revoked = joined_fixture.accept(&revoke);
+        let passkey_proof = f.passkey_proof(7);
+        let passkey = prepare_passkey_device_enrollment(
+            &encode(&passkey_proof.intent).unwrap(),
+            &encode(&passkey_proof.certificate).unwrap(),
+            &encode(&passkey_proof.assertion).unwrap(),
+            &key(7),
+            &f.pins_json(),
+            &f.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let passkey_result = f.accept(&passkey);
+        let committed = |result: &VerifiedAccountDeviceChange| {
+            let Some(JournalEntry::AccountCommit(value)) = result.bundle.journal.last() else {
+                panic!("missing committed device change")
+            };
+            value.clone()
+        };
+        let offer = create_device_enrollment_offer(
+            &key(3),
+            f.account().as_str(),
+            "https://node.example",
+            &key(4).public_key_hex(),
+            "[]",
+            END as f64,
+            &f.pins_json(),
+            &f.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let verified_offer = verify_device_enrollment_offer(&offer, NOW as f64).unwrap();
+        assert_eq!(
+            verified_offer.offer_hash().unwrap(),
+            parse::<Signed<EnrollmentOffer>>(&offer)
+                .unwrap()
+                .hash()
+                .unwrap()
+                .to_string()
+        );
+        let AccountDeviceChange::Enrollment { intent, .. } = &manager.request.change else {
+            panic!("missing manager intent")
+        };
+        let manager_intent_hash = ObjectHash::body(&intent.payload).unwrap();
+        let vector = serde_json::json!({
+            "now": NOW, "end": END, "account": f.account(), "pins": f.pins, "bundle": f.bundle,
+            "offer": parse::<Signed<EnrollmentOffer>>(&offer).unwrap(), "offer_hash": verified_offer.offer_hash().unwrap(),
+            "manager": {"intent_hash": manager_intent_hash, "request": manager.request, "committed": committed(&joined), "bundle": joined.bundle, "pins": joined.pins, "scope": joined.scope},
+            "revoke": {"request": revoke.request, "committed": committed(&revoked), "bundle": revoked.bundle, "pins": revoked.pins, "scope": revoked.scope},
+            "passkey": {"proof": passkey_proof, "request": passkey.request, "committed": committed(&passkey_result), "bundle": passkey_result.bundle, "pins": passkey_result.pins, "scope": passkey_result.scope}
+        });
+        if let Ok(path) = std::env::var("VIBEFACE_ENROLLMENT_VECTORS") {
+            std::fs::write(path, serde_json::to_vec(&vector).unwrap()).unwrap();
+        }
     }
 
     #[test]
