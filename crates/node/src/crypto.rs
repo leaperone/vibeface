@@ -4,7 +4,6 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use vibeface_secure::authorization::SpaceId;
 
 const EVENT_DOMAIN: &[u8] = b"vibeface:event:v2:";
 
@@ -241,49 +240,7 @@ fn payload_message(domain: &str, payload: &[u8]) -> Result<Vec<u8>> {
     Ok(format!("vibeface:message:v1:{domain}:{}", digest(payload)).into_bytes())
 }
 pub fn validate_event_shape(event: &Event) -> Result<()> {
-    ensure!(event.version == WIRE_VERSION, "unsupported event version");
-    ensure!(
-        !event.scope_id.is_empty() && event.scope_id.len() <= 512,
-        "invalid scope"
-    );
-    SpaceId::parse(&event.network_id)?;
-    decode32(&event.author)?;
-    ensure!(
-        event.sequence > 0 && event.sequence <= i64::MAX as u64,
-        "invalid sequence"
-    );
-    ensure!(
-        (event.sequence == 1) == event.previous.is_none(),
-        "invalid predecessor"
-    );
-    ensure!(
-        event.parents.len() <= 1024 && event.blobs.len() <= 128,
-        "too many dependencies"
-    );
-    ensure!(
-        event.parents.windows(2).all(|w| w[0] < w[1]),
-        "parents must be sorted and unique"
-    );
-    ensure!(
-        event.blobs.windows(2).all(|w| w[0] < w[1]),
-        "blobs must be sorted and unique"
-    );
-    for hash in event.parents.iter().chain(event.previous.iter()) {
-        decode32(hash)?;
-    }
-    for blob in &event.blobs {
-        decode32(&blob.hash)?;
-        ensure!(blob.size <= MAX_BLOB_BYTES as u64, "blob too large");
-    }
-    if let EventBody::ContextCheckpoint { covered_heads, .. } = &event.body {
-        for hash in covered_heads {
-            ensure!(
-                event.parents.contains(hash),
-                "checkpoint head must be a parent"
-            );
-        }
-    }
-    Ok(())
+    vibeface_secure::authorization::events::validate_event_shape(event).map_err(anyhow::Error::msg)
 }
 
 #[cfg(test)]
