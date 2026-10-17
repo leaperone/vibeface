@@ -2500,6 +2500,9 @@ pub(crate) mod tests {
 
     impl Fixture {
         pub(crate) fn new() -> Result<Self> {
+            Self::with_executor("codex")
+        }
+        pub(crate) fn with_executor(executor_kind: &str) -> Result<Self> {
             let project = TestNetwork::new()?;
             let executor = TestNetwork::new()?;
             let mut store = project.memory().context("install Project fixture")?;
@@ -2538,7 +2541,7 @@ pub(crate) mod tests {
                     generation: 1,
                     target_node: executor.node.node_id()?,
                     session_id: "same-session".into(),
-                    open_spec: json!({"type":"open","executor":"codex","cwd":executor.project}),
+                    open_spec: json!({"type":"open","executor":executor_kind,"cwd":executor.project}),
                     previous_binding_hash: None,
                     previous_seal: None,
                 },
@@ -2585,7 +2588,7 @@ pub(crate) mod tests {
                     target: target.device.clone(),
                     session_id: operation.session_id.clone(),
                 }),
-                executor_kind: Some("codex".into()),
+                executor_kind: Some(executor_kind.into()),
                 workspace_resource: Some(project.resource.clone()),
                 sdk_session: None,
             };
