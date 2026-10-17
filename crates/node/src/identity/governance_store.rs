@@ -891,7 +891,7 @@ mod tests {
         );
         let grant = DirectionalGrantIntent {
             space: team.space.clone(),
-            grantee: Actor::Account(network.account.clone()),
+            grantee: Grantee::Actor(Actor::Account(network.account.clone())),
             scope: ResourceScope::Exact(ResourceRef {
                 space: team.space.clone(),
                 resource: team.resource.clone(),

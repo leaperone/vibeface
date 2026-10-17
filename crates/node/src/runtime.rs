@@ -1579,7 +1579,6 @@ fn require_executor_followup(
         followup_authorized(store, network, scope, task)?,
         "automatic follow-up needs an active task and user authorization"
     );
-    let events = crate::store::load_events_from(&store.connection, network)?;
     let context = store.context(network, scope, &[trigger.to_owned()])?;
     let events = crate::store::load_events_from(&store.connection, network)?;
     ensure!(

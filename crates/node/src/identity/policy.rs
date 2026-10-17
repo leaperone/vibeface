@@ -400,98 +400,99 @@ fn resource_root_from(
     Ok(root)
 }
 
-impl Store {
-    fn accepted_policy_journal(&self) -> Result<Vec<JournalEntry>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+pub(crate) fn authenticate_account_from(
+    connection: &Connection,
+    policy: &super::journal::PolicyState,
+    principal: &str,
+    params: &Value,
+    now_ms: u64,
+) -> Result<Value> {
+    ensure!(
+        params["device_public_key"].as_str() == Some(principal),
+        "account device differs from Noise identity"
+    );
+    let account = AccountId::parse(
+        params["account_id"]
+            .as_str()
+            .context("account_id is required")?,
+    )?;
+    let space = SpaceId::parse(
+        params["space_id"]
+            .as_str()
+            .context("space_id is required")?,
+    )?;
+    let key = PublicKey::parse(principal)?;
+    let requested_resource: Option<ResourceId> = params
+        .get("resource_id")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?;
+    let requested_audience: Option<Audience> = params
+        .get("audience")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?;
+    let mut statement = connection.prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let journal: Vec<JournalEntry> = rows
+        .map(|row| Ok(serde_json::from_str(&row?)?))
+        .collect::<Result<_>>()?;
+    let current = policy.verified().space(&space).context("unknown space")?;
+    for leaf in &current.grants {
+        let grant = policy
+            .verified()
+            .grant(leaf)
+            .context("registered grant proof is missing")?;
+        if requested_audience
+            .as_ref()
+            .is_some_and(|audience| audience != &grant.payload.audience)
+        {
+            continue;
+        }
+        let Ok(bundle) = policy.verified().client_authorization_projection(
+            policy.pins(),
+            &journal,
+            &account,
+            &space,
+            &key,
+            leaf,
+            now_ms,
+        ) else {
+            continue;
+        };
+        let pins = bundle_pins(policy.pins(), &bundle);
+        let verified = vibeface_secure::authorization::verify_client_authorization(
+            &serde_json::to_string(&bundle)?,
+            &serde_json::to_string(&pins)?,
+            account.as_str(),
+            space.as_str(),
+            principal,
+            now_ms as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        if requested_resource.as_ref().is_some_and(|resource| {
+            !verified
+                .resources()
+                .iter()
+                .any(|record| &record.payload.resource == resource)
+        }) {
+            continue;
+        }
+        return Ok(
+            json!({"scope":verified.scope(),"authorization":bundle,"pins":pins,"resources":verified.resources()}),
+        );
     }
+    anyhow::bail!("device has no current account authorization for this space")
+}
 
+impl Store {
     pub(crate) fn authenticate_account(
         &self,
         principal: &str,
         params: &Value,
         now_ms: u64,
     ) -> Result<Value> {
-        ensure!(
-            params["device_public_key"].as_str() == Some(principal),
-            "account device differs from Noise identity"
-        );
-        let account = AccountId::parse(
-            params["account_id"]
-                .as_str()
-                .context("account_id is required")?,
-        )?;
-        let space = SpaceId::parse(
-            params["space_id"]
-                .as_str()
-                .context("space_id is required")?,
-        )?;
-        let key = PublicKey::parse(principal)?;
-        let requested_resource: Option<ResourceId> = params
-            .get("resource_id")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?;
-        let requested_audience: Option<Audience> = params
-            .get("audience")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?;
-        let journal = self.accepted_policy_journal()?;
-        let current = self
-            .policy
-            .verified()
-            .space(&space)
-            .context("unknown space")?;
-        for leaf in &current.grants {
-            let grant = self
-                .policy
-                .verified()
-                .grant(leaf)
-                .context("registered grant proof is missing")?;
-            if requested_audience
-                .as_ref()
-                .is_some_and(|audience| audience != &grant.payload.audience)
-            {
-                continue;
-            }
-            let Ok(bundle) = self.policy.verified().client_authorization_projection(
-                self.policy.pins(),
-                &journal,
-                &account,
-                &space,
-                &key,
-                leaf,
-                now_ms,
-            ) else {
-                continue;
-            };
-            let pins = bundle_pins(self.policy.pins(), &bundle);
-            let verified = vibeface_secure::authorization::verify_client_authorization(
-                &serde_json::to_string(&bundle)?,
-                &serde_json::to_string(&pins)?,
-                account.as_str(),
-                space.as_str(),
-                principal,
-                now_ms as f64,
-            )
-            .map_err(anyhow::Error::msg)?;
-            if requested_resource.as_ref().is_some_and(|resource| {
-                !verified
-                    .resources()
-                    .iter()
-                    .any(|record| &record.payload.resource == resource)
-            }) {
-                continue;
-            }
-            return Ok(
-                json!({"scope":verified.scope(),"authorization":bundle,"pins":pins,"resources":verified.resources()}),
-            );
-        }
-        anyhow::bail!("device has no current account authorization for this space")
+        authenticate_account_from(&self.connection, &self.policy, principal, params, now_ms)
     }
     pub fn install_policy_journal(&mut self, journal: &[JournalEntry], now_ms: u64) -> Result<()> {
         let update = self.policy.prepare_network_update(journal, now_ms)?;
@@ -1203,6 +1204,11 @@ impl crate::runtime::Runtime {
             | "enrollment_status"
             | "account_device_commit" => {
                 store.enrollment_command(&self.identity, noise_public_key, method, params, now_ms)
+            }
+            "account_node_possession" | "account_node_commit" | "account_node_install" => store
+                .node_enrollment_command(&self.identity, noise_public_key, method, params, now_ms),
+            "team_create" | "space_policy_commit" => {
+                store.governance_command(&self.identity, noise_public_key, method, params, now_ms)
             }
             "passkey_prepare_registration"
             | "passkey_prepare_device"
