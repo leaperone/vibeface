@@ -19,9 +19,9 @@ use std::{
     time::{Duration, Instant},
 };
 use vibeface_secure::authorization::{
-    ClientAuthorizationBundle, ClientScope, DeviceId, Invocation, PolicyPin, PublicKey,
+    Actor, ClientAuthorizationBundle, ClientScope, DeviceId, Invocation, PolicyPin, PublicKey,
     ResourceRecord, Signed, TransportEvidence, VerifiedClientAuthorization,
-    verify_client_authorization,
+    execution_observation::ExecutionObservationRequest, verify_client_authorization,
 };
 use vibeface_secure::{Channel, Handshake};
 
@@ -331,6 +331,35 @@ async fn dispatch_request(
                 .authorization
                 .as_ref()
                 .context("authenticate before sending a request")?;
+            if params["method"] == "execution_observation" {
+                ensure!(
+                    method == "rpc" && invocation.is_none(),
+                    "execution observation requires its dedicated signed request"
+                );
+                let observation: Signed<ExecutionObservationRequest> =
+                    serde_json::from_value(params["observation_request"].clone())?;
+                let request = &observation.payload.request;
+                ensure!(
+                    request.actor == Actor::Account(client.scope().account_id.clone())
+                        && request.device == client.scope().device_id
+                        && request.resource.space == client.scope().space_id
+                        && &request.audience == client.audience(),
+                    "observation differs from the authenticated client scope"
+                );
+                if client.audience() != &node.local_audience()? {
+                    return node
+                        .forward_client_execution_observation(client, &params, &session.public_key)
+                        .await;
+                }
+                return node
+                    .observe_client_execution(
+                        params,
+                        TransportEvidence::DirectNoise {
+                            device: DeviceId::from_key(&PublicKey::parse(&session.public_key)?),
+                        },
+                    )
+                    .await;
+            }
             ensure!(
                 params["space_id"].as_str() == Some(client.scope().space_id.as_str()),
                 "request belongs to another space"
