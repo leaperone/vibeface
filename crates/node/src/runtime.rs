@@ -1683,11 +1683,9 @@ impl Runtime {
                 };
                 let Ok(view) = state.project() else { continue };
                 let online = node.hub.online(&view.network_id).await;
-                for member in view
-                    .members
-                    .into_iter()
-                    .filter(|member| member.kind == IdentityKind::Node)
-                {
+                for member in view.members.into_iter().filter(|member| {
+                    member.kind == IdentityKind::Node && !view.revoked.contains(&member.subject_id)
+                }) {
                     if member.subject_id == node.identity.node_id().unwrap_or_default()
                         || online.contains(&member.subject_id)
                     {
@@ -1804,6 +1802,11 @@ impl Runtime {
         body: EventBody,
         blobs: Vec<BlobRef>,
     ) -> Result<SignedEvent> {
+        let current = self.membership_state().await?;
+        ensure!(
+            current.genesis.network_id == network,
+            "wrong personal network"
+        );
         let event = self.store.lock().await.append_event(
             &self.identity,
             network,
@@ -1985,7 +1988,12 @@ impl Runtime {
     }
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
         let _work = self.maintenance.enter()?;
+        let current = self.membership_state().await?;
         let network = &access.network_id;
+        ensure!(
+            current.genesis.network_id == *network,
+            "wrong personal network"
+        );
         self.store
             .lock()
             .await
@@ -2014,13 +2022,14 @@ impl Runtime {
                 let online = self.hub.online(network).await;
                 let local = self.identity.node_id()?;
                 let mut nodes = vec![];
-                for member in bundle
-                    .project()?
+                let view = bundle.project()?;
+                for member in view
                     .members
                     .into_iter()
                     .filter(|member| member.kind == IdentityKind::Node)
                 {
-                    let cert = member.certificate()?;
+                    let mut cert = member.certificate()?;
+                    cert.revoked = view.revoked.contains(&cert.node_id);
                     let here = cert.node_id == local;
                     let live = here || online.contains(&cert.node_id);
                     let capabilities = if here {
@@ -3865,8 +3874,10 @@ impl Runtime {
                     .context("unknown network")?;
                 let online = self.hub.online(&request.network_id).await;
                 let mut target = None;
-                for member in bundle.project()?.members.into_iter().filter(|member| {
+                let view = bundle.project()?;
+                for member in view.members.into_iter().filter(|member| {
                     member.kind == IdentityKind::Node
+                        && !view.revoked.contains(&member.subject_id)
                         && member.node_roles.contains(&NodeRole::Scheduler)
                         && online.contains(&member.subject_id)
                 }) {
