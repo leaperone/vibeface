@@ -27,7 +27,10 @@ export function TaskActivity({ task, conversationId }: { task: TaskRecord; conve
   const capabilities = binding?.capabilities ?? []
   const hasFollowupVersion = task.followup_version !== undefined
   const targetOnline = workspace.nodes.some((node) => node.node_id === binding?.target_node && node.online && !node.revoked)
-  const pendingControls = workspace.pending.filter((operation) => operation.control?.task_id === task.task_id || (binding && operation.target_node === binding.target_node && operation.session_id === binding.session_id))
+  const pendingControls = workspace.pending.filter((operation) => operation.conversation_id === conversationId && (
+    (operation.control?.task_id ?? operation.request?.task_id) === task.task_id ||
+    (binding && operation.target_node === binding.target_node && operation.session_id === binding.session_id)
+  ))
   const canControl = workspace.writable && targetOnline && Boolean(binding?.operation_id) && binding?.state !== "unknown" && binding?.freshness !== "unknown" && pendingControls.length === 0
 
   return (

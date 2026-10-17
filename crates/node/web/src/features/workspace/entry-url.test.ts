@@ -7,7 +7,7 @@ import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import type { ReadyConnection } from "../../lib/node.ts"
 import { conversationHref } from "./entry-url.ts"
-import { isIncomplete, mergeBasis } from "./labels.ts"
+import { isIncomplete, mergeBasis, nodeName, stateNames } from "./labels.ts"
 import { hasQueuedMessage, inputText, parseArtifactPage, parseConversation, parseNodes, parsePending, parsePendingTasks } from "./model.ts"
 import { parseReconcile, reconcileDecision } from "./reconcile.ts"
 
@@ -254,5 +254,46 @@ test("workspace callers retain offline message identity and bound execution task
     assert.equal(render().pending.length, 0)
   } finally {
     for (const effect of effects.values()) effect.cleanup?.()
+  }
+})
+
+test("task pending controls stay inside their conversation and retain task and resource locks", () => {
+  const task = parseConversation({ ...context, tasks: [{ task_id: "task", title: "work", goal: "goal", acceptance: "done", detail: "running", status: "working", binding: { target_node: "executor", session_id: "session", operation_id: "execution", revision: 4, state: "running", freshness: "local_ledger", capabilities: ["interrupt"], pending_requests: [] } }] }).tasks[0]
+  const operation = (kind: "request" | "control", changes: Record<string, unknown> = {}) => {
+    const identity = { operation_id: kind, network_id: "network", conversation_id: "chat", task_id: "task", target_node: "executor", session_id: "session", expected_revision: 4, ...changes }
+    const payload = kind === "request" ? { ...identity, basis_heads: ["head"], resources: [], action: { type: "send", text: "work" } } : { ...identity, expected_operation_id: "execution", action: "interrupt" }
+    return { operation_id: identity.operation_id, conversation_id: identity.conversation_id, target_node: identity.target_node, session_id: identity.session_id, [kind]: payload }
+  }
+  let pending: ReturnType<typeof parsePending> = []
+  const elements: { type: unknown; props: Record<string, unknown> }[] = []
+  const jsx = (type: unknown, props: Record<string, unknown>) => { const element = { type, props }; elements.push(element); return element }
+  const ui = new Proxy({}, { get: (_target, name) => String(name) })
+  const module: { exports: Record<string, unknown> } = { exports: {} }
+  const require = (specifier: string) => {
+    if (specifier === "react") return { useId: () => "task", useState: (initial: unknown) => [initial, () => {}] }
+    if (specifier === "react/jsx-runtime") return { jsx, jsxs: jsx }
+    if (specifier === "./context") return { useWorkspace: () => ({ pending, nodes: [{ node_id: "executor", online: true, revoked: false }], writable: true, connectionOnline: true, canAutoFollowup: true }) }
+    if (specifier === "./labels") return { nodeName, stateNames }
+    return ui
+  }
+  const filename = fileURLToPath(new URL("./task-activity.tsx", import.meta.url))
+  const compiled = transpileModule(readFileSync(filename, "utf8"), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
+  new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext()(module.exports, require, module)
+  const TaskActivity = module.exports.TaskActivity
+  assert.ok(typeof TaskActivity === "function")
+  for (const scenario of [
+    { name: "foreign conversation with the same task and binding", pending: [operation("request", { conversation_id: "foreign" }), operation("control", { conversation_id: "foreign" })], visible: [], locked: false },
+    { name: "current conversation with the original task request and control", pending: [operation("request"), operation("control")], visible: ["request", "control"], locked: true },
+    { name: "another task and resource in the current conversation", pending: [operation("request", { task_id: "other-task", target_node: "other-executor", session_id: "other-session" })], visible: [], locked: false },
+    { name: "unbound request on the current execution resource", pending: [operation("request", { task_id: null })], visible: ["request"], locked: true },
+    { name: "original task request on its old execution binding", pending: [operation("request", { target_node: "old-executor", session_id: "old-session" })], visible: ["request"], locked: true },
+  ]) {
+    pending = parsePending(scenario.pending, "network")
+    elements.length = 0
+    TaskActivity({ task, conversationId: "chat" })
+    assert.deepEqual(elements.filter(({ props }) => props.operation !== undefined).map(({ props }) => props.operation), pending.filter((item) => scenario.visible.includes(item.operation_id)), scenario.name)
+    const interrupt = elements.filter(({ props }) => props.children === "停止当前执行")
+    assert.equal(interrupt.length, 1, scenario.name)
+    assert.equal(interrupt[0].props.disabled, scenario.locked, scenario.name)
   }
 })
