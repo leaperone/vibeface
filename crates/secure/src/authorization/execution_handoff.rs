@@ -2183,6 +2183,9 @@ pub struct ExecutionProofCounts {
     pub actual: Option<crate::signature_verification::SignatureVerificationCounts>,
 }
 impl ExecutionProofUsage {
+    pub fn record_chain_depth(&mut self, depth: usize) {
+        self.max_chain_depth = self.max_chain_depth.max(depth);
+    }
     pub fn record_actual_signature_counts(
         &mut self,
         counts: crate::signature_verification::SignatureVerificationCounts,
