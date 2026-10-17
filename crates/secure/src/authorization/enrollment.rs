@@ -1005,11 +1005,11 @@ pub fn verify_passkey_device_enrollment(
             && record.record().payload.client_enrollment == PasskeyClientEnrollment::AccountClient,
         "passkey record does not authorize account client enrollment",
     )?;
-    let credential =
-        crate::webauthn::RegisteredPasskey::from_authorized(&record, proof.assertion.state)
-            .map_err(|_| {
-                AuthorizationError::InvalidProof("invalid authorized enrollment credential")
-            })?;
+    let credential = crate::webauthn::RegisteredPasskey::from_authorized(
+        &record,
+        record.assertion_state(proof.assertion.state)?,
+    )
+    .map_err(|_| AuthorizationError::InvalidProof("invalid authorized enrollment credential"))?;
     let assertion = crate::webauthn::verify_passkey_assertion(
         &proof.assertion.pending,
         &credential,
@@ -1126,6 +1126,7 @@ pub(super) fn authorize_passkey_delta(
             .insert(stamp.domain.clone(), stamp.clone());
     }
     budget.expires(verified.expires_at_ms());
+    budget.authenticator_assertion(&verified.assertion);
     Ok(())
 }
 
@@ -1240,6 +1241,10 @@ mod tests {
                     origins: vec!["https://client.example".to_owned()],
                     user_handle: URL_SAFE_NO_PAD.encode([7; 32]),
                     backup_eligible: true,
+                    initial_state: AuthenticatorState {
+                        sign_count: 0,
+                        backup_state: false,
+                    },
                     client_enrollment: PasskeyClientEnrollment::AccountClient,
                     issued_under: head.clone(),
                     not_before_ms: 10_000,
@@ -2037,6 +2042,64 @@ mod tests {
         if let Ok(path) = std::env::var("VIBEFACE_ENROLLMENT_VECTORS") {
             std::fs::write(path, serde_json::to_vec(&vector).unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn passkey_enrollment_replay_preserves_the_verified_counter_floor() {
+        let f = Fixture::new();
+        let proof = f.passkey_proof(5);
+        let prepared = prepare_passkey_device_enrollment(
+            &encode(&proof.intent).unwrap(),
+            &encode(&proof.certificate).unwrap(),
+            &encode(&proof.assertion).unwrap(),
+            &key(5),
+            &f.pins_json(),
+            &f.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let f = Fixture::from_result(&f.accept(&prepared));
+        let state = f.state();
+        let mut proof = f.passkey_proof(6);
+        assert_eq!(
+            state
+                .verify_authenticator(&proof.assertion.record, NOW)
+                .unwrap()
+                .state_floor()
+                .sign_count,
+            1,
+        );
+        assert!(verify_passkey_device_enrollment(&state, &proof, NOW).is_err());
+        proof.assertion.state.sign_count = 1;
+        assert!(verify_passkey_device_enrollment(&state, &proof, NOW).is_err());
+        let pending = &proof.assertion.pending;
+        proof.assertion.response = crate::webauthn::tests::assertion(
+            pending,
+            crate::webauthn::tests::auth(pending, 0x0d, 2),
+            crate::webauthn::tests::client(pending, "webauthn.get"),
+            Some(URL_SAFE_NO_PAD.encode([7; 32])),
+        );
+        verify_passkey_device_enrollment(&state, &proof, NOW).unwrap();
+        let prepared = prepare_passkey_device_enrollment(
+            &encode(&proof.intent).unwrap(),
+            &encode(&proof.certificate).unwrap(),
+            &encode(&proof.assertion).unwrap(),
+            &key(6),
+            &f.pins_json(),
+            &f.bundle_json(),
+            NOW as f64,
+        )
+        .unwrap();
+        let result = f.accept(&prepared);
+        let replayed = Fixture::from_result(&result).state();
+        assert_eq!(
+            replayed
+                .verify_authenticator(&proof.assertion.record, NOW)
+                .unwrap()
+                .state_floor()
+                .sign_count,
+            2,
+        );
     }
 
     #[test]

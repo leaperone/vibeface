@@ -19,6 +19,7 @@ pub struct AuthenticatorRecord {
     pub origins: Vec<String>,
     pub user_handle: String,
     pub backup_eligible: bool,
+    pub initial_state: crate::webauthn::AuthenticatorState,
     pub client_enrollment: PasskeyClientEnrollment,
     pub issued_under: PolicyStamp,
     pub not_before_ms: u64,
@@ -35,6 +36,7 @@ impl SignedObject for AuthenticatorRecord {
 pub struct VerifiedAuthenticator {
     record: Signed<AuthenticatorRecord>,
     hash: ObjectHash,
+    state_floor: crate::webauthn::AuthenticatorState,
 }
 impl VerifiedAuthenticator {
     pub fn record(&self) -> &Signed<AuthenticatorRecord> {
@@ -63,6 +65,20 @@ impl VerifiedAuthenticator {
     }
     pub fn backup_eligible(&self) -> bool {
         self.record.payload.backup_eligible
+    }
+    pub fn state_floor(&self) -> crate::webauthn::AuthenticatorState {
+        self.state_floor
+    }
+    pub(super) fn assertion_state(
+        &self,
+        claimed: crate::webauthn::AuthenticatorState,
+    ) -> Result<crate::webauthn::AuthenticatorState> {
+        require(
+            claimed.sign_count >= self.state_floor.sign_count
+                && claimed.backup_state == self.state_floor.backup_state,
+            "passkey state is older than verified policy history",
+        )?;
+        Ok(claimed)
     }
     pub fn expires_at_ms(&self) -> u64 {
         self.record.payload.expires_at_ms
@@ -116,7 +132,8 @@ impl VerifiedPolicySet {
                 && !record.origins[0].is_empty()
                 && record.origins[0].len() <= 2048
                 && record.user_handle.len() == 43
-                && base64url(&record.user_handle, 32),
+                && base64url(&record.user_handle, 32)
+                && (!record.initial_state.backup_state || record.backup_eligible),
             "invalid authenticator record",
         )?;
         validate_window(record.not_before_ms, record.expires_at_ms, now_ms)?;
@@ -180,6 +197,11 @@ impl VerifiedPolicySet {
         }
         Ok(VerifiedAuthenticator {
             record: signed.clone(),
+            state_floor: self
+                .authenticator_states
+                .get(&hash)
+                .copied()
+                .unwrap_or(signed.payload.initial_state),
             hash,
         })
     }
@@ -234,6 +256,10 @@ mod tests {
             origins: vec!["https://example.com".into()],
             user_handle: "A".repeat(43),
             backup_eligible: true,
+            initial_state: crate::webauthn::AuthenticatorState {
+                sign_count: 0,
+                backup_state: false,
+            },
             client_enrollment: PasskeyClientEnrollment::AccountClient,
             issued_under: f
                 .state
@@ -271,12 +297,30 @@ mod tests {
         assert_eq!(verified.account(), &f.account);
         assert_eq!(verified.credential_id(), "AQID");
         assert!(verified.backup_eligible());
+        assert_eq!(verified.state_floor(), record.initial_state);
         assert_eq!(
             f.state
                 .verify_authenticator(&signed, NOW + 1000)
                 .unwrap_err(),
             AuthorizationError::Expired
         );
+        let mut tampered = signed.clone();
+        tampered.payload.initial_state.sign_count = 99;
+        assert!(f.state.verify_authenticator(&tampered, NOW).is_err());
+        let mut invalid = record.clone();
+        invalid.backup_eligible = false;
+        invalid.initial_state.backup_state = true;
+        assert!(
+            f.state
+                .install_authenticator(Signed::sign(invalid, &f.root).unwrap(), NOW)
+                .is_err()
+        );
+        let mut wire = serde_json::to_value(&signed).unwrap();
+        wire["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("initial_state");
+        assert!(serde_json::from_value::<Signed<AuthenticatorRecord>>(wire).is_err());
         let mut tampered = signed.clone();
         tampered.payload.backup_eligible = false;
         assert!(f.state.verify_authenticator(&tampered, NOW).is_err());

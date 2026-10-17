@@ -972,6 +972,7 @@ pub struct VerifiedPolicySet {
     devices: BTreeMap<ObjectHash, Signed<DeviceCertificate>>,
     resources: BTreeMap<ObjectHash, Signed<ResourceRecord>>,
     authenticators: BTreeMap<ObjectHash, Signed<AuthenticatorRecord>>,
+    authenticator_states: BTreeMap<ObjectHash, crate::webauthn::AuthenticatorState>,
     memberships: BTreeMap<ObjectHash, Signed<Membership>>,
     grants: BTreeMap<ObjectHash, Signed<Grant>>,
     roots: BTreeMap<PolicyStamp, PublicKey>,
@@ -986,6 +987,7 @@ struct Budget {
     expires_at_ms: u64,
     steps: usize,
     dependencies: BTreeMap<PolicyDomain, PolicyStamp>,
+    authenticator_updates: BTreeMap<ObjectHash, crate::webauthn::AuthenticatorState>,
 }
 impl Default for Budget {
     fn default() -> Self {
@@ -997,10 +999,20 @@ impl Default for Budget {
             expires_at_ms: u64::MAX,
             steps: 0,
             dependencies: BTreeMap::new(),
+            authenticator_updates: BTreeMap::new(),
         }
     }
 }
 impl Budget {
+    fn authenticator_assertion(&mut self, assertion: &crate::webauthn::VerifiedPasskeyAssertion) {
+        self.authenticator_updates.insert(
+            assertion.record_hash().clone(),
+            crate::webauthn::AuthenticatorState {
+                sign_count: assertion.sign_count(),
+                backup_state: assertion.backup_state(),
+            },
+        );
+    }
     fn verify_raw(
         &mut self,
         key: &PublicKey,
@@ -1430,6 +1442,8 @@ impl VerifiedPolicySet {
         if let Some((hash, certificate)) = enrolled {
             self.devices.insert(hash, certificate);
         }
+        self.authenticator_states
+            .extend(budget.authenticator_updates);
         Ok(stamp)
     }
     pub fn trust_space_genesis(

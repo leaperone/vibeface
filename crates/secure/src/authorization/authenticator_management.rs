@@ -211,17 +211,19 @@ impl VerifiedPolicySet {
             old.account() == &document.account,
             "passkey approval belongs to another account",
         )?;
-        let credential = RegisteredPasskey::from_authorized(&old, approval.assertion.state)
-            .map_err(|_| {
-                AuthorizationError::InvalidProof("invalid registered management passkey")
-            })?;
-        verify_passkey_assertion(
+        let credential = RegisteredPasskey::from_authorized(
+            &old,
+            old.assertion_state(approval.assertion.state)?,
+        )
+        .map_err(|_| AuthorizationError::InvalidProof("invalid registered management passkey"))?;
+        let assertion = verify_passkey_assertion(
             &approval.assertion.pending,
             &credential,
             &approval.assertion.response,
             now,
         )
         .map_err(|_| AuthorizationError::InvalidProof("invalid management passkey approval"))?;
+        budget.authenticator_assertion(&assertion);
         budget.expires(
             token
                 .expires_at_ms()
@@ -349,12 +351,12 @@ mod tests {
     use super::super::tests::{Fixture, NOW};
     use super::*;
     use crate::webauthn::{
-        AssertionResponse, AuthenticationCeremony, AuthenticatorAssertion, AuthenticatorState,
-        EnrollmentEnvelope, PendingPasskey, RelyingParty,
+        AuthenticationCeremony, AuthenticatorState, EnrollmentEnvelope, PendingPasskey,
+        RelyingParty,
     };
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use coset::{CborSerializable, CoseKeyBuilder, iana};
-    use p256::ecdsa::{SigningKey, signature::Signer};
+    use p256::ecdsa::SigningKey;
 
     fn proposal(add: bool) -> (Fixture, Signed<AccountDocument>) {
         let mut f = Fixture::new();
@@ -386,6 +388,10 @@ mod tests {
                 origins: vec!["https://client.example".into()],
                 user_handle: URL_SAFE_NO_PAD.encode([7; 32]),
                 backup_eligible: true,
+                initial_state: AuthenticatorState {
+                    sign_count: 0,
+                    backup_state: false,
+                },
                 client_enrollment: PasskeyClientEnrollment::AccountClient,
                 issued_under: head.clone(),
                 not_before_ms: 0,
@@ -426,8 +432,22 @@ mod tests {
         } else {
             current.authenticators.clear();
         }
+        let signed = approved(&f, current, &record, 1, 0, false, 0x0d);
+        (f, signed)
+    }
+    fn approved(
+        f: &Fixture,
+        mut document: AccountDocument,
+        record: &Signed<AuthenticatorRecord>,
+        count: u32,
+        claimed_count: u32,
+        claimed_backup: bool,
+        flags: u8,
+    ) -> Signed<AccountDocument> {
+        let manager = Identity::from_secret_hex(&"04".repeat(32)).unwrap();
+        document.authenticator_approval = None;
         let intent =
-            create_management_intent(&f.state, &current, &manager, NOW, NOW + 10_000).unwrap();
+            create_management_intent(&f.state, &document, &manager, NOW, NOW + 10_000).unwrap();
         let pending = PendingPasskey::prepare(
             EnrollmentEnvelope {
                 version: AUTH_VERSION,
@@ -449,42 +469,25 @@ mod tests {
             NOW,
         )
         .unwrap();
-        let challenge = pending.authentication_options().unwrap()["publicKey"]["challenge"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let client=serde_json::to_vec(&serde_json::json!({"type":"webauthn.get","challenge":challenge,"origin":"https://client.example","crossOrigin":false})).unwrap();
-        let mut data = Sha256::digest(b"client.example").to_vec();
-        data.push(0x0d);
-        data.extend(1u32.to_be_bytes());
-        let mut signed = data.clone();
-        signed.extend(Sha256::digest(&client));
-        let signature: p256::ecdsa::Signature = signer.sign(&signed);
-        let response = AssertionResponse {
-            id: record.payload.credential_id.clone(),
-            raw_id: record.payload.credential_id.clone(),
-            credential_type: "public-key".into(),
-            response: AuthenticatorAssertion {
-                client_data_json: URL_SAFE_NO_PAD.encode(client),
-                authenticator_data: URL_SAFE_NO_PAD.encode(data),
-                signature: URL_SAFE_NO_PAD.encode(signature.to_der()),
-                user_handle: Some(record.payload.user_handle.clone()),
-            },
-            client_extension_results: serde_json::json!({}),
-        };
-        current.authenticator_approval = Some(AuthenticatorPolicyApproval {
+        let response = crate::webauthn::tests::assertion(
+            &pending,
+            crate::webauthn::tests::auth(&pending, flags, count),
+            crate::webauthn::tests::client(&pending, "webauthn.get"),
+            Some(record.payload.user_handle.clone()),
+        );
+        document.authenticator_approval = Some(AuthenticatorPolicyApproval {
             intent,
             assertion: PasskeyAssertionProof {
                 pending,
-                record,
+                record: record.clone(),
                 state: AuthenticatorState {
-                    sign_count: 0,
-                    backup_state: false,
+                    sign_count: claimed_count,
+                    backup_state: claimed_backup,
                 },
                 response,
             },
         });
-        (f, Signed::sign(current, &manager).unwrap())
+        Signed::sign(document, &manager).unwrap()
     }
     fn committed(f: &Fixture, proposal: Signed<AccountDocument>) -> Committed<AccountDocument> {
         let previous = f
@@ -626,6 +629,131 @@ mod tests {
             .install_account(Signed::sign(current, &f.root).unwrap())
             .unwrap();
         assert!(f.state.verify_authenticator(&record, NOW).is_ok());
+    }
+
+    fn next_removal(f: &Fixture, record: &Signed<AuthenticatorRecord>) -> AccountDocument {
+        let mut next = f.state.account(&f.account).unwrap().clone();
+        next.previous = f
+            .state
+            .head(&PolicyDomain::Account(f.account.clone()))
+            .cloned();
+        next.sequence += 1;
+        next.authenticators = vec![record.hash().unwrap()];
+        next.authenticator_approval = None;
+        next
+    }
+
+    #[test]
+    fn replay_folds_counters_and_backup_state_only_after_a_complete_commit() {
+        let (mut f, first) = proposal(true);
+        let record = first
+            .payload
+            .authenticator_approval
+            .as_ref()
+            .unwrap()
+            .assertion
+            .record
+            .clone();
+        let hash = record.hash().unwrap();
+        // Opaque active commitments can disclose the full signed record in the proof.
+        f.state.authenticators.remove(&hash);
+        let mut missing_receipt = committed(&f, first.clone());
+        missing_receipt.receipts.clear();
+        assert!(
+            f.state
+                .install_account_committed(missing_receipt, NOW)
+                .is_err()
+        );
+        assert_eq!(
+            f.state
+                .verify_authenticator(&record, NOW)
+                .unwrap()
+                .state_floor()
+                .sign_count,
+            0
+        );
+        let first = committed(&f, first);
+        f.state.replay_account_committed(first).unwrap();
+        assert_eq!(
+            f.state
+                .verify_authenticator(&record, NOW)
+                .unwrap()
+                .state_floor()
+                .sign_count,
+            1
+        );
+        let next = next_removal(&f, &record);
+        for (count, claimed_count, backup, flags) in [
+            (1, 0, false, 0x0d),
+            (1, 1, false, 0x0d),
+            (2, 0, false, 0x0d),
+            (2, 1, true, 0x0d),
+            (2, 1, false, 0x05),
+        ] {
+            let signed = approved(
+                &f,
+                next.clone(),
+                &record,
+                count,
+                claimed_count,
+                backup,
+                flags,
+            );
+            let change = committed(&f, signed);
+            assert!(f.state.replay_account_committed(change).is_err());
+            assert_eq!(
+                f.state
+                    .verify_authenticator(&record, NOW)
+                    .unwrap()
+                    .state_floor(),
+                AuthenticatorState {
+                    sign_count: 1,
+                    backup_state: false
+                }
+            );
+        }
+        let signed = approved(&f, next, &record, 2, 1, false, 0x1d);
+        let change = committed(&f, signed);
+        f.state.replay_account_committed(change).unwrap();
+        assert_eq!(
+            f.state
+                .verify_authenticator(&record, NOW)
+                .unwrap()
+                .state_floor(),
+            AuthenticatorState {
+                sign_count: 2,
+                backup_state: true
+            }
+        );
+    }
+
+    #[test]
+    fn zero_counter_credentials_remain_usable_without_clone_detection() {
+        let (mut f, first) = proposal(true);
+        let record = first
+            .payload
+            .authenticator_approval
+            .as_ref()
+            .unwrap()
+            .assertion
+            .record
+            .clone();
+        let first = approved(&f, first.payload, &record, 0, 0, false, 0x0d);
+        f.state
+            .install_account_committed(committed(&f, first), NOW)
+            .unwrap();
+        let second = approved(&f, next_removal(&f, &record), &record, 0, 0, false, 0x0d);
+        f.state
+            .install_account_committed(committed(&f, second), NOW)
+            .unwrap();
+        assert_eq!(
+            f.state
+                .verify_authenticator(&record, NOW)
+                .unwrap()
+                .state_floor()
+                .sign_count,
+            0
+        );
     }
 
     #[test]
