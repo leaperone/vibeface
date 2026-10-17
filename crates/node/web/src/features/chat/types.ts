@@ -4,6 +4,7 @@ export type TranscriptMessage = {
   text: string
   event_hash: string
   created_at_ms: number
+  blobs?: { hash: string; size: number }[]
 }
 export type PendingMessage = {
   message_id: string
@@ -12,6 +13,7 @@ export type PendingMessage = {
   scheduler_node: string
   entry_node: string
   basis_heads: string[]
+  report_results?: boolean
   rejected?: { entry_node: string }
 }
-export type MessageRequest = Pick<PendingMessage, "conversation_id" | "message_id" | "text" | "basis_heads" | "scheduler_node">
+export type MessageRequest = Pick<PendingMessage, "conversation_id" | "message_id" | "text" | "basis_heads" | "scheduler_node" | "report_results">

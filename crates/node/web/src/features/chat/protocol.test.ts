@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { canSend, composerHint, isSubmitKey, prepareSend, roleLabel } from './protocol.ts'
+import { canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, roleLabel } from './protocol.ts'
 
 const ready = { hasConversation: true, loaded: true, missing: false, schedulerOnline: true, managerReady: true, schedulerNodeId: 'node-1' }
 test('send stays disabled until the conversation and scheduler are ready', () => {
@@ -42,4 +42,17 @@ test('invalid message content is rejected before a durable request is created', 
   assert.equal(prepareSend({ ...input, text: '  ' }).ok, false)
   assert.equal(prepareSend({ ...input, text: '中'.repeat(21846) }).ok, false)
   assert.equal(prepareSend({ ...input, text: 'a'.repeat(65536) }).ok, true)
+})
+test('report authorization survives retries and only the exact durable queue receipt settles a message', () => {
+  const prepared = prepareSend({ conversationId: 'chat', text: '后台处理', schedulerNodeId: 'scheduler', entryNode: 'entry', heads: [], pending: null, reportResults: true })
+  assert.equal(prepared.ok, true)
+  if (!prepared.ok) return
+  const retry = prepareSend({ conversationId: 'chat', text: '后台处理', schedulerNodeId: 'other', entryNode: 'other', heads: ['new'], pending: prepared.pending, reportResults: false })
+  assert.equal(retry.ok, true)
+  if (!retry.ok) return
+  assert.deepEqual(retry.body, prepared.body)
+  assert.equal(retry.body.report_results, true)
+  const receipt = { accepted: true, queued: true, message_id: prepared.pending.message_id, scheduler_node: 'scheduler' }
+  assert.equal(isQueuedReceipt(receipt, prepared.pending), true)
+  for (const value of [{ accepted: true }, { ...receipt, queued: false }, { ...receipt, message_id: 'other' }, { ...receipt, scheduler_node: 'other' }]) assert.equal(isQueuedReceipt(value, prepared.pending), false)
 })

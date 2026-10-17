@@ -56,6 +56,8 @@ function WorkspaceLayout() {
   const newConversationRef = useRef<HTMLButtonElement>(null)
   const [creating, setCreating] = useState(false)
   const [creatingConversation, setCreatingConversation] = useState(false)
+  const awaitingDecisions = workspace.data?.tasks.reduce((count, task) => count + (task.binding?.pending_requests.length ?? 0), 0) ?? 0
+  const queuedReplies = workspace.data?.scheduler?.jobs.filter((job) => ['delivery_pending', 'queued', 'claimed', 'running', 'cancelling', 'unknown'].includes(job.state)).length ?? 0
   const title = workspace.view === "chat"
     ? workspace.data?.conversation?.title || "新会话"
     : views.find(([view]) => view === workspace.view)?.[1]
@@ -77,7 +79,7 @@ function WorkspaceLayout() {
             <a href="/" aria-label="Vibeface 首页" className="text-lg font-semibold tracking-tight">vibeface</a>
             <SidebarTrigger className="ml-auto md:hidden" aria-label="关闭侧栏" title="关闭侧栏" />
           </div>
-          <Button ref={newConversationRef} type="button" className="w-full justify-start" onClick={() => setCreating(true)}>
+          <Button ref={newConversationRef} type="button" disabled={!workspace.writable} className="w-full justify-start" onClick={() => setCreating(true)}>
             <PlusIcon aria-hidden="true" />新建会话
           </Button>
         </SidebarHeader>
@@ -97,6 +99,7 @@ function WorkspaceLayout() {
                       >
                         <Icon aria-hidden="true" />
                         <span className="flex-1">{label}</span>
+                        {view === "chat" && awaitingDecisions + queuedReplies > 0 ? <Badge variant="secondary" className="h-5 min-w-5 px-1 text-xs" aria-label={`${awaitingDecisions} 项等待本人决定，${queuedReplies} 项调度待处理`}>{awaitingDecisions + queuedReplies}</Badge> : null}
                         {view === "tasks" && Boolean(workspace.data?.tasks?.length) ? <Badge variant="secondary" className="h-5 min-w-5 px-1 text-xs">{workspace.data?.tasks.length}</Badge> : null}
                         {view === "notifications" && workspace.notifications.length > 0 ? <Badge variant="secondary" className="h-5 min-w-5 px-1 text-xs">{workspace.notifications.length}</Badge> : null}
                       </SidebarMenuButton>
@@ -199,12 +202,13 @@ function WorkspaceLayout() {
         <header className="flex h-14 shrink-0 items-center gap-3 border-b px-4 sm:px-6">
           <SidebarTrigger aria-label="切换侧栏" title="切换侧栏" />
           <h1 className="min-w-0 flex-1 truncate text-sm font-semibold" title={title}>{title}</h1>
-          <Button type="button" size="icon" variant="ghost" aria-label="刷新状态" title="刷新状态" aria-busy={workspace.refreshing} onClick={() => { void workspace.run(async () => { await workspace.refresh(); workspace.announce("已刷新。") }) }}>
+          <Button type="button" size="icon" variant="ghost" disabled={!workspace.connectionOnline} aria-label="刷新状态" title="刷新状态" aria-busy={workspace.refreshing} onClick={() => { void workspace.run(async () => { await workspace.refresh(); workspace.announce("已刷新。") }) }}>
             {workspace.refreshing ? <Spinner /> : <RefreshCwIcon aria-hidden="true" />}
           </Button>
         </header>
-        {workspace.writeNotice || workspace.noticeText || workspace.error || workspace.data && workspace.incomplete ? (
+        {!workspace.connectionOnline || workspace.writeNotice || workspace.noticeText || workspace.error || workspace.data && workspace.incomplete ? (
           <div className="workspace-notices space-y-2">
+            {!workspace.connectionOnline ? <Alert role="status"><AlertDescription>{workspace.connectionText}后台任务不会因网页断线而自动停止，当前只能看到最后核对的进展。</AlertDescription></Alert> : null}
             {workspace.writeNotice ? <Alert role="status"><AlertDescription>{workspace.writeNotice}</AlertDescription></Alert> : null}
             {workspace.noticeText ? <Alert role="status"><AlertDescription>{workspace.noticeText}</AlertDescription></Alert> : null}
             {workspace.error ? <Alert variant="destructive" role="alert"><AlertDescription>{workspace.error}</AlertDescription></Alert> : null}

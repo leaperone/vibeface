@@ -1,4 +1,5 @@
 import { validEndpoint, validTarget } from '../../transport.js'
+import type { ChangedEvent } from './progress'
 
 export type ConnectionEntry = { address: string; node_id: string; relay: boolean }
 export type PublicIdentity = { nodeId: string; publicKey: string }
@@ -12,7 +13,7 @@ export type ReadyConnection = {
   info: EntryInfo
   request(method: string, params?: Record<string, unknown>): Promise<unknown>
   rpc(method: string, params?: Record<string, unknown>): Promise<unknown>
-  subscribe(listener: () => void): () => void
+  subscribe(listener: (event: ChangedEvent) => void): () => void
   isCurrent(): boolean
 }
 export type Member = { subject_id: string; public_key: string; kind: 'node' | 'client'; name: string; node_roles: NodeRole[]; manage: boolean }

@@ -33,6 +33,7 @@ export function prepareSend(input: {
   entryNode: string
   pending: PendingMessage | null
   heads: string[]
+  reportResults?: boolean
 }): { ok: true; pending: PendingMessage; body: MessageRequest } | { ok: false; error: string } {
   let text: string
   try { text = inputText(input.text, '消息内容', 65536) }
@@ -43,11 +44,16 @@ export function prepareSend(input: {
   const pending = input.pending ?? {
     message_id: newId(), conversation_id: input.conversationId, text,
     scheduler_node: input.schedulerNodeId, entry_node: input.entryNode, basis_heads: [...input.heads],
+    report_results: input.reportResults ?? false,
   }
   return { ok: true, pending, body: {
     conversation_id: pending.conversation_id, message_id: pending.message_id, text: pending.text,
     basis_heads: pending.basis_heads, scheduler_node: pending.scheduler_node,
+    report_results: pending.report_results ?? false,
   } }
+}
+export function isQueuedReceipt(value: unknown, pending: PendingMessage): boolean {
+  return value !== null && typeof value === 'object' && 'accepted' in value && value.accepted === true && 'queued' in value && value.queued === true && 'message_id' in value && value.message_id === pending.message_id && 'scheduler_node' in value && value.scheduler_node === pending.scheduler_node
 }
 export function messageKey(message: TranscriptMessage): string { return message.event_hash }
 

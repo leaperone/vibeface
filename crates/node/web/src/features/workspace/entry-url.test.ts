@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { conversationHref } from "./entry-url.ts"
 import { isIncomplete, mergeBasis } from "./labels.ts"
-import { inputText, parseConversation, parseNodes, parsePending } from "./model.ts"
+import { inputText, parseArtifactPage, parseConversation, parseNodes, parsePending } from "./model.ts"
 import { parseReconcile, reconcileDecision } from "./reconcile.ts"
 
 const context = {
@@ -44,6 +44,37 @@ test("stored operations retain request contents and enforce the personal network
   assert.deepEqual(parsePending([pending], "network")[0]?.request, full)
   assert.throws(() => parsePending([pending], "other-network"))
   assert.throws(() => parsePending([{ ...pending, target_node: "other" }], "network"))
+})
+test("stored task controls retain exact approval identity and expected execution revision", () => {
+  const control = { ...request, network_id: "network", task_id: "task", expected_operation_id: "original-execution", expected_revision: 4, action: "respond_request", request_id: "approval", response: { decision: "decline" } }
+  const pending = { ...request, control }
+  assert.deepEqual(parsePending([pending], "network")[0]?.control, control)
+  assert.throws(() => parsePending([pending], "other-network"))
+  assert.throws(() => parsePending([{ ...pending, session_id: "other-session" }], "network"))
+  assert.throws(() => parsePending([{ ...pending, control: { ...control, expected_revision: -1 } }], "network"))
+  assert.throws(() => parsePending([{ ...pending, control: { ...control, response: undefined, request_id: {} } }], "network"))
+})
+test("queue, task authorization, requests and result references parse as explicit facts", () => {
+  const task = { task_id: "task", title: "work", goal: "goal", acceptance: "done", detail: "pending", status: "working", followup_mode: "report", followup_version: 3, blobs: [{ hash: "execution-result", size: 20 }], binding: { target_node: "executor", session_id: "session", operation_id: "op", revision: 4, state: "running", capabilities: ["read", "respond_request"], pending_requests: [{ request_id: 1, kind: "approval", text: "write file", choices: [{ label: "拒绝", response: { decision: "decline" } }] }] } }
+  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", kind: "message", sequence: 0, message_id: "one", read_only: true }], capabilities: { streaming: true, cancel: false, steer: false }, write_frozen: true }
+  const message = { message_id: "one", event_hash: "event", role: "assistant", text: "summary", created_at_ms: 1, blobs: [{ hash: "result", size: 20 }] }
+  const parsed = parseConversation({ ...context, tasks: [task], scheduler, messages: [message] })
+  assert.deepEqual(parsed.tasks[0].binding?.pending_requests[0].choices?.[0].response, { decision: "decline" })
+  assert.equal(parsed.tasks[0].followup_version, 3)
+  assert.deepEqual(parsed.tasks[0].blobs, [{ hash: "execution-result", size: 20 }])
+  assert.equal(parsed.scheduler?.jobs[0].read_only, true)
+  assert.deepEqual(parsed.messages[0].blobs, [{ hash: "result", size: 20 }])
+  assert.equal(parseConversation(context).scheduler, null)
+  assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], sequence: -1 }] } }))
+  assert.throws(() => parseConversation({ ...context, tasks: [{ ...task, followup_mode: "approve_everything" }] }))
+  assert.throws(() => parseConversation({ ...context, tasks: [{ ...task, binding: { ...task.binding, capabilities: undefined } }] }))
+})
+test("artifact pages stay bound to their original reference and advance without skipping the end", () => {
+  const page = { blob_hash: "result", text: "first", offset: 0, next_offset: 5, size: 10 }
+  assert.deepEqual(parseArtifactPage(page, "result", 0), { text: "first", offset: 0, next_offset: 5, size: 10 })
+  assert.equal(parseArtifactPage({ ...page, offset: 5, next_offset: null }, "result", 5).next_offset, null)
+  for (const invalid of [{ ...page, blob_hash: "other" }, { ...page, offset: 1 }, { ...page, next_offset: 0 }, { ...page, next_offset: 11 }, { ...page, next_offset: undefined }, { ...page, text: "" }, { ...page, next_offset: null }, { ...page, next_offset: 5, text: "x" }, { ...page, size: 0, next_offset: null }]) assert.throws(() => parseArtifactPage(invalid, "result", 0))
+  assert.deepEqual(parseArtifactPage({ blob_hash: "result", text: "中", offset: 0, next_offset: null, size: 3 }, "result", 0), { text: "中", offset: 0, next_offset: null, size: 3 })
 })
 
 test("creation fields use the server UTF-8 byte limits and reject whitespace", () => {
