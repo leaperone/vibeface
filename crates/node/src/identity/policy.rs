@@ -1029,50 +1029,36 @@ impl Store {
             .map_err(anyhow::Error::msg)?;
         let mut receipts = Vec::new();
         for expected in &challenge.policies {
-            let current = self
-                .policy
-                .verified()
+            let state = self.policy.verified();
+            let authority = match &expected.domain {
+                PolicyDomain::Account(id) => state.account(id).map(|account| &account.authority),
+                PolicyDomain::Space(id) => state.space(id).map(|space| &space.authority),
+            };
+            let Some(authority) = authority.filter(|authority| authority.public_key == key) else {
+                continue;
+            };
+            let current = state
                 .head(&expected.domain)
-                .context("freshness policy is not installed")?;
+                .context("local authority policy is not installed")?;
             ensure!(
                 current == expected,
-                "freshness challenge references an outdated policy"
+                "freshness challenge references an outdated local authority policy"
             );
-            let authority = match &expected.domain {
-                PolicyDomain::Account(id) => {
-                    &self
-                        .policy
-                        .verified()
-                        .account(id)
-                        .context("account policy is missing")?
-                        .authority
-                }
-                PolicyDomain::Space(id) => {
-                    &self
-                        .policy
-                        .verified()
-                        .space(id)
-                        .context("space policy is missing")?
-                        .authority
-                }
-            };
-            if authority.public_key == key {
-                ensure!(
-                    authority.device == DeviceId::from_key(&key)
-                        && authority.service == ServiceId::from_key(&key),
-                    "authority identity mismatch"
-                );
-                receipts.push(Signed::sign(
-                    FreshnessReceipt {
-                        version: vibeface_secure::authorization::AUTH_VERSION,
-                        current: current.clone(),
-                        challenge_hash: challenge.hash()?,
-                        issued_at_ms: now_ms,
-                        expires_at_ms: challenge.expires_at_ms,
-                    },
-                    &signer,
-                )?);
-            }
+            ensure!(
+                authority.device == DeviceId::from_key(&key)
+                    && authority.service == ServiceId::from_key(&key),
+                "authority identity mismatch"
+            );
+            receipts.push(Signed::sign(
+                FreshnessReceipt {
+                    version: vibeface_secure::authorization::AUTH_VERSION,
+                    current: current.clone(),
+                    challenge_hash: challenge.hash()?,
+                    issued_at_ms: now_ms,
+                    expires_at_ms: challenge.expires_at_ms,
+                },
+                &signer,
+            )?);
         }
         Ok(receipts)
     }
