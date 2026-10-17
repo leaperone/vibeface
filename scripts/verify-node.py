@@ -10,7 +10,6 @@ explicit stream-json fixture, never a model. All state and logs stay beneath
 import argparse
 import base64
 import copy
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import json
@@ -25,6 +24,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import threading
@@ -80,17 +80,64 @@ def data_directory_snapshot(directory):
     return snapshot
 
 
-def verify_current_data_format(directory):
+def sqlite_files_snapshot(directory):
+    snapshot = {}
+    for name in ("node.sqlite3", "node.sqlite3-wal", "node.sqlite3-shm", "node.sqlite3-journal"):
+        path = directory / name
+        snapshot[name] = None
+        if path.exists():
+            require(path.is_file() and not path.is_symlink(), "SQLite artifact is a regular file")
+            metadata = path.stat()
+            snapshot[name] = {"mode": metadata.st_mode, "size": metadata.st_size, "sha256": file_sha256(path)}
+    return snapshot
+
+
+def verify_current_data_format(directory, *, stopped=True):
     require(json.loads((directory / "data-epoch.json").read_text()) == DATA_FORMAT,
             "fresh node declares exactly the current format, data epoch and layout")
     require(sorted(path.name for path in directory.glob("*.sqlite3")) == ["node.sqlite3"],
             "identity and business state use one SQLite database")
-    with sqlite3.connect(f"file:{directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-        metadata = connection.execute("SELECT format_id,data_epoch,layout_version,initialization_state FROM schema_metadata").fetchall()
-        require(metadata == [("vibeface-node", 3, 1, "ready")],
-                "database initialization is ready and matches the current directory format")
-        require(connection.execute("PRAGMA foreign_key_check").fetchall() == [],
-                "current database has no broken foreign keys")
+    temporary = tempfile.TemporaryDirectory(prefix="sqlite-format-", dir=directory.parent) if stopped else None
+    original = sqlite_files_snapshot(directory) if stopped else None
+    database = directory / "node.sqlite3"
+    if stopped:
+        copied = Path(temporary.name)
+        for name, metadata in original.items():
+            if metadata is not None:
+                shutil.copy2(directory / name, copied / name)
+        require(sqlite_files_snapshot(directory) == original, "copying stopped SQLite files preserves all source files")
+        database = copied / "node.sqlite3"
+    try:
+        mode = "rw" if stopped else "ro"
+        with sqlite3.connect(f"file:{database}?mode={mode}", uri=True) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            verify_database_format(connection)
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
+            require(sqlite_files_snapshot(directory) == original, "offline format inspection preserves main, WAL, SHM and journal")
+
+
+def verify_database_format(connection):
+    metadata = connection.execute("SELECT format_id,data_epoch,layout_version,initialization_state,schema_fingerprint FROM schema_metadata").fetchall()
+    require(len(metadata) == 1 and metadata[0][:4] == ("vibeface-node", 3, 1, "ready"),
+            "database initialization is ready and matches the current directory format")
+    require(re.fullmatch(r"[a-f0-9]{64}", metadata[0][4]) is not None,
+            "database declares its initialized schema fingerprint")
+    for table in ("events", "conversations"):
+        columns = {row[1]: row for row in connection.execute(f"PRAGMA table_info({table})")}
+        resource = columns.get("resource_id")
+        require(resource is not None and resource[3] == 1 and resource[4] is None,
+                f"{table} requires an explicit resource without a compatibility default")
+        references = connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
+        candidates = {row[0] for row in references
+                      if row[2:5] == ("resource_records", "resource_id", "resource_id")}
+        require(any({(row[3], row[4]) for row in references if row[0] == key}
+                    == {("space_id", "space_id"), ("resource_id", "resource_id")}
+                    for key in candidates),
+                f"{table} ties its space and resource to one signed resource catalog row")
+    require(connection.execute("PRAGMA foreign_key_check").fetchall() == [],
+            "current database has no broken foreign keys")
 
 
 def maintenance(node, command):
@@ -132,8 +179,11 @@ def verify_live_access(node, operation_id):
     result = subprocess.run([str(node.binary), "access", "--json", "--data-dir", str(node.directory)],
                             capture_output=True, text=True, timeout=10)
     require(result.returncode == 0, "access CLI reads the live node without taking its directory lock")
-    require(json.loads(result.stdout) == {"url": node.url, "node_id": node.node_id, "capability": None},
-            "initialized access returns only the pinned entry and no bootstrap capability")
+    access = json.loads(result.stdout)
+    require(access["url"] == node.url and access["node_id"] == node.node_id
+            and access["node_public_key"] == node.node_public_key
+            and access["capability"] is None and access["claim_nonce"] is None,
+            "initialized access returns the pinned entry and no bootstrap claim secrets")
     require(operation(node.client, node, operation_id) == before,
             "access CLI leaves the running operation and its deduplication record unchanged")
 
@@ -155,7 +205,8 @@ def verify_maintenance(node):
     marker = node.directory / "update-pending.json"
     private_json(marker, {"protocol": 1})
     node.start()
-    opened = node.client.command("connect", url=node.url, node_id=node.node_id, check=False)
+    opened = node.client.command("connect", url=node.url, node_id=node.node_id,
+                                 node_public_key=node.node_public_key, check=False)
     if opened["ok"]:
         denied = node.client.command("request", method="rpc",
                                      params={"method": "nodes"}, check=False)
@@ -339,148 +390,29 @@ class RelayCapture:
         self.thread.join(timeout=2)
 
 
-CLIENT_SOURCE = r"""
-import init, { Identity, Handshake, recoverySeal, recoveryOpen, verifyMembership } from "MODULE_URL";
-import { readFile } from 'node:fs/promises';
-import { createInterface } from 'node:readline';
-await init({ module_or_path: await readFile(new URL('./vibeface_secure_bg.wasm', "MODULE_URL")) });
-const encoder = new TextEncoder();
-const decoder = new TextDecoder('utf-8', { fatal: true });
-const keys = new Map([['client', Identity.generate()], ['root', Identity.generate()]]);
-const connections = new Map();
-const identity = name => { const key = keys.get(name); if (!key) throw new Error('unknown local identity'); return key; };
-const exposed = key => ({ public_key: key.publicKeyHex(), subject_id: key.nodeId() });
-async function connect(input) {
-  const key = identity(input.identity || 'client');
-  const socket = new WebSocket(new URL('/api/network/ws', input.url.replace(/^http/, 'ws')));
-  socket.binaryType = 'arraybuffer';
-  const queue = [], waiting = [], pending = new Map(), events = [], frames = [];
-  let channel, closed = false, sequence = 0;
-  function close(error = new Error('channel closed')) {
-    if (closed) return;
-    closed = true;
-    for (const waiter of waiting.splice(0)) waiter.reject(error);
-    for (const request of pending.values()) { clearTimeout(request.timer); request.reject(error); }
-    pending.clear(); socket.close();
-  }
-  const receive = () => queue.length ? Promise.resolve(queue.shift()) : closed ? Promise.reject(new Error('channel closed')) : new Promise((resolve, reject) => waiting.push({resolve, reject}));
-  socket.addEventListener('message', event => { const waiter = waiting.shift(); if (waiter) waiter.resolve(event.data); else if (queue.length < 512) queue.push(event.data); else close(new Error('bounded receive queue')); });
-  socket.addEventListener('close', () => close());
-  socket.addEventListener('error', () => close(new Error('WebSocket transport failed')));
-  async function control(type) { const frame = await receive(); if (typeof frame !== 'string') throw new Error('control frame is not text'); const value = JSON.parse(frame); if (value.type !== type) throw new Error(`expected ${type}`); }
-  const timer = setTimeout(() => close(new Error('handshake timeout')), 15000);
-  try {
-    await control('welcome');
-    socket.send(JSON.stringify(input.relay ? {type:'dial', target:input.node_id, service:'client'} : {type:'direct', service:'client'}));
-    await control('ready');
-    const handshake = new Handshake(true, key.secretHex(), input.node_id, encoder.encode('vibeface:client:v1'));
-    socket.send(handshake.write(new Uint8Array()));
-    const response = await receive();
-    if (!(response instanceof ArrayBuffer)) throw new Error('Noise response must be binary');
-    handshake.read(new Uint8Array(response));
-    socket.send(handshake.write(new Uint8Array()));
-    if (!handshake.isFinished() || handshake.remoteId() !== input.node_id) throw new Error('target identity mismatch');
-    channel = handshake.finish(); handshake.free();
-  } catch (error) { close(error); throw error; }
-  finally { clearTimeout(timer); }
-  (async () => {
-    try {
-      while (!closed) {
-        const frame = await receive();
-        if (!(frame instanceof ArrayBuffer)) throw new Error('plaintext application frame rejected');
-        const plaintext = channel.openRecord(new Uint8Array(frame));
-        if (plaintext === null) continue;
-        const value = JSON.parse(decoder.decode(plaintext));
-        const request = pending.get(value.id);
-        if (request) { pending.delete(value.id); clearTimeout(request.timer); request.resolve(value); }
-        else events.push(value);
-      }
-    } catch (error) { close(error); }
-    finally { channel.free(); }
-  })();
-  return {
-    events, frames,
-    request(method, params) {
-      if (closed) throw new Error('channel closed');
-      const id = String(++sequence);
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { pending.delete(id); reject(new Error('request timeout')); }, 20000);
-        pending.set(id, {resolve, reject, timer});
-        for (const record of channel.sealMessage(encoder.encode(JSON.stringify({id,method,params})))) { frames.push(Buffer.from(record)); socket.send(record); }
-      });
-    },
-    async attack(kind) {
-      if (!frames.length) throw new Error('no protected request to attack');
-      const record = Buffer.from(frames[frames.length - 1]);
-      if (kind === 'tamper') record[record.length - 1] ^= 1;
-      socket.send(record);
-      for (let attempt = 0; attempt < 50 && !closed; attempt++) await new Promise(resolve => setTimeout(resolve, 100));
-      if (!closed) throw new Error('invalid protected frame did not close the channel');
-      return {rejected:true};
-    },
-    close,
-  };
-}
-for await (const line of createInterface({input:process.stdin})) {
-  try {
-    const input = JSON.parse(line);
-    let result;
-    if (input.op === 'identity') result = exposed(identity(input.identity || 'client'));
-    else if (input.op === 'sign') result = identity(input.identity || 'client').sign(input.domain, encoder.encode(typeof input.payload === 'string' ? input.payload : JSON.stringify(input.payload)));
-    else if (input.op === 'backup') {
-      const root = identity(input.identity || 'root');
-      const epoch = input.recovery_epoch || 1;
-      const payload = encoder.encode(JSON.stringify({version:1,network_id:root.nodeId(),root_secret_key:root.secretHex(),genesis:input.state.genesis,recovery_epoch:epoch,decryption_keys:[]}));
-      try { result = {version:1,network_id:root.nodeId(),recovery_epoch:epoch,envelope:JSON.parse(decoder.decode(recoverySeal(payload,input.password)))}; }
-      finally { payload.fill(0); }
-    }
-    else if (input.op === 'recover_material') {
-      const plaintext = recoveryOpen(encoder.encode(JSON.stringify(input.backup.envelope)),input.password);
-      try {
-        const payload = JSON.parse(decoder.decode(plaintext));
-        const root = Identity.fromSecretHex(payload.root_secret_key);
-        keys.get('recovered')?.free(); keys.set('recovered',root);
-        result = {network_id:root.nodeId(),recovery_epoch:payload.recovery_epoch,genesis:payload.genesis};
-      } finally { plaintext.fill(0); }
-    }
-    else if (input.op === 'recovery_checkpoint') {
-      const root = identity('recovered');
-      const verified = verifyMembership(JSON.stringify(input.state), root.nodeId(), root.publicKeyHex());
-      try { result = JSON.parse(verified.createRecoveryCheckpoint(root, JSON.stringify(input.members), input.backup_epoch, JSON.stringify(input.prepared))); }
-      finally { verified.free(); }
-    }
-    else if (input.op === 'forget_root') { identity('root').free(); keys.delete('root'); result = {forgotten:true}; }
-    else if (input.op === 'connect') { const old = connections.get(input.connection || 'main'); old?.close(); const value = await connect(input); connections.set(input.connection || 'main', value); result = {connected:true}; }
-    else { const connection = connections.get(input.connection || 'main'); if (!connection) throw new Error('no connection');
-      if (input.op === 'request') result = await connection.request(input.method,input.params || {});
-      else if (input.op === 'events') result = connection.events;
-      else if (input.op === 'wire') result = connection.frames.map(frame => frame.toString('hex'));
-      else if (input.op === 'attack') result = await connection.attack(input.kind);
-      else if (input.op === 'close') { connection.close(); result = {closed:true}; }
-      else throw new Error('unknown client command');
-    }
-    process.stdout.write(`${JSON.stringify({ok:true,result})}\n`);
-  } catch (error) { process.stdout.write(`${JSON.stringify({ok:false,error:String(error)})}\n`); }
-}
-for (const connection of connections.values()) connection.close();
-for (const key of keys.values()) key.free();
-"""
-
-
 class Client:
     def __init__(self, url, helper, module):
         self.url = url
         self.helper = helper
         self.module = module
-        self.network_id = None
-        self.principal = None
+        self.scope = None
+        self.policy = None
+        self.authorization = None
+        self.resource_id = None
         self.process = None
         self.node_id = None
+        self.node_public_key = None
+        self.host_public_key = None
+        self.audience = None
+        self.tasks = {}
+        self.bindings = {}
+        self.target_public_keys = {}
+        self.operations = {}
 
     def command(self, op, *, check=True, **arguments):
         if self.process is None:
             self.process = subprocess.Popen(
-                ["node", str(self.helper)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                ["node", str(self.helper), str(self.module)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self.process.stdin.write(json.dumps({"op": op, **arguments}) + "\n")
         self.process.stdin.flush()
@@ -493,13 +425,15 @@ class Client:
         require(value.get("ok"), f"client {op} failed: {value.get('error', 'unknown error')}")
         return value.get("result")
 
-    def connect(self, node_id=None, *, relay=False, connection="main"):
+    def connect(self, node_id=None, *, node_public_key=None, relay=False, connection="main"):
         self.node_id = node_id or self.node_id
+        self.node_public_key = node_public_key or self.node_public_key
         return self.command("connect", url=self.url, node_id=self.node_id,
-                            relay=relay, connection=connection)
+                            node_public_key=self.node_public_key, relay=relay, connection=connection)
 
-    def call(self, method, params=None, *, status=200, connection="main"):
-        response = self.command("request", method=method, params=params or {}, connection=connection)
+    def call(self, method, params=None, *, status=200, connection="main", invocation=None):
+        response = self.command("request", method=method, params=params or {},
+                                invocation=invocation, connection=connection)
         error = response.get("error")
         if status == 200:
             require(not error, f"encrypted {method} rejected: {error}")
@@ -509,15 +443,179 @@ class Client:
             require(error["status"] == status, f"encrypted {method} rejection status")
         return response
 
-    def authenticate(self, network=None):
-        self.network_id = network or self.network_id
-        result = self.call("authenticate", {"network_id": self.network_id})
-        self.principal = result["principal"]
-        require(self.principal["network_id"] == self.network_id, "client authenticates the pinned personal network")
+    def identity_call(self, method, params=None, *, status=200, connection="main"):
+        return self.call("identity", {"method": method, "params": params or {}},
+                         status=status, connection=connection)
+
+    def authenticate(self, *, resource_id=None, audience=None, host_public_key=None, connection="main"):
+        own = self.command("identity")
+        params = {"account_id": self.scope["account_id"], "space_id": self.scope["space_id"],
+                  "device_public_key": own["public_key"]}
+        selected_resource = resource_id or self.resource_id
+        selected_audience = audience or self.audience
+        if selected_resource is not None:
+            params["resource_id"] = selected_resource
+        if selected_audience is not None:
+            params["audience"] = selected_audience
+        expected_host = host_public_key or self.host_public_key or self.node_public_key
+        result = self.call("authenticate", params, connection=connection)
+        verified = self.command("authorize", response=result, expected_host_public_key=expected_host,
+                                connection=connection)
+        require(verified["scope"] == self.scope, "client authenticates the pinned account, space and device")
+        self.policy = verified["policy"]
+        self.authorization = result["authorization"]
+        require(self.policy["audience_public_key"] == expected_host,
+                "verified authorization targets the independently pinned resource host")
+        self.host_public_key = expected_host
+        self.target_public_keys[hashlib.sha256(bytes.fromhex(expected_host)).hexdigest()] = expected_host
+        self.audience = self.policy["audience"]
+        if resource_id is not None:
+            self.resource_id = resource_id
+        resources = self.policy["resources"]
+        require(resources and all(item["payload"]["kind"] == "project" for item in resources),
+                "signed authorization exposes explicit Project resources")
+        if self.resource_id is None:
+            self.resource_id = resources[0]["payload"]["resource"]
+        require(self.resource_id in {item["payload"]["resource"] for item in resources},
+                "selected Project belongs to the verified resource projection")
         return result
 
-    def rpc(self, method, *, status=200, **arguments):
-        return self.call("rpc", {"method": method, **arguments}, status=status)
+    def rpc(self, method, *, status=200, connection="main", **arguments):
+        body = {"method": method, "space_id": self.scope["space_id"],
+                "resource_id": self.resource_id, **arguments}
+        body.setdefault("authorization_id", body["request"]["operation_id"]
+                        if method == "operate" else uuid.uuid4().hex)
+        original = None
+        if method in {"operation", "reconcile", "resolve_unknown"}:
+            original = self.operations.get((body["space_id"], body["resource_id"], body["operation_id"]))
+        if method == "session":
+            matching = [request for (space, resource, _), request in self.operations.items()
+                        if (space, resource, request["target_node"], request["session_id"])
+                        == (body["space_id"], body["resource_id"], body["target_node"], body["session_id"])]
+            require(matching and all((request["conversation_id"], request["task_id"], request["binding"])
+                                     == (matching[0]["conversation_id"], matching[0]["task_id"], matching[0]["binding"])
+                                     for request in matching),
+                    "session read uses independently saved matching task and binding intent")
+            original = matching[0]
+        if original:
+            for field in ("conversation_id", "task_id", "target_node", "session_id", "binding"):
+                body.setdefault(field, copy.deepcopy(original[field]))
+        request = body["request"] if method == "operate" else body
+        conversation = request.get("conversation_id")
+        task_id = request.get("task_id")
+        task = (self.tasks.get((body["space_id"], body["resource_id"], conversation, task_id))
+                if task_id and method != "create_task" else None)
+        require(not task_id or method == "create_task" or task is not None,
+                "task context comes from an independently verified TaskCreated")
+        if task:
+            body.setdefault("task_ref", task["task_ref"])
+        context = {"conversation": conversation, "task": task["task_ref"] if task else None,
+                   "sdk_session": None, "execution_session": None, "executor_kind": None,
+                   "workspace_resource": body["resource_id"]}
+        raw_context = {"context": context, "binding_generation": None, "canonical_cwd": None,
+                       "execution_target_public_key": None}
+        if method == "update_task":
+            body.setdefault("detail", "")
+        if method == "message":
+            body.setdefault("scheduler_node", hashlib.sha256(bytes.fromhex(self.host_public_key)).hexdigest())
+        if method in {"operate", "bind_execution"} or original:
+            target = request["target_node"]
+            target_key = self.target_public_keys.get(target)
+            require(target_key is not None, "execution target has an independently verified public key")
+            binding = request.get("binding")
+            executor = (request.get("action", {}).get("executor") or body.get("executor")
+                        or (binding and binding["binding"]["open_spec"]["executor"]))
+            require(executor is not None, "execution kind comes from the intended open or verified binding")
+            context["execution_session"] = {"target": self.command("derive_authorization_id", kind="device", value=target_key),
+                                            "session_id": request["session_id"]}
+            context["executor_kind"] = executor
+            raw_context["binding_generation"] = binding["binding"]["generation"] if binding else None
+            raw_context["execution_target_public_key"] = target_key
+            if binding:
+                raw_context["canonical_cwd"] = binding["binding"]["open_spec"]["cwd"]
+            if method == "bind_execution":
+                raw_context["canonical_cwd"] = body["cwd"]
+            elif method == "operate" and request["action"]["type"] == "open":
+                raw_context["canonical_cwd"] = request["action"]["cwd"]
+        signing = {"raw_context": raw_context}
+        response = self.command("signed_request", body=body, connection=connection, **signing)
+        error = response.get("error")
+        require(not error if status == 200 else bool(error),
+                f"encrypted {method}: expected {'success' if status == 200 else 'rejection'}, received {error}")
+        if status == 200 and method == "operate":
+            self.operations[(body["space_id"], body["resource_id"], body["request"]["operation_id"])] = copy.deepcopy(body["request"])
+        return response.get("result") if status == 200 else response
+
+    def add_project_fixture(self):
+        stamp = next(head for head in self.policy["heads"]
+                     if head["domain"] == {"kind": "space", "id": self.scope["space_id"]})
+        document = next(entry["value"]["payload"] for entry in reversed(self.authorization["journal"])
+                        if entry["kind"] in {"space", "space_genesis"}
+                        and entry["value"]["payload"]["space"] == self.scope["space_id"]
+                        and entry["value"]["payload"]["sequence"] == stamp["sequence"])
+        resource_id = "res2_" + os.urandom(32).hex()
+        resource = self.command("sign_resource_fixture", kind="resource", payload={
+            "version": 2, "space": self.scope["space_id"], "resource": resource_id,
+            "kind": "project", "host": self.policy["audience"]["service"],
+            "issued_under": stamp, "nonce": os.urandom(32).hex()})
+        updated = copy.deepcopy(document)
+        updated["previous"] = stamp
+        updated["sequence"] += 1
+        updated["resources"] = sorted(set(updated["resources"] + [resource["hash"]]))
+        signed = self.command("sign_resource_fixture", kind="space_document", payload=updated)
+        self.identity_call("policy_commit", {"journal": [
+            {"kind": "resource", "value": resource["signed"]},
+            {"kind": "space", "value": signed["signed"]}]})
+        self.authenticate()
+        require(resource_id in {item["payload"]["resource"] for item in self.policy["resources"]},
+                "root-signed Project is visible only after its signed space policy is installed")
+        return resource_id
+
+    def create_task(self, authority, conversation, task_id, *, title, goal, acceptance):
+        intended = {"type": "task_created", "task_id": task_id, "title": title,
+                    "goal": goal, "acceptance": acceptance}
+        response = self.rpc("create_task", conversation_id=conversation, task_id=task_id,
+                            title=title, goal=goal, acceptance=acceptance)
+        envelope = response["creation"]
+        require(response["authority_public_key"] == authority.node_public_key
+                and response["task"]["task_creation"] == envelope,
+                "task response matches the independently pinned author and signed creation")
+        verified = self.command("verify_event", envelope=envelope,
+                                space_id=self.scope["space_id"], resource_id=self.resource_id,
+                                author_public_key=authority.node_public_key)
+        require(verified["body"]["scope_id"] == conversation and verified["body"]["body"] == intended,
+                "signed task creation matches the independently specified conversation and task intent")
+        self.tasks[(self.scope["space_id"], self.resource_id, conversation, task_id)] = {
+            "task_ref": verified["hash"],
+            "authority_node": authority.node_id, "authority_public_key": authority.node_public_key}
+        return response
+
+    def bind_execution(self, conversation, task_id, target, session_id, open_spec):
+        task = self.tasks[(self.scope["space_id"], self.resource_id, conversation, task_id)]
+        self.target_public_keys[target.node_id] = target.node_public_key
+        require(open_spec["type"] == "open" and Path(open_spec["cwd"]).resolve() == Path(open_spec["cwd"]),
+                "binding intent uses an explicit canonical project directory")
+        response = self.rpc("bind_execution", conversation_id=conversation, task_id=task_id,
+                            task_ref=task["task_ref"],
+                            target_node=target.node_id, session_id=session_id,
+                            executor=open_spec["executor"], cwd=open_spec["cwd"])
+        expected = {"space_id": self.scope["space_id"], "conversation_id": conversation,
+                    "task_ref": task["task_ref"], "task_id": task_id,
+                    "authority_node": task["authority_node"], "generation": 1,
+                    "target_node": target.node_id, "session_id": session_id,
+                    "open_spec": open_spec, "previous_binding_hash": None, "previous_seal": None}
+        binding = self.command("verify_task_binding", binding=response["binding"],
+                               authority_public_key=task["authority_public_key"],
+                               expected={"binding": expected})
+        self.bindings[(self.scope["space_id"], self.resource_id, conversation, task_id, session_id)] = binding
+        return binding
+
+    def subscribe(self):
+        body = {"method": "conversations", "space_id": self.scope["space_id"],
+                "resource_id": self.resource_id, "authorization_id": uuid.uuid4().hex}
+        response = self.command("signed_request", method="subscribe", body=body)
+        require(not response.get("error") and response.get("result") == {"subscribed": True},
+                "subscription is signed for the selected account, space and resource")
 
     def request(self, path, payload=None, *, status=200, origin=True, headers=None, timeout=20, **unused):
         request_headers = dict(headers or {})
@@ -538,41 +636,6 @@ class Client:
             require(len(encoded) <= 4 * 1024 * 1024, "HTTP response is bounded")
             require(observed == status, f"{path}: expected HTTP {status}, received {observed}")
             return json.loads(encoded) if encoded and "application/json" in response.headers.get("Content-Type", "") else encoded or None
-
-    def invite(self, kind, roles=None):
-        prepared = self.call("prepare_invite", {"kind": kind, "node_roles": sorted(roles or []),
-                                                 "request_id": uuid.uuid4().hex})
-        prepared["invite"]["inviter_signature"] = self.command("sign", **prepared["signing"])
-        tampered = copy.deepcopy(prepared["invite"])
-        tampered["payload"]["network_id"] = "ab" * 32
-        self.call("commit_invite", {"invite": tampered, "capability": prepared["capability"]}, status=400)
-        return self.call("commit_invite", {"invite": prepared["invite"], "capability": prepared["capability"]})
-
-    def approve(self, request_id):
-        prepared = self.call("prepare_pair", {"request_id": request_id})
-        prepared["event"]["signature"] = self.command("sign", **prepared["signing"])
-        review_signature = self.command("sign", **prepared["review_signing"])
-        return self.call("pair_confirm", {"request_id": request_id, "event": prepared["event"],
-                                           "inviter_signature": review_signature})
-
-    def pair_client(self, owner, network, name):
-        self.url = owner.url
-        self.connect(owner.node_id)
-        invitation = owner.invite("client")
-        prepared = self.call("prepare_pair_request", {**invitation, "name": name,
-                                                       "request_id": uuid.uuid4().hex})
-        prepared["request"]["proof"] = self.command("sign", **prepared["signing"])
-        invalid = copy.deepcopy(prepared["request"])
-        invalid["proof"] = "00" * 64
-        self.call("pair_request", {"request": invalid}, status=400)
-        receipt = self.call("pair_request", {"request": prepared["request"]})
-        review_signature = self.command("sign", **receipt["signing"])
-        self.call("pair_accept", {"request_id": receipt["request_id"], "signature": review_signature})
-        owner.approve(receipt["request_id"])
-        result = self.call("pair_status", {"request_id": receipt["request_id"]})
-        require(result["status"] == "granted", "new client pairing completes after both signatures")
-        self.authenticate(network)
-        self.call("prepare_revoke", {"subject_id": owner.node_id}, status=403)
 
     def close(self):
         if self.process is not None:
@@ -595,13 +658,17 @@ class Node:
         self.client = Client(self.url, helper, module)
         self.process = None
         self.log = None
+        initialized_at = time.monotonic()
         try:
             result = subprocess.run(
                 [str(binary), "init", "--data-dir", str(self.directory),
                  "--listen", f"127.0.0.1:{self.port}", "--root", str(workspace)],
-                capture_output=True, timeout=45)
-        except subprocess.TimeoutExpired:
+                env={**os.environ, "RUST_BACKTRACE": "1"}, capture_output=True, timeout=45)
+        except subprocess.TimeoutExpired as error:
+            (run / f"{name}-init.log").write_bytes((error.stdout or b"") + (error.stderr or b""))
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
+        self.init_seconds = time.monotonic() - initialized_at
+        (run / f"{name}-init.log").write_bytes(result.stdout + result.stderr)
         require(result.returncode == 0, f"{name}: CLI initialization succeeds")
         verify_current_data_format(self.directory)
         self.configure(claude_bin=str(fixture), timeout_secs=60)
@@ -611,6 +678,15 @@ class Node:
         self.access = json.loads(result.stdout)
         require(self.access["node_id"], "local access pins the Node identity")
         self.node_id = self.access["node_id"]
+        self.node_public_key = self.access["node_public_key"]
+        require(hashlib.sha256(bytes.fromhex(self.node_public_key)).hexdigest() == self.node_id,
+                "trusted local access pins the exact Node public key")
+        require(isinstance(self.access["claim_nonce"], str)
+                and re.fullmatch(r"[a-f0-9]{64}", self.access["claim_nonce"]) is not None
+                and self.access["claim_nonce"] == self.access["capability"],
+                "fresh local access binds the installation capability to the Node claim nonce")
+        self.client.node_id = self.node_id
+        self.client.node_public_key = self.node_public_key
 
     def configure(self, **values):
         path = self.directory / "config.json"
@@ -626,7 +702,7 @@ class Node:
             stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log,
             start_new_session=True)
         info = wait_for(f"{self.name} HTTP listener", lambda: self.client.request("/api/info"))
-        self.node_id = info["node_id"]
+        require(self.node_id == info["node_id"], "HTTP listener serves the independently pinned local Node")
         require(self.process.poll() is None, f"{self.name}: independent process remains running")
 
     def stop(self):
@@ -645,69 +721,36 @@ class Node:
             self.log.close()
             self.log = None
 
-    def pair(self, owner, network, *, relay_url=None):
-        network_config = json.loads((self.directory / "config.json").read_text())["network"]
-        invitation = owner.client.invite("node", ["gateway", "relay", "replica", "scheduler", "executor"])
-        path = self.directory / "pair-invitation.json"
-        private_json(path, {"url": relay_url or owner.url, "node_id": owner.node_id,
-                            "relay": relay_url is not None, "invite": invitation})
-        process = subprocess.Popen([str(self.binary), "pair", "--data-dir", str(self.directory),
-                                    "--invite-file", str(path), "--name", f"Node {self.name}"],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            def pending():
-                requests = owner.client.call("pair_requests")
-                return next((item for item in requests if item["review"]["new_member"]["subject_id"] == self.node_id
-                             and item.get("new_subject_signature")), None)
-            review = wait_for(f"{self.name} signed CLI pairing review", pending)
-            owner.client.approve(review["request_id"])
-            stdout, stderr = process.communicate(timeout=40)
-            log = self.directory / "pair-cli.log"
-            log.write_bytes(stdout + stderr)
-            log.chmod(0o600)
-            require(process.returncode == 0, f"{self.name}: pinned CLI pairing completes after management approval")
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                process.wait(timeout=5)
-        self.client.pair_client(owner.client, network, f"{self.name} independent client")
-        self.client.url = self.url
-        self.client.node_id = self.node_id
-        self.configure(network=network_config)
-
     def bootstrap(self):
         self.client.connect(self.node_id)
-        root = self.client.command("identity", identity="root")
-        prepared = self.client.call("prepare_genesis", {"owner_public_key": root["public_key"],
-                                                        "client_name": f"{self.name} management client"})
-        state = prepared["state"]
-        signing = prepared["signing"]
-        state["genesis"]["signature"] = self.client.command("sign", identity="root", **signing)
+        self.client.identity_call("node_claim", {"capability": "invalid-capability"}, status=400)
+        claimed = self.client.identity_call("node_claim", {"capability": self.access["capability"]})
+        prepared = self.client.command("prepare_creation", claim=claimed["claim"],
+                                       node_public_key=self.node_public_key,
+                                       claim_nonce=self.access["claim_nonce"])
+        possession = self.client.identity_call("node_possession", prepared)
+        require(self.client.identity_call("node_possession", prepared) == possession,
+                "repeated Node possession request returns the persisted proof")
         self.backup_password = "acceptance-only-encrypted-recovery-passphrase"
-        self.backup = self.client.command("backup", state=state, password=self.backup_password)
-        private_json(self.directory / "recovery-package.json", self.backup)
-        self.client.command("forget_root")
-        self.client.call("bootstrap", {"capability": "invalid-capability", "state": state}, status=400)
-        result = self.client.call("bootstrap", {"capability": self.access["capability"], "state": state})
-        self.client.network_id = state["genesis"]["network_id"]
-        self.client.principal = result["principal"]
-        require(self.client.principal["can_manage"], "bootstrap grants the local management client")
-        return self.client.network_id
-
-
-class Events:
-    def __init__(self, client):
-        self.client = client
-
-    @property
-    def lines(self):
-        return self.client.command("events")
-
-    def start(self):
-        self.client.call("subscribe")
-
-    def close(self):
-        pass
+        created = self.client.command("finish_creation", proof=possession["proof"],
+                                       password=self.backup_password, endpoint=self.url)
+        self.backup = created["recovery_envelope"]
+        backup_path = self.directory / "account-recovery.json"
+        backup_path.write_bytes(bytes.fromhex(self.backup))
+        backup_path.chmod(0o600)
+        self.client.scope = created["scope"]
+        payload = {"pins": created["pins"], "authorization": created["authorization"]}
+        invalid = copy.deepcopy(payload)
+        invalid["authorization"]["journal"][0]["value"]["signature"] = "00" * 64
+        self.client.identity_call("bootstrap", invalid, status=400)
+        require(not self.client.identity_call("status")["initialized"],
+                "invalid account creation leaves the Node unclaimed")
+        result = self.client.identity_call("bootstrap", payload)
+        require(result["scope"] == self.client.scope, "bootstrap installs the locally constructed account scope")
+        require(self.client.identity_call("bootstrap", payload) == result,
+                "identical bootstrap request is idempotent after capability consumption")
+        self.client.authenticate()
+        return self.client.scope["space_id"]
 
 
 def fixture_executor(arguments):
@@ -739,15 +782,62 @@ def operation(client, node, operation_id):
     return client.rpc("operation", target_node=node.node_id, operation_id=operation_id)["operation"]
 
 
-def request(network, conversation, node, operation_id, session_id, action, revision=0, task=None):
-    return {"operation_id": operation_id, "network_id": network,
+def admitted_scope(node, client, operation_id):
+    with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT * FROM accepted_authorizations WHERE space_id=? AND authorization_id=?",
+            (client.scope["space_id"], operation_id)).fetchall()
+    require(len(rows) == 1, "execution has exactly one durable authorization admission")
+    record = dict(rows[0])
+    signed = json.loads(record["signed_invocation"])
+    body = json.loads(record["source_body"])
+    require(record["actor_kind"] == "account" and record["actor_id"] == client.scope["account_id"]
+            and record["device_id"] == client.scope["device_id"]
+            and record["resource_id"] == client.resource_id
+            and record["operation_id"] == operation_id
+            and signed["payload"]["operation_id"] == operation_id
+            and body["space_id"] == client.scope["space_id"]
+            and body["resource_id"] == client.resource_id
+            and body["authorization_id"] == operation_id,
+            "durable admission keeps the original account, space, device, resource and operation identity")
+    return record
+
+
+def resolution_audit(node, client, operation_id):
+    with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT * FROM accepted_authorizations WHERE space_id=? AND json_extract(source_body,'$.method')='resolve_unknown' AND json_extract(source_body,'$.operation_id')=?",
+            (client.scope["space_id"], operation_id)).fetchall()
+    require(len(rows) == 1, "Unknown resolution has one independent durable authorization")
+    record = dict(rows[0])
+    body = json.loads(record["source_body"])
+    invocation = json.loads(record["signed_invocation"])["payload"]
+    require(record["actor_kind"] == "account" and record["actor_id"] == client.scope["account_id"]
+            and record["device_id"] == client.scope["device_id"]
+            and record["resource_id"] == client.resource_id
+            and body["operation_id"] == operation_id
+            and invocation["operation_id"] == body["authorization_id"] != operation_id,
+            "resolution keeps the original actor and Project and uses an independent signed call identity")
+    return record
+
+
+def request(space, conversation, node, operation_id, session_id, action, revision=0, task=None):
+    return {"operation_id": operation_id, "space_id": space,
             "conversation_id": conversation, "task_id": task,
             "target_node": node.node_id, "session_id": session_id,
             "expected_revision": revision, "basis_heads": [], "action": action,
-            "resources": []}
+            "resources": [action["cwd"]] if action["type"] == "open" else []}
 
 
 def dispatch(client, value, status=200):
+    key = (client.scope["space_id"], client.resource_id, value["conversation_id"], value["task_id"], value["session_id"])
+    binding = client.bindings.get(key)
+    if binding is not None:
+        value["binding"] = binding
+        if value["action"]["type"] == "send":
+            value["resources"] = [binding["binding"]["open_spec"]["cwd"]]
     return client.rpc("operate", request=value, status=status)
 
 
@@ -759,13 +849,19 @@ def succeeded(client, node, operation_id):
     return record if record["state"] == "succeeded" else None
 
 
-def verify_snapshot(snapshot):
+def verify_snapshot(client, snapshot, resource_id, author_keys):
+    require(snapshot["version"] == 2 and snapshot["space_id"] == client.scope["space_id"],
+            "snapshot declares the current wire version and expected space")
     events = {event["hash"]: event for event in snapshot["events"]}
+    require(len(events) == len(snapshot["events"]), "snapshot contains no duplicate event hashes")
     for event_hash, signed in events.items():
-        require(hashlib.sha256(signed["canonical_body"].encode()).hexdigest() == event_hash,
-                "exported event content hash matches")
-        event = json.loads(signed["canonical_body"])
-        require(event["network_id"] == snapshot["network_id"], "snapshot remains in its network")
+        claimed_author = json.loads(signed["canonical_body"])["author"]
+        require(claimed_author in author_keys, "event author has an independently verified Node key")
+        verified = client.command("verify_event", envelope=signed,
+                                  space_id=client.scope["space_id"], resource_id=resource_id,
+                                  author_public_key=author_keys[claimed_author])
+        require(verified["hash"] == event_hash, "shared verifier preserves the exported event hash")
+        event = verified["body"]
         dependencies = event["parents"] + ([event["previous"]] if event["previous"] else [])
         require(all(dependency in events for dependency in dependencies), "export includes complete event closure")
     require(all(head in events for head in snapshot["heads"]), "snapshot contains advertised heads")
@@ -900,8 +996,13 @@ def verify_web_assets(node, module):
 
 def verify_incompatible_data(run, binary, workspace):
     directory = run / "INCOMPATIBLE"
-    result = subprocess.run([str(binary), "init", "--data-dir", str(directory), "--root", str(workspace)],
-                            capture_output=True, timeout=45)
+    try:
+        result = subprocess.run([str(binary), "init", "--data-dir", str(directory), "--root", str(workspace)],
+                                env={**os.environ, "RUST_BACKTRACE": "1"}, capture_output=True, timeout=45)
+    except subprocess.TimeoutExpired as error:
+        (run / "incompatible-init.log").write_bytes((error.stdout or b"") + (error.stderr or b""))
+        raise RuntimeError("incompatible fixture: CLI initialization timed out") from None
+    (run / "incompatible-init.log").write_bytes(result.stdout + result.stderr)
     require(result.returncode == 0, "format boundary fixture initializes through the real CLI")
     verify_current_data_format(directory)
     (directory / "node.lock").unlink(missing_ok=True)
@@ -981,162 +1082,163 @@ def verify_incompatible_data(run, binary, workspace):
     rejected_startup()
 
 
-def clear_private_binding_cache(node, run, network):
-    require(node.name == "C" and node.directory.parent == run and node.process is None,
-            "binding cache reset is limited to this stopped private acceptance node")
-    with sqlite3.connect(node.directory / "node.sqlite3") as connection:
-        before = connection.execute("SELECT hash,envelope FROM events WHERE space_id=? ORDER BY hash", (network,)).fetchall()
-        deleted = connection.execute("DELETE FROM local_values WHERE space_id=? AND (key LIKE 'task-binding-current:%' OR key LIKE 'task-binding-record:%')", (network,)).rowcount
-        require(connection.execute("SELECT hash,envelope FROM events WHERE space_id=? ORDER BY hash", (network,)).fetchall() == before,
-                "fresh scheduler simulation retains every signed DAG event byte")
-        require(connection.execute("SELECT COUNT(*) FROM local_values WHERE space_id=? AND (key LIKE 'task-binding-current:%' OR key LIKE 'task-binding-record:%')", (network,)).fetchone()[0] == 0,
-                "fresh scheduler has no task binding current or record cache")
-    return deleted
+def recover_same_node(node):
+    previous = node.client
+    restored = Client(node.url, previous.helper, previous.module)
+    try:
+        wrong = restored.command("open_recovery", envelope=node.backup,
+                                 password="incorrect-acceptance-password", check=False)
+        require(not wrong["ok"], "wrong recovery password is rejected locally")
+        uninitialized = restored.command("recovery_context_request", node_public_key=node.node_public_key, check=False)
+        require(not uninitialized["ok"], "a rejected recovery open leaves no usable material")
+        context = restored.command("open_recovery", envelope=node.backup, password=node.backup_password)
+        require(context["scope"] == previous.scope and context["entry"]["node_public_key"] == node.node_public_key,
+                "encrypted recovery material independently pins the original account, space and Node")
+        restored.connect(node.node_id, node_public_key=node.node_public_key)
+        request = restored.command("recovery_context_request", node_public_key=node.node_public_key)
+        current = restored.identity_call("recovery_context", {"request": request})
+        prepared = restored.command("prepare_recovery", claim=current["claim"], authorization=current["authorization"],
+                                    node_public_key=node.node_public_key)
+        proof = restored.identity_call("recovery_node_possession", prepared)
+        created = restored.command("finish_recovery", proof=proof["proof"], endpoint=node.url,
+                                   password=node.backup_password)
+        result = restored.identity_call("recover", created["commit"])
+        require(result["scope"] == created["scope"]
+                and result["scope"]["account_id"] == previous.scope["account_id"]
+                and result["scope"]["space_id"] == previous.scope["space_id"]
+                and result["scope"]["device_id"] != previous.scope["device_id"],
+                "typed recovery preserves the account and space while installing a new device")
+        restored.scope = created["scope"]
+        restored.resource_id = previous.resource_id
+        restored.authenticate()
+        own = previous.command("identity")
+        rejected = previous.command("request", method="authenticate", params={
+            "account_id": previous.scope["account_id"], "space_id": previous.scope["space_id"],
+            "device_public_key": own["public_key"]}, check=False)
+        require(not rejected["ok"] or rejected["result"].get("error"),
+                "the pre-recovery device no longer authenticates")
+        inspected = restored.command("open_recovery", envelope=created["recovery_envelope"], password=node.backup_password)
+        require(inspected["scope"] == restored.scope,
+                "the new encrypted recovery material represents the recovered account and device")
+        node.backup = created["recovery_envelope"]
+        path = node.directory / "account-recovery.json"
+        path.write_bytes(bytes.fromhex(node.backup))
+        path.chmod(0o600)
+        previous.close()
+        node.client = restored
+        return restored
+    except Exception:
+        restored.close()
+        raise
 
 
-def recover_fresh_node(node, backup, password):
-    node.start()
-    node.client.connect(node.node_id)
-    material = node.client.command("recover_material", backup=backup, password=password)
-    state = {"genesis": material["genesis"], "checkpoint": None, "events": []}
-    challenge = node.client.call("recovery_challenge", {"network_id": material["network_id"],
-                                 "owner_public_key": material["genesis"]["owner_public_key"],
-                                 "genesis": material["genesis"]})
-    signature = node.client.command("sign", identity="recovered", **challenge["signing"])
-    params = {"challenge_id": challenge["challenge_id"], "signature": signature,
-              "recovery_epoch": material["recovery_epoch"], "state": state}
-    node.client.call("recovery_context", params, status=400)
-    context = node.client.call("recovery_context", {**params, "capability": node.access["capability"]})
-    require(context["view"]["network_id"] == backup["network_id"], "fresh recovery proves the original root network")
-    identity = node.client.command("identity")
-    info = node.client.call("info")
-    members = [
-        {**identity, "kind": "client", "name": "Fresh recovery manager", "node_roles": [], "manage": True},
-        {"subject_id": info["node_id"], "public_key": info["public_key"], "kind": "node", "name": node.name,
-         "node_roles": sorted(info["roles"]), "manage": False},
-    ]
-    members.sort(key=lambda member: member["subject_id"])
-    prepared = node.client.call("prepare_recovery", {"challenge_id": challenge["challenge_id"], "members": members})
-    require(prepared["checkpoint"]["epoch"] == backup["recovery_epoch"] + 1,
-            "fresh recovery advances beyond the backed-up recovery epoch")
-    prepared["checkpoint"] = node.client.command("recovery_checkpoint", state=context["state"], members=members,
-                                                   backup_epoch=backup["recovery_epoch"], prepared=prepared)
-    result = node.client.call("recover", {"challenge_id": challenge["challenge_id"], "checkpoint": prepared["checkpoint"],
-                                          "capability": node.access["capability"]})
-    node.client.network_id = backup["network_id"]
-    require(result["principal"]["can_manage"] and result["view"]["epoch"] == backup["recovery_epoch"] + 1,
-            "fresh node restores independent management at the next recovery epoch")
-    node.client.authenticate()
-    require(node.client.rpc("conversations")["conversations"] == [],
-            "root-only recovery does not invent unavailable business history")
-    updated = node.client.command("backup", identity="recovered", state=result["state"],
-                                  recovery_epoch=result["view"]["epoch"], password=password)
-    private_json(node.directory / "recovery-package.json", updated)
-    return updated
+def business_policy_snapshot(node):
+    with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+        grants = {digest: json.loads(entry)["value"]["payload"]["grantee"] for digest, entry in connection.execute(
+            "SELECT entry_hash,entry FROM policy_journal WHERE json_extract(entry,'$.kind')='grant' ORDER BY entry_hash")}
+        spaces = connection.execute(
+            "SELECT domain_id,authority_epoch,sequence,head_hash FROM current_policy_heads WHERE domain_kind='space' ORDER BY domain_id"
+        ).fetchall()
+    require(spaces, "Node policy contains an independently established space head")
+    return {"grants": grants, "space_heads": spaces}
 
 
-def verify_recovery(node, other, nodes, network):
-    wrong = other.command("recover_material", backup=node.backup,
-                          password="wrong-acceptance-passphrase", check=False)
-    require(wrong["ok"] is False, "encrypted recovery package rejects a wrong password")
-    missing = copy.deepcopy(node.backup)
-    missing["envelope"] = {}
-    rejected = other.command("recover_material", backup=missing,
-                             password=node.backup_password, check=False)
-    require(rejected["ok"] is False, "recovery rejects missing encrypted key material")
-    material = other.command("recover_material", backup=node.backup, password=node.backup_password)
-    require(material["network_id"] == network, "recovered root retains the original personal fingerprint")
-    other.url = node.url
-    other.connect(node.node_id)
-    wrong_challenge = other.call("recovery_challenge", {"network_id": network,
-                                 "owner_public_key": material["genesis"]["owner_public_key"],
-                                 "genesis": material["genesis"]})
-    wrong_signature = other.command("sign", **wrong_challenge["signing"])
-    response = other.call("recovery_context", {"challenge_id": wrong_challenge["challenge_id"],
-                                              "signature": wrong_signature}, status=403)
-    require(not response.get("result") and "state" not in response and "view" not in response,
-            "wrong root proof reveals no private membership")
-    challenge = other.call("recovery_challenge", {"network_id": network,
-                           "owner_public_key": material["genesis"]["owner_public_key"],
-                           "genesis": material["genesis"]})
-    signature = other.command("sign", identity="recovered", **challenge["signing"])
-    context = other.call("recovery_context", {"challenge_id": challenge["challenge_id"], "signature": signature})
-    view = context["view"]
-    keep = [member for member in view["members"] if member["subject_id"] not in view["revoked"] and not member["manage"]]
-    identity = other.command("identity")
-    keep.append({**identity, "kind": "client", "name": "Recovered management client", "node_roles": [], "manage": True})
-    keep.sort(key=lambda member: member["subject_id"])
-    prepared = other.call("prepare_recovery", {"challenge_id": challenge["challenge_id"], "members": keep})
-    for field in ("history", "signing"):
-        tampered = copy.deepcopy(prepared)
-        if field == "history":
-            tampered["checkpoint"]["historical_nodes"] = []
-        else:
-            tampered["signing"]["domain"] = "identity-genesis"
-        rejected = other.command("recovery_checkpoint", state=context["state"], members=keep,
-                                 backup_epoch=node.backup["recovery_epoch"], prepared=tampered, check=False)
-        require(rejected["ok"] is False, "trusted WASM rejects altered recovery history or signing payload")
-    prepared["checkpoint"] = other.command("recovery_checkpoint", state=context["state"], members=keep,
-                                            backup_epoch=node.backup["recovery_epoch"], prepared=prepared)
-    result = other.call("recover", {"challenge_id": challenge["challenge_id"], "checkpoint": prepared["checkpoint"]})
-    other.network_id = network
-    require(result["principal"]["can_manage"] and result["view"]["epoch"] > view["epoch"],
-            "root recovery establishes an independent manager in a higher epoch")
-    history = other.rpc("conversation", conversation_id="acceptance-conversation")
-    require(any(message["message_id"] == "message-original"
-                and message["text"] == "Keep this context after A disconnects."
-                for message in history["messages"]),
-            "root recovery retains the exact existing private conversation")
-    rejected = node.client.command("request", method="directory", check=False)
-    if rejected["ok"]:
-        require(rejected["result"].get("error") and not rejected["result"].get("result"),
-                "recovered epoch rejects the old client's already-open channel")
-    else:
-        require("closed" in rejected.get("error", "").lower(),
-                "old authorization is explicitly rejected or disconnected")
-    node.client.connect()
-    node.client.call("authenticate", {"network_id": network}, status=403)
-    for peer in nodes:
-        if peer is node or peer.name == "C":
-            continue
-        wait_for("authorized peer installs recovered management epoch", lambda: peer.client.call("directory")["view"]["epoch"] == result["view"]["epoch"])
-    return other.command("backup", identity="recovered", state=result["state"],
-                         recovery_epoch=result["view"]["epoch"], password=node.backup_password)
+def enroll_account_node(authority, candidate):
+    client = authority.client
+    before = business_policy_snapshot(authority)
+    scope = copy.deepcopy(client.scope)
+    context = client.command("open_recovery", envelope=authority.backup, password=authority.backup_password)
+    require(context["scope"] == scope,
+            "Node enrollment root material belongs to the existing independently pinned account")
+    connection = "candidate-" + candidate.name
+    client.command("connect", url=candidate.url, node_id=candidate.node_id,
+                   node_public_key=candidate.node_public_key, connection=connection)
+    require(not client.identity_call("status", connection=connection)["initialized"],
+            "additional Node starts with an unclaimed installation")
+    claim = client.identity_call("node_claim", {"capability": candidate.access["capability"]}, connection=connection)
+    prepared = client.command("prepare_node_enrollment", claim=claim["claim"],
+                              node_public_key=candidate.node_public_key,
+                              claim_nonce=candidate.access["claim_nonce"])
+    possession = client.identity_call("account_node_possession", prepared, connection=connection)
+    require(client.identity_call("account_node_possession", prepared, connection=connection) == possession,
+            "the same additional-Node possession request returns its persisted proof")
+    commit = client.command("prepare_node_enrollment_commit", possession_signature=possession["proof"])
+    committed = client.identity_call("account_node_commit", commit)
+    require(client.identity_call("account_node_commit", commit) == committed,
+            "the existing account authority returns the same enrollment receipt")
+    verified = client.command("finish_node_enrollment", journal=committed["journal_delta"])
+    installation = verified["installation"]
+    installed = client.identity_call("account_node_install", installation, connection=connection)
+    require(installed["installed"] is True and installed["account_id"] == scope["account_id"]
+            and installed["node_public_key"] == candidate.node_public_key
+            and installed["pins"] == verified["pins"],
+            "additional Node installs the verified existing account and the committed after-pins")
+    require(client.identity_call("account_node_install", installation, connection=connection) == installed,
+            "the same account Node installation is idempotent")
+    client.authenticate()
+    after = business_policy_snapshot(authority)
+    projected = business_policy_snapshot(candidate)
+    account_grantee = {"kind": "actor", "value": {"kind": "account", "id": scope["account_id"]}}
+    expected_grants = {digest: grantee for digest, grantee in before["grants"].items() if grantee == account_grantee}
+    require(client.scope == scope and after == before,
+            "Node enrollment preserves the original account and the authority's complete business policy")
+    require(expected_grants and projected["grants"] == expected_grants
+            and projected["space_heads"] == before["space_heads"],
+            "additional Node installs only the existing Account Grant projection and unchanged space heads")
+    return {"node_id": candidate.node_id, "account_id": scope["account_id"],
+            "business_policy_sha256": hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest(),
+            "authority_before": before, "authority_after": after, "candidate_projection": projected,
+            "additional_business_grants": 0}
 
 
-def verify_binding_race(a, b, c, network, conversation, workspace):
-    task_id = "concurrent-binding-task"
-    a.client.rpc("create_task", conversation_id=conversation, task_id=task_id,
-                 title="Unique execution binding", goal="Accept only one execution location",
-                 acceptance="Conflicting concurrent dispatch is rejected")
-    wait_for("C receives the exact task creation", lambda: any(item["task_id"] == task_id
-             for item in c.client.rpc("conversation", conversation_id=conversation)["tasks"]))
-    requests = [request(network, conversation, target, "binding-race-" + label,
-                        "binding-session-" + label,
-                        {"type": "open", "executor": "claude_code", "cwd": str(workspace)}, task=task_id)
-                for label, target in (("B", b), ("C", c))]
-    def submit(client, value):
-        return client.command("request", method="rpc", params={"method": "operate", "request": value})
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(submit, client, value) for client, value in zip((a.client, c.client), requests)]
-        responses = [future.result() for future in futures]
-    accepted = [index for index, value in enumerate(responses) if not value.get("error")]
-    require(len(accepted) == 1, "two schedulers confirm exactly one execution location")
-    winner = accepted[0]
-    targets = (b, c)
-    wait_for("winning binding open succeeds", lambda: succeeded(a.client, targets[winner], requests[winner]["operation_id"]))
-    require(operation(a.client, targets[1 - winner], requests[1 - winner]["operation_id"]) is None,
-            "losing execution target never accepts a conflicting operation")
+def verify_account_gateway(authority, gateway, conversation, other_resource):
+    client = authority.client
+    connection = "gateway-" + gateway.name
+    client.command("connect", url=gateway.url, node_id=gateway.node_id,
+                   node_public_key=gateway.node_public_key, connection=connection)
+    authorization = wait_for("Gateway authenticates the original Project host", lambda: client.authenticate(
+        connection=connection, host_public_key=authority.node_public_key))
+    wrong_host = client.command("authorize", response=authorization,
+                                expected_host_public_key=gateway.node_public_key,
+                                connection=connection, check=False)
+    require(not wrong_host["ok"], "Gateway transport pin cannot replace the independently pinned Project host")
+    wrong_transport = client.command("connect", url=gateway.url, node_id=authority.node_id,
+                                     node_public_key=authority.node_public_key,
+                                     connection="gateway-wrong-transport", check=False)
+    require(not wrong_transport["ok"], "Project host pin cannot replace the actual Gateway Noise endpoint")
+    direct = client.rpc("conversation", conversation_id=conversation)
+    forwarded = client.rpc("conversation", conversation_id=conversation, connection=connection)
+    require(forwarded == direct, "separately pinned Gateway returns the exact original Project-host history")
+    client.rpc("conversation", resource_id=other_resource, conversation_id=conversation,
+               connection=connection, status=400)
+    client.rpc("message", conversation_id=conversation, message_id="gateway-message",
+               text="A Gateway preserves the original signed account intent.", connection=connection)
+    messages = client.rpc("conversation", conversation_id=conversation)["messages"]
+    require(len([message for message in messages if message["message_id"] == "gateway-message"]) == 1,
+            "Gateway message writes exactly once at the original Project host")
+    with sqlite3.connect(f"file:{gateway.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+        require(all(database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+                    for table in ("events", "conversations", "messages", "tasks", "operations")),
+                "Gateway without business Grants stores no private history or execution records")
+    return {"gateway_node_id": gateway.node_id, "resource_host_node_id": authority.node_id,
+            "account_id": client.scope["account_id"], "resource_id": client.resource_id,
+            "distinct_transport_and_host_pins": True, "gateway_business_rows": 0}
 
 
 def verify_channel_security(node):
-    wrong = node.client.command("connect", url=node.url, node_id="ab" * 32,
+    substituted = node.client.command("identity", identity="root")
+    wrong = node.client.command("connect", url=node.url, node_id=substituted["node_id"],
+                                node_public_key=substituted["public_key"],
                                 connection="wrong-identity", check=False)
     require(wrong["ok"] is False, "Noise refuses a substituted target identity")
+    legacy = node.client.command("connect", url=node.url, node_id=node.node_id,
+                                 node_public_key=node.node_public_key, context="vibeface:client:v1",
+                                 connection="legacy-protocol", check=False)
+    require(legacy["ok"] is False, "Node refuses the old client handshake context")
     for kind in ("tamper", "replay"):
         connection = "negative-" + kind
         node.client.connect(connection=connection)
-        node.client.call("authenticate", {"network_id": node.client.network_id}, connection=connection)
+        node.client.authenticate(connection=connection)
         result = node.client.command("attack", kind=kind, connection=connection)
         require(result == {"rejected": True}, "invalid protected record closes the real Node channel")
     require(node.client.rpc("nodes")["nodes"], "valid channel remains usable after separate attack connections")
@@ -1154,30 +1256,25 @@ def verify_browser_origins(node, origins):
 
 def acceptance(options):
     binary = options.binary.resolve(strict=True)
+    module = options.crypto_module.resolve(strict=True)
+    require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
+            "real shared cryptography WASM is available")
     options.artifacts.mkdir(parents=True, exist_ok=True)
     run = options.artifacts.resolve() / ("node-acceptance-" + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir(mode=0o700)
-    child_workspace = workspace / "child"
-    child_workspace.mkdir()
     fixture = run / "fixture-executor"
     fixture.write_text(f"#!{sys.executable}\nimport os\nos.execv({sys.executable!r}, [{sys.executable!r}, {str(Path(__file__).resolve())!r}, '--fixture-executor', '--fixture-root', {str(run)!r}] + __import__('sys').argv[1:])\n")
     fixture.chmod(0o700)
-    module = options.crypto_module.resolve(strict=True)
-    require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
-            "real browser cryptography WASM is available")
-    helper = run / "client.mjs"
-    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    helper.chmod(0o600)
+    helper = Path(__file__).resolve().with_name("node-client.mjs")
     nodes = []
     report = {"status": "running", "evidence": [], "provider_calls": 0,
-              "binary_sha256": file_sha256(binary),
-              "not_checked": ["paid model output and SDK reasoning", "real LAN/public ingress",
-                              "rendered browser UI", "hostile DAG import rejection (run store module tests separately)"]}
-    stream = None
-    capture = None
-    recovery_client = None
+              "binary_sha256": file_sha256(binary), "crypto_module_sha256": file_sha256(module),
+              "wasm_sha256": file_sha256(module.with_name("vibeface_secure_bg.wasm")),
+              "not_checked": ["Gateway to registered Project host", "additional same-Account Node enrollment", "Node Service revocation",
+                              "recovery on real Node wire", "paid model output and SDK reasoning",
+                              "real LAN/public ingress", "rendered browser UI", "phone and platform Passkey"]}
 
     def passed(description, kind="real_node_processes"):
         report["evidence"].append({"check": description, "kind": kind})
@@ -1185,305 +1282,231 @@ def acceptance(options):
 
     try:
         verify_direct_start(run, binary)
-        passed("direct CLI startup initializes safely and restarts the same node without provider calls")
-        for name in ("A", "B", "C", "R"):
-            nodes.append(Node(run, name, binary, workspace, fixture, helper, module))
-        a, b, c, relay = nodes
         verify_incompatible_data(run, binary, workspace)
-        passed("legacy epoch, missing marker, wrong format and layout refuse startup without directory or provider changes")
-        for node in nodes:
+        passed("fresh SQLite startup and restart; incompatible directories refuse before all writes and providers")
+        for name in ("A", "OTHER"):
+            node = Node(run, name, binary, workspace, fixture, helper, module)
+            nodes.append(node)
             node.configure(codex_bin=options.codex_bin)
-        capture = RelayCapture(relay.port)
-        relay.configure(allowed_origins=[capture.url], network={"bootstrap_urls": [], "advertise_urls": [],
-                                                "mdns": False, "relay_enabled": True})
-        relay.start()
-        for node in (a, b, c):
-            node.configure(network={"bootstrap_urls": [capture.url.replace("http:", "ws:") + "/api/network/ws"],
-                                    "advertise_urls": [], "mdns": False, "relay_enabled": False})
-        a.start()
+            if name == "A":
+                node.configure(network={"bootstrap_urls": [], "advertise_urls": [node.url.replace("http://", "ws://") + "/api/network/ws"],
+                                        "mdns": False, "relay_enabled": True})
+            node.start()
+            node.bootstrap()
+        a, other = nodes
+        client, foreign = a.client, other.client
+        require(client.scope["account_id"] != foreign.scope["account_id"]
+                and client.scope["space_id"] != foreign.scope["space_id"],
+                "two real independent accounts own distinct personal spaces")
+        report["topology"] = {"accounts": [client.scope["account_id"], foreign.scope["account_id"]],
+                              "spaces": [client.scope["space_id"], foreign.scope["space_id"]],
+                              "nodes": [a.node_id, other.node_id]}
         verify_cli_status(a, True)
-        a.stop()
-        verify_cli_status(a, False)
-        missing = subprocess.run([str(binary), "status", "--json", "--data-dir", str(run / "not-initialized")],
-                                 capture_output=True, timeout=10)
-        require(missing.returncode != 0 and not missing.stdout, "CLI status rejects uninitialized directories")
-        a.start()
-        passed("binary CLI status reports running and stopped nodes without exposing pairing secrets")
-        a.client.connect(a.node_id)
-        a.client.call("rpc", {"method": "nodes"}, status=401)
-        a.client.call("directory", status=401)
-        for path in ("/api/register", "/api/login", "/api/rpc"):
-            a.client.request(path, {}, status=404)
-        network = a.bootstrap()
         verify_web_assets(a, module)
-        passed("embedded SPA routes, assets, CSP, cache policy, HEAD and packaged JS/WASM resources")
-        a.client.request("/api/tools", {"name": "nodes", "arguments": {}, "call_id": "human-call"}, status=404)
-        passed("independent client/root identity, local bootstrap capability and encrypted authorization")
-
         verify_channel_security(a)
-        passed("Noise target binding, tamper and replay reject on real Node channels")
-
         verify_maintenance(a)
-        passed("private maintenance lease, write admission, startup health gate and disabled updates")
-
         verify_browser_origins(a, [f"http://localhost:{a.port}", f"http://0.0.0.0:{a.port}"])
-        a.stop()
-        extra_origins = [f"http://192.0.2.10:{a.port}", "https://node.example"]
-        a.configure(allowed_origins=extra_origins, allow_insecure_lan=True)
-        a.start()
-        a.client.connect()
-        a.client.authenticate()
-        verify_browser_origins(a, extra_origins)
-        passed("local aliases and explicit entries validate Host/Origin without account cookies", "real_http_origin_boundaries")
+        passed("two-stage account creation, pinned Noise v2, channel attacks, maintenance and packaged web assets")
 
-        b.pair(a, network)
-        wait_for("A reserves its public relay route",
-                 lambda: b'{"type":"reserved"}' in capture.payloads)
-        c.pair(a, network, relay_url=capture.url)
-        b.start()
-        c.start()
-        b.client.connect()
-        wait_for("B receives its independently paired client grant", lambda: b.client.authenticate())
-        c.client.connect()
-        wait_for("C receives its independently paired client grant", lambda: c.client.authenticate())
-        wait_for("A reaches C through the public relay", lambda: any(n["node_id"] == c.node_id and n["online"] for n in a.client.rpc("nodes")["nodes"]))
-        require(len({a.node_id, b.node_id, c.node_id}) == 3, "nodes have distinct stable identities")
-        require(len({node.client.command("identity")["subject_id"] for node in (a, b, c)}) == 3,
-                "each client installation owns an independent identity")
-        require(c.client.network_id == b.client.network_id == network, "independent local clients use the same paired network")
-        phone = c.client.command("identity")["subject_id"]
-        laptop = b.client.command("identity")["subject_id"]
-        passed("three independent nodes pair and route through a foreign public relay")
-
-        other = relay.client
-        other_network = relay.bootstrap()
-        require(other_network != network, "public relay owns an independent personal network")
-        report["topology"] = {"network_id": network, "nodes": [node.node_id for node in (a, b, c)],
-                              "relay_node_id": relay.node_id, "relay_network_id": other_network}
-        other.command("connect", url=a.url, node_id=a.node_id, connection="foreign")
-        other.call("authenticate", {"network_id": network}, connection="foreign", status=401)
-        other.call("rpc", {"method": "nodes"}, connection="foreign", status=401)
-        conversation, task = "acceptance-conversation", "acceptance-task"
-        a.client.rpc("create_conversation", conversation_id=conversation, title="Failover acceptance")
-        a.client.rpc("create_task", conversation_id=conversation, task_id=task, title="Explicit acceptance", goal="Keep history across node changes", acceptance="User accepts explicitly")
-        a.client.rpc("message", conversation_id=conversation, message_id="message-original", text="Keep this context after A disconnects.")
-        a.client.rpc("message", conversation_id=conversation, message_id="message-original", text="Keep this context after A disconnects.")
-        a.client.rpc("message", conversation_id=conversation, message_id="message-original", text="changed content", status=400)
-        other.rpc("conversation", conversation_id=conversation, status=400)
-        require(other.rpc("conversations")["conversations"] == [], "other network cannot list conversation")
-        foreign = request(other_network, conversation, b, "foreign", "foreign", {"type": "open", "executor": "claude_code", "cwd": str(workspace)})
-        dispatch(a.client, foreign, status=400)
-        history = wait_for("shared message and task at C", lambda: shared_history(c.client, conversation, task))
-        require(len([m for m in history["messages"] if m["message_id"] == "message-original"]) == 1, "message retry is idempotent")
-        passed("shared private history stays isolated from a separately owned public relay")
-        require(capture.payloads and not capture.errors, "relay path captured valid unmasked WebSocket records")
-        require(b"Keep this context after A disconnects." not in b"".join(capture.payloads),
-                "public relay cannot see the private message present on C")
-        with sqlite3.connect(f"file:{relay.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
-            require(connection.execute("SELECT COUNT(*) FROM events WHERE space_id=?", (network,)).fetchone()[0] == 0,
-                    "foreign relay stores no private business events")
-        report["relay_capture"] = {"frames": len(capture.payloads), "plaintext_canary_found": False}
-        passed("foreign relay transports protected history without plaintext context or private replicas")
-
-        verify_binding_race(a, b, c, network, conversation, workspace)
-        passed("concurrent schedulers obtain one task binding and the losing target accepts nothing")
-
-        if not options.skip_codex:
-            require(shutil.which(options.codex_bin) is not None or Path(options.codex_bin).is_file(), "Codex executable is available; use --skip-codex for fixture-only run")
-            a.client.rpc("create_task", conversation_id=conversation, task_id="native-transport-task", title="Native transport", goal="Open one native thread without a model", acceptance="Native thread ID persists")
-            native_open = request(network, conversation, b, "codex-native-open", "native-codex", {"type": "open", "executor": "codex", "cwd": str(workspace)}, task="native-transport-task")
-            dispatch(a.client, native_open)
-            wait_for("real Codex native thread open", lambda: succeeded(a.client, b, "codex-native-open"))
-            native = a.client.rpc("session", target_node=b.node_id, session_id="native-codex")
-            require(native["session"]["native_session_id"], "real app-server native thread ID is persisted")
-            require("error" not in native["actual"], "real app-server thread is readable")
-            passed("installed Codex app-server opens and reads a native thread without a model turn", "real_codex_transport")
-        else:
+        first = client.resource_id
+        second = client.add_project_fixture()
+        require(first != second, "one space contains two independently signed Projects")
+        report["topology"]["resources"] = [first, second]
+        for resource, conversation in ((first, "scope-first"), (second, "scope-second")):
+            client.rpc("create_conversation", resource_id=resource, conversation_id=conversation, title=conversation)
+            listed = client.rpc("conversations", resource_id=resource)["conversations"]
+            require([entry["conversation_id"] for entry in listed] == [conversation],
+                    "resource list contains only its own conversation")
+        conversation, task = "scope-first", "fixture-task"
+        for method in ("conversation", "context", "export"):
+            client.rpc(method, resource_id=second, conversation_id=conversation, status=400)
+            foreign.rpc(method, conversation_id=conversation, status=400)
+        body = {"method": "conversations", "space_id": client.scope["space_id"],
+                "resource_id": first, "authorization_id": uuid.uuid4().hex}
+        prepared = client.command("prepare_signed", body=body)
+        client.call("rpc", {**body, "space_id": foreign.scope["space_id"]}, invocation=prepared["invocation"], status=400)
+        require(client.call("rpc", body, invocation=prepared["invocation"])["conversations"],
+                "a rejected signed scope replacement does not consume the valid original")
+        passed("account, space and signed Project scope isolate conversation lists, context and exports")
+        client.create_task(a, conversation, task, title="Explicit acceptance", goal="Keep an uncertain operation durable",
+                           acceptance="An explicit account decision is required")
+        client.rpc("message", conversation_id=conversation, message_id="message-original", text="Keep resource-scoped history")
+        client.rpc("message", conversation_id=conversation, message_id="message-original", text="Keep resource-scoped history")
+        client.rpc("message", conversation_id=conversation, message_id="message-original", text="changed", status=400)
+        history = client.rpc("conversation", conversation_id=conversation)
+        require(len([message for message in history["messages"] if message["message_id"] == "message-original"]) == 1,
+                "stable message retry preserves one signed event")
+        if options.skip_codex:
             report["not_checked"].append("real Codex native transport (--skip-codex)")
+        else:
+            require(shutil.which(options.codex_bin) is not None or Path(options.codex_bin).is_file(),
+                    "Codex executable is available; use --skip-codex for fixture-only acceptance")
+            client.create_task(a, conversation, "native-transport-task", title="Native transport",
+                               goal="Open one native thread without a model", acceptance="Native thread ID persists")
+            native_spec = {"type": "open", "executor": "codex", "cwd": str(workspace)}
+            client.bind_execution(conversation, "native-transport-task", a, "native-codex", native_spec)
+            native_open = request(client.scope["space_id"], conversation, a, "codex-native-open", "native-codex",
+                                  native_spec, task="native-transport-task")
+            dispatch(client, native_open)
+            wait_for("real Codex native thread opens", lambda: succeeded(client, a, "codex-native-open"))
+            native = client.rpc("session", target_node=a.node_id, session_id="native-codex")
+            require(native["session"]["native_session_id"] and "error" not in native["actual"],
+                    "real app-server native thread is persisted and readable")
+            passed("installed Codex opens and reads a native thread without a model turn", "real_codex_transport")
+        open_spec = {"type": "open", "executor": "claude_code", "cwd": str(workspace)}
+        client.bind_execution(conversation, task, a, "fixture-main", open_spec)
+        opened = request(client.scope["space_id"], conversation, a, "fixture-open", "fixture-main", open_spec, task=task)
+        dispatch(client, opened)
+        wait_for("confirmed task session opens", lambda: succeeded(client, a, "fixture-open"))
+        dispatch(client, opened)
+        changed = copy.deepcopy(opened)
+        changed["action"]["cwd"] = str(run)
+        dispatch(client, changed, status=400)
+        passed("verified TaskCreated and explicit TaskBinding govern execution; changed duplicate intent rejects")
 
-        open_request = request(network, conversation, b, "fixture-open", "fixture-main", {"type": "open", "executor": "claude_code", "cwd": str(workspace)}, task=task)
-        dispatch(a.client, open_request)
-        wait_for("fixture session ready", lambda: succeeded(a.client, b, "fixture-open"))
-        dispatch(a.client, open_request)
-        changed = copy.deepcopy(open_request)
-        changed["action"]["cwd"] = str(child_workspace)
-        dispatch(a.client, changed, status=400)
-        bad_path = request(network, conversation, b, "invalid-root", "invalid-root", {"type": "open", "executor": "claude_code", "cwd": str(run)})
-        dispatch(a.client, bad_path, status=400)
-        missing_head = request(network, conversation, b, "missing-basis", "missing-basis", {"type": "open", "executor": "claude_code", "cwd": str(workspace)})
-        missing_head["basis_heads"] = ["00" * 32]
-        dispatch(a.client, missing_head, status=400)
-        passed("execution admission rejects changed IDs, invalid roots and missing basis")
-
-        session = a.client.rpc("session", target_node=b.node_id, session_id="fixture-main")["session"]
-        gate = run / "complete-first"
-        send = request(network, conversation, b, "fixture-delayed-send", "fixture-main", {"type": "send", "text": json.dumps({"label": "delayed", "gate": str(gate), "result_size": 280000})}, revision=session["revision"], task=task)
-        dispatch(a.client, send)
-        wait_for("fixture invocation begins", lambda: len(invocations(run, "delayed")) == 1)
-        wait_for("accepted dispatch and message at C", lambda: shared_history(c.client, conversation, task, send))
-        c.stop()
-        deleted_bindings = clear_private_binding_cache(c, run, network)
-        a.stop()
-        c.start()
-        c.client.connect()
-        c.client.authenticate()
-        wait_for("fresh C reconnects to original executor B", lambda: any(item["node_id"] == b.node_id and item["online"] for item in c.client.rpc("nodes")["nodes"]))
-        require(a.process is None, "binding authority A remains offline during fresh C continuation")
-        stream = Events(c.client)
-        stream.start()
-        report["fresh_scheduler"] = {"authority_offline": True, "binding_cache_rows_removed": deleted_bindings,
-                                     "explicit_task_id": task, "original_target": b.node_id}
+        device = client.scope["device_id"]
+        session = client.rpc("session", target_node=a.node_id, session_id="fixture-main")["session"]
+        gate = run / "complete-result"
+        sent = request(client.scope["space_id"], conversation, a, "fixture-result-send", "fixture-main",
+                       {"type": "send", "text": json.dumps({"label": "result", "gate": str(gate), "result_size": 280000})},
+                       revision=session["revision"], task=task)
+        client.subscribe()
+        dispatch(client, sent)
+        wait_for("one fixture executes", lambda: len(invocations(run, "result")) == 1)
+        dispatch(client, sent)
         gate.touch(mode=0o600)
-        wait_for("B finishes while A is offline", lambda: succeeded(c.client, b, "fixture-delayed-send"))
-        notification = "result:fixture-delayed-send:succeeded"
-        wait_for("C receives durable B result notification", lambda: any(n["notification_id"] == notification for n in c.client.rpc("notifications", client_id=phone)["notifications"]))
-        wait_for("C receives live event stream update", lambda: len(stream.lines) > 0)
-        after = c.client.rpc("conversation", conversation_id=conversation)
-        require(next(item for item in after["tasks"] if item["task_id"] == task)["status"] != "accepted", "turn completion never accepts a task")
-        require(any(s["session_id"] == "fixture-main" for s in after["sessions"]), "C reads actual B execution state after A exits")
-        require(len(invocations(run, "delayed")) == 1, "retries and imported history do not repeat execution")
-        wait_for("large result blob replicated to C", lambda: verify_blobs(c, network) >= 1)
-        count = verify_snapshot(c.client.rpc("export", conversation_id=conversation))
-        require(count > 5, "export contains conversation, dispatch and result history")
-        passed("A goes offline; fresh C restores context and receives original B completion without replay", "real_nodes_with_stream_json_fixture")
-        passed("large attachment copies with matching content hash and complete DAG closure")
-        stream.close()
-        stream = None
+        wait_for("fixture result is durable", lambda: succeeded(client, a, sent["operation_id"]))
+        notification = "result:fixture-result-send:succeeded"
+        wait_for("resource result notification", lambda: any(item["notification_id"] == notification
+                 for item in client.rpc("notifications", client_id=device)["notifications"]))
+        client.rpc("notifications", client_id=foreign.scope["device_id"], status=400)
+        client.rpc("ack", conversation_id=conversation, notification_id=notification, client_id=foreign.scope["device_id"], status=400)
+        client.rpc("ack", resource_id=second, conversation_id=conversation, notification_id=notification, client_id=device, status=400)
+        client.rpc("ack", conversation_id=conversation, notification_id=notification, client_id=device)
+        require(all(item["notification_id"] != notification
+                    for item in client.rpc("notifications", client_id=device)["notifications"]),
+                "the explicit device acknowledgement removes its notification")
+        snapshot = client.rpc("export", conversation_id=conversation)
+        report["event_count"] = verify_snapshot(client, snapshot, first, {a.node_id: a.node_public_key})
+        require(verify_blobs(a, client.scope["space_id"]) > 0, "large result has verified persisted attachment bytes")
+        references = {blob["hash"]: blob["size"] for envelope in snapshot["events"]
+                      for blob in json.loads(envelope["canonical_body"])["blobs"]}
+        require(references, "a validated result event refers to a nonempty set of attachments")
+        foreign.rpc("create_conversation", conversation_id="foreign-readable", title="Foreign private context")
+        for digest, size in references.items():
+            content, offset = bytearray(), 0
+            while True:
+                chunk = client.rpc("context", conversation_id=conversation, blob_hash=digest, offset=offset, limit=100)
+                require(chunk["hash"] == digest and chunk["size"] == size and chunk["offset"] == offset,
+                        "attachment chunks retain their verified event reference and offset")
+                content.extend(bytes.fromhex(chunk["data_hex"]))
+                if chunk["next_offset"] is None:
+                    break
+                require(chunk["next_offset"] > offset, "attachment pagination makes progress")
+                offset = chunk["next_offset"]
+            require(len(content) == size and hashlib.sha256(content).hexdigest() == digest,
+                    "the real authorized attachment API returns the exact verified bytes")
+            client.rpc("context", resource_id=second, conversation_id="scope-second", blob_hash=digest, status=400)
+            foreign.rpc("context", conversation_id="foreign-readable", blob_hash=digest, status=400)
+        require(len(invocations(run, "result")) == 1, "reads and duplicate dispatch never repeat the fixture")
+        passed("large result, signed DAG closure and durable device notifications stay within one resource", "real_nodes_with_stream_json_fixture")
 
-        c.client.rpc("notifications", client_id=laptop, status=403)
-        c.client.rpc("ack", notification_id=notification, client_id=laptop, status=403)
-        c.client.rpc("ack", notification_id=notification, client_id=phone)
-        require(all(n["notification_id"] != notification for n in c.client.rpc("notifications", client_id=phone)["notifications"]), "ACK removes notification for same client")
-        require(any(n["notification_id"] == notification for n in b.client.rpc("notifications", client_id=laptop)["notifications"]), "ACK does not consume another client delivery")
-        session = c.client.rpc("session", target_node=b.node_id, session_id="fixture-main")["session"]
-        offline_gate = run / "complete-offline"
-        offline = request(network, conversation, b, "fixture-offline-send", "fixture-main", {"type": "send", "text": json.dumps({"label": "offline", "gate": str(offline_gate)})}, revision=session["revision"], task=task)
-        require(a.process is None, "fresh C submits new explicit-task work while authority A stays offline")
-        dispatch(c.client, offline)
-        wait_for("second fixture invocation", lambda: len(invocations(run, "offline")) == 1)
-        dispatch(c.client, offline)
-        stale = copy.deepcopy(offline)
-        stale["operation_id"] = "stale-concurrent"
-        dispatch(c.client, stale, status=400)
-        overlap = request(network, conversation, b, "overlapping-path", "overlapping-session", {"type": "open", "executor": "claude_code", "cwd": str(child_workspace)})
-        dispatch(c.client, overlap, status=400)
-        passed("fresh C derives the binding from DAG and dispatches new work to original B with A offline", "real_nodes_with_stream_json_fixture")
-        passed("session CAS, overlapping-directory exclusion and execution deduplication", "real_nodes_with_stream_json_fixture")
-        c.stop()
-        offline_gate.touch(mode=0o600)
-        wait_for("B completes without any connected client", lambda: succeeded(b.client, b, "fixture-offline-send"))
-        c.start()
-        c.client.connect()
-        c.client.authenticate()
-        wait_for("persistent notification delivered after reconnect", lambda: any(n["notification_id"] == "result:fixture-offline-send:succeeded" for n in c.client.rpc("notifications", client_id=phone)["notifications"]))
-        require(all(n["notification_id"] != notification for n in c.client.rpc("notifications", client_id=phone)["notifications"]), "client ACK remains durable after restart")
-        passed("offline notifications replay after reconnect and per-client ACK persists", "real_nodes_with_stream_json_fixture")
-
-        session = c.client.rpc("session", target_node=b.node_id, session_id="fixture-main")["session"]
-        unknown = request(network, conversation, b, "fixture-unknown-send", "fixture-main", {"type": "send", "text": json.dumps({"label": "unknown", "gate": str(run / "never-complete")})}, revision=session["revision"], task=task)
-        dispatch(c.client, unknown)
-        wait_for("interrupted fixture is executing", lambda: len(invocations(run, "unknown")) == 1)
-        verify_live_access(b, unknown["operation_id"])
-        lease, state = maintenance(b, "acquire")
-        lease.close()
-        require(state["status"] == "busy", "running execution postpones updates")
-        b.stop()
-        b.start()
-        b.client.connect()
-        b.client.authenticate()
-        record = wait_for("running operation recovers as Unknown", lambda: unknown_record(b.client, b, unknown["operation_id"]))
-        require(record["state"] == "unknown", "restart does not report success")
-        b.stop()
-        b.start()
-        b.client.connect()
-        b.client.authenticate()
-        verify_current_data_format(b.directory)
-        require(operation(b.client, b, unknown["operation_id"]) == record,
-                "another current-format restart preserves the exact Unknown deduplication record")
-        lease, state = maintenance(b, "acquire")
-        lease.close()
-        require(state["status"] == "busy", "Unknown execution postpones updates")
-        dispatch(b.client, unknown)
-        require(len(invocations(run, "unknown")) == 1, "Unknown retry does not invoke executor")
-        blocked = copy.deepcopy(unknown)
+        session = client.rpc("session", target_node=a.node_id, session_id="fixture-main")["session"]
+        uncertain = request(client.scope["space_id"], conversation, a, "fixture-unknown-send", "fixture-main",
+                            {"type": "send", "text": json.dumps({"label": "unknown", "gate": str(run / "never-complete")})},
+                            revision=session["revision"], task=task)
+        dispatch(client, uncertain)
+        wait_for("interrupted fixture starts once", lambda: len(invocations(run, "unknown")) == 1)
+        admission = admitted_scope(a, client, uncertain["operation_id"])
+        verify_live_access(a, uncertain["operation_id"])
+        before = None
+        report["unknown_restarts"] = {"initial_pid": a.process.pid, "original_admission": admission, "restarts": []}
+        for index in range(2):
+            a.stop()
+            a.start()
+            client.connect()
+            client.authenticate()
+            current = wait_for("restart preserves Unknown", lambda: unknown_record(client, a, uncertain["operation_id"]))
+            require(current == before if before else current["state"] == "unknown", "the second restart preserves the exact Unknown record")
+            require(admitted_scope(a, client, uncertain["operation_id"]) == admission,
+                    "both restarts preserve the complete original account admission and stable operation ID")
+            report["unknown_restarts"]["restarts"].append({"pid": a.process.pid, "operation": current})
+            before = current
+            verify_current_data_format(a.directory, stopped=False)
+        client.rpc("reconcile", target_node=a.node_id, operation_id=uncertain["operation_id"])
+        require(operation(client, a, uncertain["operation_id"])["state"] == "unknown", "inconclusive reconciliation keeps Unknown")
+        dispatch(client, uncertain, status=400)
+        client.call("rpc", json.loads(admission["source_body"]), invocation=json.loads(admission["signed_invocation"]))
+        require(len(invocations(run, "unknown")) == 1, "neither a rejected new signature nor the exact signed duplicate repeats execution")
+        require(admitted_scope(a, client, uncertain["operation_id"]) == admission,
+                "the exact signed duplicate preserves the original admission")
+        blocked = copy.deepcopy(uncertain)
         blocked["operation_id"] = "unknown-resource-conflict"
-        dispatch(b.client, blocked, status=400)
-        b.client.rpc("reconcile", target_node=b.node_id, operation_id=unknown["operation_id"])
-        require(operation(b.client, b, unknown["operation_id"])["state"] == "unknown", "inconclusive reconciliation keeps Unknown")
-        b.client.rpc("resolve_unknown", target_node=b.node_id, operation_id=unknown["operation_id"], outcome="failed", evidence="Acceptance stopped its entire private process group and verified one invocation.")
-        passed("execution interruption preserves Unknown and reserves resources until human resolution", "real_nodes_with_stream_json_fixture")
-
-        a.start()
-        a.client.connect()
-        a.client.authenticate()
-        wait_for("owner reconnects to B", lambda: any(n["node_id"] == b.node_id and n["online"] for n in a.client.rpc("nodes")["nodes"]))
-        proposal = a.client.call("prepare_revoke", {"subject_id": c.node_id})
-        proposal["event"]["signature"] = a.client.command("sign", **proposal["signing"])
-        a.client.call("revoke", {"event": proposal["event"]})
-        wait_for("B installs device revocation", lambda: any(n["node_id"] == c.node_id and n["revoked"] for n in b.client.rpc("nodes")["nodes"]))
-        wait_for("known revocation rejects C remote access", lambda: revoked_remote(c.client, b))
-        a.client.rpc("operation", target_node=c.node_id, operation_id="anything", status=400)
-        require(len(invocations(run)) == 3, "sync/restart/revocation never creates extra executor calls")
-        passed("known revocation rejects further cross-node data and execution access")
-        recovery_client = Client(a.url, helper, module)
-        backup = verify_recovery(a, recovery_client, [a, b, c], network)
-        passed("encrypted recovery rejects wrong or missing material and restores independent management without losing history")
-        for name in ("FRESH-EPOCH-2", "FRESH-EPOCH-3"):
-            fresh = Node(run, name, binary, workspace, fixture, helper, module)
-            nodes.append(fresh)
-            fresh.configure(roles=["gateway", "replica"], codex_bin=options.codex_bin)
-            backup = recover_fresh_node(fresh, backup, a.backup_password)
-        require(backup["recovery_epoch"] == 4, "authorization epochs 2 and 3 restore on independent fresh nodes")
-        passed("current-format encrypted backups restore fresh nodes at higher authorization epochs without fabricating history")
+        dispatch(client, blocked, status=400)
+        client.rpc("resolve_unknown", conversation_id=conversation, task_id=task,
+                   task_ref=client.tasks[(client.scope["space_id"], first, conversation, task)]["task_ref"],
+                   target_node=a.node_id, session_id="fixture-main", operation_id=uncertain["operation_id"],
+                   outcome="failed", evidence="The acceptance process group was stopped and one invocation was independently verified.")
+        report["unknown_resolution"] = {"original_admission": admission,
+                                        "resolution_admission": resolution_audit(a, client, uncertain["operation_id"]),
+                                        "final_operation": operation(client, a, uncertain["operation_id"])}
+        require(report["unknown_resolution"]["final_operation"]["state"] == "failed"
+                and admitted_scope(a, client, uncertain["operation_id"]) == admission
+                and len(invocations(run, "unknown")) == 1,
+                "the independent Account resolution commits Failed and preserves the original admission without replay")
+        with sqlite3.connect(f"file:{a.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+            require(database.execute("SELECT COUNT(*) FROM resource_reservations WHERE space_id=? AND operation_id=?",
+                                     (client.scope["space_id"], uncertain["operation_id"])).fetchone()[0] == 0,
+                    "explicit Account resolution releases only the resolved operation's resource reservations")
+        passed("Unknown, complete original admission and resource locks survive two restarts without replay", "real_nodes_with_stream_json_fixture")
+        require(all(item["notification_id"] != notification
+                    for item in client.rpc("notifications", client_id=device)["notifications"]),
+                "device acknowledgement remains durable after both restarts")
+        gateway = Node(run, "GATEWAY", binary, workspace, fixture, helper, module)
+        nodes.append(gateway)
+        gateway.configure(roles=["gateway", "replica", "relay"],
+                          network={"bootstrap_urls": [a.url.replace("http://", "ws://") + "/api/network/ws"],
+                                   "advertise_urls": [gateway.url.replace("http://", "ws://") + "/api/network/ws"],
+                                   "mdns": False, "relay_enabled": False})
+        gateway.start()
+        report["node_enrollment"] = enroll_account_node(a, gateway)
+        report["not_checked"].remove("additional same-Account Node enrollment")
+        passed("an additional Node installs the same Account Service and only the original Account Grant projection")
+        report["gateway"] = verify_account_gateway(a, gateway, conversation, second)
+        report["not_checked"].remove("Gateway to registered Project host")
+        passed("independent Gateway and host pins protect forwarded Account requests without Gateway private history")
+        restored = recover_same_node(a)
+        recovered = restored.rpc("conversation", conversation_id=conversation)
+        require(any(item["task_id"] == task for item in recovered["tasks"]),
+                "account recovery preserves the original signed task history")
+        verify_snapshot(restored, restored.rpc("export", conversation_id=conversation), first, {a.node_id: a.node_public_key})
+        require(len(invocations(run, "unknown")) == 1 and len(invocations(run, "result")) == 1,
+                "recovery does not replay accepted execution")
+        report["not_checked"].remove("recovery on real Node wire")
+        passed("encrypted typed recovery preserves account, resources and history and rejects the old device")
         verify_no_model_budget(nodes)
-        require(len(invocations(run)) == 3, "recovery never replays previously accepted execution")
-        passed("ordinary notifications, history replay and identity recovery use no management-model budget")
-        require(file_sha256(binary) == report["binary_sha256"], "binary did not change during acceptance")
-        report["status"] = "passed"
+        require(file_sha256(binary) == report["binary_sha256"], "binary stays unchanged throughout acceptance")
+        require(file_sha256(module) == report["crypto_module_sha256"]
+                and file_sha256(module.with_name("vibeface_secure_bg.wasm")) == report["wasm_sha256"],
+                "shared cryptography module and WASM stay unchanged throughout acceptance")
         report["fixture_invocations"] = len(invocations(run))
-        report["event_count"] = count
-        print(f"PASS acceptance report: {run / 'report.json'}", flush=True)
+        report["status"] = "passed_incremental"
+        print(f"PASS incremental process report: {run / 'report.json'}", flush=True)
     except Exception as error:
         report["status"] = "failed"
         report["failure"] = f"{type(error).__name__}: {error}"
         report["traceback"] = traceback.format_exc()
         raise
     finally:
-        if stream:
-            stream.close()
-        private_json(run / "report.json", report)
-        if recovery_client:
-            recovery_client.close()
-        if capture:
-            capture.close()
         for node in reversed(nodes):
             node.stop()
             node.client.close()
         private_json(run / "report.json", report)
 
 
-def shared_history(client, conversation, task, dispatched=None):
-    result = client.rpc("conversation", conversation_id=conversation)
-    if dispatched:
-        record = next((item for item in result["operations"] if item["request"]["operation_id"] == dispatched["operation_id"]), None)
-        if not record or not record["request"].get("binding"):
-            return None
-        actual = record["request"]
-        if any(actual[key] != dispatched[key] for key in ("target_node", "session_id", "task_id", "action")):
-            return None
-    return result if (any(m["message_id"] == "message-original" for m in result["messages"])
-                      and any(t["task_id"] == task for t in result["tasks"])
-                      and not any(result["missing"].values())) else None
-
-
 def unknown_record(client, node, operation_id):
     record = operation(client, node, operation_id)
     return record if record and record["state"] == "unknown" else None
-
-
-def revoked_remote(client, target):
-    client.rpc("session", target_node=target.node_id, session_id="fixture-main", status=400)
-    return True
 
 
 if __name__ == "__main__":
