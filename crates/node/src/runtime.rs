@@ -867,6 +867,7 @@ mod tests {
         let mut cfg = Config::load(&dir)?;
         cfg.listen = "[::1]:4790".parse()?;
         cfg.public_url = "http://[::1]:4790".into();
+        cfg.allowed_origins = vec!["http://localhost:4790".into()];
         cfg.save(&dir)?;
         let node = Runtime::open(&dir).await?;
         let first = node.register("first", "a-valid-test-password").await?;
@@ -904,6 +905,24 @@ mod tests {
                 .is_err()
         );
         drop(public);
+        let extra_dir = fixture()?;
+        let mut cfg = Config::load(&extra_dir)?;
+        cfg.allowed_origins = vec!["https://node.example".into()];
+        cfg.save(&extra_dir)?;
+        let extra = Runtime::open(&extra_dir).await?;
+        let account = extra.register("remote", "a-valid-remote-password").await?;
+        for role in [NodeRole::Scheduler, NodeRole::Executor] {
+            assert!(
+                extra
+                    .store
+                    .lock()
+                    .await
+                    .authorize_node(&account.network_id, &extra.identity.node_id()?, Some(role),)
+                    .is_err()
+            );
+        }
+        drop(extra);
+        std::fs::remove_dir_all(extra_dir)?;
         std::fs::remove_dir_all(dir)?;
         std::fs::remove_dir_all(public_dir)?;
         Ok(())
@@ -1730,15 +1749,20 @@ impl Runtime {
         let owner = LocalIdentity::generate();
         let network = owner.network_id()?;
         let mut auth = self.auth.lock().await;
-        let site = reqwest::Url::parse(&self.config.public_url)?;
         let local_setup = auth.accounts()?.is_empty()
             && self.config.listen.ip().is_loopback()
-            && site.host_str().is_some_and(|h| {
-                h == "localhost"
-                    || h.trim_matches(['[', ']'])
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback())
-            });
+            && std::iter::once(&self.config.public_url)
+                .chain(&self.config.allowed_origins)
+                .all(|origin| {
+                    reqwest::Url::parse(origin).is_ok_and(|site| {
+                        site.host_str().is_some_and(|h| {
+                            h == "localhost"
+                                || h.trim_matches(['[', ']'])
+                                    .parse::<std::net::IpAddr>()
+                                    .is_ok_and(|ip| ip.is_loopback())
+                        })
+                    })
+                });
         let roles = if local_setup {
             self.config.roles.clone()
         } else {

@@ -109,6 +109,9 @@ class Client:
                 if cookie and observed == 200 and path == "/api/login":
                     require("HttpOnly" in cookie and "SameSite=Strict" in cookie,
                             "login cookie has HttpOnly and SameSite")
+                    attributes = {value.strip().lower() for value in cookie.split(";")[1:]}
+                    require(("secure" in attributes) == request_headers["Origin"].startswith("https:"),
+                            "login cookie Secure follows the actual entry origin")
                     self.cookie = cookie.split(";", 1)[0]
                     self.csrf = value["csrf"]
                     self.account = value["account"]
@@ -312,6 +315,27 @@ def verify_no_model_budget(nodes):
             connection.close()
 
 
+def verify_browser_origins(node, password, origins):
+    # Exercise Host/Origin routing through loopback; this does not test LAN or TLS transport.
+    for index, origin in enumerate(origins):
+        headers = {"Host": urllib.parse.urlsplit(origin).netloc, "Origin": origin}
+        client = Client(node.url)
+        client.request("/api/info", headers=headers)
+        client.request("/api/rpc", {"method": "nodes"}, headers=headers, status=401)
+        client.request("/api/login", {"username": "owner_a", "password": password}, headers=headers)
+        require(client.account["network_id"] == node.client.account["network_id"],
+                "allowed entry login retains the same personal network")
+        client.request("/api/rpc", {"method": "create_conversation",
+                       "conversation_id": "entry-" + hashlib.sha256(origin.encode()).hexdigest()[:12],
+                       "title": f"Entry {index}"}, headers=headers)
+        client.request("/api/rpc", {"method": "nodes"},
+                       headers={**headers, "Origin": node.url}, status=403)
+        wrong_scheme = ("https:" if origin.startswith("http:") else "http:") + origin.split(":", 1)[1]
+        client.request("/api/rpc", {"method": "nodes"},
+                       headers={**headers, "Origin": wrong_scheme}, status=403)
+    node.client.request("/api/info", headers={"Host": "unconfigured.invalid"}, origin=False, status=403)
+
+
 def acceptance(options):
     binary = options.binary.resolve(strict=True)
     options.artifacts.mkdir(parents=True, exist_ok=True)
@@ -353,6 +377,14 @@ def acceptance(options):
         a.client.request("/api/tools", {"name": "nodes", "arguments": {}, "call_id": "human-call"}, status=401)
         a.client.request("/api/pair", {"code": "invalid", "node_id": "unknown", "public_key": "00", "proof": "00"}, status=400)
         passed("login, CSRF, Origin and scoped-tool boundaries")
+
+        verify_browser_origins(a, password_a, [f"http://localhost:{a.port}", f"http://0.0.0.0:{a.port}"])
+        a.stop()
+        extra_origins = [f"http://192.0.2.10:{a.port}", "https://node.example"]
+        a.configure(allowed_origins=extra_origins, allow_insecure_lan=True)
+        a.start()
+        verify_browser_origins(a, password_a, extra_origins)
+        passed("local aliases and explicit entries permit authenticated writes; cross-entry requests are rejected", "real_http_origin_boundaries")
 
         b.pair(a, network, "owner_b", password_b)
         c.pair(a, network, "owner_c", password_c)
