@@ -5,7 +5,7 @@ pub type NetworkId = String;
 pub type NodeId = String;
 pub type EventHash = String;
 pub type ScopeId = String;
-pub const WIRE_VERSION: u32 = 1;
+pub const WIRE_VERSION: u32 = 2;
 pub const MAX_EVENT_BYTES: usize = 1_048_576;
 pub const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
@@ -80,6 +80,7 @@ pub enum EventBody {
 #[serde(deny_unknown_fields)]
 pub struct Event {
     pub version: u32,
+    #[serde(rename = "space_id")]
     pub network_id: NetworkId,
     pub scope_id: ScopeId,
     pub author: NodeId,
@@ -116,6 +117,7 @@ impl MissingDependencies {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub version: u32,
+    #[serde(rename = "space_id")]
     pub network_id: NetworkId,
     pub scope_id: ScopeId,
     pub heads: Vec<EventHash>,
@@ -124,6 +126,7 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Context {
+    #[serde(rename = "space_id")]
     pub network_id: NetworkId,
     pub scope_id: ScopeId,
     pub heads: Vec<EventHash>,
@@ -161,6 +164,7 @@ pub struct Task {
 #[serde(deny_unknown_fields)]
 pub struct OperationRequest {
     pub operation_id: String,
+    #[serde(rename = "space_id")]
     pub network_id: NetworkId,
     pub conversation_id: ScopeId,
     pub task_id: Option<String>,
@@ -197,6 +201,7 @@ pub struct OperationRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionSession {
+    #[serde(rename = "space_id")]
     pub network_id: NetworkId,
     pub target_node: NodeId,
     pub session_id: String,
@@ -234,4 +239,96 @@ pub struct IngestOutcome {
     pub hash: EventHash,
     pub status: String,
     pub missing: MissingDependencies,
+}
+
+pub fn authorization_action(
+    body: &Value,
+) -> anyhow::Result<vibeface_secure::authorization::Action> {
+    use vibeface_secure::authorization::Action;
+
+    Ok(match body["method"].as_str() {
+        Some("conversations" | "conversation" | "context") => Action::ConversationRead,
+        Some("nodes" | "session" | "operation") => Action::OperationStatusRead,
+        Some("create_conversation") => Action::ConversationCreate,
+        Some("message") => Action::MessageAppend,
+        Some("create_task") => Action::TaskCreate,
+        Some("update_task") => match body["status"].as_str() {
+            Some("accepted") => Action::TaskAccept,
+            Some("cancelled") => Action::TaskCancel,
+            Some("open" | "working" | "blocked" | "needs_review") => Action::TaskProgress,
+            _ => anyhow::bail!("invalid task status"),
+        },
+        Some("rebind_execution") => Action::ExecutionRebind,
+        Some("notifications") => Action::NotificationRead,
+        Some("ack") => Action::NotificationAck,
+        Some("export") => Action::Export,
+        Some("reconcile") => Action::OperationReconcile,
+        Some("resolve_unknown") => Action::OperationResolve,
+        Some("operate") => match body["request"]["action"]["type"].as_str() {
+            Some("open") => Action::ExecutionOpen,
+            Some("read") => Action::OperationStatusRead,
+            Some("send") => Action::ExecutionSend,
+            Some("steer") => Action::ExecutionSteer,
+            Some("interrupt") => Action::ExecutionInterrupt,
+            Some("respond_request") => Action::ExecutionRespondApproval,
+            _ => anyhow::bail!("unknown operation action"),
+        },
+        _ => anyhow::bail!("unknown method"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use vibeface_secure::authorization::Action;
+
+    #[test]
+    fn authorization_actions_distinguish_privileged_task_outcomes() -> anyhow::Result<()> {
+        for (status, expected) in [
+            ("accepted", Action::TaskAccept),
+            ("cancelled", Action::TaskCancel),
+            ("open", Action::TaskProgress),
+            ("working", Action::TaskProgress),
+            ("blocked", Action::TaskProgress),
+            ("needs_review", Action::TaskProgress),
+        ] {
+            assert_eq!(
+                authorization_action(&json!({"method":"update_task", "status":status}))?,
+                expected
+            );
+        }
+        assert!(authorization_action(&json!({"method":"update_task", "status":"done"})).is_err());
+        assert!(authorization_action(&json!({"method":"update_task"})).is_err());
+        assert!(authorization_action(&json!({"method":"unknown"})).is_err());
+        assert!(authorization_action(&Value::Null).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn authorization_actions_match_nested_execution_requests() -> anyhow::Result<()> {
+        for (kind, expected) in [
+            ("open", Action::ExecutionOpen),
+            ("read", Action::OperationStatusRead),
+            ("send", Action::ExecutionSend),
+            ("steer", Action::ExecutionSteer),
+            ("interrupt", Action::ExecutionInterrupt),
+            ("respond_request", Action::ExecutionRespondApproval),
+        ] {
+            assert_eq!(
+                authorization_action(
+                    &json!({"method":"operate", "request":{"action":{"type":kind}}})
+                )?,
+                expected
+            );
+        }
+        assert!(
+            authorization_action(
+                &json!({"method":"operate", "request":{"action":{"type":"unknown"}}})
+            )
+            .is_err()
+        );
+        assert!(authorization_action(&json!({"method":"operate"})).is_err());
+        Ok(())
+    }
 }

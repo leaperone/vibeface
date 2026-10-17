@@ -4,8 +4,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use vibeface_secure::authorization::SpaceId;
 
-const EVENT_DOMAIN: &[u8] = b"vibeface:event:v1:";
+const EVENT_DOMAIN: &[u8] = b"vibeface:event:v2:";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -206,7 +207,7 @@ pub fn verify_signed_event(
     );
     ensure!(
         body.network_id == network_id,
-        "event belongs to another network"
+        "event belongs to another space"
     );
     ensure!(
         body.author == fingerprint(public_key)?,
@@ -245,7 +246,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         !event.scope_id.is_empty() && event.scope_id.len() <= 512,
         "invalid scope"
     );
-    decode32(&event.network_id)?;
+    SpaceId::parse(&event.network_id)?;
     decode32(&event.author)?;
     ensure!(
         event.sequence > 0 && event.sequence <= i64::MAX as u64,
@@ -341,9 +342,10 @@ mod tests {
             .is_err()
         );
         assert!(owner.sign_payload("bad:domain", b"challenge").is_err());
+        let space_id = format!("spc2_{}", owner.fixture_network_id()?);
         let body = Event {
-            version: 1,
-            network_id: owner.fixture_network_id()?,
+            version: WIRE_VERSION,
+            network_id: space_id.clone(),
             scope_id: "c".into(),
             author: owner.node_id()?,
             sequence: 1,
@@ -355,14 +357,41 @@ mod tests {
             },
             blobs: vec![],
         };
+        let mut old_body = body.clone();
+        old_body.version = 1;
+        assert!(owner.sign_event(old_body).is_err());
+        let mut old_space = body.clone();
+        old_space.network_id = owner.fixture_network_id()?;
+        assert!(owner.sign_event(old_space).is_err());
+        let mut encoded = serde_json::to_value(&body)?;
+        assert_eq!(encoded["space_id"], space_id);
+        assert!(encoded.get("network_id").is_none());
+        let space = encoded.as_object_mut().unwrap().remove("space_id").unwrap();
+        encoded["network_id"] = space;
+        assert!(serde_json::from_value::<Event>(encoded).is_err());
         let event = owner.sign_event(body)?;
-        verify_signed_event(&view.network_id, &event, &owner.public_key_hex()?)?;
+        verify_signed_event(&space_id, &event, &owner.public_key_hex()?)?;
+        let mut legacy = event.clone();
+        legacy.signature = hex::encode(
+            owner
+                .key()?
+                .sign(&domain_message(b"vibeface:event:v1:", &event.hash))
+                .to_bytes(),
+        );
+        assert!(verify_signed_event(&space_id, &legacy, &owner.public_key_hex()?).is_err());
         let mut bad = event.clone();
         bad.canonical_body.push(' ');
-        assert!(verify_signed_event(&view.network_id, &bad, &owner.public_key_hex()?).is_err());
-        assert!(verify_signed_event(&"0".repeat(64), &event, &owner.public_key_hex()?).is_err());
+        assert!(verify_signed_event(&space_id, &bad, &owner.public_key_hex()?).is_err());
+        assert!(
+            verify_signed_event(
+                &format!("spc2_{}", "0".repeat(64)),
+                &event,
+                &owner.public_key_hex()?
+            )
+            .is_err()
+        );
         let other = LocalIdentity::generate();
-        assert!(verify_signed_event(&view.network_id, &event, &other.public_key_hex()?).is_err());
+        assert!(verify_signed_event(&space_id, &event, &other.public_key_hex()?).is_err());
         Ok(())
     }
 }

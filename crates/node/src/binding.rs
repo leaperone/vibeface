@@ -2,18 +2,20 @@ use crate::crypto::{LocalIdentity, digest, fingerprint, verify_payload};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use vibeface_secure::authorization::SpaceId;
 
-const BINDING_DOMAIN: &str = "task-binding-v1";
-const SEAL_DOMAIN: &str = "binding-seal-v1";
+const BINDING_DOMAIN: &str = "task-binding-v2";
+const SEAL_DOMAIN: &str = "binding-seal-v2";
 const MAX_ID_TEXT: usize = 512;
 const MAX_EXECUTOR: usize = 128;
 const MAX_CWD: usize = 4_096;
 const SIGNATURE_HEX_LEN: usize = 128;
 
-/// The authority-signed choice of executor for one task generation.
+/// The executor and generation pinned by a task's authority node.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskBinding {
+    #[serde(rename = "space_id")]
     pub network_id: String,
     pub conversation_id: String,
     pub task_ref: String,
@@ -39,6 +41,7 @@ pub struct SignedBinding {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BindingSeal {
+    #[serde(rename = "space_id")]
     pub network_id: String,
     pub binding_hash: String,
     pub target_node: String,
@@ -55,7 +58,7 @@ pub struct SignedSeal {
 
 /// Validate the shape that is safe to sign or accept before store-level checks.
 pub fn validate_binding(binding: &TaskBinding) -> Result<()> {
-    validate_node_id(&binding.network_id, "network_id")?;
+    SpaceId::parse(&binding.network_id)?;
     validate_text(&binding.conversation_id, "conversation_id")?;
     validate_hash(&binding.task_ref, "task_ref")?;
     validate_text(&binding.task_id, "task_id")?;
@@ -75,7 +78,7 @@ pub fn validate_binding(binding: &TaskBinding) -> Result<()> {
             validate_seal(&previous_seal.seal)?;
             ensure!(
                 previous_seal.seal.network_id == binding.network_id,
-                "previous seal belongs to another network"
+                "previous seal belongs to another space"
             );
             ensure!(
                 previous_seal.seal.binding_hash == *previous_hash,
@@ -107,6 +110,7 @@ pub fn sign_binding(identity: &LocalIdentity, binding: &TaskBinding) -> Result<S
     })
 }
 
+/// Verifies the node signature; caller authorization is checked separately.
 pub fn verify_binding(proof: &SignedBinding, authority_public_key: &str) -> Result<()> {
     validate_binding(&proof.binding)?;
     validate_signature(&proof.signature)?;
@@ -151,7 +155,7 @@ pub fn verify_seal(proof: &SignedSeal, target_public_key: &str) -> Result<()> {
 }
 
 pub fn validate_seal(seal: &BindingSeal) -> Result<()> {
-    validate_node_id(&seal.network_id, "network_id")?;
+    SpaceId::parse(&seal.network_id)?;
     validate_hash(&seal.binding_hash, "binding_hash")?;
     validate_node_id(&seal.target_node, "target_node")?;
     Ok(())
@@ -230,7 +234,7 @@ mod tests {
     fn binding(authority: &LocalIdentity) -> TaskBinding {
         let node = "b".repeat(64);
         TaskBinding {
-            network_id: "a".repeat(64),
+            network_id: format!("spc2_{}", "a".repeat(64)),
             conversation_id: "conversation".into(),
             task_ref: "c".repeat(64),
             task_id: "task-1".into(),
@@ -249,6 +253,21 @@ mod tests {
         let authority = LocalIdentity::generate();
         let mut proof = sign_binding(&authority, &binding(&authority))?;
         verify_binding(&proof, &authority.public_key_hex()?)?;
+        let mut encoded = serde_json::to_value(&proof.binding)?;
+        assert_eq!(encoded["space_id"], proof.binding.network_id);
+        assert!(encoded.get("network_id").is_none());
+        let space = encoded.as_object_mut().unwrap().remove("space_id").unwrap();
+        encoded["network_id"] = space;
+        assert!(serde_json::from_value::<TaskBinding>(encoded).is_err());
+        let legacy = SignedBinding {
+            binding: proof.binding.clone(),
+            signature: authority
+                .sign_payload("task-binding-v1", &serde_json::to_vec(&proof.binding)?)?,
+        };
+        assert!(verify_binding(&legacy, &authority.public_key_hex()?).is_err());
+        let mut old_space = proof.binding.clone();
+        old_space.network_id = "a".repeat(64);
+        assert!(sign_binding(&authority, &old_space).is_err());
 
         proof.binding.target_node = "d".repeat(64);
         assert!(verify_binding(&proof, &authority.public_key_hex()?).is_err());
@@ -263,13 +282,24 @@ mod tests {
     fn seal_tampering_is_rejected() -> Result<()> {
         let target = LocalIdentity::generate();
         let seal = BindingSeal {
-            network_id: "a".repeat(64),
+            network_id: format!("spc2_{}", "a".repeat(64)),
             binding_hash: "c".repeat(64),
             target_node: target.node_id()?,
             final_revision: 1,
         };
         let mut proof = sign_seal(&target, &seal)?;
         verify_seal(&proof, &target.public_key_hex()?)?;
+        let mut encoded = serde_json::to_value(&seal)?;
+        assert_eq!(encoded["space_id"], seal.network_id);
+        assert!(encoded.get("network_id").is_none());
+        let space = encoded.as_object_mut().unwrap().remove("space_id").unwrap();
+        encoded["network_id"] = space;
+        assert!(serde_json::from_value::<BindingSeal>(encoded).is_err());
+        let legacy = SignedSeal {
+            seal: seal.clone(),
+            signature: target.sign_payload("binding-seal-v1", &serde_json::to_vec(&seal)?)?,
+        };
+        assert!(verify_seal(&legacy, &target.public_key_hex()?).is_err());
         proof.seal.final_revision = 2;
         assert!(verify_seal(&proof, &target.public_key_hex()?).is_err());
         Ok(())
