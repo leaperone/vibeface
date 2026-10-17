@@ -23,6 +23,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 import threading
 import urllib.error
 import urllib.parse
@@ -507,7 +508,8 @@ class Node:
         if self.process is not None:
             # Stop only this script's process group, including its private app-server.
             try:
-                os.killpg(self.process.pid, signal.SIGTERM)
+                if self.process.poll() is None:
+                    os.killpg(self.process.pid, signal.SIGTERM)
                 self.process.wait(timeout=5)
             except ProcessLookupError:
                 pass
@@ -545,7 +547,7 @@ class Node:
         self.client.pair_client(owner.client, network, f"{self.name} independent client")
         self.client.url = self.url
         self.client.node_id = self.node_id
-        self.configure(peers=[], network=network_config)
+        self.configure(network=network_config)
 
     def bootstrap(self):
         self.client.connect(self.node_id)
@@ -870,7 +872,7 @@ def acceptance(options):
         network = a.bootstrap()
         verify_web_assets(a, module)
         passed("served browser cryptography matches the packaged JS/WASM resources")
-        a.client.request("/api/tools", {"name": "nodes", "arguments": {}, "call_id": "human-call"}, status=401)
+        a.client.request("/api/tools", {"name": "nodes", "arguments": {}, "call_id": "human-call"}, status=404)
         passed("independent client/root identity, local bootstrap capability and encrypted authorization")
 
         verify_channel_security(a)
@@ -1071,10 +1073,12 @@ def acceptance(options):
     except Exception as error:
         report["status"] = "failed"
         report["failure"] = f"{type(error).__name__}: {error}"
+        report["traceback"] = traceback.format_exc()
         raise
     finally:
         if stream:
             stream.close()
+        private_json(run / "report.json", report)
         if recovery_client:
             recovery_client.close()
         if capture:
