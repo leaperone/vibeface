@@ -818,6 +818,10 @@ pub enum TransportEvidence {
     DirectNoise {
         device: DeviceId,
     },
+    GatewayNoise {
+        device: DeviceId,
+        gateway: DeviceId,
+    },
     VerifiedPeer {
         origin: DeviceId,
     },
@@ -2265,26 +2269,23 @@ impl VerifiedPolicySet {
             !i.action.requires_account() || matches!(i.actor, Actor::Account(_)),
             "action requires account actor",
         )?;
+        let mut transport_dependencies = BTreeMap::new();
+        let prior_budget_dependencies = budget.dependencies.clone();
         match transport {
             TransportEvidence::DirectNoise { device } => require(
                 device == &i.device && i.presenter == *device,
                 "direct transport device mismatch",
             )?,
+            TransportEvidence::GatewayNoise { device, gateway } => {
+                require(
+                    device == &i.device && gateway == &i.presenter,
+                    "gateway transport device mismatch",
+                )?;
+                self.validate_presenter(gateway, now_ms, &mut budget, &mut transport_dependencies)?;
+            }
             TransportEvidence::VerifiedPeer { origin } => {
                 require(origin == &i.presenter, "peer presenter mismatch")?;
-                let presenter = self.find_device(origin)?;
-                require(
-                    matches!(presenter.payload.subject, Actor::Service(_))
-                        && presenter.payload.uses.contains(&DeviceUse::Noise),
-                    "peer presenter is not a service",
-                )?;
-                self.validate_certificate(
-                    presenter,
-                    now_ms,
-                    &mut budget,
-                    &mut dependencies,
-                    &mut BTreeSet::new(),
-                )?;
+                self.validate_presenter(origin, now_ms, &mut budget, &mut transport_dependencies)?;
             }
             TransportEvidence::LocalAgentAdapter { service, session } => require(
                 i.actor == Actor::Service(service.clone())
@@ -2293,6 +2294,8 @@ impl VerifiedPolicySet {
                 "agent session mismatch",
             )?,
         }
+        transport_dependencies.extend(budget.dependencies.clone());
+        budget.dependencies = prior_budget_dependencies;
         let resource = self
             .resource(&i.resource.space, &i.resource.resource)
             .ok_or(AuthorizationError::InvalidProof(
@@ -2373,10 +2376,18 @@ impl VerifiedPolicySet {
         };
         require(i.initiator == expected_initiator, "forged initiator")?;
         self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
-        let dependencies: Vec<_> = dependencies.into_values().collect();
-        if phase == AuthorizationPhase::Admission && i.expected_policies != dependencies {
-            return Err(AuthorizationError::NeedPolicySync(dependencies));
+        let signed_dependencies: Vec<_> = dependencies.values().cloned().collect();
+        if phase == AuthorizationPhase::Admission && i.expected_policies != signed_dependencies {
+            return Err(AuthorizationError::NeedPolicySync(signed_dependencies));
         }
+        if transport_dependencies
+            .iter()
+            .any(|(domain, stamp)| dependencies.get(domain) != Some(stamp))
+        {
+            dependencies.extend(transport_dependencies);
+            self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
+        }
+        let dependencies = dependencies.into_values().collect();
         Ok(VerifiedAuthorization {
             invocation: signed.clone(),
             invocation_hash,
@@ -2386,6 +2397,27 @@ impl VerifiedPolicySet {
             phase,
             verified_at_ms: now_ms,
         })
+    }
+    fn validate_presenter(
+        &self,
+        device: &DeviceId,
+        now_ms: u64,
+        budget: &mut Budget,
+        dependencies: &mut BTreeMap<PolicyDomain, PolicyStamp>,
+    ) -> Result<()> {
+        let presenter = self.find_device(device)?;
+        require(
+            matches!(presenter.payload.subject, Actor::Service(_))
+                && presenter.payload.uses.contains(&DeviceUse::Noise),
+            "peer presenter is not a service",
+        )?;
+        self.validate_certificate(
+            presenter,
+            now_ms,
+            budget,
+            dependencies,
+            &mut BTreeSet::new(),
+        )
     }
     /// Call inside the same transaction that consumes the nonce and reserves work.
     pub fn check_current(&self, auth: &VerifiedAuthorization, now_ms: u64) -> Result<()> {
@@ -2971,6 +3003,161 @@ mod tests {
             AuthorizationError::Expired
         );
     }
+    #[test]
+    fn forwarded_invocation_binds_pinned_gateway_and_keeps_original_actor_and_request() {
+        use super::bootstrap::*;
+        let mut f = Fixture::new();
+        let (original, mut pins) = client_bundle(&f);
+        let auth = verify_client_authorization(
+            &serde_json::to_string(&original).unwrap(),
+            &serde_json::to_string(&pins).unwrap(),
+            f.account.as_str(),
+            f.space.as_str(),
+            PublicKey::of(&f.user).as_str(),
+            NOW as f64,
+        )
+        .unwrap();
+        let gateway_root = key(21);
+        let gateway_recovery = key(22);
+        let gateway_client = key(23);
+        let gateway = key(24);
+        let nonce = Nonce::from_bytes([24; 32]);
+        let claim_json =
+            create_node_claim(&gateway, nonce.as_str(), NOW as f64, 100_000.0).unwrap();
+        let claim = verify_node_claim(
+            &claim_json,
+            PublicKey::of(&gateway).as_str(),
+            nonce.as_str(),
+            NOW as f64,
+        )
+        .unwrap();
+        let prepared = prepare_account_creation(
+            &gateway_root,
+            &gateway_recovery,
+            &gateway_client,
+            &claim,
+            1_000_000.0,
+            NOW as f64,
+        )
+        .unwrap();
+        let pop = sign_node_possession(
+            &prepared.node_request_json().unwrap(),
+            &gateway,
+            nonce.as_str(),
+            NOW as f64,
+        )
+        .unwrap();
+        let created = finish_account_creation(&prepared, &gateway_root, &pop, NOW as f64).unwrap();
+        let gateway_bundle: ClientAuthorizationBundle =
+            serde_json::from_str(&created.bundle_json().unwrap()).unwrap();
+        let gateway_pins: Vec<PolicyPin> =
+            serde_json::from_str(&created.pins_json().unwrap()).unwrap();
+        pins.extend(gateway_pins);
+        pins.sort_by(|a, b| a.domain.cmp(&b.domain));
+        let mut journal = original.journal;
+        journal.extend(gateway_bundle.journal);
+        f.state = replay_policies(&pins, &journal).unwrap();
+        let mut invocation = f.invocation();
+        invocation.presenter = DeviceId::from_key(&PublicKey::of(&gateway));
+        let template = serde_json::to_string(&invocation).unwrap();
+        let body = r#"{"text":"hello"}"#;
+        assert!(
+            sign_client_invocation(
+                &auth,
+                &template,
+                body,
+                "message_append",
+                "op_1",
+                &f.user,
+                NOW as f64
+            )
+            .is_err()
+        );
+        assert!(
+            sign_forwarded_client_invocation(
+                &auth,
+                &template,
+                body,
+                "message_append",
+                "op_1",
+                PublicKey::of(&key(25)).as_str(),
+                &f.user,
+                NOW as f64
+            )
+            .is_err()
+        );
+        let signed: Signed<Invocation> = serde_json::from_str(
+            &sign_forwarded_client_invocation(
+                &auth,
+                &template,
+                body,
+                "message_append",
+                "op_1",
+                PublicKey::of(&gateway).as_str(),
+                &f.user,
+                NOW as f64,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let facts = f.facts(&invocation);
+        let transport = TransportEvidence::GatewayNoise {
+            device: invocation.device.clone(),
+            gateway: invocation.presenter.clone(),
+        };
+        let direct = f
+            .state
+            .verify_invocation(&signed, &facts, &transport, NOW)
+            .unwrap();
+        let peer = TransportEvidence::VerifiedPeer {
+            origin: invocation.presenter.clone(),
+        };
+        let forwarded = f
+            .state
+            .verify_invocation(&signed, &facts, &peer, NOW)
+            .unwrap();
+        assert_eq!(direct.signed_invocation(), forwarded.signed_invocation());
+        assert_eq!(forwarded.actor(), &Actor::Account(f.account.clone()));
+        assert_eq!(forwarded.body_hash(), &invocation.body_hash);
+        assert!(forwarded.dependencies().len() > invocation.expected_policies.len());
+        let wrong = TransportEvidence::GatewayNoise {
+            device: invocation.device.clone(),
+            gateway: f.audience.device.clone(),
+        };
+        assert!(
+            f.state
+                .verify_invocation(&signed, &facts, &wrong, NOW)
+                .is_err()
+        );
+        let old_direct = Signed::sign(f.invocation(), &f.user).unwrap();
+        assert!(
+            f.state
+                .verify_invocation(&old_direct, &facts, &peer, NOW)
+                .is_err()
+        );
+        let gateway_account = AccountId::from_root(&PublicKey::of(&gateway_root));
+        let mut document = f.state.account(&gateway_account).unwrap().clone();
+        document.previous = f
+            .state
+            .head(&PolicyDomain::Account(gateway_account))
+            .cloned();
+        document.authority_epoch += 1;
+        document.sequence = 0;
+        document.authority = AuthorityBinding::from_key(PublicKey::of(&key(26)));
+        document
+            .devices
+            .retain(|h| f.state.device(h).unwrap().payload.device != invocation.presenter);
+        document.revoked_devices.push(invocation.presenter);
+        f.state
+            .install_account(Signed::sign(document, &gateway_root).unwrap())
+            .unwrap();
+        assert!(
+            f.state
+                .verify_invocation(&signed, &facts, &peer, NOW)
+                .is_err()
+        );
+    }
+
     #[test]
     fn all_ancestors_must_remain_registered() {
         let mut f = Fixture::new();
@@ -5311,69 +5498,7 @@ pub fn sign_client_invocation(
     identity: &Identity,
     now_ms: f64,
 ) -> crate::Result<String> {
-    fn sign(
-        auth: &VerifiedClientAuthorization,
-        json: &str,
-        body: &str,
-        action: &str,
-        operation: &str,
-        key: &Identity,
-        now: f64,
-    ) -> Result<String> {
-        require(
-            json.len() <= MAX_PROOF_BYTES
-                && body.len() <= MAX_PROOF_BYTES
-                && now.is_finite()
-                && now >= 0.0
-                && now.fract() == 0.0
-                && now <= 9_007_199_254_740_991.0,
-            "invalid client signing input",
-        )?;
-        let invocation: Invocation = serde_json::from_str(json)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid invocation JSON"))?;
-        let action: Action =
-            serde_json::from_value(serde_json::Value::String(action.to_owned()))
-                .map_err(|_| AuthorizationError::InvalidProof("unknown expected action"))?;
-        let request: serde_json::Value = serde_json::from_str(body)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid request JSON"))?;
-        let actor = Actor::Account(auth.scope.account_id.clone());
-        require(
-            invocation.version == AUTH_VERSION
-                && invocation.actor == actor
-                && invocation.initiator == actor
-                && invocation.initiating_grant.is_none()
-                && invocation.device == auth.scope.device_id
-                && invocation.device == DeviceId::from_key(&PublicKey::of(key))
-                && invocation.presenter == invocation.device
-                && invocation.grant_leaf == auth.grant_leaf
-                && invocation.expected_policies == auth.heads
-                && invocation.audience == auth.audience
-                && invocation.resource.space == auth.scope.space_id
-                && scope_covers(&auth.grant_scope, &invocation.resource)
-                && invocation.action == action
-                && auth.actions.contains(&action)
-                && invocation.operation_id == operation
-                && valid_operation_id(operation)
-                && invocation.body_hash == ObjectHash::body(&request)?
-                && context_tighter(&auth.constraints.context, &invocation.context),
-            "invocation template does not match client request",
-        )?;
-        if auth.constraints.require_webauthn_uv {
-            return Err(AuthorizationError::UserPresenceRequired);
-        }
-        validate_window(
-            invocation.not_before_ms,
-            invocation.expires_at_ms,
-            now as u64,
-        )?;
-        require(
-            invocation.expires_at_ms - invocation.not_before_ms <= INVOCATION_MAX_AGE_MS,
-            "invocation lifetime too long",
-        )?;
-        serde_json::to_string(&Signed::sign(invocation, key)?)
-            .map_err(|_| AuthorizationError::InvalidProof("client invocation encoding failed"))
-    }
-    sign(
+    sign_client_invocation_inner(
         auth,
         template_json,
         request_json,
@@ -5381,8 +5506,103 @@ pub fn sign_client_invocation(
         operation_id,
         identity,
         now_ms,
+        &DeviceId::from_key(&PublicKey::of(identity)),
     )
     .map_err(|e| e.to_string())
+}
+
+/// The Gateway key comes from the saved, independently pinned Noise connection.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = signForwardedClientInvocation))]
+pub fn sign_forwarded_client_invocation(
+    auth: &VerifiedClientAuthorization,
+    template_json: &str,
+    request_json: &str,
+    expected_action: &str,
+    operation_id: &str,
+    expected_gateway_public_key: &str,
+    identity: &Identity,
+    now_ms: f64,
+) -> crate::Result<String> {
+    let gateway = PublicKey::parse(expected_gateway_public_key).map_err(|e| e.to_string())?;
+    require(
+        gateway != PublicKey::of(identity),
+        "gateway cannot be client key",
+    )
+    .map_err(|e| e.to_string())?;
+    sign_client_invocation_inner(
+        auth,
+        template_json,
+        request_json,
+        expected_action,
+        operation_id,
+        identity,
+        now_ms,
+        &DeviceId::from_key(&gateway),
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn sign_client_invocation_inner(
+    auth: &VerifiedClientAuthorization,
+    json: &str,
+    body: &str,
+    action: &str,
+    operation: &str,
+    key: &Identity,
+    now: f64,
+    presenter: &DeviceId,
+) -> Result<String> {
+    require(
+        json.len() <= MAX_PROOF_BYTES
+            && body.len() <= MAX_PROOF_BYTES
+            && now.is_finite()
+            && now >= 0.0
+            && now.fract() == 0.0
+            && now <= 9_007_199_254_740_991.0,
+        "invalid client signing input",
+    )?;
+    let invocation: Invocation = serde_json::from_str(json)
+        .map_err(|_| AuthorizationError::InvalidProof("invalid invocation JSON"))?;
+    let action: Action = serde_json::from_value(serde_json::Value::String(action.to_owned()))
+        .map_err(|_| AuthorizationError::InvalidProof("unknown expected action"))?;
+    let request: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| AuthorizationError::InvalidProof("invalid request JSON"))?;
+    let actor = Actor::Account(auth.scope.account_id.clone());
+    require(
+        invocation.version == AUTH_VERSION
+            && invocation.actor == actor
+            && invocation.initiator == actor
+            && invocation.initiating_grant.is_none()
+            && invocation.device == auth.scope.device_id
+            && invocation.device == DeviceId::from_key(&PublicKey::of(key))
+            && invocation.presenter == *presenter
+            && invocation.grant_leaf == auth.grant_leaf
+            && invocation.expected_policies == auth.heads
+            && invocation.audience == auth.audience
+            && invocation.resource.space == auth.scope.space_id
+            && scope_covers(&auth.grant_scope, &invocation.resource)
+            && invocation.action == action
+            && auth.actions.contains(&action)
+            && invocation.operation_id == operation
+            && valid_operation_id(operation)
+            && invocation.body_hash == ObjectHash::body(&request)?
+            && context_tighter(&auth.constraints.context, &invocation.context),
+        "invocation template does not match client request",
+    )?;
+    if auth.constraints.require_webauthn_uv {
+        return Err(AuthorizationError::UserPresenceRequired);
+    }
+    validate_window(
+        invocation.not_before_ms,
+        invocation.expires_at_ms,
+        now as u64,
+    )?;
+    require(
+        invocation.expires_at_ms - invocation.not_before_ms <= INVOCATION_MAX_AGE_MS,
+        "invocation lifetime too long",
+    )?;
+    serde_json::to_string(&Signed::sign(invocation, key)?)
+        .map_err(|_| AuthorizationError::InvalidProof("client invocation encoding failed"))
 }
 
 impl VerifiedClientAuthorization {
