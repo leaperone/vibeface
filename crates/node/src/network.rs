@@ -765,6 +765,17 @@ impl NetworkHub {
             "relay rejected reservation"
         );
         self.state.lock().await.active_relays.insert(url.to_owned());
+        let record = self.local_record().await?;
+        send_control(&mut socket, &Control::Publish { record }).await?;
+        ensure!(
+            matches!(receive_control(&mut socket).await?, Control::Published),
+            "relay accepted reservation but not reachability publication"
+        );
+        for entry in &self.config.bootstrap_urls {
+            if entry != url {
+                let _ = self.publish_at(entry).await;
+            }
+        }
         let result = async {
             let mut publish = tokio::time::interval(Duration::from_secs(60));
             publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1270,6 +1281,11 @@ mod tests {
             }
         })
         .await?;
+        let published = relay
+            .lookup_local(&target_id)
+            .await?
+            .context("target reachability record missing")?;
+        assert!(published.relay_urls.iter().any(|url| url == &relay_url));
         let (caller, _) = NetworkHub::new(
             caller_identity.clone(),
             NetworkConfig {
