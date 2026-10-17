@@ -1761,6 +1761,13 @@ mod tests {
         }
 
         fn registration(&mut self) -> PasskeyRegistrationCompletion {
+            self.registration_with_credential(42)
+        }
+
+        fn registration_with_credential(
+            &mut self,
+            credential_byte: u8,
+        ) -> PasskeyRegistrationCompletion {
             let intent = Signed::sign(
                 AuthenticatorEnrollmentIntent {
                     account: self.account.clone(),
@@ -1785,7 +1792,7 @@ mod tests {
             else {
                 panic!("pending expected")
             };
-            let credential = URL_SAFE_NO_PAD.encode([42; 32]);
+            let credential = URL_SAFE_NO_PAD.encode([credential_byte; 32]);
             let point = self.signing.verifying_key().to_encoded_point(false);
             let mut cose = vec![0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
             cose.extend_from_slice(point.x().unwrap());
@@ -1796,7 +1803,7 @@ mod tests {
             data.extend_from_slice(&1u32.to_be_bytes());
             data.extend_from_slice(&[0; 16]);
             data.extend_from_slice(&32u16.to_be_bytes());
-            data.extend_from_slice(&[42; 32]);
+            data.extend_from_slice(&[credential_byte; 32]);
             data.extend_from_slice(&cose);
             let mut attestation = vec![
                 0xa3,
@@ -1871,6 +1878,7 @@ mod tests {
             .unwrap();
             let mut document = self.next_document();
             document.authenticators.push(record.hash().unwrap());
+            document.authenticators.sort();
             let commit = self.account_commit(document, &self.root, 2);
             PasskeyRegistrationCompletion {
                 intent,
@@ -1878,6 +1886,30 @@ mod tests {
                 response,
                 journal: vec![JournalEntry::Authenticator(record), commit],
             }
+        }
+
+        fn assertion_response(&self, pending: &PendingPasskey, counter: u32) -> AssertionResponse {
+            let options = pending.authentication_options().unwrap();
+            let client = serde_json::to_vec(&serde_json::json!({
+                "type":"webauthn.get", "challenge":options["publicKey"]["challenge"],
+                "origin":"http://localhost:4310", "crossOrigin":false,
+            }))
+            .unwrap();
+            let mut auth = Sha256::digest(b"localhost").to_vec();
+            auth.push(0x05);
+            auth.extend_from_slice(&counter.to_be_bytes());
+            let mut message = auth.clone();
+            message.extend_from_slice(&Sha256::digest(&client));
+            let signature: Signature = self.signing.sign(&message);
+            let credential = URL_SAFE_NO_PAD.encode([42; 32]);
+            let response = serde_json::json!({
+                "id":credential,"rawId":credential,"type":"public-key",
+                "response":{"clientDataJSON":URL_SAFE_NO_PAD.encode(client),
+                    "authenticatorData":URL_SAFE_NO_PAD.encode(auth),
+                    "signature":URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
+                    "userHandle":pending.user_handle()},"clientExtensionResults":{},
+            });
+            serde_json::from_value(response).unwrap()
         }
 
         fn enroll_device(&mut self, device: &Identity, counter: u32) -> PasskeyDeviceCompletion {
@@ -1910,31 +1942,13 @@ mod tests {
                 options["publicKey"]["allowCredentials"],
                 serde_json::json!([])
             );
-            let client = serde_json::to_vec(&serde_json::json!({
-                "type":"webauthn.get", "challenge":options["publicKey"]["challenge"],
-                "origin":"http://localhost:4310", "crossOrigin":false,
-            }))
-            .unwrap();
-            let mut auth = Sha256::digest(b"localhost").to_vec();
-            auth.push(0x05);
-            auth.extend_from_slice(&counter.to_be_bytes());
-            let mut message = auth.clone();
-            message.extend_from_slice(&Sha256::digest(&client));
-            let signature: Signature = self.signing.sign(&message);
-            let credential = URL_SAFE_NO_PAD.encode([42; 32]);
-            let response = serde_json::json!({
-                "id":credential,"rawId":credential,"type":"public-key",
-                "response":{"clientDataJSON":URL_SAFE_NO_PAD.encode(client),
-                    "authenticatorData":URL_SAFE_NO_PAD.encode(auth),
-                    "signature":URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
-                    "userHandle":pending.user_handle()},"clientExtensionResults":{},
-            });
+            let response = self.assertion_response(&pending, counter);
             let verified = self
                 .store
                 .verify_passkey_response(
                     &self.account,
                     &pending_id,
-                    &response.to_string(),
+                    &serde_json::to_string(&response).unwrap(),
                     &self.context,
                     NOW,
                 )
@@ -2303,6 +2317,217 @@ mod tests {
                 .complete_passkey_device(&completion, &f.context, NOW)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn manager_registration_consumes_both_ceremonies_atomically_then_can_revoke() {
+        use vibeface_secure::authorization::{AuthenticatorPolicyApproval, EnrollmentAuthority};
+        let mut f = Fixture::new();
+        let mut document = f.next_document();
+        document.enrollment.push(EnrollmentAuthority {
+            device: DeviceId::from_key(&PublicKey::of(&f.requester)),
+            rights: vec![AccountRight::ManageAuthenticators],
+            expires_at_ms: NOW + 500_000,
+        });
+        f.apply(&[f.account_commit(document, &f.root, 7)]);
+        let first = f.registration();
+        f.store
+            .complete_passkey_registration(&first, &f.context, NOW)
+            .unwrap();
+        let mut second = f.registration_with_credential(43);
+        second.intent = Signed::sign(second.intent.payload.clone(), &f.requester).unwrap();
+        let JournalEntry::Authenticator(record) = &second.journal[0] else {
+            panic!("record expected")
+        };
+        let record = Signed::sign(record.payload.clone(), &f.requester).unwrap();
+        let new_hash = record.hash().unwrap();
+        let mut document = f.next_document();
+        document.authenticators.push(new_hash.clone());
+        document.authenticators.sort();
+        let intent = Signed::sign(
+            AuthenticatorManagementIntent {
+                version: AUTH_VERSION,
+                account: f.account.clone(),
+                device_public_key: PublicKey::of(&f.requester),
+                target: f.context.target.clone(),
+                proposal_hash: authenticator_proposal_hash(&document).unwrap(),
+                expected_heads: vec![f.head()],
+                request_id: Nonce::from_bytes([8; 32]),
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + 10_000,
+            },
+            &f.requester,
+        )
+        .unwrap();
+        let PasskeyPreparation::Pending {
+            pending_id: approval_id,
+            pending,
+            ..
+        } = f
+            .store
+            .prepare_passkey_management(&intent, &f.context, NOW)
+            .unwrap()
+        else {
+            panic!("pending expected")
+        };
+        let response = f.assertion_response(&pending, 2);
+        let verified = f
+            .store
+            .verify_passkey_response(
+                &f.account,
+                &approval_id,
+                &serde_json::to_string(&response).unwrap(),
+                &f.context,
+                NOW,
+            )
+            .unwrap();
+        document.authenticator_approval = Some(AuthenticatorPolicyApproval {
+            intent: intent.clone(),
+            assertion: verified.proof().clone(),
+        });
+        second.journal = vec![
+            JournalEntry::Authenticator(record),
+            JournalEntry::Account(Signed::sign(document, &f.requester).unwrap()),
+        ];
+        let before = f.counts();
+        let head = f.head();
+        f.store.connection.execute_batch("CREATE TEMP TRIGGER reject_passkey_receipt BEFORE INSERT ON passkey_receipts BEGIN SELECT RAISE(ABORT,'receipt rejected'); END").unwrap();
+        assert!(
+            f.store
+                .complete_passkey_registration_at_authority(&f.authority, &second, &f.context, NOW)
+                .is_err()
+        );
+        assert_eq!(f.counts(), before);
+        assert_eq!(f.head(), head);
+        assert!(
+            read_ledger(
+                &f.store.connection,
+                &f.account,
+                &URL_SAFE_NO_PAD.encode([43; 32])
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            read_ledger(
+                &f.store.connection,
+                &f.account,
+                &URL_SAFE_NO_PAD.encode([42; 32])
+            )
+            .unwrap()
+            .unwrap()
+            .state
+            .sign_count,
+            1
+        );
+        assert!(
+            read_receipt(&f.store.connection, &f.account, &approval_id, None)
+                .unwrap()
+                .is_none()
+        );
+        f.store
+            .connection
+            .execute_batch("DROP TRIGGER reject_passkey_receipt")
+            .unwrap();
+        f.store
+            .complete_passkey_registration_at_authority(&f.authority, &second, &f.context, NOW)
+            .unwrap();
+        assert_eq!(f.counts().1, 2);
+        assert_eq!(f.counts().2, 3);
+        assert_eq!(
+            read_ledger(
+                &f.store.connection,
+                &f.account,
+                &URL_SAFE_NO_PAD.encode([42; 32])
+            )
+            .unwrap()
+            .unwrap()
+            .state
+            .sign_count,
+            2
+        );
+        let preparation = f
+            .store
+            .prepare_passkey_management(&intent, &f.context, NOW + 1)
+            .unwrap();
+        assert!(matches!(preparation, PasskeyPreparation::Completed { .. }));
+
+        let mut document = f.next_document();
+        document.authenticators.retain(|hash| hash != &new_hash);
+        let intent = Signed::sign(
+            AuthenticatorManagementIntent {
+                version: AUTH_VERSION,
+                account: f.account.clone(),
+                device_public_key: PublicKey::of(&f.requester),
+                target: f.context.target.clone(),
+                proposal_hash: authenticator_proposal_hash(&document).unwrap(),
+                expected_heads: vec![f.head()],
+                request_id: Nonce::from_bytes([9; 32]),
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + 10_000,
+            },
+            &f.requester,
+        )
+        .unwrap();
+        let PasskeyPreparation::Pending {
+            pending_id,
+            pending,
+            ..
+        } = f
+            .store
+            .prepare_passkey_management(&intent, &f.context, NOW)
+            .unwrap()
+        else {
+            panic!("pending expected")
+        };
+        let response = f.assertion_response(&pending, 3);
+        let verified = f
+            .store
+            .verify_passkey_response(
+                &f.account,
+                &pending_id,
+                &serde_json::to_string(&response).unwrap(),
+                &f.context,
+                NOW,
+            )
+            .unwrap();
+        document.authenticator_approval = Some(AuthenticatorPolicyApproval {
+            intent: intent.clone(),
+            assertion: verified.proof().clone(),
+        });
+        let completion = PasskeyManagementCompletion {
+            intent,
+            pending_id,
+            journal: vec![JournalEntry::Account(
+                Signed::sign(document, &f.requester).unwrap(),
+            )],
+        };
+        let receipt = f
+            .store
+            .complete_passkey_management_at_authority(&f.authority, &completion, &f.context, NOW)
+            .unwrap();
+        assert_eq!(
+            f.store
+                .complete_passkey_management_at_authority(
+                    &f.authority,
+                    &completion,
+                    &f.context,
+                    NOW + 600_000
+                )
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            f.store
+                .policy
+                .verified()
+                .account(&f.account)
+                .unwrap()
+                .authenticators
+                .len(),
+            1
+        );
+        assert_eq!(f.counts().2, 4);
     }
 
     #[test]
