@@ -964,12 +964,14 @@ pub fn verify_execution_session_snapshot<'a>(
             && session.original_project == *project
             && session.execution_resource == *execution
             && binding.binding.network_id == project.space.as_str()
-            && binding.binding.authority_node == DeviceId::from_key(project_key).as_str()
+            && binding.binding.authority_node
+                == node_fingerprint(project_key.as_str()).map_err(invalid_shape)?
             && session.task.as_str() == binding.binding.task_ref
             && session.binding_hash == binding_hash(&binding.binding).map_err(invalid_shape)?
             && session.binding_generation == binding.binding.generation
             && session.target == value.target
-            && session.target.as_str() == binding.binding.target_node
+            && binding.binding.target_node
+                == node_fingerprint(target_key.as_str()).map_err(invalid_shape)?
             && session.session_id == binding.binding.session_id
             && binding.binding.open_spec["executor"].as_str() == Some(session.executor.as_str())
             && binding.binding.open_spec["cwd"].as_str() == Some(session.cwd.as_str())
