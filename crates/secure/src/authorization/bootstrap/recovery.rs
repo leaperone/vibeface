@@ -50,7 +50,8 @@ pub struct PreparedAccountRecovery {
     journal: Vec<JournalEntry>,
     client_certificate: Signed<DeviceCertificate>,
     space_document: SpaceDocument,
-    grant_nonce: Nonce,
+    owner_grant: Signed<Grant>,
+    service_grant: Signed<Grant>,
     new_project: Option<(ResourceId, Nonce)>,
 }
 
@@ -278,7 +279,7 @@ pub fn prepare_account_recovery(
         )?;
         let latest = read_bundle(latest_bundle_json)?;
         require(
-            latest.journal.len() <= 120,
+            latest.journal.len() <= 118,
             "recovery journal requires checkpoint",
         )?;
         let mut state = replay_policies(&material.pins, &latest.journal)?;
@@ -432,6 +433,38 @@ pub fn prepare_account_recovery(
         } else {
             Some((ResourceId::random()?, Nonce::random()?))
         };
+        let selected_project = new_project
+            .as_ref()
+            .map(|(id, _)| id.clone())
+            .or_else(|| {
+                space
+                    .resources
+                    .iter()
+                    .filter_map(|h| state.resources.get(h))
+                    .find(|r| {
+                        r.payload.kind == ResourceKind::Project
+                            && r.payload.host == space_document.authority.service
+                    })
+                    .map(|r| r.payload.resource.clone())
+            })
+            .ok_or(AuthorizationError::InvalidProof("missing recovery project"))?;
+        let recovery_space_head = space_stamp(&Signed::sign(space_document.clone(), next_root)?)?;
+        let owner_grant = Signed::sign(
+            initial_owner_grant(
+                &account.account,
+                &space.space,
+                &Audience {
+                    service: space_document.authority.service.clone(),
+                    device: space_document.authority.device.clone(),
+                },
+                &recovery_space_head,
+                now_ms,
+                expires_at_ms,
+                Nonce::random()?,
+            ),
+            next_root,
+        )?;
+        let service_grant = initial_service_grant(&owner_grant, &selected_project, next_client)?;
         Ok(PreparedAccountRecovery {
             request: RecoveryNodeRequest {
                 claim: claim.claim.clone(),
@@ -444,7 +477,8 @@ pub fn prepare_account_recovery(
             journal: latest.journal,
             client_certificate,
             space_document,
-            grant_nonce: Nonce::random()?,
+            owner_grant,
+            service_grant,
             new_project,
         })
     };
@@ -622,58 +656,7 @@ pub fn finish_account_recovery(
         } else {
             None
         };
-        let grant = Signed::sign(
-            Grant {
-                version: AUTH_VERSION,
-                owner_space: space.clone(),
-                scope: ResourceScope::WholeSpace(space.clone()),
-                grantee: Grantee::Actor(Actor::Account(
-                    prepared.request.account_recovery.payload.account.clone(),
-                )),
-                actions: vec![
-                    Action::ConversationRead,
-                    Action::ConversationCreate,
-                    Action::MessageAppend,
-                    Action::TaskCreate,
-                    Action::TaskProgress,
-                    Action::TaskAccept,
-                    Action::TaskCancel,
-                    Action::ExecutionOpen,
-                    Action::ExecutionSend,
-                    Action::ExecutionSteer,
-                    Action::ExecutionInterrupt,
-                    Action::ExecutionRespondApproval,
-                    Action::ExecutionRebind,
-                    Action::OperationStatusRead,
-                    Action::OperationReconcile,
-                    Action::OperationResolve,
-                    Action::AttachmentRead,
-                    Action::AttachmentWrite,
-                    Action::Export,
-                    Action::NotificationRead,
-                    Action::NotificationAck,
-                    Action::MemberManage,
-                    Action::ResourceManage,
-                    Action::GrantIssue,
-                    Action::GrantRevoke,
-                    Action::ServiceEnroll,
-                    Action::ReplicaRead,
-                    Action::AgentStart,
-                ],
-                audience: Audience {
-                    service: ServiceId::from_key(&prepared.request.node_certificate.public_key),
-                    device: prepared.request.node_certificate.device.clone(),
-                },
-                constraints: GrantConstraints::default(),
-                parent: None,
-                remaining_delegations: MAX_DELEGATION_DEPTH as u8,
-                issued_under: space_head.clone(),
-                not_before_ms: prepared.client_certificate.payload.not_before_ms,
-                expires_at_ms: prepared.client_certificate.payload.expires_at_ms,
-                nonce: prepared.grant_nonce.clone(),
-            },
-            next_root,
-        )?;
+        let grant = prepared.owner_grant.clone();
         let grant_leaf = state.install_grant(grant.clone(), now_ms)?;
         let mut space_document = prepared.space_document.clone();
         space_document.previous = Some(space_head);
@@ -687,6 +670,14 @@ pub fn finish_account_recovery(
         }
         let space_document = Signed::sign(space_document, next_root)?;
         let space_head = state.install_space(space_document.clone())?;
+        let service_hash = state.install_grant(prepared.service_grant.clone(), now_ms)?;
+        let mut service_document = space_document.payload.clone();
+        service_document.previous = Some(space_head);
+        service_document.sequence += 1;
+        service_document.grants.push(service_hash);
+        service_document.grants.sort();
+        let service_document = Signed::sign(service_document, next_root)?;
+        let space_head = state.install_space(service_document.clone())?;
         let mut pins = prepared.pins.clone();
         for pin in &mut pins {
             if pin.domain == account_head.domain {
@@ -709,6 +700,8 @@ pub fn finish_account_recovery(
         journal.extend([
             JournalEntry::Grant(grant),
             JournalEntry::Space(space_document),
+            JournalEntry::Grant(prepared.service_grant.clone()),
+            JournalEntry::Space(service_document),
         ]);
         Ok((
             ClientAuthorizationBundle {
@@ -839,12 +832,25 @@ mod tests {
         let space = state.space(&scope.space_id).unwrap();
         assert_eq!(
             (space.authority_epoch, space.root_generation, space.sequence),
-            (1, 1, 1)
+            (1, 1, 2)
         );
         assert_eq!(space.current_root, PublicKey::of(&key(5)));
         assert_eq!(space.resources, p.space_document.resources);
         assert!(!space.grants.contains(&original.bundle.grant_leaf));
-        assert_eq!(space.grants, [recovered.bundle.grant_leaf.clone()]);
+        let service: Signed<Grant> =
+            serde_json::from_str(&recovered.service_grant_json().unwrap()).unwrap();
+        assert_eq!(service.issuer, PublicKey::of(&key(6)));
+        assert_eq!(service.payload.remaining_delegations, 0);
+        assert_eq!(
+            service.payload.parent.as_ref(),
+            Some(&recovered.bundle.grant_leaf)
+        );
+        assert!(space.grants.contains(&recovered.bundle.grant_leaf));
+        assert!(space.grants.contains(&service.hash().unwrap()));
+        assert_eq!(space.grants.len(), 2);
+        let old_service: Signed<Grant> =
+            serde_json::from_str(&original.service_grant_json().unwrap()).unwrap();
+        assert!(!space.grants.contains(&old_service.hash().unwrap()));
         assert_eq!(
             recovered.authorization.account_enrollment_rights(),
             [
@@ -866,7 +872,7 @@ mod tests {
         );
         let commit: serde_json::Value =
             serde_json::from_str(&p.commit_json(&recovered).unwrap()).unwrap();
-        assert_eq!(commit["journal_delta"].as_array().unwrap().len(), 7);
+        assert_eq!(commit["journal_delta"].as_array().unwrap().len(), 9);
         assert_eq!(commit["claim_nonce"], nonce(8));
         assert_eq!(
             commit["request_hash"],
@@ -943,7 +949,7 @@ mod tests {
         assert_ne!(new_resource.payload.resource, resource.payload.resource);
         let commit: serde_json::Value =
             serde_json::from_str(&p.commit_json(&recovered).unwrap()).unwrap();
-        assert_eq!(commit["journal_delta"].as_array().unwrap().len(), 8);
+        assert_eq!(commit["journal_delta"].as_array().unwrap().len(), 10);
     }
 
     #[test]

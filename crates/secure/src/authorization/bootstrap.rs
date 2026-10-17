@@ -35,7 +35,8 @@ pub struct PreparedAccountCreation {
     node_certificate: DeviceCertificate,
     resource_id: ResourceId,
     resource_nonce: Nonce,
-    grant_nonce: Nonce,
+    owner_grant: Signed<Grant>,
+    service_grant: Signed<Grant>,
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +138,87 @@ pub fn verify_node_claim(
     verify().map_err(|e| e.to_string())
 }
 
+fn initial_owner_grant(
+    account: &AccountId,
+    space: &SpaceId,
+    audience: &Audience,
+    issued_under: &PolicyStamp,
+    not_before_ms: u64,
+    expires_at_ms: u64,
+    nonce: Nonce,
+) -> Grant {
+    Grant {
+        version: AUTH_VERSION,
+        owner_space: space.clone(),
+        scope: ResourceScope::WholeSpace(space.clone()),
+        grantee: Grantee::Actor(Actor::Account(account.clone())),
+        actions: vec![
+            Action::ConversationRead,
+            Action::ConversationCreate,
+            Action::MessageAppend,
+            Action::TaskCreate,
+            Action::TaskProgress,
+            Action::TaskAccept,
+            Action::TaskCancel,
+            Action::ExecutionOpen,
+            Action::ExecutionSend,
+            Action::ExecutionSteer,
+            Action::ExecutionInterrupt,
+            Action::ExecutionRespondApproval,
+            Action::ExecutionRebind,
+            Action::OperationStatusRead,
+            Action::OperationReconcile,
+            Action::OperationResolve,
+            Action::AttachmentRead,
+            Action::AttachmentWrite,
+            Action::Export,
+            Action::NotificationRead,
+            Action::NotificationAck,
+            Action::MemberManage,
+            Action::ResourceManage,
+            Action::GrantIssue,
+            Action::GrantRevoke,
+            Action::ServiceEnroll,
+            Action::ReplicaRead,
+            Action::AgentStart,
+        ],
+        audience: audience.clone(),
+        constraints: GrantConstraints::default(),
+        parent: None,
+        remaining_delegations: MAX_DELEGATION_DEPTH as u8,
+        issued_under: issued_under.clone(),
+        not_before_ms,
+        expires_at_ms,
+        nonce,
+    }
+}
+fn initial_service_grant(
+    owner: &Signed<Grant>,
+    project: &ResourceId,
+    client: &Identity,
+) -> Result<Signed<Grant>> {
+    let mut grant = owner.payload.clone();
+    grant.scope = ResourceScope::Exact(ResourceRef {
+        space: grant.owner_space.clone(),
+        resource: project.clone(),
+    });
+    grant.grantee = Grantee::Actor(Actor::Service(grant.audience.service.clone()));
+    grant.actions = vec![
+        Action::ConversationRead,
+        Action::TaskCreate,
+        Action::TaskProgress,
+        Action::ExecutionOpen,
+        Action::ExecutionSend,
+        Action::OperationStatusRead,
+        Action::AttachmentRead,
+        Action::AgentStart,
+    ];
+    grant.parent = Some(owner.hash()?);
+    grant.remaining_delegations = 0;
+    grant.nonce = Nonce::random()?;
+    Signed::sign(grant, client)
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = prepareAccountCreation))]
 pub fn prepare_account_creation(
     root: &Identity,
@@ -234,9 +316,9 @@ pub fn prepare_account_creation(
         let space_genesis = Signed::sign(
             SpaceDocument {
                 version: AUTH_VERSION,
-                space,
+                space: space.clone(),
                 root: SpaceRoot::Personal {
-                    owner: account,
+                    owner: account.clone(),
                     genesis_root: root_key.clone(),
                 },
                 current_root: root_key.clone(),
@@ -257,16 +339,34 @@ pub fn prepare_account_creation(
             },
             root,
         )?;
-        state.trust_space_genesis(&root_key, space_genesis.clone())?;
+        let space_head = state.trust_space_genesis(&root_key, space_genesis.clone())?;
+        let resource_id = ResourceId::random()?;
+        let owner_grant = Signed::sign(
+            initial_owner_grant(
+                &account,
+                &space,
+                &Audience {
+                    service: ServiceId::from_key(node_key),
+                    device: DeviceId::from_key(node_key),
+                },
+                &space_head,
+                now_ms,
+                expires_at_ms,
+                Nonce::random()?,
+            ),
+            root,
+        )?;
+        let service_grant = initial_service_grant(&owner_grant, &resource_id, client)?;
         Ok(PreparedAccountCreation {
             claim: claim.clone(),
             account_genesis,
             space_genesis,
             client_certificate,
             node_certificate,
-            resource_id: ResourceId::random()?,
+            resource_id,
             resource_nonce: Nonce::random()?,
-            grant_nonce: Nonce::random()?,
+            owner_grant,
+            service_grant,
         })
     };
     prepare().map_err(|e| e.to_string())
@@ -390,58 +490,7 @@ pub fn finish_account_creation(
             root,
         )?;
         let resource_hash = state.install_resource(resource.clone())?;
-        let grant = Signed::sign(
-            Grant {
-                version: AUTH_VERSION,
-                owner_space: space.clone(),
-                scope: ResourceScope::WholeSpace(space.clone()),
-                grantee: Grantee::Actor(Actor::Account(
-                    prepared.account_genesis.payload.account.clone(),
-                )),
-                actions: vec![
-                    Action::ConversationRead,
-                    Action::ConversationCreate,
-                    Action::MessageAppend,
-                    Action::TaskCreate,
-                    Action::TaskProgress,
-                    Action::TaskAccept,
-                    Action::TaskCancel,
-                    Action::ExecutionOpen,
-                    Action::ExecutionSend,
-                    Action::ExecutionSteer,
-                    Action::ExecutionInterrupt,
-                    Action::ExecutionRespondApproval,
-                    Action::ExecutionRebind,
-                    Action::OperationStatusRead,
-                    Action::OperationReconcile,
-                    Action::OperationResolve,
-                    Action::AttachmentRead,
-                    Action::AttachmentWrite,
-                    Action::Export,
-                    Action::NotificationRead,
-                    Action::NotificationAck,
-                    Action::MemberManage,
-                    Action::ResourceManage,
-                    Action::GrantIssue,
-                    Action::GrantRevoke,
-                    Action::ServiceEnroll,
-                    Action::ReplicaRead,
-                    Action::AgentStart,
-                ],
-                audience: Audience {
-                    service: ServiceId::from_key(&prepared.node_certificate.public_key),
-                    device: prepared.node_certificate.device.clone(),
-                },
-                constraints: GrantConstraints::default(),
-                parent: None,
-                remaining_delegations: MAX_DELEGATION_DEPTH as u8,
-                issued_under: space_head.clone(),
-                not_before_ms: prepared.client_certificate.payload.not_before_ms,
-                expires_at_ms: prepared.client_certificate.payload.expires_at_ms,
-                nonce: prepared.grant_nonce.clone(),
-            },
-            root,
-        )?;
+        let grant = prepared.owner_grant.clone();
         let grant_leaf = state.install_grant(grant.clone(), now_ms)?;
         let mut space_document = prepared.space_genesis.payload.clone();
         space_document.previous = Some(space_head);
@@ -450,6 +499,14 @@ pub fn finish_account_creation(
         space_document.grants = vec![grant_leaf.clone()];
         let space_document = Signed::sign(space_document, root)?;
         let space_head = state.install_space(space_document.clone())?;
+        let service_hash = state.install_grant(prepared.service_grant.clone(), now_ms)?;
+        let mut service_document = space_document.payload.clone();
+        service_document.previous = Some(space_head);
+        service_document.sequence += 1;
+        service_document.grants.push(service_hash);
+        service_document.grants.sort();
+        let service_document = Signed::sign(service_document, root)?;
+        let space_head = state.install_space(service_document.clone())?;
         let pins = vec![
             PolicyPin {
                 domain: account_head.domain.clone(),
@@ -472,6 +529,8 @@ pub fn finish_account_creation(
                 JournalEntry::Resource(resource),
                 JournalEntry::Grant(grant),
                 JournalEntry::Space(space_document),
+                JournalEntry::Grant(prepared.service_grant.clone()),
+                JournalEntry::Space(service_document),
             ],
             grant_leaf,
         };
@@ -506,6 +565,25 @@ impl CreatedAccount {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = scopeJson))]
     pub fn scope_json(&self) -> crate::Result<String> {
         self.authorization.scope_json()
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = serviceGrantJson))]
+    pub fn service_grant_json(&self) -> crate::Result<String> {
+        let grant = self
+            .bundle
+            .journal
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                JournalEntry::Grant(grant)
+                    if matches!(grant.payload.grantee, Grantee::Actor(Actor::Service(_)))
+                        && grant.payload.parent.as_ref() == Some(&self.bundle.grant_leaf) =>
+                {
+                    Some(grant)
+                }
+                _ => None,
+            })
+            .ok_or("created account is missing service grant")?;
+        encode(grant)
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = clientGrantJson))]
     pub fn client_grant_json(&self) -> crate::Result<String> {
@@ -588,6 +666,21 @@ mod tests {
                 .actions
                 .contains(&Action::ExecutionRespondApproval)
         );
+        let service: Signed<Grant> =
+            serde_json::from_str(&created.service_grant_json().unwrap()).unwrap();
+        assert_eq!(service.issuer, PublicKey::of(&key(3)));
+        assert_eq!(service.payload.remaining_delegations, 0);
+        assert_eq!(service.payload.parent, Some(grant.hash().unwrap()));
+        assert_eq!(service.payload.actions.len(), 8);
+        assert!(
+            service
+                .payload
+                .actions
+                .iter()
+                .all(|a| !a.requires_account())
+        );
+        assert!(!service.payload.actions.contains(&Action::MessageAppend));
+        assert!(!service.payload.actions.contains(&Action::GrantIssue));
         let auth = verify_client_authorization(
             &created.bundle_json().unwrap(),
             &created.pins_json().unwrap(),
