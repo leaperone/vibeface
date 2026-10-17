@@ -1,8 +1,10 @@
+use crate::identity::policy::FreshnessProof;
 use crate::{
     config::{self, Config},
     crypto::{self, LocalIdentity},
-    engine::{Engine, EngineAction, ExecutorConfig, ExecutorKind, ExecutorSession},
-    identity::{AuthorizationView, IdentityKind, NetworkState},
+    engine::{
+        Engine, EngineAction, ExecutionContext, ExecutorConfig, ExecutorKind, ExecutorSession,
+    },
     maintenance::{Busy, Gate},
     model::*,
     network::{IncomingSocket, NetworkHub, Service},
@@ -10,7 +12,6 @@ use crate::{
     store::Store,
 };
 use anyhow::{Context as _, Result, bail, ensure};
-use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -19,12 +20,38 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
+use vibeface_secure::authorization::{
+    AUTH_VERSION, Actor, Audience, CheckStage, DeviceId, FreshnessChallenge, FreshnessReceipt,
+    INVOCATION_MAX_AGE_MS, Invocation, Nonce, ObjectHash, PolicyDomain, PublicKey, ServiceId,
+    Signed, SpaceId, TransportEvidence, VerifiedAuthorization, VerifiedClientAuthorization,
+};
 
 #[derive(Clone)]
 pub struct Access {
     pub network_id: String,
-    pub human: bool,
     pub conversation_id: Option<String>,
+    authorization: VerifiedAuthorization,
+    freshness: FreshnessProof,
+    transport: TransportEvidence,
+    body: Value,
+}
+
+impl Access {
+    fn account_actor(&self) -> bool {
+        matches!(self.authorization.actor(), Actor::Account(_))
+    }
+
+    fn require_body(&self, body: &Value) -> Result<()> {
+        ensure!(
+            &self.body == body,
+            "authorization belongs to another request"
+        );
+        ensure!(
+            body["space_id"].as_str() == Some(self.network_id.as_str()),
+            "authorization belongs to another space"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1271,12 +1298,15 @@ pub struct Runtime {
     pub network: Arc<NetworkHub>,
     pub hub: Arc<PeerHub>,
     pub events: broadcast::Sender<Update>,
-    pub agent_tokens: Mutex<HashMap<String, Access>>,
+    pub agent_tokens: Mutex<HashMap<String, AgentSession>>,
+    peer_connecting: Arc<Mutex<BTreeSet<(String, String)>>>,
     pub tool_url: std::sync::OnceLock<String>,
     pub maintenance: Arc<Gate>,
     completion_lock: Mutex<()>,
+    execution_leases: Mutex<BTreeSet<(String, String)>>,
     pub engine: Engine,
-    _codex_process: Option<tokio::process::Child>,
+    _codex_process: Mutex<Option<tokio::process::Child>>,
+    managed_codex: bool,
     _process_lock: std::fs::File,
     peer_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
     network_rx: Mutex<Option<mpsc::Receiver<IncomingSocket>>>,
@@ -1311,12 +1341,109 @@ fn heads(v: &Value) -> Result<Vec<String>> {
         v.get("basis_heads").cloned().unwrap_or(json!([])),
     )?)
 }
+
+fn task_views(store: &Store, space: &str, scope: &str) -> Result<Vec<Value>> {
+    store
+        .tasks(space, scope)?
+        .into_iter()
+        .map(|task| {
+            let creation = store.task_creation(space, scope, &task.task_id)?;
+            let event = store.verify_event(space, &creation)?;
+            let authority = store.authorize_node(space, &event.author, None)?;
+            let binding = store.task_binding(space, &creation.hash)?;
+            let mut value = serde_json::to_value(task)?;
+            value["task_creation"] = serde_json::to_value(creation)?;
+            value["authority_public_key"] = json!(authority.public_key);
+            value["binding"] = serde_json::to_value(binding)?;
+            Ok(value)
+        })
+        .collect()
+}
+
+fn session_views(
+    store: &Store,
+    space: &str,
+    scope: &str,
+    operations: &[OperationRecord],
+) -> Result<Vec<Value>> {
+    store
+        .sessions(space)?
+        .into_iter()
+        .filter_map(|session| {
+            let request = operations
+                .iter()
+                .rev()
+                .find(|operation| {
+                    operation.request.target_node == session.target_node
+                        && operation.request.session_id == session.session_id
+                })?
+                .request
+                .clone();
+            Some((|| -> Result<Value> {
+                let mut value = serde_json::to_value(session)?;
+                value["task_id"] = json!(request.task_id);
+                value["binding"] = json!(request.binding);
+                if let Some(task) = &request.task_id {
+                    let creation = store.task_creation(space, scope, task)?;
+                    let event = store.verify_event(space, &creation)?;
+                    value["authority_public_key"] =
+                        json!(store.authorize_node(space, &event.author, None)?.public_key);
+                    value["task_creation"] = json!(creation);
+                }
+                Ok(value)
+            })())
+        })
+        .collect()
+}
+
+fn execution_context(
+    store: &Store,
+    request: &OperationRequest,
+    deadline: u64,
+) -> Result<ExecutionContext> {
+    use vibeface_secure::authorization::{PolicyDomain, SpaceRoot};
+    let proof = store.operation_admission_proof(&request.network_id, &request.operation_id)?;
+    let invocation = &proof.invocation.payload;
+    ensure!(
+        invocation.resource.space.as_str() == request.network_id,
+        "execution admission belongs to another space"
+    );
+    let policies = store.authorization_state();
+    let document = policies
+        .space(&invocation.resource.space)
+        .context("execution space policy is missing")?;
+    let private = match &document.root {
+        SpaceRoot::Personal { owner, .. } => match &invocation.actor {
+            Actor::Account(account) => account == owner,
+            Actor::Service(service) if invocation.initiator == Actor::Account(owner.clone()) => {
+                policies.account(owner).is_some_and(|account| {
+                    account.devices.iter().any(|hash| {
+                        policies.device(hash).is_some_and(|certificate| {
+                            certificate.payload.owner == PolicyDomain::Account(owner.clone())
+                                && certificate.payload.device == invocation.device
+                                && certificate.payload.subject == Actor::Service(service.clone())
+                        })
+                    })
+                })
+            }
+            _ => false,
+        },
+        SpaceRoot::Team { .. } => false,
+    };
+    Ok(ExecutionContext {
+        space_id: invocation.resource.space.clone(),
+        resource_id: invocation.resource.resource.clone(),
+        operation_id: request.operation_id.clone(),
+        shared: !private,
+        lease_expires_at_ms: deadline,
+    })
+}
 fn require_task_write(
     store: &Store,
     network: &str,
     scope: &str,
     task_id: &str,
-    human: bool,
+    account_actor: bool,
 ) -> Result<()> {
     let task = store
         .tasks(network, scope)?
@@ -1324,7 +1451,7 @@ fn require_task_write(
         .find(|t| t.task_id == task_id)
         .context("task not found")?;
     ensure!(
-        human || !matches!(task.status.as_str(), "accepted" | "cancelled"),
+        account_actor || !matches!(task.status.as_str(), "accepted" | "cancelled"),
         "only the user may reopen accepted or cancelled tasks"
     );
     Ok(())
@@ -1431,18 +1558,496 @@ fn require_executor_followup(
 }
 
 impl Runtime {
+    pub(crate) fn local_audience(&self) -> Result<Audience> {
+        self.audience()
+    }
+
+    pub async fn forward_client_request(
+        &self,
+        client: &VerifiedClientAuthorization,
+        body: &Value,
+        invocation: &Signed<Invocation>,
+        noise_public_key: &str,
+    ) -> Result<Value> {
+        let now = now_ms() as u64;
+        let value = &invocation.payload;
+        let device = DeviceId::from_key(&PublicKey::parse(noise_public_key)?);
+        ensure!(
+            invocation.issuer.as_str() == noise_public_key
+                && device == client.scope().device_id
+                && value.device == device
+                && value.actor == Actor::Account(client.scope().account_id.clone())
+                && value.initiator == value.actor
+                && value.initiating_grant.is_none(),
+            "forwarded actor differs from the authenticated client"
+        );
+        ensure!(
+            value.version == AUTH_VERSION
+                && value.audience == *client.audience()
+                && value.presenter == self.audience()?.device
+                && value.grant_leaf == *client.grant_leaf()
+                && value.expected_policies == client.heads(),
+            "forwarded authorization targets another route"
+        );
+        ensure!(
+            value.resource.space == client.scope().space_id
+                && body["space_id"].as_str() == Some(client.scope().space_id.as_str())
+                && body["resource_id"].as_str() == Some(value.resource.resource.as_str())
+                && client
+                    .resources()
+                    .iter()
+                    .any(|record| record.payload.resource == value.resource.resource),
+            "forwarded resource is outside the verified projection"
+        );
+        ensure!(
+            authorization_action(body)? == value.action
+                && ObjectHash::body(body)? == value.body_hash
+                && body["authorization_id"].as_str() == Some(value.operation_id.as_str()),
+            "forwarded request differs from signed intent"
+        );
+        ensure!(
+            value.not_before_ms <= now
+                && now < value.expires_at_ms
+                && value.expires_at_ms - value.not_before_ms <= INVOCATION_MAX_AGE_MS,
+            "forwarded invocation expired"
+        );
+        invocation.verify_signature()?;
+        let target = {
+            let store = self.store.lock().await;
+            for stamp in client.heads() {
+                ensure!(
+                    store.authorization_state().head(&stamp.domain) == Some(stamp),
+                    "forwarding policy needs synchronization"
+                );
+            }
+            let certificate = store.authorization_state().verify_service_device(
+                &client.scope().space_id,
+                &value.audience.device,
+                now,
+            )?;
+            ensure!(
+                certificate.payload.subject == Actor::Service(value.audience.service.clone())
+                    && certificate.payload.public_key == *client.audience_public_key(),
+                "forwarded target differs from the verified service pin"
+            );
+            crypto::fingerprint(certificate.payload.public_key.as_str())?
+        };
+        self.peer_request(
+            client.scope().space_id.as_str(),
+            &target,
+            json!({
+                "type":"rpc","authorization_body":body,"invocation":invocation,
+            }),
+        )
+        .await
+    }
+
+    fn audience(&self) -> Result<Audience> {
+        let key = PublicKey::parse(&self.identity.public_key_hex()?)?;
+        Ok(Audience {
+            service: ServiceId::from_key(&key),
+            device: DeviceId::from_key(&key),
+        })
+    }
+
+    fn request_audience(&self, store: &Store, body: &Value) -> Result<Audience> {
+        let space = SpaceId::parse(field(body, "space_id")?)?;
+        let target = match field(body, "method")? {
+            "operate" => body["request"]["target_node"]
+                .as_str()
+                .context("execution target is required")?
+                .to_owned(),
+            "session" | "operation" | "reconcile" | "resolve_unknown" => {
+                field(body, "target_node")?.to_owned()
+            }
+            "seal_execution" => field(&body["binding"]["binding"], "target_node")?.to_owned(),
+            "bind_execution" | "rebind_execution" => {
+                let creation = store.task_creation(
+                    space.as_str(),
+                    field(body, "conversation_id")?,
+                    field(body, "task_id")?,
+                )?;
+                store.verify_event(space.as_str(), &creation)?.author
+            }
+            _ => return self.audience(),
+        };
+        let certificate = store.authorize_node(space.as_str(), &target, None)?;
+        let key = PublicKey::parse(&certificate.public_key)?;
+        Ok(Audience {
+            service: ServiceId::from_key(&key),
+            device: DeviceId::from_key(&key),
+        })
+    }
+
+    async fn normalize_request_body(
+        self: &Arc<Self>,
+        space: &SpaceId,
+        mut body: Value,
+    ) -> Result<Value> {
+        ensure!(body.is_object(), "request body must be an object");
+        ensure!(
+            body["space_id"].as_str() == Some(space.as_str()),
+            "request belongs to another space"
+        );
+        id(&body, "authorization_id")?;
+        authorization_action(&body)?;
+        if body["method"] == "message" {
+            if body.get("scheduler_node").is_none() {
+                body["scheduler_node"] = json!(self.identity.node_id()?);
+            }
+            ensure!(field(&body, "text")?.len() <= 65_536, "message is too long");
+        }
+        if body["method"] == "update_task" {
+            if body.get("detail").is_none() {
+                body["detail"] = json!("");
+            }
+            ensure!(
+                body["detail"]
+                    .as_str()
+                    .is_some_and(|detail| detail.len() <= 65_536),
+                "task detail is too long"
+            );
+        }
+        if body["method"] == "operate" {
+            let mut request: OperationRequest = serde_json::from_value(body["request"].clone())?;
+            ensure!(
+                request.network_id == space.as_str()
+                    && body["authorization_id"] == request.operation_id,
+                "operation space or authorization ID mismatch"
+            );
+            self.prepare_operation_binding(&mut request).await?;
+            if request.action["type"] == "open" {
+                request.action["cwd"] = json!(
+                    self.allowed_path(field(&request.action, "cwd")?)?
+                        .to_str()
+                        .context("directory must be UTF-8")?
+                );
+            }
+            let mut resources = request
+                .resources
+                .iter()
+                .map(|path| {
+                    Ok(self
+                        .allowed_path(path)?
+                        .to_str()
+                        .context("resource must be UTF-8")?
+                        .to_owned())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if request.action["type"] == "open" {
+                resources.push(field(&request.action, "cwd")?.to_owned());
+            } else if request.action["type"] == "send" {
+                let session = self
+                    .store
+                    .lock()
+                    .await
+                    .session(
+                        &request.network_id,
+                        &request.target_node,
+                        &request.session_id,
+                    )?
+                    .context("execution session is not open")?;
+                resources.push(
+                    self.allowed_path(&session.cwd)?
+                        .to_str()
+                        .context("directory must be UTF-8")?
+                        .to_owned(),
+                );
+            }
+            resources.sort();
+            resources.dedup();
+            request.resources = resources;
+            body["request"] = serde_json::to_value(request)?;
+        }
+        Ok(body)
+    }
+
+    pub async fn prepare_client_request(
+        self: &Arc<Self>,
+        client: &VerifiedClientAuthorization,
+        body: Value,
+        intent: Signed<vibeface_secure::authorization::prepare::PrepareIntent>,
+        noise_public_key: &str,
+    ) -> Result<Value> {
+        let claim = &intent.payload.request;
+        let device = DeviceId::from_key(&PublicKey::parse(noise_public_key)?);
+        ensure!(
+            intent.issuer.as_str() == noise_public_key
+                && device == client.scope().device_id
+                && claim.device == device
+                && claim.actor == Actor::Account(client.scope().account_id.clone())
+                && claim.initiator == claim.actor
+                && claim.initiating_grant.is_none(),
+            "prepare actor differs from authenticated client"
+        );
+        ensure!(
+            claim.audience == *client.audience()
+                && claim.grant_leaf == *client.grant_leaf()
+                && claim.expected_policies == client.heads()
+                && claim.resource.space == client.scope().space_id,
+            "prepare intent differs from selected client authorization"
+        );
+        ensure!(
+            client
+                .resources()
+                .iter()
+                .any(|record| record.payload.resource == claim.resource.resource),
+            "prepare resource is outside verified projection"
+        );
+        let local = self.audience()?;
+        let transport = if claim.presenter == device {
+            TransportEvidence::DirectNoise { device }
+        } else {
+            ensure!(
+                claim.presenter == local.device,
+                "prepare targets another Gateway presenter"
+            );
+            TransportEvidence::GatewayNoise {
+                device,
+                gateway: local.device.clone(),
+            }
+        };
+        let prepared = self
+            .store
+            .lock()
+            .await
+            .authorization_state()
+            .verify_prepare_intent(
+                &intent,
+                &body,
+                authorization_action(&body)?,
+                client.audience(),
+                &transport,
+                now_ms() as u64,
+            )?;
+        if client.audience() == &local {
+            return self
+                .prepare_authorized_body(prepared, &intent.payload.request)
+                .await;
+        }
+        ensure!(
+            claim.presenter == local.device,
+            "forwarded prepare requires this Gateway presenter"
+        );
+        let target = {
+            let store = self.store.lock().await;
+            let certificate = store.authorization_state().verify_service_device(
+                &client.scope().space_id,
+                &client.audience().device,
+                now_ms() as u64,
+            )?;
+            ensure!(
+                certificate.payload.public_key == *client.audience_public_key(),
+                "prepare host differs from independently verified pin"
+            );
+            crypto::fingerprint(certificate.payload.public_key.as_str())?
+        };
+        self.peer_request(
+            client.scope().space_id.as_str(),
+            &target,
+            json!({"type":"prepare","authorization_body":body,"intent":intent}),
+        )
+        .await
+    }
+
+    async fn prepare_authorized_body(
+        self: &Arc<Self>,
+        prepared: vibeface_secure::authorization::prepare::VerifiedPrepareAuthorization,
+        original: &Invocation,
+    ) -> Result<Value> {
+        ensure!(
+            prepared.audience() == &self.audience()?,
+            "prepare reached another resource host"
+        );
+        let body = self
+            .normalize_request_body(&prepared.resource().space, prepared.raw_body().clone())
+            .await?;
+        let now = now_ms() as u64;
+        let facts = self
+            .store
+            .lock()
+            .await
+            .request_facts(&body, prepared.audience())?;
+        ensure!(
+            facts.resource == *prepared.resource()
+                && facts.action == prepared.action()
+                && facts.operation_id == prepared.operation_id()
+                && facts.audience == *prepared.audience(),
+            "normalization changed authorized prepare target"
+        );
+        let mut invocation = original.clone();
+        invocation.resource = facts.resource;
+        invocation.action = facts.action;
+        invocation.audience = facts.audience;
+        invocation.operation_id = facts.operation_id;
+        invocation.body_hash = facts.body_hash;
+        invocation.context = facts.context;
+        invocation.nonce = Nonce::random()?;
+        invocation.not_before_ms = now;
+        invocation.expires_at_ms = now.saturating_add(INVOCATION_MAX_AGE_MS);
+        Ok(json!({"invocation":invocation,"body":body}))
+    }
+
+    async fn freshness(
+        &self,
+        authorization: &VerifiedAuthorization,
+        stage: CheckStage,
+    ) -> Result<FreshnessProof> {
+        let now = now_ms() as u64;
+        let (challenge, mut receipts, authorities) = {
+            let mut store = self.store.lock().await;
+            let challenge = store.issue_freshness(authorization, stage, now)?;
+            let receipts = store.sign_current_receipts(&challenge, &self.identity, now)?;
+            let mut authorities = BTreeSet::new();
+            for stamp in &challenge.policies {
+                if receipts
+                    .iter()
+                    .any(|receipt| receipt.payload.current.domain == stamp.domain)
+                {
+                    continue;
+                }
+                let authority = match &stamp.domain {
+                    PolicyDomain::Account(id) => {
+                        &store
+                            .authorization_state()
+                            .account(id)
+                            .context("account policy missing")?
+                            .authority
+                    }
+                    PolicyDomain::Space(id) => {
+                        &store
+                            .authorization_state()
+                            .space(id)
+                            .context("space policy missing")?
+                            .authority
+                    }
+                };
+                authorities.insert(crypto::fingerprint(authority.public_key.as_str())?);
+            }
+            (challenge, receipts, authorities)
+        };
+        for target in authorities {
+            let reply = self
+                .peer_request(
+                    authorization.resource().space.as_str(),
+                    &target,
+                    json!({"type":"freshness_receipt","challenge":challenge}),
+                )
+                .await?;
+            let current: Vec<Signed<FreshnessReceipt>> =
+                serde_json::from_value(reply["receipts"].clone())?;
+            receipts.extend(current);
+        }
+        receipts.sort_by(|left, right| {
+            left.payload
+                .current
+                .domain
+                .cmp(&right.payload.current.domain)
+        });
+        ensure!(
+            receipts.len() == challenge.policies.len(),
+            "current policy authority is unavailable"
+        );
+        Ok(FreshnessProof {
+            challenge,
+            receipts,
+        })
+    }
+
+    pub async fn authorize_rpc(
+        &self,
+        body: Value,
+        invocation: Signed<Invocation>,
+        transport: TransportEvidence,
+    ) -> Result<Access> {
+        let space = SpaceId::parse(field(&body, "space_id")?)?;
+        let authorization = {
+            let store = self.store.lock().await;
+            let facts = store.request_facts(&body, &self.request_audience(&store, &body)?)?;
+            store.authorize_request(&invocation, &facts, &transport, now_ms() as u64)?
+        };
+        ensure!(
+            authorization.resource().space == space,
+            "wrong authorization space"
+        );
+        let stage = if authorization.action().is_read() {
+            CheckStage::RemoteRead
+        } else {
+            CheckStage::Admit
+        };
+        let freshness = self.freshness(&authorization, stage).await?;
+        Ok(Access {
+            network_id: space.to_string(),
+            conversation_id: body["conversation_id"].as_str().map(str::to_owned),
+            authorization,
+            freshness,
+            transport,
+            body,
+        })
+    }
+
+    pub async fn validate_subscription(&self, access: &Access) -> Result<()> {
+        ensure!(
+            access.authorization.action().is_read(),
+            "subscription requires read permission"
+        );
+        let mut store = self.store.lock().await;
+        store.authorize_read(
+            &access.authorization,
+            &access.freshness,
+            &access.transport,
+            now_ms() as u64,
+        )
+    }
+
+    pub async fn subscription_allows(&self, access: &Access, update: &Update) -> Result<bool> {
+        if update.network_id != access.network_id {
+            return Ok(false);
+        }
+        let authorization = {
+            let store = self.store.lock().await;
+            let facts = store.request_facts(&access.body, &self.audience()?)?;
+            match store.authorize_request(
+                access.authorization.signed_invocation(),
+                &facts,
+                &access.transport,
+                now_ms() as u64,
+            ) {
+                Ok(authorization) => authorization,
+                Err(_) => return Ok(false),
+            }
+        };
+        let freshness = match self.freshness(&authorization, CheckStage::RemoteRead).await {
+            Ok(freshness) => freshness,
+            Err(_) => return Ok(false),
+        };
+        let mut store = self.store.lock().await;
+        if store
+            .authorize_read(
+                &authorization,
+                &freshness,
+                &access.transport,
+                now_ms() as u64,
+            )
+            .is_err()
+        {
+            return Ok(false);
+        }
+        let scope = update.payload["conversation_id"]
+            .as_str()
+            .context("update has no resource scope")?;
+        Ok(store
+            .authorized_conversation_ids(&authorization)?
+            .iter()
+            .any(|allowed| allowed == scope))
+    }
+
     pub async fn open(dir: &Path) -> Result<Self> {
         config::verify_data_format(dir)?;
         let mut config = Config::load(dir)?;
         let process_lock = config::lock_data_dir(dir)?;
         let identity = config::identity(dir)?;
-        let mut store = Store::open(dir.join("node.sqlite3"))?;
-        if store.has_network()? {
-            let view = store.public_state()?.project()?;
-            if view.authorize_node(&identity.node_id()?, None).is_ok() {
-                store.save_local_device(&view.network_id, &identity)?;
-            }
-        }
+        let store = Store::open(dir.join("node.sqlite3"))?;
         let store = Arc::new(Mutex::new(store));
         let (hub, peer_rx) = PeerHub::new(identity.clone(), store.clone(), &config.roles);
         let (network, network_rx) = NetworkHub::new(identity.clone(), config.network.clone());
@@ -1471,44 +2076,14 @@ impl Runtime {
             }
             config.codex_socket = Some(socket_dir.join("codex.sock"));
         }
-        let mut codex_process = None;
-        if managed_socket && config.roles.contains(&NodeRole::Executor) {
-            let socket = config.codex_socket.as_ref().unwrap();
-            let existing = tokio::net::UnixStream::connect(socket).await.is_ok();
-            if !existing {
-                if socket.exists() {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::FileTypeExt;
-                        ensure!(
-                            std::fs::symlink_metadata(socket)?.file_type().is_socket(),
-                            "private Codex socket path is occupied by another file"
-                        );
-                    }
-                    std::fs::remove_file(socket)?;
-                }
-                match tokio::process::Command::new(&config.codex_bin)
-                    .args(["app-server", "--listen"])
-                    .arg(format!("unix://{}", socket.display()))
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()
-                {
-                    Ok(child) => codex_process = Some(child),
-                    Err(error) => {
-                        tracing::warn!(error=%error,"Codex not available; configure an executor before sending tasks")
-                    }
-                }
-            }
-        }
         let engine = Engine::new(
             ExecutorConfig {
                 codex_socket: config.codex_socket.clone(),
                 claude_bin: config.claude_bin.clone(),
                 cursor_bin: config.cursor_bin.clone(),
                 timeout_secs: config.timeout_secs,
+                execution_isolation: config.execution_isolation.clone(),
+                data_dir: Some(dir.to_path_buf()),
             },
             tx,
         );
@@ -1520,34 +2095,73 @@ impl Runtime {
             hub,
             events,
             agent_tokens: Mutex::new(HashMap::new()),
+            peer_connecting: Arc::new(Mutex::new(BTreeSet::new())),
             tool_url: std::sync::OnceLock::new(),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             completion_lock: Mutex::new(()),
+            execution_leases: Mutex::new(BTreeSet::new()),
             engine,
-            _codex_process: codex_process,
+            _codex_process: Mutex::new(None),
+            managed_codex: managed_socket,
             _process_lock: process_lock,
             peer_rx: Mutex::new(Some(peer_rx)),
             network_rx: Mutex::new(Some(network_rx)),
             engine_rx: Mutex::new(Some(rx)),
         })
     }
-    pub async fn install_membership(&self, incoming: NetworkState) -> Result<AuthorizationView> {
-        let _work = self.maintenance.enter()?;
-        let mut store = self.store.lock().await;
-        let view = store.install_state(incoming)?;
-        if view.authorize_node(&self.identity.node_id()?, None).is_ok() {
-            store.save_local_device(&view.network_id, &self.identity)?;
-        }
-        Ok(view)
-    }
-
     pub async fn has_membership(&self) -> Result<bool> {
-        self.store.lock().await.has_network()
+        Ok(!self.store.lock().await.networks()?.is_empty())
     }
 
-    pub async fn membership_state(&self) -> Result<NetworkState> {
-        self.store.lock().await.public_state()
+    async fn ensure_personal_provider(&self) -> Result<()> {
+        if !self.managed_codex {
+            return Ok(());
+        }
+        let mut managed = self._codex_process.lock().await;
+        if let Some(child) = managed.as_mut() {
+            ensure!(
+                child.try_wait()?.is_none(),
+                "managed Provider exited; reconcile active operations before restarting"
+            );
+            return Ok(());
+        }
+        let socket = self
+            .config
+            .codex_socket
+            .as_ref()
+            .context("private Provider socket is not configured")?;
+        if tokio::net::UnixStream::connect(socket).await.is_ok() {
+            return Ok(());
+        }
+        if socket.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                ensure!(
+                    std::fs::symlink_metadata(socket)?.file_type().is_socket(),
+                    "private Provider path is occupied"
+                );
+            }
+            std::fs::remove_file(socket)?;
+        }
+        let mut command = tokio::process::Command::new(&self.config.codex_bin);
+        command
+            .args(["app-server", "--listen"])
+            .arg(format!("unix://{}", socket.display()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        *managed = Some(
+            command
+                .spawn()
+                .context("managed Provider could not start")?,
+        );
+        Ok(())
     }
+
     pub fn info(&self) -> Value {
         json!({"node_id":self.identity.node_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
     }
@@ -1613,45 +2227,6 @@ impl Runtime {
         tokio::spawn(async move {
             if let Err(error) = transport.run(listen).await {
                 tracing::warn!(%error,"network discovery stopped");
-            }
-        });
-        let node = self.clone();
-        tokio::spawn(async move {
-            let connecting = Arc::new(Mutex::new(BTreeSet::new()));
-            let mut tick = tokio::time::interval(Duration::from_secs(3));
-            loop {
-                tick.tick().await;
-                let Ok(state) = node.store.lock().await.public_state() else {
-                    continue;
-                };
-                let Ok(view) = state.project() else { continue };
-                let online = node.hub.online(&view.network_id).await;
-                for member in view.members.into_iter().filter(|member| {
-                    member.kind == IdentityKind::Node && !view.revoked.contains(&member.subject_id)
-                }) {
-                    if member.subject_id == node.identity.node_id().unwrap_or_default()
-                        || online.contains(&member.subject_id)
-                    {
-                        continue;
-                    }
-                    let key = (view.network_id.clone(), member.subject_id.clone());
-                    if !connecting.lock().await.insert(key.clone()) {
-                        continue;
-                    }
-                    let node = node.clone();
-                    let connecting = connecting.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = node
-                            .hub
-                            .clone()
-                            .connect_target(key.0.clone(), key.1.clone(), node.network.clone())
-                            .await
-                        {
-                            tracing::debug!(%error,"personal peer reconnect pending");
-                        }
-                        connecting.lock().await.remove(&key);
-                    });
-                }
             }
         });
         let node = self.clone();
@@ -1732,86 +2307,75 @@ impl Runtime {
         }
         Ok(())
     }
-    pub async fn authorize_bearer(&self, token: &str) -> Option<Access> {
+    pub async fn authorize_bearer(&self, token: &str) -> Option<AgentSession> {
         self.agent_tokens.lock().await.get(token).cloned()
     }
-    pub async fn append(&self, network: &str, scope: &str, body: EventBody) -> Result<SignedEvent> {
-        self.append_blobs(network, scope, body, vec![]).await
+    fn publish_changed(&self, space: &str, conversation: &str, event_hash: &str) {
+        let _ = self.events.send(Update { network_id:space.to_owned(),payload:json!({"type":"changed","conversation_id":conversation,"event_hash":event_hash}) });
     }
-    pub async fn append_blobs(
+
+    async fn append_authorized(
         &self,
-        network: &str,
+        access: &Access,
         scope: &str,
+        body: EventBody,
+    ) -> Result<SignedEvent> {
+        let event = self.store.lock().await.append_authorized_event(
+            &self.identity,
+            &access.authorization,
+            &access.freshness,
+            &access.transport,
+            &access.body,
+            scope,
+            body,
+            vec![],
+            now_ms(),
+        )?;
+        self.publish_changed(&access.network_id, scope, &event.hash);
+        Ok(event)
+    }
+    async fn append_operation_fact(
+        &self,
+        request: &OperationRequest,
         body: EventBody,
         blobs: Vec<BlobRef>,
     ) -> Result<SignedEvent> {
-        let current = self.membership_state().await?;
-        ensure!(
-            current.genesis.network_id == network,
-            "wrong personal network"
-        );
-        let event = self.store.lock().await.append_event(
-            &self.identity,
-            network,
-            scope,
-            body,
-            blobs,
-            now_ms(),
-        )?;
-        self.publish_changed(network, scope, &event.hash);
+        let event = {
+            let mut store = self.store.lock().await;
+            let source = store
+                .operation_dispatch(&request.network_id, &request.operation_id)?
+                .context("admitted operation lost its dispatch proof")?;
+            store.append_derived_event(
+                &self.identity,
+                &request.network_id,
+                &source.hash,
+                body,
+                blobs,
+                now_ms(),
+            )?
+        };
+        self.publish_changed(&request.network_id, &request.conversation_id, &event.hash);
         Ok(event)
     }
-    fn publish_changed(&self, network: &str, scope: &str, event_hash: &str) {
-        let _ = self.events.send(Update {
-            network_id: network.into(),
-            payload: json!({"type":"changed","conversation_id":scope,"event_hash":event_hash}),
-        });
-    }
-    pub async fn raise_notification(
-        &self,
-        network: &str,
-        scope: &str,
-        kind: &str,
-        text: &str,
-    ) -> Result<()> {
-        self.append(
-            network,
-            scope,
-            EventBody::NotificationRaised {
-                notification_id: uuid::Uuid::new_v4().to_string(),
-                kind: kind.into(),
-                text: text.chars().take(8192).collect(),
-            },
-        )
-        .await?;
-        Ok(())
-    }
     async fn require_scope(&self, access: &Access, scope: &str) -> Result<()> {
-        let state = self.membership_state().await?;
-        ensure!(
-            state.genesis.network_id == access.network_id,
-            "wrong personal network"
-        );
         if let Some(allowed) = &access.conversation_id {
-            ensure!(allowed == scope, "outside this tool's conversation");
+            ensure!(allowed == scope, "outside this request's conversation");
         }
         let store = self.store.lock().await;
-        store.authorize_node(&access.network_id, &self.identity.node_id()?, None)?;
+        store
+            .authorization_state()
+            .check_current(&access.authorization, now_ms() as u64)?;
         ensure!(
             store
-                .conversations(&access.network_id)?
+                .authorized_conversation_ids(&access.authorization)?
                 .iter()
-                .any(|c| c.conversation_id == scope),
-            "conversation not found"
+                .any(|allowed| allowed == scope),
+            "conversation resource is outside the grant"
         );
         Ok(())
     }
     async fn require_role(&self, network: &str, role: NodeRole) -> Result<()> {
-        let state = self.membership_state().await?;
-        ensure!(
-            state.genesis.network_id == network,
-            "wrong personal network"
-        );
+        SpaceId::parse(network)?;
         ensure!(
             self.config.roles.contains(&role),
             "node capability is disabled"
@@ -1819,146 +2383,246 @@ impl Runtime {
         self.store
             .lock()
             .await
-            .authorize_node(network, &self.identity.node_id()?, Some(role))?;
+            .authorize_node(network, &self.identity.node_id()?, None)?;
         Ok(())
     }
     async fn peer_request(&self, network: &str, target: &str, payload: Value) -> Result<Value> {
+        if !self
+            .hub
+            .online(network)
+            .await
+            .iter()
+            .any(|peer| peer == target)
+        {
+            let key = (network.to_owned(), target.to_owned());
+            if self.peer_connecting.lock().await.insert(key.clone()) {
+                let hub = self.hub.clone();
+                let transport = self.network.clone();
+                let connecting = self.peer_connecting.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = hub
+                        .connect_target(key.0.clone(), key.1.clone(), transport)
+                        .await
+                    {
+                        tracing::debug!(%error,"scoped peer route unavailable");
+                    }
+                    connecting.lock().await.remove(&key);
+                });
+            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if self
+                        .hub
+                        .online(network)
+                        .await
+                        .iter()
+                        .any(|peer| peer == target)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .context("authenticated resource host is unreachable")?;
+        }
         let reply = self.hub.request(network, target, payload).await?;
         if let Some(error) = reply["error"].as_str() {
             bail!("{error}");
         }
         Ok(reply)
     }
-    pub async fn sync_all(&self, network: &str) -> Result<()> {
+    pub async fn sync_all(&self, space: &str) -> Result<()> {
         let _work = self.maintenance.enter()?;
-        let peers = self.hub.online(network).await;
-        let local = self.identity.node_id()?;
-        futures_util::stream::iter(peers.into_iter().filter(|p| p != &local))
-            .for_each_concurrent(4, |target| async move {
-                if let Err(error) = self.sync_from(network, &target).await {
-                    tracing::debug!(error=%error,"history sync pending");
-                }
-            })
-            .await;
-        Ok(())
-    }
-    async fn read_peer(&self, network: &str, target: &str, payload: Value) -> Result<Value> {
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            self.peer_request(network, target, payload),
-        )
-        .await
-        .context("history peer is currently unreachable")?
-    }
-    async fn sync_from(&self, network: &str, target: &str) -> Result<()> {
-        self.require_role(network, NodeRole::Replica).await?;
-        self.store
-            .lock()
-            .await
-            .authorize_node(network, target, Some(NodeRole::Replica))?;
-        let inventory = self
-            .read_peer(network, target, json!({"type":"inventory"}))
-            .await?;
-        let state: NetworkState = serde_json::from_value(inventory["membership"].clone())?;
-        ensure!(
-            state.genesis.network_id == network,
-            "wrong membership network"
-        );
-        self.install_membership(state).await?;
-        let scopes = inventory["scopes"]
-            .as_array()
-            .context("invalid inventory")?;
-        for scope in scopes {
-            let scope_id = field(scope, "scope_id")?;
-            let wanted: Vec<String> = serde_json::from_value(scope["heads"].clone())?;
-            self.fetch_closure(network, target, &wanted).await?;
-            let missing = self
-                .store
+        if !self.config.roles.contains(&NodeRole::Replica) {
+            return Ok(());
+        }
+        let service = self.audience()?.service;
+        let targets =
+            self.store
                 .lock()
                 .await
-                .context(network, scope_id, &wanted)?
-                .missing;
-            if missing.is_complete() {
-                let _ = self.events.send(Update {
-                    network_id: network.into(),
-                    payload: json!({"type":"changed","conversation_id":scope_id}),
-                });
+                .replication_targets(space, &service, now_ms() as u64)?;
+        for (resource, audience, target) in targets {
+            if target == self.identity.node_id()? {
+                continue;
+            }
+            if let Err(error) = self
+                .sync_resource_from(space, &resource, &audience, &target)
+                .await
+            {
+                tracing::debug!(%error,"authorized resource synchronization is pending");
             }
         }
         Ok(())
     }
-    async fn fetch_closure(&self, network: &str, target: &str, wanted: &[String]) -> Result<()> {
-        self.membership_state().await?;
-        self.store
-            .lock()
-            .await
-            .authorize_node(network, target, Some(NodeRole::Replica))?;
-        let mut pending: Vec<String> = wanted.to_vec();
+
+    async fn service_read_peer(
+        &self,
+        space: &str,
+        resource: &vibeface_secure::authorization::ResourceId,
+        audience: &Audience,
+        target: &str,
+        mut body: Value,
+    ) -> Result<Value> {
+        body["space_id"] = json!(space);
+        body["resource_id"] = json!(resource);
+        body["authorization_id"] = json!(uuid::Uuid::new_v4().to_string());
+        let identity = vibeface_secure::Identity::from_secret_hex(&self.identity.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let key = PublicKey::of(&identity);
+        let service = ServiceId::from_key(&key);
+        let template =
+            self.store
+                .lock()
+                .await
+                .service_grant(&body, audience, &service, now_ms() as u64)?;
+        ensure!(
+            template.actor == Actor::Service(service)
+                && template.device == DeviceId::from_key(&key),
+            "replication grant belongs to another service device"
+        );
+        let invocation = Signed::sign(template, &identity)?;
+        let kind = match field(&body, "method")? {
+            "replica_inventory" => "inventory",
+            "replica_event" => "event",
+            "replica_blob" => "blob",
+            _ => bail!("invalid replica read"),
+        };
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.peer_request(
+                space,
+                target,
+                json!({"type":kind,"authorization_body":body,"invocation":invocation}),
+            ),
+        )
+        .await
+        .context("authorized history peer is unreachable")?
+    }
+
+    async fn sync_resource_from(
+        &self,
+        space: &str,
+        resource: &vibeface_secure::authorization::ResourceId,
+        audience: &Audience,
+        target: &str,
+    ) -> Result<()> {
+        let mut after: Option<String> = None;
+        loop {
+            let inventory = self
+                .service_read_peer(
+                    space,
+                    resource,
+                    audience,
+                    target,
+                    json!({"method":"replica_inventory","after":after,"limit":128}),
+                )
+                .await?;
+            let wanted: Vec<String> = serde_json::from_value(inventory["events"].clone())?;
+            self.fetch_resource_closure(space, resource, audience, target, &wanted)
+                .await?;
+            let next = inventory["next_cursor"].as_str().map(str::to_owned);
+            if next.is_none() {
+                break;
+            }
+            ensure!(next > after, "resource inventory did not advance");
+            after = next;
+        }
+        Ok(())
+    }
+
+    async fn fetch_resource_closure(
+        &self,
+        space: &str,
+        resource: &vibeface_secure::authorization::ResourceId,
+        audience: &Audience,
+        target: &str,
+        wanted: &[String],
+    ) -> Result<()> {
+        let mut pending = wanted.to_vec();
         let mut seen = BTreeSet::new();
         while let Some(hash) = pending.pop() {
-            ensure!(seen.len() < 100_000, "history fetch exceeds bounded batch");
+            ensure!(
+                seen.len() < 100_000,
+                "resource history exceeds bounded batch"
+            );
             if !seen.insert(hash.clone()) {
                 continue;
             }
-            let local = self.store.lock().await.event(network, &hash)?;
-            let envelope = match local {
-                Some(e) => e,
+            let local = self.store.lock().await.event(space, &hash)?;
+            let envelope: SignedEvent = match local {
+                Some(event) => event,
                 None => serde_json::from_value(
-                    self.read_peer(network, target, json!({"type":"event","hash":hash}))
-                        .await?["event"]
+                    self.service_read_peer(
+                        space,
+                        resource,
+                        audience,
+                        target,
+                        json!({"method":"replica_event","hash":hash}),
+                    )
+                    .await?["event"]
                         .clone(),
                 )?,
             };
-            let event = self.store.lock().await.verify_event(network, &envelope)?;
+            let event = self.store.lock().await.verify_event(space, &envelope)?;
+            ensure!(
+                event.resource_id == *resource,
+                "history event is outside the authorized resource"
+            );
             pending.extend(event.parents.clone());
             pending.extend(event.previous.clone());
             for blob in &event.blobs {
-                if !self.store.lock().await.has_blob(network, blob)? {
-                    let mut bytes = Vec::with_capacity(blob.size as usize);
-                    while bytes.len() < (blob.size as usize) {
-                        let value=self.read_peer(network,target,json!({"type":"blob","hash":blob.hash,"offset":bytes.len(),"limit":65536})).await?;
-                        let encoded = value["data"].as_str().context("blob data is required")?;
-                        ensure!(encoded.len() <= 131072, "blob chunk too large");
-                        let chunk = hex::decode(encoded)?;
-                        ensure!(
-                            !chunk.is_empty()
-                                && chunk.len() <= 65536
-                                && bytes.len() + chunk.len() <= blob.size as usize,
-                            "invalid blob chunk"
-                        );
-                        bytes.extend(chunk);
-                    }
-                    self.store.lock().await.put_blob(network, blob, &bytes)?;
+                if self.store.lock().await.has_blob(space, blob)? {
+                    continue;
                 }
+                let mut bytes = Vec::with_capacity(blob.size as usize);
+                while bytes.len() < blob.size as usize {
+                    let chunk = self.service_read_peer(space,resource,audience,target,json!({"method":"replica_blob","hash":blob.hash,"offset":bytes.len(),"limit":65536})).await?;
+                    ensure!(
+                        chunk["hash"] == blob.hash
+                            && chunk["offset"].as_u64() == Some(bytes.len() as u64)
+                            && chunk["size"].as_u64() == Some(blob.size),
+                        "attachment chunk belongs to another object"
+                    );
+                    let encoded = chunk["data"]
+                        .as_str()
+                        .context("attachment chunk data is required")?;
+                    ensure!(encoded.len() <= 131072, "attachment chunk is too large");
+                    let data = hex::decode(encoded)?;
+                    ensure!(
+                        !data.is_empty()
+                            && data.len() <= 65536
+                            && bytes.len() + data.len() <= blob.size as usize,
+                        "invalid attachment chunk"
+                    );
+                    bytes.extend(data);
+                }
+                self.store.lock().await.put_blob(space, blob, &bytes)?;
             }
-            let mut store = self.store.lock().await;
-            store.authorize_node(network, target, Some(NodeRole::Replica))?;
-            store.ingest_event(network, &envelope)?;
+            self.store.lock().await.ingest_event(space, &envelope)?;
+            self.publish_changed(space, &event.scope_id, &envelope.hash);
         }
         Ok(())
     }
     fn capabilities(&self) -> Value {
-        json!({"roots":self.config.roots,"executors":["codex","claude_code","cursor_agent"],"manager":self.config.manager.as_ref().map(|m|m.provider.clone())})
+        json!({"executors":["codex","claude_code","cursor_agent"],"manager":self.config.manager.as_ref().map(|m|m.provider.clone())})
     }
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
         let _work = self.maintenance.enter()?;
-        let current = self.membership_state().await?;
+        access.require_body(&input)?;
         let network = &access.network_id;
-        ensure!(
-            current.genesis.network_id == *network,
-            "wrong personal network"
-        );
-        self.store
-            .lock()
-            .await
-            .authorize_node(network, &self.identity.node_id()?, None)?;
-        let method = field(&input, "method")?;
-        if !access.human {
-            ensure!(
-                matches!(method, "nodes" | "create_task" | "update_task" | "operate"),
-                "method unavailable to Agent tokens"
-            );
+        {
+            let store = self.store.lock().await;
+            let facts = store.request_facts(&input, &self.audience()?)?;
+            store.authorize_request(
+                access.authorization.signed_invocation(),
+                &facts,
+                &access.transport,
+                now_ms() as u64,
+            )?;
         }
+        let method = field(&input, "method")?;
         let scope = input["conversation_id"].as_str().map(String::from);
         if let Some(scope) = &scope
             && method != "create_conversation"
@@ -1967,62 +2631,42 @@ impl Runtime {
         }
         match method {
             "nodes" => {
-                let bundle = self
-                    .store
-                    .lock()
-                    .await
-                    .trust_bundle(network)?
-                    .context("unknown network")?;
-                let online = self.hub.online(network).await;
-                let local = self.identity.node_id()?;
-                let mut nodes = vec![];
-                let view = bundle.project()?;
-                let revoked_ids = view.revoked.clone();
-                for member in view
-                    .members
-                    .into_iter()
-                    .filter(|member| member.kind == IdentityKind::Node)
-                {
-                    let mut cert = member.certificate()?;
-                    cert.revoked = view.revoked.contains(&cert.node_id);
-                    let here = cert.node_id == local;
-                    let live = here || online.contains(&cert.node_id);
-                    let capabilities = if here {
-                        self.capabilities()
-                    } else if live && !cert.revoked {
-                        tokio::time::timeout(
-                            Duration::from_secs(3),
-                            self.peer_request(
-                                network,
-                                &cert.node_id,
-                                json!({"type":"capabilities"}),
-                            ),
-                        )
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .unwrap_or(Value::Null)
-                    } else {
-                        Value::Null
-                    };
-                    nodes.push(json!({"node_id":cert.node_id,"roles":cert.roles,"revoked":cert.revoked,"local":here,"online":live&&!cert.revoked,"capabilities":capabilities}));
-                }
-                let history = bundle.historical_nodes()?;
-                for revoked in revoked_ids {
-                    if nodes.iter().any(|node| node["node_id"] == revoked) {
-                        continue;
-                    }
-                    if history.iter().any(|node| node.subject_id == revoked) {
-                        nodes.push(json!({"node_id":revoked,"roles":[],"revoked":true,"local":false,"online":false,"capabilities":Value::Null}));
-                    }
-                }
-                Ok(json!({"nodes":nodes}))
+                let mut store = self.store.lock().await;
+                store.authorize_read(
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    now_ms() as u64,
+                )?;
+                ensure!(
+                    *access.authorization.audience() == self.audience()?,
+                    "grant targets another service"
+                );
+                Ok(
+                    json!({"nodes":[{"node_id":self.identity.node_id()?,"audience":self.audience()?,"roles":self.config.roles,"local":true,"online":true,"capabilities":self.capabilities()}]}),
+                )
             }
             "conversations" => {
-                Ok(json!({"conversations":self.store.lock().await.conversations(network)?}))
+                let mut store = self.store.lock().await;
+                store.authorize_read(
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    now_ms() as u64,
+                )?;
+                let allowed = store.authorized_conversation_ids(&access.authorization)?;
+                let conversations = store
+                    .conversations(network)?
+                    .into_iter()
+                    .filter(|conversation| allowed.contains(&conversation.conversation_id))
+                    .collect::<Vec<_>>();
+                Ok(json!({"conversations":conversations}))
             }
             "create_conversation" => {
-                ensure!(access.human, "only the user creates conversations");
+                ensure!(
+                    access.account_actor(),
+                    "only the user creates conversations"
+                );
                 let scope = id(&input, "conversation_id")?;
                 let title = field(&input, "title")?;
                 ensure!(title.len() <= 512, "title too long");
@@ -2037,8 +2681,8 @@ impl Runtime {
                         return Ok(json!(old));
                     }
                 }
-                self.append(
-                    network,
+                self.append_authorized(
+                    &access,
                     &scope,
                     EventBody::ConversationCreated {
                         title: title.into(),
@@ -2051,20 +2695,74 @@ impl Runtime {
             }
             "conversation" => {
                 let scope = scope.context("conversation_id is required")?;
-                self.sync_all(network).await?;
-                let facts = self.current_facts(network, &scope).await?;
-                let store = self.store.lock().await;
+                let mut store = self.store.lock().await;
+                store.authorize_read(
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    now_ms() as u64,
+                )?;
                 let context = store.context(network, &scope, &heads(&input)?)?;
+                let operations = store
+                    .operations(network)?
+                    .into_iter()
+                    .filter(|operation| operation.request.conversation_id == scope)
+                    .collect::<Vec<_>>();
+                let sessions = session_views(&store, network, &scope, &operations)?;
                 Ok(
-                    json!({"conversation":store.conversations(network)?.into_iter().find(|c|c.conversation_id==scope),"messages":store.messages(network,&scope)?,"tasks":store.tasks(network,&scope)?,"heads":context.heads,"missing":context.missing,"sessions":facts["sessions"],"operations":facts["operations"]}),
+                    json!({"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),"messages":store.messages(network,&scope)?,"tasks":task_views(&store,network,&scope)?,"heads":context.heads,"missing":context.missing,"sessions":sessions,"operations":operations}),
+                )
+            }
+            "context" => {
+                let scope = scope.context("conversation_id is required")?;
+                let mut store = self.store.lock().await;
+                store.authorize_read(
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    now_ms() as u64,
+                )?;
+                let context = store.context(network, &scope, &[])?;
+                let offset = input["offset"].as_u64().unwrap_or(0).min(usize::MAX as u64) as usize;
+                let limit = input["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+                if let Some(hash) = input["blob_hash"].as_str() {
+                    ensure!(
+                        context
+                            .events
+                            .iter()
+                            .filter(|event| event.scope_id == scope)
+                            .flat_map(|event| &event.blobs)
+                            .any(|blob| blob.hash == hash),
+                        "attachment is outside the authorized resource"
+                    );
+                    let bytes = store
+                        .get_blob(network, hash)?
+                        .context("attachment unavailable")?;
+                    let end = offset.saturating_add(limit * 1024).min(bytes.len());
+                    ensure!(offset <= end, "invalid attachment offset");
+                    return Ok(
+                        json!({"hash":hash,"offset":offset,"data_hex":hex::encode(&bytes[offset..end]),"next_offset":(end<bytes.len()).then_some(end),"size":bytes.len()}),
+                    );
+                }
+                let events = context
+                    .events
+                    .into_iter()
+                    .filter(|event| event.scope_id == scope)
+                    .collect::<Vec<_>>();
+                let end = offset.saturating_add(limit).min(events.len());
+                ensure!(offset <= end, "invalid event offset");
+                Ok(
+                    json!({"heads":context.heads,"missing":context.missing,"events":&events[offset..end],"next_offset":(end<events.len()).then_some(end)}),
                 )
             }
             "message" => {
-                ensure!(access.human, "agents cannot recursively invoke managers");
+                ensure!(
+                    access.account_actor(),
+                    "agents cannot recursively invoke managers"
+                );
                 let scope = scope.context("conversation_id is required")?;
                 let message_id = id(&input, "message_id")?;
                 let text = field(&input, "text")?.to_owned();
-                self.sync_all(network).await?;
                 ensure!(
                     self.store
                         .lock()
@@ -2078,6 +2776,10 @@ impl Runtime {
                     .as_str()
                     .unwrap_or(&self.identity.node_id()?)
                     .to_owned();
+                ensure!(
+                    target == self.identity.node_id()?,
+                    "message must target this resource host's scheduler"
+                );
                 let trigger = {
                     let mut store = self.store.lock().await;
                     let duplicate = store
@@ -2099,9 +2801,12 @@ impl Runtime {
                         );
                         old.event_hash
                     } else {
-                        let event = store.append_event(
+                        let event = store.append_authorized_event(
                             &self.identity,
-                            network,
+                            &access.authorization,
+                            &access.freshness,
+                            &access.transport,
+                            &access.body,
                             &scope,
                             EventBody::MessagePosted {
                                 message_id,
@@ -2118,7 +2823,8 @@ impl Runtime {
                 };
                 if target == self.identity.node_id()? {
                     self.require_role(network, NodeRole::Scheduler).await?;
-                    self.spawn_scheduler(network.clone(), scope, trigger.clone())?;
+                    self.spawn_scheduler(network.clone(), scope, trigger.clone())
+                        .await?;
                     Ok(json!({"state":"accepted","trigger":trigger}))
                 } else {
                     self.peer_request(
@@ -2131,73 +2837,79 @@ impl Runtime {
             }
             "create_task" => {
                 ensure!(
-                    access.human || input["auto_followup"].as_bool() != Some(true),
-                    "automatic follow-up needs user authorization"
+                    access.account_actor() || input["auto_followup"].as_bool() != Some(true),
+                    "Agent cannot grant follow-up authority"
                 );
-                if input["auto_followup"].as_bool() == Some(true) {
-                    self.require_role(network, NodeRole::Gateway).await?;
-                }
                 let scope = scope.context("conversation_id is required")?;
                 let task_id = id(&input, "task_id")?;
                 let title = field(&input, "title")?;
                 let goal = field(&input, "goal")?;
                 let acceptance = field(&input, "acceptance")?;
-                let result = {
-                    let mut store = self.store.lock().await;
-                    let existing = store
-                        .tasks(network, &scope)?
-                        .into_iter()
-                        .find(|task| task.task_id == task_id);
-                    let terminal = existing.as_ref().is_some_and(|task| {
-                        matches!(task.status.as_str(), "accepted" | "cancelled")
-                    });
-                    let result = if let Some(old) = existing {
-                        ensure!(
-                            old.title == title && old.goal == goal && old.acceptance == acceptance,
-                            "task ID reused with different content"
-                        );
-                        json!(old)
-                    } else {
-                        let event = store.append_event(
-                            &self.identity,
-                            network,
-                            &scope,
-                            EventBody::TaskCreated {
-                                task_id: task_id.clone(),
-                                title: title.into(),
-                                goal: goal.into(),
-                                acceptance: acceptance.into(),
-                            },
-                            vec![],
-                            now_ms(),
-                        )?;
-                        self.publish_changed(network, &scope, &event.hash);
-                        json!(event)
-                    };
-                    if input["auto_followup"].as_bool() == Some(true)
-                        && !terminal
-                        && !followup_authorized(&store, network, &scope, &task_id)?
-                    {
-                        let event = store.append_event(
-                            &self.identity,
-                            network,
-                            &scope,
-                            EventBody::DecisionRecorded {
-                                decision_id: format!("auto:{task_id}"),
-                                text: format!(
-                                    "User enabled bounded automatic follow-up for task {task_id}"
-                                ),
-                                effective_constraints: vec![format!("auto_followup:{task_id}")],
-                                tool_configuration: json!({"auto_followup":task_id}),
-                            },
-                            vec![],
-                            now_ms(),
-                        )?;
-                        self.publish_changed(network, &scope, &event.hash);
-                    }
-                    result
-                };
-                Ok(result)
+                let mut store = self.store.lock().await;
+                let existing = store
+                    .tasks(network, &scope)?
+                    .into_iter()
+                    .find(|task| task.task_id == task_id);
+                let terminal = existing
+                    .as_ref()
+                    .is_some_and(|task| matches!(task.status.as_str(), "accepted" | "cancelled"));
+                let mut events = Vec::new();
+                if let Some(old) = &existing {
+                    ensure!(
+                        old.title == title && old.goal == goal && old.acceptance == acceptance,
+                        "task ID reused with different content"
+                    );
+                } else {
+                    events.push((
+                        scope.clone(),
+                        EventBody::TaskCreated {
+                            task_id: task_id.clone(),
+                            title: title.into(),
+                            goal: goal.into(),
+                            acceptance: acceptance.into(),
+                        },
+                        vec![],
+                    ));
+                }
+                if input["auto_followup"].as_bool() == Some(true)
+                    && !terminal
+                    && !followup_authorized(&store, network, &scope, &task_id)?
+                {
+                    events.push((
+                        scope.clone(),
+                        EventBody::DecisionRecorded {
+                            decision_id: format!("auto:{task_id}"),
+                            text: format!(
+                                "User enabled bounded automatic follow-up for task {task_id}"
+                            ),
+                            effective_constraints: vec![format!("auto_followup:{task_id}")],
+                            tool_configuration: json!({"auto_followup":task_id}),
+                        },
+                        vec![],
+                    ));
+                }
+                let appended = store.append_authorized_events(
+                    &self.identity,
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    &access.body,
+                    events,
+                    now_ms(),
+                )?;
+                for event in &appended {
+                    self.publish_changed(network, &scope, &event.hash);
+                }
+                let creation = store.task_creation(network, &scope, &task_id)?;
+                let event = store.verify_event(network, &creation)?;
+                let authority = store.authorize_node(network, &event.author, None)?;
+                let task = task_views(&store, network, &scope)?
+                    .into_iter()
+                    .find(|task| task["task_id"].as_str() == Some(task_id.as_str()))
+                    .context("created task projection is unavailable")?;
+                Ok(
+                    json!({"task":task,"creation":creation,"authority_public_key":authority.public_key,"binding":store.task_binding(network,&creation.hash)?}),
+                )
             }
             "update_task" => {
                 let scope = scope.context("conversation_id is required")?;
@@ -2211,25 +2923,26 @@ impl Runtime {
                     "invalid task status"
                 );
                 ensure!(
-                    access.human || !matches!(status, "accepted" | "cancelled"),
+                    access.account_actor() || !matches!(status, "accepted" | "cancelled"),
                     "only the user accepts or cancels tasks"
                 );
                 let event = {
                     let mut store = self.store.lock().await;
-                    require_task_write(&store, network, &scope, &task_id, access.human)?;
-                    store.append_event(
+                    require_task_write(&store, network, &scope, &task_id, access.account_actor())?;
+                    store.append_authorized_event(
                         &self.identity,
-                        network,
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        &access.body,
                         &scope,
                         EventBody::TaskChanged {
                             task_id,
                             status: status.into(),
                             detail: input["detail"]
                                 .as_str()
-                                .unwrap_or("")
-                                .chars()
-                                .take(65536)
-                                .collect(),
+                                .context("task detail is required")?
+                                .to_owned(),
                         },
                         vec![],
                         now_ms(),
@@ -2237,6 +2950,92 @@ impl Runtime {
                 };
                 self.publish_changed(network, &scope, &event.hash);
                 Ok(json!(event))
+            }
+            "agent_notification" => {
+                ensure!(
+                    matches!(access.authorization.actor(), Actor::Service(_)),
+                    "manager notifications require service authority"
+                );
+                let scope = scope.context("conversation_id is required")?;
+                let event = self
+                    .append_authorized(
+                        &access,
+                        &scope,
+                        EventBody::NotificationRaised {
+                            notification_id: id(&input, "notification_id")?,
+                            kind: id(&input, "kind")?,
+                            text: field(&input, "text")?.to_owned(),
+                        },
+                    )
+                    .await?;
+                Ok(json!({"event":event}))
+            }
+            "agent_result" => {
+                ensure!(
+                    matches!(access.authorization.actor(), Actor::Service(_)),
+                    "manager results require service authority"
+                );
+                let scope = scope.context("conversation_id is required")?;
+                let blobs: Vec<BlobRef> = serde_json::from_value(input["blobs"].clone())?;
+                let events = vec![
+                    (
+                        scope.clone(),
+                        EventBody::DecisionRecorded {
+                            decision_id: id(&input, "decision_id")?,
+                            text: field(&input, "text")?.to_owned(),
+                            effective_constraints: serde_json::from_value(
+                                input["effective_constraints"].clone(),
+                            )?,
+                            tool_configuration: input["tool_configuration"].clone(),
+                        },
+                        vec![],
+                    ),
+                    (
+                        scope.clone(),
+                        EventBody::MessagePosted {
+                            message_id: id(&input, "message_id")?,
+                            role: "assistant".into(),
+                            text: field(&input, "output")?.to_owned(),
+                            scheduler_node: None,
+                        },
+                        blobs,
+                    ),
+                ];
+                let appended = self.store.lock().await.append_authorized_events(
+                    &self.identity,
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    &access.body,
+                    events,
+                    now_ms(),
+                )?;
+                for event in &appended {
+                    self.publish_changed(network, &scope, &event.hash);
+                }
+                Ok(json!({"events":appended}))
+            }
+            "bind_execution" => {
+                let binding = self.store.lock().await.bind_task_authorized(
+                    &self.identity,
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    &access.body,
+                    now_ms() as u64,
+                )?;
+                Ok(json!({"binding":binding}))
+            }
+            "seal_execution" => {
+                let seal = self.store.lock().await.seal_task_authorized(
+                    &self.identity,
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    &input,
+                    now_ms() as u64,
+                )?;
+                Ok(json!({"seal":seal}))
             }
             "rebind_execution" => self.rebind_execution(&access, &input).await,
             "operate" => {
@@ -2246,34 +3045,66 @@ impl Runtime {
                 self.dispatch(access, request).await
             }
             "session" => {
-                self.session_fact(
-                    network,
-                    field(&input, "target_node")?,
-                    field(&input, "session_id")?,
-                )
-                .await
+                let target = field(&input, "target_node")?;
+                ensure!(
+                    target == self.identity.node_id()?,
+                    "query the target service directly"
+                );
+                let mut store = self.store.lock().await;
+                store.authorize_read(
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    now_ms() as u64,
+                )?;
+                Ok(json!({"session":store.session(network,target,field(&input,"session_id")?)?}))
             }
             "operation" => {
                 let target = field(&input, "target_node")?;
-                let op = field(&input, "operation_id")?;
-                if target == self.identity.node_id()? {
-                    Ok(json!({"operation":self.store.lock().await.operation(network,op)?}))
-                } else {
-                    self.peer_request(
-                        network,
-                        target,
-                        json!({"type":"operation","operation_id":op}),
-                    )
-                    .await
-                }
+                ensure!(
+                    target == self.identity.node_id()?,
+                    "query the target service directly"
+                );
+                let mut store = self.store.lock().await;
+                store.authorize_read(
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    now_ms() as u64,
+                )?;
+                Ok(json!({"operation":store.operation(network,field(&input,"operation_id")?)?}))
             }
-            "notifications" => Ok(
-                json!({"notifications":self.store.lock().await.pending_notifications(network,field(&input,"client_id")?)?}),
-            ),
+            "notifications" => {
+                ensure!(
+                    input["client_id"].as_str() == Some(access.authorization.device().as_str()),
+                    "notification client differs from authenticated device"
+                );
+                let mut store = self.store.lock().await;
+                store.authorize_read(
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    now_ms() as u64,
+                )?;
+                let allowed = store.authorized_conversation_ids(&access.authorization)?;
+                let notifications = store
+                    .pending_notifications(network, access.authorization.device().as_str())?
+                    .into_iter()
+                    .filter(|notification| allowed.contains(&notification.conversation_id))
+                    .collect::<Vec<_>>();
+                Ok(json!({"notifications":notifications}))
+            }
             "ack" => {
-                ensure!(access.human, "only clients acknowledge notifications");
+                ensure!(
+                    access.account_actor(),
+                    "only clients acknowledge notifications"
+                );
                 let notification = id(&input, "notification_id")?;
                 let client = id(&input, "client_id")?;
+                ensure!(
+                    client == access.authorization.device().as_str(),
+                    "notification client differs from authenticated device"
+                );
                 let pending = self
                     .store
                     .lock()
@@ -2283,8 +3114,8 @@ impl Runtime {
                     .into_iter()
                     .find(|n| n.notification_id == notification)
                 {
-                    self.append(
-                        network,
+                    self.append_authorized(
+                        &access,
                         &n.conversation_id,
                         EventBody::NotificationAcknowledged {
                             notification_id: notification,
@@ -2297,12 +3128,23 @@ impl Runtime {
             }
             "export" => {
                 let scope = scope.context("conversation_id is required")?;
-                Ok(json!(
-                    self.store.lock().await.export_snapshot(network, &scope)?
-                ))
+                let mut store = self.store.lock().await;
+                store.authorize_read(
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    now_ms() as u64,
+                )?;
+                Ok(json!(store.export_snapshot(network, &scope)?))
             }
             "reconcile" => {
-                ensure!(access.human, "reconciliation requires the user");
+                ensure!(access.account_actor(), "reconciliation requires the user");
+                self.store.lock().await.authorize_read(
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    now_ms() as u64,
+                )?;
                 self.reconcile(
                     network,
                     field(&input, "target_node")?,
@@ -2311,149 +3153,229 @@ impl Runtime {
                 .await
             }
             "resolve_unknown" => {
-                ensure!(access.human, "resolution requires the user");
-                self.resolve_unknown(network, &input).await
+                ensure!(access.account_actor(), "resolution requires the user");
+                self.resolve_unknown(&access, &input).await
             }
             _ => bail!("unknown method"),
         }
     }
     pub async fn tool(
         self: &Arc<Self>,
-        access: Access,
+        session: AgentSession,
         name: &str,
         args: Value,
-        _call_id: &str,
+        call_id: &str,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
-        ensure!(!access.human, "tool endpoint requires a scoped Agent token");
-        let scope = access
-            .conversation_id
-            .clone()
-            .context("missing tool scope")?;
-        self.require_scope(&access, &scope).await?;
-        match name {
-            "nodes" => self.rpc(access, json!({"method":"nodes"})).await,
+        ensure!(args.is_object(), "tool arguments must be an object");
+        self.store.lock().await.manager_tool_authorization(
+            session.space_id.as_str(),
+            &format!("manager:{}", session.sdk_session.session_id),
+            now_ms() as u64,
+        )?;
+        let mut body = match name {
+            "nodes" => json!({"method":"nodes"}),
             "context" => {
-                let context = self
-                    .store
-                    .lock()
-                    .await
-                    .context(&access.network_id, &scope, &[])?;
-                let offset = args["offset"].as_u64().unwrap_or(0).min(usize::MAX as u64) as usize;
-                let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
-                if let Some(hash) = args["blob_hash"].as_str() {
-                    ensure!(
-                        context
-                            .events
-                            .iter()
-                            .filter(|e| e.scope_id == scope)
-                            .flat_map(|e| &e.blobs)
-                            .any(|b| b.hash == hash),
-                        "blob outside this conversation"
-                    );
-                    let bytes = self
-                        .store
-                        .lock()
-                        .await
-                        .get_blob(&access.network_id, hash)?
-                        .context("blob not available")?;
-                    let end = offset.saturating_add(limit * 1024).min(bytes.len());
-                    ensure!(offset <= end, "invalid blob offset");
-                    return Ok(
-                        json!({"hash":hash,"offset":offset,"data_hex":hex::encode(&bytes[offset..end]),"next_offset":(end<bytes.len()).then_some(end),"size":bytes.len()}),
-                    );
-                }
-                let events: Vec<_> = context
-                    .events
-                    .into_iter()
-                    .filter(|e| e.scope_id == scope)
-                    .collect();
-                let end = offset.saturating_add(limit).min(events.len());
-                ensure!(offset <= end, "invalid event offset");
-                Ok(
-                    json!({"heads":context.heads,"missing":context.missing,"events":&events[offset..end],"next_offset":(end<events.len()).then_some(end)}),
-                )
+                let mut body = args;
+                body["method"] = json!("context");
+                body
             }
             "create_task" | "update_task" => {
-                let mut request = args;
-                ensure!(request.is_object(), "tool arguments must be object");
-                request["method"] = json!(name);
-                request["conversation_id"] = json!(scope);
-                request.as_object_mut().unwrap().remove("auto_followup");
-                self.rpc(access, request).await
+                let mut body = args;
+                body["method"] = json!(name);
+                ensure!(
+                    body["auto_followup"].as_bool() != Some(true),
+                    "Agent cannot grant follow-up authority"
+                );
+                body
+            }
+            "bind_execution" => {
+                let mut body = args;
+                let task_id = id(&body, "task_id")?;
+                let store = self.store.lock().await;
+                let creation = store.task_creation(
+                    session.space_id.as_str(),
+                    &session.conversation_id,
+                    &task_id,
+                )?;
+                let event = store.verify_event(session.space_id.as_str(), &creation)?;
+                ensure!(
+                    event.resource_id == session.resource_id,
+                    "task belongs to another resource"
+                );
+                body["method"] = json!("bind_execution");
+                body["task_ref"] = json!(creation.hash);
+                body
             }
             "open_execution" | "send_execution" => {
-                let target = field(&args, "target_node")?;
-                let session = id(&args, "session_id")?;
                 let operation = id(&args, "operation_id")?;
                 let action = if name == "open_execution" {
                     json!({"type":"open","executor":field(&args,"executor")?,"cwd":field(&args,"cwd")?})
                 } else {
                     json!({"type":"send","text":field(&args,"text")?})
                 };
-                let context = self
-                    .store
-                    .lock()
-                    .await
-                    .context(&access.network_id, &scope, &[])?
-                    .events;
-                let previous = context.into_iter().find_map(|event| match event.body {
-                    EventBody::DispatchRecorded {
-                        operation_id,
-                        action,
-                        ..
-                    } if event.scope_id == scope && operation_id == operation => Some(action),
-                    _ => None,
-                });
-                if let Some(previous) = previous {
-                    let request: OperationRequest = serde_json::from_value(previous)?;
-                    let requested_task = args["task_id"].as_str();
-                    ensure!(
-                        request.target_node == target
-                            && request.session_id == session
-                            && request.action == action
-                            && requested_task
-                                .is_none_or(|task| request.task_id.as_deref() == Some(task))
-                            && request.expected_revision
-                                == args["expected_revision"].as_u64().unwrap_or(0),
-                        "operation ID reused with different tool arguments"
-                    );
-                    return self.dispatch(access, request).await;
-                }
-                let basis = self.store.lock().await.heads(&access.network_id, &scope)?;
                 let request = OperationRequest {
-                    operation_id: operation,
-                    network_id: access.network_id.clone(),
-                    conversation_id: scope,
-                    task_id: args["task_id"].as_str().map(String::from),
-                    target_node: target.into(),
-                    session_id: session,
+                    operation_id: operation.clone(),
+                    network_id: session.space_id.to_string(),
+                    conversation_id: session.conversation_id.clone(),
+                    task_id: Some(id(&args, "task_id")?),
+                    target_node: field(&args, "target_node")?.to_owned(),
+                    session_id: id(&args, "session_id")?,
                     expected_revision: args["expected_revision"].as_u64().unwrap_or(0),
-                    basis_heads: basis,
+                    basis_heads: self
+                        .store
+                        .lock()
+                        .await
+                        .heads(session.space_id.as_str(), &session.conversation_id)?,
                     action,
                     resources: vec![],
                     binding: None,
                 };
-                self.dispatch(access, request).await
+                json!({"method":"operate","request":request,"authorization_id":operation})
             }
             "execution_status" => {
-                self.require_execution_scope(
-                    &access,
-                    &scope,
-                    field(&args, "target_node")?,
-                    field(&args, "session_id")?,
-                )
-                .await?;
-                self.session_fact(
-                    &access.network_id,
-                    field(&args, "target_node")?,
-                    field(&args, "session_id")?,
-                )
-                .await
+                json!({"method":"session","target_node":field(&args,"target_node")?,"session_id":field(&args,"session_id")?})
             }
             _ => bail!("unknown or unavailable tool"),
+        };
+        body["space_id"] = json!(session.space_id);
+        body["resource_id"] = json!(session.resource_id);
+        body["conversation_id"] = json!(session.conversation_id);
+        body["sdk_session"] = json!(session.sdk_session);
+        body["parent_invocation"] = json!(session.parent_invocation);
+        if body.get("authorization_id").is_none() {
+            body["authorization_id"] = json!(call_id);
         }
+        let body = self.normalize_request_body(&session.space_id, body).await?;
+        let access = self.authorize_agent(&session, body.clone()).await?;
+        self.rpc(access, body).await
     }
+
+    async fn authorize_agent(&self, session: &AgentSession, body: Value) -> Result<Access> {
+        let now = now_ms() as u64;
+        let (session, facts) = {
+            let mut store = self.store.lock().await;
+            let session = store.refresh_agent_session(session, now)?;
+            let facts = store.request_facts(&body, &self.audience()?)?;
+            (session, facts)
+        };
+        let identity = vibeface_secure::Identity::from_secret_hex(&self.identity.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let key = PublicKey::of(&identity);
+        ensure!(
+            ServiceId::from_key(&key) == session.service
+                && DeviceId::from_key(&key) == session.device,
+            "Agent session is owned by another service"
+        );
+        ensure!(now < session.expires_at_ms, "Agent delegation expired");
+        let invocation = Signed::sign(
+            Invocation {
+                version: AUTH_VERSION,
+                actor: Actor::Service(session.service.clone()),
+                device: session.device.clone(),
+                initiator: session.initiator,
+                initiating_grant: session.initiating_grant,
+                resource: facts.resource,
+                action: facts.action,
+                audience: facts.audience,
+                presenter: session.device,
+                operation_id: facts.operation_id,
+                body_hash: facts.body_hash,
+                grant_leaf: session.grant_leaf,
+                expected_policies: session.expected_policies,
+                context: facts.context,
+                nonce: Nonce::random()?,
+                not_before_ms: now,
+                expires_at_ms: now
+                    .saturating_add(INVOCATION_MAX_AGE_MS)
+                    .min(session.expires_at_ms),
+            },
+            &identity,
+        )?;
+        self.authorize_rpc(
+            body,
+            invocation,
+            TransportEvidence::LocalAgentAdapter {
+                service: session.service,
+                session: session.sdk_session,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn claim_manager(
+        &self,
+        session: &AgentSession,
+        trigger: &str,
+        boot: &str,
+        sdk_config: &str,
+    ) -> Result<crate::identity::admission::ManagerAdmission> {
+        let body = json!({"method":"agent_start","space_id":session.space_id,
+            "resource_id":session.resource_id,"authorization_id":format!("manager:{trigger}"),
+            "conversation_id":session.conversation_id,"trigger":trigger,
+            "sdk_session":session.sdk_session,"parent_invocation":session.parent_invocation,
+            "sdk_config":sdk_config});
+        let access = self.authorize_agent(session, body.clone()).await?;
+        self.store.lock().await.claim_authorized_manager(
+            &access.authorization,
+            &access.freshness,
+            &access.transport,
+            &body,
+            boot,
+            sdk_config,
+            now_ms() as u64,
+        )
+    }
+
+    pub(crate) async fn renew_manager_authorization(
+        &self,
+        context: &ExecutionContext,
+    ) -> Result<u64> {
+        let auth = self.store.lock().await.manager_authorization(
+            context.space_id.as_str(),
+            &context.operation_id,
+            now_ms() as u64,
+        )?;
+        let proof = self.freshness(&auth, CheckStage::Renew).await?;
+        self.store.lock().await.renew_authorized_manager(
+            context.space_id.as_str(),
+            &context.operation_id,
+            &proof,
+            now_ms() as u64,
+        )
+    }
+
+    pub async fn record_agent_result(
+        self: &Arc<Self>,
+        session: &AgentSession,
+        mut body: Value,
+    ) -> Result<Value> {
+        body["method"] = json!("agent_result");
+        body["space_id"] = json!(session.space_id);
+        body["resource_id"] = json!(session.resource_id);
+        body["conversation_id"] = json!(session.conversation_id);
+        body["sdk_session"] = json!(session.sdk_session);
+        body["parent_invocation"] = json!(session.parent_invocation);
+        let access = self.authorize_agent(session, body.clone()).await?;
+        self.rpc(access, body).await
+    }
+
+    pub async fn agent_notification(
+        self: &Arc<Self>,
+        session: &AgentSession,
+        kind: &str,
+        text: &str,
+    ) -> Result<Value> {
+        let id = format!("manager:{}:{}", session.sdk_session.session_id, kind);
+        let body = json!({
+            "method":"agent_notification","space_id":session.space_id,"resource_id":session.resource_id,
+            "conversation_id":session.conversation_id,"sdk_session":session.sdk_session,"parent_invocation":session.parent_invocation,
+            "authorization_id":id,"notification_id":id,"kind":kind,"text":text,
+        });
+        let access = self.authorize_agent(session, body.clone()).await?;
+        self.rpc(access, body).await
+    }
+
     async fn cache_context_bindings(&self, network: &str, scope: &str) -> Result<()> {
         let context = self.store.lock().await.context(network, scope, &[])?;
         let mut proofs = context
@@ -2477,334 +3399,78 @@ impl Runtime {
         Ok(())
     }
 
-    async fn confirm_binding(
-        self: &Arc<Self>,
-        binding: crate::binding::TaskBinding,
-    ) -> Result<crate::binding::SignedBinding> {
-        let proof = if binding.authority_node == self.identity.node_id()? {
-            self.store
-                .lock()
-                .await
-                .bind_task(&self.identity, &binding)?
-        } else {
-            let reply = self
-                .peer_request(
-                    &binding.network_id,
-                    &binding.authority_node,
-                    serde_json::json!({"type":"bind_task","binding":binding}),
-                )
-                .await
-                .context("task binding authority is unreachable; execution was not reassigned")?;
-            serde_json::from_value(reply["binding"].clone())?
-        };
-        self.store.lock().await.install_binding(&proof)?;
-        Ok(proof)
-    }
-
     async fn prepare_operation_binding(
         self: &Arc<Self>,
         request: &mut OperationRequest,
     ) -> Result<()> {
-        self.cache_context_bindings(&request.network_id, &request.conversation_id)
-            .await?;
-        if let Some(proof) = &request.binding {
-            self.store.lock().await.install_binding(proof)?;
-            return self.store.lock().await.validate_operation_binding(request);
-        }
-        if request.task_id.is_none() {
-            let context = self.store.lock().await.context(
-                &request.network_id,
-                &request.conversation_id,
-                &[],
-            )?;
-            if let Some(proof) = context.events.iter().rev().find_map(|event| {
-                if let EventBody::DispatchRecorded {
-                    action,
-                    target_node,
-                    session_id,
-                    ..
-                } = &event.body
-                    && target_node == &request.target_node
-                    && session_id == &request.session_id
-                {
-                    serde_json::from_value::<OperationRequest>(action.clone())
-                        .ok()
-                        .and_then(|request| request.binding)
-                } else {
-                    None
-                }
-            }) {
-                request.task_id = Some(proof.binding.task_id.clone());
-                request.binding = Some(proof);
-                return self.store.lock().await.validate_operation_binding(request);
-            }
-            let task_id = format!(
-                "execution-{}",
-                crypto::digest(&serde_json::to_vec(&(
-                    &request.target_node,
-                    &request.session_id
-                ))?)
-            );
-            if !self
-                .store
-                .lock()
-                .await
-                .tasks(&request.network_id, &request.conversation_id)?
-                .iter()
-                .any(|task| task.task_id == task_id)
-            {
-                self.append(
-                    &request.network_id,
-                    &request.conversation_id,
-                    EventBody::TaskCreated {
-                        task_id: task_id.clone(),
-                        title: "Execution session".into(),
-                        goal: "User-requested execution".into(),
-                        acceptance: "The user verifies the result".into(),
-                    },
-                )
-                .await?;
-            }
-            request.task_id = Some(task_id);
-        }
-        let task_id = request
-            .task_id
-            .as_ref()
-            .context("task binding requires a task")?;
-        let (creation, event) = {
+        if request.binding.is_none() {
+            let task = request
+                .task_id
+                .as_ref()
+                .context("create a task and explicitly bind its execution before operating")?;
             let store = self.store.lock().await;
             let creation =
-                store.task_creation(&request.network_id, &request.conversation_id, task_id)?;
-            let event = store.verify_event(&request.network_id, &creation)?;
-            (creation, event)
-        };
-        let mut existing = self
-            .store
-            .lock()
-            .await
-            .task_binding(&request.network_id, &creation.hash)?;
-        if event.author != self.identity.node_id()?
-            && existing.as_ref().is_none_or(|proof| {
-                proof.binding.target_node != request.target_node
-                    || proof.binding.session_id != request.session_id
-            })
-            && let Ok(reply) = self
-                .peer_request(
-                    &request.network_id,
-                    &event.author,
-                    serde_json::json!({"type":"task_binding","task_ref":creation.hash}),
-                )
-                .await
-            && !reply["binding"].is_null()
-        {
-            let proof: crate::binding::SignedBinding =
-                serde_json::from_value(reply["binding"].clone())?;
-            self.store.lock().await.install_binding(&proof)?;
-            existing = Some(proof);
+                store.task_creation(&request.network_id, &request.conversation_id, task)?;
+            request.binding = Some(
+                store
+                    .task_binding(&request.network_id, &creation.hash)?
+                    .context("signed bind_execution must complete before operating")?,
+            );
         }
-        if let Some(proof) = existing {
-            request.binding = Some(proof);
-            return self.store.lock().await.validate_operation_binding(request);
-        }
-        let open_spec = if request.action["type"] == "open" {
-            request.action.clone()
-        } else {
-            let value = self
-                .session_fact(
-                    &request.network_id,
-                    &request.target_node,
-                    &request.session_id,
-                )
-                .await?;
-            serde_json::json!({"type":"open","executor":value["session"]["executor"],"cwd":value["session"]["cwd"]})
-        };
-        let binding = crate::binding::TaskBinding {
-            network_id: request.network_id.clone(),
-            conversation_id: request.conversation_id.clone(),
-            task_ref: creation.hash,
-            task_id: task_id.clone(),
-            authority_node: event.author,
-            generation: 1,
-            target_node: request.target_node.clone(),
-            session_id: request.session_id.clone(),
-            open_spec,
-            previous_binding_hash: None,
-            previous_seal: None,
-        };
-        request.binding = Some(self.confirm_binding(binding).await?);
         self.store.lock().await.validate_operation_binding(request)
     }
 
     async fn rebind_execution(self: &Arc<Self>, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "moving execution requires the user");
-        let scope = field(input, "conversation_id")?;
-        self.require_scope(access, scope).await?;
-        self.sync_all(&access.network_id).await?;
-        self.cache_context_bindings(&access.network_id, scope)
-            .await?;
-        let creation = self.store.lock().await.task_creation(
-            &access.network_id,
-            scope,
-            field(input, "task_id")?,
+        access.require_body(input)?;
+        let binding = self.store.lock().await.rebind_task_authorized(
+            &self.identity,
+            &access.authorization,
+            &access.freshness,
+            &access.transport,
+            input,
+            now_ms() as u64,
         )?;
-        let previous = self
-            .store
-            .lock()
-            .await
-            .task_binding(&access.network_id, &creation.hash)?
-            .context("task has no confirmed execution binding")?;
-        let old = &previous.binding;
-        let seal = if old.target_node == self.identity.node_id()? {
-            self.store
-                .lock()
-                .await
-                .seal_binding(&self.identity, &previous)?
-        } else {
-            let reply = self
-                .peer_request(
-                    &access.network_id,
-                    &old.target_node,
-                    serde_json::json!({"type":"seal_binding","binding":previous,"human":true}),
-                )
-                .await
-                .context("original executor is unreachable; task was not reassigned")?;
-            serde_json::from_value(reply["seal"].clone())?
-        };
-        let next = crate::binding::TaskBinding {
-            network_id: old.network_id.clone(),
-            conversation_id: old.conversation_id.clone(),
-            task_ref: old.task_ref.clone(),
-            task_id: old.task_id.clone(),
-            authority_node: old.authority_node.clone(),
-            generation: old
-                .generation
-                .checked_add(1)
-                .context("binding generation overflow")?,
-            target_node: field(input, "target_node")?.into(),
-            session_id: id(input, "session_id")?,
-            open_spec: serde_json::json!({"type":"open","executor":field(input,"executor")?,"cwd":field(input,"cwd")?}),
-            previous_binding_hash: Some(crate::binding::binding_hash(old)?),
-            previous_seal: Some(seal),
-        };
-        Ok(serde_json::json!({"binding":self.confirm_binding(next).await?}))
+        Ok(json!({"binding":binding}))
     }
 
     pub async fn dispatch(
         self: &Arc<Self>,
         access: Access,
-        mut request: OperationRequest,
+        request: OperationRequest,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         ensure!(
             request.network_id == access.network_id,
-            "operation belongs to another network"
+            "operation belongs to another space"
         );
         self.require_scope(&access, &request.conversation_id)
             .await?;
-        id(&json!({"id":request.operation_id}), "id")?;
-        id(&json!({"id":request.session_id}), "id")?;
         ensure!(
-            access.human || request.action["type"] != "respond_request",
-            "only the user may answer approvals"
+            serde_json::to_value(&request)? == access.body["request"],
+            "execution request differs from signed body"
         );
-        if !access.human && request.action["type"] != "open" {
-            self.require_execution_scope(
-                &access,
-                &request.conversation_id,
-                &request.target_node,
-                &request.session_id,
-            )
-            .await?;
-        }
-        self.store.lock().await.authorize_node(
-            &access.network_id,
-            &request.target_node,
-            Some(NodeRole::Executor),
-        )?;
-        self.sync_all(&access.network_id).await?;
-        if !access.human
-            && matches!(
-                request.action["type"].as_str(),
-                Some("open" | "send" | "steer")
-            )
-            && let Some(task) = &request.task_id
-        {
-            require_task_write(
-                &*self.store.lock().await,
-                &request.network_id,
-                &request.conversation_id,
-                task,
-                false,
-            )?;
-        }
-        self.prepare_operation_binding(&mut request).await?;
-        let context = self.store.lock().await.context(
-            &access.network_id,
-            &request.conversation_id,
-            &request.basis_heads,
-        )?;
-        ensure!(
-            context.missing.is_complete(),
-            "operation basis is incomplete or conflicting"
-        );
-        let old = context.events.iter().find_map(|e| {
-            if let EventBody::DispatchRecorded {
-                operation_id,
-                action,
-                ..
-            } = &e.body
-            {
-                (operation_id == &request.operation_id).then_some((e, action))
-            } else {
-                None
-            }
-        });
-        let head = if let Some((event, old)) = old {
-            ensure!(
-                old == &serde_json::to_value(&request)?,
-                "operation ID reused with different request"
-            );
-            crypto::digest(&serde_json::to_vec(event)?)
-        } else {
-            if !access.human
-                && matches!(
-                    request.action["type"].as_str(),
-                    Some("open" | "send" | "steer")
-                )
-                && let Some(task) = &request.task_id
-            {
-                require_task_write(
-                    &*self.store.lock().await,
-                    &request.network_id,
-                    &request.conversation_id,
-                    task,
-                    false,
-                )?;
-            }
-            self.append(
-                &access.network_id,
-                &request.conversation_id,
-                EventBody::DispatchRecorded {
-                    operation_id: request.operation_id.clone(),
-                    task_id: request.task_id.clone(),
-                    target_node: request.target_node.clone(),
-                    session_id: request.session_id.clone(),
-                    action: serde_json::to_value(&request)?,
-                },
-            )
-            .await?
-            .hash
-        };
+        self.store
+            .lock()
+            .await
+            .validate_operation_binding(&request)?;
         if request.target_node == self.identity.node_id()? {
-            self.admit_operation(request, access.human).await
+            self.admit_operation(request, &access).await
         } else {
-            self.peer_request(&access.network_id,&request.target_node,json!({"type":"execute","request":request,"dispatch_head":head,"human":access.human})).await
+            self.peer_request(
+                &access.network_id,
+                &request.target_node,
+                json!({
+                    "type":"execute","authorization_body":access.body,
+                    "invocation":access.authorization.signed_invocation(),
+                }),
+            )
+            .await
         }
     }
     async fn admit_operation(
         self: &Arc<Self>,
-        mut request: OperationRequest,
-        human: bool,
+        request: OperationRequest,
+        access: &Access,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         self.require_role(&request.network_id, NodeRole::Executor)
@@ -2815,7 +3481,7 @@ impl Runtime {
         );
         let kind = field(&request.action, "type")?;
         ensure!(
-            human || kind != "respond_request",
+            access.account_actor() || kind != "respond_request",
             "only the user may answer approvals"
         );
         let mut store = self.store.lock().await;
@@ -2825,7 +3491,10 @@ impl Runtime {
             &request.session_id,
         )?;
         let existing_operation = store.operation(&request.network_id, &request.operation_id)?;
-        if !human && existing_operation.is_none() && matches!(kind, "open" | "send" | "steer") {
+        if !access.account_actor()
+            && existing_operation.is_none()
+            && matches!(kind, "open" | "send" | "steer")
+        {
             if let Some(task) = &request.task_id {
                 require_task_write(
                     &store,
@@ -2903,7 +3572,10 @@ impl Runtime {
             }
             resources.sort();
             resources.dedup();
-            request.resources = resources;
+            ensure!(
+                request.resources == resources,
+                "execution resources differ from signed canonical request"
+            );
         }
         if let Some(old) = existing_operation {
             ensure!(
@@ -2912,14 +3584,15 @@ impl Runtime {
             );
             return Ok(json!({"operation":old}));
         }
-        let operation = if control {
-            store.accept_control_operation(&request.network_id, &request)?
-        } else {
-            store.accept_operation(&request.network_id, &request)?
-        };
-        if kind == "open" {
-            store.upsert_session(&request.network_id, &session)?;
-        }
+        let operation = store.accept_authorized_operation(
+            &self.identity,
+            &access.authorization,
+            &access.freshness,
+            &access.transport,
+            &access.body,
+            &request,
+            now_ms() as u64,
+        )?;
         drop(store);
         let node = self.clone();
         tokio::spawn(async move {
@@ -2970,12 +3643,211 @@ impl Runtime {
             Ok(serde_json::from_value(action.clone())?)
         }
     }
+
+    async fn supervise_execution(self: &Arc<Self>, mut context: ExecutionContext) {
+        let key = (context.space_id.to_string(), context.operation_id.clone());
+        if !self.execution_leases.lock().await.insert(key.clone()) {
+            return;
+        }
+        let node = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let operation = node
+                    .store
+                    .lock()
+                    .await
+                    .operation(context.space_id.as_str(), &context.operation_id);
+                match operation {
+                    Ok(Some(record)) if record.state.terminal() => break,
+                    Ok(Some(record)) if record.state == OperationState::Running => {}
+                    _ => {
+                        let _ = node
+                            .stop_expired_execution(&context, "execution outcome is unresolved")
+                            .await;
+                        break;
+                    }
+                }
+                let renewal: Result<u64> = async {
+                    let auth = node.store.lock().await.operation_authorization(
+                        context.space_id.as_str(),
+                        &context.operation_id,
+                        now_ms() as u64,
+                    )?;
+                    let proof = node.freshness(&auth, CheckStage::Renew).await?;
+                    let deadline = node.store.lock().await.renew_authorized_operation(
+                        context.space_id.as_str(),
+                        &context.operation_id,
+                        &proof,
+                        now_ms() as u64,
+                    )?;
+                    if context.shared {
+                        node.engine.renew_operation(&context, deadline).await?;
+                    }
+                    Ok(deadline)
+                }
+                .await;
+                match renewal {
+                    Ok(deadline) => context.lease_expires_at_ms = deadline,
+                    Err(error) => {
+                        let _ = node
+                            .stop_expired_execution(
+                                &context,
+                                &format!("authorization lease could not renew: {error:#}"),
+                            )
+                            .await;
+                        break;
+                    }
+                }
+            }
+            node.execution_leases.lock().await.remove(&key);
+        });
+    }
+
+    async fn cancel_personal_execution(
+        &self,
+        context: &ExecutionContext,
+        affected: &mut Vec<(String, String)>,
+    ) -> Result<()> {
+        let turn = {
+            let store = self.store.lock().await;
+            let operation = store
+                .operation(context.space_id.as_str(), &context.operation_id)?
+                .context("cancelled operation is missing")?;
+            let session = store
+                .session(
+                    context.space_id.as_str(),
+                    &operation.request.target_node,
+                    &operation.request.session_id,
+                )?
+                .context("cancelled execution session is missing")?;
+            let turn = store.local_value(
+                context.space_id.as_str(),
+                &format!("turn:{}", context.operation_id),
+            )?;
+            session
+                .native_session_id
+                .zip(turn.and_then(|value| value["turn"]["id"].as_str().map(str::to_owned)))
+        };
+        if let Some((native_id, turn_id)) = turn
+            && self
+                .engine
+                .cancel_personal_turn(context, &native_id, &turn_id)
+                .await
+                .is_ok()
+        {
+            return Ok(());
+        }
+        let mut managed = self._codex_process.lock().await;
+        let child = managed.as_mut().context("original turn cancellation could not be confirmed and this Node does not own the Provider process")?;
+        let pid = child
+            .id()
+            .context("managed Provider process has no live identity")?;
+        {
+            let store = self.store.lock().await;
+            for space in store.networks()? {
+                for operation in store
+                    .operations(&space)?
+                    .into_iter()
+                    .filter(|record| !record.state.terminal())
+                {
+                    if let Some(session) = store.session(
+                        &space,
+                        &operation.request.target_node,
+                        &operation.request.session_id,
+                    )? && session.executor == "codex"
+                        && !execution_context(&store, &operation.request, 0)?.shared
+                    {
+                        affected.push((space.clone(), operation.request.operation_id));
+                    }
+                }
+            }
+        }
+        let group = format!("-{pid}");
+        let _ = tokio::process::Command::new("/bin/kill")
+            .args(["-15", &group])
+            .status()
+            .await?;
+        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            let _ = tokio::process::Command::new("/bin/kill")
+                .args(["-9", &group])
+                .status()
+                .await?;
+            tokio::time::timeout(Duration::from_secs(2), child.wait())
+                .await
+                .context("managed Provider did not exit after cancellation")??;
+        }
+        let still_alive = tokio::process::Command::new("/bin/kill")
+            .args(["-0", &group])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await?
+            .success();
+        ensure!(
+            !still_alive,
+            "managed Provider process group still has live processes"
+        );
+        Ok(())
+    }
+
+    async fn stop_expired_execution(
+        self: &Arc<Self>,
+        context: &ExecutionContext,
+        reason: &str,
+    ) -> Result<()> {
+        let mut affected = self
+            .engine
+            .affected_operations(context)
+            .await
+            .into_iter()
+            .map(|id| (context.space_id.to_string(), id))
+            .collect::<Vec<_>>();
+        affected.push((context.space_id.to_string(), context.operation_id.clone()));
+        let cancellation = if context.shared {
+            self.engine
+                .cancel_operation(context)
+                .await
+                .map(|operations| {
+                    affected.extend(
+                        operations
+                            .into_iter()
+                            .map(|id| (context.space_id.to_string(), id)),
+                    );
+                })
+        } else {
+            self.cancel_personal_execution(context, &mut affected).await
+        };
+        affected.sort();
+        affected.dedup();
+        for (space, operation_id) in affected {
+            let record = self.store.lock().await.operation(&space, &operation_id)?;
+            if let Some(record) = record
+                && !record.state.terminal()
+            {
+                self.finish(&record.request, OperationState::Unknown, json!({
+                    "error":reason,"cancellation_confirmed":cancellation.is_ok(),
+                    "cancellation_error":cancellation.as_ref().err().map(|error|format!("{error:#}")),
+                })).await?;
+            }
+        }
+        cancellation
+    }
     async fn execute_operation(self: Arc<Self>, request: OperationRequest) -> Result<()> {
         let _work = self.maintenance.enter()?;
         let action = self.engine_action(&request.action)?;
-        let preparation: Result<ExecutionSession> = async {
+        let preparation: Result<(ExecutionSession, ExecutionContext)> = async {
             self.require_role(&request.network_id, NodeRole::Executor)
                 .await?;
+            let authorization = self.store.lock().await.operation_authorization(
+                &request.network_id,
+                &request.operation_id,
+                now_ms() as u64,
+            )?;
+            let freshness = self.freshness(&authorization, CheckStage::Start).await?;
             let mut store = self.store.lock().await;
             let session = store
                 .session(
@@ -2989,12 +3861,18 @@ impl Runtime {
             for resource in &request.resources {
                 self.allowed_path(resource)?;
             }
-            store.claim_operation(&request.network_id, &request.operation_id)?;
-            Ok(session)
+            let (_, deadline) = store.claim_authorized_operation(
+                &request.network_id,
+                &request.operation_id,
+                &freshness,
+                now_ms() as u64,
+            )?;
+            let context = execution_context(&store, &request, deadline)?;
+            Ok((session, context))
         }
         .await;
-        let session = match preparation {
-            Ok(session) => session,
+        let (session, context) = match preparation {
+            Ok(prepared) => prepared,
             Err(error) => {
                 let accepted = self
                     .store
@@ -3018,12 +3896,16 @@ impl Runtime {
             cwd: PathBuf::from(&session.cwd),
             native_session_id: session.native_session_id.clone(),
         };
+        if !context.shared && native.executor == ExecutorKind::Codex {
+            self.ensure_personal_provider().await?;
+        }
+        self.supervise_execution(context.clone()).await;
         let store = self.store.clone();
         let mut persisted = session.clone();
         let network = request.network_id.clone();
         let result = self
             .engine
-            .execute(&native, action.clone(), move |id| async move {
+            .execute_authorized(&context, &native, action.clone(), move |id| async move {
                 persisted.native_session_id = Some(id);
                 store.lock().await.upsert_session(&network, &persisted)?;
                 Ok(())
@@ -3057,9 +3939,8 @@ impl Runtime {
                         &result.result,
                     )?;
                     drop(store);
-                    self.append(
-                        &request.network_id,
-                        &request.conversation_id,
+                    self.append_operation_fact(
+                        &request,
                         EventBody::ExecutionObserved {
                             operation_id: request.operation_id.clone(),
                             task_id: request.task_id.clone(),
@@ -3068,6 +3949,7 @@ impl Runtime {
                             status: "running".into(),
                             detail: result.result,
                         },
+                        vec![],
                     )
                     .await?;
                     self.reconcile(
@@ -3114,11 +3996,46 @@ impl Runtime {
     async fn finish(
         self: &Arc<Self>,
         request: &OperationRequest,
-        state: OperationState,
-        result: Value,
+        mut state: OperationState,
+        mut result: Value,
     ) -> Result<()> {
         let _work = self.maintenance.enter()?;
         let _completion = self.completion_lock.lock().await;
+        let current = self
+            .store
+            .lock()
+            .await
+            .operation(&request.network_id, &request.operation_id)?
+            .context("completed operation is missing")?;
+        if state.terminal() && !current.state.terminal() {
+            let context = execution_context(&*self.store.lock().await, request, 0)?;
+            let affected = self.engine.affected_operations(&context).await;
+            if let Err(error) = self.engine.complete_operation(&context).await {
+                state = OperationState::Unknown;
+                result = json!({"error":format!("execution cleanup could not be confirmed: {error:#}"),"observed_result":result});
+                let mut store = self.store.lock().await;
+                for operation_id in affected
+                    .into_iter()
+                    .filter(|id| id != &request.operation_id)
+                {
+                    if let Some(operation) = store.operation(&request.network_id, &operation_id)?
+                        && !operation.state.terminal()
+                    {
+                        store.local_set(
+                            &request.network_id,
+                            &format!("completion:{operation_id}"),
+                            &json!({"state":OperationState::Unknown,"result":result}),
+                        )?;
+                        store.finish_operation(
+                            &request.network_id,
+                            &operation_id,
+                            OperationState::Unknown,
+                            result.clone(),
+                        )?;
+                    }
+                }
+            }
+        }
         let status = serde_json::to_value(&state)?.as_str().unwrap().to_owned();
         let completion_key = format!("completion:{}", request.operation_id);
         {
@@ -3187,9 +4104,8 @@ impl Runtime {
         let event_hash = if let Some(existing) = existing {
             crypto::digest(&serde_json::to_vec(&existing)?)
         } else {
-            self.append_blobs(
-                &request.network_id,
-                &request.conversation_id,
+            self.append_operation_fact(
+                request,
                 EventBody::ExecutionObserved {
                     operation_id: request.operation_id.clone(),
                     task_id: request.task_id.clone(),
@@ -3207,9 +4123,10 @@ impl Runtime {
             let notification_id = format!("result:{}:{}", request.operation_id, status);
             let already=self.store.lock().await.context(&request.network_id,&request.conversation_id,&[])?.events.iter().any(|e|matches!(&e.body,EventBody::NotificationRaised{notification_id:id,..} if id==&notification_id));
             if !already {
-                self.append(
+                let event = self.store.lock().await.append_derived_event(
+                    &self.identity,
                     &request.network_id,
-                    &request.conversation_id,
+                    &event_hash,
                     EventBody::NotificationRaised {
                         notification_id,
                         kind: status.clone(),
@@ -3218,8 +4135,10 @@ impl Runtime {
                             request.session_id, status
                         ),
                     },
-                )
-                .await?;
+                    vec![],
+                    now_ms(),
+                )?;
+                self.publish_changed(&request.network_id, &request.conversation_id, &event.hash);
             }
             if state.terminal() && !self.maybe_followup(request, &event_hash).await? {
                 return Ok(());
@@ -3249,42 +4168,47 @@ impl Runtime {
         Ok(())
     }
     async fn session_fact(&self, network: &str, target: &str, session_id: &str) -> Result<Value> {
-        if target != self.identity.node_id()? {
-            return self
-                .read_peer(
-                    network,
-                    target,
-                    json!({"type":"session","session_id":session_id}),
-                )
-                .await;
-        }
+        ensure!(
+            target == self.identity.node_id()?,
+            "read another service through a signed request to its audience"
+        );
         let session = self
             .store
             .lock()
             .await
             .session(network, target, session_id)?
             .context("execution session not found")?;
-        let mut snapshot = self.engine.snapshot().await;
-        if let Some(requests) = snapshot["pending_requests"].as_array_mut() {
-            requests.retain(|r| {
-                r["params"]["threadId"].as_str() == session.native_session_id.as_deref()
-            });
-        }
-        let native = ExecutorSession {
-            executor: serde_json::from_value(json!(session.executor))?,
-            cwd: session.cwd.clone().into(),
-            native_session_id: session.native_session_id.clone(),
+        let context = {
+            let store = self.store.lock().await;
+            let operation = store
+                .operations(network)?
+                .into_iter()
+                .rev()
+                .find(|record| {
+                    record.request.target_node == target && record.request.session_id == session_id
+                })
+                .context("execution session has no admitted operation")?;
+            execution_context(&store, &operation.request, 0)?
         };
-        let read = self
+        let snapshot = self
             .engine
-            .execute(&native, EngineAction::Read {}, |_| async {
-                bail!("read must not create a session")
-            })
-            .await;
+            .snapshot_authorized(&context)
+            .await
+            .unwrap_or_else(|error| json!({"error":format!("{error:#}"),"pending_requests":[]}));
+        let read = match &session.native_session_id {
+            Some(native_id) => {
+                self.engine
+                    .read_session_authorized(&context, native_id)
+                    .await
+            }
+            None => Err(anyhow::anyhow!(
+                "execution session has no recorded native ID"
+            )),
+        };
         let actual = match read {
-            Ok(r) => json!({"thread":r.result,"pending_requests":snapshot["pending_requests"]}),
-            Err(e) => {
-                json!({"error":e.message,"uncertain":e.uncertain,"pending_requests":snapshot["pending_requests"]})
+            Ok(thread) => json!({"thread":thread,"pending_requests":snapshot["pending_requests"]}),
+            Err(error) => {
+                json!({"error":format!("{error:#}"),"freshness":"unknown","pending_requests":snapshot["pending_requests"]})
             }
         };
         Ok(json!({"session":session,"actual":actual}))
@@ -3336,337 +4260,199 @@ impl Runtime {
         Ok(json!({"sessions":sessions,"operations":records,"facts":facts}))
     }
     async fn handle_peer(self: &Arc<Self>, message: &Inbound) -> Result<Value> {
-        self.membership_state().await?;
-        let network = &message.network_id;
-        let input = &message.payload;
-        self.store
+        let envelope = &message.payload;
+        let kind = field(envelope, "type")?;
+        let certificate = self
+            .store
             .lock()
             .await
-            .authorize_node(network, &message.origin, None)?;
-        let kind = field(input, "type")?;
-        let _work = (!matches!(
-            kind,
-            "capabilities" | "inventory" | "event" | "blob" | "operation" | "task_binding"
-        ))
-        .then(|| self.maintenance.enter())
-        .transpose()?;
-        match kind {
-            "capabilities" => Ok(self.capabilities()),
-            "inventory" => {
-                self.require_role(network, NodeRole::Replica).await?;
-                self.store.lock().await.authorize_node(
-                    network,
-                    &message.origin,
-                    Some(NodeRole::Replica),
-                )?;
-                let store = self.store.lock().await;
-                let scopes = store
-                    .scopes(network)?
-                    .into_iter()
-                    .map(|s| Ok(json!({"scope_id":s,"heads":store.heads(network,&s)?})))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(json!({"membership":store.trust_bundle(network)?,"scopes":scopes}))
-            }
-            "event" => {
-                self.require_role(network, NodeRole::Replica).await?;
-                self.store.lock().await.authorize_node(
-                    network,
-                    &message.origin,
-                    Some(NodeRole::Replica),
-                )?;
-                Ok(json!({"event":self.store.lock().await.event(network,field(input,"hash")?)?}))
-            }
-            "blob" => {
-                self.require_role(network, NodeRole::Replica).await?;
-                self.store.lock().await.authorize_node(
-                    network,
-                    &message.origin,
-                    Some(NodeRole::Replica),
-                )?;
-                let bytes = self
-                    .store
-                    .lock()
-                    .await
-                    .get_blob(network, field(input, "hash")?)?
-                    .context("blob unavailable")?;
-                let offset = input["offset"]
-                    .as_u64()
-                    .context("offset required")?
-                    .min(usize::MAX as u64) as usize;
-                let limit = input["limit"].as_u64().unwrap_or(65536).clamp(1, 65536) as usize;
-                ensure!(offset <= bytes.len(), "invalid blob offset");
-                Ok(
-                    json!({"data":hex::encode(&bytes[offset..offset.saturating_add(limit).min(bytes.len())]),"size":bytes.len()}),
-                )
-            }
-            "trust" => {
-                let state: NetworkState = serde_json::from_value(input["state"].clone())?;
-                ensure!(
-                    state.genesis.network_id == *network,
-                    "wrong membership network"
-                );
-                self.install_membership(state).await?;
-                Ok(json!({"received":true}))
-            }
-            "task_binding" => Ok(
-                json!({"binding":self.store.lock().await.task_binding(network,field(input,"task_ref")?)?}),
-            ),
-            "bind_task" => {
-                let sender =
-                    self.store
-                        .lock()
-                        .await
-                        .authorize_node(network, &message.origin, None)?;
-                ensure!(
-                    sender.roles.contains(&NodeRole::Scheduler)
-                        || sender.roles.contains(&NodeRole::Gateway),
-                    "origin cannot propose execution binding"
-                );
-                let binding: crate::binding::TaskBinding =
-                    serde_json::from_value(input["binding"].clone())?;
-                ensure!(binding.network_id == *network, "wrong binding network");
-                Ok(json!({"binding":self.store.lock().await.bind_task(&self.identity,&binding)?}))
-            }
-            "seal_binding" => {
-                let sender = self.store.lock().await.authorize_node(
-                    network,
-                    &message.origin,
-                    Some(NodeRole::Gateway),
-                )?;
-                ensure!(
-                    input["human"] == true && sender.roles.contains(&NodeRole::Gateway),
-                    "sealing execution requires the user"
-                );
-                let proof: crate::binding::SignedBinding =
-                    serde_json::from_value(input["binding"].clone())?;
-                ensure!(
-                    proof.binding.network_id == *network,
-                    "wrong binding network"
-                );
-                Ok(json!({"seal":self.store.lock().await.seal_binding(&self.identity,&proof)?}))
-            }
-            "execute" => {
-                let sender =
-                    self.store
-                        .lock()
-                        .await
-                        .authorize_node(network, &message.origin, None)?;
-                ensure!(
-                    sender.roles.contains(&NodeRole::Scheduler)
-                        || sender.roles.contains(&NodeRole::Gateway),
-                    "origin cannot dispatch"
-                );
-                let human = input["human"].as_bool().unwrap_or(false);
-                ensure!(
-                    !human || sender.roles.contains(&NodeRole::Gateway),
-                    "origin cannot assert human authority"
-                );
-                let request: OperationRequest = serde_json::from_value(input["request"].clone())?;
-                ensure!(request.network_id == *network, "wrong operation network");
-                // Admission holds the complete dispatched history before any external call.
-                self.sync_from(network, &message.origin).await?;
-                let mut wanted = request.basis_heads.clone();
-                wanted.push(field(input, "dispatch_head")?.into());
-                self.fetch_closure(network, &message.origin, &wanted)
-                    .await?;
-                ensure!(
-                    self.store
-                        .lock()
-                        .await
-                        .missing_dependencies(network, &wanted)?
-                        .is_complete(),
-                    "dispatch context is incomplete"
-                );
-                self.cache_context_bindings(network, &request.conversation_id)
-                    .await?;
-                let proof = request
-                    .binding
-                    .as_ref()
-                    .context("execute requires a confirmed task binding")?;
-                self.store.lock().await.install_binding(proof)?;
-                self.admit_operation(request, human).await
-            }
-            "session" => {
-                self.session_fact(
-                    network,
-                    &self.identity.node_id()?,
-                    field(input, "session_id")?,
-                )
-                .await
-            }
-            "operation" => Ok(
-                json!({"operation":self.store.lock().await.operation(network,field(input,"operation_id")?)?}),
-            ),
-            "schedule" => {
-                self.require_role(network, NodeRole::Scheduler).await?;
-                let sender =
-                    self.store
-                        .lock()
-                        .await
-                        .authorize_node(network, &message.origin, None)?;
-                ensure!(
-                    sender.roles.contains(&NodeRole::Gateway)
-                        || sender.roles.contains(&NodeRole::Scheduler)
-                        || sender.roles.contains(&NodeRole::Executor),
-                    "origin cannot schedule"
-                );
-                self.sync_from(network, &message.origin).await?;
-                let scope = id(input, "conversation_id")?;
-                let trigger = field(input, "trigger")?.to_owned();
-                self.fetch_closure(network, &message.origin, std::slice::from_ref(&trigger))
-                    .await?;
-                if !sender.roles.contains(&NodeRole::Gateway)
-                    && !sender.roles.contains(&NodeRole::Scheduler)
-                {
-                    require_executor_followup(
-                        &*self.store.lock().await,
-                        network,
-                        &message.origin,
-                        &scope,
-                        &trigger,
-                    )?;
-                }
-                self.spawn_scheduler(network.clone(), scope, trigger)?;
-                Ok(json!({"state":"accepted"}))
-            }
-            "manager_status" => {
-                crate::scheduler::status(
-                    self,
-                    network,
-                    field(input, "conversation_id")?,
-                    field(input, "trigger")?,
-                )
-                .await
-            }
-            "reconcile" => {
-                self.reconcile(
-                    network,
-                    &self.identity.node_id()?,
-                    field(input, "operation_id")?,
-                )
-                .await
-            }
-            "resolve_unknown" => {
-                self.store.lock().await.authorize_node(
-                    network,
-                    &message.origin,
-                    Some(NodeRole::Gateway),
-                )?;
-                self.resolve_unknown(network, input).await
-            }
-            _ => bail!("unknown peer message"),
+            .authorize_transport_node(&message.origin, now_ms() as u64)?;
+        if kind == "freshness_receipt" {
+            let challenge: FreshnessChallenge =
+                serde_json::from_value(envelope["challenge"].clone())?;
+            ensure!(
+                challenge.policies.len() <= vibeface_secure::authorization::MAX_POLICY_DOMAINS,
+                "freshness proof exceeds policy budget"
+            );
+            let receipts = self.store.lock().await.sign_current_receipts(
+                &challenge,
+                &self.identity,
+                now_ms() as u64,
+            )?;
+            return Ok(json!({"receipts":receipts}));
         }
+        ensure!(
+            matches!(
+                kind,
+                "prepare" | "rpc" | "execute" | "inventory" | "event" | "blob"
+            ),
+            "unsupported peer operation"
+        );
+        let body = envelope["authorization_body"].clone();
+        ensure!(
+            body["space_id"].as_str() == Some(message.network_id.as_str()),
+            "peer authorization belongs to another space"
+        );
+        if kind == "prepare" {
+            let intent: Signed<vibeface_secure::authorization::prepare::PrepareIntent> =
+                serde_json::from_value(envelope["intent"].clone())?;
+            let origin = DeviceId::from_key(&PublicKey::parse(&certificate.public_key)?);
+            let prepared = self
+                .store
+                .lock()
+                .await
+                .authorization_state()
+                .verify_prepare_intent(
+                    &intent,
+                    &body,
+                    authorization_action(&body)?,
+                    &self.audience()?,
+                    &TransportEvidence::VerifiedPeer { origin },
+                    now_ms() as u64,
+                )?;
+            return self
+                .prepare_authorized_body(prepared, &intent.payload.request)
+                .await;
+        }
+        let expected_method = match kind {
+            "execute" => Some("operate"),
+            "inventory" => Some("replica_inventory"),
+            "event" => Some("replica_event"),
+            "blob" => Some("replica_blob"),
+            _ => None,
+        };
+        if let Some(expected) = expected_method {
+            ensure!(
+                body["method"] == expected,
+                "peer method differs from signed request"
+            );
+        }
+        let invocation: Signed<Invocation> =
+            serde_json::from_value(envelope["invocation"].clone())?;
+        let origin = DeviceId::from_key(&PublicKey::parse(&certificate.public_key)?);
+        let access = self
+            .authorize_rpc(
+                body.clone(),
+                invocation,
+                TransportEvidence::VerifiedPeer { origin },
+            )
+            .await?;
+        ensure!(
+            *access.authorization.audience() == self.audience()?,
+            "peer request reached another service"
+        );
+        if matches!(kind, "inventory" | "event" | "blob") {
+            self.require_role(&message.network_id, NodeRole::Replica)
+                .await?;
+            let mut store = self.store.lock().await;
+            store.authorize_read(
+                &access.authorization,
+                &access.freshness,
+                &access.transport,
+                now_ms() as u64,
+            )?;
+            return crate::replication::query(&store, &access.authorization, &body);
+        }
+        self.rpc(access, body).await
     }
-    async fn observe_engine(self: &Arc<Self>, event: Value) -> Result<()> {
+    async fn observe_engine(self: &Arc<Self>, envelope: Value) -> Result<()> {
         let _work = self.maintenance.enter_when_open().await;
+        let context = &envelope["execution_context"];
+        let space = SpaceId::parse(field(context, "space_id")?)?;
+        let operation_id = id(context, "operation_id")?;
+        let Some(operation) = self
+            .store
+            .lock()
+            .await
+            .operation(space.as_str(), &operation_id)?
+        else {
+            return Ok(());
+        };
+        if !matches!(
+            operation.state,
+            OperationState::Running | OperationState::Unknown
+        ) || operation.request.action["type"] != "send"
+        {
+            return Ok(());
+        }
+        let request = &operation.request;
+        let expected = execution_context(&*self.store.lock().await, request, 0)?;
+        ensure!(
+            context["resource_id"].as_str() == Some(expected.resource_id.as_str()),
+            "Provider event belongs to another resource"
+        );
+        ensure!(
+            if expected.shared {
+                context["container_id"]
+                    .as_str()
+                    .is_some_and(|id| id.len() == 64)
+            } else {
+                context["container_id"].is_null()
+            },
+            "Provider event isolation context differs"
+        );
+        let event = &envelope["event"];
         let cli_progress = event["kind"] == "executor_progress";
         let method = event["method"].as_str().unwrap_or(if cli_progress {
             "executor/progress"
         } else {
             ""
         });
+        let session = self
+            .store
+            .lock()
+            .await
+            .session(space.as_str(), &request.target_node, &request.session_id)?
+            .context("running operation lost its session")?;
+        if method == "bridge.codex_disconnected" && session.executor == "codex" {
+            if operation.state == OperationState::Running {
+                self.finish(
+                    request,
+                    OperationState::Unknown,
+                    json!({"error":"Codex disconnected; reconcile before any retry"}),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
         let thread = event["params"]["threadId"]
             .as_str()
             .or_else(|| event["params"]["thread_id"].as_str())
             .or_else(|| event["params"]["session_id"].as_str())
             .or_else(|| event["native_session_id"].as_str());
-        let networks = self.store.lock().await.networks()?;
-        for network in networks {
-            let operations = self.store.lock().await.operations(&network)?;
-            for operation in operations.into_iter().filter(|o| {
-                matches!(o.state, OperationState::Running | OperationState::Unknown)
-                    && o.request.action["type"] == "send"
-            }) {
-                let request = &operation.request;
-                let session = self
-                    .store
-                    .lock()
-                    .await
-                    .session(&network, &request.target_node, &request.session_id)?
-                    .context("running operation lost session")?;
-                if method == "bridge.codex_disconnected"
-                    && session.executor == "codex"
-                    && operation.state == OperationState::Running
-                {
-                    self.finish(
-                        request,
-                        OperationState::Unknown,
-                        json!({"error":"Codex disconnected; reconcile before any retry"}),
-                    )
-                    .await?;
-                    continue;
-                }
-                if thread.is_none() || thread != session.native_session_id.as_deref() {
-                    continue;
-                }
-                if cli_progress && event["executor"] != session.executor {
-                    continue;
-                }
-                let _=self.events.send(Update{network_id:network.clone(),payload:json!({"type":"execution_progress","conversation_id":request.conversation_id,"session_id":request.session_id,"event":event})});
-                if method == "turn/completed" {
-                    let turn = field(&event["params"]["turn"], "id")?;
-                    let known = self
-                        .store
-                        .lock()
-                        .await
-                        .local_value(&network, &format!("turn:{}", request.operation_id))?;
-                    if known.as_ref().and_then(|v| v["turn"]["id"].as_str()) != Some(turn) {
-                        continue;
-                    }
-                    let state = if event["params"]["turn"]["status"] == "completed" {
-                        OperationState::Succeeded
-                    } else {
-                        OperationState::Failed
-                    };
-                    self.finish(request, state, event.clone()).await?;
-                } else if !method.ends_with("/delta")
-                    && (method == "item/completed"
-                        || event.get("id").is_some()
-                        || (cli_progress && event["event"]["type"] != "stream_event"))
-                {
-                    let bytes = serde_json::to_vec(&event)?;
-                    let mut blobs = vec![];
-                    let detail = if bytes.len() > 262144 {
-                        let blob = BlobRef {
-                            hash: crypto::digest(&bytes),
-                            size: bytes.len() as u64,
-                        };
-                        self.store.lock().await.put_blob(&network, &blob, &bytes)?;
-                        blobs.push(blob.clone());
-                        json!({"event_blob":blob})
-                    } else {
-                        event.clone()
-                    };
-                    self.append_blobs(
-                        &network,
-                        &request.conversation_id,
-                        EventBody::ExecutionObserved {
-                            operation_id: request.operation_id.clone(),
-                            task_id: request.task_id.clone(),
-                            target_node: request.target_node.clone(),
-                            session_id: request.session_id.clone(),
-                            status: if event.get("id").is_some() {
-                                "needs_input"
-                            } else {
-                                "progress"
-                            }
-                            .into(),
-                            detail,
-                        },
-                        blobs,
-                    )
-                    .await?;
-                    if event.get("id").is_some() {
-                        self.raise_notification(
-                            &network,
-                            &request.conversation_id,
-                            "needs_input",
-                            "执行 Agent 正在等待本人审批或补充输入。",
-                        )
-                        .await?;
-                    }
-                }
+        if thread.is_none()
+            || thread != session.native_session_id.as_deref()
+            || (cli_progress && event["executor"] != session.executor)
+        {
+            return Ok(());
+        }
+        let _ = self.events.send(Update {
+            network_id: space.to_string(),
+            payload: json!({
+                "type":"execution_progress","conversation_id":request.conversation_id,
+                "session_id":request.session_id,"event":event,
+            }),
+        });
+        if method == "turn/completed" {
+            let turn = field(&event["params"]["turn"], "id")?;
+            let known = self
+                .store
+                .lock()
+                .await
+                .local_value(space.as_str(), &format!("turn:{operation_id}"))?;
+            if known
+                .as_ref()
+                .and_then(|value| value["turn"]["id"].as_str())
+                != Some(turn)
+            {
+                return Ok(());
             }
+            let state = if event["params"]["turn"]["status"] == "completed" {
+                OperationState::Succeeded
+            } else {
+                OperationState::Failed
+            };
+            self.finish(request, state, event.clone()).await?;
         }
         Ok(())
     }
@@ -3676,15 +4462,10 @@ impl Runtime {
         target: &str,
         operation_id: &str,
     ) -> Result<Value> {
-        if target != self.identity.node_id()? {
-            return self
-                .peer_request(
-                    network,
-                    target,
-                    json!({"type":"reconcile","operation_id":operation_id}),
-                )
-                .await;
-        }
+        ensure!(
+            target == self.identity.node_id()?,
+            "reconcile through a signed request to the target service"
+        );
         let Some(operation) = self.store.lock().await.operation(network, operation_id)? else {
             return Ok(
                 json!({"operation":null,"state":"not_found","target_node":target,"checked_at_ms":now_ms()}),
@@ -3705,7 +4486,12 @@ impl Runtime {
             let native_id = actual["session"]["native_session_id"]
                 .as_str()
                 .context("execution session has no native ID")?;
-            let turn = match self.engine.read_turn(native_id, turn_id).await {
+            let context = execution_context(&*self.store.lock().await, &operation.request, 0)?;
+            let turn = match self
+                .engine
+                .read_turn_authorized(&context, native_id, turn_id)
+                .await
+            {
                 Ok(turn) => turn,
                 Err(error) => {
                     actual["reconcile_error"] = json!(format!("{error:#}"));
@@ -3734,240 +4520,144 @@ impl Runtime {
             json!({"operation":self.store.lock().await.operation(network,operation_id)?,"actual":actual}),
         )
     }
-    async fn resolve_unknown(self: &Arc<Self>, network: &str, input: &Value) -> Result<Value> {
-        let target = field(input, "target_node")?;
-        if target != self.identity.node_id()? {
-            let mut value = input.clone();
-            value["type"] = json!("resolve_unknown");
-            return self.peer_request(network, target, value).await;
-        }
-        let operation = self
-            .store
-            .lock()
-            .await
-            .operation(network, field(input, "operation_id")?)?
-            .context("operation not found")?;
-        ensure!(
-            operation.state == OperationState::Unknown,
-            "only unknown outcomes require a human resolution"
-        );
-        let evidence = field(input, "evidence")?;
-        ensure!(
-            evidence.len() >= 12,
-            "describe how you verified the process and external effects"
-        );
-        let state = match field(input, "outcome")? {
-            "succeeded" => OperationState::Succeeded,
-            "failed" => OperationState::Failed,
-            _ => bail!("invalid resolution"),
-        };
-        self.finish(
-            &operation.request,
-            state,
-            json!({"human_verified":true,"evidence":evidence}),
-        )
-        .await?;
-        Ok(
-            json!({"operation":self.store.lock().await.operation(network,&operation.request.operation_id)?}),
-        )
+    async fn resolve_unknown(self: &Arc<Self>, access: &Access, input: &Value) -> Result<Value> {
+        access.require_body(input)?;
+        let operation = self.store.lock().await.resolve_authorized_operation(
+            &self.identity,
+            &access.authorization,
+            &access.freshness,
+            &access.transport,
+            input,
+            now_ms() as u64,
+        )?;
+        self.publish_changed(&access.network_id, &operation.request.conversation_id, "");
+        Ok(json!({"operation":operation}))
     }
     fn spawn_scheduler(
         self: &Arc<Self>,
         network: String,
         scope: String,
         trigger: String,
-    ) -> Result<()> {
-        let work = self.maintenance.enter()?;
-        let node = self.clone();
-        tokio::spawn(async move {
-            let _work = work;
-            let access = Access {
-                network_id: network.clone(),
-                human: false,
-                conversation_id: Some(scope.clone()),
+    ) -> futures_util::future::BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let work = self.maintenance.enter()?;
+            let audience = self.audience()?;
+            let session = vibeface_secure::authorization::SessionRef {
+                target: audience.device.clone(),
+                session_id: trigger.clone(),
             };
-            if let Err(error) =
-                crate::scheduler::run(node.clone(), access, scope.clone(), trigger.clone()).await
-                && crate::scheduler::status(&node, &network, &scope, &trigger)
-                    .await
-                    .is_ok_and(|status| status["state"] == "not_found")
-            {
-                let _ = node
-                    .raise_notification(
-                        &network,
-                        &scope,
-                        "manager_failed",
-                        &format!("管理 Agent 未完成：{error:#}"),
-                    )
-                    .await;
-            }
-        });
-        Ok(())
-    }
-    async fn maybe_followup(
-        self: &Arc<Self>,
-        request: &OperationRequest,
-        result_hash: &str,
-    ) -> Result<bool> {
-        let work = self.maintenance.enter()?;
-        let Some(task) = &request.task_id else {
-            return Ok(true);
-        };
-        {
-            let store = self.store.lock().await;
-            if store
-                .continuation(&request.network_id, result_hash, "v1")?
-                .is_some()
-                || !followup_authorized(
-                    &store,
-                    &request.network_id,
-                    &request.conversation_id,
-                    task,
-                )?
-            {
-                return Ok(true);
-            }
-        }
-        let target =
-            if self.config.manager.is_some() && self.config.roles.contains(&NodeRole::Scheduler) {
-                Some(self.identity.node_id()?)
-            } else {
-                let bundle = self
-                    .store
-                    .lock()
-                    .await
-                    .trust_bundle(&request.network_id)?
-                    .context("unknown network")?;
-                let online = self.hub.online(&request.network_id).await;
-                let mut target = None;
-                let view = bundle.project()?;
-                for member in view.members.into_iter().filter(|member| {
-                    member.kind == IdentityKind::Node
-                        && !view.revoked.contains(&member.subject_id)
-                        && member.node_roles.contains(&NodeRole::Scheduler)
-                        && online.contains(&member.subject_id)
-                }) {
-                    let node = member.certificate()?;
-                    if let Ok(Ok(cap)) = tokio::time::timeout(
-                        Duration::from_secs(3),
-                        self.peer_request(
-                            &request.network_id,
-                            &node.node_id,
-                            json!({"type":"capabilities"}),
-                        ),
-                    )
-                    .await
-                        && !cap["manager"].is_null()
-                    {
-                        target = Some(node.node_id);
-                        break;
-                    }
-                }
-                target
-            };
-        let Some(target) = target else {
-            let notification_id = format!("followup:{result_hash}:waiting");
-            let already = self.store.lock().await.context(&request.network_id, &request.conversation_id, &[])?.events.iter().any(|event| {
-                matches!(&event.body, EventBody::NotificationRaised { notification_id: old, .. } if old == &notification_id)
-            });
-            if !already {
-                self.append(
-                    &request.network_id,
-                    &request.conversation_id,
-                    EventBody::NotificationRaised {
-                        notification_id,
-                        kind: "followup_waiting".into(),
-                        text: "执行已完成，当前没有可达的管理 Agent；可从其他入口查看结果。".into(),
-                    },
+            let access = self.store.lock().await.agent_grant(
+                &network,
+                &scope,
+                &audience.service,
+                &session,
+                &trigger,
+                now_ms() as u64,
+            )?;
+            let node = self.clone();
+            tokio::spawn(async move {
+                let _work = work;
+                if let Err(error) = crate::scheduler::run(
+                    node.clone(),
+                    access.clone(),
+                    scope.clone(),
+                    trigger.clone(),
                 )
-                .await?;
-            }
-            return Ok(false);
-        };
-        {
-            let mut store = self.store.lock().await;
-            if store
-                .continuation(&request.network_id, result_hash, "v1")?
-                .is_some()
-            {
+                .await
+                    && crate::scheduler::status(&node, &network, &scope, &trigger)
+                        .await
+                        .is_ok_and(|status| status["state"] == "not_found")
+                {
+                    let _ = node
+                        .agent_notification(
+                            &access,
+                            "manager_failed",
+                            &format!("管理 Agent 未完成：{error:#}"),
+                        )
+                        .await;
+                }
+            });
+            Ok(())
+        })
+    }
+    fn maybe_followup<'a>(
+        self: &'a Arc<Self>,
+        request: &'a OperationRequest,
+        result_hash: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            let Some(task) = &request.task_id else {
                 return Ok(true);
-            }
-            store.claim_continuation(&request.network_id, result_hash, "v1", &target)?;
-        }
-        let node = self.clone();
-        let request = request.clone();
-        let result_hash = result_hash.to_owned();
-        tokio::spawn(async move {
-            let _work = work;
-            let access = Access {
-                network_id: request.network_id.clone(),
-                human: false,
-                conversation_id: Some(request.conversation_id.clone()),
             };
-            let result = if target == node.identity.node_id().unwrap_or_default() {
-                crate::scheduler::run(
+            if self.config.manager.is_none() || !self.config.roles.contains(&NodeRole::Scheduler) {
+                return Ok(false);
+            }
+            let audience = self.audience()?;
+            let session = vibeface_secure::authorization::SessionRef {
+                target: audience.device,
+                session_id: result_hash.to_owned(),
+            };
+            let access = {
+                let mut store = self.store.lock().await;
+                if store
+                    .continuation(&request.network_id, result_hash, "v2")?
+                    .is_some()
+                    || !followup_authorized(
+                        &store,
+                        &request.network_id,
+                        &request.conversation_id,
+                        task,
+                    )?
+                {
+                    return Ok(true);
+                }
+                let access = store.agent_grant(
+                    &request.network_id,
+                    &request.conversation_id,
+                    &audience.service,
+                    &session,
+                    result_hash,
+                    now_ms() as u64,
+                )?;
+                store.claim_continuation(
+                    &request.network_id,
+                    result_hash,
+                    "v2",
+                    &self.identity.node_id()?,
+                )?;
+                access
+            };
+            let work = self.maintenance.enter()?;
+            let node = self.clone();
+            let request = request.clone();
+            let source = result_hash.to_owned();
+            tokio::spawn(async move {
+                let _work = work;
+                let outcome = crate::scheduler::run(
                     node.clone(),
                     access,
                     request.conversation_id.clone(),
-                    result_hash.clone(),
+                    source.clone(),
                 )
-                .await
-            } else {
-                match node
-                    .peer_request(
+                .await;
+                let (state, value) = match outcome {
+                    Ok(value) if value["state"] == "completed" => ("completed", value),
+                    Ok(value) if value["state"] == "failed" => ("failed", value),
+                    Ok(value) => ("unknown", value),
+                    Err(error) => ("unknown", json!({"error":format!("{error:#}")})),
+                };
+                if let Ok(target) = node.identity.node_id() {
+                    let _ = node.store.lock().await.finish_continuation(
                         &request.network_id,
+                        &source,
+                        "v2",
                         &target,
-                        json!({"type":"schedule","conversation_id":request.conversation_id,"trigger":result_hash}),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        let mut final_result = Err(anyhow::anyhow!(
-                            "scheduler result unknown; query its durable invocation status"
-                        ));
-                        for _ in 0..220 {
-                            tokio::time::sleep(Duration::from_secs(3)).await;
-                            match node
-                                .peer_request(
-                                    &request.network_id,
-                                    &target,
-                                    json!({"type":"manager_status","conversation_id":request.conversation_id,"trigger":result_hash}),
-                                )
-                                .await
-                            {
-                                Ok(value)
-                                    if matches!(value["state"].as_str(), Some("completed" | "failed" | "unknown")) =>
-                                {
-                                    final_result = Ok(value);
-                                    break;
-                                }
-                                Err(error) => {
-                                    final_result = Err(error);
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        final_result
-                    }
-                    Err(error) => Err(error),
+                        state,
+                        value,
+                    );
                 }
-            };
-            let (state, value) = match result {
-                Ok(v) if v["state"] == "completed" => ("completed", v),
-                Ok(v) if v["state"] == "failed" => ("failed", v),
-                Ok(v) => ("unknown", v),
-                Err(e) => ("unknown", json!({"error":format!("{e:#}")})),
-            };
-            let _ = node.store.lock().await.finish_continuation(
-                &request.network_id,
-                &result_hash,
-                "v1",
-                &target,
-                state,
-                value,
-            );
-        });
-        Ok(true)
+            });
+            Ok(true)
+        })
     }
 }

@@ -93,11 +93,7 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct ManagerSettings {
     pub provider: String,
-    pub workspace: PathBuf,
     pub model: String,
-    pub cursor_sdk_bin: PathBuf,
-    pub node_bin: PathBuf,
-    pub codex_sdk_script: PathBuf,
 }
 impl Config {
     pub fn local(listen: SocketAddr, roots: Vec<PathBuf>, allow_insecure_lan: bool) -> Self {
@@ -165,7 +161,6 @@ impl Config {
                 matches!(m.provider.as_str(), "cursor_sdk" | "codex_sdk"),
                 "unknown manager provider"
             );
-            ensure!(m.workspace.is_dir(), "manager workspace does not exist");
         }
         Ok(())
     }

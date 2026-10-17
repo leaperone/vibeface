@@ -6137,3 +6137,6 @@ pub mod task_binding;
 pub use task_binding::verify_task_binding;
 
 pub mod events;
+
+pub mod prepare;
+pub use prepare::sign_client_prepare_intent;

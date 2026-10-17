@@ -1,9 +1,10 @@
 //! SDK sessions stay local; their visible decisions belong to the replicated conversation.
 use crate::{
     crypto::digest,
+    engine::ExecutionContext,
     manager::{self, ManagerConfig, ManagerError, ManagerKind},
-    model::{BlobRef, Context, EventBody, NodeRole},
-    runtime::{Access, Runtime, Update},
+    model::{BlobRef, Context, EventBody},
+    runtime::{Runtime, Update},
     store::Store,
 };
 use anyhow::{Context as _, Result, ensure};
@@ -101,6 +102,7 @@ fn save_invocation(
     )
 }
 
+#[cfg(test)]
 fn claim(
     store: &mut Store,
     network: &str,
@@ -224,16 +226,18 @@ pub async fn status(
 
 pub async fn run(
     node: Arc<Runtime>,
-    access: Access,
+    access: crate::model::AgentSession,
     conversation: String,
     trigger: String,
 ) -> Result<Value> {
     let _work = node.maintenance.enter()?;
+    let access = node
+        .store
+        .lock()
+        .await
+        .refresh_agent_session(&access, crate::runtime::now_ms() as u64)?;
     ensure!(
-        access
-            .conversation_id
-            .as_ref()
-            .is_none_or(|id| id == &conversation),
+        access.conversation_id == conversation,
         "conversation access denied"
     );
     let settings = node
@@ -247,86 +251,115 @@ pub async fn run(
         _ => anyhow::bail!("unknown management SDK"),
     };
     let sdk_config = digest(&serde_json::to_vec(&settings)?);
-    let network = &access.network_id;
-    let (context, mut invocation, previous, fresh) = {
-        let mut store = node.store.lock().await;
-        store.authorize_node(
-            network,
-            &node.identity.node_id()?,
-            Some(NodeRole::Scheduler),
-        )?;
-        let envelope = store
-            .event(network, &trigger)?
-            .context("scheduler trigger is not present")?;
-        let event = store.verify_event(network, &envelope)?;
-        ensure!(
-            event.scope_id == conversation,
-            "scheduler trigger belongs to another conversation"
-        );
-        ensure!(
-            matches!(&event.body, EventBody::MessagePosted { role, .. } if role == "user")
-                || matches!(&event.body, EventBody::ExecutionObserved { status, .. } if matches!(status.as_str(), "completed" | "succeeded" | "failed" | "rejected" | "interrupted")),
-            "invalid scheduler trigger"
-        );
-        if let EventBody::MessagePosted { scheduler_node, .. } = &event.body {
-            ensure!(
-                scheduler_node.as_deref() == Some(node.identity.node_id()?.as_str()),
-                "this message is addressed to another scheduler; send a new message to continue here"
-            );
-        }
+    let network = &access.space_id.to_string();
+    let (context, project_root) = {
+        let store = node.store.lock().await;
         let context = store.context(network, &conversation, &[])?;
         ensure!(
             context.missing.is_complete(),
-            "conversation has missing or conflicting history; synchronize it before scheduling"
+            "conversation has missing or conflicting history"
         );
-        let (invocation, previous, fresh) = claim(
-            &mut store,
-            network,
-            &conversation,
-            &trigger,
-            boot_id(),
-            &sdk_config,
-        )?;
-        (context, invocation, previous, fresh)
+        ensure!(
+            context
+                .events
+                .iter()
+                .all(|event| event.resource_id == access.resource_id),
+            "manager context contains another resource"
+        );
+        (context, store.resource_root(network, &access.resource_id)?)
     };
-    if !fresh {
+    let admission = node
+        .claim_manager(&access, &trigger, boot_id(), &sdk_config)
+        .await?;
+    let mut invocation = admission.invocation;
+    let _previous_native_id = admission.previous_native_id;
+    if !admission.fresh {
         return Ok(invocation_value(&invocation));
     }
-
+    let agent_context = ExecutionContext {
+        space_id: access.space_id.clone(),
+        resource_id: access.resource_id.clone(),
+        operation_id: admission.manager_id,
+        shared: true,
+        lease_expires_at_ms: admission.lease_expires_at_ms,
+    };
     let token = uuid::Uuid::new_v4().to_string();
     let started = AtomicBool::new(false);
+    let lease_node = node.clone();
+    let lease_context = agent_context.clone();
+    let lease_conversation = conversation.clone();
+    let lease_trigger = trigger.clone();
+    let lease_token = token.clone();
+    let supervisor = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let state = status(
+                &lease_node,
+                lease_context.space_id.as_str(),
+                &lease_conversation,
+                &lease_trigger,
+            )
+            .await;
+            if !state
+                .as_ref()
+                .is_ok_and(|value| value["state"] == "running")
+            {
+                break;
+            }
+            let renewal: Result<()> = async {
+                let deadline = lease_node
+                    .renew_manager_authorization(&lease_context)
+                    .await?;
+                lease_node
+                    .engine
+                    .renew_manager(&lease_context, deadline)
+                    .await
+            }
+            .await;
+            if renewal.is_err() {
+                lease_node.agent_tokens.lock().await.remove(&lease_token);
+                let _ = lease_node.engine.cancel_manager(&lease_context).await;
+                let mut store = lease_node.store.lock().await;
+                if let Some(value) = store.local_value(
+                    lease_context.space_id.as_str(),
+                    &key("invocation", &lease_conversation, &lease_trigger),
+                )? {
+                    let mut invocation: Invocation = serde_json::from_value(value)?;
+                    if invocation.state == InvocationState::Running {
+                        invocation.state = InvocationState::Unknown;
+                        finish(
+                            &mut store,
+                            lease_context.space_id.as_str(),
+                            &lease_conversation,
+                            &invocation,
+                        )?;
+                    }
+                }
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
     let outcome: Result<Value> = async {
         let facts = node.current_facts(network, &conversation).await?;
         let (tasks, targets) = {
             let store = node.store.lock().await;
-            let view = store.trust_bundle(network)?.context("missing network trust")?.project()?;
-            let targets = view.members.into_iter()
-                .filter(|n| !view.revoked.contains(&n.subject_id) && n.kind == crate::identity::IdentityKind::Node && n.node_roles.contains(&NodeRole::Executor)).map(|n| n.subject_id).collect::<Vec<_>>();
-            (serde_json::to_value(store.tasks(network, &conversation)?)?, targets)
+            (serde_json::to_value(store.tasks(network, &conversation)?)?, vec![node.identity.node_id()?])
         };
-        let prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &node.config.roots)?;
+        let prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &[project_root.clone()])?;
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
         let config = ManagerConfig {
-            kind, workspace: settings.workspace, model: settings.model,
+            kind, workspace: project_root, model: settings.model,
             timeout_secs: node.config.timeout_secs,
-            cursor_sdk_bin: settings.cursor_sdk_bin, node_bin: settings.node_bin,
-            codex_bin: node.config.codex_bin.clone(), codex_sdk_script: settings.codex_sdk_script,
             custom_tools: tools(),
-            tool_callback_url: Some(local_url.clone()),
+            tool_callback_url: Some(local_url),
             tool_callback_token: Some(token.clone()),
-            tool_cli: Some(std::env::current_exe()?),
-            tool_env: BTreeMap::from([
-                ("VIBEFACE_NODE_URL".into(), local_url),
-                ("VIBEFACE_TOOL_TOKEN".into(), token.clone()),
-                ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
-                ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
-            ]),
         };
         {
             let mut store = node.store.lock().await;
             store.reserve_budget(network, &utc_day(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()), 1, node.config.daily_decision_limit)?;
         }
-        node.agent_tokens.lock().await.insert(token.clone(), Access { network_id: network.clone(), human: false, conversation_id: Some(conversation.clone()) });
+        node.agent_tokens.lock().await.insert(token.clone(), access.clone());
         let persist_node = node.clone();
         let persist_network = network.clone();
         let persist_conversation = conversation.clone();
@@ -335,7 +368,7 @@ pub async fn run(
         let progress_conversation = conversation.clone();
         let progress_trigger = trigger.clone();
         started.store(true, Ordering::Relaxed);
-        let result = manager::run_manager(&config, &prompt, previous.as_deref(), move |id| async move {
+        let result = manager::run_manager_authorized(&node.engine, &agent_context, &config, &prompt, None, move |id| async move {
             let mut store = persist_node.store.lock().await;
             let mut session = load_session(&store, &persist_network, &persist_conversation)?;
             session.native_id = Some(id);
@@ -348,6 +381,7 @@ pub async fn run(
             async { Ok(()) }
         }).await?;
         node.agent_tokens.lock().await.remove(&token);
+        node.store.lock().await.manager_tool_authorization(network, &agent_context.operation_id, crate::runtime::now_ms() as u64)?;
         let mut blobs = Vec::new();
         let output = if result.output.trim().is_empty() {
             "调度器已完成本轮处理，请查看工单与执行会话状态。".into()
@@ -358,29 +392,33 @@ pub async fn run(
             blobs.push(blob);
             text
         } else { result.output };
-        node.append_blobs(network, &conversation, EventBody::DecisionRecorded {
-            decision_id: format!("decision-{}", invocation.message_id), text: output.clone(),
-            effective_constraints: CONSTRAINTS.iter().map(|s| (*s).into()).collect(),
-            tool_configuration: json!({"provider":settings.provider,"model":config.model,"tools":tools().keys().collect::<Vec<_>>(),"trigger":trigger}),
-        }, blobs.clone()).await?;
-        node.append_blobs(network, &conversation, EventBody::MessagePosted {
-            message_id: invocation.message_id.clone(), role: "assistant".into(), text: output, scheduler_node: None,
-        }, blobs).await?;
+        node.record_agent_result(&access, json!({
+            "authorization_id":format!("result:{}",invocation.message_id),
+            "decision_id":format!("decision-{}",invocation.message_id), "text":output,
+            "effective_constraints":CONSTRAINTS.iter().map(|constraint| (*constraint).to_owned()).collect::<Vec<_>>(),
+            "tool_configuration":{"provider":settings.provider,"model":config.model,"tools":tools().keys().collect::<Vec<_>>(),"trigger":trigger},
+            "message_id":invocation.message_id,"output":output,"blobs":blobs,
+        })).await?;
         invocation.state = InvocationState::Completed;
         {
             let mut store = node.store.lock().await;
             finish(&mut store, network, &conversation, &invocation)?;
         }
-        node.raise_notification(network, &conversation, "manager_response", "调度器已回复，可查看会话。").await?;
         Ok(invocation_value(&invocation))
     }.await;
     node.agent_tokens.lock().await.remove(&token);
+    supervisor.abort();
+    let _ = supervisor.await;
     if let Err(error) = outcome {
         if invocation.state != InvocationState::Completed {
-            let uncertain = error
-                .downcast_ref::<ManagerError>()
-                .map(|e| e.uncertain)
-                .unwrap_or_else(|| started.load(Ordering::Relaxed));
+            let already_unknown = status(&node, network, &conversation, &trigger)
+                .await
+                .is_ok_and(|value| value["state"] == "unknown");
+            let uncertain = already_unknown
+                || error
+                    .downcast_ref::<ManagerError>()
+                    .map(|e| e.uncertain)
+                    .unwrap_or_else(|| started.load(Ordering::Relaxed));
             invocation.state = if uncertain {
                 InvocationState::Unknown
             } else {
@@ -395,7 +433,7 @@ pub async fn run(
             } else {
                 "调度调用失败，请检查本机 SDK 配置或调用额度；系统没有重新发送。"
             };
-            node.raise_notification(network, &conversation, "manager_attention", text)
+            node.agent_notification(&access, "manager_attention", text)
                 .await?;
         }
         return Err(error);
@@ -495,7 +533,7 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
     let specs = [
         (
             "nodes",
-            "List reachable execution Nodes and their capabilities and allowed roots.",
+            "Read this authorized project's execution host and root.",
             json!({}),
             vec![],
         ),
@@ -512,6 +550,12 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
             vec!["task_id", "title", "goal", "acceptance"],
         ),
         (
+            "bind_execution",
+            "Explicitly bind a selected task to its first execution session. This cannot move an existing binding.",
+            json!({"task_id":string(),"target_node":string(),"session_id":string(),"executor":{"type":"string","enum":["codex","cursor_agent","claude_code"]},"cwd":string()}),
+            vec!["task_id", "target_node", "session_id", "executor", "cwd"],
+        ),
+        (
             "open_execution",
             "Open one execution session. Reuse operation_id and session_id for the same request; unknown outcomes require reconciliation.",
             json!({"operation_id":string(),"session_id":string(),"target_node":string(),"executor":{"type":"string","enum":["codex","cursor_agent","claude_code"]},"cwd":string(),"task_id":string()}),
@@ -521,6 +565,7 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
                 "target_node",
                 "executor",
                 "cwd",
+                "task_id",
             ],
         ),
         (
@@ -533,6 +578,7 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
                 "target_node",
                 "expected_revision",
                 "text",
+                "task_id",
             ],
         ),
         (

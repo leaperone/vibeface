@@ -1,24 +1,23 @@
-//! Client-owned keys authenticate the encrypted channel; current membership authorizes each request.
+//! Noise proves device possession. Every business request carries an independent Invocation.
 
 use crate::{
-    crypto::{self, LocalIdentity},
-    identity::{
-        self, AuthorizationView, Genesis, GovernanceAction, GovernanceEvent, HistoricalNode,
-        IdentityKind, Member, NetworkState, RootCheckpoint,
-        local::{InviteEnvelope, InviteRequest, PairConfirm, PairRequest},
-    },
+    crypto::LocalIdentity,
     network::{NetworkSocket, Service},
     runtime::{Access, Runtime},
 };
 use anyhow::{Context, Result, bail, ensure};
 use axum::extract::ws::Message;
 use futures_util::{SinkExt, StreamExt};
-use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
+};
+use vibeface_secure::authorization::{
+    ClientAuthorizationBundle, ClientScope, DeviceId, Invocation, PolicyPin, PublicKey,
+    ResourceRecord, Signed, TransportEvidence, VerifiedClientAuthorization,
+    verify_client_authorization,
 };
 use vibeface_secure::{Channel, Handshake};
 
@@ -34,6 +33,8 @@ struct Request {
     method: String,
     #[serde(default)]
     params: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invocation: Option<Signed<Invocation>>,
 }
 #[derive(Serialize)]
 struct Response {
@@ -42,32 +43,18 @@ struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
-
-#[derive(Clone, Serialize)]
-struct RecoveryChallenge {
-    challenge_id: String,
-    network_id: String,
-    owner_public_key: String,
-    subject_id: String,
-    target_node_id: String,
-    genesis_hash: String,
-    nonce: String,
-    expires_at_ms: i64,
-}
-struct Recovery {
-    challenge: RecoveryChallenge,
-    genesis: Genesis,
-    authorized: bool,
-    state: Option<NetworkState>,
-    prepared: Option<RootCheckpoint>,
-    authorized_until_ms: Option<i64>,
-    minimum_epoch: u64,
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Authentication {
+    scope: ClientScope,
+    authorization: ClientAuthorizationBundle,
+    pins: Vec<PolicyPin>,
+    resources: Vec<Signed<ResourceRecord>>,
 }
 struct Session {
-    subject_id: String,
     public_key: String,
-    subscribed: bool,
-    recovery: Option<Recovery>,
+    authorization: Option<VerifiedClientAuthorization>,
+    subscription: Option<Access>,
 }
 
 pub struct Client {
@@ -99,7 +86,7 @@ impl Client {
                 true,
                 &identity.secret_key_hex,
                 Some(target.to_owned()),
-                b"vibeface:client:v1",
+                b"vibeface:client:v2",
             ))?;
             send_frame(&mut socket, secure(handshake.write(&[]))?).await?;
             let second = next_binary(&mut socket).await?;
@@ -120,6 +107,7 @@ impl Client {
             id: id.clone(),
             method: method.to_owned(),
             params,
+            invocation: None,
         };
         send_value(&mut self.socket, &mut self.channel, &request).await?;
         tokio::time::timeout(CALL_TIMEOUT, async {
@@ -142,12 +130,12 @@ impl Client {
 }
 
 pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> {
-    let (mut channel, subject_id, public_key) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let (mut channel, public_key) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let mut handshake = secure(Handshake::new(
             false,
             &node.identity.secret_key_hex,
             None,
-            b"vibeface:client:v1",
+            b"vibeface:client:v2",
         ))?;
         ensure!(
             secure(handshake.read(&next_binary(&mut socket).await?))?.is_empty(),
@@ -158,19 +146,17 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
             secure(handshake.read(&next_binary(&mut socket).await?))?.is_empty(),
             "unexpected final client payload"
         );
-        let subject_id = handshake.remote_id().context("client identity missing")?;
         let public_key = handshake
             .remote_public_key()
             .context("client public key missing")?;
-        Ok::<_, anyhow::Error>((secure(handshake.finish())?, subject_id, public_key))
+        Ok::<_, anyhow::Error>((secure(handshake.finish())?, public_key))
     })
     .await
     .context("client handshake timed out")??;
     let mut session = Session {
-        subject_id,
         public_key,
-        subscribed: false,
-        recovery: None,
+        authorization: None,
+        subscription: None,
     };
     let mut events = node.events.subscribe();
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
@@ -187,8 +173,12 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                             partial_started = None;
                             let request: Request = serde_json::from_slice(&plaintext).context("invalid client request")?;
                             validate_request(&request)?;
-                            let result = dispatch(&node, &mut session, &request.method, request.params).await;
-                            let response = match result { Ok(result) => Response { id: request.id, result, error: None }, Err(error) => Response { id: request.id, result: Value::Null, error: Some(error.to_string()) } };
+                            let result = dispatch(&node, &mut session, request).await;
+                            let (id, result) = result;
+                            let response = match result {
+                                Ok(result) => Response { id, result, error: None },
+                                Err(error) => Response { id, result: Value::Null, error: Some(error.to_string()) },
+                            };
                             send_value(&mut socket, &mut channel, &response).await?;
                         } else { partial_started.get_or_insert_with(Instant::now); }
                     }
@@ -196,19 +186,24 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                     _ => bail!("client channel accepts only encrypted binary frames"),
                 }
             }
-            event = events.recv(), if session.subscribed => {
-                let principal = current_view(&node, &session).await?.principal(&session.subject_id)?;
+            event = events.recv(), if session.subscription.is_some() => {
                 match event {
-                    Ok(event) if event.network_id == principal.network_id => send_value(&mut socket, &mut channel, &json!({"type":"changed","payload":event.payload})).await?,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => send_value(&mut socket, &mut channel, &json!({"type":"changed"})).await?,
+                    Ok(event) => {
+                        let access = session.subscription.as_ref().context("subscription missing")?;
+                        if node.subscription_allows(access, &event).await? {
+                            send_value(&mut socket, &mut channel, &json!({"type":"changed"})).await?;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        session.subscription = None;
+                        send_value(&mut socket, &mut channel, &json!({"type":"subscription_expired"})).await?;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
-                    _ => {},
                 }
             }
             _ = heartbeat.tick() => {
                 ensure!(received.elapsed() < IDLE_TIMEOUT, "client channel idle");
                 ensure!(partial_started.is_none_or(|at| at.elapsed() < IDLE_TIMEOUT), "client fragmented message timed out");
-                if session.subscribed { current_view(&node, &session).await?.principal(&session.subject_id)?; }
                 tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.send(Message::Ping(Vec::new().into()))).await.context("client heartbeat send timed out")??;
             }
         }
@@ -218,709 +213,136 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
 async fn dispatch(
     node: &Arc<Runtime>,
     session: &mut Session,
+    request: Request,
+) -> (String, Result<Value>) {
+    let id = request.id;
+    let result = dispatch_request(
+        node,
+        session,
+        &request.method,
+        request.params,
+        request.invocation,
+    )
+    .await;
+    (id, result)
+}
+
+async fn dispatch_request(
+    node: &Arc<Runtime>,
+    session: &mut Session,
     method: &str,
     params: Value,
+    invocation: Option<Signed<Invocation>>,
 ) -> Result<Value> {
-    let _work = if matches!(
-        method,
-        "info"
-            | "authenticate"
-            | "directory"
-            | "subscribe"
-            | "pair_status"
-            | "pair_requests"
-            | "recovery_challenge"
-            | "recovery_context"
-    ) {
-        None
-    } else {
-        Some(node.maintenance.enter()?)
-    };
     match method {
-        "info" => Ok(
-            json!({"initialized":node.has_membership().await?,"node_id":node.identity.node_id()?,"public_key":node.identity.public_key_hex()?,"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION")}),
-        ),
+        "info" => Ok(node.info()),
         "authenticate" => {
-            let authenticated = authentication(node, session).await?;
-            if let Some(network) = params
-                .get("network_id")
-                .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
-            {
-                ensure!(
-                    network == &authenticated["principal"]["network_id"],
-                    "client requested another personal network"
-                );
-            }
-            Ok(authenticated)
-        }
-        "directory" => {
-            let view = current_view(node, session).await?;
-            view.authorize_client(&session.subject_id)?;
-            Ok(json!({"state":node.membership_state().await?,"view":view}))
-        }
-        "subscribe" => {
-            current_view(node, session)
-                .await?
-                .authorize_client(&session.subject_id)?;
-            session.subscribed = true;
-            Ok(json!({"subscribed":true}))
-        }
-        "rpc" => {
-            let principal = current_view(node, session)
-                .await?
-                .principal(&session.subject_id)?;
-            let mut params = params;
-            bind_client_identity(&mut params, &principal.subject_id)?;
-            node.rpc(
-                Access {
-                    network_id: principal.network_id,
-                    human: true,
-                    conversation_id: None,
-                },
-                params,
-            )
-            .await
-        }
-        "prepare_genesis" => {
-            ensure!(
-                !node.has_membership().await?,
-                "personal network already initialized"
-            );
-            let owner_public_key = text(&params, "owner_public_key")?.to_owned();
-            let network_id = crypto::fingerprint(&owner_public_key)?;
-            let mut initial_members = vec![
-                Member::node(
-                    &node.identity,
-                    params["node_name"].as_str().unwrap_or("This device"),
-                    node.config.roles.clone(),
-                )?,
-                session_member(
-                    session,
-                    text(&params, "client_name")?,
-                    IdentityKind::Client,
-                    vec![],
-                    true,
-                )?,
-            ];
-            initial_members.sort_by(|a, b| a.subject_id.cmp(&b.subject_id));
-            let genesis = Genesis {
-                version: identity::IDENTITY_VERSION,
-                network_id,
-                owner_public_key,
-                initial_members,
-                signature: String::new(),
+            let envelope = node
+                .identity_command(&session.public_key, "authenticate", &params)
+                .await?;
+            let input: Authentication = serde_json::from_value(envelope)?;
+            let pins = {
+                let store = node.store.lock().await;
+                serde_json::to_string(store.trusted_policy_pins())?
             };
-            let signing = signing("identity-genesis", genesis.signing_bytes()?);
-            Ok(
-                json!({"state":NetworkState{genesis,checkpoint:None,events:vec![]},"signing":signing}),
-            )
-        }
-        "bootstrap" => {
-            let state: NetworkState = from_field(&params, "state")?;
-            validate_local_node(node, &state, true)?;
-            if node.has_membership().await? {
-                let current = node.membership_state().await?;
-                ensure!(
-                    current.genesis == state.genesis
-                        && state.checkpoint.is_none()
-                        && state.events.is_empty(),
-                    "personal network already initialized"
-                );
-                ensure!(
-                    current
-                        .project()?
-                        .principal(&session.subject_id)?
-                        .can_manage,
-                    "bootstrap requires its original management identity"
-                );
-            } else {
-                node.store.lock().await.bootstrap_network(
-                    state.clone(),
-                    text(&params, "capability")?,
-                    &session.subject_id,
-                )?;
-            }
-            node.install_membership(state).await?;
-            authentication(node, session).await
-        }
-        "prepare_invite" => {
-            let view = manager_view(node, session).await?;
-            let capability = random_hex();
-            let kind: IdentityKind = from_field(&params, "kind")?;
-            let mut roles: Vec<crate::model::NodeRole> = params
-                .get("node_roles")
-                .map(|v| serde_json::from_value(v.clone()))
-                .transpose()?
-                .unwrap_or_default();
-            sort_roles(&mut roles)?;
-            let payload = node.store.lock().await.create_invite(InviteRequest {
-                request_id: request_id(&params)?,
-                network_id: view.network_id,
-                inviter_subject_id: session.subject_id.clone(),
-                epoch: view.epoch,
-                capability: capability.clone(),
-                new_kind: kind,
-                node_roles: roles,
-                manage: false,
-                expires_at_ms: None,
-            })?;
-            let signing = signing("identity-invite", payload.signing_bytes()?);
-            Ok(
-                json!({"invite":InviteEnvelope{payload,inviter_signature:String::new()},"capability":capability,"signing":signing}),
-            )
-        }
-        "commit_invite" => {
-            manager_view(node, session).await?;
-            let invite: InviteEnvelope = from_field(&params, "invite")?;
+            let verified = secure(verify_client_authorization(
+                &serde_json::to_string(&input.authorization)?,
+                &pins,
+                input.scope.account_id.as_str(),
+                input.scope.space_id.as_str(),
+                &session.public_key,
+                crate::runtime::now_ms() as f64,
+            ))?;
             ensure!(
-                invite.payload.inviter_subject_id == session.subject_id,
-                "invitation signer differs from authenticated client"
-            );
-            let capability = text(&params, "capability")?;
-            ensure!(
-                crypto::digest(capability.as_bytes()) == invite.payload.capability_hash,
-                "invitation capability mismatch"
-            );
-            node.store.lock().await.commit_invite(invite.clone())?;
-            Ok(json!({"invite":invite,"capability":capability}))
-        }
-        "prepare_pair_request" => {
-            let invite: InviteEnvelope = from_field(&params, "invite")?;
-            let state = node.membership_state().await?;
-            let view = state.project()?;
-            ensure!(
-                invite.payload.network_id == view.network_id && invite.payload.epoch == view.epoch,
-                "invitation is for another network or epoch"
-            );
-            let inviter = view.authorize_client(&invite.payload.inviter_subject_id)?;
-            ensure!(inviter.manage, "inviter no longer manages this network");
-            crypto::verify_payload(
-                &inviter.public_key,
-                "identity-invite",
-                &invite.signing_bytes()?,
-                &invite.inviter_signature,
-            )?;
-            let capability = text(&params, "capability")?.to_owned();
-            ensure!(
-                crypto::digest(capability.as_bytes()) == invite.payload.capability_hash,
-                "invalid invitation capability"
+                verified.scope() == &input.scope,
+                "client scope differs from verified proof"
             );
             ensure!(
-                invite.payload.expires_at_ms > crate::runtime::now_ms(),
-                "invitation expired"
+                verified.resources() == input.resources,
+                "resource directory differs from verified policy"
             );
-            let member = session_member(
-                session,
-                text(&params, "name")?,
-                invite.payload.new_kind,
-                invite.payload.node_roles.clone(),
-                false,
-            )?;
-            let request_id = request_id(&params)?;
-            let nonce = crypto::digest(&identity::canonical_json(&(
-                "pair-nonce",
-                &request_id,
-                &invite.payload.invite_id,
-                &session.subject_id,
-            ))?);
-            let request = PairRequest {
-                request_id,
-                invite_id: invite.payload.invite_id,
-                capability,
-                member,
-                nonce,
-                proof: String::new(),
-            };
-            let signing = signing("identity-pair", request.signing_bytes()?);
-            Ok(json!({"request":request,"signing":signing}))
-        }
-        "pair_request" => {
-            node.membership_state().await?;
-            let request: PairRequest = from_field(&params, "request")?;
-            ensure!(
-                request.member.subject_id == session.subject_id
-                    && request.member.public_key == session.public_key,
-                "pair request is for another channel identity"
-            );
-            let request_id = request.request_id.clone();
-            let review = node.store.lock().await.pair_request(request)?;
-            let signing = signing("identity-pair-review", review.signing_bytes()?);
-            Ok(json!({"request_id":request_id,"review":review,"signing":signing}))
-        }
-        "pair_accept" => {
-            node.membership_state().await?;
-            let request_id = text(&params, "request_id")?;
-            let review = node.store.lock().await.lookup_pair(request_id)?;
-            ensure!(
-                review.new_member.subject_id == session.subject_id
-                    && review.new_member.public_key == session.public_key,
-                "pair request is for another channel identity"
-            );
-            let state = node.membership_state().await?;
-            if state
-                .project()?
-                .authorize_member(&session.subject_id)
-                .is_ok_and(|member| member == review.new_member)
             {
-                return Ok(json!({"status":"granted"}));
-            }
-            let receipt = node
-                .store
-                .lock()
-                .await
-                .accept_pair(review, text(&params, "signature")?.to_owned())?;
-            let _ = node.events.send(crate::runtime::Update {
-                network_id: state.genesis.network_id,
-                payload: json!({"type":"pair_requested"}),
-            });
-            Ok(serde_json::to_value(receipt)?)
-        }
-        "pair_requests" => {
-            manager_view(node, session).await?;
-            Ok(serde_json::to_value(
-                node.store.lock().await.pending_pairs(&session.subject_id)?,
-            )?)
-        }
-        "prepare_pair" => {
-            let view = manager_view(node, session).await?;
-            let pair = node
-                .store
-                .lock()
-                .await
-                .pending_pairs(&session.subject_id)?
-                .into_iter()
-                .find(|pair| pair.request_id == params["request_id"])
-                .context("pair request not found")?;
-            ensure!(
-                !pair.new_subject_signature.is_empty(),
-                "waiting for the new device to confirm"
-            );
-            ensure!(pair.review.epoch == view.epoch, "pair review epoch changed");
-            let event = grant_event(&pair.review)?;
-            Ok(
-                json!({"review":pair.review,"review_signing":signing("identity-pair-review",pair.review.signing_bytes()?),"event":event,"signing":signing("identity-governance",event.signing_bytes()?)}),
-            )
-        }
-        "pair_confirm" => {
-            manager_view(node, session).await?;
-            let event: GovernanceEvent = from_field(&params, "event")?;
-            ensure!(
-                event.issuer == session.subject_id,
-                "pair grant signer differs from authenticated client"
-            );
-            let current = node.membership_state().await?;
-            if current.events.iter().any(|existing| existing == &event) {
-                node.install_membership(current).await?;
-                return authentication(node, session).await;
-            }
-            let pair = node
-                .store
-                .lock()
-                .await
-                .pending_pairs(&session.subject_id)?
-                .into_iter()
-                .find(|pair| pair.request_id == params["request_id"])
-                .context("pair request not found")?;
-            let mut expected = grant_event(&pair.review)?;
-            expected.signature = event.signature.clone();
-            ensure!(
-                event == expected && event.issuer == session.subject_id,
-                "grant differs from approved pair review"
-            );
-            node.store.lock().await.confirm_pair(PairConfirm {
-                review: pair.review,
-                inviter_signature: text(&params, "inviter_signature")?.to_owned(),
-                new_subject_signature: pair.new_subject_signature,
-            })?;
-            let state = node.store.lock().await.store_signed_grant(event)?;
-            let network_id = state.genesis.network_id.clone();
-            node.install_membership(state.clone()).await?;
-            announce_membership(node, &network_id, &state).await;
-            authentication(node, session).await
-        }
-        "pair_status" => {
-            node.membership_state().await?;
-            let request_id = text(&params, "request_id")?;
-            let review = match node.store.lock().await.lookup_pair(request_id) {
-                Ok(review) => review,
-                Err(error)
-                    if error
-                        .downcast_ref::<rusqlite::Error>()
-                        .is_some_and(|error| {
-                            matches!(error, rusqlite::Error::QueryReturnedNoRows)
-                        }) =>
-                {
-                    return Ok(json!({"status":"not_found"}));
+                let store = node.store.lock().await;
+                for stamp in verified.heads() {
+                    ensure!(
+                        store.authorization_state().head(&stamp.domain) == Some(stamp),
+                        "policy synchronization is required"
+                    );
                 }
-                Err(error) => return Err(error),
-            };
-            ensure!(
-                review.new_member.subject_id == session.subject_id
-                    && review.new_member.public_key == session.public_key,
-                "pair request is for another channel identity"
-            );
-            let state = node.membership_state().await?;
-            if state
-                .project()?
-                .authorize_member(&session.subject_id)
-                .is_ok_and(|member| member == review.new_member)
-            {
-                Ok(json!({"status":"granted","state":state}))
-            } else {
-                ensure!(
-                    review.expires_at_ms > crate::runtime::now_ms(),
-                    "pair review expired"
-                );
-                Ok(json!({"status":"pending","request_id":request_id,"review":review}))
             }
-        }
-        "prepare_revoke" => {
-            let view = manager_view(node, session).await?;
-            let subject_id = text(&params, "subject_id")?.to_owned();
-            ensure!(
-                !view.authorize_member(&subject_id)?.manage,
-                "management-client changes require a root checkpoint"
-            );
-            let event = GovernanceEvent {
-                version: identity::IDENTITY_VERSION,
-                network_id: view.network_id,
-                epoch: view.epoch,
-                parents: view.heads,
-                issuer: session.subject_id.clone(),
-                action: GovernanceAction::Revoke { subject_id },
-                signature: String::new(),
-            };
+            session.subscription = None;
+            session.authorization = Some(verified);
             Ok(
-                json!({"event":event,"signing":signing("identity-governance",event.signing_bytes()?)}),
+                json!({"scope":input.scope,"authorization":input.authorization,"pins":input.pins,"resources":input.resources}),
             )
         }
-        "revoke" => {
-            manager_view(node, session).await?;
-            let event: GovernanceEvent = from_field(&params, "event")?;
-            ensure!(
-                event.issuer == session.subject_id
-                    && matches!(event.action, GovernanceAction::Revoke { .. }),
-                "invalid revoke signer or action"
-            );
-            let mut state = node.membership_state().await?;
-            state.append(event)?;
-            let network_id = state.genesis.network_id.clone();
-            node.install_membership(state.clone()).await?;
-            announce_membership(node, &network_id, &state).await;
-            authentication(node, session).await
-        }
-        "recovery_challenge" => recovery_challenge(node, session, &params).await,
-        "recovery_context" => recovery_context(node, session, &params).await,
-        "prepare_recovery" => {
-            let latest = if node.has_membership().await? {
-                Some(node.membership_state().await?)
-            } else {
-                None
-            };
-            let recovery = authorized_recovery(session, &params)?;
-            if let Some(latest) = latest {
-                ensure!(
-                    latest.genesis == recovery.genesis,
-                    "recovery network changed"
-                );
-                recovery.state = Some(latest);
-            }
-            let state = recovery
-                .state
+        "prepare_invocation" => {
+            let client = session
+                .authorization
                 .as_ref()
-                .context("recovery context is required")?;
-            let mut members: Vec<Member> = from_field(&params, "members")?;
-            for member in &members {
-                member.validate()?;
-            }
-            members.sort_by(|a, b| a.subject_id.cmp(&b.subject_id));
-            let historical_nodes = recovery_history(state, &members)?;
-            let minimum_epoch = recovery
-                .minimum_epoch
-                .checked_add(1)
-                .context("recovery epoch overflow")?;
-            let checkpoint = RootCheckpoint {
-                version: identity::IDENTITY_VERSION,
-                network_id: state.genesis.network_id.clone(),
-                epoch: state
-                    .epoch()
-                    .checked_add(1)
-                    .context("recovery epoch overflow")?
-                    .max(minimum_epoch),
-                members,
-                historical_nodes,
-                signature: String::new(),
-            };
-            let signing = signing("identity-recovery", checkpoint.signing_bytes()?);
-            recovery.prepared = Some(checkpoint.clone());
-            Ok(json!({"checkpoint":checkpoint,"signing":signing}))
+                .context("authenticate before preparing a request")?;
+            let intent = serde_json::from_value(params["intent"].clone())?;
+            node.prepare_client_request(client, params["body"].clone(), intent, &session.public_key)
+                .await
         }
-        "recover" => {
-            let checkpoint: RootCheckpoint = from_field(&params, "checkpoint")?;
-            let recovery = authorized_recovery(session, &params)?;
-            let mut expected = recovery
-                .prepared
-                .clone()
-                .context("prepare recovery before signing")?;
-            expected.signature = checkpoint.signature.clone();
+        "rpc" | "subscribe" => {
+            let client = session
+                .authorization
+                .as_ref()
+                .context("authenticate before sending a request")?;
             ensure!(
-                checkpoint == expected,
-                "checkpoint differs from the confirmed recovery template"
+                params["space_id"].as_str() == Some(client.scope().space_id.as_str()),
+                "request belongs to another space"
             );
-            let mut state = recovery
-                .state
-                .clone()
-                .context("recovery context is required")?;
-            state.recover(checkpoint)?;
-            if node.has_membership().await? {
-                let current = node.membership_state().await?;
-                let prior = recovery
-                    .state
-                    .as_ref()
-                    .context("recovery context is required")?;
+            let invocation = invocation.context("signed Invocation is required")?;
+            ensure!(
+                invocation.payload.grant_leaf == *client.grant_leaf(),
+                "request uses another grant"
+            );
+            if client.audience() != &node.local_audience()? {
                 ensure!(
-                    current.genesis == prior.genesis && current.project()? == prior.project()?,
-                    "membership changed; review recovery again"
+                    method == "rpc",
+                    "subscribe directly to the selected resource host"
                 );
+                return node
+                    .forward_client_request(client, &params, &invocation, &session.public_key)
+                    .await;
             }
-            let fresh = !node.has_membership().await?;
-            validate_local_node(node, &state, fresh)?;
-            if fresh {
-                node.store.lock().await.bootstrap_recovered_network(
-                    state.clone(),
-                    text(&params, "capability")?,
-                    &session.subject_id,
-                )?;
+            let device = DeviceId::from_key(&PublicKey::parse(&session.public_key)?);
+            let transport = if invocation.payload.presenter == device {
+                TransportEvidence::DirectNoise { device }
+            } else {
+                TransportEvidence::GatewayNoise {
+                    device,
+                    gateway: DeviceId::from_key(&PublicKey::parse(
+                        &node.identity.public_key_hex()?,
+                    )?),
+                }
+            };
+            let access = node
+                .authorize_rpc(params.clone(), invocation, transport)
+                .await?;
+            if method == "subscribe" {
+                node.validate_subscription(&access).await?;
+                session.subscription = Some(access);
+                Ok(json!({"subscribed":true}))
+            } else {
+                node.rpc(access, params).await
             }
-            node.install_membership(state).await?;
-            session.recovery = None;
-            authentication(node, session).await
+        }
+        "identity" => {
+            let method = params["method"]
+                .as_str()
+                .context("identity method is required")?;
+            ensure!(
+                method != "authenticate",
+                "use the authenticate channel method to bind this session"
+            );
+            node.identity_command(&session.public_key, method, &params["params"])
+                .await
         }
         _ => bail!("unknown client method"),
     }
-}
-
-async fn current_view(node: &Runtime, session: &Session) -> Result<AuthorizationView> {
-    let view = node.membership_state().await?.project()?;
-    let member = view.authorize_client(&session.subject_id)?;
-    ensure!(
-        member.public_key == session.public_key,
-        "client identity key mismatch"
-    );
-    Ok(view)
-}
-async fn manager_view(node: &Runtime, session: &Session) -> Result<AuthorizationView> {
-    let view = current_view(node, session).await?;
-    ensure!(
-        view.principal(&session.subject_id)?.can_manage,
-        "management permission required"
-    );
-    Ok(view)
-}
-async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
-    let state = node.membership_state().await?;
-    let view = state.project()?;
-    let member = view.authorize_client(&session.subject_id)?;
-    ensure!(
-        member.public_key == session.public_key,
-        "client identity key mismatch"
-    );
-    Ok(json!({"principal":view.principal(&session.subject_id)?,"state":state,"view":view}))
-}
-fn session_member(
-    session: &Session,
-    name: &str,
-    kind: IdentityKind,
-    node_roles: Vec<crate::model::NodeRole>,
-    manage: bool,
-) -> Result<Member> {
-    let member = Member {
-        subject_id: session.subject_id.clone(),
-        public_key: session.public_key.clone(),
-        kind,
-        name: name.to_owned(),
-        node_roles,
-        manage,
-    };
-    member.validate()?;
-    Ok(member)
-}
-fn validate_local_node(node: &Runtime, state: &NetworkState, required: bool) -> Result<()> {
-    let view = state.project()?;
-    let local = view.authorize_node(&node.identity.node_id()?, None);
-    if required || local.is_ok() {
-        let member = local?;
-        ensure!(
-            member.public_key == node.identity.public_key_hex()?
-                && member
-                    .node_roles
-                    .iter()
-                    .all(|role| node.config.roles.contains(role)),
-            "local device authorization exceeds configured roles"
-        );
-    }
-    Ok(())
-}
-fn recovery_history(state: &NetworkState, members: &[Member]) -> Result<Vec<HistoricalNode>> {
-    let mut history: std::collections::BTreeMap<String, HistoricalNode> = state
-        .historical_nodes()?
-        .into_iter()
-        .map(|node| (node.subject_id.clone(), node))
-        .collect();
-    for member in members
-        .iter()
-        .filter(|member| member.kind == IdentityKind::Node)
-    {
-        let node = HistoricalNode {
-            subject_id: member.subject_id.clone(),
-            public_key: member.public_key.clone(),
-        };
-        if let Some(previous) = history.insert(node.subject_id.clone(), node.clone()) {
-            ensure!(previous == node, "historical device key conflict");
-        }
-    }
-    Ok(history.into_values().collect())
-}
-
-fn grant_event(review: &crate::identity::local::PairReview) -> Result<GovernanceEvent> {
-    ensure!(
-        !review.new_member.manage,
-        "management clients require a root checkpoint"
-    );
-    Ok(GovernanceEvent {
-        version: identity::IDENTITY_VERSION,
-        network_id: review.network_id.clone(),
-        epoch: review.epoch,
-        parents: review.parents.clone(),
-        issuer: review.inviter_subject_id.clone(),
-        action: GovernanceAction::Grant {
-            member: review.new_member.clone(),
-        },
-        signature: String::new(),
-    })
-}
-
-async fn announce_membership(node: &Runtime, network_id: &str, state: &NetworkState) {
-    let _ = node
-        .hub
-        .broadcast(network_id, json!({"type":"trust","state":state}))
-        .await;
-}
-async fn recovery_challenge(
-    node: &Runtime,
-    session: &mut Session,
-    params: &Value,
-) -> Result<Value> {
-    let network_id = text(params, "network_id")?.to_owned();
-    let owner_public_key = text(params, "owner_public_key")?.to_owned();
-    ensure!(
-        crypto::fingerprint(&owner_public_key)? == network_id,
-        "recovery root fingerprint mismatch"
-    );
-    let genesis = if node.has_membership().await? {
-        node.membership_state().await?.genesis
-    } else {
-        from_field(params, "genesis")?
-    };
-    genesis.verify()?;
-    ensure!(
-        genesis.network_id == network_id && genesis.owner_public_key == owner_public_key,
-        "recovery root differs from pinned network"
-    );
-    let challenge = RecoveryChallenge {
-        challenge_id: uuid::Uuid::new_v4().to_string(),
-        network_id,
-        owner_public_key,
-        subject_id: session.subject_id.clone(),
-        target_node_id: node.identity.node_id()?,
-        genesis_hash: crypto::digest(&identity::canonical_json(&genesis)?),
-        nonce: random_hex(),
-        expires_at_ms: crate::runtime::now_ms() + 90_000,
-    };
-    let signing = signing(
-        "identity-recovery-access",
-        identity::canonical_json(&challenge)?,
-    );
-    session.recovery = Some(Recovery {
-        challenge: challenge.clone(),
-        genesis,
-        authorized: false,
-        state: None,
-        prepared: None,
-        authorized_until_ms: None,
-        minimum_epoch: 1,
-    });
-    Ok(json!({"challenge_id":challenge.challenge_id,"challenge":challenge,"signing":signing}))
-}
-async fn recovery_context(node: &Runtime, session: &mut Session, params: &Value) -> Result<Value> {
-    let recovery = session
-        .recovery
-        .as_mut()
-        .context("recovery challenge is required")?;
-    check_recovery(recovery, params)?;
-    crypto::verify_payload(
-        &recovery.challenge.owner_public_key,
-        "identity-recovery-access",
-        &identity::canonical_json(&recovery.challenge)?,
-        text(params, "signature")?,
-    )?;
-    let state = if node.has_membership().await? {
-        node.membership_state().await?
-    } else {
-        node.store
-            .lock()
-            .await
-            .verify_bootstrap_capability(text(params, "capability")?)?;
-        from_field(params, "state")?
-    };
-    ensure!(
-        state.genesis == recovery.genesis,
-        "recovery state belongs to another genesis"
-    );
-    recovery.minimum_epoch = params["recovery_epoch"].as_u64().unwrap_or(1);
-    let view = state.project()?;
-    recovery.authorized = true;
-    recovery.authorized_until_ms = Some(crate::runtime::now_ms() + 600_000);
-    recovery.state = Some(state.clone());
-    Ok(json!({"state":state,"view":view}))
-}
-fn check_recovery(recovery: &Recovery, params: &Value) -> Result<()> {
-    ensure!(
-        text(params, "challenge_id")? == recovery.challenge.challenge_id
-            && crate::runtime::now_ms()
-                < recovery
-                    .authorized_until_ms
-                    .unwrap_or(recovery.challenge.expires_at_ms),
-        "recovery challenge expired or mismatched"
-    );
-    Ok(())
-}
-fn authorized_recovery<'a>(session: &'a mut Session, params: &Value) -> Result<&'a mut Recovery> {
-    let recovery = session
-        .recovery
-        .as_mut()
-        .context("recovery challenge is required")?;
-    check_recovery(recovery, params)?;
-    ensure!(recovery.authorized, "prove root ownership before recovery");
-    Ok(recovery)
-}
-fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
-    if let Some(client) = input.get("client_id") {
-        ensure!(
-            client.as_str() == Some(subject),
-            "client_id differs from authenticated client"
-        );
-    }
-    if matches!(
-        input["method"].as_str(),
-        Some("message" | "presence" | "notifications" | "ack")
-    ) {
-        input
-            .as_object_mut()
-            .context("RPC input must be an object")?
-            .insert("client_id".to_owned(), Value::String(subject.to_owned()));
-    }
-    Ok(())
 }
 
 fn client_endpoint(value: &str) -> Result<String> {
@@ -947,47 +369,6 @@ fn client_endpoint(value: &str) -> Result<String> {
     Ok(url.into())
 }
 
-fn signing(domain: &str, payload: Vec<u8>) -> Value {
-    json!({"domain":domain,"payload":String::from_utf8(payload).expect("canonical JSON is UTF-8")})
-}
-fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
-    let text = value[key]
-        .as_str()
-        .with_context(|| format!("{key} is required"))?;
-    ensure!(
-        !text.is_empty() && text.len() <= 2048 && !text.chars().any(char::is_control),
-        "invalid {key}"
-    );
-    Ok(text)
-}
-fn from_field<T: serde::de::DeserializeOwned>(value: &Value, key: &str) -> Result<T> {
-    serde_json::from_value(
-        value
-            .get(key)
-            .cloned()
-            .with_context(|| format!("{key} is required"))?,
-    )
-    .with_context(|| format!("invalid {key}"))
-}
-fn request_id(params: &Value) -> Result<String> {
-    Ok(match params.get("request_id") {
-        Some(_) => text(params, "request_id")?.to_owned(),
-        None => uuid::Uuid::new_v4().to_string(),
-    })
-}
-fn sort_roles(roles: &mut [crate::model::NodeRole]) -> Result<()> {
-    roles.sort_by_key(|role| serde_json::to_string(role).unwrap_or_default());
-    ensure!(
-        !roles.windows(2).any(|r| r[0] == r[1]),
-        "duplicate node roles"
-    );
-    Ok(())
-}
-fn random_hex() -> String {
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
 fn secure<T>(result: std::result::Result<T, String>) -> Result<T> {
     result.map_err(anyhow::Error::msg)
 }
@@ -1051,147 +432,24 @@ async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Res
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn client_route_is_explicit_and_pins_the_destination() -> Result<()> {
-        use tokio_tungstenite::tungstenite::Message as NativeMessage;
-        for relay in [false, true] {
-            for correct_target in [false, true] {
-                let destination = LocalIdentity::generate();
-                let target = if correct_target {
-                    destination.node_id()?
-                } else {
-                    LocalIdentity::generate().node_id()?
-                };
-                let expected_target = target.clone();
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                let url = format!("ws://{}/api/network/ws", listener.local_addr()?);
-                let server = tokio::spawn(async move {
-                    let (stream, _) = listener.accept().await?;
-                    let mut socket = tokio_tungstenite::accept_async(stream).await?;
-                    socket
-                        .send(NativeMessage::Text(
-                            json!({"type":"welcome","nonce":"ab".repeat(32)})
-                                .to_string()
-                                .into(),
-                        ))
-                        .await?;
-                    let control: Value = serde_json::from_str(
-                        socket.next().await.context("missing route")??.to_text()?,
-                    )?;
-                    assert_eq!(
-                        control,
-                        if relay {
-                            json!({"type":"dial","target":expected_target,"service":"client"})
-                        } else {
-                            json!({"type":"direct","service":"client"})
-                        }
-                    );
-                    socket
-                        .send(NativeMessage::Text(
-                            json!({"type":"ready"}).to_string().into(),
-                        ))
-                        .await?;
-                    let mut handshake = secure(Handshake::new(
-                        false,
-                        &destination.secret_key_hex,
-                        None,
-                        b"vibeface:client:v1",
-                    ))?;
-                    let first = socket.next().await.context("missing first handshake")??;
-                    assert!(secure(handshake.read(&first.into_data()))?.is_empty());
-                    socket
-                        .send(NativeMessage::Binary(secure(handshake.write(&[]))?.into()))
-                        .await?;
-                    if correct_target {
-                        let third = socket.next().await.context("missing final handshake")??;
-                        assert!(secure(handshake.read(&third.into_data()))?.is_empty());
-                        secure(handshake.finish())?;
-                    }
-                    Ok::<_, anyhow::Error>(())
-                });
-                let client =
-                    Client::connect(&url, &LocalIdentity::generate(), &target, relay).await;
-                assert_eq!(client.is_ok(), correct_target);
-                server.await??;
-            }
-        }
-        Ok(())
-    }
-
     #[test]
-    fn recovery_keeps_old_node_keys_and_covers_the_new_local_node() -> Result<()> {
-        let root = LocalIdentity::generate();
-        let admin = Member::client(&LocalIdentity::generate(), "owner", true)?;
-        let old = Member::node(
-            &LocalIdentity::generate(),
-            "old node",
-            vec![crate::model::NodeRole::Replica],
-        )?;
-        let new = Member::node(
-            &LocalIdentity::generate(),
-            "new node",
-            vec![crate::model::NodeRole::Replica],
-        )?;
-        let state = NetworkState::new(Genesis::create(&root, vec![admin.clone(), old.clone()])?)?;
-        let members = vec![admin, new.clone()];
-        let history = recovery_history(&state, &members)?;
+    fn encrypted_requests_require_bounded_ids_and_reject_legacy_invocations() {
+        let request: Request =
+            serde_json::from_value(json!({"id":"read", "method":"rpc", "params":{}})).unwrap();
+        assert!(validate_request(&request).is_ok());
         assert!(
-            history
-                .iter()
-                .any(|node| node.subject_id == old.subject_id && node.public_key == old.public_key)
-        );
-        assert!(
-            history
-                .iter()
-                .any(|node| node.subject_id == new.subject_id && node.public_key == new.public_key)
-        );
-        assert!(
-            history
-                .windows(2)
-                .all(|nodes| nodes[0].subject_id < nodes[1].subject_id)
-        );
-        assert!(
-            !members
-                .iter()
-                .any(|member| member.subject_id == old.subject_id)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn rpc_client_identity_is_bound_to_the_noise_principal() {
-        let mut input = json!({"method":"notifications"});
-        bind_client_identity(&mut input, "actual-client").unwrap();
-        assert_eq!(input["client_id"], "actual-client");
-        assert!(
-            bind_client_identity(
-                &mut json!({"method":"ack","client_id":"another-client"}),
-                "actual-client"
+            serde_json::from_value::<Request>(
+                json!({"id":"read", "method":"rpc", "params":{}, "human":true})
             )
             .is_err()
         );
-        assert!(bind_client_identity(&mut json!({"method":"operate","request":{"action":{"response":{"client_id":"business-data"}}}}), "actual-client").is_ok());
-        assert!(
-            bind_client_identity(
-                &mut json!({"method":"message","client_id":"actual-client"}),
-                "actual-client"
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn channel_requests_require_bounded_ids_and_object_params() {
-        let mut request = Request {
-            id: "valid-request".into(),
-            method: "info".into(),
+        assert!(serde_json::from_value::<Authentication>(json!({"network_id":"legacy"})).is_err());
+        let request = Request {
+            id: "\n".into(),
+            method: "rpc".into(),
             params: json!({}),
+            invocation: None,
         };
-        assert!(validate_request(&request).is_ok());
-        request.params = json!("untyped payload");
-        assert!(validate_request(&request).is_err());
-        request.params = json!({});
-        request.id = "\n".into();
         assert!(validate_request(&request).is_err());
     }
 }
