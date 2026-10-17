@@ -72,6 +72,30 @@ impl VerifiedExecutionDestination {
     }
 }
 
+fn remote_actions(actions: &[Action], resolver: bool) -> bool {
+    if resolver {
+        return actions.len() == 2
+            && actions.contains(&Action::ExecutionResolve)
+            && actions.contains(&Action::OperationResolve);
+    }
+    actions.contains(&Action::ExecutionSubmit)
+        && actions
+            .iter()
+            .any(|action| *action != Action::ExecutionSubmit)
+        && actions.iter().all(|action| {
+            matches!(
+                action,
+                Action::ExecutionSubmit
+                    | Action::ExecutionOpen
+                    | Action::ExecutionSend
+                    | Action::ExecutionSteer
+                    | Action::ExecutionInterrupt
+                    | Action::ExecutionRespondApproval
+                    | Action::OperationStatusRead
+            )
+        })
+}
+
 impl VerifiedPolicySet {
     pub fn verify_execution_destination(
         &self,
@@ -93,6 +117,7 @@ impl VerifiedPolicySet {
                     | Action::ExecutionInterrupt
                     | Action::ExecutionRespondApproval
                     | Action::OperationStatusRead
+                    | Action::OperationResolve
             ),
             "unsupported remote execution action",
         )?;
@@ -144,20 +169,8 @@ impl VerifiedPolicySet {
                 && leaf.payload.audience == audience
                 && !leaf.payload.constraints.require_account_actor
                 && !leaf.payload.constraints.require_webauthn_uv
-                && leaf.payload.actions.contains(&Action::ExecutionSubmit)
                 && leaf.payload.actions.contains(&action)
-                && leaf.payload.actions.iter().all(|action| {
-                    matches!(
-                        action,
-                        Action::ExecutionSubmit
-                            | Action::ExecutionOpen
-                            | Action::ExecutionSend
-                            | Action::ExecutionSteer
-                            | Action::ExecutionInterrupt
-                            | Action::ExecutionRespondApproval
-                            | Action::OperationStatusRead
-                    )
-                })
+                && remote_actions(&leaf.payload.actions, action == Action::OperationResolve)
                 && leaf.payload.expires_at_ms < u64::MAX
                 && leaf.payload.constraints.context == execution_context,
             "remote execution grant must exactly bind this task and executor",
@@ -247,10 +260,7 @@ pub fn verify_directional_grant_snapshot(
             && target.payload.subject == Actor::Service(leaf.audience.service.clone())
             && matches!(&leaf.grantee,Grantee::Actor(Actor::Service(service)) if service != &leaf.audience.service)
             && leaf.remaining_delegations == 0 && leaf.expires_at_ms < u64::MAX
-            && leaf.actions.contains(&Action::ExecutionSubmit)
-            && leaf.actions.iter().any(|action| *action != Action::ExecutionSubmit)
-            && leaf.actions.iter().all(|action| matches!(action,Action::ExecutionSubmit|Action::ExecutionOpen|Action::ExecutionSend
-                |Action::ExecutionSteer|Action::ExecutionInterrupt|Action::ExecutionRespondApproval|Action::OperationStatusRead))
+            && (remote_actions(&leaf.actions,false) || remote_actions(&leaf.actions,true))
             && !leaf.constraints.require_account_actor && !leaf.constraints.require_webauthn_uv
             && leaf.constraints.context.sdk_session.is_none() && leaf.constraints.context.task.is_some()
             && leaf.constraints.context.conversation.is_some() && leaf.constraints.context.executor_kind.is_some()
@@ -465,6 +475,117 @@ pub fn verify_remote_execution(
 }
 
 impl VerifiedRemoteExecution {
+    fn checked_observation(
+        &self,
+        actual_json: &str,
+        binding_json: &str,
+        now_ms: u64,
+    ) -> Result<execution_handoff::ExecutionHandoffResult> {
+        require(
+            actual_json.len() <= execution_handoff::MAX_EXECUTION_HANDOFF_BYTES
+                && binding_json.len() <= MAX_PROOF_BYTES
+                && now_ms >= self.verified_at_ms,
+            "remote observation proof is outside its bounds",
+        )?;
+        let actual: execution_handoff::ExecutionHandoffResult =
+            serde_json::from_str(actual_json)
+                .map_err(|_| AuthorizationError::InvalidProof("invalid remote observation"))?;
+        let binding: task_binding::SignedBinding = serde_json::from_str(binding_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid observation binding"))?;
+        self.state
+            .verify_project_execution_source(&actual.handoff.handoff, now_ms)?;
+        execution_handoff::verify_execution_handoff_receipt_signature(
+            &actual.handoff,
+            &actual.receipt,
+            &actual.result,
+        )?;
+        let event: events::Event =
+            serde_json::from_str(&actual.handoff.handoff.project_dispatch.canonical_body)
+                .map_err(|_| AuthorizationError::InvalidProof("invalid observation dispatch"))?;
+        let events::EventCause::Invocation { admission } = &event.cause else {
+            return Err(AuthorizationError::InvalidProof(
+                "observation has no original admission",
+            ));
+        };
+        admission.invocation.verify_signature()?;
+        actual.handoff.invocation.verify_signature()?;
+        require(
+            actual.handoff.handoff.execution_resource == self.selection.execution_resource
+                && actual.handoff.handoff.target_public_key == self.selection.target_public_key
+                && actual.handoff.invocation.issuer == self.source.audience_public_key
+                && actual.handoff.invocation.payload.action == Action::ExecutionSubmit
+                && actual.handoff.invocation.payload.resource == self.selection.execution_resource
+                && admission.invocation.payload.resource.space == self.source.scope.space_id
+                && Some(&admission.invocation.payload.resource.resource)
+                    == self.context.context.workspace_resource.as_ref()
+                && scope_covers(
+                    &self.source.grant_scope,
+                    &admission.invocation.payload.resource,
+                )
+                && admission.invocation.payload.audience == self.source.audience
+                && admission.invocation.payload.context.task == self.context.context.task
+                && admission.invocation.payload.context.conversation
+                    == self.context.context.conversation
+                && admission.invocation.payload.context.execution_session
+                    == self.context.context.execution_session
+                && admission.invocation.payload.context.executor_kind
+                    == self.context.context.executor_kind
+                && admission.invocation.payload.body_hash
+                    == ObjectHash::body(&admission.source_body)?
+                && admission.source_body["request"]["binding"]
+                    == serde_json::to_value(&binding).map_err(|_| {
+                        AuthorizationError::InvalidProof("observation binding encoding failed")
+                    })?
+                && actual.receipt.payload.issued_at_ms <= now_ms
+                && actual.receipt.payload.issued_at_ms
+                    >= actual.handoff.invocation.payload.not_before_ms,
+            "remote observation differs from the selected Project task",
+        )?;
+        Ok(actual)
+    }
+
+    fn checked_result(
+        &self,
+        actual_json: &str,
+        expected_body_json: &str,
+        expected_invocation_json: &str,
+        binding_json: &str,
+        now_ms: u64,
+    ) -> Result<execution_handoff::ExecutionHandoffResult> {
+        require(
+            expected_body_json.len() <= MAX_PROOF_BYTES
+                && expected_invocation_json.len() <= MAX_PROOF_BYTES,
+            "original browser proof is outside its bounds",
+        )?;
+        let actual = self.checked_observation(actual_json, binding_json, now_ms)?;
+        let body: Value = serde_json::from_str(expected_body_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid original browser body"))?;
+        let invocation: Signed<Invocation> = serde_json::from_str(expected_invocation_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid original browser invocation"))?;
+        let event: events::Event =
+            serde_json::from_str(&actual.handoff.handoff.project_dispatch.canonical_body)
+                .map_err(|_| AuthorizationError::InvalidProof("invalid result dispatch"))?;
+        let events::EventCause::Invocation { admission } = &event.cause else {
+            return Err(AuthorizationError::InvalidProof(
+                "result dispatch has no admission",
+            ));
+        };
+        require(
+            admission.source_body == body
+                && admission.invocation == invocation
+                && invocation.payload.device == self.source.scope.device_id
+                && invocation.issuer
+                    == self
+                        .state
+                        .find_device(&self.source.scope.device_id)?
+                        .payload
+                        .public_key
+                && invocation.payload.actor == Actor::Account(self.source.scope.account_id.clone()),
+            "remote result differs from the original browser authorization",
+        )?;
+        Ok(actual)
+    }
+
     fn signing_authorization(
         &self,
         auth: &VerifiedClientAuthorization,
@@ -512,6 +633,262 @@ impl VerifiedRemoteExecution {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedRemoteExecution {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = resolutionResultJson))]
+    pub fn resolution_result_json(
+        &self,
+        actual_json: &str,
+        body_json: &str,
+        invocation_json: &str,
+        now_ms: f64,
+    ) -> crate::Result<String> {
+        (|| -> Result<String> {
+            use execution_handoff::*;
+            let now = client_time(now_ms)?;
+            require(
+                self.action == Action::OperationResolve
+                    && actual_json.len() <= MAX_EXECUTION_HANDOFF_BYTES
+                    && body_json.len() <= MAX_PROOF_BYTES
+                    && invocation_json.len() <= MAX_PROOF_BYTES,
+                "invalid resolver result proof bounds",
+            )?;
+            let expected_body: Value = serde_json::from_str(body_json)
+                .map_err(|_| AuthorizationError::InvalidProof("invalid saved resolver body"))?;
+            let expected_invocation: Signed<Invocation> = serde_json::from_str(invocation_json)
+                .map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid saved resolver invocation")
+                })?;
+            expected_invocation.verify_signature()?;
+            let raw: Value = serde_json::from_str(actual_json).map_err(|_| {
+                AuthorizationError::InvalidProof("invalid executor resolution result")
+            })?;
+            let unknown = raw.get("resolution").is_some();
+            let (wire, freshness, decision_time, state, purpose, encoded) = if unknown {
+                let result: ExecutionHandoffResolutionResult = serde_json::from_value(raw)
+                    .map_err(|_| {
+                        AuthorizationError::InvalidProof("invalid Unknown resolution result")
+                    })?;
+                let clock = result.receipt.payload.issued_at_ms;
+                (
+                    result.resolution.clone(),
+                    result.freshness.clone(),
+                    clock,
+                    result.handoff_receipt.payload.state,
+                    ExecutionResolutionPurpose::ResolveUnknown,
+                    serde_json::to_value(result),
+                )
+            } else {
+                let result: ExecutionHandoffTerminalReconciliationResult =
+                    serde_json::from_value(raw).map_err(|_| {
+                        AuthorizationError::InvalidProof("invalid terminal reconciliation result")
+                    })?;
+                let clock = result
+                    .freshness
+                    .receipts
+                    .iter()
+                    .map(|r| r.payload.issued_at_ms)
+                    .max()
+                    .unwrap_or(result.freshness.challenge.issued_at_ms);
+                (
+                    result.reconciliation.clone(),
+                    result.freshness.clone(),
+                    clock,
+                    result
+                        .reconciliation
+                        .resolution
+                        .observation
+                        .receipt
+                        .payload
+                        .state,
+                    ExecutionResolutionPurpose::ReconcileTerminal,
+                    serde_json::to_value(result),
+                )
+            };
+            let encoded = encoded
+                .map_err(|_| AuthorizationError::InvalidProof("resolution encoding failed"))?;
+            let admission = &wire.resolution.account_admission;
+            let facts = execution_resolution_account_facts(&wire.resolution)?;
+            require(
+                decision_time <= now
+                    && now >= self.verified_at_ms
+                    && admission.source_body == expected_body
+                    && admission.invocation == expected_invocation
+                    && admission.invocation.payload.device == self.source.scope.device_id
+                    && admission.invocation.issuer
+                        == self
+                            .state
+                            .find_device(&self.source.scope.device_id)?
+                            .payload
+                            .public_key
+                    && admission.invocation.payload.actor
+                        == Actor::Account(self.source.scope.account_id.clone())
+                    && facts.resource.space == self.source.scope.space_id
+                    && Some(&facts.resource.resource)
+                        == self.context.context.workspace_resource.as_ref()
+                    && facts.audience == self.source.audience
+                    && facts.context == self.context.context
+                    && wire.invocation.issuer == self.source.audience_public_key
+                    && wire.invocation.payload.grant_leaf == self.selection.execution_grant
+                    && wire
+                        .resolution
+                        .observation
+                        .handoff
+                        .handoff
+                        .execution_resource
+                        == self.selection.execution_resource
+                    && wire
+                        .resolution
+                        .observation
+                        .handoff
+                        .handoff
+                        .target_public_key
+                        == self.selection.target_public_key,
+                "resolution result differs from the original browser decision",
+            )?;
+            let transport = admission.transport.clone().into_evidence();
+            let request = self.state.verify_invocation(
+                &admission.invocation,
+                &facts,
+                &transport,
+                admission.admitted_at_ms,
+            )?;
+            let fresh = self.state.verify_freshness(
+                &request,
+                &admission.challenge,
+                &admission.receipts,
+                admission.admitted_at_ms,
+            )?;
+            let admitted =
+                self.state
+                    .admit_operation(&request, &fresh, admission.admitted_at_ms)?;
+            let resolver = self.state.verify_operation_authorization(
+                &admitted,
+                &facts,
+                &transport,
+                decision_time,
+            )?;
+            if unknown {
+                let result: ExecutionHandoffResolutionResult =
+                    serde_json::from_value(encoded.clone()).map_err(|_| {
+                        AuthorizationError::InvalidProof("invalid resolution encoding")
+                    })?;
+                let verified = self.state.verify_execution_resolution_ack(
+                    &result,
+                    &resolver,
+                    decision_time,
+                )?;
+                self.state.verify_execution_resolution_freshness(
+                    &verified,
+                    &freshness,
+                    decision_time,
+                )?;
+            } else {
+                let result: ExecutionHandoffTerminalReconciliationResult =
+                    serde_json::from_value(encoded.clone()).map_err(|_| {
+                        AuthorizationError::InvalidProof("invalid terminal encoding")
+                    })?;
+                self.state.verify_execution_terminal_reconciliation(
+                    &result,
+                    &resolver,
+                    decision_time,
+                )?;
+            }
+            serde_json::to_string(
+                &serde_json::json!({"state":state,"purpose":purpose,"actual":encoded}),
+            )
+            .map_err(|_| AuthorizationError::InvalidProof("verified resolution encoding failed"))
+        })()
+        .map_err(|error| error.to_string())
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = observationJson))]
+    pub fn observation_json(
+        &self,
+        actual_json: &str,
+        binding_json: &str,
+        now_ms: f64,
+    ) -> crate::Result<String> {
+        (|| -> Result<String> {
+            require(
+                self.source.actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        Action::OperationStatusRead
+                            | Action::OperationReconcile
+                            | Action::OperationResolve
+                    )
+                }),
+                "client has no Project operation read permission",
+            )?;
+            let actual =
+                self.checked_observation(actual_json, binding_json, client_time(now_ms)?)?;
+            serde_json::to_string(&actual)
+                .map_err(|_| AuthorizationError::InvalidProof("observation encoding failed"))
+        })()
+        .map_err(|error| error.to_string())
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = resolutionBodyJson))]
+    pub fn resolution_body_json(
+        &self,
+        actual_json: &str,
+        authorization_id: &str,
+        outcome: &str,
+        evidence: &str,
+        now_ms: f64,
+    ) -> crate::Result<String> {
+        (|| -> Result<String> {
+            let now = client_time(now_ms)?;
+            require(
+                self.action == Action::OperationResolve
+                    && actual_json.len() <= execution_handoff::MAX_EXECUTION_HANDOFF_BYTES,
+                "resolution needs an independently verified resolver grant",
+            )?;
+            let actual: execution_handoff::ExecutionHandoffResult =
+                serde_json::from_str(actual_json).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid resolution observation")
+                })?;
+            self.state
+                .verify_project_execution_source(&actual.handoff.handoff, now)?;
+            let (body, context) = remote_resolution_intent(
+                &actual,
+                &self.selection,
+                authorization_id,
+                outcome,
+                evidence,
+                &self.source.audience_public_key,
+                now,
+            )?;
+            require(
+                context == self.context,
+                "resolver handle differs from the original task binding",
+            )?;
+            self.signing_authorization(&self.source, &body, now)?;
+            serde_json::to_string(&serde_json::json!({"body":body,"context":context}))
+                .map_err(|_| AuthorizationError::InvalidProof("resolution intent encoding failed"))
+        })()
+        .map_err(|error| error.to_string())
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = resultJson))]
+    pub fn result_json(
+        &self,
+        actual_json: &str,
+        expected_body_json: &str,
+        expected_invocation_json: &str,
+        binding_json: &str,
+        now_ms: f64,
+    ) -> crate::Result<String> {
+        (|| -> Result<String> {
+            let actual = self.checked_result(
+                actual_json,
+                expected_body_json,
+                expected_invocation_json,
+                binding_json,
+                client_time(now_ms)?,
+            )?;
+            serde_json::to_string(&actual).map_err(|_| {
+                AuthorizationError::InvalidProof("verified remote result encoding failed")
+            })
+        })()
+        .map_err(|error| error.to_string())
+    }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = selectionJson))]
     pub fn selection_json(&self) -> crate::Result<String> {
         serde_json::to_string(&self.selection)
@@ -787,7 +1164,10 @@ fn remote_selection(body: &Value) -> Result<Option<(ResourceRef, PublicKey, Obje
         "remote execution selection is incomplete",
     )?;
     require(
-        matches!(body["method"].as_str(), Some("operate" | "bind_execution")),
+        matches!(
+            body["method"].as_str(),
+            Some("operate" | "bind_execution" | "resolve_unknown")
+        ),
         "remote execution selection is not valid for this method",
     )?;
     Ok(Some((
@@ -798,6 +1178,156 @@ fn remote_selection(body: &Value) -> Result<Option<(ResourceRef, PublicKey, Obje
         serde_json::from_value(body["execution_grant"].clone())
             .map_err(|_| AuthorizationError::InvalidProof("invalid execution grant"))?,
     )))
+}
+
+fn remote_resolution_intent(
+    actual: &execution_handoff::ExecutionHandoffResult,
+    selection: &RemoteExecutionSelection,
+    authorization_id: &str,
+    outcome: &str,
+    evidence: &str,
+    project_key: &PublicKey,
+    now_ms: u64,
+) -> Result<(Value, PrepareContext)> {
+    use execution_handoff::{ExecutionHandoffState, ExecutionResolutionPurpose};
+    execution_handoff::verify_execution_handoff_receipt_signature(
+        &actual.handoff,
+        &actual.receipt,
+        &actual.result,
+    )?;
+    let wire = &actual.handoff;
+    let source =
+        wire.handoff
+            .source_attestation
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "resolution has no Project attestation",
+            ))?;
+    source.verify_signature()?;
+    require(
+        source.issuer == *project_key
+            && source.payload == wire.handoff.source_statement()?
+            && wire.handoff.target_public_key == selection.target_public_key
+            && wire.handoff.execution_resource == selection.execution_resource
+            && actual.receipt.payload.issued_at_ms <= now_ms
+            && !authorization_id.is_empty()
+            && authorization_id.len() <= 512
+            && matches!(outcome, "succeeded" | "failed" | "rejected")
+            && evidence.trim().len() >= 12
+            && evidence.len() <= 65_536,
+        "resolution intent differs from the signed Project or executor",
+    )?;
+    let purpose = match actual.receipt.payload.state {
+        ExecutionHandoffState::Unknown => ExecutionResolutionPurpose::ResolveUnknown,
+        ExecutionHandoffState::Succeeded
+        | ExecutionHandoffState::Failed
+        | ExecutionHandoffState::Rejected => {
+            require(
+                serde_json::to_value(actual.receipt.payload.state)
+                    .map_err(|_| AuthorizationError::InvalidProof("invalid observed state"))?
+                    == outcome,
+                "terminal reconciliation cannot change the executor outcome",
+            )?;
+            ExecutionResolutionPurpose::ReconcileTerminal
+        }
+        _ => {
+            return Err(AuthorizationError::InvalidProof(
+                "executor result is still in progress",
+            ));
+        }
+    };
+    let event: events::Event = serde_json::from_str(&wire.handoff.project_dispatch.canonical_body)
+        .map_err(|_| AuthorizationError::InvalidProof("invalid original dispatch"))?;
+    let events::EventCause::Invocation { admission } = &event.cause else {
+        return Err(AuthorizationError::InvalidProof(
+            "resolution has no original admission",
+        ));
+    };
+    let request = &admission.source_body["request"];
+    let binding: task_binding::SignedBinding =
+        serde_json::from_value(request["binding"].clone())
+            .map_err(|_| AuthorizationError::InvalidProof("invalid original resolution binding"))?;
+    task_binding::verify_binding(&binding, project_key.as_str())
+        .map_err(|_| AuthorizationError::InvalidProof("resolution binding signature mismatch"))?;
+    require(
+        authorization_id != admission.invocation.payload.operation_id,
+        "resolution requires a new authorization ID",
+    )?;
+    let body = serde_json::json!({
+        "method":"resolve_unknown", "space_id":event.network_id, "resource_id":event.resource_id,
+        "authorization_id":authorization_id, "operation_id":admission.invocation.payload.operation_id,
+        "conversation_id":event.scope_id, "task_id":request["task_id"], "task_ref":binding.binding.task_ref,
+        "target_node":binding.binding.target_node, "session_id":binding.binding.session_id,
+        "outcome":outcome, "evidence":evidence, "execution_resource":selection.execution_resource,
+        "target_public_key":selection.target_public_key, "execution_grant":selection.execution_grant,
+        "original_handoff_hash":wire.hash()?, "original_body_hash":admission.invocation.payload.body_hash,
+        "unknown_receipt_hash":actual.receipt.hash()?, "resolution_purpose":purpose,
+        "execution_observation":actual
+    });
+    let context = InvocationContext {
+        conversation: Some(binding.binding.conversation_id.clone()),
+        task: Some(EventRef::parse(&binding.binding.task_ref)?),
+        sdk_session: None,
+        execution_session: Some(SessionRef {
+            target: DeviceId::from_key(&selection.target_public_key),
+            session_id: binding.binding.session_id.clone(),
+        }),
+        executor_kind: binding.binding.open_spec["executor"]
+            .as_str()
+            .map(str::to_owned),
+        workspace_resource: Some(event.resource_id),
+    };
+    Ok((
+        body,
+        PrepareContext {
+            context,
+            binding_generation: Some(binding.binding.generation),
+            canonical_cwd: binding.binding.open_spec["cwd"].as_str().map(str::to_owned),
+            execution_target_public_key: Some(selection.target_public_key.clone()),
+        },
+    ))
+}
+
+fn check_raw_resolution(intent: &PrepareIntent, body: &Value, key: &PublicKey) -> Result<bool> {
+    if body["method"] != "resolve_unknown" || body.get("execution_resource").is_none() {
+        return Ok(false);
+    }
+    let i = &intent.request;
+    require(
+        i.action == Action::OperationResolve
+            && matches!(i.actor, Actor::Account(_))
+            && i.context.sdk_session.is_none(),
+        "remote resolution requires an Account intent",
+    )?;
+    let (resource, public_key, grant) = remote_selection(body)?.ok_or(
+        AuthorizationError::InvalidProof("resolution selection is missing"),
+    )?;
+    let selection = RemoteExecutionSelection {
+        execution_resource: resource,
+        target_public_key: public_key,
+        execution_grant: grant,
+    };
+    let actual: execution_handoff::ExecutionHandoffResult =
+        serde_json::from_value(body["execution_observation"].clone())
+            .map_err(|_| AuthorizationError::InvalidProof("resolution observation is missing"))?;
+    let (expected, context) = remote_resolution_intent(
+        &actual,
+        &selection,
+        &i.operation_id,
+        body["outcome"].as_str().unwrap_or_default(),
+        body["evidence"].as_str().unwrap_or_default(),
+        key,
+        i.not_before_ms,
+    )?;
+    require(
+        *body == expected
+            && intent.request.context == context.context
+            && intent.binding_generation == context.binding_generation
+            && intent.canonical_cwd == context.canonical_cwd
+            && intent.execution_target_public_key == context.execution_target_public_key,
+        "resolution prepare differs from its signed observation",
+    )?;
+    Ok(true)
 }
 
 #[derive(Clone, Debug)]
@@ -944,6 +1474,60 @@ fn project_metadata_context(
 }
 
 impl VerifiedPolicySet {
+    pub fn verify_execution_resolution_request_facts(
+        &self,
+        body: &Value,
+        audience: &Audience,
+        now_ms: u64,
+    ) -> Result<RequestFacts> {
+        let (resource, key, grant) = remote_selection(body)?.ok_or(
+            AuthorizationError::InvalidProof("resolution destination is missing"),
+        )?;
+        require(
+            body["method"] == "resolve_unknown",
+            "invalid remote resolution purpose",
+        )?;
+        let actual: execution_handoff::ExecutionHandoffResult =
+            serde_json::from_value(body["execution_observation"].clone()).map_err(|_| {
+                AuthorizationError::InvalidProof("resolution observation is missing")
+            })?;
+        self.verify_project_execution_source(&actual.handoff.handoff, now_ms)?;
+        let project_key = &self.find_device(&audience.device)?.payload.public_key;
+        let (expected, context) = remote_resolution_intent(
+            &actual,
+            &RemoteExecutionSelection {
+                execution_resource: resource,
+                target_public_key: key,
+                execution_grant: grant,
+            },
+            body["authorization_id"].as_str().unwrap_or_default(),
+            body["outcome"].as_str().unwrap_or_default(),
+            body["evidence"].as_str().unwrap_or_default(),
+            project_key,
+            now_ms,
+        )?;
+        let project = raw_resource(body)?;
+        require(
+            expected == *body
+                && actual
+                    .handoff
+                    .handoff
+                    .source_attestation
+                    .as_ref()
+                    .is_some_and(|source| source.payload.project == project)
+                && actual.handoff.invocation.payload.presenter == audience.device,
+            "remote resolution differs from the original Project observation",
+        )?;
+        Ok(RequestFacts {
+            resource: project,
+            action: Action::OperationResolve,
+            audience: audience.clone(),
+            operation_id: body["authorization_id"].as_str().unwrap_or_default().into(),
+            body_hash: ObjectHash::body(body)?,
+            context: context.context,
+        })
+    }
+
     pub fn verify_execution_dispatch_metadata(
         &self,
         project: &ResourceRef,
@@ -1074,6 +1658,9 @@ fn raw_binding(value: Option<&Value>) -> Result<Option<task_binding::SignedBindi
         .transpose()
 }
 fn check_raw_context(intent: &PrepareIntent, body: &Value, audience_key: &PublicKey) -> Result<()> {
+    if check_raw_resolution(intent, body, audience_key)? {
+        return Ok(());
+    }
     if check_raw_metadata(intent, body, audience_key)? {
         return Ok(());
     }

@@ -40,7 +40,35 @@ pub(crate) fn request_execution_dispatch_facts_from(
     body: &Value,
     audience: &Audience,
     destination: &vibeface_secure::authorization::prepare::VerifiedExecutionDestination,
+    now_ms: u64,
 ) -> Result<RequestFacts> {
+    if body["method"] == "resolve_unknown" {
+        let facts = policies.verify_execution_resolution_request_facts(body, audience, now_ms)?;
+        let encoded: String = connection.query_row(
+            "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
+            params![
+                facts.resource.space.as_str(),
+                body["operation_id"]
+                    .as_str()
+                    .context("resolution operation is missing")?
+            ],
+            |row| row.get(0),
+        )?;
+        let actual: vibeface_secure::authorization::execution_handoff::ExecutionHandoffResult =
+            serde_json::from_value(body["execution_observation"].clone())?;
+        let event: crate::model::Event =
+            serde_json::from_str(&actual.handoff.handoff.project_dispatch.canonical_body)?;
+        let crate::model::EventCause::Invocation { admission } = event.cause else {
+            anyhow::bail!("resolution operation has no original admission");
+        };
+        ensure!(
+            serde_json::from_str::<crate::model::OperationRequest>(&encoded)?
+                == serde_json::from_value(admission.source_body["request"].clone())?,
+            "resolution observation differs from the durable operation request"
+        );
+        destination.check_facts(&facts)?;
+        return Ok(facts);
+    }
     let facts = request_facts_impl(connection, policies, body, audience, Some(destination))?;
     destination.check_facts(&facts)?;
     Ok(facts)

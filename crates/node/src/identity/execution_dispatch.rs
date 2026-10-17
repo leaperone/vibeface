@@ -140,12 +140,97 @@ pub(super) fn dispatch_facts_from(
         crate::model::authorization_action(body)?,
         now_ms,
     )?;
-    let facts =
-        request_execution_dispatch_facts_from(connection, policies, body, audience, &destination)?;
+    let facts = request_execution_dispatch_facts_from(
+        connection,
+        policies,
+        body,
+        audience,
+        &destination,
+        now_ms,
+    )?;
     Ok(VerifiedDispatchFacts { facts, destination })
 }
 
 impl Store {
+    pub fn execution_share_request(
+        &self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<Value> {
+        use vibeface_secure::authorization::{Actor, ClientAuthorizationBundle, PolicyPin};
+        ensure!(
+            auth.action() == Action::ConversationRead
+                && matches!(auth.actor(), Actor::Account(_))
+                && auth
+                    .signed_invocation()
+                    .payload
+                    .context
+                    .sdk_session
+                    .is_none()
+                && body["method"] == "execution_share_request"
+                && auth.body_hash() == &ObjectHash::body(body)?,
+            "execution sharing requires a current Account task read"
+        );
+        self.policy.verified().check_current(auth, now_ms)?;
+        let creation = self.task_creation(
+            auth.resource().space.as_str(),
+            text(body, "conversation_id")?,
+            text(body, "task_id")?,
+        )?;
+        let event = self.verify_event(auth.resource().space.as_str(), &creation)?;
+        ensure!(
+            creation.hash == text(body, "task_ref")?
+                && event.resource_id == auth.resource().resource
+                && event.scope_id == text(body, "conversation_id")?
+                && self
+                    .missing_dependencies(
+                        auth.resource().space.as_str(),
+                        std::slice::from_ref(&creation.hash)
+                    )?
+                    .is_complete(),
+            "execution sharing task history differs from the selected Project"
+        );
+        let principal = auth.signed_invocation().issuer.as_str();
+        let Actor::Account(account) = auth.actor() else {
+            unreachable!()
+        };
+        let projection = super::policy::authenticate_account_from(
+            &self.connection,
+            &self.policy,
+            principal,
+            &json!({"account_id":account,"space_id":auth.resource().space,"resource_id":auth.resource().resource,
+                "device_public_key":principal,"audience":auth.audience()}),
+            now_ms,
+        )?;
+        let pins: Vec<PolicyPin> = serde_json::from_value(projection["pins"].clone())?;
+        let bundle: ClientAuthorizationBundle =
+            serde_json::from_value(projection["authorization"].clone())?;
+        let options = &body["share_request"];
+        let session = text(options, "session_id")?;
+        let executor = text(options, "executor_kind")?;
+        serde_json::from_value::<crate::engine::ExecutorKind>(Value::String(executor.into()))?;
+        let expires = options["expires_at_ms"]
+            .as_u64()
+            .context("share request expiry is required")?;
+        let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let envelope = vibeface_secure::authorization::remote_share::build_execution_share_request(
+            self.policy.verified(),
+            &pins,
+            &bundle,
+            auth.resource(),
+            &creation,
+            session,
+            executor,
+            &signer,
+            now_ms,
+            expires,
+        )?;
+        Ok(serde_json::to_value(envelope)?)
+    }
+
     pub fn execution_dispatch_targets(
         &self,
         session: &crate::model::AgentSession,
@@ -1217,6 +1302,8 @@ mod tests {
                         Action::ExecutionOpen,
                         Action::ExecutionSend,
                         Action::ExecutionSubmit,
+                        Action::ExecutionResolve,
+                        Action::OperationResolve,
                     ],
                     audience: target,
                     constraints: GrantConstraints {
@@ -1267,6 +1354,9 @@ mod tests {
                 .unwrap()
                 .clone();
             let mut child = parent.payload.clone();
+            child.actions.retain(|action| {
+                !matches!(action, Action::ExecutionResolve | Action::OperationResolve)
+            });
             child.grantee = Grantee::Actor(Actor::Service(audience.service.clone()));
             child.parent = Some(parent.hash()?);
             child.remaining_delegations = 0;
@@ -1308,6 +1398,60 @@ mod tests {
                 "authorization_id":id,"execution_resource":self.execution,"execution_grant":self.grant,
                 "target_public_key":self.executor.node.public_key_hex()?}),
             )
+        }
+
+        fn resolver_grant(&mut self) -> Result<ObjectHash> {
+            let parent = self
+                .store
+                .policy
+                .verified()
+                .grant(&self.grant)
+                .unwrap()
+                .payload
+                .parent
+                .clone()
+                .unwrap();
+            let mut child = self
+                .store
+                .policy
+                .verified()
+                .grant(&parent)
+                .unwrap()
+                .payload
+                .clone();
+            let stamp = self
+                .store
+                .policy
+                .verified()
+                .head(&PolicyDomain::Space(self.executor.space.clone()))
+                .unwrap()
+                .clone();
+            child.parent = Some(parent);
+            child.grantee = Grantee::Actor(Actor::Service(self.audience.service.clone()));
+            child.actions = vec![Action::ExecutionResolve, Action::OperationResolve];
+            child.remaining_delegations = 0;
+            child.issued_under = stamp.clone();
+            child.nonce = Nonce::random()?;
+            let child = Signed::sign(child, &self.executor.client)?;
+            let hash = child.hash()?;
+            let mut document = self
+                .store
+                .policy
+                .verified()
+                .space(&self.executor.space)
+                .unwrap()
+                .clone();
+            document.previous = Some(stamp);
+            document.sequence += 1;
+            document.grants.push(hash.clone());
+            document.grants.sort();
+            let tail = vec![
+                JournalEntry::Grant(child),
+                JournalEntry::Space(Signed::sign(document, &self.executor.root)?),
+            ];
+            self.store.install_policy_journal(&tail, now() + 3)?;
+            self.journal.extend(tail);
+            Ok(hash)
         }
 
         fn authorize(
@@ -1625,6 +1769,151 @@ mod tests {
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
+        let verified_result: Value = serde_json::from_str(
+            &handle
+                .result_json(
+                    &serde_json::to_string(&result)?,
+                    &body.to_string(),
+                    &serde_json::to_string(auth.signed_invocation())?,
+                    &serde_json::to_string(&binding)?,
+                    (now() + 2) as f64,
+                )
+                .map_err(anyhow::Error::msg)?,
+        )?;
+        assert_eq!(verified_result["result"], json!({"opened":true}));
+        assert!(
+            handle
+                .result_json(
+                    &serde_json::to_string(&wrong)?,
+                    &body.to_string(),
+                    &serde_json::to_string(auth.signed_invocation())?,
+                    &serde_json::to_string(&binding)?,
+                    (now() + 2) as f64
+                )
+                .is_err()
+        );
+        let verified_observation: Value = serde_json::from_str(
+            &handle
+                .observation_json(
+                    &serde_json::to_string(&result)?,
+                    &serde_json::to_string(&binding)?,
+                    (now() + 2) as f64,
+                )
+                .map_err(anyhow::Error::msg)?,
+        )?;
+        assert_eq!(verified_observation["result"], json!({"opened":true}));
+        let resolver_grant = f.resolver_grant()?;
+        let mut resolver_bundle = f.executor.bundle.clone();
+        resolver_bundle.journal.extend(f.journal.clone());
+        resolver_bundle.grant_leaf = resolver_grant.clone();
+        let resolver_selection = json!({"execution_resource":f.execution,"execution_grant":resolver_grant,
+            "target_public_key":f.executor.node.public_key_hex()?});
+        let resolver = verify_remote_execution(
+            &client,
+            &serde_json::to_string(&f.project.bundle)?,
+            &serde_json::to_string(&f.project.pins)?,
+            &serde_json::to_string(&resolver_bundle)?,
+            &serde_json::to_string(&f.executor.pins)?,
+            &resolver_selection.to_string(),
+            &serde_json::to_string(&raw)?,
+            "operation_resolve",
+            (now() + 3) as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let intent: Value = serde_json::from_str(
+            &resolver
+                .resolution_body_json(
+                    &serde_json::to_string(&result)?,
+                    "resolve-terminal",
+                    "succeeded",
+                    "verified the original executor result",
+                    (now() + 3) as f64,
+                )
+                .map_err(anyhow::Error::msg)?,
+        )?;
+        assert_eq!(intent["body"]["resolution_purpose"], "reconcile_terminal");
+        assert_eq!(
+            intent["body"]["execution_observation"],
+            serde_json::to_value(&result)?
+        );
+        assert!(
+            resolver
+                .resolution_body_json(
+                    &serde_json::to_string(&result)?,
+                    "resolve-terminal",
+                    "failed",
+                    "verified the original executor result",
+                    (now() + 3) as f64
+                )
+                .is_err()
+        );
+        let signed_prepare: Signed<PrepareIntent> = serde_json::from_str(
+            &resolver
+                .prepare(
+                    &client,
+                    &intent["body"].to_string(),
+                    &intent["context"].to_string(),
+                    "operation_resolve",
+                    "resolve-terminal",
+                    &f.project.node.public_key_hex()?,
+                    &f.project.client,
+                    (now() + 3) as f64,
+                )
+                .map_err(anyhow::Error::msg)?,
+        )?;
+        f.store.policy.verified().verify_prepare_intent(
+            &signed_prepare,
+            &intent["body"],
+            Action::OperationResolve,
+            &f.audience,
+            &transport,
+            now() + 3,
+        )?;
+        let resolver_facts =
+            f.store
+                .execution_dispatch_facts(&intent["body"], &f.audience, now() + 3)?;
+        assert_eq!(
+            resolver_facts.facts().context,
+            signed_prepare.payload.request.context
+        );
+        let mut share_body = f.project.body("execution_share_request", "conversation");
+        share_body["task_id"] = json!("remote-task");
+        share_body["task_ref"] = json!(f.task.hash);
+        share_body["share_request"] = json!({"session_id":"second-session","executor_kind":"codex",
+            "expires_at_ms":now()+60_000});
+        let (share_auth, _) = f.project.authorization(&f.store, &share_body, now() + 3)?;
+        let signed_share = f.store.execution_share_request(
+            &f.project.node,
+            &share_auth,
+            &share_body,
+            now() + 3,
+        )?;
+        assert_eq!(
+            signed_share["request"]["payload"]["task_creation"],
+            serde_json::to_value(&f.task)?
+        );
+        assert!(signed_share.get("pins").is_none());
+        if std::env::var_os("VIBEFACE_EXPORT_REMOTE_FIXTURE").is_some() {
+            use std::os::unix::fs::OpenOptionsExt;
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.artifacts/remote-execution-client-fixture.json");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(path)?;
+            serde_json::to_writer(
+                file,
+                &json!({"nowMs":now()+3,"accountId":f.project.account,"spaceId":f.project.space,
+                "testClientSecret":f.project.client.secret_hex(),"clientPublicKey":PublicKey::of(&f.project.client),
+                "projectPublicKey":f.project.node.public_key_hex()?,"projectBundle":f.project.bundle,"projectPins":f.project.pins,
+                "executionBundle":cb,"executionPins":f.executor.pins,"selection":selection,"context":raw,"binding":binding,
+                "browserBody":body,"browserInvocation":auth.signed_invocation(),"actual":result,"receipt":receipt,
+                "resolverBundle":resolver_bundle,"resolverSelection":resolver_selection,"resolverIntent":intent,
+                "resolverPrepare":signed_prepare,"shareRequest":signed_share}),
+            )?;
+        }
         let snapshot: Value = serde_json::from_str(
             &handle
                 .session_json(
