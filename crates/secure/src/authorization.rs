@@ -417,10 +417,15 @@ pub enum ResourceKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceRecord {
+    pub version: u16,
+    pub space: SpaceId,
     pub resource: ResourceId,
     pub kind: ResourceKind,
     pub host: ServiceId,
+    pub issued_under: PolicyStamp,
+    pub nonce: Nonce,
 }
+signed_object!(ResourceRecord, "resource-record-v2");
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SpaceDocument {
@@ -438,7 +443,7 @@ pub struct SpaceDocument {
     pub revoked_devices: Vec<DeviceId>,
     pub memberships: Vec<ObjectHash>,
     pub grants: Vec<ObjectHash>,
-    pub resources: Vec<ResourceRecord>,
+    pub resources: Vec<ObjectHash>,
     pub governance_grant: Option<ObjectHash>,
     pub root_acceptance: Option<Signature>,
     pub recovery_approvals: Vec<KeyApproval>,
@@ -942,6 +947,7 @@ pub struct VerifiedPolicySet {
     accounts: BTreeMap<AccountId, AccountState>,
     spaces: BTreeMap<SpaceId, SpaceState>,
     devices: BTreeMap<ObjectHash, Signed<DeviceCertificate>>,
+    resources: BTreeMap<ObjectHash, Signed<ResourceRecord>>,
     memberships: BTreeMap<ObjectHash, Signed<Membership>>,
     grants: BTreeMap<ObjectHash, Signed<Grant>>,
     roots: BTreeMap<PolicyStamp, PublicKey>,
@@ -1151,6 +1157,37 @@ impl VerifiedPolicySet {
     pub fn grant(&self, hash: &ObjectHash) -> Option<&Signed<Grant>> {
         self.grants.get(hash)
     }
+    pub fn resource(&self, space: &SpaceId, id: &ResourceId) -> Option<&Signed<ResourceRecord>> {
+        self.space(space)?
+            .resources
+            .iter()
+            .filter_map(|h| self.resources.get(h))
+            .find(|r| r.payload.space == *space && r.payload.resource == *id)
+    }
+    pub fn install_resource(&mut self, signed: Signed<ResourceRecord>) -> Result<ObjectHash> {
+        require(self.resources.len() < 16384, "too many resource records")?;
+        let r = &signed.payload;
+        require(
+            r.version == AUTH_VERSION
+                && r.issued_under.domain == PolicyDomain::Space(r.space.clone()),
+            "invalid resource record",
+        )?;
+        self.historical_root(&r.issued_under)?;
+        signed.verify_signature()?;
+        let hash = signed.hash()?;
+        if self
+            .space(&r.space)
+            .is_some_and(|s| s.resources.contains(&hash))
+        {
+            require(
+                self.resource(&r.space, &r.resource)
+                    .is_none_or(|current| current.hash().ok().as_ref() == Some(&hash)),
+                "conflicting registered resource",
+            )?;
+        }
+        self.resources.insert(hash.clone(), signed);
+        Ok(hash)
+    }
 
     pub fn trust_account_genesis(
         &mut self,
@@ -1227,10 +1264,9 @@ impl VerifiedPolicySet {
         )?;
         for hash in &previous.devices {
             if !d.devices.contains(hash) {
-                let old = self
-                    .devices
-                    .get(hash)
-                    .ok_or(AuthorizationError::PolicyConflict)?;
+                let Some(old) = self.devices.get(hash) else {
+                    continue;
+                };
                 let replaced = d.devices.iter().any(|h| {
                     self.devices
                         .get(h)
@@ -1417,10 +1453,9 @@ impl VerifiedPolicySet {
         )?;
         for hash in &previous.devices {
             if !d.devices.contains(hash) {
-                let old = self
-                    .devices
-                    .get(hash)
-                    .ok_or(AuthorizationError::PolicyConflict)?;
+                let Some(old) = self.devices.get(hash) else {
+                    continue;
+                };
                 let replaced = d.devices.iter().any(|h| {
                     self.devices
                         .get(h)
@@ -1447,24 +1482,18 @@ impl VerifiedPolicySet {
             &d.current_root,
         )?;
         for hash in &d.grants {
-            let grant = self
-                .grants
-                .get(hash)
-                .ok_or(AuthorizationError::InvalidProof(
-                    "grant must be verified before registration",
-                ))?;
+            let Some(grant) = self.grants.get(hash) else {
+                continue;
+            };
             require(
                 grant.payload.owner_space == d.space,
                 "cross-space grant registration",
             )?;
         }
         for hash in &d.memberships {
-            let membership = self
-                .memberships
-                .get(hash)
-                .ok_or(AuthorizationError::InvalidProof(
-                    "membership must be verified before registration",
-                ))?;
+            let Some(membership) = self.memberships.get(hash) else {
+                continue;
+            };
             require(
                 membership.payload.space == d.space,
                 "cross-space membership registration",
@@ -1617,12 +1646,17 @@ impl VerifiedPolicySet {
                 && sorted_unique(&d.memberships),
             "invalid space document",
         )?;
-        require(
-            d.resources
-                .windows(2)
-                .all(|p| p[0].resource < p[1].resource),
-            "duplicate resources",
-        )?;
+        require(sorted_unique(&d.resources), "duplicate resources")?;
+        let mut known = BTreeSet::new();
+        for hash in &d.resources {
+            if let Some(record) = self.resources.get(hash) {
+                require(
+                    record.payload.space == d.space
+                        && known.insert(record.payload.resource.clone()),
+                    "invalid registered resource",
+                )?;
+            }
+        }
         require(
             !d.revoked_devices.contains(&d.authority.device),
             "revoked authority requires replacement",
@@ -1639,12 +1673,9 @@ impl VerifiedPolicySet {
     ) -> Result<()> {
         let mut devices = BTreeSet::new();
         for hash in hashes {
-            let certificate = self
-                .devices
-                .get(hash)
-                .ok_or(AuthorizationError::InvalidProof(
-                    "device must be verified before registration",
-                ))?;
+            let Some(certificate) = self.devices.get(hash) else {
+                continue;
+            };
             require(
                 &certificate.payload.owner == domain
                     && &certificate.payload.public_key != root
@@ -1986,20 +2017,20 @@ impl VerifiedPolicySet {
                     .ok_or(AuthorizationError::PolicyConflict)?
                     .payload;
                 for hash in &current.memberships {
-                    let membership =
-                        self.memberships
-                            .get(hash)
-                            .ok_or(AuthorizationError::InvalidProof(
-                                "missing installed membership",
-                            ))?;
+                    let Some(membership) = self.memberships.get(hash) else {
+                        continue;
+                    };
                     let m = &membership.payload;
                     if &m.subject != actor
                         || !m.roles.iter().any(|role| selector.roles_any.contains(role))
                     {
                         continue;
                     }
+                    match validate_window(m.not_before_ms, m.expires_at_ms, now_ms) {
+                        Err(AuthorizationError::Expired) => continue,
+                        result => result?,
+                    }
                     budget.verify(membership)?;
-                    validate_window(m.not_before_ms, m.expires_at_ms, now_ms)?;
                     budget.expires(m.expires_at_ms);
                     self.historical_root(&m.issued_under)?;
                     if membership.issuer != self.historical_root(&m.issued_under)? {
@@ -2251,14 +2282,14 @@ impl VerifiedPolicySet {
                 "agent session mismatch",
             )?,
         }
-        let space = self
-            .space(&i.resource.space)
-            .ok_or(AuthorizationError::InvalidProof("missing resource space"))?;
+        let resource = self
+            .resource(&i.resource.space, &i.resource.resource)
+            .ok_or(AuthorizationError::InvalidProof(
+                "missing registered resource",
+            ))?;
+        budget.verify(resource)?;
         require(
-            space
-                .resources
-                .iter()
-                .any(|r| r.resource == i.resource.resource && r.host == i.audience.service),
+            resource.payload.host == i.audience.service,
             "resource is not hosted by audience",
         )?;
         let target = self.find_device(&i.audience.device)?;
@@ -2643,11 +2674,7 @@ mod tests {
                 revoked_devices: vec![],
                 memberships: vec![],
                 grants: vec![],
-                resources: vec![ResourceRecord {
-                    resource: resource.resource.clone(),
-                    kind: ResourceKind::Project,
-                    host: audience.service.clone(),
-                }],
+                resources: vec![],
                 governance_grant: None,
                 root_acceptance: None,
                 recovery_approvals: vec![],
@@ -2656,6 +2683,23 @@ mod tests {
                 .trust_space_genesis(
                     &PublicKey::of(&root),
                     Signed::sign(document, &root).unwrap(),
+                )
+                .unwrap();
+            let resource_hash = state
+                .install_resource(
+                    Signed::sign(
+                        ResourceRecord {
+                            version: AUTH_VERSION,
+                            space: space.clone(),
+                            resource: resource.resource.clone(),
+                            kind: ResourceKind::Project,
+                            host: audience.service.clone(),
+                            issued_under: space_genesis.clone(),
+                            nonce: Nonce::from_bytes([10; 32]),
+                        },
+                        &root,
+                    )
+                    .unwrap(),
                 )
                 .unwrap();
             let grant = Grant {
@@ -2694,7 +2738,10 @@ mod tests {
                 root_grant,
             };
             let root_grant = fixture.root_grant.clone();
-            fixture.update_space(|d| d.grants.push(root_grant));
+            fixture.update_space(|d| {
+                d.grants.push(root_grant);
+                d.resources.push(resource_hash);
+            });
             fixture
         }
         fn update_space(&mut self, change: impl FnOnce(&mut SpaceDocument)) {
@@ -2708,6 +2755,7 @@ mod tests {
             d.grants.sort();
             d.memberships.sort();
             d.devices.sort();
+            d.resources.sort();
             self.state
                 .install_space(Signed::sign(d, &self.root).unwrap())
                 .unwrap();
@@ -3212,6 +3260,12 @@ mod tests {
             journal.push(JournalEntry::Account(d.clone()));
         }
         journal.push(JournalEntry::SpaceGenesis(sh[0].clone()));
+        journal.push(JournalEntry::Resource(
+            f.state
+                .resource(&f.space, &f.resource.resource)
+                .unwrap()
+                .clone(),
+        ));
         journal.push(JournalEntry::Grant(
             f.state.grant(&f.root_grant).unwrap().clone(),
         ));
@@ -3241,6 +3295,180 @@ mod tests {
             pins,
         )
     }
+    #[test]
+    fn scoped_resource_bundle_hides_unrelated_records_and_rejects_missing_or_tampered_proofs() {
+        let mut f = Fixture::new();
+        let hidden_resource = ResourceId::from_bytes([91; 32]);
+        let hidden_host = ServiceId::from_key(&PublicKey::of(&key(92)));
+        let mut record = f
+            .state
+            .resource(&f.space, &f.resource.resource)
+            .unwrap()
+            .payload
+            .clone();
+        record.resource = hidden_resource.clone();
+        record.host = hidden_host.clone();
+        record.nonce = Nonce::from_bytes([91; 32]);
+        let hidden_hash = f
+            .state
+            .install_resource(Signed::sign(record, &f.root).unwrap())
+            .unwrap();
+        let mut grant = f.state.grant(&f.root_grant).unwrap().payload.clone();
+        grant.scope = ResourceScope::Exact(ResourceRef {
+            space: f.space.clone(),
+            resource: hidden_resource.clone(),
+        });
+        grant.audience.service = hidden_host.clone();
+        grant.nonce = Nonce::from_bytes([92; 32]);
+        let hidden_grant = f
+            .state
+            .install_grant(Signed::sign(grant, &f.root).unwrap(), NOW)
+            .unwrap();
+        f.update_space(|d| {
+            d.resources.push(hidden_hash.clone());
+            d.grants.push(hidden_grant.clone());
+        });
+        let (bundle, pins) = client_bundle(&f);
+        let json = serde_json::to_string(&bundle).unwrap();
+        assert!(!json.contains(hidden_resource.as_str()));
+        assert!(!json.contains(hidden_host.as_str()));
+        assert!(json.contains(hidden_hash.as_str()));
+        assert!(json.contains(hidden_grant.as_str()));
+        let verify = |bundle: &ClientAuthorizationBundle| {
+            verify_client_authorization(
+                &serde_json::to_string(bundle).unwrap(),
+                &serde_json::to_string(&pins).unwrap(),
+                f.account.as_str(),
+                f.space.as_str(),
+                PublicKey::of(&f.user).as_str(),
+                NOW as f64,
+            )
+        };
+        assert!(verify(&bundle).is_ok());
+        let mut missing = bundle.clone();
+        missing
+            .journal
+            .retain(|e| !matches!(e, JournalEntry::Resource(_)));
+        assert!(verify(&missing).is_err());
+        let mut tampered = bundle.clone();
+        for entry in &mut tampered.journal {
+            if let JournalEntry::Resource(signed) = entry {
+                signed.payload.host = hidden_host.clone();
+            }
+        }
+        assert!(verify(&tampered).is_err());
+        let mut cross_space = bundle;
+        for entry in &mut cross_space.journal {
+            if let JournalEntry::Resource(signed) = entry {
+                signed.payload.space = SpaceId::team(&PublicKey::of(&key(93)));
+                *signed = Signed::sign(signed.payload.clone(), &f.root).unwrap();
+            }
+        }
+        assert!(verify(&cross_space).is_err());
+    }
+
+    #[test]
+    fn conflicting_resources_are_rejected_before_and_after_policy_registration() {
+        let mut f = Fixture::new();
+        let mut record = f
+            .state
+            .resource(&f.space, &f.resource.resource)
+            .unwrap()
+            .payload
+            .clone();
+        record.nonce = Nonce::from_bytes([94; 32]);
+        let signed = Signed::sign(record, &f.root).unwrap();
+        let hash = f.state.install_resource(signed.clone()).unwrap();
+        let mut document = f.state.space(&f.space).unwrap().clone();
+        document.previous = f.state.head(&PolicyDomain::Space(f.space.clone())).cloned();
+        document.sequence += 1;
+        document.resources.push(hash.clone());
+        document.resources.sort();
+        let proposal = Signed::sign(document.clone(), &f.root).unwrap();
+        assert_eq!(
+            f.state.install_space(proposal.clone()).unwrap_err(),
+            AuthorizationError::InvalidProof("invalid registered resource")
+        );
+        f.state.resources.remove(&hash);
+        f.state.install_space(proposal).unwrap();
+        assert_eq!(
+            f.state.install_resource(signed).unwrap_err(),
+            AuthorizationError::InvalidProof("conflicting registered resource")
+        );
+    }
+
+    #[test]
+    fn expired_membership_does_not_hide_an_independent_current_membership() {
+        let mut f = Fixture::new();
+        let issued_under = f
+            .state
+            .head(&PolicyDomain::Space(f.space.clone()))
+            .unwrap()
+            .clone();
+        let member = Membership {
+            version: AUTH_VERSION,
+            space: f.space.clone(),
+            subject: Actor::Account(f.account.clone()),
+            roles: vec![SpaceRole::Operator],
+            issued_under: issued_under.clone(),
+            not_before_ms: 0,
+            expires_at_ms: NOW + 1,
+            nonce: Nonce::from_bytes([95; 32]),
+        };
+        let expired = f
+            .state
+            .install_membership(Signed::sign(member.clone(), &f.root).unwrap(), NOW)
+            .unwrap();
+        let mut current_member = member;
+        current_member.expires_at_ms = 1_000_000;
+        let current = f
+            .state
+            .install_membership(Signed::sign(current_member, &f.root).unwrap(), NOW)
+            .unwrap();
+        // Choose the expired record first in canonical hash order to exercise the failing branch.
+        let (expired, current) = if expired < current {
+            (expired, current)
+        } else {
+            let mut candidate = f.state.membership(&expired).unwrap().payload.clone();
+            let mut found = None;
+            for nonce in 0..=255 {
+                candidate.nonce = Nonce::from_bytes([nonce; 32]);
+                let signed = Signed::sign(candidate.clone(), &f.root).unwrap();
+                if signed.hash().unwrap() < current {
+                    found = Some(signed);
+                    break;
+                }
+            }
+            (
+                f.state.install_membership(found.unwrap(), NOW).unwrap(),
+                current,
+            )
+        };
+        let mut grant = f.state.grant(&f.root_grant).unwrap().payload.clone();
+        grant.grantee = Grantee::MembersOf(MembersOf {
+            space: f.space.clone(),
+            pinned_genesis: f.state.space_history(&f.space).unwrap()[0].hash().unwrap(),
+            kind: MemberKind::Account,
+            roles_any: vec![SpaceRole::Operator],
+        });
+        grant.nonce = Nonce::from_bytes([96; 32]);
+        let grant_hash = f
+            .state
+            .install_grant(Signed::sign(grant, &f.root).unwrap(), NOW)
+            .unwrap();
+        f.update_space(|d| {
+            d.memberships = vec![expired.clone(), current.clone()];
+            d.grants.push(grant_hash.clone());
+        });
+        let mut invocation = f.invocation();
+        invocation.grant_leaf = grant_hash.clone();
+        assert!(f.check(invocation, &f.user, NOW + 2).is_ok());
+        f.update_space(|d| d.memberships = vec![expired]);
+        let mut invocation = f.invocation();
+        invocation.grant_leaf = grant_hash;
+        assert!(f.check(invocation, &f.user, NOW + 2).is_err());
+    }
+
     #[test]
     fn client_scope_comes_from_pinned_policy_and_matches_native_wasm_vector() {
         let f = Fixture::new();
@@ -3606,6 +3834,7 @@ mod tests {
         d.previous = None;
         d.sequence = 0;
         d.grants.clear();
+        d.resources.clear();
         let genesis = f
             .state
             .trust_space_genesis(
@@ -3702,7 +3931,7 @@ mod tests {
         };
         let resource = ResourceRef {
             space: team.clone(),
-            resource: document.resources[0].resource.clone(),
+            resource: f.resource.resource.clone(),
         };
         let grant = Grant {
             version: AUTH_VERSION,
@@ -3723,11 +3952,29 @@ mod tests {
             .state
             .install_grant(Signed::sign(grant, &team_root).unwrap(), NOW)
             .unwrap();
-        document.previous = Some(previous);
+        document.previous = Some(previous.clone());
         document.sequence += 1;
         document.grants.push(leaf.clone());
         document.grants.sort();
-        document.resources[0].host = audience.service.clone();
+        let resource_hash = f
+            .state
+            .install_resource(
+                Signed::sign(
+                    ResourceRecord {
+                        version: AUTH_VERSION,
+                        space: team.clone(),
+                        resource: resource.resource.clone(),
+                        kind: ResourceKind::Project,
+                        host: audience.service.clone(),
+                        issued_under: previous.clone(),
+                        nonce: Nonce::from_bytes([74; 32]),
+                    },
+                    &team_root,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        document.resources = vec![resource_hash];
         document.governance_grant = None;
         let head = f
             .state
@@ -4475,14 +4722,26 @@ impl VerifiedPolicySet {
             )?;
         }
         if d.resources != previous.resources {
-            for resource in d.resources.iter().chain(previous.resources.iter()) {
-                if !d.resources.contains(resource) || !previous.resources.contains(resource) {
+            for resource_hash in d.resources.iter().chain(previous.resources.iter()) {
+                if !d.resources.contains(resource_hash)
+                    || !previous.resources.contains(resource_hash)
+                {
+                    let resource = self.resources.get(resource_hash).ok_or(
+                        AuthorizationError::InvalidProof("missing changed resource record"),
+                    )?;
+                    budget.verify(resource)?;
+                    if !previous.resources.contains(resource_hash) {
+                        require(
+                            resource.issuer == signed.issuer && resource.payload.space == d.space,
+                            "resource registration issuer mismatch",
+                        )?;
+                    }
                     self.governance_capability(
                         hash,
                         &signed.issuer,
                         &d.space,
                         Some(Action::ResourceManage),
-                        Some(&resource.resource),
+                        Some(&resource.payload.resource),
                         at,
                         budget,
                     )?;
@@ -4525,6 +4784,7 @@ pub enum JournalEntry {
     SpaceGenesis(Signed<SpaceDocument>),
     Space(Signed<SpaceDocument>),
     Device(Signed<DeviceCertificate>),
+    Resource(Signed<ResourceRecord>),
     Membership(Signed<Membership>),
     Grant(Signed<Grant>),
     AccountCommit(Committed<AccountDocument>),
@@ -4644,6 +4904,16 @@ pub fn verify_client_authorization(
                 )?,
             "client grant does not authorize this account and space",
         )?;
+        if let ResourceScope::Exact(resource) = &leaf.scope {
+            let record = state.resource(&resource.space, &resource.resource).ok_or(
+                AuthorizationError::InvalidProof("missing client resource record"),
+            )?;
+            budget.verify(record)?;
+            require(
+                record.payload.host == leaf.audience.service,
+                "client resource audience mismatch",
+            )?;
+        }
         let target = state.find_device(&leaf.audience.device)?;
         require(
             target.payload.subject == Actor::Service(leaf.audience.service.clone()),
@@ -4880,6 +5150,7 @@ pub fn prepare_authorization_signing(
             "space_document" => prepare_signed::<SpaceDocument>(json, &issuer)?,
             "device_certificate" => prepare_signed::<DeviceCertificate>(json, &issuer)?,
             "membership" => prepare_signed::<Membership>(json, &issuer)?,
+            "resource" => prepare_signed::<ResourceRecord>(json, &issuer)?,
             "grant" => prepare_signed::<Grant>(json, &issuer)?,
             "invocation" => prepare_signed::<Invocation>(json, &issuer)?,
             "policy_commit" => prepare_signed::<PolicyCommit>(json, &issuer)?,
@@ -5114,6 +5385,9 @@ pub fn replay_policies(pins: &[PolicyPin], journal: &[JournalEntry]) -> Result<V
             JournalEntry::Device(signed) => {
                 let at = signed.payload.not_before_ms;
                 state.install_device(signed, at)?;
+            }
+            JournalEntry::Resource(signed) => {
+                state.install_resource(signed)?;
             }
             JournalEntry::Membership(signed) => {
                 let at = signed.payload.not_before_ms;
