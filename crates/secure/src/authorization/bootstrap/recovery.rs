@@ -1,5 +1,7 @@
 //! Account recovery preserves identity and replaces device authorization atomically.
 
+pub mod context;
+
 use super::*;
 use zeroize::Zeroize;
 
