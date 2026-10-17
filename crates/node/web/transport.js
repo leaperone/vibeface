@@ -95,7 +95,7 @@ async function initializeIdentity(replaceLostKey) {
     if (record?.secret) identity = Identity.fromSecretHex(record.secret);
     else {
       let previouslyPaired = false;
-      try { previouslyPaired = localStorage.getItem("vibeface.device-created") === "true"; } catch { /* IndexedDB remains the required key store. */ }
+      try { previouslyPaired = localStorage.getItem("vibeface.device-created") === "true"; } catch {}
       if (previouslyPaired && !replaceLostKey) { const error = new Error(lostKeyMessage); error.code = "key_lost"; throw error; }
       const generated = Identity.generate();
       let claimed;
@@ -103,7 +103,7 @@ async function initializeIdentity(replaceLostKey) {
       catch (error) { generated.free(); throw error; }
       if (claimed) identity = generated;
       else { generated.free(); const existing = await keyRecord(); if (!existing?.secret) throw new Error("浏览器设备密钥初始化发生竞争，请刷新后重试。"); identity = Identity.fromSecretHex(existing.secret); }
-      try { localStorage.setItem("vibeface.device-created", "true"); } catch { /* Pairing still requires an explicit invitation. */ }
+      try { localStorage.setItem("vibeface.device-created", "true"); } catch {}
     }
   }
   return { nodeId: identity.nodeId(), publicKey: identity.publicKeyHex() };
@@ -114,7 +114,8 @@ export function signClient(domain, payload) {
   return identity.sign(domain, encoder.encode(payload));
 }
 
-export async function connectDevice(entry, { onEvent, onClose } = {}) {
+export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
+  if (signal?.aborted) throw new Error("设备连接已取消。");
   if (!identity) await initClient();
   const target = validTarget(entry.node_id);
   const endpoint = validEndpoint(entry.address);
@@ -126,6 +127,7 @@ export async function connectDevice(entry, { onEvent, onClose } = {}) {
   const waiting = [];
   const pending = new Map();
   let channel;
+  let publicKey;
   let closed = false;
   let nextId = 0;
   const disconnected = () => new Error("加密连接已断开，操作结果尚未确认。重新连接后先核对原操作，不要重复派发。");
@@ -135,9 +137,13 @@ export async function connectDevice(entry, { onEvent, onClose } = {}) {
     for (const item of waiting.splice(0)) item.reject(error);
     for (const item of pending.values()) { clearTimeout(item.timer); item.reject(error); }
     pending.clear();
+    signal?.removeEventListener("abort", abort);
     socket.close();
     onClose?.(error);
   }
+  function abort() { fail(new Error("设备连接已取消。")); }
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
   function receive() {
     if (incoming.length) return Promise.resolve(incoming.shift());
     if (closed) return Promise.reject(disconnected());
@@ -157,24 +163,28 @@ export async function connectDevice(entry, { onEvent, onClose } = {}) {
     const frame = await receive();
     if (typeof frame !== "string" || frame.length > 8192) throw new Error("中继握手格式无效。");
     const message = JSON.parse(frame);
+    if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error("中继握手格式无效。");
     if (message.type !== expected) throw new Error(typeof message.message === "string" ? message.message : "入口未能建立指定设备的通道。");
     return message;
   }
+  let handshake;
   try {
     await control("welcome");
     socket.send(JSON.stringify(entry.relay ? { type: "dial", target, service: "client" } : { type: "direct", service: "client" }));
     await control("ready");
-    const handshake = new Handshake(true, identity.secretHex(), target, encoder.encode("vibeface:client:v1"));
+    handshake = new Handshake(true, identity.secretHex(), target, encoder.encode("vibeface:client:v1"));
     socket.send(handshake.write(new Uint8Array()));
     const response = await receive();
     if (!(response instanceof ArrayBuffer)) throw new Error("设备未返回加密握手。");
-    handshake.read(new Uint8Array(response));
+    if (handshake.read(new Uint8Array(response)).length) throw new Error("设备握手包含未预期的数据。");
     socket.send(handshake.write(new Uint8Array()));
     if (!handshake.isFinished() || handshake.remoteId() !== target) throw new Error("设备身份与已保存指纹不符，已拒绝连接。");
+    publicKey = handshake.remotePublicKey();
+    if (typeof publicKey !== "string" || !nodePattern.test(publicKey)) throw new Error("设备未提供有效的认证公钥。");
     channel = handshake.finish();
-    handshake.free();
     clearTimeout(handshakeTimer);
   } catch (error) { clearTimeout(handshakeTimer); fail(error); throw error; }
+  finally { handshake?.free(); }
   (async () => {
     try {
       while (!closed) {
@@ -183,9 +193,14 @@ export async function connectDevice(entry, { onEvent, onClose } = {}) {
         const plaintext = channel.openRecord(new Uint8Array(frame));
         if (plaintext == null) continue;
         const message = JSON.parse(decoder.decode(plaintext));
+        if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error("设备返回的加密消息格式无效。");
+        if (message.id !== undefined && typeof message.id !== "string") throw new Error("设备返回的请求编号格式无效。");
+        if (message.error !== undefined && message.error !== null && typeof message.error !== "string") throw new Error("设备返回的错误格式无效。");
         if (message.id !== undefined && pending.has(message.id)) {
           const item = pending.get(message.id); pending.delete(message.id); clearTimeout(item.timer);
-          if (message.error) { const error = new Error(typeof message.error === "string" ? message.error : message.error.message || "设备拒绝此操作。"); error.status = message.error.status || message.error.code; error.responded = true; item.reject(error); }
+          if (message.error !== undefined && message.error !== null) {
+            const error = new Error(message.error); error.responded = true; item.reject(error);
+          }
           else item.resolve(message.result);
         } else onEvent?.(message);
       }
@@ -194,6 +209,7 @@ export async function connectDevice(entry, { onEvent, onClose } = {}) {
   })();
   return {
     nodeId: target,
+    publicKey,
     request(method, params = {}) {
       if (closed) return Promise.reject(disconnected());
       const id = String(++nextId);
