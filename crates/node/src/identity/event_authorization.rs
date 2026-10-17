@@ -1252,17 +1252,24 @@ pub(crate) fn append_execution_handoff_observation_in(
     identity: &LocalIdentity,
     source: &SignedEvent,
     result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffResult,
+    verified: &vibeface_secure::authorization::execution_handoff::VerifiedExecutionHandoffResult,
     now_ms: u64,
 ) -> Result<SignedEvent> {
-    use vibeface_secure::authorization::execution_handoff::verify_execution_handoff_receipt_signature;
     ensure!(
-        result.handoff.handoff.project_dispatch == *source,
+        verified.result() == result && result.handoff.handoff.project_dispatch == *source,
         "handoff acknowledgement belongs to another dispatch"
     );
-    verify_execution_handoff_receipt_signature(&result.handoff, &result.receipt, &result.result)?;
-    append_signed_execution_observation_in(
+    check_execution_observation_authorizations_in(
         connection,
         policy,
+        identity,
+        verified.original(),
+        verified.submission(),
+        now_ms,
+    )?;
+    verified.proof_usage().enforce_limits()?;
+    append_checkpointed_execution_observation_in(
+        connection,
         identity,
         source,
         &serde_json::to_value(result)?,
@@ -1416,102 +1423,155 @@ fn check_execution_observation_authorizations_in(
     Ok(())
 }
 
+struct ObservationCausalFact {
+    author: String,
+    sequence: u64,
+    previous: Option<String>,
+}
+
+struct ObservationScopeCheckpoint {
+    heads: Vec<String>,
+    previous: Option<(u64, String)>,
+}
+
 fn ready_observation_scope_in(
     connection: &Connection,
     source: &SignedEvent,
-) -> Result<BTreeMap<String, StoredEvent>> {
+    local_author: &str,
+    observation_slot: &str,
+) -> Result<ObservationScopeCheckpoint> {
     let expected: Event = serde_json::from_str(&source.canonical_body)?;
-    let mut statement = connection.prepare(
-        "SELECT hash,envelope,status,author,sequence FROM events WHERE space_id=? AND resource_id=? AND scope_id=? ORDER BY hash LIMIT 129",
+    let invocation_hash = admission(&expected).invocation.hash()?;
+    let row_count: u64 = connection.query_row(
+        "SELECT COUNT(*) FROM events WHERE space_id=? AND resource_id=? AND scope_id=?",
+        params![
+            expected.network_id,
+            expected.resource_id.as_str(),
+            expected.scope_id
+        ],
+        |row| row.get(0),
     )?;
-    let rows = statement
-        .query_map(
-            params![
-                expected.network_id,
-                expected.resource_id.as_str(),
-                expected.scope_id
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, u64>(4)?,
-                ))
-            },
-        )?
+    let heads = connection.prepare(
+        "WITH scoped AS (SELECT hash,json_extract(envelope,'$.canonical_body') AS body FROM events WHERE space_id=?1 AND resource_id=?2 AND scope_id=?3), dependencies AS (SELECT value AS hash FROM scoped,json_each(scoped.body,'$.parents') UNION SELECT json_extract(body,'$.previous') FROM scoped WHERE json_extract(body,'$.previous') IS NOT NULL) SELECT hash FROM scoped WHERE hash NOT IN (SELECT hash FROM dependencies) ORDER BY hash",
+    )?.query_map(params![expected.network_id, expected.resource_id.as_str(), expected.scope_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    ensure!(
-        rows.len() <= 128,
-        "execution observation scope checkpoint is too large"
-    );
-    let mut events = BTreeMap::new();
+    let mut lookup = connection.prepare(
+        "SELECT envelope,status,scope_id,author,sequence,resource_id FROM events WHERE space_id=? AND hash=?",
+    )?;
+    let mut pending = heads
+        .iter()
+        .chain(std::iter::once(&source.hash))
+        .map(|hash| (hash.clone(), false))
+        .collect::<Vec<_>>();
+    let mut visiting = BTreeSet::new();
+    let mut completed = BTreeSet::new();
+    let mut facts = BTreeMap::<String, ObservationCausalFact>::new();
     let mut sequences = BTreeSet::new();
-    let mut total_bytes = 0usize;
-    for (hash, encoded, status, author, sequence) in rows {
-        total_bytes = total_bytes
-            .checked_add(encoded.len())
-            .context("execution observation scope size overflow")?;
+    let mut previous = None::<(u64, String)>;
+    while let Some((hash, exiting)) = pending.pop() {
+        if exiting {
+            visiting.remove(&hash);
+            completed.insert(hash);
+            continue;
+        }
+        if completed.contains(&hash) {
+            continue;
+        }
         ensure!(
-            total_bytes <= 8 * 1024 * 1024,
-            "execution observation scope checkpoint is too large"
+            visiting.insert(hash.clone()),
+            "execution observation scope has cyclic causal history"
         );
-        let envelope: SignedEvent = serde_json::from_str(&encoded)?;
+        let row: (String, String, String, String, u64, String) = lookup
+            .query_row(params![expected.network_id, hash], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .context("execution observation scope has missing causal history")?;
+        let envelope: SignedEvent = serde_json::from_str(&row.0)?;
+        ensure!(
+            envelope.canonical_body.len() <= crate::model::MAX_EVENT_BYTES,
+            "execution observation event is too large"
+        );
         let event: Event = serde_json::from_str(&envelope.canonical_body)?;
         ensure!(
-            status == "ready"
-                && envelope.canonical_body.len() <= crate::model::MAX_EVENT_BYTES
+            row.1 == "ready"
                 && envelope.hash == hash
                 && crypto::digest(envelope.canonical_body.as_bytes()) == hash
                 && serde_json::to_string(&event)? == envelope.canonical_body
                 && event.network_id == expected.network_id
                 && event.resource_id == expected.resource_id
+                && event.resource_id.as_str() == row.5
                 && event.scope_id == expected.scope_id
-                && event.author == author
-                && event.sequence == sequence
-                && sequences.insert((author, sequence)),
-            "execution observation scope checkpoint changed"
+                && event.scope_id == row.2
+                && event.author == row.3
+                && event.sequence == row.4
+                && sequences.insert((event.author.clone(), event.sequence)),
+            "execution observation causal checkpoint changed"
         );
         crypto::validate_event_shape(&event)?;
+        if hash == source.hash {
+            ensure!(
+                envelope == *source,
+                "execution observation has no exact local ready Dispatch checkpoint"
+            );
+        }
         for blob in &event.blobs {
             ensure!(
                 has_blob_from(connection, &event.network_id, blob)?,
                 "execution observation scope has missing blob content"
             );
         }
-        events.insert(
+        ensure!(
+            admission(&event).invocation.hash()? != invocation_hash
+                || event_slot(&event.body) != observation_slot,
+            "execution observation conflicts with its original invocation slot"
+        );
+        if event.author == local_author
+            && previous
+                .as_ref()
+                .is_none_or(|(sequence, _)| event.sequence > *sequence)
+        {
+            previous = Some((event.sequence, hash.clone()));
+        }
+        pending.push((hash.clone(), true));
+        pending.extend(
+            event
+                .parents
+                .iter()
+                .chain(&event.previous)
+                .map(|dependency| (dependency.clone(), false)),
+        );
+        facts.insert(
             hash,
-            StoredEvent {
-                envelope,
-                event,
-                status,
+            ObservationCausalFact {
+                author: event.author,
+                sequence: event.sequence,
+                previous: event.previous,
             },
         );
     }
     ensure!(
-        events
-            .get(&source.hash)
-            .is_some_and(|event| event.envelope == *source),
-        "execution observation has no exact local ready Dispatch checkpoint"
+        facts.len() as u64 == row_count,
+        "execution observation scope has unreachable causal history"
     );
-    for stored in events.values() {
-        for dependency in stored.event.parents.iter().chain(&stored.event.previous) {
+    for fact in facts.values() {
+        if let Some(previous) = &fact.previous {
+            let prior = facts
+                .get(previous)
+                .context("execution observation has missing author history")?;
             ensure!(
-                events.contains_key(dependency),
-                "execution observation scope has missing causal history"
-            );
-        }
-        if let Some(previous) = &stored.event.previous {
-            let prior = &events[previous].event;
-            ensure!(
-                prior.author == stored.event.author
-                    && prior.sequence.checked_add(1) == Some(stored.event.sequence),
+                prior.author == fact.author && prior.sequence.checked_add(1) == Some(fact.sequence),
                 "execution observation scope author chain changed"
             );
         }
     }
-    Ok(events)
+    Ok(ObservationScopeCheckpoint { heads, previous })
 }
 
 fn append_checkpointed_execution_observation_in(
@@ -1522,8 +1582,7 @@ fn append_checkpointed_execution_observation_in(
     state: vibeface_secure::authorization::execution_handoff::ExecutionHandoffState,
     now_ms: u64,
 ) -> Result<SignedEvent> {
-    let events = ready_observation_scope_in(connection, source)?;
-    let source_event = &events[&source.hash].event;
+    let source_event: Event = serde_json::from_str(&source.canonical_body)?;
     crypto::verify_signed_event(
         &source_event.network_id,
         source,
@@ -1554,7 +1613,7 @@ fn append_checkpointed_execution_observation_in(
             && serde_json::from_str::<Value>(&stored_result)? == *result,
         "execution observation differs from its durable signed acknowledgement"
     );
-    let proof = admission(source_event);
+    let proof = admission(&source_event);
     ensure!(
         now_ms >= proof.admitted_at_ms,
         "execution observation predates its original admission"
@@ -1580,14 +1639,8 @@ fn append_checkpointed_execution_observation_in(
             .to_owned(),
         detail: json!({"result_blob":blob}),
     };
-    let invocation_hash = proof.invocation.hash()?;
-    for stored in events.values() {
-        ensure!(
-            admission(&stored.event).invocation.hash()? != invocation_hash
-                || event_slot(&stored.event.body) != event_slot(&body),
-            "execution observation conflicts with its original invocation slot"
-        );
-    }
+    let author = identity.node_id()?;
+    let checkpoint = ready_observation_scope_in(connection, source, &author, &event_slot(&body))?;
     connection.execute(
         "INSERT OR IGNORE INTO blobs(space_id,hash,size,content) VALUES(?,?,?,?)",
         params![source_event.network_id, blob.hash, blob.size, bytes],
@@ -1596,26 +1649,18 @@ fn append_checkpointed_execution_observation_in(
         has_blob_from(connection, &source_event.network_id, &blob)?,
         "execution observation blob conflicts with stored bytes"
     );
-    let author = identity.node_id()?;
-    let previous = events
-        .values()
-        .filter(|event| event.event.author == author)
-        .max_by_key(|event| event.event.sequence);
-    let sequence = previous.map_or(Ok(1), |event| {
-        event
-            .event
-            .sequence
-            .checked_add(1)
-            .context("execution observation author sequence overflow")
-    })?;
-    let mut parents = heads_from_events(&events, &source_event.scope_id);
+    let sequence = checkpoint
+        .previous
+        .as_ref()
+        .map_or(Ok(1), |(sequence, _)| {
+            sequence
+                .checked_add(1)
+                .context("execution observation author sequence overflow")
+        })?;
+    let mut parents = checkpoint.heads;
     parents.push(source.hash.clone());
     parents.sort();
     parents.dedup();
-    ensure!(
-        closure_hashes(&events, &parents).len() == events.len(),
-        "execution observation scope has cyclic causal history"
-    );
     let envelope = identity.sign_event(Event {
         version: WIRE_VERSION,
         network_id: source_event.network_id.clone(),
@@ -1627,7 +1672,7 @@ fn append_checkpointed_execution_observation_in(
         scope_id: source_event.scope_id.clone(),
         author: author.clone(),
         sequence,
-        previous: previous.map(|event| event.envelope.hash.clone()),
+        previous: checkpoint.previous.map(|(_, hash)| hash),
         parents,
         created_at_ms: i64::try_from(now_ms)?,
         body,
@@ -1635,89 +1680,6 @@ fn append_checkpointed_execution_observation_in(
     })?;
     connection.execute("INSERT INTO events(space_id,resource_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?,'ready')", params![source_event.network_id, source_event.resource_id.as_str(), envelope.hash, source_event.scope_id, author, sequence, serde_json::to_string(&envelope)?])?;
     Ok(envelope)
-}
-
-fn append_signed_execution_observation_in(
-    connection: &Connection,
-    policy: &PolicyState,
-    identity: &LocalIdentity,
-    source: &SignedEvent,
-    result: &Value,
-    state: vibeface_secure::authorization::execution_handoff::ExecutionHandoffState,
-    now_ms: u64,
-) -> Result<SignedEvent> {
-    let source_network: String = serde_json::from_str::<Event>(&source.canonical_body)?.network_id;
-    let source_event = verify_event_envelope(policy, source_network.as_str(), source)?;
-    let EventBody::DispatchRecorded {
-        operation_id,
-        task_id,
-        target_node,
-        session_id,
-        ..
-    } = &source_event.body
-    else {
-        bail!("handoff acknowledgement source is not a dispatch")
-    };
-    let state: OperationState = serde_json::from_value(serde_json::to_value(state)?)?;
-    ensure!(
-        state != OperationState::Accepted,
-        "accepted handoff has no execution observation"
-    );
-    let (stored_state, stored_result): (String, String) = connection.query_row(
-        "SELECT state,result FROM operations WHERE space_id=? AND operation_id=?",
-        params![source_event.network_id, operation_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    ensure!(
-        serde_json::from_str::<OperationState>(&stored_state)? == state
-            && serde_json::from_str::<Value>(&stored_result)? == *result,
-        "handoff observation differs from its durable signed acknowledgement"
-    );
-    let bytes = serde_json::to_vec(result)?;
-    ensure!(
-        bytes.len() <= crate::model::MAX_BLOB_BYTES,
-        "handoff result proof is too large"
-    );
-    let blob = BlobRef {
-        hash: crypto::digest(&bytes),
-        size: bytes.len() as u64,
-    };
-    connection.execute(
-        "INSERT OR IGNORE INTO blobs(space_id,hash,size,content) VALUES(?,?,?,?)",
-        params![source_event.network_id, blob.hash, blob.size, bytes],
-    )?;
-    ensure!(
-        has_blob_from(connection, &source_event.network_id, &blob)?,
-        "handoff result proof blob conflicts with stored bytes"
-    );
-    let proof = admission(&source_event);
-    super::admission::validate_persisted_admission(connection, proof)?;
-    let signed = append_event_in(
-        connection,
-        policy,
-        identity,
-        proof,
-        &source_event.scope_id,
-        EventCause::Derived {
-            admission: proof.clone(),
-            source: source.hash.clone(),
-        },
-        EventBody::ExecutionObserved {
-            operation_id: operation_id.clone(),
-            task_id: task_id.clone(),
-            target_node: target_node.clone(),
-            session_id: session_id.clone(),
-            status: serde_json::to_value(&state)?
-                .as_str()
-                .context("invalid execution observation state")?
-                .to_owned(),
-            detail: json!({"result_blob":blob}),
-        },
-        vec![blob],
-        now_ms,
-    )?;
-    rebuild_projections_from(connection, &source_event.network_id)?;
-    Ok(signed)
 }
 
 impl Store {

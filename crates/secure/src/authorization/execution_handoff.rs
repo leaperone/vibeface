@@ -215,6 +215,30 @@ pub struct ExecutionHandoffResult {
     pub result: Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct VerifiedExecutionHandoffResult {
+    result: ExecutionHandoffResult,
+    authorization: VerifiedExecutionHandoff,
+}
+
+impl VerifiedExecutionHandoffResult {
+    pub fn result(&self) -> &ExecutionHandoffResult {
+        &self.result
+    }
+    pub fn original(&self) -> &VerifiedAuthorization {
+        self.authorization.original()
+    }
+    pub fn submission(&self) -> &VerifiedAuthorization {
+        self.authorization.submission()
+    }
+    pub fn dependencies(&self) -> &[PolicyStamp] {
+        self.authorization.dependencies()
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        self.authorization.proof_usage()
+    }
+}
+
 impl SignedExecutionHandoff {
     pub fn hash(&self) -> Result<ObjectHash> {
         require(
@@ -1249,6 +1273,25 @@ pub fn verify_execution_handoff_receipt_signature(
 }
 
 impl VerifiedPolicySet {
+    pub fn verify_execution_handoff_result(
+        &self,
+        result: &ExecutionHandoffResult,
+        original: &VerifiedAuthorization,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionHandoffResult> {
+        let authorization = self.verify_execution_handoff_ack(
+            &result.handoff,
+            original,
+            &result.receipt,
+            &result.result,
+            now_ms,
+        )?;
+        Ok(VerifiedExecutionHandoffResult {
+            result: result.clone(),
+            authorization,
+        })
+    }
+
     pub fn verify_execution_handoff_ack(
         &self,
         wire: &SignedExecutionHandoff,
