@@ -598,3 +598,569 @@ impl Store {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::test_support::{TestNetwork, now};
+    use std::collections::BTreeMap;
+    use vibeface_secure::Identity;
+
+    struct Flow {
+        network: TestNetwork,
+        store: Store,
+        device: Identity,
+        offer: String,
+        hash: Value,
+        intent: String,
+        record: Value,
+    }
+
+    impl Flow {
+        fn new(persistent: bool) -> Result<Self> {
+            let network = TestNetwork::new()?;
+            let store = if persistent {
+                network.at(&network.directory.join("enrollment.sqlite3"))?
+            } else {
+                network.memory()?
+            };
+            let offer = offer::create_device_enrollment_offer(
+                &network.client,
+                network.account.as_str(),
+                "https://node.example.test",
+                &network.node.public_key_hex()?,
+                "[]",
+                (now() + 60_000) as f64,
+                &serde_json::to_string(&network.pins)?,
+                &serde_json::to_string(&network.bundle)?,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let device = Identity::generate().map_err(anyhow::Error::msg)?;
+            let verified = offer::verify_device_enrollment_offer(&offer, now() as f64)
+                .map_err(anyhow::Error::msg)?;
+            let intent =
+                offer::create_device_enrollment_intent_from_offer(&verified, &device, now() as f64)
+                    .map_err(anyhow::Error::msg)?;
+            let mut flow = Self {
+                network,
+                store,
+                device,
+                offer,
+                hash: Value::Null,
+                intent,
+                record: Value::Null,
+            };
+            let published = flow.call(
+                &flow.network.client.public_key_hex(),
+                "enrollment_offer_publish",
+                &json!({"offer":serde_json::from_str::<Value>(&flow.offer)?}),
+                now(),
+            )?;
+            flow.hash = published["offer_hash"].clone();
+            Ok(flow)
+        }
+
+        fn call(
+            &mut self,
+            principal: &str,
+            method: &str,
+            params: &Value,
+            at: u64,
+        ) -> Result<Value> {
+            self.store
+                .enrollment_command(&self.network.node, principal, method, params, at)
+        }
+
+        fn reference(&self) -> Value {
+            json!({"account_id":self.network.account,"offer_hash":self.hash,"request_id":self.record["request_id"]})
+        }
+
+        fn request_params(&self) -> Result<Value> {
+            Ok(
+                json!({"account_id":self.network.account,"offer_hash":self.hash,
+                "new_device_public_key":self.device.public_key_hex(),"intent":serde_json::from_str::<Value>(&self.intent)?}),
+            )
+        }
+
+        fn request(&mut self) -> Result<Value> {
+            self.record = self.call(
+                &self.device.public_key_hex(),
+                "enrollment_request",
+                &self.request_params()?,
+                now(),
+            )?;
+            Ok(self.record.clone())
+        }
+
+        fn approval(&self) -> Result<String> {
+            enrollment::sign_device_enrollment_intent(
+                &self.intent,
+                &self.network.client,
+                &serde_json::to_string(&self.network.pins)?,
+                &serde_json::to_string(&self.network.bundle)?,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        }
+
+        fn approve(&mut self) -> Result<Value> {
+            let mut params = self.reference();
+            params["intent"] = serde_json::from_str(&self.approval()?)?;
+            self.record = self.call(
+                &self.network.client.public_key_hex(),
+                "enrollment_approve",
+                &params,
+                now(),
+            )?;
+            Ok(self.record.clone())
+        }
+
+        fn qualification(&self) -> Result<enrollment::VerifiedAccountEnrollment> {
+            let verified = offer::verify_device_enrollment_offer(&self.offer, now() as f64)
+                .map_err(anyhow::Error::msg)?;
+            offer::verify_account_enrollment_from_offer(&self.approval()?, &verified, now() as f64)
+                .map_err(anyhow::Error::msg)
+        }
+
+        fn certificate(&self) -> Result<String> {
+            enrollment::sign_device_enrollment_possession(
+                &self.qualification()?,
+                &self.device,
+                self.record["nonce"]
+                    .as_str()
+                    .context("pending nonce missing")?,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        }
+
+        fn possess(&mut self) -> Result<Value> {
+            let mut params = self.reference();
+            params["certificate"] = serde_json::from_str(&self.certificate()?)?;
+            self.record = self.call(
+                &self.device.public_key_hex(),
+                "enrollment_possession",
+                &params,
+                now(),
+            )?;
+            Ok(self.record.clone())
+        }
+
+        fn prepared(&self) -> Result<enrollment::PreparedAccountDeviceChange> {
+            enrollment::prepare_account_device_enrollment(
+                &self.qualification()?,
+                &self.certificate()?,
+                &self.network.client,
+                &serde_json::to_string(&self.network.pins)?,
+                &serde_json::to_string(&self.network.bundle)?,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        }
+
+        fn commit_params(&self) -> Result<Value> {
+            Ok(json!({"request_id":self.record["request_id"],
+                "request":serde_json::from_str::<Value>(&self.prepared()?.request_json().map_err(anyhow::Error::msg)?)?}))
+        }
+
+        fn restart(self) -> Result<Self> {
+            let Self {
+                network,
+                store,
+                device,
+                offer,
+                hash,
+                intent,
+                record,
+            } = self;
+            drop(store);
+            let store = Store::open(network.directory.join("enrollment.sqlite3"))?;
+            Ok(Self {
+                network,
+                store,
+                device,
+                offer,
+                hash,
+                intent,
+                record,
+            })
+        }
+
+        fn snapshot(&self) -> Result<(BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>, Value)> {
+            let tables = self.store.connection.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")?
+                .query_map([],|row| row.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            let mut database = BTreeMap::new();
+            for table in tables {
+                let mut statement = self
+                    .store
+                    .connection
+                    .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))?;
+                let columns = statement.column_count();
+                let rows = statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get(column))
+                            .collect::<std::result::Result<Vec<rusqlite::types::Value>, _>>()
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                database.insert(table, rows);
+            }
+            Ok((
+                database,
+                json!({"account":self.store.authorization_state().account(&self.network.account),
+                "account_head":self.store.authorization_state().head(&PolicyDomain::Account(self.network.account.clone())),
+                "space_head":self.store.authorization_state().head(&PolicyDomain::Space(self.network.space.clone()))}),
+            ))
+        }
+    }
+
+    #[test]
+    fn failed_enrollment_writes_roll_back_database_and_memory_and_allow_exact_retry() -> Result<()>
+    {
+        for (trigger, commit) in [
+            (
+                "CREATE TEMP TRIGGER enrollment_failure BEFORE INSERT ON main.local_values WHEN NEW.key GLOB 'enrollment-request:*' BEGIN SELECT RAISE(ABORT,'request failure'); END",
+                false,
+            ),
+            (
+                "CREATE TEMP TRIGGER enrollment_failure BEFORE UPDATE ON main.local_values WHEN NEW.key GLOB 'enrollment-request:*' AND json_extract(NEW.value,'$.status')='completed' BEGIN SELECT RAISE(ABORT,'completion failure'); END",
+                true,
+            ),
+            (
+                "CREATE TEMP TRIGGER enrollment_failure BEFORE INSERT ON main.local_values WHEN NEW.key GLOB 'device-policy-receipt:*' BEGIN SELECT RAISE(ABORT,'receipt failure'); END",
+                true,
+            ),
+        ] {
+            let mut flow = Flow::new(false)?;
+            let params = if commit {
+                flow.request()?;
+                flow.approve()?;
+                flow.possess()?;
+                flow.commit_params()?
+            } else {
+                flow.request_params()?
+            };
+            flow.store.connection.execute_batch(trigger)?;
+            let before = flow.snapshot()?;
+            let principal = if commit {
+                flow.network.client.public_key_hex()
+            } else {
+                flow.device.public_key_hex()
+            };
+            let method = if commit {
+                "account_device_commit"
+            } else {
+                "enrollment_request"
+            };
+            assert!(flow.call(&principal, method, &params, now()).is_err());
+            assert_eq!(flow.snapshot()?, before);
+            flow.store
+                .connection
+                .execute_batch("DROP TRIGGER enrollment_failure")?;
+            let result = flow.call(&principal, method, &params, now())?;
+            if commit {
+                assert!(result["committed"]["proposal"].is_object());
+                assert_eq!(
+                    flow.call(
+                        &flow.device.public_key_hex(),
+                        "enrollment_status",
+                        &flow.reference(),
+                        now()
+                    )?["status"],
+                    "completed"
+                );
+            } else {
+                assert_eq!(result["status"], "requested");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enrollment_binds_each_phase_to_noise_offer_intent_and_possession() -> Result<()> {
+        let mut flow = Flow::new(false)?;
+        let outsider = Identity::generate()
+            .map_err(anyhow::Error::msg)?
+            .public_key_hex();
+        let before = flow.snapshot()?;
+        assert!(
+            flow.call(
+                &outsider,
+                "enrollment_request",
+                &flow.request_params()?,
+                now()
+            )
+            .is_err()
+        );
+        assert_eq!(flow.snapshot()?, before);
+        flow.request()?;
+        let mut approve = flow.reference();
+        approve["intent"] = serde_json::from_str(&flow.approval()?)?;
+        let before = flow.snapshot()?;
+        assert!(
+            flow.call(&outsider, "enrollment_approve", &approve, now())
+                .is_err()
+        );
+        let mut changed = approve.clone();
+        changed["intent"]["payload"]["requested_rights"] = json!(["enroll_device"]);
+        assert!(
+            flow.call(
+                &flow.network.client.public_key_hex(),
+                "enrollment_approve",
+                &changed,
+                now()
+            )
+            .is_err()
+        );
+        let mut cross = approve.clone();
+        cross["offer_hash"] = json!(ObjectHash::body(&"another offer")?);
+        assert!(
+            flow.call(
+                &flow.network.client.public_key_hex(),
+                "enrollment_approve",
+                &cross,
+                now()
+            )
+            .is_err()
+        );
+        assert_eq!(flow.snapshot()?, before);
+        flow.approve()?;
+        let mut possession = flow.reference();
+        possession["certificate"] = serde_json::from_str(&flow.certificate()?)?;
+        let before = flow.snapshot()?;
+        assert!(
+            flow.call(
+                &flow.network.client.public_key_hex(),
+                "enrollment_possession",
+                &possession,
+                now()
+            )
+            .is_err()
+        );
+        for field in ["nonce", "possession", "uses"] {
+            let mut changed = possession.clone();
+            changed["certificate"][field] = match field {
+                "nonce" => json!(Nonce::random()?),
+                "possession" => json!("00".repeat(64)),
+                _ => json!([]),
+            };
+            assert!(
+                flow.call(
+                    &flow.device.public_key_hex(),
+                    "enrollment_possession",
+                    &changed,
+                    now()
+                )
+                .is_err()
+            );
+            assert_eq!(flow.snapshot()?, before);
+        }
+        flow.possess()?;
+        let params = flow.commit_params()?;
+        let before = flow.snapshot()?;
+        assert!(
+            flow.call(
+                &flow.device.public_key_hex(),
+                "account_device_commit",
+                &params,
+                now()
+            )
+            .is_err()
+        );
+        let mut wrong_request = params.clone();
+        wrong_request["request_id"] = json!(ObjectHash::body(&"another pending request")?);
+        assert!(
+            flow.call(
+                &flow.network.client.public_key_hex(),
+                "account_device_commit",
+                &wrong_request,
+                now()
+            )
+            .is_err()
+        );
+        assert!(
+            flow.call(&outsider, "enrollment_status", &flow.reference(), now())
+                .is_err()
+        );
+        assert_eq!(flow.snapshot()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_enrollment_cas_never_overwrites_a_newer_approval() -> Result<()> {
+        let mut flow = Flow::new(false)?;
+        flow.request()?;
+        let id = ObjectHash::parse(flow.record["request_id"].as_str().unwrap())?;
+        let (previous, record) = flow.store.enrollment_record(&flow.network.account, &id)?;
+        flow.approve()?;
+        let before = flow.snapshot()?;
+        assert!(
+            flow.store
+                .save_enrollment_record(&flow.network.account, Some(&previous), &record, now())
+                .is_err()
+        );
+        assert_eq!(flow.snapshot()?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn revocation_and_expiry_stop_every_unfinished_enrollment_phase() -> Result<()> {
+        for phase in 0..3 {
+            let mut flow = Flow::new(false)?;
+            flow.request()?;
+            if phase >= 1 {
+                flow.approve()?;
+            }
+            if phase >= 2 {
+                flow.possess()?;
+            }
+            let (method, params, principal) = match phase {
+                0 => {
+                    let mut params = flow.reference();
+                    params["intent"] = serde_json::from_str(&flow.approval()?)?;
+                    (
+                        "enrollment_approve",
+                        params,
+                        flow.network.client.public_key_hex(),
+                    )
+                }
+                1 => {
+                    let mut params = flow.reference();
+                    params["certificate"] = serde_json::from_str(&flow.certificate()?)?;
+                    (
+                        "enrollment_possession",
+                        params,
+                        flow.device.public_key_hex(),
+                    )
+                }
+                _ => (
+                    "account_device_commit",
+                    flow.commit_params()?,
+                    flow.network.client.public_key_hex(),
+                ),
+            };
+            let before = flow.snapshot()?;
+            assert!(
+                flow.call(&principal, method, &params, now() + 60_001)
+                    .is_err()
+            );
+            assert_eq!(flow.snapshot()?, before);
+            flow.network.revoke_client(&mut flow.store)?;
+            let before = flow.snapshot()?;
+            assert!(flow.call(&principal, method, &params, now()).is_err());
+            assert_eq!(flow.snapshot()?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pending_enrollment_limit_counts_active_distinct_requests_only() -> Result<()> {
+        let mut flow = Flow::new(false)?;
+        let verified = offer::verify_device_enrollment_offer(&flow.offer, now() as f64)
+            .map_err(anyhow::Error::msg)?;
+        for _ in 0..32 {
+            flow.device = Identity::generate().map_err(anyhow::Error::msg)?;
+            flow.intent = offer::create_device_enrollment_intent_from_offer(
+                &verified,
+                &flow.device,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let requested = flow.request()?;
+            assert_eq!(flow.request()?, requested);
+        }
+        flow.device = Identity::generate().map_err(anyhow::Error::msg)?;
+        flow.intent = offer::create_device_enrollment_intent_from_offer(
+            &verified,
+            &flow.device,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let before = flow.snapshot()?;
+        assert!(flow.request().is_err());
+        assert_eq!(flow.snapshot()?, before);
+        assert_eq!(
+            flow.store.connection.query_row(
+                "SELECT count(*) FROM local_values WHERE key GLOB 'enrollment-request:*'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            32
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_enrollment_survives_each_restart_and_recovers_only_the_original_receipt() -> Result<()>
+    {
+        let mut flow = Flow::new(true)?;
+        flow = flow.restart()?;
+        let requested = flow.request()?;
+        assert_eq!(requested["status"], "requested");
+        assert_eq!(flow.request()?, requested);
+        flow = flow.restart()?;
+        let approved = flow.approve()?;
+        assert_eq!(approved["status"], "approved");
+        assert_eq!(flow.approve()?, approved);
+        flow = flow.restart()?;
+        let possessed = flow.possess()?;
+        assert_eq!(possessed["status"], "possessed");
+        assert_eq!(flow.possess()?, possessed);
+        flow = flow.restart()?;
+        let prepared = flow.prepared()?;
+        let params = flow.commit_params()?;
+        let manager = flow.network.client.public_key_hex();
+        let receipt = flow.call(&manager, "account_device_commit", &params, now())?;
+        let finished = enrollment::finish_account_device_change(
+            &prepared,
+            &serde_json::to_string(&receipt["committed"])?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let scope: Option<vibeface_secure::authorization::ClientScope> =
+            serde_json::from_str(&finished.scope_json().map_err(anyhow::Error::msg)?)?;
+        assert_eq!(
+            scope.as_ref().map(|scope| &scope.device_id),
+            Some(&DeviceId::from_key(&PublicKey::of(&flow.device)))
+        );
+        let completed = flow.call(
+            &flow.device.public_key_hex(),
+            "enrollment_status",
+            &flow.reference(),
+            now(),
+        )?;
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["completion"], receipt);
+        let key = flow.device.public_key_hex();
+        let authenticated = flow.store.authenticate_account(
+            &key,
+            &json!({"account_id":flow.network.account,
+            "space_id":flow.network.space,"device_public_key":key}),
+            now(),
+        )?;
+        assert_eq!(
+            authenticated["scope"]["device_id"],
+            json!(DeviceId::from_key(&PublicKey::of(&flow.device)))
+        );
+        flow = flow.restart()?;
+        let before = flow.snapshot()?;
+        assert_eq!(
+            flow.call(&manager, "account_device_commit", &params, now() + 120_001)?,
+            receipt
+        );
+        assert!(
+            flow.call(&key, "account_device_commit", &params, now())
+                .is_err()
+        );
+        assert_eq!(flow.snapshot()?, before);
+        flow.network.revoke_client(&mut flow.store)?;
+        let before = flow.snapshot()?;
+        assert_eq!(
+            flow.call(&manager, "account_device_commit", &params, now())?,
+            receipt
+        );
+        assert_eq!(flow.snapshot()?, before);
+        Ok(())
+    }
+}
