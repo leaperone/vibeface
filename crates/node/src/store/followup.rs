@@ -476,7 +476,7 @@ pub(super) fn validate_followup_result_from(
         policy.mode != FollowupMode::Off && policy.target_node == scheduler,
         "follow-up is disabled or belongs to another scheduler"
     );
-    let mut matches = 0;
+    let mut original = None;
     for hash in closure_hashes(&events, &[trigger.into()]) {
         let Some(dispatch) = events.get(&hash) else {
             continue;
@@ -539,12 +539,16 @@ pub(super) fn validate_followup_result_from(
             |row| row.get(0),
         )?;
         crate::binding::verify_binding(binding, &key)?;
-        matches += 1;
+        if let Some(original) = &original {
+            ensure!(
+                original == &request,
+                "execution result has conflicting dispatch bodies"
+            );
+        } else {
+            original = Some(request);
+        }
     }
-    ensure!(
-        matches == 1,
-        "execution result dispatch is missing or ambiguous"
-    );
+    ensure!(original.is_some(), "execution result dispatch is missing");
     Ok(policy)
 }
 
@@ -1122,6 +1126,51 @@ mod tests {
             5,
         )?;
         assert!(store.followup_policy(&network, "chat", "task").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn identical_dispatch_retries_preserve_followup_but_changed_bodies_are_rejected() -> Result<()>
+    {
+        let (mut store, identity, network, node) = fixture()?;
+        store.create_task_with_origin(&identity, &network, "chat", task_body("task"), None, 2)?;
+        store.set_task_followup(
+            &identity,
+            &network,
+            "chat",
+            "task",
+            FollowupMode::Report,
+            0,
+            Some(&node),
+            3,
+        )?;
+        let completion = result(&mut store, &identity, &network, &node, "task")?;
+        let result_body = store.verify_event(&network, &completion)?.body;
+        let mut dispatch = store.context(&network, "chat", &[])?.events.into_iter()
+            .find_map(|event| matches!(&event.body, EventBody::DispatchRecorded { operation_id, .. } if operation_id == "send").then_some(event.body))
+            .context("dispatch missing")?;
+        store.append_event(&identity, &network, "chat", dispatch.clone(), vec![], 6)?;
+        let repeated =
+            store.append_event(&identity, &network, "chat", result_body.clone(), vec![], 7)?;
+        assert_eq!(
+            store
+                .validate_followup_result(&network, "chat", &repeated.hash, &node)?
+                .mode,
+            FollowupMode::Report
+        );
+        if let EventBody::DispatchRecorded { action, .. } = &mut dispatch {
+            action["action"]["text"] = json!("changed request");
+        }
+        store.append_event(&identity, &network, "chat", dispatch, vec![], 8)?;
+        let conflicting =
+            store.append_event(&identity, &network, "chat", result_body, vec![], 9)?;
+        assert!(
+            store
+                .validate_followup_result(&network, "chat", &conflicting.hash, &node)
+                .unwrap_err()
+                .to_string()
+                .contains("conflicting dispatch bodies")
+        );
         Ok(())
     }
 
