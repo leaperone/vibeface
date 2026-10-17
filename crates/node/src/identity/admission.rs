@@ -67,7 +67,21 @@ fn consume_challenge_in(
     );
     check_policy_heads_in(tx, state, auth, now_ms)?;
     let freshness = state.verify_freshness(auth, &proof.challenge, &proof.receipts, now_ms)?;
-    let stored: (String, String, String, u64, bool) = tx.query_row(
+    check_challenge_record(tx, auth, proof, false)?;
+    ensure!(tx.execute(
+        "UPDATE authorization_challenges SET consumed=1 WHERE space_id=? AND nonce=? AND consumed=0",
+        params![auth.resource().space.as_str(), proof.challenge.nonce.as_str()],
+    )? == 1, "freshness challenge was already consumed");
+    Ok(freshness.expires_at_ms().min(auth.expires_at_ms()))
+}
+
+fn check_challenge_record(
+    connection: &Connection,
+    auth: &VerifiedAuthorization,
+    proof: &FreshnessProof,
+    consumed: bool,
+) -> Result<()> {
+    let stored: (String, String, String, u64, bool) = connection.query_row(
         "SELECT invocation_hash,stage,challenge,expires_at_ms,consumed FROM authorization_challenges WHERE space_id=? AND nonce=?",
         params![auth.resource().space.as_str(), proof.challenge.nonce.as_str()],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
@@ -75,21 +89,17 @@ fn consume_challenge_in(
     ensure!(
         stored.0 == auth.invocation_hash().as_str()
             && stored.1
-                == serde_json::to_value(stage)?
+                == serde_json::to_value(proof.challenge.stage)?
                     .as_str()
                     .context("invalid freshness stage")?
             && serde_json::from_str::<vibeface_secure::authorization::FreshnessChallenge>(
                 &stored.2
             )? == proof.challenge
             && stored.3 == proof.challenge.expires_at_ms
-            && !stored.4,
+            && stored.4 == consumed,
         "freshness challenge is consumed or does not match persisted proof"
     );
-    ensure!(tx.execute(
-        "UPDATE authorization_challenges SET consumed=1 WHERE space_id=? AND nonce=? AND consumed=0",
-        params![auth.resource().space.as_str(), proof.challenge.nonce.as_str()],
-    )? == 1, "freshness challenge was already consumed");
-    Ok(freshness.expires_at_ms().min(auth.expires_at_ms()))
+    Ok(())
 }
 
 fn source_matches(auth: &VerifiedAuthorization, source_body: &Value) -> Result<()> {
@@ -544,24 +554,31 @@ fn lease_deadline_from(
         lease.deadline == freshness.expires_at_ms().min(auth.expires_at_ms()),
         "persisted lease deadline differs from verified receipts"
     );
-    let (invocation_hash, stage, challenge, expires_at_ms, consumed): (String, String, String, u64, bool) = connection.query_row(
-        "SELECT invocation_hash,stage,challenge,expires_at_ms,consumed FROM authorization_challenges WHERE space_id=? AND nonce=?",
-        params![space, lease.proof.challenge.nonce.as_str()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-    )?;
-    ensure!(
-        invocation_hash == auth.invocation_hash().as_str()
-            && serde_json::from_str::<vibeface_secure::authorization::FreshnessChallenge>(
-                &challenge
-            )? == lease.proof.challenge
-            && serde_json::to_value(lease.proof.challenge.stage)?.as_str() == Some(stage.as_str())
-            && expires_at_ms == lease.proof.challenge.expires_at_ms
-            && consumed,
-        "persisted execution lease does not match consumed challenge"
-    );
+    check_challenge_record(connection, &auth, &lease.proof, true)?;
     Ok(lease.deadline)
 }
 
 impl Store {
+    pub fn authorize_read(
+        &self,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        now_ms: u64,
+    ) -> Result<()> {
+        ensure!(
+            proof.challenge.stage == CheckStage::RemoteRead && auth.action().is_read(),
+            "read requires remote-read freshness"
+        );
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        check_policy_heads_in(&tx, self.policy.verified(), auth, now_ms)?;
+        self.policy
+            .verified()
+            .verify_freshness(auth, &proof.challenge, &proof.receipts, now_ms)?;
+        check_challenge_record(&tx, auth, proof, false)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn accept_authorized_operation(
         &mut self,
         identity: &LocalIdentity,
@@ -1047,7 +1064,7 @@ pub(crate) mod tests {
                         owner_space: space.clone(),
                         scope: ResourceScope::Exact(resource.clone()),
                         grantee: Grantee::Actor(Actor::Account(account.clone())),
-                        actions: vec![Action::ConversationCreate],
+                        actions: vec![Action::ConversationRead, Action::ConversationCreate],
                         audience: audience.clone(),
                         constraints: GrantConstraints::default(),
                         parent: None,
@@ -1507,6 +1524,89 @@ pub(crate) mod tests {
             lease_deadline_from(&fixture.connection, &fixture.policy, space, "operation_1")
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_reads_reuse_exact_proof_without_consuming_write_nonces() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let body = json!({"method":"conversations","space_id":fixture.auth.resource().space,
+            "resource_id":fixture.auth.resource().resource,"authorization_id":"read_1"});
+        let facts = request_facts_from(
+            &fixture.connection,
+            &fixture.state,
+            &body,
+            fixture.auth.audience(),
+        )?;
+        let mut invocation = fixture.auth.signed_invocation().payload.clone();
+        invocation.action = facts.action;
+        invocation.context = facts.context.clone();
+        invocation.operation_id = facts.operation_id.clone();
+        invocation.body_hash = facts.body_hash.clone();
+        invocation.nonce = Nonce::random()?;
+        let user = Identity::from_secret_hex(&hex::encode([4; 32])).map_err(anyhow::Error::msg)?;
+        let auth = fixture.state.verify_invocation(
+            &Signed::sign(invocation, &user)?,
+            &facts,
+            &fixture.transport,
+            NOW,
+        )?;
+        let challenge = FreshnessChallenge::new(
+            &auth,
+            CheckStage::RemoteRead,
+            Nonce::random()?,
+            NOW,
+            NOW + 60_000,
+        )?;
+        let receipts = auth
+            .dependencies()
+            .iter()
+            .map(|current| {
+                Ok(Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: current.clone(),
+                        challenge_hash: challenge.hash()?,
+                        issued_at_ms: NOW,
+                        expires_at_ms: NOW + 60_000,
+                    },
+                    &fixture.authority,
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        fixture.connection.execute("INSERT INTO authorization_challenges(space_id,nonce,invocation_hash,stage,challenge,expires_at_ms) VALUES(?,?,?,'remote_read',?,?)",
+            params![auth.resource().space.as_str(), challenge.nonce.as_str(), auth.invocation_hash().as_str(), serde_json::to_string(&challenge)?, challenge.expires_at_ms])?;
+        let proof = FreshnessProof {
+            challenge,
+            receipts,
+        };
+        let store = Store {
+            connection: fixture.connection,
+            policy: fixture.policy,
+        };
+        store.authorize_read(&auth, &proof, NOW)?;
+        store.authorize_read(&auth, &proof, NOW + 1)?;
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM authorization_nonces", [], |row| row
+                    .get::<_, u64>(
+                    0
+                ))?,
+            0
+        );
+        assert!(!store.connection.query_row(
+            "SELECT consumed FROM authorization_challenges",
+            [],
+            |row| row.get::<_, bool>(0)
+        )?);
+        let mut wrong_stage = proof.clone();
+        wrong_stage.challenge.stage = CheckStage::Admit;
+        assert!(store.authorize_read(&auth, &wrong_stage, NOW).is_err());
+        store
+            .connection
+            .execute("UPDATE current_policy_heads SET sequence=sequence+1", [])?;
+        assert!(store.authorize_read(&auth, &proof, NOW + 1).is_err());
         Ok(())
     }
 }
