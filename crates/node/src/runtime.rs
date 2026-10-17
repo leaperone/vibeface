@@ -55,15 +55,11 @@ impl Access {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    fn test_owner(node: &Runtime) -> Result<LocalIdentity> {
-        Ok(LocalIdentity {
-            secret_key_hex: crypto::digest(
-                format!("runtime-test-root:{}", node.identity.node_id()?).as_bytes(),
-            ),
-        })
-    }
+    use crate::identity::test_support::TestNetwork;
+    use vibeface_secure::authorization::{ResourceId, SessionRef};
+
     fn fixture() -> Result<PathBuf> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
@@ -75,82 +71,240 @@ mod tests {
         )?;
         let mut cfg = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         cfg.codex_socket = Some(dir.join("unavailable.sock"));
+        cfg.claude_bin = dir.join("missing-claude");
         cfg.save(&dir)?;
         config::private_write(
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
         )?;
-        drop(Store::open(dir.join("node.sqlite3"))?);
+        drop(Store::initialize(&dir.join("node.sqlite3"))?);
         Ok(dir)
     }
-    async fn conversation(node: &Runtime) -> Result<String> {
-        let owner = test_owner(node)?;
-        let state = owner.sign_network_fixture(
-            1,
-            vec![node.identity.certificate(node.config.roles.clone())?],
+
+    pub(crate) async fn runtime_fixture() -> Result<(TestNetwork, Arc<Runtime>)> {
+        let network = TestNetwork::new()?;
+        let dir = &network.directory;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &serde_json::to_vec(&config::data_format())?,
         )?;
-        let view = node.install_membership(state).await?;
-        node.append(
-            &view.network_id,
-            "chat",
-            EventBody::ConversationCreated {
-                title: "test".into(),
-            },
-        )
-        .await?;
-        Ok(view.network_id)
+        let mut cfg = Config::local(
+            "127.0.0.1:4790".parse()?,
+            vec![network.project.clone()],
+            false,
+        );
+        cfg.codex_socket = Some(dir.join("unavailable.sock"));
+        cfg.claude_bin = dir.join("missing-claude");
+        cfg.codex_bin = dir.join("missing-codex");
+        cfg.save(dir)?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&network.node)?,
+        )?;
+        let mut store = network.at(&dir.join("node.sqlite3"))?;
+        network.conversation(&mut store, "conversation")?;
+        drop(store);
+        let node = Arc::new(Runtime::open(dir).await?);
+        Ok((network, node))
     }
+
+    async fn access(network: &TestNetwork, node: &Runtime, body: &Value) -> Result<Access> {
+        let now = now_ms() as u64;
+        let mut store = node.store.lock().await;
+        let (authorization, transport) = network.authorization(&store, body, now)?;
+        let stage = if body["method"] != "operate" && authorization.action().is_read() {
+            CheckStage::RemoteRead
+        } else {
+            CheckStage::Admit
+        };
+        let freshness = network.freshness(&mut store, &authorization, stage, now)?;
+        Ok(Access {
+            network_id: network.space.to_string(),
+            conversation_id: body["conversation_id"].as_str().map(str::to_owned),
+            authorization,
+            freshness,
+            transport,
+            body: body.clone(),
+        })
+    }
+
+    async fn rpc(network: &TestNetwork, node: &Arc<Runtime>, body: Value) -> Result<Value> {
+        node.rpc(access(network, node, &body).await?, body).await
+    }
+
+    async fn task(
+        network: &TestNetwork,
+        node: &Arc<Runtime>,
+        name: &str,
+        auto: bool,
+    ) -> Result<Value> {
+        let mut body = network.body("create_task", "conversation");
+        body["task_id"] = json!(name);
+        body["title"] = json!(name);
+        body["goal"] = json!("complete the requested work");
+        body["acceptance"] = json!("the user verifies the result");
+        body["auto_followup"] = json!(auto);
+        rpc(network, node, body).await
+    }
+
+    async fn change_task(
+        network: &TestNetwork,
+        node: &Arc<Runtime>,
+        name: &str,
+        state: &str,
+    ) -> Result<()> {
+        let mut body = network.body("update_task", "conversation");
+        body["task_id"] = json!(name);
+        body["task_ref"] = json!(
+            node.store
+                .lock()
+                .await
+                .task_creation(network.space.as_str(), "conversation", name)?
+                .hash
+        );
+        body["status"] = json!(state);
+        body["detail"] = json!("the user changed this task");
+        rpc(network, node, body).await?;
+        Ok(())
+    }
+
     async fn queued(
-        node: &Runtime,
-        network: &str,
-        operation: &str,
-        action: Value,
+        network: &TestNetwork,
+        node: &Arc<Runtime>,
+        name: &str,
+        executor: &str,
     ) -> Result<OperationRequest> {
-        let local = node.identity.node_id()?;
+        task(network, node, name, false).await?;
+        let creation =
+            node.store
+                .lock()
+                .await
+                .task_creation(network.space.as_str(), "conversation", name)?;
+        let mut bind = network.body("bind_execution", "conversation");
+        bind["task_id"] = json!(name);
+        bind["task_ref"] = json!(creation.hash);
+        bind["target_node"] = json!(node.identity.node_id()?);
+        bind["session_id"] = json!(name);
+        bind["executor"] = json!(executor);
+        bind["cwd"] = json!(network.project);
+        let binding = serde_json::from_value(rpc(network, node, bind).await?["binding"].clone())?;
         let mut store = node.store.lock().await;
         store.upsert_session(
-            network,
+            network.space.as_str(),
             &ExecutionSession {
-                network_id: network.into(),
-                target_node: local.clone(),
-                session_id: operation.into(),
+                network_id: network.space.to_string(),
+                target_node: node.identity.node_id()?,
+                session_id: name.into(),
                 revision: 0,
                 state: "idle".into(),
-                executor: "claude_code".into(),
-                cwd: node.config.roots[0].to_string_lossy().into_owned(),
+                executor: executor.into(),
+                cwd: network.project.to_string_lossy().into_owned(),
                 native_session_id: Some("native-test".into()),
             },
         )?;
-        let mut request = OperationRequest {
-            operation_id: operation.into(),
-            network_id: network.into(),
-            conversation_id: "chat".into(),
-            task_id: None,
-            target_node: local,
-            session_id: operation.into(),
+        let request = OperationRequest {
+            operation_id: name.into(),
+            network_id: network.space.to_string(),
+            conversation_id: "conversation".into(),
+            task_id: Some(name.into()),
+            target_node: node.identity.node_id()?,
+            session_id: name.into(),
             expected_revision: 0,
-            basis_heads: store.heads(network, "chat")?,
-            action,
-            resources: vec![node.config.roots[0].to_string_lossy().into_owned()],
-            binding: None,
+            basis_heads: store.heads(network.space.as_str(), "conversation")?,
+            action: json!({"type":"send","text":"test"}),
+            resources: vec![network.project.to_string_lossy().into_owned()],
+            binding: Some(binding),
         };
-        store.bind_test_operation(&node.identity, &mut request)?;
-        store.accept_operation(network, &request)?;
+        drop(store);
+        admit(network, node, &request).await?;
         Ok(request)
     }
-    async fn task(node: &Arc<Runtime>, network: &str, task_id: &str, auto: bool) -> Result<()> {
-        node.rpc(
-            Access {
-                network_id: network.into(),
-                human: true,
-                conversation_id: None,
-            },
-            json!({"method":"create_task","conversation_id":"chat","task_id":task_id,
-                "title":"test","goal":"test","acceptance":"user verifies","auto_followup":auto}),
+
+    async fn admit(
+        network: &TestNetwork,
+        node: &Runtime,
+        request: &OperationRequest,
+    ) -> Result<OperationRecord> {
+        let mut body = network.body("operate", "conversation");
+        body["authorization_id"] = json!(request.operation_id);
+        body["request"] = json!(request);
+        let access = access(network, node, &body).await?;
+        node.store.lock().await.accept_authorized_operation(
+            &node.identity,
+            &access.authorization,
+            &access.freshness,
+            &access.transport,
+            &body,
+            request,
+            now_ms() as u64,
         )
-        .await?;
+    }
+
+    async fn claim(
+        network: &TestNetwork,
+        node: &Runtime,
+        request: &OperationRequest,
+    ) -> Result<()> {
+        let now = now_ms() as u64;
+        let mut store = node.store.lock().await;
+        let auth =
+            store.operation_authorization(network.space.as_str(), &request.operation_id, now)?;
+        let proof = network.freshness(&mut store, &auth, CheckStage::Start, now)?;
+        store.claim_authorized_operation(
+            network.space.as_str(),
+            &request.operation_id,
+            &proof,
+            now,
+        )?;
         Ok(())
     }
+
+    async fn operation(network: &TestNetwork, node: &Runtime, id: &str) -> Result<OperationRecord> {
+        node.store
+            .lock()
+            .await
+            .operation(network.space.as_str(), id)?
+            .context("operation is missing")
+    }
+
+    async fn agent(network: &TestNetwork, node: &Arc<Runtime>) -> Result<AgentSession> {
+        let trigger = network.message(
+            &mut *node.store.lock().await,
+            "conversation",
+            "manage these tasks",
+        )?;
+        let audience = node.audience()?;
+        let session = SessionRef {
+            target: audience.device,
+            session_id: trigger.hash.clone(),
+        };
+        let descriptor = node.store.lock().await.agent_grant(
+            network.space.as_str(),
+            "conversation",
+            &audience.service,
+            &session,
+            &trigger.hash,
+            now_ms() as u64,
+        )?;
+        node.claim_manager(
+            &descriptor,
+            &trigger.hash,
+            "runtime-tests",
+            &crypto::digest(b"runtime manager configuration"),
+        )
+        .await?;
+        Ok(descriptor)
+    }
+
+    fn derived_result(
+        space: &str,
+        resource: &ResourceId,
+        request: &OperationRequest,
+        turn: &str,
+    ) -> Value {
+        json!({"execution_context":{"space_id":space,"resource_id":resource,"operation_id":request.operation_id,"container_id":null},"event":{"method":"turn/completed","params":{"threadId":"native-test","turn":{"id":turn,"status":"completed"}}}})
+    }
+
     #[tokio::test]
     async fn unsupported_epoch_does_not_open_databases_or_modify_the_directory() -> Result<()> {
         let dir = fixture()?;
@@ -195,698 +349,349 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn membership_reopen_uses_one_store_without_root_secrets() -> Result<()> {
-        let dir = fixture()?;
-        let node = Runtime::open(&dir).await?;
-        assert!(!node.has_membership().await?);
-        let owner = test_owner(&node)?;
-        let initial = owner.sign_network_fixture(
-            1,
-            vec![node.identity.certificate(node.config.roles.clone())?],
-        )?;
-        node.store.lock().await.init_network(initial.clone())?;
-        drop(node);
-        let node = Runtime::open(&dir).await?;
-        assert_eq!(node.membership_state().await?, initial);
-        assert!(node.has_membership().await?);
-        let updated = owner.sign_network_fixture(
-            2,
-            vec![
-                node.identity
-                    .certificate(vec![NodeRole::Gateway, NodeRole::Replica])?,
-            ],
-        )?;
-        node.store
+    async fn policy_reopen_uses_one_store_without_root_secrets() -> Result<()> {
+        let (network, node) = runtime_fixture().await?;
+        let heads = node
+            .store
             .lock()
             .await
-            .install_trust_bundle(&owner.fixture_network_id()?, &updated)?;
+            .authorization_state()
+            .head(&PolicyDomain::Space(network.space.clone()))
+            .cloned();
+        assert!(node.has_membership().await?);
         drop(node);
-        let node = Runtime::open(&dir).await?;
-        assert_eq!(node.membership_state().await?, updated);
-        assert_eq!(node.store.lock().await.public_state()?, updated);
-        assert!(!dir.join("auth.sqlite3").exists());
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
+        let node = Runtime::open(&network.directory).await?;
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .authorization_state()
+                .head(&PolicyDomain::Space(network.space.clone()))
+                .cloned(),
+            heads
+        );
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .messages(network.space.as_str(), "conversation")?
+                .len(),
+            0
+        );
+        assert!(!network.directory.join("auth.sqlite3").exists());
+        assert!(!network.directory.join("identity.sqlite3").exists());
+        for entry in std::fs::read_dir(&network.directory)? {
+            assert!(!entry?.file_name().to_string_lossy().contains("root"));
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn executor_followup_only_accepts_its_authorized_dispatched_result() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        task(&node, &network, "task", true).await?;
-        task(&node, &network, "unapproved", false).await?;
-        let executor = LocalIdentity::generate();
-        let origin = executor.node_id()?;
-        let owner = test_owner(&node)?;
-        let mut store = node.store.lock().await;
-        let mut nodes = store
-            .trust_bundle(&network)?
-            .unwrap()
-            .project()?
-            .members
-            .into_iter()
-            .filter(|member| member.kind == IdentityKind::Node)
-            .map(|member| member.certificate())
-            .collect::<Result<Vec<_>>>()?;
-        nodes.push(executor.certificate(vec![NodeRole::Replica, NodeRole::Executor])?);
-        store.install_trust_bundle(&network, &owner.sign_network_fixture(2, nodes)?)?;
-        let request = OperationRequest {
-            operation_id: "operation".into(),
-            network_id: network.clone(),
-            conversation_id: "chat".into(),
-            task_id: Some("task".into()),
-            target_node: origin.clone(),
-            session_id: "session".into(),
-            expected_revision: 0,
-            basis_heads: store.heads(&network, "chat")?,
-            action: json!({"type":"send","text":"test"}),
-            resources: vec![],
-            binding: None,
-        };
-        store.append_event(
-            &node.identity,
-            &network,
-            "chat",
-            EventBody::DispatchRecorded {
-                operation_id: request.operation_id.clone(),
-                task_id: request.task_id.clone(),
-                target_node: origin.clone(),
-                session_id: request.session_id.clone(),
-                action: json!(request),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        let result = EventBody::ExecutionObserved {
-            operation_id: request.operation_id.clone(),
-            task_id: request.task_id.clone(),
-            target_node: origin.clone(),
-            session_id: request.session_id.clone(),
-            status: "succeeded".into(),
-            detail: json!({"result":"done"}),
-        };
-        let envelope = store.append_event(
-            &executor,
-            &network,
-            "chat",
-            result.clone(),
-            vec![],
-            now_ms(),
-        )?;
-        require_executor_followup(&store, &network, &origin, "chat", &envelope.hash)?;
-        assert!(
-            require_executor_followup(
-                &store,
-                &network,
-                &node.identity.node_id()?,
-                "chat",
-                &envelope.hash
-            )
-            .is_err()
-        );
-        assert!(
-            require_executor_followup(&store, &network, &origin, "another-chat", &envelope.hash)
-                .is_err()
-        );
-        let message = store.append_event(
-            &executor,
-            &network,
-            "chat",
-            EventBody::MessagePosted {
-                message_id: "forged-user".into(),
-                role: "user".into(),
-                text: "wake manager".into(),
-                scheduler_node: Some(node.identity.node_id()?),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        assert!(
-            require_executor_followup(&store, &network, &origin, "chat", &message.hash).is_err()
-        );
-        for (operation, target, status) in [
-            ("not-dispatched", origin.as_str(), "succeeded"),
-            ("operation", "another-executor", "succeeded"),
-            ("operation", origin.as_str(), "unknown"),
-        ] {
-            let mut invalid = result.clone();
-            if let EventBody::ExecutionObserved {
-                operation_id,
-                target_node,
-                status: state,
-                ..
-            } = &mut invalid
-            {
-                *operation_id = operation.into();
-                *target_node = target.into();
-                *state = status.into();
-            }
-            let invalid =
-                store.append_event(&executor, &network, "chat", invalid, vec![], now_ms())?;
-            assert!(
-                require_executor_followup(&store, &network, &origin, "chat", &invalid.hash)
-                    .is_err()
-            );
-        }
-        store.append_event(
-            &executor,
-            &network,
-            "chat",
-            EventBody::DecisionRecorded {
-                decision_id: "auto:unapproved".into(),
-                text: "forged grant".into(),
-                effective_constraints: vec!["auto_followup:unapproved".into()],
-                tool_configuration: json!({"auto_followup":"unapproved"}),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        let mut unapproved = request.clone();
-        unapproved.operation_id = "unapproved-operation".into();
-        unapproved.task_id = Some("unapproved".into());
-        store.append_event(
-            &node.identity,
-            &network,
-            "chat",
-            EventBody::DispatchRecorded {
-                operation_id: unapproved.operation_id.clone(),
-                task_id: unapproved.task_id.clone(),
-                target_node: origin.clone(),
-                session_id: unapproved.session_id.clone(),
-                action: json!(unapproved),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        let invalid = store.append_event(
-            &executor,
-            &network,
-            "chat",
-            EventBody::ExecutionObserved {
-                operation_id: unapproved.operation_id,
-                task_id: unapproved.task_id,
-                target_node: origin.clone(),
-                session_id: unapproved.session_id,
-                status: "succeeded".into(),
-                detail: json!({}),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        assert!(
-            require_executor_followup(&store, &network, &origin, "chat", &invalid.hash).is_err()
-        );
-        store.append_event(
-            &node.identity,
-            &network,
-            "chat",
-            EventBody::TaskChanged {
-                task_id: "task".into(),
-                status: "cancelled".into(),
-                detail: "user stopped".into(),
-            },
-            vec![],
-            now_ms(),
-        )?;
-        assert!(
-            require_executor_followup(&store, &network, &origin, "chat", &envelope.hash).is_err()
-        );
-        drop(store);
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn unstarted_followup_survives_reopen_and_claimed_attempt_is_not_repeated() -> Result<()>
-    {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        task(&node, &network, "task", true).await?;
-        let mut request = queued(
-            &node,
-            &network,
-            "seed",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
-        {
-            let mut store = node.store.lock().await;
-            store.claim_operation(&network, "seed")?;
-            store.finish_operation(&network, "seed", OperationState::Failed, json!({}))?;
-            request.operation_id = "followup".into();
-            request.task_id = Some("task".into());
-            request.expected_revision = store
-                .session(&network, &request.target_node, &request.session_id)?
-                .unwrap()
-                .revision;
-            request.basis_heads = store.heads(&network, "chat")?;
-            store.bind_test_operation(&node.identity, &mut request)?;
-            store.accept_operation(&network, &request)?;
-            store.claim_operation(&network, &request.operation_id)?;
-        }
+        let (network, node) = runtime_fixture().await?;
+        let request = queued(&network, &node, "work", "codex").await?;
+        task(&network, &node, "work", true).await?;
+        claim(&network, &node, &request).await?;
         node.finish(
             &request,
             OperationState::Succeeded,
             json!({"result":"done"}),
         )
         .await?;
-        node.flush_completions(&network).await?;
-        let result_hash = {
-            let store = node.store.lock().await;
-            assert!(
-                store
-                    .local_value(&network, "completion:followup")?
-                    .is_some()
-            );
-            assert_eq!(
-                store
-                    .pending_notifications(&network, "client")?
-                    .iter()
-                    .filter(|n| n.kind == "followup_waiting")
-                    .count(),
-                1
-            );
-            store.context(&network, "chat", &[])?.events.into_iter().find_map(|event| {
-                matches!(&event.body, EventBody::ExecutionObserved { operation_id, status, .. } if operation_id == "followup" && status == "succeeded")
-                    .then(|| crypto::digest(&serde_json::to_vec(&event).unwrap()))
-            }).unwrap()
-        };
-        // A durable execution result can migrate while its automatic follow-up is waiting for an Agent.
-        node.store
-            .lock()
-            .await
-            .seal_binding(&node.identity, request.binding.as_ref().unwrap())?;
+        let mut store = node.store.lock().await;
+        let result=store.context(network.space.as_str(),"conversation",&[])?.events.into_iter().find(|event|matches!(&event.body,EventBody::ExecutionObserved{status,..} if status=="succeeded")).context("result missing")?;
+        let hash = crypto::digest(&serde_json::to_vec(&result)?);
+        require_executor_followup(
+            &store,
+            network.space.as_str(),
+            &node.identity.node_id()?,
+            "conversation",
+            &hash,
+        )?;
+        assert!(
+            require_executor_followup(
+                &store,
+                network.space.as_str(),
+                "other-node",
+                "conversation",
+                &hash
+            )
+            .is_err()
+        );
+        assert!(
+            require_executor_followup(
+                &store,
+                network.space.as_str(),
+                &node.identity.node_id()?,
+                "other-conversation",
+                &hash
+            )
+            .is_err()
+        );
+        let message = network.message(
+            &mut store,
+            "conversation",
+            "a user message is not an execution result",
+        )?;
+        assert!(
+            require_executor_followup(
+                &store,
+                network.space.as_str(),
+                &node.identity.node_id()?,
+                "conversation",
+                &message.hash
+            )
+            .is_err()
+        );
+        let mut forged = store.event(network.space.as_str(), &hash)?.unwrap();
+        forged.canonical_body = forged.canonical_body.replace("succeeded", "unknown");
+        assert!(store.ingest_event(network.space.as_str(), &forged).is_err());
+        drop(store);
+        change_task(&network, &node, "work", "cancelled").await?;
+        assert!(
+            require_executor_followup(
+                &*node.store.lock().await,
+                network.space.as_str(),
+                &node.identity.node_id()?,
+                "conversation",
+                &hash
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unstarted_followup_survives_reopen_and_claimed_attempt_is_not_repeated() -> Result<()>
+    {
+        let (network, node) = runtime_fixture().await?;
+        let request = queued(&network, &node, "followup", "codex").await?;
+        task(&network, &node, "followup", true).await?;
+        claim(&network, &node, &request).await?;
+        node.finish(
+            &request,
+            OperationState::Succeeded,
+            json!({"result":"done"}),
+        )
+        .await?;
+        let result=node.store.lock().await.context(network.space.as_str(),"conversation",&[])?.events.into_iter().find(|event|matches!(&event.body,EventBody::ExecutionObserved{status,..} if status=="succeeded")).unwrap();
+        let hash = crypto::digest(&serde_json::to_vec(&result)?);
+        assert!(
+            node.store
+                .lock()
+                .await
+                .local_value(network.space.as_str(), "completion:followup")?
+                .is_some()
+        );
         drop(node);
-        let mut config = Config::load(&dir)?;
-        config.manager = Some(config::ManagerSettings {
-            provider: "cursor_sdk".into(),
-            workspace: dir.clone(),
-            model: "auto".into(),
-            cursor_sdk_bin: dir.join("must-not-spawn"),
-            node_bin: "node".into(),
-            codex_sdk_script: dir.join("must-not-run.mjs"),
+        let mut cfg = Config::load(&network.directory)?;
+        cfg.manager = Some(config::ManagerSettings {
+            provider: "codex_sdk".into(),
+            model: "unused".into(),
         });
-        config.save(&dir)?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        node.flush_completions(&network).await?;
+        cfg.save(&network.directory)?;
+        let node = Arc::new(Runtime::open(&network.directory).await?);
+        node.flush_completions(network.space.as_str()).await?;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if node
                     .store
                     .lock()
                     .await
-                    .continuation(&network, &result_hash, "v1")
+                    .continuation(network.space.as_str(), &hash, "v2")
                     .unwrap()
-                    .is_some_and(|claim| claim.state == "unknown")
+                    .is_some_and(|record| record.state != "claimed")
                 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await?;
-        let status = crate::scheduler::status(&node, &network, "chat", &result_hash).await?;
-        assert_eq!(status["state"], "failed");
+        let first = node
+            .store
+            .lock()
+            .await
+            .continuation(network.space.as_str(), &hash, "v2")?
+            .context("followup claim missing")?;
+        node.flush_completions(network.space.as_str()).await?;
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .continuation(network.space.as_str(), &hash, "v2")?
+                .unwrap(),
+            first
+        );
         assert!(
             node.store
                 .lock()
                 .await
-                .local_value(&network, "completion:followup")?
+                .local_value(network.space.as_str(), "completion:followup")?
                 .is_none()
         );
-        let claim = node
-            .store
-            .lock()
-            .await
-            .continuation(&network, &result_hash, "v1")?
-            .unwrap();
-        assert_eq!(claim.state, "unknown");
-        node.flush_completions(&network).await?;
+        assert!(node._codex_process.lock().await.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_cannot_reopen_or_start_new_work_for_a_user_finalized_task() -> Result<()> {
+        let (network, node) = runtime_fixture().await?;
+        let session = agent(&network, &node).await?;
+        let request = queued(&network, &node, "finalized", "codex").await?;
+        claim(&network, &node, &request).await?;
         node.finish(
             &request,
             OperationState::Succeeded,
             json!({"result":"done"}),
         )
         .await?;
-        assert_eq!(
-            node.store
-                .lock()
+        for state in ["accepted", "cancelled"] {
+            change_task(&network, &node, "finalized", state).await?;
+            let update =
+                json!({"task_id":"finalized","status":"working","detail":"agent tries to reopen"});
+            assert!(
+                node.tool(
+                    session.clone(),
+                    "update_task",
+                    update,
+                    &uuid::Uuid::new_v4().to_string()
+                )
                 .await
-                .continuation(&network, &result_hash, "v1")?
-                .unwrap(),
-            claim
-        );
-        assert_eq!(
-            crate::scheduler::status(&node, &network, "chat", &result_hash).await?,
-            status
-        );
-        assert_eq!(
-            node.store
-                .lock()
+                .is_err()
+            );
+            let open = json!({"task_id":"finalized","operation_id":format!("new-{state}"),"session_id":format!("new-{state}"),"target_node":node.identity.node_id()?,"executor":"codex","cwd":network.project});
+            assert!(
+                node.tool(
+                    session.clone(),
+                    "open_execution",
+                    open,
+                    &uuid::Uuid::new_v4().to_string()
+                )
                 .await
-                .pending_notifications(&network, "client")?
-                .iter()
-                .filter(|n| n.kind == "followup_waiting")
-                .count(),
-            1
-        );
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn agent_cannot_reopen_or_start_new_work_for_a_user_finalized_task() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        task(&node, &network, "task", false).await?;
-        let human = Access {
-            network_id: network.clone(),
-            human: true,
-            conversation_id: Some("chat".into()),
-        };
-        let agent = Access {
-            human: false,
-            ..human.clone()
-        };
-        for status in ["accepted", "cancelled"] {
-            node.rpc(human.clone(), json!({"method":"update_task","conversation_id":"chat","task_id":"task","status":status})).await?;
-            let update = json!({"method":"update_task","conversation_id":"chat","task_id":"task","status":"working"});
-            assert!(
-                node.rpc(agent.clone(), update.clone())
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("only the user may reopen")
-            );
-            let request = OperationRequest {
-                operation_id: format!("new-{status}"),
-                network_id: network.clone(),
-                conversation_id: "chat".into(),
-                task_id: Some("task".into()),
-                target_node: node.identity.node_id()?,
-                session_id: format!("session-{status}"),
-                expected_revision: 0,
-                basis_heads: node.store.lock().await.heads(&network, "chat")?,
-                action: json!({"type":"open","executor":"claude_code","cwd":dir}),
-                resources: vec![],
-                binding: None,
-            };
-            assert!(
-                node.dispatch(agent.clone(), request.clone())
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("only the user may reopen")
+                .is_err()
             );
             assert!(
-                node.admit_operation(request, false)
+                node.store
+                    .lock()
                     .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("only the user may reopen")
+                    .operation(network.space.as_str(), &format!("new-{state}"))?
+                    .is_none()
             );
-            node.rpc(human.clone(), update).await?;
+            change_task(&network, &node, "finalized", "working").await?;
         }
-        assert!(node.store.lock().await.operations(&network)?.is_empty());
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
+
     #[tokio::test]
     async fn agent_cannot_silently_detach_a_session_from_its_latest_admitted_task() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        task(&node, &network, "task", false).await?;
-        task(&node, &network, "next-task", false).await?;
-        let human = Access {
-            network_id: network.clone(),
-            human: true,
-            conversation_id: Some("chat".into()),
-        };
-        let mut associated = queued(
-            &node,
-            &network,
-            "seed",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
-        {
-            let mut store = node.store.lock().await;
-            store.claim_operation(&network, "seed")?;
-            store.finish_operation(&network, "seed", OperationState::Succeeded, json!({}))?;
-            associated.operation_id = "associated".into();
-            associated.task_id = Some("task".into());
-            associated.expected_revision = 1;
-            associated.binding = None;
-            store.bind_test_operation(&node.identity, &mut associated)?;
-            store.accept_operation(&network, &associated)?;
-            let mut concurrent = associated.clone();
-            concurrent.operation_id = "concurrent-untasked-steer".into();
-            concurrent.task_id = Some("task".into());
-            concurrent.action = json!({"type":"steer","turn_id":"turn","text":"test"});
-            concurrent.resources.clear();
-            store.accept_control_operation(&network, &concurrent)?;
-            for operation in [&associated, &concurrent] {
-                store.claim_operation(&network, &operation.operation_id)?;
-            }
-            for operation in [&associated, &concurrent] {
-                store.finish_operation(
-                    &network,
-                    &operation.operation_id,
-                    OperationState::Succeeded,
-                    json!({}),
-                )?;
-            }
+        let (network, node) = runtime_fixture().await?;
+        let request = queued(&network, &node, "associated", "codex").await?;
+        let session = agent(&network, &node).await?;
+        let before = operation(&network, &node, "associated").await?;
+        let mut detached = request.clone();
+        detached.operation_id = "detached".into();
+        detached.task_id = None;
+        let mut body = network.body("operate", "conversation");
+        body["authorization_id"] = json!(detached.operation_id);
+        body["request"] = json!(detached);
+        body["sdk_session"] = json!(session.sdk_session);
+        body["parent_invocation"] = json!(session.parent_invocation);
+        let result = node.authorize_agent(&session, body.clone()).await;
+        if let Ok(access) = result {
+            assert!(node.rpc(access, body).await.is_err());
         }
-        let mut request = associated.clone();
-        request.operation_id = "untasked".into();
-        request.task_id = None;
-        request.expected_revision = 2;
-        request.resources.clear();
-        for status in ["working", "accepted", "cancelled"] {
-            node.rpc(human.clone(), json!({"method":"update_task","conversation_id":"chat","task_id":"task","status":status})).await?;
-            for action in [
-                json!({"type":"steer","turn_id":"turn","text":"test"}),
-                json!({"type":"send","text":"test"}),
-                json!({"type":"open","executor":"claude_code","cwd":dir}),
-            ] {
-                request.action = action;
-                assert!(
-                    node.admit_operation(request.clone(), false)
-                        .await
-                        .unwrap_err()
-                        .to_string()
-                        .contains("task_id is required")
-                );
-            }
-        }
-        assert_eq!(
-            node.admit_operation(associated.clone(), false).await?["operation"]["state"],
-            "succeeded"
-        );
-        let mut unadmitted = request.clone();
-        unadmitted.operation_id = "unadmitted".into();
-        unadmitted.expected_revision = 99;
-        node.append(
-            &network,
-            "chat",
-            EventBody::DispatchRecorded {
-                operation_id: unadmitted.operation_id.clone(),
-                task_id: None,
-                target_node: unadmitted.target_node.clone(),
-                session_id: unadmitted.session_id.clone(),
-                action: json!(unadmitted),
-            },
-        )
-        .await?;
-        assert!(node.admit_operation(request.clone(), false).await.is_err());
-        request.action = json!({"type":"steer","turn_id":"turn","text":"test"});
-        for (operation, human, task_id) in [
-            ("retask", false, Some("next-task")),
-            ("human-detach", true, None),
-            ("agent-after-detach", false, None),
-        ] {
-            request.operation_id = operation.into();
-            request.task_id = task_id.map(String::from);
-            request.basis_heads = node.store.lock().await.heads(&network, "chat")?;
-            assert!(node.admit_operation(request.clone(), human).await.is_err());
-        }
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn peer_mutations_and_replica_reads_enforce_roles() -> Result<()> {
-        let dir = fixture()?;
-        let mut node = Arc::new(Runtime::open(&dir).await?);
-        let owner = LocalIdentity::generate();
-        let replica = LocalIdentity::generate();
-        let relay = LocalIdentity::generate();
-        let scheduler = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
-        node.install_membership(owner.sign_network_fixture(
-            1,
-            vec![
-                node.identity.certificate(node.config.roles.clone())?,
-                owner.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?,
-                replica.certificate(vec![NodeRole::Replica])?,
-                relay.certificate(vec![NodeRole::Relay])?,
-                scheduler.certificate(vec![NodeRole::Scheduler, NodeRole::Replica])?,
-            ],
-        )?)
-        .await?;
-        let event = node
-            .append(
-                &network,
-                "chat",
-                EventBody::ConversationCreated {
-                    title: "roles".into(),
-                },
-            )
-            .await?;
-        let request = queued(
-            &node,
-            &network,
-            "unknown-role-test",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
-        {
-            let mut store = node.store.lock().await;
-            store.claim_operation(&network, &request.operation_id)?;
-            store.finish_operation(
-                &network,
-                &request.operation_id,
-                OperationState::Unknown,
-                json!({}),
-            )?;
-        }
-        for (origin, human, expected) in [
-            (&scheduler, true, "origin cannot assert human authority"),
-            (&scheduler, false, "no peer route available"),
-            (&owner, true, "no peer route available"),
-        ] {
-            let message = Inbound {
-                network_id: network.clone(),
-                origin: origin.node_id()?,
-                request_id: "approval-origin-test".into(),
-                payload: json!({"type":"execute","human":human,"request":request}),
-                broadcast: false,
-            };
-            assert_eq!(
-                node.handle_peer(&message).await.unwrap_err().to_string(),
-                expected
-            );
-        }
-        let resolution = json!({"type":"resolve_unknown","target_node":node.identity.node_id()?,"operation_id":request.operation_id,"outcome":"succeeded","evidence":"verified test fixture process stopped"});
-        for origin in [&replica, &relay] {
-            let message = Inbound {
-                network_id: network.clone(),
-                origin: origin.node_id()?,
-                request_id: "role-test".into(),
-                payload: resolution.clone(),
-                broadcast: false,
-            };
-            assert_eq!(
-                node.handle_peer(&message).await.unwrap_err().to_string(),
-                "Node lacks required role"
-            );
-            let message = Inbound {
-                payload: json!({"type":"schedule"}),
-                ..message
-            };
-            assert_eq!(
-                node.handle_peer(&message).await.unwrap_err().to_string(),
-                "origin cannot schedule"
-            );
-        }
-        assert_eq!(
+        assert!(
             node.store
                 .lock()
                 .await
-                .operation(&network, &request.operation_id)?
-                .unwrap()
-                .state,
-            OperationState::Unknown
+                .operation(network.space.as_str(), "detached")?
+                .is_none()
         );
-        for origin in [&owner, &scheduler] {
+        assert_eq!(
+            operation(&network, &node, "associated").await?.request,
+            before.request
+        );
+        assert_eq!(
+            node.store.lock().await.task_binding(
+                network.space.as_str(),
+                &request.binding.as_ref().unwrap().binding.task_ref
+            )?,
+            request.binding
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_mutations_and_replica_reads_require_signed_resource_authority() -> Result<()> {
+        let (network, node) = runtime_fixture().await?;
+        let origin = node.identity.node_id()?;
+        for payload in [
+            json!({"type":"schedule","human":true}),
+            json!({"type":"execute","human":true}),
+            json!({"type":"event","hash":"x"}),
+            json!({"type":"blob","hash":"x","offset":0}),
+        ] {
             let message = Inbound {
-                network_id: network.clone(),
-                origin: origin.node_id()?,
-                request_id: "schedule-role-test".into(),
-                payload: json!({"type":"schedule"}),
+                network_id: network.space.to_string(),
+                origin: origin.clone(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                payload,
                 broadcast: false,
             };
-            assert_eq!(
-                node.handle_peer(&message).await.unwrap_err().to_string(),
-                "no peer route available"
-            );
+            assert!(node.handle_peer(&message).await.is_err());
         }
+        let body = network.body("conversations", "conversation");
+        let auth = access(&network, &node, &body).await?;
+        let mut invocation = auth.authorization.signed_invocation().payload.clone();
+        invocation.presenter = node.audience()?.device;
+        let invocation = Signed::sign(invocation, &network.client)?;
         let message = Inbound {
-            network_id: network.clone(),
-            origin: owner.node_id()?,
-            request_id: "gateway-test".into(),
-            payload: resolution,
+            network_id: network.space.to_string(),
+            origin: origin.clone(),
+            request_id: "actual-peer-read".into(),
+            payload: json!({"type":"rpc","authorization_body":body,"invocation":invocation}),
             broadcast: false,
         };
         assert_eq!(
-            node.handle_peer(&message).await?["operation"]["state"],
-            "succeeded"
+            node.handle_peer(&message).await?["conversations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
-        let message = Inbound {
-            origin: replica.node_id()?,
-            payload: json!({"type":"event","hash":event.hash}),
-            ..message
-        };
-        assert_eq!(
-            node.handle_peer(&message).await?["event"]["hash"],
-            event.hash
+        let mut changed = message.clone();
+        changed.payload["authorization_body"]["resource_id"] =
+            json!(ResourceId::from_bytes([42; 32]));
+        assert!(node.handle_peer(&changed).await.is_err());
+        assert!(
+            node.store
+                .lock()
+                .await
+                .operations(network.space.as_str())?
+                .is_empty()
         );
-        let blob = BlobRef {
-            hash: crypto::digest(b"test"),
-            size: 4,
-        };
-        node.store.lock().await.put_blob(&network, &blob, b"test")?;
-        let blob_message = Inbound {
-            payload: json!({"type":"blob","hash":blob.hash,"offset":0}),
-            ..message.clone()
-        };
-        assert_eq!(node.handle_peer(&blob_message).await?["data"], "74657374");
-        Arc::get_mut(&mut node)
-            .unwrap()
-            .config
-            .roles
-            .retain(|r| r != &NodeRole::Replica);
-        for message in [&message, &blob_message] {
-            assert_eq!(
-                node.handle_peer(message).await.unwrap_err().to_string(),
-                "node capability is disabled"
-            );
-        }
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_message_retries_record_one_trigger() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
+        let (network, node) = runtime_fixture().await?;
+        let mut body = network.body("message", "conversation");
+        body["message_id"] = json!("same-message");
+        body["text"] = json!("same goal");
+        body["scheduler_node"] = json!(node.identity.node_id()?);
+        let access = access(&network, &node, &body).await?;
         let barrier = Arc::new(tokio::sync::Barrier::new(16));
-        let mut calls = Vec::new();
+        let mut calls = vec![];
         for _ in 0..16 {
             let node = node.clone();
-            let network = network.clone();
+            let access = access.clone();
+            let body = body.clone();
             let barrier = barrier.clone();
             calls.push(tokio::spawn(async move {
                 barrier.wait().await;
-                node.rpc(Access { network_id: network, human: true, conversation_id: None },
-                    json!({"method":"message", "conversation_id":"chat", "message_id":"same-message", "text":"same goal"})).await
+                node.rpc(access, body).await
             }));
         }
         let mut triggers = BTreeSet::new();
@@ -894,352 +699,338 @@ mod tests {
             triggers.insert(call.await??["trigger"].as_str().unwrap().to_owned());
         }
         assert_eq!(triggers.len(), 1);
-        let count = node.store.lock().await.context(&network, "chat", &[])?.events.iter()
-            .filter(|event| matches!(&event.body, EventBody::MessagePosted { message_id, .. } if message_id == "same-message")).count();
-        assert_eq!(count, 1);
-        std::fs::remove_dir_all(dir)?;
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .messages(network.space.as_str(), "conversation")?
+                .iter()
+                .filter(|message| message.message_id == "same-message")
+                .count(),
+            1
+        );
         Ok(())
     }
+
     #[tokio::test]
     async fn task_retry_recovers_missing_grant_once_without_reopening() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        for (task_id, status) in [
+        let (network, node) = runtime_fixture().await?;
+        for (name, state) in [
             ("active", "open"),
             ("accepted", "accepted"),
             ("cancelled", "cancelled"),
         ] {
-            task(&node, &network, task_id, false).await?;
-            if status != "open" {
-                node.append(
-                    &network,
-                    "chat",
-                    EventBody::TaskChanged {
-                        task_id: task_id.into(),
-                        status: status.into(),
-                        detail: "user ended this task".into(),
-                    },
-                )
-                .await?;
+            task(&network, &node, name, false).await?;
+            if state != "open" {
+                change_task(&network, &node, name, state).await?;
             }
         }
         drop(node);
-        let node = Arc::new(Runtime::open(&dir).await?);
+        let node = Arc::new(Runtime::open(&network.directory).await?);
         for _ in 0..2 {
-            for task_id in ["active", "accepted", "cancelled"] {
-                task(&node, &network, task_id, true).await?;
+            for name in ["active", "accepted", "cancelled"] {
+                task(&network, &node, name, true).await?;
             }
         }
         let store = node.store.lock().await;
-        assert!(followup_authorized(&store, &network, "chat", "active")?);
-        for task_id in ["accepted", "cancelled"] {
-            assert!(!followup_authorized(&store, &network, "chat", task_id)?);
-        }
-        let grants = store.context(&network, "chat", &[])?.events.into_iter()
-            .filter(|event| matches!(&event.body, EventBody::DecisionRecorded { decision_id, .. } if decision_id.starts_with("auto:"))).count();
-        assert_eq!(grants, 1);
-        drop(store);
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
+        assert!(followup_authorized(
+            &store,
+            network.space.as_str(),
+            "conversation",
+            "active"
+        )?);
+        assert!(!followup_authorized(
+            &store,
+            network.space.as_str(),
+            "conversation",
+            "accepted"
+        )?);
+        assert!(!followup_authorized(
+            &store,
+            network.space.as_str(),
+            "conversation",
+            "cancelled"
+        )?);
+        assert_eq!(store.context(network.space.as_str(),"conversation",&[])?.events.iter().filter(|event|matches!(&event.body,EventBody::DecisionRecorded{decision_id,..} if decision_id.starts_with("auto:"))).count(),1);
+        assert_eq!(
+            store
+                .tasks(network.space.as_str(), "conversation")?
+                .iter()
+                .find(|task| task.task_id == "accepted")
+                .unwrap()
+                .status,
+            "accepted"
+        );
         Ok(())
     }
+
     #[tokio::test]
     async fn completion_receipt_recovers_history_and_notifies_once_after_reopen() -> Result<()> {
-        let dir = fixture()?;
-        let node = Runtime::open(&dir).await?;
-        let network = conversation(&node).await?;
-        let request = queued(
-            &node,
-            &network,
-            "done",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
+        let (network, node) = runtime_fixture().await?;
+        let request = queued(&network, &node, "done", "codex").await?;
+        claim(&network, &node, &request).await?;
         let result = json!({"result":"verified completion"});
         {
             let mut store = node.store.lock().await;
-            store.claim_operation(&network, "done")?;
             store.local_set(
-                &network,
+                network.space.as_str(),
                 "completion:done",
                 &json!({"state":"succeeded","result":result}),
             )?;
-            store.finish_operation(&network, "done", OperationState::Succeeded, result)?;
+            store.finish_operation(
+                network.space.as_str(),
+                "done",
+                OperationState::Succeeded,
+                result,
+            )?;
         }
         drop(node);
-        let node = Arc::new(Runtime::open(&dir).await?);
-        node.flush_completions(&network).await?;
-        node.flush_completions(&network).await?;
+        let node = Arc::new(Runtime::open(&network.directory).await?);
+        node.flush_completions(network.space.as_str()).await?;
+        node.flush_completions(network.space.as_str()).await?;
         let store = node.store.lock().await;
-        let events = store.context(&network, "chat", &[])?.events;
-        assert_eq!(events.iter().filter(|e|matches!(&e.body,EventBody::ExecutionObserved{operation_id,status,..} if operation_id==&request.operation_id && status=="succeeded")).count(),1);
-        assert_eq!(store.pending_notifications(&network, "client")?.len(), 1);
-        assert!(store.local_value(&network, "completion:done")?.is_none());
-        drop(store);
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
+        let events = store
+            .context(network.space.as_str(), "conversation", &[])?
+            .events;
+        assert_eq!(events.iter().filter(|event|matches!(&event.body,EventBody::ExecutionObserved{operation_id,status,..} if operation_id=="done" && status=="succeeded")).count(),1);
+        assert_eq!(
+            store
+                .pending_notifications(network.space.as_str(), "client")?
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .local_value(network.space.as_str(), "completion:done")?
+                .is_none()
+        );
         Ok(())
     }
+
     #[tokio::test]
     async fn failed_claude_spawn_does_not_leave_a_nonexistent_native_session() -> Result<()> {
-        let dir = fixture()?;
-        let mut cfg = Config::load(&dir)?;
-        cfg.claude_bin = dir.join("missing-claude");
-        cfg.save(&dir)?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        let request = queued(
-            &node,
-            &network,
-            "not-started",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
+        let (network, node) = runtime_fixture().await?;
+        let request = queued(&network, &node, "not-started", "claude_code").await?;
         {
             let mut store = node.store.lock().await;
             let mut session = store
-                .session(&network, &request.target_node, &request.session_id)?
+                .session(
+                    network.space.as_str(),
+                    &request.target_node,
+                    &request.session_id,
+                )?
                 .unwrap();
             session.native_session_id = None;
-            store.upsert_session(&network, &session)?;
+            store.upsert_session(network.space.as_str(), &session)?;
         }
         node.clone().execute_operation(request.clone()).await?;
-        let store = node.store.lock().await;
         assert_eq!(
-            store
-                .operation(&network, &request.operation_id)?
-                .unwrap()
+            operation(&network, &node, &request.operation_id)
+                .await?
                 .state,
             OperationState::Failed
         );
         assert!(
-            store
-                .session(&network, &request.target_node, &request.session_id)?
+            node.store
+                .lock()
+                .await
+                .session(
+                    network.space.as_str(),
+                    &request.target_node,
+                    &request.session_id
+                )?
                 .unwrap()
                 .native_session_id
                 .is_none()
         );
-        drop(store);
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
+
     #[tokio::test]
     async fn reconciliation_reports_only_the_executors_confirmed_absence() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
+        let (network, node) = runtime_fixture().await?;
         let local = node.identity.node_id()?;
-        let result = node.reconcile(&network, &local, "never-received").await?;
+        let result = node
+            .reconcile(network.space.as_str(), &local, "never-received")
+            .await?;
         assert_eq!(result["state"], "not_found");
         assert_eq!(result["target_node"], local);
         assert!(result["operation"].is_null());
-        assert!(result["checked_at_ms"].as_i64().is_some_and(|t| t > 0));
         assert!(
-            node.reconcile(&network, "offline-node", "never-received")
+            result["checked_at_ms"]
+                .as_i64()
+                .is_some_and(|value| value > 0)
+        );
+        assert!(
+            node.reconcile(network.space.as_str(), "offline-node", "never-received")
                 .await
                 .is_err()
         );
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
+        assert!(node._codex_process.lock().await.is_none());
         Ok(())
     }
+
     #[tokio::test]
     async fn retrying_an_undelivered_message_reuses_its_event_and_attempts_scheduling() -> Result<()>
     {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        let access = Access {
-            network_id: network.clone(),
-            human: true,
-            conversation_id: None,
-        };
-        let request = json!({"method":"message","conversation_id":"chat","message_id":"retry-message","text":"test","scheduler_node":"offline-node"});
-        assert!(node.rpc(access.clone(), request.clone()).await.is_err());
-        let first = node.store.lock().await.messages(&network, "chat")?;
+        let (network, mut node) = runtime_fixture().await?;
+        Arc::get_mut(&mut node)
+            .unwrap()
+            .config
+            .roles
+            .retain(|role| role != &NodeRole::Scheduler);
+        Arc::get_mut(&mut node).unwrap().config.manager = Some(config::ManagerSettings {
+            provider: "codex_sdk".into(),
+            model: "unused".into(),
+        });
+        let mut body = network.body("message", "conversation");
+        body["message_id"] = json!("retry-message");
+        body["text"] = json!("test");
+        body["scheduler_node"] = json!(node.identity.node_id()?);
+        let original = access(&network, &node, &body).await?;
+        assert!(node.rpc(original.clone(), body.clone()).await.is_err());
+        let first = node
+            .store
+            .lock()
+            .await
+            .messages(network.space.as_str(), "conversation")?;
         assert_eq!(first.len(), 1);
-        assert!(node.rpc(access, request).await.is_err());
-        let retry = node.store.lock().await.messages(&network, "chat")?;
-        assert_eq!(retry.len(), 1);
-        assert_eq!(retry[0].event_hash, first[0].event_hash);
-        let other = node.rpc(Access { network_id: network.clone(), human: true, conversation_id: None }, json!({"method":"message","conversation_id":"chat","message_id":"retry-message","text":"test","scheduler_node":"different-node"})).await.unwrap_err();
-        assert!(other.to_string().contains("original scheduler"));
-        assert_eq!(node.store.lock().await.messages(&network, "chat")?.len(), 1);
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
+        assert!(node.rpc(original, body.clone()).await.is_err());
+        let second = node
+            .store
+            .lock()
+            .await
+            .messages(network.space.as_str(), "conversation")?;
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].event_hash, first[0].event_hash);
+        body["authorization_id"] = json!("other-scheduler");
+        body["scheduler_node"] = json!("different-node");
+        assert!(rpc(&network, &node, body).await.is_err());
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .messages(network.space.as_str(), "conversation")?
+                .len(),
+            1
+        );
         Ok(())
     }
+
     #[tokio::test]
     async fn completion_requires_the_exact_persisted_turn_even_after_unknown() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        let request = queued(
-            &node,
-            &network,
-            "uncertain",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
-        {
-            let mut store = node.store.lock().await;
-            let mut session = store
-                .session(&network, &request.target_node, &request.session_id)?
-                .unwrap();
-            session.executor = "codex".into();
-            store.upsert_session(&network, &session)?;
-            store.claim_operation(&network, &request.operation_id)?;
-        }
+        let (network, node) = runtime_fixture().await?;
+        let request = queued(&network, &node, "uncertain", "codex").await?;
+        claim(&network, &node, &request).await?;
         node.finish(
             &request,
             OperationState::Unknown,
             json!({"error":"start response lost"}),
         )
         .await?;
-        let completion = json!({"method":"turn/completed","params":{"threadId":"native-test","turn":{"id":"unrelated","status":"completed"}}});
-        node.observe_engine(completion.clone()).await?;
+        node.observe_engine(derived_result(
+            network.space.as_str(),
+            &network.resource,
+            &request,
+            "unrelated",
+        ))
+        .await?;
         assert_eq!(
-            node.store
-                .lock()
-                .await
-                .operation(&network, &request.operation_id)?
-                .unwrap()
-                .state,
+            operation(&network, &node, "uncertain").await?.state,
             OperationState::Unknown
         );
         node.store.lock().await.local_set(
-            &network,
+            network.space.as_str(),
             "turn:uncertain",
             &json!({"turn":{"id":"expected"}}),
         )?;
-        node.observe_engine(completion.clone()).await?;
+        node.observe_engine(derived_result(
+            network.space.as_str(),
+            &network.resource,
+            &request,
+            "unrelated",
+        ))
+        .await?;
         assert_eq!(
-            node.store
-                .lock()
-                .await
-                .operation(&network, &request.operation_id)?
-                .unwrap()
-                .state,
+            operation(&network, &node, "uncertain").await?.state,
             OperationState::Unknown
         );
-        let mut matching = completion;
-        matching["params"]["turn"]["id"] = json!("expected");
-        node.observe_engine(matching).await?;
+        let mut wrong = derived_result(
+            network.space.as_str(),
+            &network.resource,
+            &request,
+            "expected",
+        );
+        wrong["execution_context"]["resource_id"] = json!(ResourceId::from_bytes([7; 32]));
+        assert!(node.observe_engine(wrong).await.is_err());
         assert_eq!(
-            node.store
-                .lock()
-                .await
-                .operation(&network, &request.operation_id)?
-                .unwrap()
-                .state,
+            operation(&network, &node, "uncertain").await?.state,
+            OperationState::Unknown
+        );
+        node.observe_engine(derived_result(
+            network.space.as_str(),
+            &network.resource,
+            &request,
+            "expected",
+        ))
+        .await?;
+        assert_eq!(
+            operation(&network, &node, "uncertain").await?.state,
             OperationState::Succeeded
         );
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
+
     #[tokio::test]
     async fn accepted_recovery_rechecks_config_and_rejects_before_any_external_call() -> Result<()>
     {
-        let dir = fixture()?;
-        let node = Runtime::open(&dir).await?;
-        let network = conversation(&node).await?;
-        let request = queued(
-            &node,
-            &network,
-            "queued",
-            json!({"type":"send","text":"must not run"}),
-        )
-        .await?;
+        let (network, node) = runtime_fixture().await?;
+        let request = queued(&network, &node, "queued", "codex").await?;
         drop(node);
-        let mut cfg = Config::load(&dir)?;
-        cfg.roles.retain(|r| r != &NodeRole::Executor);
-        cfg.save(&dir)?;
-        let node = Arc::new(Runtime::open(&dir).await?);
+        let mut cfg = Config::load(&network.directory)?;
+        cfg.roles.retain(|role| role != &NodeRole::Executor);
+        cfg.save(&network.directory)?;
+        let node = Arc::new(Runtime::open(&network.directory).await?);
         assert!(node.clone().execute_operation(request).await.is_err());
         assert_eq!(
-            node.store
-                .lock()
-                .await
-                .operation(&network, "queued")?
-                .unwrap()
-                .state,
+            operation(&network, &node, "queued").await?.state,
             OperationState::Rejected
         );
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
+        assert!(node._codex_process.lock().await.is_none());
         Ok(())
     }
+
     #[tokio::test]
     async fn stale_accepted_send_is_rejected_after_a_control_advances_revision() -> Result<()> {
-        let dir = fixture()?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let network = conversation(&node).await?;
-        let request = queued(
-            &node,
-            &network,
-            "send",
-            json!({"type":"send","text":"must not run"}),
+        let (network, node) = runtime_fixture().await?;
+        let request = queued(&network, &node, "send", "codex").await?;
+        let mut control = request.clone();
+        control.operation_id = "control".into();
+        control.resources.clear();
+        control.action = json!({"type":"interrupt","turn_id":"turn"});
+        admit(&network, &node, &control).await?;
+        claim(&network, &node, &control).await?;
+        node.finish(
+            &control,
+            OperationState::Succeeded,
+            json!({"interrupted":"turn"}),
         )
         .await?;
-        {
-            let mut store = node.store.lock().await;
-            let mut control = request.clone();
-            control.operation_id = "control".into();
-            control.resources.clear();
-            control.action = json!({"type":"interrupt","turn_id":"turn"});
-            store.accept_control_operation(&network, &control)?;
-            store.claim_operation(&network, "control")?;
-            store.finish_operation(&network, "control", OperationState::Succeeded, json!({}))?;
-        }
         assert!(node.clone().execute_operation(request).await.is_err());
         assert_eq!(
-            node.store
-                .lock()
-                .await
-                .operation(&network, "send")?
-                .unwrap()
-                .state,
+            operation(&network, &node, "send").await?.state,
             OperationState::Rejected
         );
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
+        assert!(node._codex_process.lock().await.is_none());
         Ok(())
     }
+
     #[tokio::test]
     async fn maintenance_waits_for_local_outcomes_and_completion_but_not_remote_operations()
     -> Result<()> {
-        let dir = fixture()?;
-        let node = Runtime::open(&dir).await?;
-        let owner = LocalIdentity::generate();
-        let remote = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
-        node.install_membership(owner.sign_network_fixture(
-            1,
-            vec![
-                node.identity.certificate(node.config.roles.clone())?,
-                remote.certificate(vec![NodeRole::Executor, NodeRole::Replica])?,
-            ],
-        )?)
-        .await?;
-        node.append(
-            &network,
-            "chat",
-            EventBody::ConversationCreated {
-                title: "test".into(),
-            },
-        )
-        .await?;
+        let (network, node) = runtime_fixture().await?;
         node.maintenance_idle().await?;
-        let request = queued(
-            &node,
-            &network,
-            "local",
-            json!({"type":"send","text":"test"}),
-        )
-        .await?;
+        let request = queued(&network, &node, "local", "codex").await?;
         assert!(
             node.maintenance_idle()
                 .await
@@ -1247,42 +1038,40 @@ mod tests {
                 .downcast_ref::<Busy>()
                 .is_some()
         );
-        node.store.lock().await.claim_operation(&network, "local")?;
+        claim(&network, &node, &request).await?;
         assert!(node.maintenance_idle().await.is_err());
-        node.store.lock().await.finish_operation(
-            &network,
-            "local",
+        node.finish(
+            &request,
             OperationState::Unknown,
-            json!({}),
+            json!({"error":"unresolved"}),
+        )
+        .await?;
+        assert!(node.maintenance_idle().await.is_err());
+        node.finish(
+            &request,
+            OperationState::Succeeded,
+            json!({"result":"verified"}),
+        )
+        .await?;
+        node.maintenance_idle().await?;
+        node.store.lock().await.local_set(
+            network.space.as_str(),
+            "completion:local",
+            &json!({"state":"succeeded","result":{}}),
         )?;
         assert!(node.maintenance_idle().await.is_err());
-        node.store.lock().await.finish_operation(
-            &network,
-            "local",
-            OperationState::Succeeded,
-            json!({}),
-        )?;
-        node.maintenance_idle().await?;
         node.store
             .lock()
             .await
-            .local_set(&network, "completion:local", &json!({}))?;
-        assert!(node.maintenance_idle().await.is_err());
-        {
-            let mut store = node.store.lock().await;
-            store.local_delete(&network, "completion:local")?;
-            let mut remote_request = request;
-            remote_request.operation_id = "remote".into();
-            remote_request.target_node = remote.node_id()?;
-            remote_request.resources.clear();
-            remote_request.task_id = Some("remote-fixture".into());
-            remote_request.binding = None;
-            store.bind_test_operation(&node.identity, &mut remote_request)?;
-            store.accept_operation(&network, &remote_request)?;
-        }
+            .local_delete(network.space.as_str(), "completion:local")?;
+        let remote = TestNetwork::new()?;
+        let mut store = node.store.lock().await;
+        remote.install(&mut store)?;
+        remote.conversation(&mut store, "conversation")?;
+        let request = remote.request(&mut store, "remote", "remote")?;
+        remote.admit(&mut store, &request)?;
+        drop(store);
         node.maintenance_idle().await?;
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 }
@@ -1673,35 +1462,6 @@ impl Runtime {
 
     fn audience(&self) -> Result<Audience> {
         let key = PublicKey::parse(&self.identity.public_key_hex()?)?;
-        Ok(Audience {
-            service: ServiceId::from_key(&key),
-            device: DeviceId::from_key(&key),
-        })
-    }
-
-    fn request_audience(&self, store: &Store, body: &Value) -> Result<Audience> {
-        let space = SpaceId::parse(field(body, "space_id")?)?;
-        let target = match field(body, "method")? {
-            "operate" => body["request"]["target_node"]
-                .as_str()
-                .context("execution target is required")?
-                .to_owned(),
-            "session" | "operation" | "reconcile" | "resolve_unknown" => {
-                field(body, "target_node")?.to_owned()
-            }
-            "seal_execution" => field(&body["binding"]["binding"], "target_node")?.to_owned(),
-            "bind_execution" | "rebind_execution" => {
-                let creation = store.task_creation(
-                    space.as_str(),
-                    field(body, "conversation_id")?,
-                    field(body, "task_id")?,
-                )?;
-                store.verify_event(space.as_str(), &creation)?.author
-            }
-            _ => return self.audience(),
-        };
-        let certificate = store.authorize_node(space.as_str(), &target, None)?;
-        let key = PublicKey::parse(&certificate.public_key)?;
         Ok(Audience {
             service: ServiceId::from_key(&key),
             device: DeviceId::from_key(&key),
@@ -2889,9 +2649,12 @@ impl Runtime {
                 if target == self.identity.node_id()? {
                     if self.config.manager.is_some() {
                         self.require_role(network, NodeRole::Scheduler).await?;
-                        self.spawn_scheduler(network.clone(), scope, trigger.clone()).await?;
+                        self.spawn_scheduler(network.clone(), scope, trigger.clone())
+                            .await?;
                     }
-                    Ok(json!({"state":"accepted","trigger":trigger,"manager_started":self.config.manager.is_some()}))
+                    Ok(
+                        json!({"state":"accepted","trigger":trigger,"manager_started":self.config.manager.is_some()}),
+                    )
                 } else {
                     self.peer_request(
                         network,

@@ -102,62 +102,6 @@ fn save_invocation(
     )
 }
 
-#[cfg(test)]
-fn claim(
-    store: &mut Store,
-    network: &str,
-    conversation: &str,
-    trigger: &str,
-    boot: &str,
-    sdk_config: &str,
-) -> Result<(Invocation, Option<String>, bool)> {
-    if let Some(value) = store.local_value(network, &key("invocation", conversation, trigger))? {
-        let mut previous: Invocation = serde_json::from_value(value)?;
-        if previous.state == InvocationState::Running && previous.boot != boot {
-            previous.state = InvocationState::Unknown;
-            save_invocation(store, network, conversation, &previous)?;
-        }
-        return Ok((previous, None, false));
-    }
-    let mut session = load_session(store, network, conversation)?;
-    if let Some(active) = session.active.take() {
-        let mut active: Invocation = serde_json::from_value(
-            store
-                .local_value(network, &key("invocation", conversation, &active.trigger))?
-                .context("missing active scheduler invocation")?,
-        )?;
-        if active.state == InvocationState::Running {
-            ensure!(
-                active.boot != boot,
-                "a scheduler invocation is already running for this conversation"
-            );
-            active.state = InvocationState::Unknown;
-            save_invocation(store, network, conversation, &active)?;
-        }
-        if active.state == InvocationState::Unknown {
-            session.native_id = None;
-        }
-    }
-    if session.sdk_config.as_deref() != Some(sdk_config) {
-        session.native_id = None;
-        session.sdk_config = Some(sdk_config.into());
-    }
-    let invocation = Invocation {
-        state: InvocationState::Running,
-        boot: boot.into(),
-        trigger: trigger.into(),
-        message_id: format!(
-            "scheduler-message-{}",
-            digest(&serde_json::to_vec(&(network, conversation, trigger))?)
-        ),
-    };
-    save_invocation(store, network, conversation, &invocation)?;
-    let previous = session.native_id.clone();
-    session.active = Some(invocation.clone());
-    save_session(store, network, conversation, &session)?;
-    Ok((invocation, previous, true))
-}
-
 fn finish(
     store: &mut Store,
     network: &str,
@@ -618,169 +562,175 @@ fn utc_day(seconds: u64) -> String {
 mod tests {
     use super::*;
     use crate::{
-        crypto::LocalIdentity,
-        model::{Event, MissingDependencies, WIRE_VERSION},
+        identity::test_support::TestNetwork,
+        model::{Event, MissingDependencies},
+        runtime::tests::runtime_fixture,
     };
+    use vibeface_secure::authorization::SessionRef;
 
-    #[test]
-    fn invocation_replay_and_crash_do_not_relaunch_or_reuse_unknown_sdk_state() -> Result<()> {
-        let identity = LocalIdentity::generate();
-        let network = identity.fixture_network_id()?;
-        let mut store = Store::open(":memory:")?;
-        store.install_trust_bundle(
-            &network,
-            &identity
-                .sign_network_fixture(1, vec![identity.certificate(vec![NodeRole::Scheduler])?])?,
+    async fn descriptor(
+        network: &TestNetwork,
+        node: &Arc<Runtime>,
+        scope: &str,
+    ) -> Result<crate::model::AgentSession> {
+        let trigger = network.message(
+            &mut *node.store.lock().await,
+            scope,
+            "manage this conversation",
         )?;
-        let (first, _, fresh) = claim(&mut store, &network, "chat", "trigger", "boot-a", "sdk-a")?;
-        assert!(fresh);
-        assert!(!claim(&mut store, &network, "chat", "trigger", "boot-a", "sdk-a")?.2);
-        assert!(claim(&mut store, &network, "chat", "other", "boot-a", "sdk-a").is_err());
-        let mut session = load_session(&store, &network, "chat")?;
-        session.native_id = Some("local-sdk-session".into());
-        save_session(&mut store, &network, "chat", &session)?;
-        let (old, _, fresh) = claim(&mut store, &network, "chat", "trigger", "boot-b", "sdk-a")?;
-        assert!(!fresh);
-        assert!(old.state == InvocationState::Unknown);
-        let (mut next, native, fresh) = claim(
-            &mut store,
-            &network,
-            "chat",
-            "new-human-input",
-            "boot-b",
-            "sdk-a",
-        )?;
-        assert!(fresh && native.is_none());
-        next.state = InvocationState::Completed;
-        finish(&mut store, &network, "chat", &next)?;
-        let mut session = load_session(&store, &network, "chat")?;
-        session.native_id = Some("completed-sdk-session".into());
-        let mut stale = next.clone();
-        stale.state = InvocationState::Running;
-        session.active = Some(stale);
-        save_session(&mut store, &network, "chat", &session)?;
-        let (mut after_crash, native, fresh) = claim(
-            &mut store,
-            &network,
-            "chat",
-            "after-completion-crash",
-            "boot-c",
-            "sdk-a",
-        )?;
-        assert!(fresh);
-        assert_eq!(native.as_deref(), Some("completed-sdk-session"));
+        let key =
+            vibeface_secure::authorization::PublicKey::parse(&node.identity.public_key_hex()?)?;
+        let service = vibeface_secure::authorization::ServiceId::from_key(&key);
+        let session = SessionRef {
+            target: vibeface_secure::authorization::DeviceId::from_key(&key),
+            session_id: trigger.hash.clone(),
+        };
+        node.store.lock().await.agent_grant(
+            network.space.as_str(),
+            scope,
+            &service,
+            &session,
+            &trigger.hash,
+            crate::runtime::now_ms() as u64,
+        )
+    }
+
+    #[tokio::test]
+    async fn invocation_replay_and_crash_do_not_relaunch_or_reuse_unknown_sdk_state() -> Result<()>
+    {
+        let (network, node) = runtime_fixture().await?;
+        let first = descriptor(&network, &node, "conversation").await?;
+        let config = digest(b"scheduler configuration");
+        let claim = node
+            .claim_manager(&first, &first.sdk_session.session_id, "boot-a", &config)
+            .await?;
+        assert!(claim.fresh);
         assert!(
-            serde_json::from_value::<Invocation>(
-                store
-                    .local_value(&network, &key("invocation", "chat", &next.trigger))?
-                    .unwrap()
-            )?
-            .state
-                == InvocationState::Completed
+            !node
+                .claim_manager(&first, &first.sdk_session.session_id, "boot-a", &config)
+                .await?
+                .fresh
         );
-        after_crash.state = InvocationState::Completed;
-        finish(&mut store, &network, "chat", &after_crash)?;
+        let other = descriptor(&network, &node, "conversation").await?;
         assert!(
-            claim(
-                &mut store,
-                &network,
-                "chat",
-                "new-provider",
-                "boot-c",
-                "sdk-b"
-            )?
-            .1
+            node.claim_manager(&other, &other.sdk_session.session_id, "boot-a", &config)
+                .await
+                .is_err()
+        );
+        {
+            let mut store = node.store.lock().await;
+            let mut session = load_session(&store, network.space.as_str(), "conversation")?;
+            session.native_id = Some("uncertain-sdk-session".into());
+            save_session(&mut store, network.space.as_str(), "conversation", &session)?;
+        }
+        let old = node
+            .claim_manager(&first, &first.sdk_session.session_id, "boot-b", &config)
+            .await?;
+        assert!(
+            !old.fresh
+                && old.invocation.state == InvocationState::Unknown
+                && old.previous_native_id.is_none()
+        );
+        let next = node
+            .claim_manager(&other, &other.sdk_session.session_id, "boot-b", &config)
+            .await?;
+        assert!(next.fresh && next.previous_native_id.is_none());
+        let mut completed = next.invocation;
+        completed.state = InvocationState::Completed;
+        finish(
+            &mut *node.store.lock().await,
+            network.space.as_str(),
+            "conversation",
+            &completed,
+        )?;
+        let changed = descriptor(&network, &node, "conversation").await?;
+        assert!(
+            node.claim_manager(
+                &changed,
+                &changed.sdk_session.session_id,
+                "boot-b",
+                &digest(b"different config")
+            )
+            .await?
+            .previous_native_id
             .is_none()
         );
+        network.conversation(&mut *node.store.lock().await, "other-conversation")?;
+        let separate = descriptor(&network, &node, "other-conversation").await?;
         assert!(
-            claim(
-                &mut store,
-                &network,
-                "other-chat",
-                &first.trigger,
+            node.claim_manager(
+                &separate,
+                &separate.sdk_session.session_id,
                 "boot-b",
-                "sdk-a"
-            )?
-            .2
+                &config
+            )
+            .await?
+            .fresh
         );
         assert!(
-            !claim(
-                &mut store,
-                &network,
-                "chat",
-                "new-human-input",
-                "boot-b",
-                "sdk-a"
-            )?
-            .2
+            !node
+                .claim_manager(&first, &first.sdk_session.session_id, "boot-b", &config)
+                .await?
+                .fresh
         );
+        assert!(node.agent_tokens.lock().await.is_empty());
         Ok(())
     }
 
-    #[test]
-    fn unknown_scheduler_blocks_updates_until_new_user_work_completes() -> Result<()> {
-        let identity = LocalIdentity::generate();
-        let network = identity.fixture_network_id()?;
-        let mut store = Store::open(":memory:")?;
-        store.install_trust_bundle(
-            &network,
-            &identity
-                .sign_network_fixture(1, vec![identity.certificate(vec![NodeRole::Scheduler])?])?,
-        )?;
-        store.append_event(
-            &identity,
-            &network,
-            "chat",
-            EventBody::ConversationCreated {
-                title: "test".into(),
-            },
-            vec![],
-            1,
-        )?;
-        let (mut invocation, _, _) = claim(
-            &mut store,
-            &network,
-            "chat",
-            "old-user-message",
-            "boot-a",
-            "sdk",
-        )?;
-        let mut session = load_session(&store, &network, "chat")?;
-        session.native_id = Some("uncertain-sdk-session".into());
-        save_session(&mut store, &network, "chat", &session)?;
+    #[tokio::test]
+    async fn unknown_scheduler_blocks_updates_until_new_user_work_completes() -> Result<()> {
+        let (network, node) = runtime_fixture().await?;
+        let first = descriptor(&network, &node, "conversation").await?;
+        let config = digest(b"scheduler configuration");
+        let mut invocation = node
+            .claim_manager(&first, &first.sdk_session.session_id, "boot-a", &config)
+            .await?
+            .invocation;
         invocation.state = InvocationState::Unknown;
-        finish(&mut store, &network, "chat", &invocation)?;
-        assert!(maintenance_idle(&store, &network).is_err());
-        let (old, native, fresh) = claim(
-            &mut store,
-            &network,
-            "chat",
-            "old-user-message",
-            "boot-b",
-            "sdk",
+        finish(
+            &mut *node.store.lock().await,
+            network.space.as_str(),
+            "conversation",
+            &invocation,
         )?;
-        assert!(old.state == InvocationState::Unknown && native.is_none() && !fresh);
-        let (mut next, native, fresh) = claim(
-            &mut store,
-            &network,
-            "chat",
-            "new-user-message",
-            "boot-b",
-            "sdk",
+        assert!(maintenance_idle(&*node.store.lock().await, network.space.as_str()).is_err());
+        let old = node
+            .claim_manager(&first, &first.sdk_session.session_id, "boot-b", &config)
+            .await?;
+        assert!(
+            !old.fresh
+                && old.invocation.state == InvocationState::Unknown
+                && old.previous_native_id.is_none()
+        );
+        let next = descriptor(&network, &node, "conversation").await?;
+        let mut invocation = node
+            .claim_manager(&next, &next.sdk_session.session_id, "boot-b", &config)
+            .await?
+            .invocation;
+        assert!(maintenance_idle(&*node.store.lock().await, network.space.as_str()).is_err());
+        invocation.state = InvocationState::Completed;
+        finish(
+            &mut *node.store.lock().await,
+            network.space.as_str(),
+            "conversation",
+            &invocation,
         )?;
-        assert!(fresh && native.is_none());
-        assert!(maintenance_idle(&store, &network).is_err());
-        next.state = InvocationState::Completed;
-        finish(&mut store, &network, "chat", &next)?;
-        maintenance_idle(&store, &network)?;
+        maintenance_idle(&*node.store.lock().await, network.space.as_str())?;
         Ok(())
     }
 
     #[test]
     fn context_is_bounded_keeps_original_offsets_and_excludes_other_conversations() -> Result<()> {
+        let network = TestNetwork::new()?;
+        let mut store = network.memory()?;
+        network.conversation(&mut store, "conversation")?;
+        let original = network.message(&mut store, "conversation", "context data")?;
+        let original: Event = serde_json::from_str(&original.canonical_body)?;
         let make = |scope: &str, text: String, n| Event {
-            version: WIRE_VERSION,
-            network_id: "network".into(),
+            version: crate::model::WIRE_VERSION,
+            network_id: network.space.to_string(),
+            resource_id: network.resource.clone(),
+            cause: original.cause.clone(),
             scope_id: scope.into(),
             author: "node".into(),
             sequence: n,
@@ -804,7 +754,7 @@ mod tests {
             (2..100).map(|n| make("chat", format!("event-{n} {}", "界".repeat(10_000)), n)),
         );
         let context = Context {
-            network_id: "network".into(),
+            network_id: network.space.to_string(),
             scope_id: "chat".into(),
             heads: vec!["known-frontier".into()],
             events,
@@ -831,7 +781,7 @@ mod tests {
     #[test]
     fn tool_schema_has_no_human_grants_and_write_operations_require_stable_ids() {
         let schemas = tools();
-        assert_eq!(schemas.len(), 7);
+        assert_eq!(schemas.len(), 8);
         for name in ["open_execution", "send_execution"] {
             assert!(
                 schemas[name].input_schema["required"]
