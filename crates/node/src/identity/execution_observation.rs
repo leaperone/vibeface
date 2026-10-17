@@ -1,0 +1,341 @@
+use super::{
+    StoredHandoff, public_execution_result, session_from, signed_receipt, stored_from,
+    verify_local_handoff_checkpoint,
+};
+use crate::{crypto::LocalIdentity, model::Event, store::Store};
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use vibeface_secure::{
+    authorization::{
+        AUTH_VERSION, CheckStage, DeviceId, EXECUTION_LEASE_MS, FreshnessReceipt, Nonce,
+        PolicyDomain, PolicyStamp, PublicKey, REMOTE_READ_MAX_AGE_MS, ResourceKind, ServiceId,
+        Signed, TransportEvidence, VerifiedPolicySet,
+        events::StoredTransport,
+        execution_handoff::{
+            ExecutionHandoffResult, verify_execution_handoff_admission_checkpoint,
+        },
+        execution_observation::{
+            ExecutionObservationChallenge, ExecutionObservationFreshness,
+            ExecutionObservationTarget, SignedExecutionObservation,
+        },
+    },
+    signature_verification::ScopedSignatureVerification,
+};
+
+fn check_heads_in(
+    connection: &Connection,
+    policy: &VerifiedPolicySet,
+    heads: &[PolicyStamp],
+) -> Result<()> {
+    for expected in heads {
+        let (kind, id) = match &expected.domain {
+            PolicyDomain::Account(id) => ("account", id.as_str()),
+            PolicyDomain::Space(id) => ("space", id.as_str()),
+        };
+        let actual: Option<(u64, u64, String)> = connection.query_row(
+            "SELECT authority_epoch,sequence,head_hash FROM current_policy_heads WHERE domain_kind=? AND domain_id=?",
+            params![kind, id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        ensure!(
+            policy.head(&expected.domain) == Some(expected)
+                && actual
+                    == Some((
+                        expected.authority_epoch,
+                        expected.sequence,
+                        expected.head.to_string(),
+                    )),
+            "observation policy changed before the local read"
+        );
+    }
+    Ok(())
+}
+
+fn check_local_route_in(
+    connection: &Connection,
+    policy: &VerifiedPolicySet,
+    identity: &LocalIdentity,
+    target: &ExecutionObservationTarget,
+) -> Result<()> {
+    let key = PublicKey::parse(&identity.public_key_hex()?)?;
+    ensure!(
+        key == target.target_public_key
+            && target.execution_audience.device == DeviceId::from_key(&key)
+            && target.execution_audience.service == ServiceId::from_key(&key),
+        "observation targets another executor"
+    );
+    let execution = &target.execution_resource;
+    let local: Option<String> = connection
+        .query_row(
+            "SELECT public_key FROM local_devices WHERE space_id=? AND device_id=?",
+            params![execution.space.as_str(), identity.node_id()?],
+            |row| row.get(0),
+        )
+        .optional()?;
+    ensure!(
+        local.as_deref() == Some(key.as_str()),
+        "observation executor is not a local device"
+    );
+    let registered = policy
+        .resource(&execution.space, &execution.resource)
+        .context("observation has no current ExecutionService")?;
+    let projected: Option<(String, String, String)> = connection.query_row(
+        "SELECT kind,host_service_id,record_hash FROM resource_records WHERE space_id=? AND resource_id=?",
+        params![execution.space.as_str(), execution.resource.as_str()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()?;
+    ensure!(
+        registered.payload.kind == ResourceKind::ExecutionService
+            && registered.payload.host == target.execution_audience.service
+            && projected
+                == Some((
+                    "execution_service".to_owned(),
+                    target.execution_audience.service.to_string(),
+                    registered.hash()?.to_string(),
+                )),
+        "observation ExecutionService route changed"
+    );
+    Ok(())
+}
+
+fn challenge_key(challenge: &ExecutionObservationChallenge) -> String {
+    format!(
+        "execution-observation:{}:{}",
+        challenge.observation_hash, challenge.nonce
+    )
+}
+
+fn check_local_checkpoint_in(connection: &Connection, stored: &StoredHandoff) -> Result<()> {
+    verify_local_handoff_checkpoint(connection, stored)?;
+    let execution = stored.wire.handoff.execution_resource.space.as_str();
+    let original = &stored.request.network_id;
+    let operation = &stored.request.operation_id;
+    let actual = connection.prepare("SELECT target_node,resource FROM execution_handoff_reservations WHERE execution_space_id=? AND original_space_id=? AND operation_id=? ORDER BY resource")?
+        .query_map(params![execution, original, operation], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut expected = if stored.state.terminal() {
+        Vec::new()
+    } else {
+        stored
+            .request
+            .resources
+            .iter()
+            .map(|resource| (stored.request.target_node.clone(), resource.clone()))
+            .collect::<Vec<_>>()
+    };
+    expected.sort();
+    ensure!(
+        actual == expected,
+        "observation execution reservations changed"
+    );
+    let dispatch: Event =
+        serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
+    let (session, binding) = session_from(
+        connection,
+        execution,
+        original,
+        dispatch.resource_id.as_str(),
+        &stored.request.target_node,
+        &stored.request.session_id,
+    )?
+    .context("observed execution session disappeared")?;
+    ensure!(
+        stored.request.binding.as_ref() == Some(&binding),
+        "observation session binding differs from the accepted operation"
+    );
+    ensure!(
+        public_execution_result(stored.result.clone(), session.native_session_id.as_deref())
+            == stored.result,
+        "observed execution result contains private provider identifiers"
+    );
+    Ok(())
+}
+
+impl Store {
+    pub fn issue_execution_observation_challenge(
+        &mut self,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionObservation,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<ExecutionObservationChallenge> {
+        let signature_scope = ScopedSignatureVerification::new();
+        let current = self
+            .policy
+            .verified()
+            .verify_execution_observation_current(wire, transport, now_ms)?;
+        let challenge = ExecutionObservationChallenge::new(
+            &current,
+            Nonce::random()?,
+            now_ms,
+            now_ms
+                .checked_add(EXECUTION_LEASE_MS)
+                .context("observation challenge clock overflow")?
+                .min(current.expires_at_ms()),
+        )?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        check_heads_in(&tx, self.policy.verified(), current.heads())?;
+        check_local_route_in(&tx, self.policy.verified(), identity, current.target())?;
+        let mut usage = current.proof_usage().clone();
+        usage.record_metadata(&challenge)?;
+        usage.record_actual_signature_counts(signature_scope.counts());
+        usage.enforce_limits()?;
+        tx.execute(
+            "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
+            params![
+                current.target().execution_resource.space.as_str(),
+                challenge_key(&challenge),
+                serde_json::to_string(&challenge)?,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(challenge)
+    }
+
+    pub fn sign_execution_observation_receipts(
+        &self,
+        challenge: &ExecutionObservationChallenge,
+        identity: &LocalIdentity,
+        now_ms: u64,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        let _signature_scope = ScopedSignatureVerification::new();
+        ensure!(
+            challenge.version == AUTH_VERSION
+                && challenge.stage == CheckStage::RemoteRead
+                && challenge.issued_at_ms <= now_ms
+                && now_ms < challenge.expires_at_ms
+                && challenge.expires_at_ms - challenge.issued_at_ms <= REMOTE_READ_MAX_AGE_MS
+                && !challenge.policies.is_empty()
+                && challenge.policies.len() <= vibeface_secure::authorization::MAX_POLICY_DOMAINS
+                && challenge
+                    .policies
+                    .windows(2)
+                    .all(|pair| pair[0].domain < pair[1].domain),
+            "invalid execution observation freshness challenge"
+        );
+        let key = PublicKey::parse(&identity.public_key_hex()?)?;
+        let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let mut receipts = Vec::new();
+        for stamp in &challenge.policies {
+            let authority = match &stamp.domain {
+                PolicyDomain::Account(id) => self
+                    .policy
+                    .verified()
+                    .account(id)
+                    .map(|document| &document.authority),
+                PolicyDomain::Space(id) => self
+                    .policy
+                    .verified()
+                    .space(id)
+                    .map(|document| &document.authority),
+            };
+            let Some(authority) = authority.filter(|authority| authority.public_key == key) else {
+                continue;
+            };
+            check_heads_in(&tx, self.policy.verified(), std::slice::from_ref(stamp))?;
+            ensure!(
+                authority.device == DeviceId::from_key(&key)
+                    && authority.service == ServiceId::from_key(&key),
+                "observation freshness authority mismatch"
+            );
+            receipts.push(Signed::sign(
+                FreshnessReceipt {
+                    version: AUTH_VERSION,
+                    current: stamp.clone(),
+                    challenge_hash: challenge.hash()?,
+                    issued_at_ms: now_ms,
+                    expires_at_ms: challenge.expires_at_ms,
+                },
+                &signer,
+            )?);
+        }
+        tx.commit()?;
+        Ok(receipts)
+    }
+
+    pub fn observe_execution_handoff(
+        &self,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionObservation,
+        proof: &ExecutionObservationFreshness,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<Option<ExecutionHandoffResult>> {
+        let signature_scope = ScopedSignatureVerification::new();
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let current = self
+            .policy
+            .verified()
+            .verify_execution_observation_current(wire, transport, now_ms)?;
+        check_heads_in(&tx, self.policy.verified(), current.heads())?;
+        check_local_route_in(&tx, self.policy.verified(), identity, current.target())?;
+        self.policy
+            .verified()
+            .verify_execution_observation_current_freshness(&current, proof, now_ms)?;
+        let encoded: String = tx
+            .query_row(
+                "SELECT value FROM local_values WHERE space_id=? AND key=?",
+                params![
+                    current.target().execution_resource.space.as_str(),
+                    challenge_key(&proof.challenge),
+                ],
+                |row| row.get(0),
+            )
+            .context("observation challenge was not issued by this executor")?;
+        ensure!(
+            serde_json::from_str::<ExecutionObservationChallenge>(&encoded)? == proof.challenge,
+            "local execution observation challenge changed"
+        );
+        let target = current.target();
+        let Some(stored) = stored_from(
+            &tx,
+            target.execution_resource.space.as_str(),
+            target.source.project.space.as_str(),
+            &target.source.operation_id,
+        )?
+        else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        check_local_checkpoint_in(&tx, &stored)?;
+        let checkpoint = verify_execution_handoff_admission_checkpoint(
+            &stored.wire,
+            &stored.admission_receipt,
+            &stored.admission,
+            &StoredTransport::from(&stored.transport),
+            stored.admitted_at_ms,
+        )?;
+        let full = self.policy.verified().verify_execution_observation(
+            wire,
+            &stored.wire,
+            transport,
+            now_ms,
+        )?;
+        let receipt = signed_receipt(&tx, identity, &stored, now_ms)?;
+        let fresh = self
+            .policy
+            .verified()
+            .verify_execution_observation_freshness(&full, proof, now_ms)?;
+        let mut usage = fresh.proof_usage().clone();
+        usage.merge(checkpoint.proof_usage());
+        if let Some(lease) = &stored.lease {
+            usage.record_metadata(lease)?;
+        }
+        if let Some(previous) = &stored.receipt {
+            usage.record_signed(previous)?;
+        }
+        usage.record_signed(&receipt)?;
+        usage.record_actual_signature_counts(signature_scope.counts());
+        usage.enforce_limits()?;
+        let observation = ExecutionHandoffResult {
+            handoff: stored.wire,
+            receipt,
+            result: stored.result,
+        };
+        tx.commit()?;
+        Ok(Some(observation))
+    }
+}
