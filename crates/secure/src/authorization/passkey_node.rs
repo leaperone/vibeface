@@ -48,6 +48,86 @@ pub struct VerifiedNodePasskeyState {
     state: AuthenticatorState,
 }
 
+pub fn commit_passkey_policy_at_authority(
+    state: &VerifiedPolicySet,
+    proposal: Signed<AccountDocument>,
+    authority: &Identity,
+    not_after_ms: u64,
+    now_ms: u64,
+) -> Result<Committed<AccountDocument>> {
+    let account = state
+        .account(&proposal.payload.account)
+        .ok_or(AuthorizationError::PolicyConflict)?;
+    let authority_key = PublicKey::of(authority);
+    require(
+        account.authority.public_key == authority_key,
+        "passkey commit requires the current local account authority",
+    )?;
+    let domain = PolicyDomain::Account(account.account.clone());
+    let mut budget = Budget::default();
+    if proposal.issuer != account.current_root && !account.recovery.keys.contains(&proposal.issuer)
+    {
+        state.authorize_account_delta(&proposal, account, now_ms, &mut budget)?;
+    }
+    let mut dependencies = budget.dependencies.clone();
+    state.dependency(&domain, &mut dependencies)?;
+    state.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
+    let dependencies: Vec<_> = dependencies.into_values().collect();
+    for dependency in &dependencies {
+        let current = match &dependency.domain {
+            PolicyDomain::Account(id) => state.account(id).map(|d| &d.authority),
+            PolicyDomain::Space(id) => state.space(id).map(|d| &d.authority),
+        }
+        .ok_or(AuthorizationError::PolicyConflict)?;
+        require(
+            current.public_key == authority_key,
+            "passkey completion cannot issue another authority's freshness receipt",
+        )?;
+    }
+    let expires = now_ms.saturating_add(EXECUTION_LEASE_MS).min(not_after_ms);
+    require(now_ms < expires, "passkey authority completion expired")?;
+    let commit = Signed::sign(
+        PolicyCommit {
+            version: AUTH_VERSION,
+            previous: state
+                .head(&domain)
+                .cloned()
+                .ok_or(AuthorizationError::PolicyConflict)?,
+            proposal_hash: proposal.hash()?,
+            accepted_at_ms: now_ms,
+            issued_at_ms: now_ms,
+            expires_at_ms: expires,
+            nonce: Nonce::random()?,
+            dependencies: dependencies.clone(),
+        },
+        authority,
+    )?;
+    let challenge_hash = commit.challenge_hash()?;
+    let receipts = dependencies
+        .into_iter()
+        .map(|current| {
+            Signed::sign(
+                FreshnessReceipt {
+                    version: AUTH_VERSION,
+                    current,
+                    challenge_hash: challenge_hash.clone(),
+                    issued_at_ms: now_ms,
+                    expires_at_ms: expires,
+                },
+                authority,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let committed = Committed {
+        proposal,
+        commit,
+        receipts,
+    };
+    let mut checked = state.clone();
+    checked.install_account_committed(committed.clone(), now_ms)?;
+    Ok(committed)
+}
+
 fn parse<T: for<'de> Deserialize<'de>>(json: &str) -> Result<T> {
     require(json.len() <= MAX_PROOF_BYTES, "node passkey JSON too large")?;
     serde_json::from_str(json)
@@ -318,24 +398,44 @@ mod tests {
                 NOW,
             )
             .unwrap();
+            let mut registration_envelope = pending.envelope().clone();
+            registration_envelope.purpose = PasskeyPurpose::RegisterAuthenticator;
+            registration_envelope.rights = vec![AccountRight::ManageAuthenticators];
+            registration_envelope.enrollment_hash =
+                ObjectHash::body(&"registration intent").unwrap();
+            let registration_pending = PendingPasskey::prepare(
+                registration_envelope,
+                pending.relying_party().clone(),
+                &[7; 32],
+                AuthenticationCeremony::IdentifiedAccount,
+                vec![],
+                NOW,
+            )
+            .unwrap();
+            let registration = crate::webauthn::verify_passkey_registration(
+                &registration_pending,
+                &crate::webauthn::tests::registration(&registration_pending),
+                NOW,
+            )
+            .unwrap();
             let record = Signed::sign(
                 AuthenticatorRecord {
                     version: AUTH_VERSION,
                     account,
                     credential_id: URL_SAFE_NO_PAD.encode([9; 32]),
-                    cose_public_key: crate::webauthn::tests::cose(),
+                    cose_public_key: registration.cose_public_key().to_vec(),
                     rp_id: "client.example".into(),
                     origins: vec!["https://client.example".into()],
                     user_handle: pending.user_handle().to_owned(),
                     backup_eligible: true,
                     client_enrollment: PasskeyClientEnrollment::AccountClient,
                     initial_state: AuthenticatorState {
-                        sign_count: 1,
-                        backup_state: false,
+                        sign_count: registration.sign_count(),
+                        backup_state: registration.backup_state(),
                     },
                     issued_under: head,
-                    nonce: Nonce::from_bytes([3; 32]),
-                    enrollment_hash: ObjectHash::body(&"registration envelope").unwrap(),
+                    nonce: registration_pending.envelope().nonce.clone(),
+                    enrollment_hash: registration_pending.envelope_hash().unwrap(),
                     not_before_ms: NOW,
                     expires_at_ms: NOW + 500_000,
                 },
@@ -616,5 +716,58 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    fn authority_wraps_only_valid_account_proposals_with_its_own_fresh_receipts() {
+        let f = super::super::tests::Fixture::new();
+        let domain = PolicyDomain::Account(f.account.clone());
+        let original = f.state.head(&domain).unwrap().clone();
+        let mut document = f.state.account(&f.account).unwrap().clone();
+        document.previous = Some(original.clone());
+        document.sequence += 1;
+        document.device_enrollment = None;
+        document.authenticator_approval = None;
+        let proposal = Signed::sign(document, &f.root).unwrap();
+        assert!(
+            commit_passkey_policy_at_authority(
+                &f.state,
+                proposal.clone(),
+                &key(8),
+                NOW + 100_000,
+                NOW
+            )
+            .is_err()
+        );
+        let committed = commit_passkey_policy_at_authority(
+            &f.state,
+            proposal.clone(),
+            &key(3),
+            NOW + 100_000,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(committed.commit.issuer, PublicKey::of(&key(3)));
+        assert_eq!(
+            committed.commit.payload.dependencies,
+            vec![original.clone()]
+        );
+        assert_eq!(
+            committed.commit.payload.expires_at_ms,
+            NOW + EXECUTION_LEASE_MS
+        );
+        assert_eq!(committed.receipts.len(), 1);
+        let mut replay = f.state.clone();
+        let head = replay.install_account_committed(committed, NOW).unwrap();
+        assert_eq!(head.sequence, original.sequence + 1);
+        assert_eq!(f.state.head(&domain), Some(&original));
+        let mut invalid = proposal;
+        invalid.payload.sequence += 1;
+        assert!(
+            commit_passkey_policy_at_authority(&f.state, invalid, &key(3), NOW + 100_000, NOW)
+                .is_err()
+        );
+        assert_eq!(f.state.head(&domain), Some(&original));
     }
 }

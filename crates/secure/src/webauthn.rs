@@ -936,7 +936,7 @@ pub(crate) mod tests {
         result.extend_from_slice(&counter.to_be_bytes());
         result
     }
-    fn registration(p: &PendingPasskey) -> RegistrationResponse {
+    pub(crate) fn registration(p: &PendingPasskey) -> RegistrationResponse {
         let mut data = auth(p, 0x4d, 0);
         data.extend([0; 16]);
         data.extend(32u16.to_be_bytes());
