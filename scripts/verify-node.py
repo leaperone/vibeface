@@ -63,6 +63,62 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+def maintenance(node, command):
+    stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stream.settimeout(5)
+    try:
+        wait_for("private maintenance listener",
+                 lambda: stream.connect(f"/tmp/vibeface-{node.node_id[:32]}/maintenance.sock") is None,
+                 timeout=5)
+        stream.sendall(json.dumps({"protocol": 1, "command": command}).encode() + b"\n")
+        response = b""
+        while not response.endswith(b"\n"):
+            part = stream.recv(1024)
+            require(part and len(response) < 8192, "bounded maintenance response")
+            response += part
+        value = json.loads(response)
+        require(value["protocol"] == 1, "maintenance protocol matches")
+        return stream, value
+    except BaseException:
+        stream.close()
+        raise
+
+
+def verify_maintenance(node):
+    stream, value = maintenance(node, "acquire")
+    try:
+        require(value["status"] == "ready", "idle node enters maintenance")
+        require(value["health"]["node_id"] == node.node_id, "lease pins the running node")
+        node.client.request("/api/rpc", {"method": "nodes"}, status=503)
+        node.client.request("/api/login", {"username": "owner_a", "password": "wrong"}, status=503)
+        probe, health = maintenance(node, "probe")
+        probe.close()
+        require(health["status"] == "healthy", "health is readable while writes are closed")
+        require(node.client.request("/api/info")["node_id"] == node.node_id, "HTTP reads survive maintenance")
+    finally:
+        stream.close()
+    wait_for("lease disconnect reopens node", lambda: node.client.rpc("nodes"))
+    node.stop()
+    marker = node.directory / "update-pending.json"
+    private_json(marker, {"protocol": 1})
+    node.start()
+    node.client.request("/api/rpc", {"method": "nodes"}, status=503)
+    commit, value = maintenance(node, "commit")
+    commit.close()
+    require(value["status"] == "error", "pending marker prevents premature commit")
+    marker.unlink()
+    commit, value = maintenance(node, "commit")
+    commit.close()
+    require(value["status"] == "committed", "verified startup opens only after explicit commit")
+    node.client.rpc("nodes")
+    result = subprocess.run([str(node.binary), "update", "status", "--data-dir", str(node.directory)],
+                            capture_output=True, timeout=10)
+    require(result.returncode == 0, "update status works without a managed installation")
+    result = subprocess.run([str(node.binary), "update", "apply", "--automatic", "--data-dir", str(node.directory)],
+                            capture_output=True, timeout=10)
+    require(result.returncode == 0, "unconfigured automatic updates do nothing")
+
+
 def available_port():
     with socket.socket() as stream:
         stream.bind(("127.0.0.1", 0))
@@ -378,6 +434,9 @@ def acceptance(options):
         a.client.request("/api/pair", {"code": "invalid", "node_id": "unknown", "public_key": "00", "proof": "00"}, status=400)
         passed("login, CSRF, Origin and scoped-tool boundaries")
 
+        verify_maintenance(a)
+        passed("private maintenance lease, write admission, startup health gate and disabled updates")
+
         verify_browser_origins(a, password_a, [f"http://localhost:{a.port}", f"http://0.0.0.0:{a.port}"])
         a.stop()
         extra_origins = [f"http://192.0.2.10:{a.port}", "https://node.example"]
@@ -497,11 +556,17 @@ def acceptance(options):
         unknown = request(network, conversation, b, "fixture-unknown-send", "fixture-main", {"type": "send", "text": json.dumps({"label": "unknown", "gate": str(run / "never-complete")})}, revision=session["revision"], task=task)
         dispatch(c.client, unknown)
         wait_for("interrupted fixture is executing", lambda: len(invocations(run, "unknown")) == 1)
+        lease, state = maintenance(b, "acquire")
+        lease.close()
+        require(state["status"] == "busy", "running execution postpones updates")
         b.stop()
         b.start()
         b.client.login("owner_b", password_b)
         record = wait_for("running operation recovers as Unknown", lambda: unknown_record(b.client, b, unknown["operation_id"]))
         require(record["state"] == "unknown", "restart does not report success")
+        lease, state = maintenance(b, "acquire")
+        lease.close()
+        require(state["status"] == "busy", "Unknown execution postpones updates")
         dispatch(b.client, unknown)
         require(len(invocations(run, "unknown")) == 1, "Unknown retry does not invoke executor")
         blocked = copy.deepcopy(unknown)

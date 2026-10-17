@@ -40,12 +40,12 @@ cd vibeface-node-<version>-<target>
 | 渠道 | Tag 格式 | 示例 | GitHub Release |
 | --- | --- | --- | --- |
 | stable | `vX.Y.Z` | `v0.0.1` | 正式版本，标记为 Latest |
-| nightly | `vX.Y.Z-nightly.YYYYMMDD.N` | `v0.0.1-nightly.20261016.1` | 预发布，不标记为 Latest |
+| nightly | `vX.Y.Z-nightly.YYYYMMDD.N` | `v0.0.1-nightly.20261017.1` | 预发布，不标记为 Latest |
 | rc | `vX.Y.Z-rc.N` | `v0.0.1-rc.1` | 预发布，不标记为 Latest |
 
-`X.Y.Z` 是目标正式版本，数字不带前导零。nightly 日期按发布时的 UTC 日历日期填写，`N` 是该目标版本、当天从 `1` 递增的发布序号；rc 的 `N` 则在该目标版本内从 `1` 递增。日期必须有效，序号不带前导零。本次首个版本为 `0.0.1-nightly.20261016.1`：本地日期虽为 10 月 17 日，UTC 日期仍为 10 月 16 日。
+`X.Y.Z` 是目标正式版本，数字不带前导零。nightly 日期按发布时的 UTC 日历日期填写，`N` 是该目标版本、当天从 `1` 递增的发布序号；rc 的 `N` 则在该目标版本内从 `1` 递增。日期必须有效，序号不带前导零。例如 `0.0.1-nightly.20261017.1` 表示目标正式版本 `0.0.1` 在 UTC 2026-10-17 的第一个 Nightly。
 
-nightly 表示开发预发布，需显式选择对应版本，不能通过 GitHub 的 Latest 稳定版入口获取。tag 一经发布不可移动、删除重用或覆盖；不创建可变的 `nightly` tag，不追加 build metadata 或 SHA。包内 `BUILD-INFO.json` 记录实际源码提交。
+nightly 表示开发预发布，需选择 Nightly 更新渠道或手动下载，不能通过 GitHub 的 Latest 稳定版入口获取。tag 一经发布不可移动、删除重用或覆盖；不创建可变的 `nightly` tag，不追加 build metadata 或 SHA。包内 `BUILD-INFO.json` 记录实际源码提交。
 
 1. 通过 PR 更新 workspace 版本及 `Cargo.lock`，完成检查并合并到 `main`。
 2. 按上述格式在已合并的提交创建并推送 `v<version>` tag。tag 必须与 Cargo 版本完全相同，且指向已进入 `main` 的提交；CI 拒绝其他后缀或格式。
@@ -54,8 +54,28 @@ nightly 表示开发预发布，需显式选择对应版本，不能通过 GitHu
 
 只有发布任务拥有 `contents: write` 权限。失败留下的 draft 可以在修复原因后重跑；公开 Release 不会被覆盖。同名公开版本需要更正时，使用新的版本和 tag。合并 PR 不会自动推送 tag。
 
-## 更换本机程序
+## 更新渠道
 
-先停止 Node 或卸载用户服务，确认进程已经退出，再备份完整数据目录；目录包含身份和历史，备份应保持私密。校验并解压新包到单独目录，保留原数据目录，用新程序前台启动检查。确认可用后重新安装指向新路径的用户服务。不要让新旧程序同时使用同一数据目录。
+Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `vX.Y.Z` 正式版，Nightly 只选择 `vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。更新器比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
 
-没有自动更新或旧版数据兼容承诺。若新版本改变存储格式，应按该版本说明处理；不要直接让旧程序打开已经升级的数据。需要恢复时，停止程序并恢复对应版本的完整备份。
+自动更新默认关闭，默认渠道为 Stable。策略保存在数据目录的私有 `update.json`，不进入共享会话或 DAG。配置、检查及手动应用命令见 [选择更新渠道](node.md#选择更新渠道)。旧版本没有更新器，首次使用须按下一节手动安装包含更新器的新包。
+
+匿名 GitHub API 请求被限流时，更新器明确报错并保留现版，自动更新在下轮再次检查。可在更新服务的运行环境提供 `GITHUB_TOKEN` 提高额度；token 只发往 `api.github.com`，不发给下载 CDN，也不写入配置或更新策略。后台服务不保证继承终端的临时环境变量。
+
+更新器只接受受管安装的 `current` 符号链接，下载对应平台的完整包，核对 SHA256、版本、target、源码身份和存储兼容声明后再安装。包和 checksum 都通过 GitHub HTTPS 下载，这依赖 GitHub 账户、仓库和 TLS 的可信性，不是独立发布签名。macOS 开发者签名和 notarization 仍未提供。
+
+每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序和随包 sidecar，不覆盖账户、身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。使用 Codex SDK 时，更新器在停服务前按新包的 lock 安装 sidecar 依赖，需要可用的 npm；安装失败保留现版，不复制旧 `node_modules`。Cursor SDK 不需要这一步。
+
+更新器只安装声明与当前数据格式兼容的包。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
+
+## 首次安装更新器或手动更换程序
+
+先停止 Node 用户服务，确认进程退出，再备份完整数据目录。备份包括身份和历史，应保持私密。不要让新旧程序同时使用同一数据目录。
+
+校验并解压新包到受管安装根目录下的独立目录，通过 `current` 符号链接选择程序。例如，先将解压后的包移动到 `$HOME/.local/share/vibeface/releases/<version>`，再创建指向它的 `$HOME/.local/share/vibeface/current`。保留整个包，不单独复制 Rust binary；更新器需要同包的脚本、sidecar 和 `BUILD-INFO.json`。
+
+用 `current/vibeface-node` 前台启动并核对原账户和历史，随后按 [后台运行说明](node.md#作为后台应用运行) 安装指向这一固定路径的用户服务。停止前台进程后再启动用户服务，不更改原数据目录。已有私有凭证启动脚本时，保留它，并让它通过 `current` 启动 Node。
+
+确认新程序可用后，再执行 `update configure` 设置渠道和自动更新。普通 `cargo install` 或直接复制 binary 不构成受管安装，更新器会要求先建立完整包与 `current` 链接。
+
+若版本改变存储格式且不声明兼容，应按该版本说明手动处理。需要数据恢复时，停止程序并恢复对应版本的完整备份，不直接让旧程序打开已经升级的数据。

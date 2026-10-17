@@ -224,7 +224,24 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
     )
     .await
     {
-        Ok(()) => next.run(request).await,
+        Ok(()) => {
+            let work = if matches!(
+                *request.method(),
+                Method::GET | Method::HEAD | Method::OPTIONS
+            ) {
+                Ok(None)
+            } else {
+                app.node.maintenance.enter().map(Some)
+            };
+            match work {
+                Ok(_work) => next.run(request).await,
+                Err(_) => ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "node is preparing an update; try again after it restarts".into(),
+                )
+                .into_response(),
+            }
+        }
         Err(error) => error.into_response(),
     };
     let headers = response.headers_mut();

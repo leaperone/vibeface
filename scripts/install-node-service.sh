@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 usage() {
   cat <<'USAGE'
 Usage: install-node-service.sh install --binary /absolute/vibeface-node --data-dir /absolute/data
+       install-node-service.sh install-updater --binary /install-root/current/vibeface-node --data-dir /absolute/data
        install-node-service.sh status
+       install-node-service.sh uninstall-updater
        install-node-service.sh uninstall
 
-Installs a user-level launchd agent on macOS or a systemd user service on Linux.
+Installs user-level launchd agents on macOS or systemd user services on Linux.
 Initialize the node before installing. Uninstall keeps all node data.
 USAGE
 }
@@ -30,22 +33,22 @@ while (($#)); do
     *) usage >&2; exit 2 ;;
   esac
 done
-case "$action" in install|status|uninstall) ;; *) usage >&2; exit 2 ;; esac
+case "$action" in install|install-updater|status|uninstall-updater|uninstall) ;; *) usage >&2; exit 2 ;; esac
 
-if [[ "$action" == install ]]; then
+if [[ "$action" == install || "$action" == install-updater ]]; then
   [[ "$binary" == /* && -x "$binary" ]] || { echo 'An absolute executable --binary is required.' >&2; exit 2; }
   [[ "$data_dir" == /* && -f "$data_dir/config.json" && -f "$data_dir/identity.json" ]] || { echo 'An initialized absolute --data-dir is required.' >&2; exit 2; }
   case "$binary$data_dir" in *$'\n'*|*$'\r'*) echo 'Paths must not contain line breaks.' >&2; exit 2 ;; esac
+  log_prefix='service'
+  [[ "$action" != install-updater ]] || log_prefix='update'
+  if [[ "$action" == install-updater || "$(uname -s)" == Darwin ]]; then
+    touch "$data_dir/$log_prefix.stdout.log" "$data_dir/$log_prefix.stderr.log"
+    chmod 600 "$data_dir/$log_prefix.stdout.log" "$data_dir/$log_prefix.stderr.log"
+  fi
 fi
 
 xml_escape() {
-  local value="$1"
-  value="${value//&/\&amp;}"
-  value="${value//</\&lt;}"
-  value="${value//>/\&gt;}"
-  value="${value//\"/\&quot;}"
-  value="${value//\'/\&apos;}"
-  printf '%s' "$value"
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\\&apos;/g"
 }
 
 systemd_escape() {
@@ -54,6 +57,12 @@ systemd_escape() {
   value="${value//\"/\\\"}"
   value="${value//%/%%}"
   printf '%s' "$value"
+}
+
+systemd_path_escape() {
+  # Path directives preserve shell quotes and backslashes literally.
+  local value="$1"
+  printf '%s' "${value//%/%%}"
 }
 
 systemd_exec_escape() {
@@ -66,25 +75,53 @@ systemd_exec_escape() {
 case "$(uname -s)" in
   Darwin)
     label='com.leaperone.vibeface.node'
+    update_label='com.leaperone.vibeface.update'
     domain="gui/$(id -u)"
     service_dir="$HOME/Library/LaunchAgents"
     service="$service_dir/$label.plist"
+    update_service="$service_dir/$update_label.plist"
     case "$action" in
-      install)
+      install|install-updater)
         mkdir -p "$service_dir"
         temp="$(mktemp "$service_dir/.vibeface.XXXXXX")"
         trap 'rm -f "$temp"' EXIT
+        if [[ "$action" == install-updater ]]; then
+          label="$update_label"
+          service="$update_service"
+        fi
         cat > "$temp" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>$label</string>
-<key>ProgramArguments</key><array><string>$(xml_escape "$binary")</string><string>serve</string><string>--data-dir</string><string>$(xml_escape "$data_dir")</string></array>
+<key>ProgramArguments</key><array><string>$(xml_escape "$binary")</string>
+PLIST
+        if [[ "$action" == install-updater ]]; then
+          cat >> "$temp" <<PLIST
+<string>update</string><string>apply</string><string>--automatic</string>
+PLIST
+        else
+          cat >> "$temp" <<PLIST
+<string>serve</string>
+PLIST
+        fi
+        cat >> "$temp" <<PLIST
+<string>--data-dir</string><string>$(xml_escape "$data_dir")</string></array>
 <key>WorkingDirectory</key><string>$(xml_escape "$(dirname "$binary")")</string>
 <key>RunAtLoad</key><true/>
+PLIST
+        if [[ "$action" == install-updater ]]; then
+          cat >> "$temp" <<PLIST
+<key>StartInterval</key><integer>3600</integer>
+PLIST
+        else
+          cat >> "$temp" <<PLIST
 <key>KeepAlive</key><true/>
-<key>StandardOutPath</key><string>$(xml_escape "$data_dir/service.stdout.log")</string>
-<key>StandardErrorPath</key><string>$(xml_escape "$data_dir/service.stderr.log")</string>
+PLIST
+        fi
+        cat >> "$temp" <<PLIST
+<key>StandardOutPath</key><string>$(xml_escape "$data_dir/$log_prefix.stdout.log")</string>
+<key>StandardErrorPath</key><string>$(xml_escape "$data_dir/$log_prefix.stderr.log")</string>
 <key>Umask</key><integer>63</integer>
 </dict></plist>
 PLIST
@@ -93,27 +130,81 @@ PLIST
         launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
         mv "$temp" "$service"
         launchctl bootstrap "$domain" "$service"
-        launchctl kickstart "$domain/$label"
+        if [[ "$action" == install ]]; then launchctl kickstart "$domain/$label"; fi
         printf 'Installed %s\n' "$service"
         ;;
-      status) launchctl print "$domain/$label" ;;
-      uninstall)
-        launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
-        rm -f "$service"
-        printf 'Removed service; node data was kept.\n'
+      status)
+        status_code=0
+        launchctl print "$domain/$label" || status_code=$?
+        if ! launchctl print "$domain/$update_label"; then
+          if [[ -f "$update_service" ]]; then
+            printf 'Updater is installed but not loaded.\n'
+          else
+            printf 'Updater is not installed.\n'
+          fi
+        fi
+        exit "$status_code"
+        ;;
+      uninstall|uninstall-updater)
+        launchctl bootout "$domain/$update_label" >/dev/null 2>&1 || true
+        rm -f "$update_service"
+        if [[ "$action" == uninstall ]]; then
+          launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+          rm -f "$service"
+        fi
+        printf 'Removed requested services; node data was kept.\n'
         ;;
     esac
     ;;
   Linux)
     service_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     service="$service_dir/vibeface-node.service"
+    update_service="$service_dir/vibeface-update.service"
+    update_timer="$service_dir/vibeface-update.timer"
     case "$action" in
-      install)
+      install|install-updater)
         command -v systemctl >/dev/null || { echo 'systemd user services are unavailable on this host.' >&2; exit 1; }
         mkdir -p "$service_dir"
         temp="$(mktemp "$service_dir/.vibeface.XXXXXX")"
         trap 'rm -f "$temp"' EXIT
-        cat > "$temp" <<UNIT
+        if [[ "$action" == install-updater ]]; then
+          cat > "$temp" <<UNIT
+[Unit]
+Description=Update Vibeface personal node
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart="$(systemd_exec_escape "$binary")" update apply --automatic --data-dir "$(systemd_exec_escape "$data_dir")"
+WorkingDirectory=$(systemd_path_escape "$(dirname "$binary")")
+StandardOutput=append:$(systemd_path_escape "$data_dir/update.stdout.log")
+StandardError=append:$(systemd_path_escape "$data_dir/update.stderr.log")
+UMask=0077
+UNIT
+          chmod 600 "$temp"
+          mv "$temp" "$update_service"
+          temp="$(mktemp "$service_dir/.vibeface.XXXXXX")"
+          cat > "$temp" <<UNIT
+[Unit]
+Description=Check for Vibeface updates hourly
+
+[Timer]
+OnBootSec=1h
+OnUnitActiveSec=1h
+Persistent=true
+Unit=vibeface-update.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+          chmod 600 "$temp"
+          mv "$temp" "$update_timer"
+          systemctl --user daemon-reload
+          systemctl --user enable --now vibeface-update.timer
+          printf 'Installed %s and %s\n' "$update_service" "$update_timer"
+        else
+          cat > "$temp" <<UNIT
 [Unit]
 Description=Vibeface personal node
 After=network-online.target
@@ -121,7 +212,7 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart="$(systemd_exec_escape "$binary")" serve --data-dir "$(systemd_exec_escape "$data_dir")"
-WorkingDirectory="$(systemd_escape "$(dirname "$binary")")"
+WorkingDirectory=$(systemd_path_escape "$(dirname "$binary")")
 Restart=on-failure
 RestartSec=3
 UMask=0077
@@ -129,18 +220,36 @@ UMask=0077
 [Install]
 WantedBy=default.target
 UNIT
-        chmod 600 "$temp"
-        mv "$temp" "$service"
-        systemctl --user daemon-reload
-        systemctl --user enable --now vibeface-node.service
-        printf 'Installed %s\n' "$service"
+          chmod 600 "$temp"
+          mv "$temp" "$service"
+          systemctl --user daemon-reload
+          systemctl --user enable --now vibeface-node.service
+          printf 'Installed %s\n' "$service"
+        fi
         ;;
-      status) systemctl --user status vibeface-node.service ;;
-      uninstall)
-        systemctl --user disable --now vibeface-node.service >/dev/null 2>&1 || true
-        rm -f "$service"
+      status)
+        status_code=0
+        systemctl --user status vibeface-node.service || status_code=$?
+        if ! systemctl --user status vibeface-update.timer; then
+          if [[ -f "$update_timer" ]]; then
+            printf 'Updater is installed but its timer is not active.\n'
+          else
+            printf 'Updater is not installed.\n'
+          fi
+        fi
+        systemctl --user status vibeface-update.service || true
+        exit "$status_code"
+        ;;
+      uninstall|uninstall-updater)
+        systemctl --user disable --now vibeface-update.timer >/dev/null 2>&1 || true
+        systemctl --user stop vibeface-update.service >/dev/null 2>&1 || true
+        rm -f "$update_service" "$update_timer"
+        if [[ "$action" == uninstall ]]; then
+          systemctl --user disable --now vibeface-node.service >/dev/null 2>&1 || true
+          rm -f "$service"
+        fi
         systemctl --user daemon-reload
-        printf 'Removed service; node data was kept.\n'
+        printf 'Removed requested services; node data was kept.\n'
         ;;
     esac
     ;;

@@ -169,7 +169,7 @@ fn finish(
         .as_ref()
         .is_some_and(|a| a.trigger == invocation.trigger)
     {
-        session.active = None;
+        session.active = (invocation.state == InvocationState::Unknown).then(|| invocation.clone());
         if invocation.state == InvocationState::Unknown {
             session.native_id = None;
         }
@@ -183,12 +183,33 @@ fn invocation_value(invocation: &Invocation) -> Value {
         "result":if invocation.state == InvocationState::Completed { json!({"message_id":invocation.message_id}) } else { Value::Null }})
 }
 
+pub(crate) fn maintenance_idle(store: &Store, network: &str) -> Result<()> {
+    for scope in store.scopes(network)? {
+        if let Some(active) = load_session(store, network, &scope)?.active {
+            let invocation: Invocation = serde_json::from_value(
+                store
+                    .local_value(network, &key("invocation", &scope, &active.trigger))?
+                    .context("missing active scheduler invocation")?,
+            )?;
+            ensure!(
+                !matches!(
+                    invocation.state,
+                    InvocationState::Running | InvocationState::Unknown
+                ),
+                crate::maintenance::Busy("scheduler invocation requires reconciliation".into())
+            );
+        }
+    }
+    Ok(())
+}
+
 pub async fn status(
     node: &Runtime,
     network: &str,
     conversation: &str,
     trigger: &str,
 ) -> Result<Value> {
+    let _work = node.maintenance.enter()?;
     let mut store = node.store.lock().await;
     let Some(value) = store.local_value(network, &key("invocation", conversation, trigger))? else {
         return Ok(json!({"state":"not_found","trigger":trigger,"result":null}));
@@ -207,6 +228,7 @@ pub async fn run(
     conversation: String,
     trigger: String,
 ) -> Result<Value> {
+    let _work = node.maintenance.enter()?;
     ensure!(
         access
             .conversation_id
@@ -645,6 +667,65 @@ mod tests {
             )?
             .2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_scheduler_blocks_updates_until_new_user_work_completes() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let network = identity.network_id()?;
+        let mut store = Store::open(":memory:")?;
+        store.install_trust_bundle(
+            &network,
+            &identity
+                .sign_trust_bundle(1, vec![identity.certificate(vec![NodeRole::Scheduler])?])?,
+        )?;
+        store.append_event(
+            &identity,
+            &network,
+            "chat",
+            EventBody::ConversationCreated {
+                title: "test".into(),
+            },
+            vec![],
+            1,
+        )?;
+        let (mut invocation, _, _) = claim(
+            &mut store,
+            &network,
+            "chat",
+            "old-user-message",
+            "boot-a",
+            "sdk",
+        )?;
+        let mut session = load_session(&store, &network, "chat")?;
+        session.native_id = Some("uncertain-sdk-session".into());
+        save_session(&mut store, &network, "chat", &session)?;
+        invocation.state = InvocationState::Unknown;
+        finish(&mut store, &network, "chat", &invocation)?;
+        assert!(maintenance_idle(&store, &network).is_err());
+        let (old, native, fresh) = claim(
+            &mut store,
+            &network,
+            "chat",
+            "old-user-message",
+            "boot-b",
+            "sdk",
+        )?;
+        assert!(old.state == InvocationState::Unknown && native.is_none() && !fresh);
+        let (mut next, native, fresh) = claim(
+            &mut store,
+            &network,
+            "chat",
+            "new-user-message",
+            "boot-b",
+            "sdk",
+        )?;
+        assert!(fresh && native.is_none());
+        assert!(maintenance_idle(&store, &network).is_err());
+        next.state = InvocationState::Completed;
+        finish(&mut store, &network, "chat", &next)?;
+        maintenance_idle(&store, &network)?;
         Ok(())
     }
 
