@@ -2487,6 +2487,7 @@ dependencies = [
  "futures-util",
  "hex",
  "mdns-sd",
+ "p256",
  "rand 0.8.8",
  "reqwest",
  "rusqlite",
