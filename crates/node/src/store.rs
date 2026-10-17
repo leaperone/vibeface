@@ -744,6 +744,34 @@ impl Store {
         Ok(Some(job))
     }
 
+    pub(crate) fn fence_manager_permission(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        target: &str,
+        trigger: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        self.update_scheduler_attempt(
+            network,
+            conversation,
+            target,
+            trigger,
+            attempt_id,
+            |job, session| {
+                let attempt = job.state.attempt().context("manager attempt missing")?;
+                if attempt.permission_version == session.permission_version {
+                    session.permission_version = session
+                        .permission_version
+                        .checked_add(1)
+                        .context("scheduler permission version overflow")?;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
     pub fn manager_attempt_allowed(
         &self,
         network: &str,
@@ -1807,6 +1835,7 @@ impl Store {
                 result: serde_json::from_str(&result)?,
             });
         }
+        followup::validate_manager_dispatch_from(&tx, network_id, request)?;
         validate_operation_binding_from(&tx, request)?;
         for event in &complete.events {
             let hash = digest(serde_json::to_string(event)?.as_bytes());
@@ -3134,7 +3163,7 @@ mod tests {
                 .context(&network, "conversation", &[])?
                 .events
                 .iter()
-                .any(|event| matches!(event.body, EventBody::DecisionRecorded { .. }))
+                .any(|event| matches!(&event.body, EventBody::DecisionRecorded { decision_id, .. } if decision_id == &format!("decision-{}", claimed.job.message_id)))
         );
         store
             .connection
@@ -3579,6 +3608,7 @@ mod tests {
             action: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
             resources: vec![],
             binding: None,
+            manager_authority: None,
         };
         store.bind_test_operation(owner, &mut request)?;
         Ok(request)

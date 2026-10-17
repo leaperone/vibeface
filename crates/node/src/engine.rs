@@ -18,6 +18,22 @@ pub enum ExecutorKind {
     CursorAgent,
 }
 
+impl ExecutorKind {
+    pub fn capabilities(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &[
+                "open",
+                "send",
+                "read",
+                "steer",
+                "interrupt",
+                "respond_request",
+            ],
+            Self::ClaudeCode | Self::CursorAgent => &["open", "send"],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {

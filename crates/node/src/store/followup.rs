@@ -543,6 +543,30 @@ pub(super) fn validate_followup_result_from(
     Ok(policy)
 }
 
+pub(super) fn validate_manager_dispatch_from(
+    connection: &Connection,
+    network: &str,
+    request: &OperationRequest,
+) -> Result<()> {
+    let Some(authority) = &request.manager_authority else {
+        return Ok(());
+    };
+    let policy = validate_followup_result_from(
+        connection,
+        network,
+        &request.conversation_id,
+        &authority.trigger,
+        &authority.scheduler_node,
+    )?;
+    ensure!(
+        policy.version == authority.followup_version
+            && policy.mode == FollowupMode::Continue
+            && request.task_id.as_deref() == Some(policy.task_id.as_str()),
+        "autonomous dispatch permission was revoked or changed"
+    );
+    Ok(())
+}
+
 impl Store {
     pub fn report_intent_head(
         &self,
@@ -560,6 +584,15 @@ impl Store {
         task: &str,
     ) -> Result<FollowupPolicy> {
         followup_policy_from(&self.connection, network, scope, task)
+    }
+
+    pub fn historical_followup_policy(
+        &self,
+        network: &str,
+        scope: &str,
+        task: &str,
+    ) -> Result<FollowupPolicy> {
+        policy_from(&self.connection, network, scope, task, false)
     }
 
     pub fn validate_followup_result(
@@ -919,6 +952,7 @@ mod tests {
             action: json!({"type":"send","text":"work"}),
             resources: vec![],
             binding: Some(binding),
+            manager_authority: None,
         };
         store.append_event(
             identity,
@@ -1131,6 +1165,28 @@ mod tests {
                 )
                 .is_err()
         );
+        let mut accepted: OperationRequest = store
+            .context(&network, "chat", &[])?
+            .events
+            .into_iter()
+            .find_map(|event| match event.body {
+                EventBody::DispatchRecorded { action, .. } => serde_json::from_value(action).ok(),
+                _ => None,
+            })
+            .context("original dispatch missing")?;
+        store.install_binding(accepted.binding.as_ref().unwrap())?;
+        accepted.operation_id = "accepted-before-revocation".into();
+        accepted.expected_revision = 0;
+        accepted.basis_heads = store.heads(&network, "chat")?;
+        accepted.manager_authority = Some(ManagerDispatchAuthority {
+            scheduler_node: node.clone(),
+            trigger: completion.hash.clone(),
+            followup_version: 1,
+        });
+        assert_eq!(
+            store.accept_operation(&network, &accepted)?.state,
+            OperationState::Accepted
+        );
         store.set_task_followup(
             &identity,
             &network,
@@ -1167,6 +1223,16 @@ mod tests {
                 )
                 .is_err()
         );
+        assert_eq!(
+            store.accept_operation(&network, &accepted)?.state,
+            OperationState::Accepted
+        );
+        let mut delayed = accepted.clone();
+        delayed.operation_id = "new-arrival-after-revocation".into();
+        delayed.expected_revision = 1;
+        let rejected = store.accept_operation(&network, &delayed).unwrap_err();
+        assert!(rejected.to_string().contains("follow-up"), "{rejected:#}");
+        assert!(store.operation(&network, &delayed.operation_id)?.is_none());
         assert_eq!(store.followup_policy(&network, "chat", "task")?.version, 2);
         assert!(store.event(&network, &completion.hash)?.is_some());
         Ok(())

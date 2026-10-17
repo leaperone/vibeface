@@ -645,6 +645,7 @@ impl Runtime {
             action: native_action,
             resources: vec![],
             binding: Some(proof),
+            manager_authority: None,
         };
         {
             let mut store = self.store.lock().await;

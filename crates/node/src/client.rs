@@ -68,6 +68,7 @@ struct Session {
     public_key: String,
     subscribed: bool,
     recovery: Option<Recovery>,
+    observation: Option<crate::runtime::ObservationGuard>,
 }
 
 pub struct Client {
@@ -171,6 +172,7 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
         public_key,
         subscribed: false,
         recovery: None,
+        observation: None,
     };
     let mut events = node.events.subscribe();
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
@@ -208,7 +210,8 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
             _ = heartbeat.tick() => {
                 ensure!(received.elapsed() < IDLE_TIMEOUT, "client channel idle");
                 ensure!(partial_started.is_none_or(|at| at.elapsed() < IDLE_TIMEOUT), "client fragmented message timed out");
-                if session.subscribed { current_view(&node, &session).await?.principal(&session.subject_id)?; }
+                if session.subscribed || session.observation.is_some() { current_view(&node, &session).await?.principal(&session.subject_id)?; }
+                if let Some(observation) = &session.observation { observation.refresh(); }
                 tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.send(Message::Ping(Vec::new().into()))).await.context("client heartbeat send timed out")??;
             }
         }
@@ -271,15 +274,30 @@ async fn dispatch(
                 .principal(&session.subject_id)?;
             let mut params = params;
             bind_client_identity(&mut params, &principal.subject_id)?;
-            node.rpc(
-                Access {
-                    network_id: principal.network_id,
-                    human: true,
-                    conversation_id: None,
-                },
-                params,
-            )
-            .await
+            let watched_scope = (params["method"] == "conversation")
+                .then(|| params["conversation_id"].as_str().map(String::from))
+                .flatten();
+            let access = Access {
+                network_id: principal.network_id,
+                human: true,
+                conversation_id: None,
+                manager: None,
+            };
+            let mut result = node.rpc(access.clone(), params).await?;
+            if let Some(scope) = watched_scope {
+                session.observation.take();
+                let targets = result["observation_targets"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str().map(String::from))
+                    .collect();
+                match node.observe_conversation(&access, &scope, targets).await {
+                    Ok(observation) => session.observation = Some(observation),
+                    Err(error) => result["observation_error"] = json!(error.to_string()),
+                }
+            }
+            Ok(result)
         }
         "prepare_genesis" => {
             ensure!(

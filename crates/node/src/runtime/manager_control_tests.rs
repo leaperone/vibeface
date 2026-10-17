@@ -75,6 +75,7 @@ fn operation(access: &Access) -> OperationRequest {
         action: json!({"type":"send","text":"continue"}),
         resources: vec![],
         binding: None,
+        manager_authority: None,
     }
 }
 

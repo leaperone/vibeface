@@ -8,6 +8,7 @@ use crate::{
     store::Store,
 };
 use anyhow::{Context as _, Result, ensure};
+use futures_util::FutureExt;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -37,9 +38,18 @@ pub(crate) fn maintenance_idle(store: &Store, network: &str) -> Result<()> {
 }
 
 fn invocation_value(job: &SchedulerJob, network: &str) -> Value {
-    let mut value =
-        serde_json::to_value(job.receipt(network)).expect("scheduler receipt serializes");
-    value["message_id"] = json!(job.message_id);
+    let mut value = serde_json::to_value(job).expect("scheduler job serializes");
+    value["network_id"] = json!(network);
+    value["read_only"] = json!(job.state.attempt().is_some_and(|attempt| attempt.read_only));
+    value["reply_message_id"] = if matches!(job.state, JobState::Completed { .. }) {
+        json!(job.message_id)
+    } else {
+        Value::Null
+    };
+    value["error"] = match &job.state {
+        JobState::Failed { detail, .. } | JobState::Unknown { detail, .. } => json!(detail),
+        _ => Value::Null,
+    };
     value["result"] = if matches!(job.state, JobState::Completed { .. }) {
         json!({"message_id":job.message_id})
     } else {
@@ -124,7 +134,7 @@ pub async fn run(
     let mut started = false;
     let mut tools_fenced = false;
     let mut registered = false;
-    let outcome: Result<Value> = async {
+    let outcome: Result<Value> = std::panic::AssertUnwindSafe(async {
         let (context, tasks, facts, targets) = {
             let store = node.store.lock().await;
             let context = store.context(&network, &conversation, &job.basis_heads)?;
@@ -154,7 +164,7 @@ pub async fn run(
         if job.kind == TriggerKind::Autonomous {
             node.store.lock().await.reserve_budget(&network, &utc_day(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()), 1, node.config.daily_decision_limit)?;
         }
-        let cancel = node.register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, attempt.read_only).await;
+        let cancel = node.register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, attempt.read_only).await?;
         registered = true;
         let persist_node = node.clone();
         let persist_network = network.clone();
@@ -174,10 +184,10 @@ pub async fn run(
             persist_node.store.lock().await.save_scheduler_native_id(&persist_network, &persist_conversation, &persist_target, &persist_trigger, &persist_attempt, &id)
         }, cancel, move |progress| {
             let sequence = progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let _ = progress_node.events.send(Update { network_id: progress_network.clone(), payload: json!({
+            progress_node.publish_progress(&progress_network, json!({
                 "type":"manager_progress", "conversation_id":progress_conversation,
-                "trigger":progress_trigger, "invocation_id":progress_attempt, "source":"manager", "sequence":sequence, "progress":progress,
-            }) });
+                "trigger":progress_trigger, "invocation_id":progress_attempt, "source":progress_node.identity.node_id().ok(), "source_node":progress_node.identity.node_id().ok(), "sequence":sequence, "progress":progress,
+            }));
             async { Ok(()) }
         }).await?;
         node.fence_manager_attempt(&attempt.id).await?;
@@ -203,7 +213,7 @@ pub async fn run(
         ];
         job = node.store.lock().await.finish_job(&node.identity, &network, &conversation, &target, &trigger, &attempt.id, JobOutcome::Completed, events, crate::runtime::now_ms())?;
         Ok(invocation_value(&job, &network))
-    }.await;
+    }).catch_unwind().await.unwrap_or_else(|_| Err(anyhow::anyhow!("management attempt panicked; reconcile its outcome")));
     let final_result: Result<Value> = async {
         if let Err(error) = outcome {
             let cancellation = error
