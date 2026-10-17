@@ -28,6 +28,12 @@ fn require(condition: bool, reason: &str) -> Result<()> {
 pub enum PasskeyPurpose {
     RegisterAuthenticator,
     EnrollDevice,
+    ManageAuthenticators,
+}
+impl PasskeyPurpose {
+    fn is_assertion(&self) -> bool {
+        matches!(self, Self::EnrollDevice | Self::ManageAuthenticators)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -155,7 +161,7 @@ impl PendingPasskey {
         for id in &credential_ids {
             require(!decode(id, 1024)?.is_empty(), "empty passkey credential ID")?;
         }
-        if envelope.purpose == PasskeyPurpose::EnrollDevice {
+        if envelope.purpose.is_assertion() {
             require(
                 (ceremony == AuthenticationCeremony::Discoverable) == credential_ids.is_empty(),
                 "invalid allowed credentials for ceremony",
@@ -205,7 +211,7 @@ impl PendingPasskey {
     }
     pub fn authentication_options(&self) -> Result<serde_json::Value> {
         require(
-            self.envelope.purpose == PasskeyPurpose::EnrollDevice,
+            self.envelope.purpose.is_assertion(),
             "wrong assertion purpose",
         )?;
         Ok(
@@ -226,7 +232,7 @@ impl PendingPasskey {
                 "invalid stored passkey credential ID",
             )?;
         }
-        if self.envelope.purpose == PasskeyPurpose::EnrollDevice {
+        if self.envelope.purpose.is_assertion() {
             require(
                 (self.ceremony == AuthenticationCeremony::Discoverable)
                     == self.credential_ids.is_empty(),
@@ -669,7 +675,11 @@ pub fn verify_passkey_assertion(
     response: &AssertionResponse,
     now_ms: u64,
 ) -> Result<VerifiedPasskeyAssertion> {
-    pending.validate(PasskeyPurpose::EnrollDevice, now_ms)?;
+    require(
+        pending.envelope.purpose.is_assertion(),
+        "wrong assertion purpose",
+    )?;
+    pending.validate(pending.envelope.purpose.clone(), now_ms)?;
     require(
         credential.account == pending.envelope.account
             && credential.relying_party == pending.relying_party
@@ -883,9 +893,7 @@ pub(crate) mod tests {
             RelyingParty::new("client.example", "https://client.example").unwrap(),
             &[7; 32],
             ceremony,
-            if purpose == PasskeyPurpose::EnrollDevice
-                && ceremony == AuthenticationCeremony::IdentifiedAccount
-            {
+            if purpose.is_assertion() && ceremony == AuthenticationCeremony::IdentifiedAccount {
                 vec![URL_SAFE_NO_PAD.encode([9; 32])]
             } else {
                 vec![]
@@ -1163,6 +1171,23 @@ pub(crate) mod tests {
                 "accepted flags {flags}"
             );
         }
+        let mut management = p.clone();
+        management.envelope.purpose = PasskeyPurpose::ManageAuthenticators;
+        let management_assertion = assertion(
+            &management,
+            auth(&management, 0x0d, 0),
+            client(&management, "webauthn.get"),
+            None,
+        );
+        assert!(management.authentication_options().is_ok());
+        assert_eq!(
+            verify_passkey_assertion(&management, &credential, &management_assertion, NOW)
+                .unwrap()
+                .envelope()
+                .purpose,
+            PasskeyPurpose::ManageAuthenticators
+        );
+        assert!(verify_passkey_assertion(&p, &credential, &management_assertion, NOW).is_err());
         let mut counted = credential.clone();
         counted.state.sign_count = 3;
         assert!(
