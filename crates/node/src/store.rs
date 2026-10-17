@@ -732,6 +732,9 @@ impl Store {
         let key = scheduler_key("job", conversation, target, &trigger);
         let mut job: SchedulerJob =
             scheduler_load(&tx, network, &key)?.context("missing active scheduler job")?;
+        if scheduler_publication_from(&tx, network, &job)?.is_some() {
+            return Ok(Some(job));
+        }
         if let JobState::Claimed { attempt } | JobState::Running { attempt } = &job.state {
             job.state = JobState::Cancelling {
                 attempt: attempt.clone(),
@@ -792,6 +795,10 @@ impl Store {
         let Some(attempt) = job.state.attempt() else {
             return Ok(false);
         };
+        if scheduler_publication_from(&self.connection, network, &job)?.is_some() {
+            return Ok(false);
+        }
+
         Ok(session.active.as_deref() == Some(trigger)
             && attempt.id == attempt_id
             && attempt.permission_version == session.permission_version
@@ -818,19 +825,23 @@ impl Store {
         events: Vec<(EventBody, Vec<BlobRef>)>,
         created_at_ms: i64,
     ) -> Result<SchedulerJob> {
+        ensure!(
+            identity.node_id()? == target,
+            "terminal publication requires its target scheduler identity"
+        );
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut session = load_scheduler_session(&tx, network, conversation, target)?;
+        let session = load_scheduler_session(&tx, network, conversation, target)?;
         let key = scheduler_key("job", conversation, target, trigger);
-        let mut job: SchedulerJob =
+        let job: SchedulerJob =
             scheduler_load(&tx, network, &key)?.context("scheduler job missing")?;
-        let attempt = job
-            .state
-            .attempt()
-            .context("scheduler attempt missing")?
-            .clone();
-        ensure!(attempt.id == attempt_id, "scheduler attempt does not match");
+        ensure!(
+            job.state
+                .attempt()
+                .is_some_and(|attempt| attempt.id == attempt_id),
+            "scheduler attempt does not match"
+        );
         if matches!(
             job.state,
             JobState::Completed { .. }
@@ -844,53 +855,107 @@ impl Store {
             session.active.as_deref() == Some(trigger),
             "scheduler attempt is no longer active"
         );
-        if matches!(outcome, JobOutcome::Completed) {
-            ensure!(
-                !matches!(job.state, JobState::Cancelling { .. }),
-                "cancelled manager credentials cannot complete a reply"
-            );
-            ensure!(events.iter().any(|(body, _)| matches!(body, EventBody::DecisionRecorded { decision_id, .. } if decision_id == &format!("decision-{}", job.message_id))), "completed scheduler job requires its final decision");
-            ensure!(events.iter().any(|(body, _)| matches!(body, EventBody::MessagePosted { message_id, role, .. } if message_id == &job.message_id && role == "assistant")), "completed scheduler job requires its final reply");
-        }
-        for (body, blobs) in events {
-            append_event_from(
-                &tx,
-                identity,
-                network,
-                conversation,
-                body,
-                blobs,
+        if scheduler_publication_from(&tx, network, &job)?.is_none() {
+            validate_scheduler_terminal(&job, &outcome, &events)?;
+            let marker = SchedulerTerminalPublication {
+                version: SCHEDULING_VERSION,
+                job: job.clone(),
+                outcome,
+                events,
                 created_at_ms,
+            };
+            scheduler_save(
+                &tx,
+                network,
+                &scheduler_key("publication", conversation, target, trigger),
+                &marker,
             )?;
         }
-        job.state = match outcome {
-            JobOutcome::Completed => JobState::Completed { attempt },
-            JobOutcome::Failed(detail) => JobState::Failed { attempt, detail },
-            JobOutcome::Cancelled(evidence) => {
-                ensure!(!evidence.is_empty(), "cancellation evidence is required");
-                JobState::Cancelled { attempt, evidence }
-            }
-            JobOutcome::Unknown(detail) => {
-                session.unresolved.insert(trigger.into());
-                session.native_id = None;
-                session.permission_version = session
-                    .permission_version
-                    .checked_add(1)
-                    .context("scheduler permission version overflow")?;
-                JobState::Unknown {
-                    attempt,
-                    detail,
-                    fenced: false,
-                }
-            }
-        };
-        if !matches!(job.state, JobState::Unknown { .. }) {
-            session.active = None;
-        }
-        scheduler_save(&tx, network, &key, &job)?;
-        save_scheduler_session(&tx, network, &session)?;
         tx.commit()?;
-        Ok(job)
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let published = publish_scheduler_terminal_from(&tx, identity, network, &job)?;
+        tx.commit()?;
+        Ok(published.job)
+    }
+
+    pub fn scheduler_publication_pending(
+        &self,
+        network: &str,
+        conversation: &str,
+        target: &str,
+        trigger: &str,
+    ) -> Result<bool> {
+        let Some(job) = self.scheduler_job(network, conversation, trigger, target)? else {
+            return Ok(false);
+        };
+        Ok(scheduler_publication_from(&self.connection, network, &job)?.is_some())
+    }
+
+    pub fn flush_scheduler_publications(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        target: &str,
+    ) -> Result<SchedulerPublicationBatch> {
+        ensure!(
+            identity.node_id()? == target,
+            "terminal publication requires its target scheduler identity"
+        );
+        let mut statement = self.connection.prepare("SELECT value FROM local_values WHERE network_id=? AND key LIKE 'scheduler:v1:publication:%'")?;
+        let encoded = statement
+            .query_map([network], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut markers = Vec::new();
+        for value in encoded {
+            let marker: SchedulerTerminalPublication = serde_json::from_str(&value)?;
+            ensure!(
+                marker.version == SCHEDULING_VERSION,
+                "unsupported scheduler publication version"
+            );
+            if marker.job.target_node == target {
+                markers.push(marker);
+            }
+        }
+        let mut batch = SchedulerPublicationBatch::default();
+        for marker in markers {
+            let publication: Result<Option<SchedulerPublication>> = (|| {
+                let tx = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let job: SchedulerJob = scheduler_load(
+                    &tx,
+                    network,
+                    &scheduler_key(
+                        "job",
+                        &marker.job.conversation_id,
+                        target,
+                        &marker.job.trigger,
+                    ),
+                )?
+                .context("scheduler publication job missing")?;
+                if scheduler_publication_from(&tx, network, &job)?.is_none() {
+                    return Ok(None);
+                }
+                if !scheduler_scope_publishable(&tx, network, &job.conversation_id)? {
+                    return Ok(None);
+                }
+                let publication = publish_scheduler_terminal_from(&tx, identity, network, &job)?;
+                tx.commit()?;
+                Ok(Some(publication))
+            })();
+            match publication {
+                Ok(Some(publication)) => batch.published.push(publication),
+                Ok(None) => {}
+                Err(error) => batch.errors.push(format!(
+                    "{}:{}: {error:#}",
+                    marker.job.conversation_id, marker.job.trigger
+                )),
+            }
+        }
+        Ok(batch)
     }
 
     /// Runtime calls this only after old credentials are fenced and in-flight tools are accounted for.
@@ -2222,6 +2287,159 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
+fn scheduler_publication_from(
+    connection: &Connection,
+    network: &str,
+    job: &SchedulerJob,
+) -> Result<Option<SchedulerTerminalPublication>> {
+    let marker: Option<SchedulerTerminalPublication> = scheduler_load(
+        connection,
+        network,
+        &scheduler_key(
+            "publication",
+            &job.conversation_id,
+            &job.target_node,
+            &job.trigger,
+        ),
+    )?;
+    if let Some(marker) = &marker {
+        ensure!(
+            marker.version == SCHEDULING_VERSION && marker.job == *job,
+            "scheduler publication does not match its exact invocation"
+        );
+    }
+    Ok(marker)
+}
+
+fn validate_scheduler_terminal(
+    job: &SchedulerJob,
+    outcome: &JobOutcome,
+    events: &[(EventBody, Vec<BlobRef>)],
+) -> Result<()> {
+    match outcome {
+        JobOutcome::Completed => {
+            ensure!(
+                !matches!(job.state, JobState::Cancelling { .. }),
+                "cancelled manager credentials cannot complete a reply"
+            );
+            ensure!(events.iter().filter(|(body, _)| matches!(body, EventBody::DecisionRecorded { decision_id, .. } if decision_id == &format!("decision-{}", job.message_id))).count() == 1, "completed scheduler job requires one final decision");
+            ensure!(events.iter().filter(|(body, _)| matches!(body, EventBody::MessagePosted { message_id, role, .. } if message_id == &job.message_id && role == "assistant")).count() == 1, "completed scheduler job requires one final reply");
+        }
+        JobOutcome::Cancelled(evidence) => {
+            ensure!(!evidence.is_empty(), "cancellation evidence is required")
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn scheduler_scope_publishable(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+) -> Result<bool> {
+    let events = load_events_from(connection, network)?;
+    for hash in closure_hashes(&events, &heads_from_events(&events, conversation)) {
+        let Some(stored) = events.get(&hash) else {
+            return Ok(false);
+        };
+        if stored.status != "ready" {
+            return Ok(false);
+        }
+        for blob in &stored.event.blobs {
+            if !has_blob_from(connection, network, blob)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn publish_scheduler_terminal_from(
+    connection: &Connection,
+    identity: &LocalIdentity,
+    network: &str,
+    expected: &SchedulerJob,
+) -> Result<SchedulerPublication> {
+    let key = scheduler_key(
+        "job",
+        &expected.conversation_id,
+        &expected.target_node,
+        &expected.trigger,
+    );
+    let mut job: SchedulerJob =
+        scheduler_load(connection, network, &key)?.context("scheduler publication job missing")?;
+    ensure!(
+        job == *expected,
+        "scheduler invocation changed before terminal publication"
+    );
+    let marker = scheduler_publication_from(connection, network, &job)?
+        .context("scheduler publication marker missing")?;
+    validate_scheduler_terminal(&job, &marker.outcome, &marker.events)?;
+    let mut session =
+        load_scheduler_session(connection, network, &job.conversation_id, &job.target_node)?;
+    ensure!(
+        session.active.as_deref() == Some(&job.trigger),
+        "scheduler publication invocation is no longer active"
+    );
+    let attempt = job
+        .state
+        .attempt()
+        .context("scheduler publication attempt missing")?
+        .clone();
+    let mut event_hashes = Vec::new();
+    for (body, blobs) in marker.events {
+        event_hashes.push(
+            append_event_from(
+                connection,
+                identity,
+                network,
+                &job.conversation_id,
+                body,
+                blobs,
+                marker.created_at_ms,
+            )?
+            .hash,
+        );
+    }
+    job.state = match marker.outcome {
+        JobOutcome::Completed => JobState::Completed { attempt },
+        JobOutcome::Failed(detail) => JobState::Failed { attempt, detail },
+        JobOutcome::Cancelled(evidence) => JobState::Cancelled { attempt, evidence },
+        JobOutcome::Unknown(detail) => {
+            session.unresolved.insert(job.trigger.clone());
+            session.native_id = None;
+            session.permission_version = session
+                .permission_version
+                .checked_add(1)
+                .context("scheduler permission version overflow")?;
+            JobState::Unknown {
+                attempt,
+                detail,
+                fenced: false,
+            }
+        }
+    };
+    if !matches!(job.state, JobState::Unknown { .. }) {
+        session.active = None;
+    }
+    scheduler_save(connection, network, &key, &job)?;
+    save_scheduler_session(connection, network, &session)?;
+    connection.execute(
+        "DELETE FROM local_values WHERE network_id=? AND key=?",
+        params![
+            network,
+            scheduler_key(
+                "publication",
+                &job.conversation_id,
+                &job.target_node,
+                &job.trigger
+            )
+        ],
+    )?;
+    Ok(SchedulerPublication { job, event_hashes })
+}
+
 fn scheduler_load<T: DeserializeOwned>(
     connection: &Connection,
     network: &str,
@@ -2568,6 +2786,9 @@ fn recover_scheduler_session(
     let Some(attempt) = job.state.attempt().cloned() else {
         bail!("active scheduler job has no attempt");
     };
+    if scheduler_publication_from(connection, network, &job)?.is_some() {
+        return Ok(());
+    }
     if attempt.boot == boot {
         return Ok(());
     }
@@ -3192,6 +3413,29 @@ mod tests {
             .unwrap();
         let attempt = claimed.job.state.attempt().unwrap().id.clone();
         store.mark_started(&network, "conversation", &target, &first.hash, &attempt)?;
+        let mut incomplete = completed_job_events(&claimed.job);
+        incomplete.pop();
+        assert!(
+            store
+                .finish_job(
+                    &owner,
+                    &network,
+                    "conversation",
+                    &target,
+                    &first.hash,
+                    &attempt,
+                    JobOutcome::Completed,
+                    incomplete,
+                    3
+                )
+                .is_err()
+        );
+        assert!(!store.scheduler_publication_pending(
+            &network,
+            "conversation",
+            &target,
+            &first.hash
+        )?);
         store.connection.execute_batch("CREATE TRIGGER reject_scheduler_reply BEFORE INSERT ON events WHEN json_extract(json_extract(NEW.envelope,'$.canonical_body'),'$.body.role')='assistant' BEGIN SELECT RAISE(ABORT,'injected assistant failure'); END;")?;
         assert!(
             store
@@ -3222,6 +3466,42 @@ mod tests {
                 .iter()
                 .any(|event| matches!(&event.body, EventBody::DecisionRecorded { decision_id, .. } if decision_id == &format!("decision-{}", claimed.job.message_id)))
         );
+        assert!(store.scheduler_publication_pending(
+            &network,
+            "conversation",
+            &target,
+            &first.hash
+        )?);
+        assert!(!store.manager_attempt_allowed(
+            &network,
+            "conversation",
+            &target,
+            &first.hash,
+            &attempt,
+            true
+        )?);
+        assert!(matches!(
+            store
+                .request_manager_cancel(&network, "conversation", &target)?
+                .unwrap()
+                .state,
+            JobState::Running { .. }
+        ));
+        assert!(
+            store
+                .finish_job(
+                    &owner,
+                    &network,
+                    "conversation",
+                    &target,
+                    &first.hash,
+                    &attempt,
+                    JobOutcome::Unknown("cleanup must not erase the known reply".into()),
+                    vec![],
+                    4
+                )
+                .is_err()
+        );
         store
             .connection
             .execute_batch("DROP TRIGGER reject_scheduler_reply;")?;
@@ -3248,11 +3528,358 @@ mod tests {
             3,
         )?;
         assert_eq!(store.messages(&network, "conversation")?.len(), 2);
+        assert!(!store.scheduler_publication_pending(
+            &network,
+            "conversation",
+            &target,
+            &first.hash
+        )?);
+        assert!(
+            store
+                .flush_scheduler_publications(&owner, &network, &target)?
+                .published
+                .is_empty()
+        );
+
         assert!(
             store
                 .claim_next(&network, "conversation", &target, "boot", "sdk")?
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_known_results_survive_missing_parents_and_reopen_without_sdk_replay() -> Result<()>
+    {
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-publication-{}", uuid::Uuid::new_v4()));
+        let db = dir.join("state.db");
+        let owner = LocalIdentity::generate();
+        let peer = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let target = owner.node_id()?;
+        let mut store = Store::open(&db)?;
+        store.install_trust_bundle(
+            &network,
+            &owner.sign_network_fixture(
+                1,
+                vec![owner.certificate(roles())?, peer.certificate(roles())?],
+            )?,
+        )?;
+        store.save_local_identity(&network, &owner)?;
+        let root = conversation(&mut store, &owner)?;
+        let message = admitted_message(&mut store, &owner, "known-result", &target)?;
+        let claimed = store
+            .claim_next(&network, "conversation", &target, "boot-a", "sdk")?
+            .unwrap();
+        let attempt = claimed.job.state.attempt().unwrap().id.clone();
+        store.mark_started(&network, "conversation", &target, &message.hash, &attempt)?;
+        let parent = peer.sign_event(Event {
+            version: WIRE_VERSION,
+            network_id: network.clone(),
+            scope_id: "conversation".into(),
+            author: peer.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![root.hash],
+            created_at_ms: 3,
+            body: EventBody::NotificationRaised {
+                notification_id: "parent".into(),
+                kind: "progress".into(),
+                text: "parent".into(),
+            },
+            blobs: vec![],
+        })?;
+        let child = peer.sign_event(Event {
+            version: WIRE_VERSION,
+            network_id: network.clone(),
+            scope_id: "conversation".into(),
+            author: peer.node_id()?,
+            sequence: 2,
+            previous: Some(parent.hash.clone()),
+            parents: vec![parent.hash.clone()],
+            created_at_ms: 4,
+            body: EventBody::NotificationRaised {
+                notification_id: "child".into(),
+                kind: "progress".into(),
+                text: "child".into(),
+            },
+            blobs: vec![],
+        })?;
+        assert_eq!(store.ingest_event(&network, &child)?.status, "pending");
+        assert!(
+            store
+                .finish_job(
+                    &owner,
+                    &network,
+                    "conversation",
+                    &target,
+                    &message.hash,
+                    &attempt,
+                    JobOutcome::Completed,
+                    completed_job_events(&claimed.job),
+                    5
+                )
+                .is_err()
+        );
+        assert!(store.scheduler_publication_pending(
+            &network,
+            "conversation",
+            &target,
+            &message.hash
+        )?);
+        assert!(
+            store
+                .finish_job(
+                    &owner,
+                    &network,
+                    "conversation",
+                    &target,
+                    &message.hash,
+                    &attempt,
+                    JobOutcome::Unknown("failed cleanup".into()),
+                    vec![],
+                    6
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .messages(&network, "conversation")?
+                .iter()
+                .all(|message| message.role != "assistant")
+        );
+
+        store.append_event(
+            &owner,
+            &network,
+            "healthy",
+            EventBody::ConversationCreated {
+                title: "independent".into(),
+            },
+            vec![],
+            1,
+        )?;
+        let (healthy, _) = store.accept_message(
+            &owner,
+            &network,
+            "healthy",
+            EventBody::MessagePosted {
+                message_id: "other".into(),
+                role: "user".into(),
+                text: "other".into(),
+                scheduler_node: Some(target.clone()),
+            },
+            vec![],
+            2,
+            &target,
+            &target,
+            false,
+        )?;
+        let healthy_job = store
+            .claim_next(&network, "healthy", &target, "boot-a", "sdk")?
+            .unwrap();
+        let healthy_attempt = healthy_job.job.state.attempt().unwrap().id.clone();
+        store.mark_started(
+            &network,
+            "healthy",
+            &target,
+            &healthy.hash,
+            &healthy_attempt,
+        )?;
+        store.connection.execute_batch("CREATE TRIGGER reject_publication_reply BEFORE INSERT ON events WHEN json_extract(json_extract(NEW.envelope,'$.canonical_body'),'$.body.role')='assistant' BEGIN SELECT RAISE(ABORT,'injected publication failure'); END;")?;
+        assert!(
+            store
+                .finish_job(
+                    &owner,
+                    &network,
+                    "healthy",
+                    &target,
+                    &healthy.hash,
+                    &healthy_attempt,
+                    JobOutcome::Completed,
+                    completed_job_events(&healthy_job.job),
+                    5
+                )
+                .is_err()
+        );
+        assert!(store.scheduler_publication_pending(
+            &network,
+            "healthy",
+            &target,
+            &healthy.hash
+        )?);
+        drop(store);
+
+        let mut store = Store::open(&db)?;
+        store.recover_scheduler_jobs(&network, &target, "boot-b")?;
+        for (scope, trigger) in [("conversation", &message.hash), ("healthy", &healthy.hash)] {
+            let current = store
+                .scheduler_job(&network, scope, trigger, &target)?
+                .unwrap();
+            assert!(matches!(current.state, JobState::Running { .. }));
+            assert!(matches!(
+                store
+                    .request_manager_cancel(&network, scope, &target)?
+                    .unwrap()
+                    .state,
+                JobState::Running { .. }
+            ));
+            assert!(
+                store
+                    .claim_next(&network, scope, &target, "boot-b", "sdk")?
+                    .is_none()
+            );
+        }
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_publication_reply;")?;
+        let independent = store.flush_scheduler_publications(&owner, &network, &target)?;
+        assert!(independent.errors.is_empty());
+        assert_eq!(independent.published.len(), 1);
+        assert_eq!(independent.published[0].job.conversation_id, "healthy");
+        assert_eq!(independent.published[0].event_hashes.len(), 2);
+        assert!(store.scheduler_publication_pending(
+            &network,
+            "conversation",
+            &target,
+            &message.hash
+        )?);
+        assert!(!store.scheduler_publication_pending(
+            &network,
+            "healthy",
+            &target,
+            &healthy.hash
+        )?);
+        assert_eq!(store.ingest_event(&network, &parent)?.status, "ready");
+        let flushed = store.flush_scheduler_publications(&owner, &network, &target)?;
+        assert!(flushed.errors.is_empty());
+        assert_eq!(flushed.published.len(), 1);
+        assert_eq!(flushed.published[0].job.trigger, message.hash);
+        assert!(matches!(
+            flushed.published[0].job.state,
+            JobState::Completed { .. }
+        ));
+        assert_eq!(flushed.published[0].event_hashes.len(), 2);
+        assert!(!store.scheduler_publication_pending(
+            &network,
+            "conversation",
+            &target,
+            &message.hash
+        )?);
+        let final_messages = store.messages(&network, "conversation")?;
+        assert_eq!(
+            final_messages
+                .iter()
+                .filter(|message| message.role == "assistant")
+                .count(),
+            1
+        );
+        assert_eq!(
+            final_messages
+                .iter()
+                .find(|message| message.role == "assistant")
+                .unwrap()
+                .text,
+            "done"
+        );
+        assert!(
+            store
+                .flush_scheduler_publications(&owner, &network, &target)?
+                .published
+                .is_empty()
+        );
+        assert!(
+            store
+                .claim_next(&network, "conversation", &target, "boot-b", "sdk")?
+                .is_none()
+        );
+        store.scheduler_maintenance_idle(&network)?;
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_pending_prestart_terminals_are_not_reclaimed_after_restart() -> Result<()> {
+        for cancelled in [false, true] {
+            let owner = LocalIdentity::generate();
+            let network = owner.fixture_network_id()?;
+            let target = owner.node_id()?;
+            let mut store = memory(&owner, None)?;
+            conversation(&mut store, &owner)?;
+            let message = admitted_message(&mut store, &owner, "prestart", &target)?;
+            let claimed = store
+                .claim_next(&network, "conversation", &target, "boot-a", "sdk")?
+                .unwrap();
+            let attempt = claimed.job.state.attempt().unwrap().id.clone();
+            if cancelled {
+                store.request_manager_cancel(&network, "conversation", &target)?;
+            }
+            store.connection.execute_batch("CREATE TRIGGER reject_prestart_terminal BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'injected prestart terminal failure'); END;")?;
+            let outcome = if cancelled {
+                JobOutcome::Cancelled("confirmed before SDK start".into())
+            } else {
+                JobOutcome::Failed("SDK did not start".into())
+            };
+            assert!(
+                store
+                    .finish_job(
+                        &owner,
+                        &network,
+                        "conversation",
+                        &target,
+                        &message.hash,
+                        &attempt,
+                        outcome,
+                        vec![(
+                            EventBody::NotificationRaised {
+                                notification_id: "terminal".into(),
+                                kind: "attention".into(),
+                                text: "terminal".into()
+                            },
+                            vec![]
+                        )],
+                        3
+                    )
+                    .is_err()
+            );
+            assert!(store.scheduler_publication_pending(
+                &network,
+                "conversation",
+                &target,
+                &message.hash
+            )?);
+            store.recover_scheduler_jobs(&network, &target, "boot-b")?;
+            let preserved = store
+                .scheduler_job(&network, "conversation", &message.hash, &target)?
+                .unwrap();
+            assert_eq!(
+                preserved.state.name(),
+                if cancelled { "cancelling" } else { "claimed" }
+            );
+            assert!(
+                store
+                    .claim_next(&network, "conversation", &target, "boot-b", "sdk")?
+                    .is_none()
+            );
+            store
+                .connection
+                .execute_batch("DROP TRIGGER reject_prestart_terminal;")?;
+            let flushed = store.flush_scheduler_publications(&owner, &network, &target)?;
+            assert!(flushed.errors.is_empty());
+            assert_eq!(flushed.published.len(), 1);
+            assert_eq!(
+                flushed.published[0].job.state.name(),
+                if cancelled { "cancelled" } else { "failed" }
+            );
+            assert!(
+                store
+                    .claim_next(&network, "conversation", &target, "boot-b", "sdk")?
+                    .is_none()
+            );
+        }
         Ok(())
     }
 
@@ -3574,6 +4201,12 @@ mod tests {
                 )
                 .is_err()
         );
+        assert!(!store.scheduler_publication_pending(
+            &network,
+            "conversation",
+            &target,
+            &event.hash
+        )?);
         store.finish_job(
             &owner,
             &network,

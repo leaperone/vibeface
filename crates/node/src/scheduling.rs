@@ -1,5 +1,8 @@
 //! Local scheduling state is never reconstructed by importing shared conversation history.
-use crate::crypto::digest;
+use crate::{
+    crypto::digest,
+    model::{BlobRef, EventBody},
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -153,11 +156,34 @@ pub struct ClaimedJob {
     pub previous_native_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
 pub enum JobOutcome {
     Completed,
     Failed(String),
     Cancelled(String),
     Unknown(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct SchedulerPublication {
+    pub job: SchedulerJob,
+    pub event_hashes: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct SchedulerPublicationBatch {
+    pub published: Vec<SchedulerPublication>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SchedulerTerminalPublication {
+    pub version: u32,
+    pub job: SchedulerJob,
+    pub outcome: JobOutcome,
+    pub events: Vec<(EventBody, Vec<BlobRef>)>,
+    pub created_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
