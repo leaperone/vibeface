@@ -642,6 +642,7 @@ pub enum Action {
     ExecutionInterrupt,
     ExecutionRespondApproval,
     ExecutionRebind,
+    ExecutionSubmit,
     OperationStatusRead,
     OperationReconcile,
     OperationResolve,
