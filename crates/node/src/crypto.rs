@@ -1,5 +1,5 @@
 use crate::model::*;
-use anyhow::{ensure, Context as _, Result};
+use anyhow::{Context as _, Result, ensure};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -269,9 +269,10 @@ mod tests {
         )?;
         let view = state.project()?;
         assert_eq!(view.network_id, owner.network_id()?);
-        assert!(view
-            .authorize_node(&owner.node_id()?, Some(NodeRole::Replica))
-            .is_ok());
+        assert!(
+            view.authorize_node(&owner.node_id()?, Some(NodeRole::Replica))
+                .is_ok()
+        );
         assert!(view.authorize_node(&revoked.node_id()?, None).is_err());
         let later = owner.sign_network_fixture(2, vec![])?;
         assert_eq!(state.genesis, later.genesis);
@@ -282,13 +283,15 @@ mod tests {
             b"challenge",
             &signed,
         )?;
-        assert!(verify_payload(
-            &owner.public_key_hex()?,
-            "peer-response",
-            b"challenge",
-            &signed
-        )
-        .is_err());
+        assert!(
+            verify_payload(
+                &owner.public_key_hex()?,
+                "peer-response",
+                b"challenge",
+                &signed
+            )
+            .is_err()
+        );
         assert!(owner.sign_payload("bad:domain", b"challenge").is_err());
         let body = Event {
             version: 1,

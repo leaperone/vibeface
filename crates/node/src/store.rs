@@ -1,5 +1,6 @@
 use crate::{
-    crypto::{LocalIdentity, digest, verify_signed_event, verify_trust_bundle},
+    crypto::{LocalIdentity, digest, verify_signed_event},
+    identity::{GovernanceAction, IdentityKind, NetworkState},
     model::*,
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -52,7 +53,7 @@ impl Store {
                 ensure!(tables == 0, "unversioned database is not supported");
                 connection.execute_batch(&format!("BEGIN IMMEDIATE;{INITIAL_SCHEMA}COMMIT;"))?;
             }
-            1 => {}
+            2 => {}
             _ => bail!("unsupported database schema version {version}"),
         }
         let mut store = Self { connection };
@@ -62,49 +63,62 @@ impl Store {
         }
         Ok(store)
     }
-    pub fn install_trust_bundle(&mut self, network_id: &str, bundle: &TrustBundle) -> Result<bool> {
+    pub fn install_trust_bundle(&mut self, network_id: &str, state: &NetworkState) -> Result<bool> {
         ensure!(
-            bundle.network_id == network_id,
-            "trust bundle belongs to another network"
+            state.genesis.network_id == network_id,
+            "membership belongs to another personal network"
         );
-        verify_trust_bundle(bundle)?;
-        let encoded = serde_json::to_string(bundle)?;
+        state.project()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let old: Option<(u64, String)> = tx
+        let previous: Option<String> = tx
             .query_row(
-                "SELECT revision,bundle FROM networks WHERE network_id=?",
+                "SELECT bundle FROM networks WHERE network_id=?",
                 [network_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .optional()?;
-        if let Some((revision, previous)) = old {
-            if revision == bundle.revision {
-                ensure!(previous == encoded, "conflicting trust revision");
-                return Ok(false);
-            }
-            ensure!(bundle.revision > revision, "trust bundle rollback rejected");
+        let merged = if let Some(previous) = &previous {
+            serde_json::from_str::<NetworkState>(previous)?.merge(state)?
+        } else {
+            state.clone()
+        };
+        let encoded = serde_json::to_string(&merged)?;
+        if previous.as_ref() == Some(&encoded) {
+            return Ok(false);
         }
-        tx.execute("INSERT INTO networks(network_id,revision,bundle) VALUES(?,?,?) ON CONFLICT(network_id) DO UPDATE SET revision=excluded.revision,bundle=excluded.bundle",params![network_id,bundle.revision,encoded])?;
-        for node in &bundle.nodes {
-            let old_key: Option<String> = tx
+        tx.execute("INSERT INTO networks(network_id,revision,bundle) VALUES(?,?,?) ON CONFLICT(network_id) DO UPDATE SET revision=excluded.revision,bundle=excluded.bundle",params![network_id,merged.epoch(),encoded])?;
+        let mut historical = merged.genesis.initial_members.clone();
+        if let Some(checkpoint) = &merged.checkpoint {
+            historical.extend(checkpoint.members.clone());
+        }
+        for event in &merged.events {
+            if let GovernanceAction::Grant { member } = &event.action {
+                historical.push(member.clone());
+            }
+        }
+        for member in historical
+            .into_iter()
+            .filter(|member| member.kind == IdentityKind::Node)
+        {
+            let old: Option<String> = tx
                 .query_row(
                     "SELECT public_key FROM node_certificates WHERE network_id=? AND node_id=?",
-                    params![network_id, node.node_id],
+                    params![network_id, member.subject_id],
                     |r| r.get(0),
                 )
                 .optional()?;
             ensure!(
-                old_key.as_ref().is_none_or(|key| key == &node.public_key),
-                "node certificate key changed"
+                old.as_ref().is_none_or(|key| key == &member.public_key),
+                "historical Node identity key changed"
             );
-            tx.execute("INSERT OR IGNORE INTO node_certificates(network_id,node_id,public_key) VALUES(?,?,?)",params![network_id,node.node_id,node.public_key])?;
+            tx.execute("INSERT OR IGNORE INTO node_certificates(network_id,node_id,public_key) VALUES(?,?,?)",params![network_id,member.subject_id,member.public_key])?;
         }
         tx.commit()?;
         Ok(true)
     }
-    pub fn trust_bundle(&self, network_id: &str) -> Result<Option<TrustBundle>> {
+    pub fn trust_bundle(&self, network_id: &str) -> Result<Option<NetworkState>> {
         optional_json(
             self.connection
                 .query_row(
@@ -1588,22 +1602,13 @@ fn authorize_node_from(
         )
         .optional()?
         .context("unknown network")?;
-    let bundle: TrustBundle = serde_json::from_str(&encoded)?;
-    verify_trust_bundle(&bundle)?;
+    let state: NetworkState = serde_json::from_str(&encoded)?;
+    let view = state.project()?;
     ensure!(
-        bundle.network_id == network_id,
-        "stored trust bundle network mismatch"
+        view.network_id == network_id,
+        "stored membership network mismatch"
     );
-    let node = bundle
-        .nodes
-        .into_iter()
-        .find(|n| n.node_id == node_id)
-        .context("node is not currently authorized")?;
-    ensure!(!node.revoked, "node has been revoked");
-    if let Some(role) = role {
-        ensure!(node.roles.contains(&role), "node lacks required role");
-    }
-    Ok(node)
+    view.authorize_node(node_id, role)?.certificate()
 }
 fn validate_operation_binding_from(
     connection: &Connection,
@@ -1860,7 +1865,7 @@ mod tests {
         if let Some(other) = other {
             nodes.push(other.certificate(roles())?);
         }
-        store.install_trust_bundle(&owner.network_id()?, &owner.sign_trust_bundle(1, nodes)?)?;
+        store.install_trust_bundle(&owner.network_id()?, &owner.sign_network_fixture(1, nodes)?)?;
         store.save_local_identity(&owner.network_id()?, owner)?;
         Ok(store)
     }
@@ -2121,7 +2126,7 @@ mod tests {
         let event = message(&b, &network, 1, None, vec![root.hash], "old", vec![])?;
         let mut revoked = b.certificate(roles())?;
         revoked.revoked = true;
-        let bundle = a.sign_trust_bundle(2, vec![a.certificate(roles())?, revoked])?;
+        let bundle = a.sign_network_fixture(2, vec![a.certificate(roles())?, revoked])?;
         store.install_trust_bundle(&network, &bundle)?;
         assert!(store.authorize_node(&network, &b.node_id()?, None).is_err());
         assert_eq!(store.ingest_event(&network, &event)?.status, "ready");
@@ -2139,7 +2144,7 @@ mod tests {
                 )
                 .is_err()
         );
-        let old = a.sign_trust_bundle(1, vec![a.certificate(roles())?])?;
+        let old = a.sign_network_fixture(1, vec![a.certificate(roles())?])?;
         assert!(store.install_trust_bundle(&network, &old).is_err());
         Ok(())
     }
@@ -2153,7 +2158,7 @@ mod tests {
         store.accept_operation(&network, &request)?;
         let mut certificate = a.certificate(roles())?;
         certificate.revoked = true;
-        store.install_trust_bundle(&network, &a.sign_trust_bundle(2, vec![certificate])?)?;
+        store.install_trust_bundle(&network, &a.sign_network_fixture(2, vec![certificate])?)?;
         assert!(store.claim_operation(&network, "queued").is_err());
         assert_eq!(
             store.operation(&network, "queued")?.unwrap().state,
@@ -2170,7 +2175,7 @@ mod tests {
         let mut initial = Store::open(&db)?;
         initial.install_trust_bundle(
             &network,
-            &owner.sign_trust_bundle(1, vec![owner.certificate(roles())?])?,
+            &owner.sign_network_fixture(1, vec![owner.certificate(roles())?])?,
         )?;
         conversation(&mut initial, &owner)?;
         drop(initial);
@@ -2241,7 +2246,7 @@ mod tests {
         let mut store = Store::open(&db)?;
         store.install_trust_bundle(
             &network,
-            &owner.sign_trust_bundle(
+            &owner.sign_network_fixture(
                 1,
                 vec![owner.certificate(roles())?, executor.certificate(roles())?],
             )?,
@@ -2397,7 +2402,7 @@ mod tests {
         let mut store = Store::open(&db)?;
         store.install_trust_bundle(
             &network,
-            &owner.sign_trust_bundle(1, vec![owner.certificate(roles())?])?,
+            &owner.sign_network_fixture(1, vec![owner.certificate(roles())?])?,
         )?;
         let root = conversation(&mut store, &owner)?;
         let request = request(&mut store, &owner, "first", vec![root.hash])?;
@@ -2546,13 +2551,59 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn management_clients_cannot_author_business_dag_events() -> Result<()> {
+        let root = LocalIdentity::generate();
+        let admin = LocalIdentity::generate();
+        let node = LocalIdentity::generate();
+        let state = crate::identity::NetworkState::new(crate::identity::Genesis::create(
+            &root,
+            vec![
+                crate::identity::Member::client(&admin, "management", true)?,
+                crate::identity::Member::node(&node, "Node", roles())?,
+            ],
+        )?)?;
+        let network = root.network_id()?;
+        let mut store = Store::open(":memory:")?;
+        store.install_trust_bundle(&network, &state)?;
+        let forged = admin.sign_event(Event {
+            version: WIRE_VERSION,
+            network_id: network.clone(),
+            scope_id: "conversation".into(),
+            author: admin.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 0,
+            body: EventBody::ConversationCreated {
+                title: "invalid client event".into(),
+            },
+            blobs: vec![],
+        })?;
+        assert!(store.ingest_event(&network, &forged).is_err());
+        assert!(
+            store
+                .authorize_node(&network, &admin.node_id()?, None)
+                .is_err()
+        );
+        assert!(
+            store
+                .authorize_node(&network, &node.node_id()?, Some(NodeRole::Replica))
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn all_replicated_and_local_ids_are_network_scoped() -> Result<()> {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let mut store = memory(&a, None)?;
         let na = a.network_id()?;
         let nb = b.network_id()?;
-        store.install_trust_bundle(&nb, &b.sign_trust_bundle(1, vec![b.certificate(roles())?])?)?;
+        store.install_trust_bundle(
+            &nb,
+            &b.sign_network_fixture(1, vec![b.certificate(roles())?])?,
+        )?;
         let ea = conversation(&mut store, &a)?;
         let eb = conversation(&mut store, &b)?;
         assert!(store.ingest_event(&nb, &ea).is_err());
@@ -2600,7 +2651,7 @@ mod tests {
         let mut store = memory(&a, None)?;
         store.install_trust_bundle(
             &nb,
-            &b.sign_trust_bundle(1, vec![a.certificate(roles())?, b.certificate(roles())?])?,
+            &b.sign_network_fixture(1, vec![a.certificate(roles())?, b.certificate(roles())?])?,
         )?;
         let ea = conversation(&mut store, &a)?;
         let eb = conversation(&mut store, &b)?;
@@ -2739,7 +2790,7 @@ mod tests {
             let mut store = Store::open(&db)?;
             store.install_trust_bundle(
                 &network,
-                &a.sign_trust_bundle(1, vec![a.certificate(roles())?])?,
+                &a.sign_network_fixture(1, vec![a.certificate(roles())?])?,
             )?;
             let event = conversation(&mut store, &a)?;
             let request = request(&mut store, &a, "durable", vec![event.hash])?;
@@ -2755,7 +2806,7 @@ mod tests {
             assert_eq!(store.conversations(&network)?.len(), 1);
         }
         let connection = Connection::open(&db)?;
-        connection.execute_batch("PRAGMA user_version=2;")?;
+        connection.execute_batch("PRAGMA user_version=3;")?;
         drop(connection);
         assert!(Store::open(&db).is_err());
         std::fs::remove_dir_all(root)?;

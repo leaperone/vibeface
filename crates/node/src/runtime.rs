@@ -1,10 +1,11 @@
 use crate::{
-    auth::{Account, AuthStore},
     config::{self, Config},
     crypto::{self, LocalIdentity},
     engine::{Engine, EngineAction, ExecutorConfig, ExecutorKind, ExecutorSession},
+    identity::{AuthorizationView, IdentityKind, IdentityStore, NetworkState},
     maintenance::{Busy, Gate},
     model::*,
+    network::{IncomingSocket, NetworkHub, Service},
     peer::{Inbound, PeerHub},
     store::Store,
 };
@@ -29,11 +30,19 @@ pub struct Access {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_owner(node: &Runtime) -> Result<LocalIdentity> {
+        Ok(LocalIdentity {
+            secret_key_hex: crypto::digest(
+                format!("runtime-test-root:{}", node.identity.node_id()?).as_bytes(),
+            ),
+        })
+    }
     fn fixture() -> Result<PathBuf> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("runtime-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":2}"#)?;
         let mut cfg = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         cfg.codex_socket = Some(dir.join("unavailable.sock"));
         cfg.save(&dir)?;
@@ -44,16 +53,21 @@ mod tests {
         Ok(dir)
     }
     async fn conversation(node: &Runtime) -> Result<String> {
-        let account = node.register("owner", "test-password-for-owner").await?;
+        let owner = test_owner(node)?;
+        let state = owner.sign_network_fixture(
+            1,
+            vec![node.identity.certificate(node.config.roles.clone())?],
+        )?;
+        let view = node.install_membership(state).await?;
         node.append(
-            &account.network_id,
+            &view.network_id,
             "chat",
             EventBody::ConversationCreated {
                 title: "test".into(),
             },
         )
         .await?;
-        Ok(account.network_id)
+        Ok(view.network_id)
     }
     async fn queued(
         node: &Runtime,
@@ -107,6 +121,55 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn unsupported_epoch_does_not_open_databases_or_modify_the_directory() -> Result<()> {
+        let dir = fixture()?;
+        std::fs::remove_file(dir.join("data-epoch.json"))?;
+        let config = std::fs::read(dir.join("config.json"))?;
+        assert!(Runtime::open(&dir).await.is_err());
+        assert!(!dir.join("node.sqlite3").exists());
+        assert!(!dir.join("identity.sqlite3").exists());
+        assert_eq!(std::fs::read(dir.join("config.json"))?, config);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn membership_reopen_recovers_either_durable_store_without_root_secrets() -> Result<()> {
+        let dir = fixture()?;
+        let node = Runtime::open(&dir).await?;
+        assert!(!node.has_membership().await?);
+        let owner = test_owner(&node)?;
+        let initial = owner.sign_network_fixture(
+            1,
+            vec![node.identity.certificate(node.config.roles.clone())?],
+        )?;
+        node.identities.init_network(initial.clone())?;
+        drop(node);
+        let node = Runtime::open(&dir).await?;
+        assert_eq!(node.membership_state().await?, initial);
+        assert!(node.has_membership().await?);
+        let updated = owner.sign_network_fixture(
+            2,
+            vec![
+                node.identity
+                    .certificate(vec![NodeRole::Gateway, NodeRole::Replica])?,
+            ],
+        )?;
+        node.store
+            .lock()
+            .await
+            .install_trust_bundle(&owner.network_id()?, &updated)?;
+        drop(node);
+        let node = Runtime::open(&dir).await?;
+        assert_eq!(node.membership_state().await?, updated);
+        assert_eq!(node.identities.public_state()?, updated);
+        assert!(!dir.join("auth.sqlite3").exists());
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn executor_followup_only_accepts_its_authorized_dispatched_result() -> Result<()> {
         let dir = fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
@@ -115,15 +178,19 @@ mod tests {
         task(&node, &network, "unapproved", false).await?;
         let executor = LocalIdentity::generate();
         let origin = executor.node_id()?;
-        let owner = LocalIdentity {
-            secret_key_hex: node.auth.lock().await.owner(&network)?.unwrap(),
-        };
+        let owner = test_owner(&node)?;
         let mut store = node.store.lock().await;
-        let mut bundle = store.trust_bundle(&network)?.unwrap();
-        bundle
-            .nodes
-            .push(executor.certificate(vec![NodeRole::Replica, NodeRole::Executor])?);
-        store.install_trust_bundle(&network, &owner.sign_trust_bundle(2, bundle.nodes)?)?;
+        let mut nodes = store
+            .trust_bundle(&network)?
+            .unwrap()
+            .project()?
+            .members
+            .into_iter()
+            .filter(|member| member.kind == IdentityKind::Node)
+            .map(|member| member.certificate())
+            .collect::<Result<Vec<_>>>()?;
+        nodes.push(executor.certificate(vec![NodeRole::Replica, NodeRole::Executor])?);
+        store.install_trust_bundle(&network, &owner.sign_network_fixture(2, nodes)?)?;
         let request = OperationRequest {
             operation_id: "operation".into(),
             network_id: network.clone(),
@@ -601,23 +668,17 @@ mod tests {
         let relay = LocalIdentity::generate();
         let scheduler = LocalIdentity::generate();
         let network = owner.network_id()?;
-        {
-            let mut store = node.store.lock().await;
-            store.install_trust_bundle(
-                &network,
-                &owner.sign_trust_bundle(
-                    1,
-                    vec![
-                        node.identity.certificate(node.config.roles.clone())?,
-                        owner.certificate(vec![NodeRole::Gateway])?,
-                        replica.certificate(vec![NodeRole::Replica])?,
-                        relay.certificate(vec![NodeRole::Relay])?,
-                        scheduler.certificate(vec![NodeRole::Scheduler, NodeRole::Replica])?,
-                    ],
-                )?,
-            )?;
-            store.save_local_identity(&network, &node.identity)?;
-        }
+        node.install_membership(owner.sign_network_fixture(
+            1,
+            vec![
+                node.identity.certificate(node.config.roles.clone())?,
+                owner.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?,
+                replica.certificate(vec![NodeRole::Replica])?,
+                relay.certificate(vec![NodeRole::Relay])?,
+                scheduler.certificate(vec![NodeRole::Scheduler, NodeRole::Replica])?,
+            ],
+        )?)
+        .await?;
         let event = node
             .append(
                 &network,
@@ -672,7 +733,7 @@ mod tests {
             };
             assert_eq!(
                 node.handle_peer(&message).await.unwrap_err().to_string(),
-                "node lacks required role"
+                "Node lacks required role"
             );
             let message = Inbound {
                 payload: json!({"type":"schedule"}),
@@ -750,148 +811,6 @@ mod tests {
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
-    #[tokio::test]
-    async fn pairing_recovers_claim_and_trust_committed_without_receipt() -> Result<()> {
-        let dir = fixture()?;
-        let node = Runtime::open(&dir).await?;
-        let account = node.register("owner", "a-valid-test-password").await?;
-        let device = LocalIdentity::generate();
-        let device_id = device.node_id()?;
-        let code = {
-            let mut auth = node.auth.lock().await;
-            let code = auth.create_invite(
-                &account.network_id,
-                vec!["executor".into(), "replica".into()],
-            )?;
-            auth.consume_invite(&code, &device_id)?;
-            code
-        };
-        let owner = LocalIdentity {
-            secret_key_hex: node.auth.lock().await.owner(&account.network_id)?.unwrap(),
-        };
-        let revision = {
-            let mut store = node.store.lock().await;
-            let old = store.trust_bundle(&account.network_id)?.unwrap();
-            let mut nodes = old.nodes;
-            nodes.push(device.certificate(vec![NodeRole::Executor, NodeRole::Replica])?);
-            let bundle = owner.sign_trust_bundle(old.revision + 1, nodes)?;
-            store.install_trust_bundle(&account.network_id, &bundle)?;
-            assert!(
-                store
-                    .local_value(
-                        &account.network_id,
-                        &format!("pair_receipt:{}", crypto::digest(code.as_bytes()))
-                    )?
-                    .is_none()
-            );
-            bundle.revision
-        };
-        drop(node);
-        let node = Runtime::open(&dir).await?;
-        let request = |identity: &LocalIdentity| -> Result<Value> {
-            let node_id = identity.node_id()?;
-            let public_key = identity.public_key_hex()?;
-            let proof = identity.sign_payload(
-                "pair",
-                &serde_json::to_vec(&json!([code, node_id, public_key]))?,
-            )?;
-            Ok(json!({"code":code,"node_id":node_id,"public_key":public_key,"proof":proof}))
-        };
-        assert!(
-            node.pair(request(&LocalIdentity::generate())?)
-                .await
-                .is_err()
-        );
-        let input = request(&device)?;
-        let response = node.pair(input.clone()).await?;
-        assert_eq!(response["trust_bundle"]["revision"], revision);
-        assert_eq!(node.pair(input).await?, response);
-        assert_eq!(
-            node.store
-                .lock()
-                .await
-                .trust_bundle(&account.network_id)?
-                .unwrap()
-                .revision,
-            revision
-        );
-        assert!(
-            node.auth
-                .lock()
-                .await
-                .pairing_invite(&code, &device_id)
-                .is_err()
-        );
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn only_first_loopback_account_can_bootstrap_this_hosts_agents() -> Result<()> {
-        let dir = fixture()?;
-        let mut cfg = Config::load(&dir)?;
-        cfg.listen = "[::1]:4790".parse()?;
-        cfg.public_url = "http://[::1]:4790".into();
-        cfg.allowed_origins = vec!["http://localhost:4790".into()];
-        cfg.save(&dir)?;
-        let node = Runtime::open(&dir).await?;
-        let first = node.register("first", "a-valid-test-password").await?;
-        let second = node.register("second", "another-valid-password").await?;
-        let store = node.store.lock().await;
-        let local = node.identity.node_id()?;
-        assert!(
-            store
-                .authorize_node(&first.network_id, &local, Some(NodeRole::Executor))
-                .is_ok()
-        );
-        assert!(
-            store
-                .authorize_node(&second.network_id, &local, Some(NodeRole::Executor))
-                .is_err()
-        );
-        drop(store);
-        drop(node);
-        let public_dir = fixture()?;
-        let mut cfg = Config::load(&public_dir)?;
-        cfg.public_url = "https://node.example".into();
-        cfg.save(&public_dir)?;
-        let public = Runtime::open(&public_dir).await?;
-        let account = public.register("public", "a-valid-public-password").await?;
-        assert!(
-            public
-                .store
-                .lock()
-                .await
-                .authorize_node(
-                    &account.network_id,
-                    &public.identity.node_id()?,
-                    Some(NodeRole::Executor)
-                )
-                .is_err()
-        );
-        drop(public);
-        let extra_dir = fixture()?;
-        let mut cfg = Config::load(&extra_dir)?;
-        cfg.allowed_origins = vec!["https://node.example".into()];
-        cfg.save(&extra_dir)?;
-        let extra = Runtime::open(&extra_dir).await?;
-        let account = extra.register("remote", "a-valid-remote-password").await?;
-        for role in [NodeRole::Scheduler, NodeRole::Executor] {
-            assert!(
-                extra
-                    .store
-                    .lock()
-                    .await
-                    .authorize_node(&account.network_id, &extra.identity.node_id()?, Some(role),)
-                    .is_err()
-            );
-        }
-        drop(extra);
-        std::fs::remove_dir_all(extra_dir)?;
-        std::fs::remove_dir_all(dir)?;
-        std::fs::remove_dir_all(public_dir)?;
-        Ok(())
-    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_message_retries_record_one_trigger() -> Result<()> {
         let dir = fixture()?;
@@ -962,115 +881,6 @@ mod tests {
         drop(store);
         drop(node);
         std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-    #[tokio::test]
-    async fn registration_recovers_after_auth_and_trust_commits() -> Result<()> {
-        for trust_committed in [false, true] {
-            let dir = fixture()?;
-            let node = Runtime::open(&dir).await?;
-            let owner = LocalIdentity::generate();
-            let bootstrap = owner.sign_trust_bundle(
-                1,
-                vec![node.identity.certificate(node.config.roles.clone())?],
-            )?;
-            let account = node.auth.lock().await.register(
-                "owner",
-                "a-valid-test-password",
-                &owner,
-                &bootstrap,
-            )?;
-            if trust_committed {
-                node.store
-                    .lock()
-                    .await
-                    .install_trust_bundle(&account.network_id, &bootstrap)?;
-            }
-            drop(node);
-            for _ in 0..2 {
-                let node = Runtime::open(&dir).await?;
-                assert_eq!(
-                    node.auth
-                        .lock()
-                        .await
-                        .login("owner", "a-valid-test-password")?
-                        .account,
-                    account
-                );
-                let store = node.store.lock().await;
-                assert_eq!(
-                    store.trust_bundle(&account.network_id)?,
-                    Some(bootstrap.clone())
-                );
-                assert_eq!(
-                    store
-                        .local_identity(&account.network_id, &node.identity.node_id()?)?
-                        .context("registration identity was not recovered")?
-                        .public_key_hex()?,
-                    node.identity.public_key_hex()?
-                );
-            }
-            std::fs::remove_dir_all(dir)?;
-        }
-        Ok(())
-    }
-    #[tokio::test]
-    async fn registration_recovery_preserves_public_roles_and_newer_revocations() -> Result<()> {
-        for revoked in [None, Some(false), Some(true)] {
-            let dir = fixture()?;
-            let mut cfg = Config::load(&dir)?;
-            cfg.public_url = "https://node.example".into();
-            cfg.save(&dir)?;
-            let node = Runtime::open(&dir).await?;
-            let owner = LocalIdentity::generate();
-            let bootstrap = owner.sign_trust_bundle(
-                1,
-                vec![node.identity.certificate(vec![
-                    NodeRole::Gateway,
-                    NodeRole::Relay,
-                    NodeRole::Replica,
-                ])?],
-            )?;
-            let account = node.auth.lock().await.register(
-                "owner",
-                "a-valid-test-password",
-                &owner,
-                &bootstrap,
-            )?;
-            let expected = if let Some(revoked) = revoked {
-                let mut certificate = node.identity.certificate(vec![NodeRole::Gateway])?;
-                certificate.revoked = revoked;
-                let newer = owner.sign_trust_bundle(2, vec![certificate])?;
-                node.store
-                    .lock()
-                    .await
-                    .install_trust_bundle(&account.network_id, &newer)?;
-                newer
-            } else {
-                bootstrap
-            };
-            drop(node);
-            cfg.public_url = format!("http://{}", cfg.listen);
-            cfg.save(&dir)?;
-            let node = Runtime::open(&dir).await?;
-            let local = node.identity.node_id()?;
-            let store = node.store.lock().await;
-            assert_eq!(store.trust_bundle(&account.network_id)?, Some(expected));
-            for role in [NodeRole::Scheduler, NodeRole::Executor] {
-                assert!(
-                    store
-                        .authorize_node(&account.network_id, &local, Some(role))
-                        .is_err()
-                );
-            }
-            assert_eq!(
-                store.local_identity(&account.network_id, &local)?.is_some(),
-                revoked != Some(true)
-            );
-            drop(store);
-            drop(node);
-            std::fs::remove_dir_all(dir)?;
-        }
         Ok(())
     }
     #[tokio::test]
@@ -1345,20 +1155,14 @@ mod tests {
         let owner = LocalIdentity::generate();
         let remote = LocalIdentity::generate();
         let network = owner.network_id()?;
-        {
-            let mut store = node.store.lock().await;
-            store.install_trust_bundle(
-                &network,
-                &owner.sign_trust_bundle(
-                    1,
-                    vec![
-                        node.identity.certificate(node.config.roles.clone())?,
-                        remote.certificate(vec![NodeRole::Executor])?,
-                    ],
-                )?,
-            )?;
-            store.save_local_identity(&network, &node.identity)?;
-        }
+        node.install_membership(owner.sign_network_fixture(
+            1,
+            vec![
+                node.identity.certificate(node.config.roles.clone())?,
+                remote.certificate(vec![NodeRole::Executor, NodeRole::Replica])?,
+            ],
+        )?)
+        .await?;
         node.append(
             &network,
             "chat",
@@ -1430,7 +1234,8 @@ pub struct Runtime {
     pub config: Config,
     pub identity: LocalIdentity,
     pub store: Arc<Mutex<Store>>,
-    pub auth: Arc<Mutex<AuthStore>>,
+    pub identities: Arc<IdentityStore>,
+    pub network: Arc<NetworkHub>,
     pub hub: Arc<PeerHub>,
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
@@ -1441,6 +1246,7 @@ pub struct Runtime {
     _codex_process: Option<tokio::process::Child>,
     _process_lock: std::fs::File,
     peer_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
+    network_rx: Mutex<Option<mpsc::Receiver<IncomingSocket>>>,
     engine_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
 }
 pub fn now_ms() -> i64 {
@@ -1593,33 +1399,50 @@ fn require_executor_followup(
 
 impl Runtime {
     pub async fn open(dir: &Path) -> Result<Self> {
+        let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
+        ensure!(
+            epoch == json!({"data_epoch":2}),
+            "this Node requires an initialized data epoch 2 directory"
+        );
         let mut config = Config::load(dir)?;
         let process_lock = config::lock_data_dir(dir)?;
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
-        let auth = AuthStore::open(&dir.join("auth.sqlite3"))?;
-        let local = identity.node_id()?;
-        for bootstrap in auth.registration_bundles()? {
-            let network = &bootstrap.network_id;
-            let current = match store.trust_bundle(network)? {
-                Some(current) => current,
-                None => {
-                    store.install_trust_bundle(network, &bootstrap)?;
-                    bootstrap.clone()
-                }
-            };
-            if current
-                .nodes
-                .iter()
-                .any(|node| node.node_id == local && !node.revoked)
-                && store.local_identity(network, &local)?.is_none()
-            {
-                store.save_local_identity(network, &identity)?;
+        let identities = Arc::new(IdentityStore::open(&dir.join("identity.sqlite3"))?);
+        let networks = store.networks()?;
+        ensure!(
+            networks.len() <= 1,
+            "one installation can join only one personal network"
+        );
+        let stored = networks
+            .first()
+            .map(|network| store.trust_bundle(network))
+            .transpose()?
+            .flatten();
+        let local = if identities.has_network()? {
+            Some(identities.public_state()?)
+        } else {
+            None
+        };
+        let state = match (local, stored) {
+            (Some(a), Some(b)) => Some(if a.epoch() >= b.epoch() {
+                b.merge(&a)?
+            } else {
+                a.merge(&b)?
+            }),
+            (a, b) => a.or(b),
+        };
+        if let Some(state) = state {
+            let view = state.project()?;
+            store.install_trust_bundle(&view.network_id, &state)?;
+            identities.install_state(state)?;
+            if view.authorize_node(&identity.node_id()?, None).is_ok() {
+                store.save_local_identity(&view.network_id, &identity)?;
             }
         }
         let store = Arc::new(Mutex::new(store));
-        let auth = Arc::new(Mutex::new(auth));
         let (hub, peer_rx) = PeerHub::new(identity.clone(), store.clone(), &config.roles);
+        let (network, network_rx) = NetworkHub::new(identity.clone(), config.network.clone());
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
         let managed_socket = config.codex_socket.is_none();
@@ -1690,7 +1513,8 @@ impl Runtime {
             config,
             identity,
             store,
-            auth,
+            identities,
+            network,
             hub,
             events,
             agent_tokens: Mutex::new(HashMap::new()),
@@ -1701,8 +1525,85 @@ impl Runtime {
             _codex_process: codex_process,
             _process_lock: process_lock,
             peer_rx: Mutex::new(Some(peer_rx)),
+            network_rx: Mutex::new(Some(network_rx)),
             engine_rx: Mutex::new(Some(rx)),
         })
+    }
+    pub async fn install_membership(&self, incoming: NetworkState) -> Result<AuthorizationView> {
+        let _work = self.maintenance.enter()?;
+        let mut store = self.store.lock().await;
+        let mut state = incoming;
+        let networks = store.networks()?;
+        ensure!(
+            networks
+                .iter()
+                .all(|network| network == &state.genesis.network_id),
+            "installation belongs to a different personal network"
+        );
+        if self.identities.has_network()? {
+            let previous = self.identities.public_state()?;
+            state = previous.merge(&state)?;
+        }
+        if let Some(previous) = store.trust_bundle(&state.genesis.network_id)? {
+            state = previous.merge(&state)?;
+        }
+        let view = state.project()?;
+        self.identities.install_state(state.clone())?;
+        store.install_trust_bundle(&view.network_id, &state)?;
+        if view.authorize_node(&self.identity.node_id()?, None).is_ok() {
+            store.save_local_identity(&view.network_id, &self.identity)?;
+        }
+        Ok(view)
+    }
+
+    pub async fn has_membership(&self) -> Result<bool> {
+        let in_identity = self.identities.has_network()?;
+        let in_store = !self.store.lock().await.networks()?.is_empty();
+        if !in_identity && !in_store {
+            return Ok(false);
+        }
+        self.membership_state().await?;
+        Ok(true)
+    }
+
+    pub async fn membership_state(&self) -> Result<NetworkState> {
+        let local = if self.identities.has_network()? {
+            Some(self.identities.public_state()?)
+        } else {
+            None
+        };
+        let mut store = self.store.lock().await;
+        let networks = store.networks()?;
+        ensure!(
+            networks.len() <= 1,
+            "one installation can join only one personal network"
+        );
+        let stored = networks
+            .first()
+            .map(|network| store.trust_bundle(network))
+            .transpose()?
+            .flatten();
+        let merged = match (&local, &stored) {
+            (Some(a), Some(b)) => {
+                if a.epoch() >= b.epoch() {
+                    b.merge(a)?
+                } else {
+                    a.merge(b)?
+                }
+            }
+            (Some(state), None) | (None, Some(state)) => state.clone(),
+            (None, None) => bail!("personal network is not installed"),
+        };
+        if stored.as_ref() != Some(&merged) || local.as_ref() != Some(&merged) {
+            let _work = self.maintenance.enter()?;
+            self.identities.install_state(merged.clone())?;
+            store.install_trust_bundle(&merged.genesis.network_id, &merged)?;
+            let view = merged.project()?;
+            if view.authorize_node(&self.identity.node_id()?, None).is_ok() {
+                store.save_local_identity(&view.network_id, &self.identity)?;
+            }
+        }
+        Ok(merged)
     }
     pub fn info(&self) -> Value {
         json!({"node_id":self.identity.node_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
@@ -1741,22 +1642,77 @@ impl Runtime {
                 }
             }
         });
-        for peer in &self.config.peers {
-            let peer = peer.clone();
-            let hub = self.hub.clone();
-            tokio::spawn(async move {
-                loop {
-                    if let Err(e) = hub
-                        .clone()
-                        .connect(peer.network_id.clone(), peer.url.clone())
-                        .await
-                    {
-                        tracing::debug!(error=%e,"peer reconnect pending");
+        let mut incoming = self
+            .network_rx
+            .lock()
+            .await
+            .take()
+            .context("runtime already started")?;
+        let node = self.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = incoming.recv().await {
+                let node = node.clone();
+                tokio::spawn(async move {
+                    let result = match incoming.service {
+                        Service::Peer => node.hub.clone().accept_transport(incoming.socket).await,
+                        Service::Client => {
+                            crate::client::serve(node.clone(), incoming.socket).await
+                        }
+                    };
+                    if let Err(error) = result {
+                        tracing::debug!(%error,"authenticated channel closed");
                     }
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                });
+            }
+        });
+        let transport = self.network.clone();
+        let listen = self.config.listen;
+        tokio::spawn(async move {
+            if let Err(error) = transport.run(listen).await {
+                tracing::warn!(%error,"network discovery stopped");
+            }
+        });
+        let node = self.clone();
+        tokio::spawn(async move {
+            let connecting = Arc::new(Mutex::new(BTreeSet::new()));
+            let mut tick = tokio::time::interval(Duration::from_secs(3));
+            loop {
+                tick.tick().await;
+                let Ok(state) = node.identities.public_state() else {
+                    continue;
+                };
+                let Ok(view) = state.project() else { continue };
+                let online = node.hub.online(&view.network_id).await;
+                for member in view
+                    .members
+                    .into_iter()
+                    .filter(|member| member.kind == IdentityKind::Node)
+                {
+                    if member.subject_id == node.identity.node_id().unwrap_or_default()
+                        || online.contains(&member.subject_id)
+                    {
+                        continue;
+                    }
+                    let key = (view.network_id.clone(), member.subject_id.clone());
+                    if !connecting.lock().await.insert(key.clone()) {
+                        continue;
+                    }
+                    let node = node.clone();
+                    let connecting = connecting.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = node
+                            .hub
+                            .clone()
+                            .connect_target(key.0.clone(), key.1.clone(), node.network.clone())
+                            .await
+                        {
+                            tracing::debug!(%error,"personal peer reconnect pending");
+                        }
+                        connecting.lock().await.remove(&key);
+                    });
                 }
-            });
-        }
+            }
+        });
         let node = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(3));
@@ -1835,128 +1791,8 @@ impl Runtime {
         }
         Ok(())
     }
-    pub async fn register(&self, username: &str, password: &str) -> Result<Account> {
-        let _work = self.maintenance.enter()?;
-        ensure!(
-            self.config.roles.contains(&NodeRole::Gateway),
-            "this node does not accept registration"
-        );
-        let owner = LocalIdentity::generate();
-        let network = owner.network_id()?;
-        let mut auth = self.auth.lock().await;
-        let local_setup = auth.accounts()?.is_empty()
-            && self.config.listen.ip().is_loopback()
-            && std::iter::once(&self.config.public_url)
-                .chain(&self.config.allowed_origins)
-                .all(|origin| {
-                    reqwest::Url::parse(origin).is_ok_and(|site| {
-                        site.host_str().is_some_and(|h| {
-                            h == "localhost"
-                                || h.trim_matches(['[', ']'])
-                                    .parse::<std::net::IpAddr>()
-                                    .is_ok_and(|ip| ip.is_loopback())
-                        })
-                    })
-                });
-        let roles = if local_setup {
-            self.config.roles.clone()
-        } else {
-            self.config
-                .roles
-                .iter()
-                .filter(|r| matches!(r, NodeRole::Gateway | NodeRole::Relay | NodeRole::Replica))
-                .cloned()
-                .collect()
-        };
-        let bundle = owner.sign_trust_bundle(1, vec![self.identity.certificate(roles)?])?;
-        let account = auth.register(username, password, &owner, &bundle)?;
-        drop(auth);
-        let mut store = self.store.lock().await;
-        store.install_trust_bundle(&network, &bundle)?;
-        store.save_local_identity(&network, &self.identity)?;
-        Ok(account)
-    }
     pub async fn authorize_bearer(&self, token: &str) -> Option<Access> {
         self.agent_tokens.lock().await.get(token).cloned()
-    }
-    pub async fn pair(&self, input: Value) -> Result<Value> {
-        let _work = self.maintenance.enter()?;
-        let code = field(&input, "code")?;
-        let public_key = field(&input, "public_key")?;
-        let node_id = field(&input, "node_id")?;
-        ensure!(
-            crypto::fingerprint(public_key)? == node_id,
-            "node fingerprint mismatch"
-        );
-        crypto::verify_payload(
-            public_key,
-            "pair",
-            &serde_json::to_vec(&json!([code, node_id, public_key]))?,
-            field(&input, "proof")?,
-        )?;
-        let receipt_key = format!("pair_receipt:{}", crypto::digest(code.as_bytes()));
-        {
-            let store = self.store.lock().await;
-            for network in store.networks()? {
-                if let Some(receipt) = store.local_value(&network, &receipt_key)? {
-                    ensure!(
-                        receipt["node_id"] == node_id
-                            && receipt["expires_at"].as_i64().unwrap_or(0) > now_ms(),
-                        "pairing invitation is no longer valid"
-                    );
-                    store.authorize_node(&network, node_id, None)?;
-                    return Ok(receipt["response"].clone());
-                }
-            }
-        }
-        let mut auth = self.auth.lock().await;
-        let grant = auth.pairing_invite(code, node_id)?;
-        let secret = auth
-            .owner(&grant.network_id)?
-            .context("pair on the owner device")?;
-        let owner = LocalIdentity {
-            secret_key_hex: secret,
-        };
-        let mut store = self.store.lock().await;
-        let old = store
-            .trust_bundle(&grant.network_id)?
-            .context("unknown personal network")?;
-        let roles: Vec<NodeRole> = grant
-            .roles
-            .into_iter()
-            .map(|r| serde_json::from_value(json!(r)))
-            .collect::<std::result::Result<_, _>>()?;
-        ensure!(!roles.is_empty(), "no device roles");
-        let certificate = NodeCertificate {
-            node_id: node_id.into(),
-            public_key: public_key.into(),
-            roles,
-            revoked: false,
-        };
-        let bundle = if let Some(existing) = old.nodes.iter().find(|n| n.node_id == node_id) {
-            ensure!(
-                grant.claimed && existing == &certificate,
-                "device already bound; revoke or use a fresh identity"
-            );
-            old
-        } else {
-            let mut nodes = old.nodes;
-            nodes.push(certificate);
-            owner.sign_trust_bundle(old.revision + 1, nodes)?
-        };
-        // Retain the device-bound claim until trust and its retry receipt are durable.
-        auth.consume_invite(code, node_id)?;
-        drop(auth);
-        store.install_trust_bundle(&grant.network_id, &bundle)?;
-        let response = json!({"network_id":grant.network_id,"trust_bundle":bundle});
-        store.local_set(
-            &grant.network_id,
-            &receipt_key,
-            &json!({"node_id":node_id,"expires_at":now_ms()+600_000,"response":response}),
-        )?;
-        drop(store);
-        self.auth.lock().await.complete_invite(code, node_id)?;
-        Ok(response)
     }
     pub async fn append(&self, network: &str, scope: &str, body: EventBody) -> Result<SignedEvent> {
         self.append_blobs(network, scope, body, vec![]).await
@@ -2005,6 +1841,11 @@ impl Runtime {
         Ok(())
     }
     async fn require_scope(&self, access: &Access, scope: &str) -> Result<()> {
+        let state = self.membership_state().await?;
+        ensure!(
+            state.genesis.network_id == access.network_id,
+            "wrong personal network"
+        );
         if let Some(allowed) = &access.conversation_id {
             ensure!(allowed == scope, "outside this tool's conversation");
         }
@@ -2020,6 +1861,11 @@ impl Runtime {
         Ok(())
     }
     async fn require_role(&self, network: &str, role: NodeRole) -> Result<()> {
+        let state = self.membership_state().await?;
+        ensure!(
+            state.genesis.network_id == network,
+            "wrong personal network"
+        );
         ensure!(
             self.config.roles.contains(&role),
             "node capability is disabled"
@@ -2063,15 +1909,12 @@ impl Runtime {
         let inventory = self
             .read_peer(network, target, json!({"type":"inventory"}))
             .await?;
-        let bundle: TrustBundle = serde_json::from_value(inventory["trust_bundle"].clone())?;
-        {
-            let mut store = self.store.lock().await;
-            let old = store.trust_bundle(network)?.context("unpinned network")?;
-            ensure!(bundle.network_id == old.network_id, "wrong network");
-            if bundle.revision > old.revision {
-                store.install_trust_bundle(network, &bundle)?;
-            }
-        }
+        let state: NetworkState = serde_json::from_value(inventory["membership"].clone())?;
+        ensure!(
+            state.genesis.network_id == network,
+            "wrong membership network"
+        );
+        self.install_membership(state).await?;
         let scopes = inventory["scopes"]
             .as_array()
             .context("invalid inventory")?;
@@ -2171,7 +2014,13 @@ impl Runtime {
                 let online = self.hub.online(network).await;
                 let local = self.identity.node_id()?;
                 let mut nodes = vec![];
-                for cert in bundle.nodes {
+                for member in bundle
+                    .project()?
+                    .members
+                    .into_iter()
+                    .filter(|member| member.kind == IdentityKind::Node)
+                {
+                    let cert = member.certificate()?;
                     let here = cert.node_id == local;
                     let live = here || online.contains(&cert.node_id);
                     let capabilities = if here {
@@ -2472,61 +2321,6 @@ impl Runtime {
                     .await?;
                 }
                 Ok(json!({"acknowledged":true}))
-            }
-            "invite" => {
-                ensure!(access.human, "only the user pairs devices");
-                ensure!(
-                    self.auth.lock().await.owner(network)?.is_some(),
-                    "create invitations on the network owner device"
-                );
-                let roles: Vec<NodeRole> = serde_json::from_value(input["roles"].clone())?;
-                ensure!(!roles.is_empty() && roles.len() <= 5, "invalid roles");
-                let strings = roles
-                    .iter()
-                    .map(|r| {
-                        serde_json::to_value(r)
-                            .unwrap()
-                            .as_str()
-                            .unwrap()
-                            .to_owned()
-                    })
-                    .collect();
-                let code = self.auth.lock().await.create_invite(network, strings)?;
-                Ok(
-                    json!({"code":code,"network_id":network,"expires_in":600,"command":format!("vibeface-node pair --url {} --network-id {} --code {} --username YOUR_NAME --password-stdin",self.config.public_url,network,code)}),
-                )
-            }
-            "revoke" => {
-                ensure!(access.human, "only the user revokes devices");
-                let target = field(&input, "node_id")?;
-                ensure!(
-                    target != self.identity.node_id()?,
-                    "cannot revoke current owner device from this endpoint"
-                );
-                let owner = LocalIdentity {
-                    secret_key_hex: self
-                        .auth
-                        .lock()
-                        .await
-                        .owner(network)?
-                        .context("revoke on the network owner device")?,
-                };
-                let mut store = self.store.lock().await;
-                let old = store.trust_bundle(network)?.context("unknown network")?;
-                let mut nodes = old.nodes;
-                let node = nodes
-                    .iter_mut()
-                    .find(|n| n.node_id == target)
-                    .context("unknown node")?;
-                node.revoked = true;
-                let bundle = owner.sign_trust_bundle(old.revision + 1, nodes)?;
-                store.install_trust_bundle(network, &bundle)?;
-                drop(store);
-                let _ = self
-                    .hub
-                    .broadcast(network, json!({"type":"trust","bundle":bundle}))
-                    .await;
-                Ok(json!({"revoked":target}))
             }
             "export" => {
                 let scope = scope.context("conversation_id is required")?;
@@ -3567,6 +3361,7 @@ impl Runtime {
         Ok(json!({"sessions":sessions,"operations":records,"facts":facts}))
     }
     async fn handle_peer(self: &Arc<Self>, message: &Inbound) -> Result<Value> {
+        self.membership_state().await?;
         let network = &message.network_id;
         let input = &message.payload;
         self.store
@@ -3595,7 +3390,7 @@ impl Runtime {
                     .into_iter()
                     .map(|s| Ok(json!({"scope_id":s,"heads":store.heads(network,&s)?})))
                     .collect::<Result<Vec<_>>>()?;
-                Ok(json!({"trust_bundle":store.trust_bundle(network)?,"scopes":scopes}))
+                Ok(json!({"membership":store.trust_bundle(network)?,"scopes":scopes}))
             }
             "event" => {
                 self.require_role(network, NodeRole::Replica).await?;
@@ -3630,12 +3425,12 @@ impl Runtime {
                 )
             }
             "trust" => {
-                let bundle: TrustBundle = serde_json::from_value(input["bundle"].clone())?;
-                let mut store = self.store.lock().await;
-                let old = store.trust_bundle(network)?.context("unpinned network")?;
-                if bundle.revision > old.revision {
-                    store.install_trust_bundle(network, &bundle)?;
-                }
+                let state: NetworkState = serde_json::from_value(input["state"].clone())?;
+                ensure!(
+                    state.genesis.network_id == *network,
+                    "wrong membership network"
+                );
+                self.install_membership(state).await?;
                 Ok(json!({"received":true}))
             }
             "task_binding" => Ok(
@@ -4058,39 +3853,41 @@ impl Runtime {
                 return Ok(true);
             }
         }
-        let target = if self.config.manager.is_some()
-            && self.config.roles.contains(&NodeRole::Scheduler)
-        {
-            Some(self.identity.node_id()?)
-        } else {
-            let bundle = self
-                .store
-                .lock()
-                .await
-                .trust_bundle(&request.network_id)?
-                .context("unknown network")?;
-            let online = self.hub.online(&request.network_id).await;
-            let mut target = None;
-            for node in bundle.nodes.into_iter().filter(|n| {
-                !n.revoked && n.roles.contains(&NodeRole::Scheduler) && online.contains(&n.node_id)
-            }) {
-                if let Ok(Ok(cap)) = tokio::time::timeout(
-                    Duration::from_secs(3),
-                    self.peer_request(
-                        &request.network_id,
-                        &node.node_id,
-                        json!({"type":"capabilities"}),
-                    ),
-                )
-                .await
-                    && !cap["manager"].is_null()
-                {
-                    target = Some(node.node_id);
-                    break;
+        let target =
+            if self.config.manager.is_some() && self.config.roles.contains(&NodeRole::Scheduler) {
+                Some(self.identity.node_id()?)
+            } else {
+                let bundle = self
+                    .store
+                    .lock()
+                    .await
+                    .trust_bundle(&request.network_id)?
+                    .context("unknown network")?;
+                let online = self.hub.online(&request.network_id).await;
+                let mut target = None;
+                for member in bundle.project()?.members.into_iter().filter(|member| {
+                    member.kind == IdentityKind::Node
+                        && member.node_roles.contains(&NodeRole::Scheduler)
+                        && online.contains(&member.subject_id)
+                }) {
+                    let node = member.certificate()?;
+                    if let Ok(Ok(cap)) = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        self.peer_request(
+                            &request.network_id,
+                            &node.node_id,
+                            json!({"type":"capabilities"}),
+                        ),
+                    )
+                    .await
+                        && !cap["manager"].is_null()
+                    {
+                        target = Some(node.node_id);
+                        break;
+                    }
                 }
-            }
-            target
-        };
+                target
+            };
         let Some(target) = target else {
             let notification_id = format!("followup:{result_hash}:waiting");
             let already = self.store.lock().await.context(&request.network_id, &request.conversation_id, &[])?.events.iter().any(|event| {
