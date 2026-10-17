@@ -3,6 +3,7 @@
 pub mod authenticators;
 pub mod bootstrap;
 pub mod projection;
+pub mod services;
 use crate::{Identity, membership::canonical_json};
 pub use authenticators::{AuthenticatorRecord, VerifiedAuthenticator};
 use serde::{Deserialize, Deserializer, Serialize};

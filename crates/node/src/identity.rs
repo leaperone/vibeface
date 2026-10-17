@@ -2,6 +2,8 @@
 
 pub use vibeface_secure::membership::*;
 
+pub(crate) mod admission;
+pub(crate) mod event_authorization;
 pub(crate) mod journal;
 pub mod local;
 pub mod policy;

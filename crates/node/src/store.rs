@@ -1,5 +1,5 @@
 use crate::{
-    crypto::{LocalIdentity, digest, verify_signed_event},
+    crypto::{LocalIdentity, digest},
     identity::NetworkState,
     model::*,
 };
@@ -63,22 +63,36 @@ fn validate_persisted_state(connection: &Connection) -> Result<()> {
     let policy = crate::identity::journal::PolicyState::load(connection)?;
     let mut statement = connection.prepare("SELECT space_id,revision,bundle FROM spaces")?;
     let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, String>(2)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u64>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     })?;
     let mut seen = BTreeSet::new();
     for row in rows {
         let (space, revision, encoded) = row?;
         let id = vibeface_secure::authorization::SpaceId::parse(&space)?;
-        let current = policy.verified().space_history(&id).and_then(|history| history.last())
+        let current = policy
+            .verified()
+            .space_history(&id)
+            .and_then(|history| history.last())
             .context("stored space has no pinned policy")?;
-        ensure!(serde_json::to_string(current)? == encoded && current.payload.sequence == revision,
-            "stored space projection differs from verified policy");
+        ensure!(
+            serde_json::to_string(current)? == encoded && current.payload.sequence == revision,
+            "stored space projection differs from verified policy"
+        );
         seen.insert(id);
         load_events_from(connection, &space)?;
     }
-    let expected: BTreeSet<_> = policy.pins().iter().filter_map(|pin| match &pin.domain {
-        vibeface_secure::authorization::PolicyDomain::Space(space) => Some(space.clone()), _ => None,
-    }).collect();
+    let expected: BTreeSet<_> = policy
+        .pins()
+        .iter()
+        .filter_map(|pin| match &pin.domain {
+            vibeface_secure::authorization::PolicyDomain::Space(space) => Some(space.clone()),
+            _ => None,
+        })
+        .collect();
     ensure!(seen == expected, "stored space projection is incomplete");
     crate::identity::policy::validate_resource_projections(connection)?;
     Ok(())
@@ -403,9 +417,16 @@ impl Store {
             .context("unknown historical event author")
     }
     pub fn verify_event(&self, network_id: &str, envelope: &SignedEvent) -> Result<Event> {
-        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
-        let key = self.public_key(network_id, &event.author)?;
-        verify_signed_event(network_id, envelope, &key)
+        let event = crate::identity::event_authorization::verify_event_envelope(
+            &self.policy,
+            network_id,
+            envelope,
+        )?;
+        ensure!(
+            event.network_id == network_id,
+            "event belongs to another space"
+        );
+        Ok(event)
     }
     pub fn ingest_event(
         &mut self,
@@ -956,6 +977,116 @@ impl Store {
             &serde_json::to_value(&proof)?,
         )?;
         Ok(proof)
+    }
+
+    pub fn bind_task_authorized(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &vibeface_secure::authorization::VerifiedAuthorization,
+        proof: &crate::identity::policy::FreshnessProof,
+        transport: &vibeface_secure::authorization::TransportEvidence,
+        source_body: &Value,
+        now_ms: u64,
+    ) -> Result<crate::binding::SignedBinding> {
+        use vibeface_secure::authorization::Action;
+        ensure!(
+            auth.action() == Action::ExecutionOpen && source_body["method"] == "bind_execution",
+            "initial binding requires an execution-open invocation"
+        );
+        let required = |field: &str| {
+            source_body[field]
+                .as_str()
+                .with_context(|| format!("{field} is required"))
+        };
+        let space = auth.resource().space.as_str();
+        let scope = required("conversation_id")?;
+        let task_id = required("task_id")?;
+        let creation = self.task_creation(space, scope, task_id)?;
+        ensure!(
+            creation.hash == required("task_ref")?,
+            "binding refers to another task creation"
+        );
+        let task = self.verify_event(space, &creation)?;
+        ensure!(
+            task.resource_id == auth.resource().resource && task.author == identity.node_id()?,
+            "task authority or resource mismatch"
+        );
+        let binding = crate::binding::TaskBinding {
+            network_id: space.to_owned(),
+            conversation_id: scope.to_owned(),
+            task_ref: creation.hash,
+            task_id: task_id.to_owned(),
+            authority_node: task.author,
+            generation: 1,
+            target_node: required("target_node")?.to_owned(),
+            session_id: required("session_id")?.to_owned(),
+            open_spec: serde_json::json!({"type":"open","executor":required("executor")?,"cwd":required("cwd")?}),
+            previous_binding_hash: None,
+            previous_seal: None,
+        };
+        self.verify_binding_task(&binding, true)?;
+        let facts = self.request_facts(source_body, auth.audience())?;
+        let checked = self.policy.verified().verify_invocation(
+            auth.signed_invocation(),
+            &facts,
+            transport,
+            now_ms,
+        )?;
+        ensure!(
+            checked.invocation_hash() == auth.invocation_hash(),
+            "binding invocation changed"
+        );
+        self.policy
+            .verified()
+            .verify_freshness(auth, &proof.challenge, &proof.receipts, now_ms)?;
+        let signed = crate::binding::sign_binding(identity, &binding)?;
+        let hash = crate::binding::binding_hash(&binding)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_key = format!("task-binding-current:{}", binding.task_ref);
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT value FROM local_values WHERE space_id=? AND key=?",
+                params![space, current_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(current) = current {
+            let current: String = serde_json::from_str(&current)?;
+            ensure!(
+                current == hash,
+                "task is already bound; changing it requires execution-rebind authorization"
+            );
+            return Ok(signed);
+        }
+        let ready: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND hash=? AND resource_id=? AND status='ready')",
+            params![space,binding.task_ref,auth.resource().resource.as_str()], |row| row.get(0))?;
+        ensure!(ready, "task creation changed before binding");
+        crate::identity::admission::consume_authorization_in(
+            &tx,
+            self.policy.verified(),
+            auth,
+            proof,
+            transport,
+            source_body,
+            None,
+            now_ms,
+        )?;
+        tx.execute(
+            "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
+            params![
+                space,
+                format!("task-binding-record:{hash}"),
+                serde_json::to_string(&signed)?
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
+            params![space, current_key, serde_json::to_string(&hash)?],
+        )?;
+        tx.commit()?;
+        Ok(signed)
     }
 
     pub fn install_binding(&mut self, proof: &crate::binding::SignedBinding) -> Result<()> {
@@ -1662,6 +1793,7 @@ impl Store {
     }
 }
 pub(crate) fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result<()> {
+    let policy = crate::identity::journal::PolicyState::load(connection)?;
     let mut events = load_events_from(connection, network_id)?;
     let mut author_sequences: BTreeMap<(String, String, u64), Vec<String>> = BTreeMap::new();
     for (hash, e) in &events {
@@ -1722,7 +1854,14 @@ pub(crate) fn rebuild_projections_from(connection: &Connection, network_id: &str
                 break;
             }
         }
-        if blobs_complete {
+        if blobs_complete
+            && matches!(
+                crate::identity::event_authorization::validate_event_evidence(
+                    &policy, connection, &e.event, &events,
+                )?,
+                crate::identity::event_authorization::EventEvidenceStatus::Valid
+            )
+        {
             events.get_mut(hash).unwrap().status = "ready".into();
         }
     }
@@ -1805,16 +1944,30 @@ fn authorize_node_from(
     use vibeface_secure::authorization::{DeviceId, PublicKey, SpaceId};
     let key: String = connection.query_row(
         "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
-        params![network_id,node_id], |row| row.get(0),
+        params![network_id, node_id],
+        |row| row.get(0),
     )?;
-    ensure!(crate::crypto::fingerprint(&key)? == node_id, "Node certificate projection mismatch");
+    ensure!(
+        crate::crypto::fingerprint(&key)? == node_id,
+        "Node certificate projection mismatch"
+    );
     let policy = crate::identity::journal::PolicyState::load(connection)?;
     let public_key = PublicKey::parse(&key)?;
     let certificate = policy.verified().verify_service_device(
-        &SpaceId::parse(network_id)?, &DeviceId::from_key(&public_key), crate::runtime::now_ms() as u64,
+        &SpaceId::parse(network_id)?,
+        &DeviceId::from_key(&public_key),
+        crate::runtime::now_ms() as u64,
     )?;
-    ensure!(certificate.payload.public_key == public_key, "Node certificate key mismatch");
-    Ok(NodeCertificate { node_id:node_id.to_owned(), public_key:key, roles:vec![], revoked:false })
+    ensure!(
+        certificate.payload.public_key == public_key,
+        "Node certificate key mismatch"
+    );
+    Ok(NodeCertificate {
+        node_id: node_id.to_owned(),
+        public_key: key,
+        roles: vec![],
+        revoked: false,
+    })
 }
 
 pub(crate) fn validate_operation_binding_from(
@@ -1880,7 +2033,10 @@ pub(crate) fn validate_operation_binding_from(
     Ok(())
 }
 
-pub(crate) fn heads_from_events(events: &BTreeMap<String, StoredEvent>, scope_id: &str) -> Vec<String> {
+pub(crate) fn heads_from_events(
+    events: &BTreeMap<String, StoredEvent>,
+    scope_id: &str,
+) -> Vec<String> {
     let mut heads: BTreeSet<String> = events
         .iter()
         .filter(|(_, e)| e.event.scope_id == scope_id)
@@ -1898,7 +2054,7 @@ pub(crate) fn load_events_from(
     network_id: &str,
 ) -> Result<BTreeMap<String, StoredEvent>> {
     let mut query = connection
-        .prepare("SELECT hash,envelope,status,scope_id,author,sequence FROM events WHERE space_id=? ORDER BY hash")?;
+        .prepare("SELECT hash,envelope,status,scope_id,author,sequence,resource_id FROM events WHERE space_id=? ORDER BY hash")?;
     let rows = query.query_map([network_id], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -1907,22 +2063,23 @@ pub(crate) fn load_events_from(
             r.get::<_, String>(3)?,
             r.get::<_, String>(4)?,
             r.get::<_, u64>(5)?,
+            r.get::<_, String>(6)?,
         ))
     })?;
     let mut result = BTreeMap::new();
+    let policy = crate::identity::journal::PolicyState::load(connection)?;
     for row in rows {
-        let (hash, envelope, status, scope, author, sequence) = row?;
+        let (hash, envelope, status, scope, author, sequence, resource) = row?;
         let envelope: SignedEvent = serde_json::from_str(&envelope)?;
         ensure!(envelope.hash == hash, "stored event hash mismatch");
-        let body: Event = serde_json::from_str(&envelope.canonical_body)?;
-        let public_key: String = connection.query_row(
-            "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
-            params![network_id, body.author],
-            |r| r.get(0),
+        let event = crate::identity::event_authorization::verify_event_envelope(
+            &policy, network_id, &envelope,
         )?;
-        let event = verify_signed_event(network_id, &envelope, &public_key)?;
         ensure!(
-            event.scope_id == scope && event.author == author && event.sequence == sequence,
+            event.scope_id == scope
+                && event.author == author
+                && event.sequence == sequence
+                && event.resource_id.as_str() == resource,
             "stored event metadata does not match signed body"
         );
         result.insert(
@@ -1934,10 +2091,30 @@ pub(crate) fn load_events_from(
             },
         );
     }
+    for stored in result.values() {
+        let evidence = crate::identity::event_authorization::validate_event_evidence(
+            &policy,
+            connection,
+            &stored.event,
+            &result,
+        )?;
+        ensure!(
+            stored.status != "ready"
+                || matches!(
+                    evidence,
+                    crate::identity::event_authorization::EventEvidenceStatus::Valid
+                ),
+            "ready event has incomplete admission or causal evidence"
+        );
+    }
     Ok(result)
 }
 
-pub(crate) fn has_blob_from(connection: &Connection, network_id: &str, blob: &BlobRef) -> Result<bool> {
+pub(crate) fn has_blob_from(
+    connection: &Connection,
+    network_id: &str,
+    blob: &BlobRef,
+) -> Result<bool> {
     let content: Option<Vec<u8>> = connection
         .query_row(
             "SELECT content FROM blobs WHERE space_id=? AND hash=? AND size=?",
@@ -1955,7 +2132,10 @@ fn optional_json<T: DeserializeOwned>(value: Option<String>) -> Result<Option<T>
 fn dependencies(event: &Event) -> impl Iterator<Item = &String> {
     event.parents.iter().chain(event.previous.iter())
 }
-pub(crate) fn closure_hashes(events: &BTreeMap<String, StoredEvent>, heads: &[String]) -> BTreeSet<String> {
+pub(crate) fn closure_hashes(
+    events: &BTreeMap<String, StoredEvent>,
+    heads: &[String],
+) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
     let mut stack = heads.to_vec();
     while let Some(hash) = stack.pop() {
