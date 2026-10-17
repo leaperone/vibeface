@@ -163,12 +163,17 @@ impl Store {
         let request: AccountNodeEnrollmentCommitRequest = serde_json::from_value(params.clone())?;
         require_principal(&request, principal)?;
         let account = &request.intent.payload.account;
-        let document = self
-            .policy
+        let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = journal::PolicyState::load(&tx)?;
+        let document = current
             .verified()
             .account(account)
             .context("account policy is unavailable")?;
-        self.policy.verified().verify_account_client_device(
+        current.verified().verify_account_client_device(
             account,
             &request.intent.payload.requesting_device,
             now,
@@ -180,27 +185,30 @@ impl Store {
         let request_hash = ObjectHash::body(&request.intent)?;
         let input_hash = ObjectHash::body(&request)?;
         let receipt_key = format!("node-enrollment-commit:{request_hash}");
-        if let Some(receipt) = metadata(&self.connection, &receipt_key)? {
+        if let Some(receipt) = metadata(&tx, &receipt_key)? {
             let receipt: Value = serde_json::from_str(&receipt)?;
             ensure!(
                 receipt["input_hash"] == input_hash.as_str() && receipt["principal"] == principal,
                 "node enrollment completion changed its signed request"
             );
-            return Ok(receipt["response"].clone());
+            let response = receipt["response"].clone();
+            tx.commit()?;
+            self.policy = current;
+            return Ok(response);
         }
         node_enrollment::verify_account_node_enrollment_proposal(
-            self.policy.verified(),
+            current.verified(),
             &request,
             now,
         )?;
-        let snapshot = self.authenticate_account(
+        let snapshot = super::policy::authenticate_account_from(
+            &tx,
+            &current,
             principal,
             &json!({"account_id":account,
             "space_id":SpaceId::personal(account),"device_public_key":principal}),
             now,
         )?;
-        let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
-            .map_err(anyhow::Error::msg)?;
         let delta: Vec<JournalEntry> = serde_json::from_str(
             &node_enrollment::commit_account_node_enrollment(
                 &serde_json::to_string(&request)?,
@@ -211,12 +219,9 @@ impl Store {
             )
             .map_err(anyhow::Error::msg)?,
         )?;
-        let update = self.policy.prepare_network_update(&delta, now)?;
+        let update = current.prepare_network_update(&delta, now)?;
         let response = json!({"journal_delta":delta});
         let receipt = json!({"request_hash":request_hash,"input_hash":input_hash,"principal":principal,"response":response});
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let state = journal::commit_in(&tx, &update)?;
         project_policy_in(&tx, &state)?;
         tx.execute(
@@ -244,19 +249,30 @@ impl Store {
             "installation changed the approved account proposal or local Node"
         );
         let input_hash = ObjectHash::body(params)?;
-        if let Some(receipt) = metadata(&self.connection, "account_node_installation")? {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = journal::PolicyState::load(&tx)?;
+        if let Some(receipt) = metadata(&tx, "account_node_installation")? {
             let receipt: Value = serde_json::from_str(&receipt)?;
             ensure!(
                 receipt["input_hash"] == input_hash.as_str() && receipt["principal"] == principal,
                 "Node has already installed another account enrollment"
             );
-            return Ok(receipt["response"].clone());
+            current.verified().verify_account_client_device(
+                &installation.request.intent.payload.account,
+                &installation.request.intent.payload.requesting_device,
+                now,
+            )?;
+            let response = receipt["response"].clone();
+            tx.commit()?;
+            self.policy = current;
+            return Ok(response);
         }
         let claim = &installation.request.intent.payload.claim;
-        self.verify_bootstrap_capability(claim.payload.claim_nonce.as_str())?;
+        check_claim_in(&tx, claim)?;
         let saved: PossessionRecord = serde_json::from_str(
-            &metadata(&self.connection, "node_possession")?
-                .context("Node possession is missing")?,
+            &metadata(&tx, "node_possession")?.context("Node possession is missing")?,
         )?;
         ensure!(
             saved.request_hash == ObjectHash::body(&installation.request.intent)?
@@ -288,9 +304,7 @@ impl Store {
                 && verified.node_public_key().as_str() == identity.public_key_hex()?,
             "verified installation differs from this local Node"
         );
-        let update = self
-            .policy
-            .prepare_bootstrap(verified.pins(), verified.journal(), now)?;
+        let update = current.prepare_bootstrap(verified.pins(), verified.journal(), now)?;
         update
             .verified_after()
             .verify_transport_device(&DeviceId::from_key(verified.node_public_key()), now)?;
@@ -302,10 +316,6 @@ impl Store {
         let response = json!({"installed":true,"account_id":verified.account(),
             "node_public_key":verified.node_public_key(),"pins":verified.pins()});
         let receipt = json!({"request_hash":verified.request_hash()?,"input_hash":input_hash,"principal":principal,"response":response});
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_claim_in(&tx, claim)?;
         let state = journal::commit_in(&tx, &update)?;
         project_policy_in(&tx, &state)?;
         ensure!(tx.execute("UPDATE identity_meta SET value='consumed:'||value WHERE key='bootstrap_capability_hash' AND value=?",
@@ -345,7 +355,7 @@ mod tests {
     impl Fixture {
         fn new() -> Result<Self> {
             let network = TestNetwork::new()?;
-            let authority = network.memory()?;
+            let authority = network.at(&network.directory.join("authority.sqlite3"))?;
             let mut fresh = Store::initialize(&network.directory.join("new-node.sqlite3"))?;
             let capability = BootstrapCapability::generate();
             fresh.install_bootstrap_capability(&capability)?;
@@ -451,6 +461,13 @@ mod tests {
         let (prepared, request) = f.commit_request()?;
         let principal = f.network.client.public_key_hex();
         let before = count(&f.authority, "policy_journal")?;
+        let grants_before = f
+            .authority
+            .authorization_state()
+            .space(&f.network.space)
+            .context("space missing")?
+            .grants
+            .clone();
         assert!(
             f.authority
                 .node_enrollment_command(
@@ -543,15 +560,15 @@ mod tests {
                 .space(&f.network.space)
                 .context("space missing")?
                 .grants,
-            f.network
-                .bundle
-                .journal
-                .iter()
-                .find_map(|entry| match entry {
-                    JournalEntry::SpaceGenesis(value) => Some(value.payload.grants.clone()),
-                    _ => None,
-                })
-                .context("space genesis missing")?
+            grants_before
+        );
+        assert_eq!(
+            f.authority
+                .authorization_state()
+                .space(&f.network.space)
+                .context("space missing")?
+                .grants,
+            grants_before
         );
         let path = f.network.directory.join("new-node.sqlite3");
         drop(f.fresh);
@@ -691,6 +708,76 @@ mod tests {
                 .is_err()
         );
         assert_eq!(count(&f.authority, "policy_journal")?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_retries_reload_revocation_from_a_second_connection() -> Result<()> {
+        let mut f = Fixture::new()?;
+        let (prepared, request) = f.commit_request()?;
+        let principal = f.network.client.public_key_hex();
+        let response = f.authority.node_enrollment_command(
+            &f.network.node,
+            &principal,
+            "account_node_commit",
+            &request,
+            now(),
+        )?;
+        let verified = node_enrollment::finish_account_node_enrollment(
+            &prepared,
+            &serde_json::to_string(&response["journal_delta"])?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let installation =
+            serde_json::from_str(&verified.installation_json().map_err(anyhow::Error::msg)?)?;
+        assert_eq!(
+            f.fresh.node_enrollment_command(
+                &f.node,
+                &principal,
+                "account_node_install",
+                &installation,
+                now()
+            )?["installed"],
+            true
+        );
+        let device = DeviceId::from_key(&PublicKey::of(&f.network.client));
+        let mut independent_authority = Store::open(f.network.directory.join("authority.sqlite3"))?;
+        f.network.revoke_client(&mut independent_authority)?;
+        f.authority.policy.verified().verify_account_client_device(
+            &f.network.account,
+            &device,
+            now() + 2,
+        )?;
+        assert!(
+            f.authority
+                .node_enrollment_command(
+                    &f.network.node,
+                    &principal,
+                    "account_node_commit",
+                    &request,
+                    now() + 2
+                )
+                .is_err()
+        );
+        let mut independent_target = Store::open(f.network.directory.join("new-node.sqlite3"))?;
+        f.network.revoke_client(&mut independent_target)?;
+        f.fresh.policy.verified().verify_account_client_device(
+            &f.network.account,
+            &device,
+            now() + 2,
+        )?;
+        assert!(
+            f.fresh
+                .node_enrollment_command(
+                    &f.node,
+                    &principal,
+                    "account_node_install",
+                    &installation,
+                    now() + 2
+                )
+                .is_err()
+        );
         Ok(())
     }
 
