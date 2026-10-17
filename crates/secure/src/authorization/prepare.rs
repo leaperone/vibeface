@@ -169,6 +169,18 @@ fn check_raw_context(intent: &PrepareIntent, body: &Value, audience_key: &Public
             "raw binding belongs to another space",
         )?;
     }
+    let task_ids = [
+        text(body.get("task_id"))?,
+        text(request.and_then(|request| request.get("task_id")))?,
+        binding
+            .as_ref()
+            .map(|binding| binding.binding.task_id.as_str()),
+    ];
+    match_text(
+        task_ids.iter().flatten().next().copied(),
+        &task_ids,
+        "raw request contains conflicting task IDs",
+    )?;
     let conversation = [
         text(body.get("conversation_id"))?,
         text(request.and_then(|request| request.get("conversation_id")))?,
@@ -789,6 +801,22 @@ mod tests {
         selected.canonical_cwd = Some("/selected".into());
         let proof = sign(&auth, &execution, &selected, &user, "execution_send").unwrap();
         assert!(check(&f, &proof, &execution, Action::ExecutionSend, NOW).is_ok());
+        let mut wrong_task = execution.clone();
+        wrong_task["request"]["task_id"] = json!("other-task");
+        assert!(sign(&auth, &wrong_task, &selected, &user, "execution_send").is_err());
+        let mut forged = proof.payload.clone();
+        forged.request.body_hash = ObjectHash::body(&wrong_task).unwrap();
+        assert_eq!(
+            check(
+                &f,
+                &Signed::sign(forged, &user).unwrap(),
+                &wrong_task,
+                Action::ExecutionSend,
+                NOW
+            )
+            .unwrap_err(),
+            AuthorizationError::InvalidProof("raw request contains conflicting task IDs")
+        );
         let mut conflict = binding;
         conflict.binding.task_id = "other-task".into();
         execution["request"]["binding"] = serde_json::to_value(conflict).unwrap();
