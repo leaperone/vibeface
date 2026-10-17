@@ -529,8 +529,8 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
     let specs = [
         (
             "nodes",
-            "Read this authorized project's execution host and root.",
-            json!({}),
+            "Read this project's host and local roots. To discover explicitly authorized remote targets, supply the existing task_id, executor and execution_action (open also covers binding). An incomplete selection returns no remote targets.",
+            json!({"task_id":string(),"executor":{"type":"string","enum":["codex","cursor_agent","claude_code"]},"execution_action":{"type":"string","enum":["open","send"]}}),
             vec![],
         ),
         (

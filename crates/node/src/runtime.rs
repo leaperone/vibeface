@@ -3529,18 +3529,28 @@ impl Runtime {
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         ensure!(args.is_object(), "tool arguments must be an object");
+        let verification = SignatureVerification::new();
         let execution_args = matches!(
             name,
             "bind_execution" | "open_execution" | "send_execution" | "execution_status"
         )
         .then(|| args.clone());
-        self.store.lock().await.manager_tool_authorization(
-            session.space_id.as_str(),
-            &format!("manager:{}", session.sdk_session.session_id),
-            now_ms() as u64,
-        )?;
+        {
+            let store = self.store.lock().await;
+            verification.run(|| {
+                store.manager_tool_authorization(
+                    session.space_id.as_str(),
+                    &format!("manager:{}", session.sdk_session.session_id),
+                    now_ms() as u64,
+                )
+            })?;
+        }
         let mut body = match name {
-            "nodes" => json!({"method":"nodes"}),
+            "nodes" => {
+                let mut body = args;
+                body["method"] = json!("nodes");
+                body
+            }
             "context" => {
                 let mut body = args;
                 body["method"] = json!("context");
@@ -3559,18 +3569,21 @@ impl Runtime {
                 let mut body = args;
                 let task_id = id(&body, "task_id")?;
                 let store = self.store.lock().await;
-                let creation = store.task_creation(
-                    session.space_id.as_str(),
-                    &session.conversation_id,
-                    &task_id,
-                )?;
-                let event = store.verify_event(session.space_id.as_str(), &creation)?;
-                ensure!(
-                    event.resource_id == session.resource_id,
-                    "task belongs to another resource"
-                );
-                body["method"] = json!("bind_execution");
-                body["task_ref"] = json!(creation.hash);
+                verification.run(|| -> Result<()> {
+                    let creation = store.task_creation(
+                        session.space_id.as_str(),
+                        &session.conversation_id,
+                        &task_id,
+                    )?;
+                    let event = store.verify_event(session.space_id.as_str(), &creation)?;
+                    ensure!(
+                        event.resource_id == session.resource_id,
+                        "task belongs to another resource"
+                    );
+                    body["method"] = json!("bind_execution");
+                    body["task_ref"] = json!(creation.hash);
+                    Ok(())
+                })?;
                 body
             }
             "open_execution" | "send_execution" => {
@@ -3613,20 +3626,42 @@ impl Runtime {
             body["authorization_id"] = json!(call_id);
         }
         if let Some(args) = execution_args {
-            self.prepare_execution_tool_body(&session, name, &args, &mut body)
+            self.prepare_execution_tool_body(&session, name, &args, &mut body, &verification)
                 .await?;
         }
-        let body = self.normalize_request_body(&session.space_id, body).await?;
-        let access = self.authorize_agent(&session, body.clone()).await?;
+        let body = self
+            .normalize_request_body_with_verification(&session.space_id, body, &verification)
+            .await?;
+        let access = self
+            .authorize_agent_with_verification(&session, body, verification.clone())
+            .await?;
         let body = access.body.clone();
-        self.rpc(access, body).await
+        let mut result = self.rpc(access, body.clone()).await?;
+        if name == "nodes" {
+            result["execution_targets"] = serde_json::to_value(
+                self.execution_tool_targets(&session, &body, &verification)
+                    .await?,
+            )?;
+        }
+        Ok(result)
     }
 
-    async fn authorize_agent(&self, session: &AgentSession, mut body: Value) -> Result<Access> {
+    async fn authorize_agent(&self, session: &AgentSession, body: Value) -> Result<Access> {
+        self.authorize_agent_with_verification(session, body, SignatureVerification::new())
+            .await
+    }
+
+    async fn authorize_agent_with_verification(
+        &self,
+        session: &AgentSession,
+        mut body: Value,
+        verification: SignatureVerification,
+    ) -> Result<Access> {
         let now = now_ms() as u64;
         let (session, facts) = {
             let mut store = self.store.lock().await;
-            let session = store.refresh_agent_session(session, now)?;
+            verification.run(|| -> Result<_> {
+            let mut session = store.refresh_agent_session(session, now)?;
             let origin = store.agent_origin(&session, now)?;
             if let Some((task, reference)) = origin.task {
                 ensure!(
@@ -3663,7 +3698,17 @@ impl Runtime {
                 };
             }
             let facts = self.authorization_facts(&store, &body, &self.audience()?, now)?;
-            (session, facts)
+            let delegated = store.authorization_state().verify_service_delegation(
+                &origin.parent, &session.service, &session.grant_leaf, &facts, now,
+            )?;
+            ensure!(delegated.device() == &session.device
+                && delegated.initiator() == &session.initiator
+                && delegated.initiating_grant() == session.initiating_grant.as_ref(),
+                "SDK request differs from its current admitted delegation");
+            session.expected_policies = delegated.heads().to_vec();
+            session.expires_at_ms = session.expires_at_ms.min(delegated.expires_at_ms());
+            Ok((session, facts))
+            })?
         };
         let identity = vibeface_secure::Identity::from_secret_hex(&self.identity.secret_key_hex)
             .map_err(anyhow::Error::msg)?;
@@ -3698,13 +3743,14 @@ impl Runtime {
             },
             &identity,
         )?;
-        self.authorize_rpc(
+        self.authorize_rpc_with_verification(
             body,
             invocation,
             TransportEvidence::LocalAgentAdapter {
                 service: session.service,
                 session: session.sdk_session,
             },
+            verification,
         )
         .await
     }

@@ -29,12 +29,21 @@ impl Runtime {
             .is_some_and(|target| target != local))
     }
 
-    pub(super) fn check_execution_metadata_actor(
+    pub(super) fn is_execution_resolution(&self, body: &Value) -> Result<bool> {
+        let local = self.identity.node_id()?;
+        Ok(body["method"] == "resolve_unknown"
+            && body["target_node"]
+                .as_str()
+                .is_some_and(|target| target != local))
+    }
+
+    pub(super) fn check_execution_actor(
         &self,
         body: &Value,
         invocation: &Invocation,
     ) -> Result<()> {
-        if !self.is_execution_metadata(body)? {
+        let resolution = self.is_execution_resolution(body)?;
+        if !resolution && !self.is_execution_metadata(body)? {
             return Ok(());
         }
         match invocation.actor {
@@ -45,7 +54,8 @@ impl Runtime {
                 "account metadata cannot claim an SDK session"
             ),
             Actor::Service(_) => ensure!(
-                invocation.context.sdk_session.is_some()
+                !resolution
+                    && invocation.context.sdk_session.is_some()
                     && serde_json::to_value(&invocation.context.sdk_session)?
                         == body["sdk_session"]
                     && body["parent_invocation"].as_str().is_some(),
@@ -95,7 +105,7 @@ impl Runtime {
                 "SDK metadata requires its original durable Project dispatch"
             );
             store.request_facts(body, audience)
-        } else if self.is_execution_dispatch(body)? {
+        } else if self.is_execution_resolution(body)? || self.is_execution_dispatch(body)? {
             Ok(store
                 .execution_dispatch_facts(body, audience, now)?
                 .facts()
@@ -105,12 +115,37 @@ impl Runtime {
         }
     }
 
+    pub(super) async fn execution_tool_targets(
+        &self,
+        session: &AgentSession,
+        body: &Value,
+        verification: &SignatureVerification,
+    ) -> Result<Vec<Value>> {
+        let (Some(task), Some(executor), Some(action)) = (
+            body["task_id"].as_str(),
+            body["executor"].as_str(),
+            body["execution_action"].as_str(),
+        ) else {
+            return Ok(vec![]);
+        };
+        let action = match action {
+            "open" => vibeface_secure::authorization::Action::ExecutionOpen,
+            "send" => vibeface_secure::authorization::Action::ExecutionSend,
+            _ => bail!("target discovery requires an explicit open or send action"),
+        };
+        let store = self.store.lock().await;
+        verification.run(|| {
+            store.execution_dispatch_targets(session, task, executor, action, now_ms() as u64)
+        })
+    }
+
     pub(super) async fn prepare_execution_tool_body(
         &self,
         session: &AgentSession,
         tool: &str,
         args: &Value,
         body: &mut Value,
+        verification: &SignatureVerification,
     ) -> Result<()> {
         ensure!(
             [
@@ -141,35 +176,37 @@ impl Runtime {
         if tool == "execution_status" {
             let operation_id = id(args, "operation_id")?;
             let store = self.store.lock().await;
-            let operation = store
-                .operation(session.space_id.as_str(), &operation_id)?
-                .context("remote status requires a known original Project operation ID")?;
-            self.check_execution_tool_operation(
-                &store,
-                session,
-                &operation,
-                &target,
-                field(body, "session_id")?,
-                None,
-            )?;
-            let wire = store
-                .execution_dispatch_handoff(session.space_id.as_str(), &operation_id)?
-                .context("remote status requires the original durable execution handoff")?;
-            let binding = operation
-                .request
-                .binding
-                .as_ref()
-                .context("remote operation has no signed task binding")?;
-            body["operation_id"] = json!(operation_id);
-            body["execution_source"] = serde_json::to_value(
-                wire.handoff
-                    .source_attestation
-                    .context("remote operation has no signed Project source")?,
-            )?;
-            body["binding"] = serde_json::to_value(binding)?;
-            body["task_id"] = json!(operation.request.task_id);
-            body["task_ref"] = json!(binding.binding.task_ref);
-            return Ok(());
+            return verification.run(|| {
+                let operation = store
+                    .operation(session.space_id.as_str(), &operation_id)?
+                    .context("remote status requires a known original Project operation ID")?;
+                self.check_execution_tool_operation(
+                    &store,
+                    session,
+                    &operation,
+                    &target,
+                    field(body, "session_id")?,
+                    None,
+                )?;
+                let wire = store
+                    .execution_dispatch_handoff(session.space_id.as_str(), &operation_id)?
+                    .context("remote status requires the original durable execution handoff")?;
+                let binding = operation
+                    .request
+                    .binding
+                    .as_ref()
+                    .context("remote operation has no signed task binding")?;
+                body["operation_id"] = json!(operation_id);
+                body["execution_source"] = serde_json::to_value(
+                    wire.handoff
+                        .source_attestation
+                        .context("remote operation has no signed Project source")?,
+                )?;
+                body["binding"] = serde_json::to_value(binding)?;
+                body["task_id"] = json!(operation.request.task_id);
+                body["task_ref"] = json!(binding.binding.task_ref);
+                Ok(())
+            });
         }
         for field in selected {
             body[field] = args
@@ -184,48 +221,59 @@ impl Runtime {
         let request: OperationRequest = serde_json::from_value(body["request"].clone())?;
         let (wire, binding, prior_state) = {
             let store = self.store.lock().await;
-            let operation = store
-                .operation(session.space_id.as_str(), &prior_id)?
-                .context("remote send requires a known original prior operation ID")?;
-            self.check_execution_tool_operation(
-                &store,
-                session,
-                &operation,
-                &target,
-                &request.session_id,
-                request.task_id.as_deref(),
-            )?;
-            ensure!(
-                operation.state.terminal(),
-                "reconcile the original remote operation before sending another task"
-            );
-            let task = request
-                .task_id
-                .as_deref()
-                .context("remote send requires its original task")?;
-            let creation =
-                store.task_creation(session.space_id.as_str(), &session.conversation_id, task)?;
-            let binding = store
-                .task_binding(session.space_id.as_str(), &creation.hash)?
-                .context("remote send requires its confirmed signed task binding")?;
-            ensure!(
-                operation.request.binding.as_ref() == Some(&binding),
-                "prior operation belongs to another task binding generation"
-            );
-            let wire = store
-                .execution_dispatch_handoff(session.space_id.as_str(), &prior_id)?
-                .context("prior operation has no durable execution handoff")?;
-            ensure!(
-                serde_json::to_value(&wire.handoff.execution_resource)?
-                    == body["execution_resource"]
-                    && serde_json::to_value(&wire.handoff.target_public_key)?
-                        == body["target_public_key"],
-                "remote send changed the prior operation's executor resource or public key"
-            );
-            (wire, binding, operation.state)
+            verification.run(|| -> Result<_> {
+                let operation = store
+                    .operation(session.space_id.as_str(), &prior_id)?
+                    .context("remote send requires a known original prior operation ID")?;
+                self.check_execution_tool_operation(
+                    &store,
+                    session,
+                    &operation,
+                    &target,
+                    &request.session_id,
+                    request.task_id.as_deref(),
+                )?;
+                ensure!(
+                    operation.state.terminal(),
+                    "reconcile the original remote operation before sending another task"
+                );
+                let task = request
+                    .task_id
+                    .as_deref()
+                    .context("remote send requires its original task")?;
+                let creation = store.task_creation(
+                    session.space_id.as_str(),
+                    &session.conversation_id,
+                    task,
+                )?;
+                let binding = store
+                    .task_binding(session.space_id.as_str(), &creation.hash)?
+                    .context("remote send requires its confirmed signed task binding")?;
+                ensure!(
+                    operation.request.binding.as_ref() == Some(&binding),
+                    "prior operation belongs to another task binding generation"
+                );
+                let wire = store
+                    .execution_dispatch_handoff(session.space_id.as_str(), &prior_id)?
+                    .context("prior operation has no durable execution handoff")?;
+                ensure!(
+                    serde_json::to_value(&wire.handoff.execution_resource)?
+                        == body["execution_resource"]
+                        && serde_json::to_value(&wire.handoff.target_public_key)?
+                            == body["target_public_key"],
+                    "remote send changed the prior operation's executor resource or public key"
+                );
+                Ok((wire, binding, operation.state))
+            })?
         };
         let actual = self
-            .request_execution_dispatch(session.space_id.as_str(), &target, &wire, false)
+            .request_execution_dispatch_with_verification(
+                session.space_id.as_str(),
+                &target,
+                &wire,
+                false,
+                verification,
+            )
             .await?;
         ensure!(
             serde_json::to_value(actual.receipt.payload.state)?
@@ -236,7 +284,7 @@ impl Runtime {
             space: session.space_id.clone(),
             resource: session.resource_id.clone(),
         };
-        let snapshot =
+        let snapshot = verification.run(|| {
             vibeface_secure::authorization::execution_handoff::verify_execution_session_snapshot(
                 &actual.receipt,
                 &project,
@@ -245,7 +293,8 @@ impl Runtime {
                 &binding,
                 &PublicKey::parse(&self.identity.public_key_hex()?)?,
                 now_ms() as u64,
-            )?;
+            )
+        })?;
         ensure!(
             !matches!(
                 snapshot.state.as_str(),
@@ -306,7 +355,16 @@ impl Runtime {
         Ok(())
     }
 
-    pub(super) async fn normalize_execution_dispatch(&self, mut body: Value) -> Result<Value> {
+    pub(super) async fn normalize_execution_dispatch(&self, body: Value) -> Result<Value> {
+        self.normalize_execution_dispatch_with_verification(body, &SignatureVerification::new())
+            .await
+    }
+
+    pub(super) async fn normalize_execution_dispatch_with_verification(
+        &self,
+        mut body: Value,
+        verification: &SignatureVerification,
+    ) -> Result<Value> {
         if body["method"] != "operate" {
             return Ok(body);
         }
@@ -317,34 +375,36 @@ impl Runtime {
             "operation space or authorization ID mismatch"
         );
         let store = self.store.lock().await;
-        if request.binding.is_none() {
-            let task = request
-                .task_id
-                .as_deref()
-                .context("remote execution requires a task")?;
-            let creation =
-                store.task_creation(&request.network_id, &request.conversation_id, task)?;
-            request.binding = Some(
-                store
-                    .task_binding(&request.network_id, &creation.hash)?
-                    .context("confirm the remote task binding before operating")?,
-            );
-        }
-        let binding = request
-            .binding
-            .as_ref()
-            .context("remote task binding is missing")?;
-        store.verify_historical_binding(binding)?;
-        crate::store::validate_operation_binding_from(&store.connection, &request)?;
-        if matches!(request.action["type"].as_str(), Some("open" | "send")) {
-            request
-                .resources
-                .push(field(&binding.binding.open_spec, "cwd")?.to_owned());
-        }
-        request.resources.sort();
-        request.resources.dedup();
-        body["request"] = serde_json::to_value(request)?;
-        Ok(body)
+        verification.run(|| -> Result<Value> {
+            if request.binding.is_none() {
+                let task = request
+                    .task_id
+                    .as_deref()
+                    .context("remote execution requires a task")?;
+                let creation =
+                    store.task_creation(&request.network_id, &request.conversation_id, task)?;
+                request.binding = Some(
+                    store
+                        .task_binding(&request.network_id, &creation.hash)?
+                        .context("confirm the remote task binding before operating")?,
+                );
+            }
+            let binding = request
+                .binding
+                .as_ref()
+                .context("remote task binding is missing")?;
+            store.verify_historical_binding(binding)?;
+            crate::store::validate_operation_binding_from(&store.connection, &request)?;
+            if matches!(request.action["type"].as_str(), Some("open" | "send")) {
+                request
+                    .resources
+                    .push(field(&binding.binding.open_spec, "cwd")?.to_owned());
+            }
+            request.resources.sort();
+            request.resources.dedup();
+            body["request"] = serde_json::to_value(request)?;
+            Ok(body)
+        })
     }
 
     pub(super) async fn dispatch_execution(
@@ -354,21 +414,24 @@ impl Runtime {
     ) -> Result<Value> {
         {
             let mut store = self.store.lock().await;
-            let facts = store.execution_dispatch_facts(
-                &access.body,
-                access.authorization.audience(),
-                now_ms() as u64,
-            )?;
-            store.accept_execution_dispatch(
-                &self.identity,
-                &facts,
-                &access.authorization,
-                &access.freshness,
-                &access.transport,
-                &access.body,
-                &request,
-                now_ms() as u64,
-            )?;
+            access.verification.run(|| -> Result<()> {
+                let facts = store.execution_dispatch_facts(
+                    &access.body,
+                    access.authorization.audience(),
+                    now_ms() as u64,
+                )?;
+                store.accept_execution_dispatch(
+                    &self.identity,
+                    &facts,
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    &access.body,
+                    &request,
+                    now_ms() as u64,
+                )?;
+                Ok(())
+            })?;
         }
         self.publish_changed(&request.network_id, &request.conversation_id, "");
         let key = (request.network_id.clone(), request.operation_id.clone());
@@ -379,7 +442,15 @@ impl Runtime {
             .await
             .insert(key.clone())
         {
-            if let Err(error) = self.advance_execution_dispatch(&key.0, &key.1, true).await {
+            if let Err(error) = self
+                .advance_execution_dispatch_with_verification(
+                    &key.0,
+                    &key.1,
+                    true,
+                    &access.verification,
+                )
+                .await
+            {
                 refresh_error = Some(error.to_string());
             }
             let ongoing = self
@@ -409,12 +480,13 @@ impl Runtime {
         )
     }
 
-    async fn request_execution_dispatch(
+    async fn request_execution_dispatch_with_verification(
         &self,
         space: &str,
         target: &str,
         wire: &SignedExecutionHandoff,
         submit: bool,
+        verification: &SignatureVerification,
     ) -> Result<ExecutionHandoffResult> {
         let kind = if submit {
             "execution_handoff_submit"
@@ -429,11 +501,10 @@ impl Runtime {
             result.handoff == *wire,
             "execution response changed its durable handoff"
         );
-        self.store.lock().await.verify_execution_dispatch_receipt(
-            &self.identity,
-            &result,
-            now_ms() as u64,
-        )?;
+        let store = self.store.lock().await;
+        verification.run(|| {
+            store.verify_execution_dispatch_receipt(&self.identity, &result, now_ms() as u64)
+        })?;
         Ok(result)
     }
 
@@ -442,6 +513,22 @@ impl Runtime {
         space: &str,
         operation_id: &str,
         allow_first_submit: bool,
+    ) -> Result<()> {
+        self.advance_execution_dispatch_with_verification(
+            space,
+            operation_id,
+            allow_first_submit,
+            &SignatureVerification::new(),
+        )
+        .await
+    }
+
+    async fn advance_execution_dispatch_with_verification(
+        self: &Arc<Self>,
+        space: &str,
+        operation_id: &str,
+        allow_first_submit: bool,
+        verification: &SignatureVerification,
     ) -> Result<()> {
         let (wire, fresh, target) = {
             let mut store = self.store.lock().await;
@@ -455,12 +542,14 @@ impl Runtime {
                 return Ok(());
             }
             let (wire, fresh) = if allow_first_submit {
-                store.prepare_execution_dispatch_handoff(
-                    &self.identity,
-                    space,
-                    operation_id,
-                    now_ms() as u64,
-                )?
+                verification.run(|| {
+                    store.prepare_execution_dispatch_handoff(
+                        &self.identity,
+                        space,
+                        operation_id,
+                        now_ms() as u64,
+                    )
+                })?
             } else {
                 let Some(wire) = store.execution_dispatch_handoff(space, operation_id)? else {
                     return Ok(());
@@ -470,7 +559,13 @@ impl Runtime {
             (wire, fresh, operation.request.target_node)
         };
         let result = self
-            .request_execution_dispatch(space, &target, &wire, fresh)
+            .request_execution_dispatch_with_verification(
+                space,
+                &target,
+                &wire,
+                fresh,
+                verification,
+            )
             .await;
         let mut store = self.store.lock().await;
         let operation = store
@@ -483,7 +578,9 @@ impl Runtime {
             return Ok(());
         }
         let applied = result.and_then(|result| {
-            store.apply_execution_handoff_receipt(&self.identity, &result, now_ms() as u64)
+            verification.run(|| {
+                store.apply_execution_handoff_receipt(&self.identity, &result, now_ms() as u64)
+            })
         });
         match applied {
             Ok(operation) => {
@@ -583,12 +680,14 @@ impl Runtime {
     ) -> Result<Value> {
         {
             let store = self.store.lock().await;
-            store.authorize_read(
-                &access.authorization,
-                &access.freshness,
-                &access.transport,
-                now_ms() as u64,
-            )?;
+            access.verification.run(|| {
+                store.authorize_read(
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    now_ms() as u64,
+                )
+            })?;
             let operation = store
                 .operation(&access.network_id, operation_id)?
                 .context("remote operation is missing")?;
@@ -598,7 +697,7 @@ impl Runtime {
             );
         }
         let (operation, actual, error) = self
-            .execution_dispatch_metadata(&access.network_id, operation_id)
+            .execution_dispatch_metadata(&access.network_id, operation_id, &access.verification)
             .await?;
         let operation = execution_operation_view(&*self.store.lock().await, &operation)?;
         Ok(
@@ -615,12 +714,14 @@ impl Runtime {
         let operation_id = field(&access.body, "operation_id")?;
         {
             let store = self.store.lock().await;
-            store.authorize_read(
-                &access.authorization,
-                &access.freshness,
-                &access.transport,
-                now_ms() as u64,
-            )?;
+            access.verification.run(|| {
+                store.authorize_read(
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    now_ms() as u64,
+                )
+            })?;
             let operation = store
                 .operation(&access.network_id, operation_id)?
                 .context("session has no authorized Project dispatch")?;
@@ -639,7 +740,7 @@ impl Runtime {
             );
         }
         let (operation, actual, error) = self
-            .execution_dispatch_metadata(&access.network_id, operation_id)
+            .execution_dispatch_metadata(&access.network_id, operation_id, &access.verification)
             .await?;
         let operation = execution_operation_view(&*self.store.lock().await, &operation)?;
         Ok(
@@ -653,6 +754,7 @@ impl Runtime {
         &self,
         space: &str,
         operation_id: &str,
+        verification: &SignatureVerification,
     ) -> Result<(
         OperationRecord,
         Option<ExecutionHandoffResult>,
@@ -676,7 +778,13 @@ impl Runtime {
             ));
         };
         match self
-            .request_execution_dispatch(space, &operation.request.target_node, &wire, false)
+            .request_execution_dispatch_with_verification(
+                space,
+                &operation.request.target_node,
+                &wire,
+                false,
+                verification,
+            )
             .await
         {
             Ok(actual) => Ok((operation, Some(actual), None)),
