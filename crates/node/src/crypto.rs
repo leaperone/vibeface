@@ -72,6 +72,18 @@ impl LocalIdentity {
         })
     }
     #[cfg(test)]
+    fn fixture_root(&self) -> Self {
+        Self {
+            secret_key_hex: digest(
+                format!("vibeface:network-fixture-root:v1:{}", self.secret_key_hex).as_bytes(),
+            ),
+        }
+    }
+    #[cfg(test)]
+    pub fn fixture_network_id(&self) -> Result<String> {
+        self.fixture_root().network_id()
+    }
+    #[cfg(test)]
     pub fn sign_network_fixture(
         &self,
         revision: u64,
@@ -86,7 +98,8 @@ impl LocalIdentity {
             secret_key_hex: hex::encode(admin_secret),
         };
         let admin_member = Member::client(&admin, "fixture-admin", true)?;
-        let genesis = Genesis::create(self, vec![admin_member.clone()])?;
+        let root = self.fixture_root();
+        let genesis = Genesis::create(&root, vec![admin_member.clone()])?;
         let mut members = vec![admin_member];
         for certificate in nodes.into_iter().filter(|certificate| !certificate.revoked) {
             let node_id = certificate.node_id;
@@ -117,7 +130,7 @@ impl LocalIdentity {
         let epoch = revision
             .checked_add(1)
             .context("network fixture revision overflow")?;
-        state.recover(RootCheckpoint::create(self, epoch, members)?)?;
+        state.recover(RootCheckpoint::create(&root, epoch, members)?)?;
         Ok(state)
     }
 }
@@ -143,13 +156,13 @@ fn verify(public_key: &str, signature: &str, message: &[u8]) -> Result<()> {
         .context("invalid signature")
 }
 #[cfg(test)]
-fn node_role_key(role: &NodeRole) -> u8 {
+fn node_role_key(role: &NodeRole) -> &'static str {
     match role {
-        NodeRole::Gateway => 0,
-        NodeRole::Relay => 1,
-        NodeRole::Replica => 2,
-        NodeRole::Scheduler => 3,
-        NodeRole::Executor => 4,
+        NodeRole::Gateway => "gateway",
+        NodeRole::Relay => "relay",
+        NodeRole::Replica => "replica",
+        NodeRole::Scheduler => "scheduler",
+        NodeRole::Executor => "executor",
     }
 }
 pub fn verify_signed_event(
@@ -268,12 +281,26 @@ mod tests {
             ],
         )?;
         let view = state.project()?;
-        assert_eq!(view.network_id, owner.network_id()?);
+        assert_eq!(view.network_id, owner.fixture_network_id()?);
         assert!(
             view.authorize_node(&owner.node_id()?, Some(NodeRole::Replica))
                 .is_ok()
         );
         assert!(view.authorize_node(&revoked.node_id()?, None).is_err());
+        let all = owner.sign_network_fixture(
+            1,
+            vec![owner.certificate(vec![
+                NodeRole::Scheduler,
+                NodeRole::Executor,
+                NodeRole::Relay,
+                NodeRole::Gateway,
+            ])?],
+        )?;
+        assert!(
+            all.project()?
+                .authorize_node(&owner.node_id()?, Some(NodeRole::Executor))
+                .is_ok()
+        );
         let later = owner.sign_network_fixture(2, vec![])?;
         assert_eq!(state.genesis, later.genesis);
         let signed = owner.sign_payload("peer-request", b"challenge")?;
@@ -295,7 +322,7 @@ mod tests {
         assert!(owner.sign_payload("bad:domain", b"challenge").is_err());
         let body = Event {
             version: 1,
-            network_id: owner.network_id()?,
+            network_id: owner.fixture_network_id()?,
             scope_id: "c".into(),
             author: owner.node_id()?,
             sequence: 1,

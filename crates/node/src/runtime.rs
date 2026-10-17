@@ -158,7 +158,7 @@ mod tests {
         node.store
             .lock()
             .await
-            .install_trust_bundle(&owner.network_id()?, &updated)?;
+            .install_trust_bundle(&owner.fixture_network_id()?, &updated)?;
         drop(node);
         let node = Runtime::open(&dir).await?;
         assert_eq!(node.membership_state().await?, updated);
@@ -667,7 +667,7 @@ mod tests {
         let replica = LocalIdentity::generate();
         let relay = LocalIdentity::generate();
         let scheduler = LocalIdentity::generate();
-        let network = owner.network_id()?;
+        let network = owner.fixture_network_id()?;
         node.install_membership(owner.sign_network_fixture(
             1,
             vec![
@@ -1154,7 +1154,7 @@ mod tests {
         let node = Runtime::open(&dir).await?;
         let owner = LocalIdentity::generate();
         let remote = LocalIdentity::generate();
-        let network = owner.network_id()?;
+        let network = owner.fixture_network_id()?;
         node.install_membership(owner.sign_network_fixture(
             1,
             vec![

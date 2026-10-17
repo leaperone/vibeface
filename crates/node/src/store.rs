@@ -1854,14 +1854,17 @@ mod tests {
         if let Some(other) = other {
             nodes.push(other.certificate(roles())?);
         }
-        store.install_trust_bundle(&owner.network_id()?, &owner.sign_network_fixture(1, nodes)?)?;
-        store.save_local_identity(&owner.network_id()?, owner)?;
+        store.install_trust_bundle(
+            &owner.fixture_network_id()?,
+            &owner.sign_network_fixture(1, nodes)?,
+        )?;
+        store.save_local_identity(&owner.fixture_network_id()?, owner)?;
         Ok(store)
     }
     fn conversation(store: &mut Store, owner: &LocalIdentity) -> Result<SignedEvent> {
         store.append_event(
             owner,
-            &owner.network_id()?,
+            &owner.fixture_network_id()?,
             "conversation",
             EventBody::ConversationCreated {
                 title: "work".into(),
@@ -1905,7 +1908,7 @@ mod tests {
     ) -> Result<OperationRequest> {
         let mut request = OperationRequest {
             operation_id: id.into(),
-            network_id: owner.network_id()?,
+            network_id: owner.fixture_network_id()?,
             conversation_id: "conversation".into(),
             task_id: None,
             target_node: owner.node_id()?,
@@ -1921,7 +1924,7 @@ mod tests {
     }
     fn session(owner: &LocalIdentity, id: &str) -> Result<ExecutionSession> {
         Ok(ExecutionSession {
-            network_id: owner.network_id()?,
+            network_id: owner.fixture_network_id()?,
             target_node: owner.node_id()?,
             session_id: id.into(),
             revision: 0,
@@ -1935,7 +1938,7 @@ mod tests {
     fn causal_import_waits_for_every_dependency_and_blob_then_converges() -> Result<()> {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let mut source = memory(&a, Some(&b))?;
         let mut replica = memory(&a, Some(&b))?;
         let root = conversation(&mut source, &a)?;
@@ -2005,7 +2008,7 @@ mod tests {
     #[test]
     fn corrupted_stored_blob_blocks_context_until_verified_content_is_restored() -> Result<()> {
         let a = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let mut store = memory(&a, None)?;
         let root = conversation(&mut store, &a)?;
         let content = b"evidence";
@@ -2048,7 +2051,7 @@ mod tests {
     #[test]
     fn author_equivocation_removes_both_projections_and_blocks_descendants() -> Result<()> {
         let a = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let mut store = memory(&a, None)?;
         let root = conversation(&mut store, &a)?;
         let left = message(
@@ -2109,7 +2112,7 @@ mod tests {
     fn revoked_author_history_verifies_but_new_commands_are_denied() -> Result<()> {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let mut store = memory(&a, Some(&b))?;
         let root = conversation(&mut store, &a)?;
         let event = message(&b, &network, 1, None, vec![root.hash], "old", vec![])?;
@@ -2140,7 +2143,7 @@ mod tests {
     #[test]
     fn queued_operation_cannot_start_after_known_executor_revocation() -> Result<()> {
         let a = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let mut store = memory(&a, None)?;
         let event = conversation(&mut store, &a)?;
         let request = request(&mut store, &a, "queued", vec![event.hash])?;
@@ -2160,7 +2163,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("vibeface-writers-{}", uuid::Uuid::new_v4()));
         let db = root.join("node.sqlite3");
         let owner = LocalIdentity::generate();
-        let network = owner.network_id()?;
+        let network = owner.fixture_network_id()?;
         let mut initial = Store::open(&db)?;
         initial.install_trust_bundle(
             &network,
@@ -2212,7 +2215,7 @@ mod tests {
     #[test]
     fn corrupted_stored_event_never_becomes_a_complete_context() -> Result<()> {
         let a = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let mut store = memory(&a, None)?;
         let mut event = conversation(&mut store, &a)?;
         event.canonical_body = event.canonical_body.replace("work", "tampered");
@@ -2228,7 +2231,7 @@ mod tests {
     fn task_binding_cas_rejects_competing_targets_and_recovers_unsigned_commit() -> Result<()> {
         let owner = LocalIdentity::generate();
         let executor = LocalIdentity::generate();
-        let network = owner.network_id()?;
+        let network = owner.fixture_network_id()?;
         let dir =
             std::env::temp_dir().join(format!("vibeface-binding-cas-{}", uuid::Uuid::new_v4()));
         let db = dir.join("node.sqlite3");
@@ -2310,7 +2313,7 @@ mod tests {
     #[test]
     fn unknown_binding_cannot_move_and_seal_fences_delayed_commands() -> Result<()> {
         let owner = LocalIdentity::generate();
-        let network = owner.network_id()?;
+        let network = owner.fixture_network_id()?;
         let mut store = memory(&owner, None)?;
         let root = conversation(&mut store, &owner)?;
         let request = request(&mut store, &owner, "work", vec![root.hash])?;
@@ -2384,7 +2387,7 @@ mod tests {
     #[test]
     fn two_scheduler_requests_at_one_revision_admit_only_one_side_effect() -> Result<()> {
         let owner = LocalIdentity::generate();
-        let network = owner.network_id()?;
+        let network = owner.fixture_network_id()?;
         let dir =
             std::env::temp_dir().join(format!("vibeface-session-cas-{}", uuid::Uuid::new_v4()));
         let db = dir.join("node.sqlite3");
@@ -2425,7 +2428,7 @@ mod tests {
     #[test]
     fn operation_cas_reserves_resources_and_reconciles_unknown_without_replay() -> Result<()> {
         let a = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let mut store = memory(&a, None)?;
         let root = conversation(&mut store, &a)?;
         store.upsert_session(&network, &session(&a, "session")?)?;
@@ -2490,7 +2493,7 @@ mod tests {
     #[test]
     fn running_send_allows_deduped_controls_but_blocks_other_sends_and_controls() -> Result<()> {
         let a = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let mut store = memory(&a, None)?;
         let root = conversation(&mut store, &a)?;
         store.upsert_session(&network, &session(&a, "session")?)?;
@@ -2646,8 +2649,8 @@ mod tests {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
         let mut store = memory(&a, None)?;
-        let na = a.network_id()?;
-        let nb = b.network_id()?;
+        let na = a.fixture_network_id()?;
+        let nb = b.fixture_network_id()?;
         store.install_trust_bundle(
             &nb,
             &b.sign_network_fixture(1, vec![b.certificate(roles())?])?,
@@ -2694,8 +2697,8 @@ mod tests {
     fn same_device_resources_are_reserved_across_networks_without_sharing_records() -> Result<()> {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();
-        let na = a.network_id()?;
-        let nb = b.network_id()?;
+        let na = a.fixture_network_id()?;
+        let nb = b.fixture_network_id()?;
         let mut store = memory(&a, None)?;
         store.install_trust_bundle(
             &nb,
@@ -2721,7 +2724,7 @@ mod tests {
     #[test]
     fn notifications_budget_and_continuation_claims_are_durable_deduped_state() -> Result<()> {
         let a = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let mut store = memory(&a, None)?;
         conversation(&mut store, &a)?;
         let result = store.append_event(
@@ -2790,7 +2793,7 @@ mod tests {
     #[test]
     fn replicated_notification_and_ack_rebuild_without_model_or_operation() -> Result<()> {
         let a = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         let mut source = memory(&a, None)?;
         let mut target = memory(&a, None)?;
         conversation(&mut source, &a)?;
@@ -2833,7 +2836,7 @@ mod tests {
         std::fs::create_dir_all(&root)?;
         let db = root.join("node.sqlite3");
         let a = LocalIdentity::generate();
-        let network = a.network_id()?;
+        let network = a.fixture_network_id()?;
         {
             let mut store = Store::open(&db)?;
             store.install_trust_bundle(
