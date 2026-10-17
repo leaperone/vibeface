@@ -2284,806 +2284,989 @@ fn validate_day(day: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::test_support::{TestNetwork, now};
+    use anyhow::Result;
     use serde_json::json;
-    fn roles() -> Vec<NodeRole> {
-        vec![
-            NodeRole::Gateway,
-            NodeRole::Replica,
-            NodeRole::Scheduler,
-            NodeRole::Executor,
-        ]
+    use vibeface_secure::{
+        Identity,
+        authorization::{
+            bootstrap::{self, recovery},
+            *,
+        },
+    };
+
+    fn setup() -> Result<(TestNetwork, Store)> {
+        let network = TestNetwork::new()?;
+        let store = network.memory()?;
+        Ok((network, store))
     }
-    fn memory(owner: &LocalIdentity, other: Option<&LocalIdentity>) -> Result<Store> {
-        let mut store = Store::open(":memory:")?;
-        let mut nodes = vec![owner.certificate(roles())?];
-        if let Some(other) = other {
-            nodes.push(other.certificate(roles())?);
-        }
-        store.install_trust_bundle(
-            &owner.fixture_network_id()?,
-            &owner.sign_network_fixture(1, nodes)?,
-        )?;
-        store.save_local_device(&owner.fixture_network_id()?, owner)?;
-        Ok(store)
-    }
-    fn conversation(store: &mut Store, owner: &LocalIdentity) -> Result<SignedEvent> {
-        store.append_event(
-            owner,
-            &owner.fixture_network_id()?,
-            "conversation",
-            EventBody::ConversationCreated {
-                title: "work".into(),
-            },
-            vec![],
-            1,
-        )
-    }
-    fn message(
-        owner: &LocalIdentity,
-        network: &str,
-        author_sequence: u64,
-        previous: Option<String>,
-        parents: Vec<String>,
-        text: &str,
-        blobs: Vec<BlobRef>,
-    ) -> Result<SignedEvent> {
-        owner.sign_event(Event {
-            version: 1,
-            network_id: network.into(),
-            scope_id: "conversation".into(),
-            author: owner.node_id()?,
-            sequence: author_sequence,
-            previous,
-            parents,
-            created_at_ms: 2,
-            body: EventBody::MessagePosted {
-                message_id: text.into(),
-                scheduler_node: None,
-                role: "user".into(),
-                text: text.into(),
-            },
-            blobs,
-        })
-    }
-    fn request(
-        store: &mut Store,
-        owner: &LocalIdentity,
-        id: &str,
-        heads: Vec<String>,
-    ) -> Result<OperationRequest> {
-        let mut request = OperationRequest {
-            operation_id: id.into(),
-            network_id: owner.fixture_network_id()?,
-            conversation_id: "conversation".into(),
-            task_id: None,
-            target_node: owner.node_id()?,
-            session_id: "session".into(),
-            expected_revision: 0,
-            basis_heads: heads,
-            action: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
-            resources: vec![],
-            binding: None,
+
+    fn second_space(network: &TestNetwork, store: &Store) -> Result<TestNetwork> {
+        let root = Identity::generate().map_err(anyhow::Error::msg)?;
+        let public_key = PublicKey::of(&root);
+        let space = SpaceId::team(&public_key);
+        let mut document = store
+            .authorization_state()
+            .space(&network.space)
+            .unwrap()
+            .clone();
+        document.space = space.clone();
+        document.root = SpaceRoot::Team {
+            genesis_root: public_key.clone(),
         };
-        store.bind_test_operation(owner, &mut request)?;
-        Ok(request)
-    }
-    fn session(owner: &LocalIdentity, id: &str) -> Result<ExecutionSession> {
-        Ok(ExecutionSession {
-            network_id: owner.fixture_network_id()?,
-            target_node: owner.node_id()?,
-            session_id: id.into(),
-            revision: 0,
-            state: "idle".into(),
-            executor: "codex".into(),
-            cwd: "/tmp".into(),
-            native_session_id: None,
+        document.current_root = public_key.clone();
+        document.previous = None;
+        document.sequence = 0;
+        document.devices.clear();
+        document.revoked_devices.clear();
+        document.memberships.clear();
+        document.grants.clear();
+        document.resources.clear();
+        document.governance_grant = None;
+        let signed_genesis = Signed::sign(document.clone(), &root)?;
+        let mut state = store.authorization_state().clone();
+        let genesis = state.trust_space_genesis(&public_key, signed_genesis.clone())?;
+        let resource = Signed::sign(
+            ResourceRecord {
+                version: AUTH_VERSION,
+                space: space.clone(),
+                resource: network.resource.clone(),
+                kind: ResourceKind::Project,
+                host: ServiceId::from_key(&PublicKey::parse(&network.node.public_key_hex()?)?),
+                issued_under: genesis.clone(),
+                nonce: Nonce::random()?,
+            },
+            &root,
+        )?;
+        let mut grant = state
+            .grant(&network.bundle.grant_leaf)
+            .unwrap()
+            .payload
+            .clone();
+        grant.owner_space = space.clone();
+        grant.scope = ResourceScope::Exact(ResourceRef {
+            space: space.clone(),
+            resource: network.resource.clone(),
+        });
+        grant.issued_under = genesis.clone();
+        grant.nonce = Nonce::random()?;
+        let grant = Signed::sign(grant, &root)?;
+        let service = ServiceId::from_key(&PublicKey::parse(&network.node.public_key_hex()?)?);
+        let members = [
+            Actor::Account(network.account.clone()),
+            Actor::Service(service.clone()),
+        ]
+        .into_iter()
+        .map(|subject| {
+            Signed::sign(
+                Membership {
+                    version: AUTH_VERSION,
+                    space: space.clone(),
+                    subject,
+                    roles: vec![SpaceRole::Operator],
+                    issued_under: genesis.clone(),
+                    not_before_ms: now(),
+                    expires_at_ms: now() + 1_000_000,
+                    nonce: Nonce::random()?,
+                },
+                &root,
+            )
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+        let node_certificate = network
+            .bundle
+            .journal
+            .iter()
+            .find_map(|entry| match entry {
+                JournalEntry::Device(certificate)
+                    if certificate.payload.subject == Actor::Service(service.clone()) =>
+                {
+                    Some(certificate.hash())
+                }
+                _ => None,
+            })
+            .context("account service certificate missing")??;
+        document.previous = Some(genesis);
+        document.sequence = 1;
+        document.devices = vec![node_certificate];
+        document.resources = vec![resource.hash()?];
+        document.grants = vec![grant.hash()?];
+        document.memberships = members
+            .iter()
+            .map(Signed::hash)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        document.memberships.sort();
+        let mut journal = network.bundle.journal.clone();
+        journal.push(JournalEntry::SpaceGenesis(signed_genesis));
+        journal.push(JournalEntry::Resource(resource));
+        journal.extend(members.into_iter().map(JournalEntry::Membership));
+        journal.push(JournalEntry::Grant(grant.clone()));
+        journal.push(JournalEntry::Space(Signed::sign(document, &root)?));
+        let mut pins = network.pins.clone();
+        pins.push(PolicyPin {
+            domain: PolicyDomain::Space(space.clone()),
+            genesis_root: public_key,
+            minimum_head: None,
+        });
+        let directory = network
+            .directory
+            .parent()
+            .unwrap()
+            .join(uuid::Uuid::new_v4().to_string());
+        crate::config::private_dir(&directory)?;
+        Ok(TestNetwork {
+            created: network.created.clone(),
+            root: Identity::from_secret_hex(&network.root.secret_hex())
+                .map_err(anyhow::Error::msg)?,
+            recovery: Identity::from_secret_hex(&network.recovery.secret_hex())
+                .map_err(anyhow::Error::msg)?,
+            client: Identity::from_secret_hex(&network.client.secret_hex())
+                .map_err(anyhow::Error::msg)?,
+            node: network.node.clone(),
+            account: network.account.clone(),
+            space,
+            resource: network.resource.clone(),
+            bundle: ClientAuthorizationBundle {
+                journal,
+                grant_leaf: grant.hash()?,
+            },
+            pins,
+            directory,
+            project: network.project.clone(),
         })
     }
-    #[test]
-    fn causal_import_waits_for_every_dependency_and_blob_then_converges() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let b = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let mut source = memory(&a, Some(&b))?;
-        let mut replica = memory(&a, Some(&b))?;
-        let root = conversation(&mut source, &a)?;
-        let content = b"necessary evidence";
+
+    fn blob_result(
+        network: &TestNetwork,
+        store: &mut Store,
+        id: &str,
+    ) -> Result<(SignedEvent, BlobRef, Vec<u8>)> {
+        let request = network.request(store, id, id)?;
+        network.admit(store, &request)?;
+        network.claim(store, id)?;
+        let result = json!({"evidence":"necessary content"});
+        store.finish_operation(
+            network.space.as_str(),
+            id,
+            OperationState::Succeeded,
+            result.clone(),
+        )?;
+        let content = serde_json::to_vec(&result)?;
         let blob = BlobRef {
-            hash: digest(content),
+            hash: digest(&content),
             size: content.len() as u64,
         };
-        let left = message(
-            &a,
-            &network,
+        store.put_blob(network.space.as_str(), &blob, &content)?;
+        let source = store
+            .operation_dispatch(network.space.as_str(), id)?
+            .unwrap();
+        let event = store.append_derived_event(
+            &network.node,
+            network.space.as_str(),
+            &source.hash,
+            EventBody::ExecutionObserved {
+                operation_id: id.into(),
+                task_id: request.task_id,
+                target_node: request.target_node,
+                session_id: request.session_id,
+                status: "succeeded".into(),
+                detail: json!({"result_blob":blob}),
+            },
+            vec![blob.clone()],
+            (now() + 2) as i64,
+        )?;
+        Ok((event, blob, content))
+    }
+
+    fn result(
+        network: &TestNetwork,
+        store: &mut Store,
+        id: &str,
+    ) -> Result<(OperationRequest, SignedEvent)> {
+        let request = network.request(store, id, id)?;
+        network.admit(store, &request)?;
+        network.claim(store, id)?;
+        let event = network.complete(
+            store,
+            &request,
+            OperationState::Succeeded,
+            json!({"result":"done"}),
+        )?;
+        Ok((request, event))
+    }
+
+    fn notify(
+        network: &TestNetwork,
+        store: &mut Store,
+        request: &OperationRequest,
+        result: &SignedEvent,
+    ) -> Result<SignedEvent> {
+        store.append_derived_event(
+            &network.node,
+            network.space.as_str(),
+            &result.hash,
+            EventBody::NotificationRaised {
+                notification_id: format!("result:{}:succeeded", request.operation_id),
+                kind: "succeeded".into(),
+                text: format!(
+                    "执行会话 {} 的本轮执行状态为 succeeded。工单验收仍需本人确认。",
+                    request.session_id
+                ),
+            },
+            vec![],
+            (now() + 3) as i64,
+        )
+    }
+
+    fn ack(network: &TestNetwork, store: &mut Store, notification_id: &str) -> Result<SignedEvent> {
+        let mut body = network.body("ack", "conversation");
+        body["notification_id"] = json!(notification_id);
+        body["client_id"] = json!("phone");
+        network.append(
+            store,
+            &body,
+            EventBody::NotificationAcknowledged {
+                notification_id: notification_id.into(),
+                client_id: "phone".into(),
+            },
+            now(),
+        )
+    }
+
+    fn seal(
+        network: &TestNetwork,
+        store: &mut Store,
+        binding: &crate::binding::SignedBinding,
+    ) -> Result<crate::binding::SignedSeal> {
+        let mut body = network.body("seal_execution", &binding.binding.conversation_id);
+        body["task_id"] = json!(binding.binding.task_id);
+        body["task_ref"] = json!(binding.binding.task_ref);
+        body["binding"] = json!(binding);
+        let (auth, transport) = network.authorization(store, &body, now())?;
+        let proof = network.freshness(store, &auth, CheckStage::Admit, now())?;
+        store.seal_task_authorized(&network.node, &auth, &proof, &transport, &body, now())
+    }
+
+    fn rebind(
+        network: &TestNetwork,
+        store: &mut Store,
+        binding: &crate::binding::SignedBinding,
+        previous_seal: &crate::binding::SignedSeal,
+        session: &str,
+    ) -> Result<crate::binding::SignedBinding> {
+        let mut body = network.body("rebind_execution", &binding.binding.conversation_id);
+        body["task_id"] = json!(binding.binding.task_id);
+        body["task_ref"] = json!(binding.binding.task_ref);
+        body["binding"] = json!(binding);
+        body["previous_seal"] = json!(previous_seal);
+        body["target_node"] = json!(network.node.node_id()?);
+        body["session_id"] = json!(session);
+        body["executor"] = binding.binding.open_spec["executor"].clone();
+        body["cwd"] = binding.binding.open_spec["cwd"].clone();
+        let (auth, transport) = network.authorization(store, &body, now())?;
+        let proof = network.freshness(store, &auth, CheckStage::Admit, now())?;
+        store.rebind_task_authorized(&network.node, &auth, &proof, &transport, &body, now())
+    }
+
+    #[test]
+    fn causal_import_waits_for_every_dependency_and_blob_then_converges() -> Result<()> {
+        let (network, mut source) = setup()?;
+        let space = network.space.as_str();
+        network.conversation(&mut source, "conversation")?;
+        network.message(&mut source, "conversation", "request")?;
+        let (event, blob, content) = blob_result(&network, &mut source, "result")?;
+        let mut replica = network.memory()?;
+        assert_eq!(replica.ingest_event(space, &event)?.status, "pending");
+        assert!(
+            !replica
+                .missing_dependencies(space, std::slice::from_ref(&event.hash))?
+                .events
+                .is_empty()
+        );
+        let snapshot = source.export_snapshot(space, "conversation")?;
+        for envelope in &snapshot.events {
+            if envelope.hash != event.hash {
+                replica.ingest_event(space, envelope)?;
+            }
+        }
+        assert_eq!(
+            replica.context(space, "conversation", &[])?.missing.blobs,
+            vec![blob.clone()]
+        );
+        assert!(replica.put_blob(space, &blob, b"wrong").is_err());
+        replica.put_blob(space, &blob, &content)?;
+        replica.ingest_event(space, &event)?;
+        assert!(
+            replica
+                .context(space, "conversation", &[])?
+                .missing
+                .is_complete()
+        );
+        assert_eq!(
+            replica.messages(space, "conversation")?,
+            source.messages(space, "conversation")?
+        );
+        assert_eq!(
+            replica.heads(space, "conversation")?,
+            source.heads(space, "conversation")?
+        );
+        assert!(replica.operations(space)?.is_empty());
+        assert_eq!(replica.context(space, "conversation", &[])?.events.len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupted_stored_blob_blocks_context_until_verified_content_is_restored() -> Result<()> {
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        network.conversation(&mut store, "conversation")?;
+        let (_, blob, content) = blob_result(&network, &mut store, "blob")?;
+        store.connection.execute(
+            "UPDATE blobs SET content=? WHERE space_id=? AND hash=?",
+            params![b"tampered".as_slice(), space, blob.hash],
+        )?;
+        assert!(store.get_blob(space, &blob.hash).is_err());
+        let error = store.context(space, "conversation", &[]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ready event has incomplete admission or causal evidence")
+        );
+        assert!(store.rebuild_projections(space).is_err());
+        store.put_blob(space, &blob, &content)?;
+        assert!(
+            store
+                .context(space, "conversation", &[])?
+                .missing
+                .is_complete()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn author_equivocation_removes_both_projections_and_blocks_descendants() -> Result<()> {
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        let root = network.conversation(&mut store, "conversation")?;
+        let left = network.signed_message(
+            &mut store,
+            "one",
             2,
             Some(root.hash.clone()),
             vec![root.hash.clone()],
-            "left",
-            vec![blob.clone()],
         )?;
-        let right = message(
-            &b,
-            &network,
-            1,
-            None,
-            vec![root.hash.clone()],
-            "right",
-            vec![],
-        )?;
-        assert_eq!(replica.ingest_event(&network, &left)?.status, "pending");
-        assert!(replica.messages(&network, "conversation")?.is_empty());
-        assert_eq!(
-            replica
-                .missing_dependencies(&network, std::slice::from_ref(&left.hash))?
-                .events,
-            vec![root.hash.clone()]
-        );
-        replica.ingest_event(&network, &right)?;
-        replica.ingest_event(&network, &root)?;
-        assert_eq!(replica.messages(&network, "conversation")?.len(), 1);
-        assert_eq!(
-            replica
-                .context(&network, "conversation", &[])?
-                .missing
-                .blobs,
-            vec![blob.clone()]
-        );
-        assert!(replica.put_blob(&network, &blob, b"wrong").is_err());
-        replica.put_blob(&network, &blob, content)?;
-        assert_eq!(replica.messages(&network, "conversation")?.len(), 2);
-        replica.ingest_event(&network, &left)?;
-        assert_eq!(replica.messages(&network, "conversation")?.len(), 2);
-        let snapshot = replica.export_snapshot(&network, "conversation")?;
-        source.import_snapshot(&network, &snapshot)?;
-        source.put_blob(&network, &blob, content)?;
-        assert_eq!(
-            source.heads(&network, "conversation")?,
-            replica.heads(&network, "conversation")?
-        );
-        assert_eq!(
-            source.messages(&network, "conversation")?,
-            replica.messages(&network, "conversation")?
-        );
-        assert!(replica.operations(&network)?.is_empty());
-        let context = replica.context(&network, "conversation", &snapshot.heads)?;
-        assert!(context.missing.is_complete());
-        assert_eq!(context.events.len(), 3);
-        Ok(())
-    }
-    #[test]
-    fn corrupted_stored_blob_blocks_context_until_verified_content_is_restored() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let mut store = memory(&a, None)?;
-        let root = conversation(&mut store, &a)?;
-        let content = b"evidence";
-        let blob = BlobRef {
-            hash: digest(content),
-            size: content.len() as u64,
-        };
-        store.put_blob(&network, &blob, content)?;
-        let event = message(
-            &a,
-            &network,
+        let right = network.signed_message(
+            &mut store,
+            "two",
             2,
             Some(root.hash.clone()),
             vec![root.hash],
-            "attached",
-            vec![blob.clone()],
         )?;
-        store.ingest_event(&network, &event)?;
-        store.connection.execute(
-            "UPDATE blobs SET content=? WHERE space_id=? AND hash=?",
-            params![b"tampered".as_slice(), network, blob.hash],
-        )?;
-        assert!(store.get_blob(&network, &blob.hash).is_err());
-        assert_eq!(
-            store.context(&network, "conversation", &[])?.missing.blobs,
-            vec![blob.clone()]
-        );
-        store.rebuild_projections(&network)?;
-        assert!(store.messages(&network, "conversation")?.is_empty());
-        store.put_blob(&network, &blob, content)?;
-        assert_eq!(store.messages(&network, "conversation")?.len(), 1);
-        assert!(
-            store
-                .context(&network, "conversation", &[])?
-                .missing
-                .is_complete()
-        );
-        Ok(())
-    }
-    #[test]
-    fn author_equivocation_removes_both_projections_and_blocks_descendants() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let mut store = memory(&a, None)?;
-        let root = conversation(&mut store, &a)?;
-        let left = message(
-            &a,
-            &network,
-            2,
-            Some(root.hash.clone()),
-            vec![root.hash.clone()],
-            "one",
-            vec![],
-        )?;
-        let right = message(
-            &a,
-            &network,
-            2,
-            Some(root.hash.clone()),
-            vec![root.hash.clone()],
-            "two",
-            vec![],
-        )?;
-        store.ingest_event(&network, &left)?;
-        assert_eq!(store.messages(&network, "conversation")?.len(), 1);
-        assert_eq!(store.ingest_event(&network, &right)?.status, "conflict");
-        assert!(store.messages(&network, "conversation")?.is_empty());
-        let child = message(
-            &a,
-            &network,
+        store.ingest_event(space, &left)?;
+        assert_eq!(store.messages(space, "conversation")?.len(), 1);
+        assert_eq!(store.ingest_event(space, &right)?.status, "conflict");
+        assert!(store.messages(space, "conversation")?.is_empty());
+        let child = network.signed_message(
+            &mut store,
+            "child",
             3,
             Some(left.hash.clone()),
-            vec![left.hash.clone()],
-            "child",
-            vec![],
+            vec![left.hash],
         )?;
-        assert_eq!(store.ingest_event(&network, &child)?.status, "invalid");
+        assert_eq!(store.ingest_event(space, &child)?.status, "invalid");
         assert!(
             !store
-                .context(&network, "conversation", &[])?
+                .context(space, "conversation", &[])?
                 .missing
                 .is_complete()
         );
         assert!(
-            store
-                .append_event(
-                    &a,
-                    &network,
-                    "conversation",
-                    EventBody::ConversationCreated {
-                        title: "bad".into()
-                    },
-                    vec![],
-                    0
-                )
+            network
+                .message(&mut store, "conversation", "blocked")
                 .is_err()
         );
         Ok(())
     }
+
     #[test]
     fn revoked_author_history_verifies_but_new_commands_are_denied() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let b = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let mut store = memory(&a, Some(&b))?;
-        let root = conversation(&mut store, &a)?;
-        let event = message(&b, &network, 1, None, vec![root.hash], "old", vec![])?;
-        let mut revoked = b.certificate(roles())?;
-        revoked.revoked = true;
-        let bundle = a.sign_network_fixture(2, vec![a.certificate(roles())?, revoked])?;
-        store.install_trust_bundle(&network, &bundle)?;
-        assert!(store.authorize_node(&network, &b.node_id()?, None).is_err());
-        assert_eq!(store.ingest_event(&network, &event)?.status, "ready");
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        let root = network.conversation(&mut store, "conversation")?;
+        let old = network.signed_message(
+            &mut store,
+            "historical",
+            2,
+            Some(root.hash.clone()),
+            vec![root.hash],
+        )?;
+        network.revoke_node(&mut store)?;
         assert!(
             store
-                .append_event(
-                    &b,
-                    &network,
-                    "conversation",
-                    EventBody::ConversationCreated {
-                        title: "bad".into()
-                    },
-                    vec![],
-                    0
-                )
+                .authorize_node(space, &network.node.node_id()?, None)
                 .is_err()
         );
-        let old = a.sign_network_fixture(1, vec![a.certificate(roles())?])?;
-        assert!(store.install_trust_bundle(&network, &old).is_err());
+        assert_eq!(store.ingest_event(space, &old)?.status, "ready");
+        assert!(
+            network
+                .message(&mut store, "conversation", "denied")
+                .is_err()
+        );
+        assert!(store.verify_event(space, &old).is_ok());
         Ok(())
     }
+
     #[test]
     fn queued_operation_cannot_start_after_known_executor_revocation() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let mut store = memory(&a, None)?;
-        let event = conversation(&mut store, &a)?;
-        let request = request(&mut store, &a, "queued", vec![event.hash])?;
-        store.accept_operation(&network, &request)?;
-        let mut certificate = a.certificate(roles())?;
-        certificate.revoked = true;
-        store.install_trust_bundle(&network, &a.sign_network_fixture(2, vec![certificate])?)?;
-        assert!(store.claim_operation(&network, "queued").is_err());
+        let (network, mut store) = setup()?;
+        network.conversation(&mut store, "conversation")?;
+        let request = network.request(&mut store, "queued", "session")?;
+        network.admit(&mut store, &request)?;
+        network.revoke_node(&mut store)?;
+        assert!(network.claim(&mut store, "queued").is_err());
         assert_eq!(
-            store.operation(&network, "queued")?.unwrap().state,
+            store
+                .operation(network.space.as_str(), "queued")?
+                .unwrap()
+                .state,
             OperationState::Accepted
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT count(*) FROM resource_reservations",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            1
         );
         Ok(())
     }
+
     #[test]
     fn concurrent_local_writers_serialize_author_sequences_and_projection_updates() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("vibeface-writers-{}", uuid::Uuid::new_v4()));
-        let db = root.join("node.sqlite3");
-        let owner = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
-        let mut initial = Store::open(&db)?;
-        initial.install_trust_bundle(
-            &network,
-            &owner.sign_network_fixture(1, vec![owner.certificate(roles())?])?,
-        )?;
-        conversation(&mut initial, &owner)?;
-        drop(initial);
-        let first = Store::open(&db)?;
-        let second = Store::open(&db)?;
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let mut workers = Vec::new();
-        for (writer, mut store) in [first, second].into_iter().enumerate() {
-            let barrier = barrier.clone();
-            let owner = owner.clone();
-            let network = network.clone();
-            workers.push(std::thread::spawn(move || -> Result<()> {
-                barrier.wait();
-                for index in 0..6 {
-                    store.append_event(
-                        &owner,
-                        &network,
-                        "conversation",
-                        EventBody::MessagePosted {
-                            message_id: format!("{writer}-{index}"),
-                            scheduler_node: None,
-                            role: "user".into(),
-                            text: format!("{writer}-{index}"),
-                        },
-                        vec![],
-                        index,
-                    )?;
-                }
-                Ok(())
-            }));
-        }
-        for worker in workers {
-            worker.join().unwrap()?;
-        }
-        let final_store = Store::open(&db)?;
-        assert_eq!(final_store.messages(&network, "conversation")?.len(), 12);
-        let context = final_store.context(&network, "conversation", &[])?;
+        let network = TestNetwork::new()?;
+        let mut initial = network.memory()?;
+        network.conversation(&mut initial, "conversation")?;
+        let store = std::sync::Mutex::new(initial);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| -> Result<()> {
+            let threads = (0..2)
+                .map(|writer| {
+                    let network = &network;
+                    let store = &store;
+                    let barrier = &barrier;
+                    scope.spawn(move || -> Result<()> {
+                        barrier.wait();
+                        for index in 0..6 {
+                            network.message(
+                                &mut store.lock().unwrap(),
+                                "conversation",
+                                &format!("{writer}-{index}"),
+                            )?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect::<Vec<_>>();
+            for thread in threads {
+                thread.join().unwrap()?;
+            }
+            Ok(())
+        })?;
+        let store = store.into_inner().unwrap();
+        assert_eq!(
+            store
+                .messages(network.space.as_str(), "conversation")?
+                .len(),
+            12
+        );
+        let context = store.context(network.space.as_str(), "conversation", &[])?;
         assert!(context.missing.is_complete());
         assert_eq!(context.events.len(), 13);
         assert_eq!(context.heads.len(), 1);
-        drop(final_store);
-        std::fs::remove_dir_all(root)?;
         Ok(())
     }
+
     #[test]
     fn corrupted_stored_event_never_becomes_a_complete_context() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let mut store = memory(&a, None)?;
-        let mut event = conversation(&mut store, &a)?;
+        let (network, mut store) = setup()?;
+        let mut event = network.conversation(&mut store, "conversation")?;
         event.canonical_body = event.canonical_body.replace("work", "tampered");
         store.connection.execute(
             "UPDATE events SET envelope=? WHERE space_id=? AND hash=?",
-            params![serde_json::to_string(&event)?, network, event.hash],
-        )?;
-        assert!(store.context(&network, "conversation", &[]).is_err());
-        assert!(store.rebuild_projections(&network).is_err());
-        Ok(())
-    }
-    #[test]
-    fn task_binding_cas_rejects_competing_targets_and_recovers_unsigned_commit() -> Result<()> {
-        let owner = LocalIdentity::generate();
-        let executor = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
-        let dir =
-            std::env::temp_dir().join(format!("vibeface-binding-cas-{}", uuid::Uuid::new_v4()));
-        let db = dir.join("node.sqlite3");
-        let mut store = Store::open(&db)?;
-        store.install_trust_bundle(
-            &network,
-            &owner.sign_network_fixture(
-                1,
-                vec![owner.certificate(roles())?, executor.certificate(roles())?],
-            )?,
-        )?;
-        conversation(&mut store, &owner)?;
-        let creation = store.append_event(
-            &owner,
-            &network,
-            "conversation",
-            EventBody::TaskCreated {
-                task_id: "task".into(),
-                title: "task".into(),
-                goal: "task".into(),
-                acceptance: "task".into(),
-            },
-            vec![],
-            2,
-        )?;
-        let first = crate::binding::TaskBinding {
-            network_id: network.clone(),
-            conversation_id: "conversation".into(),
-            task_ref: creation.hash,
-            task_id: "task".into(),
-            authority_node: owner.node_id()?,
-            generation: 1,
-            target_node: owner.node_id()?,
-            session_id: "first".into(),
-            open_spec: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
-            previous_binding_hash: None,
-            previous_seal: None,
-        };
-        let mut second = first.clone();
-        second.target_node = executor.node_id()?;
-        second.session_id = "second".into();
-        drop(store);
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let mut threads = vec![];
-        for proposal in [first, second] {
-            let mut store = Store::open(&db)?;
-            let owner = owner.clone();
-            let barrier = barrier.clone();
-            threads.push(std::thread::spawn(move || {
-                barrier.wait();
-                store.bind_task(&owner, &proposal)
-            }));
-        }
-        let results = threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        let proof = results.into_iter().find_map(Result::ok).unwrap();
-        let mut store = Store::open(&db)?;
-        let hash = crate::binding::binding_hash(&proof.binding)?;
-        // Simulate commit succeeding while the process exits before its signature is persisted.
-        store.local_set(
-            &network,
-            &format!("task-binding-record:{hash}"),
-            &json!({"binding":proof.binding,"signature":null}),
+            params![
+                serde_json::to_string(&event)?,
+                network.space.as_str(),
+                event.hash
+            ],
         )?;
         assert!(
             store
-                .task_binding(&network, &proof.binding.task_ref)?
+                .context(network.space.as_str(), "conversation", &[])
+                .is_err()
+        );
+        assert!(store.rebuild_projections(network.space.as_str()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn task_binding_cas_rejects_competing_targets_and_rolls_back_failed_commits() -> Result<()> {
+        let network = TestNetwork::new()?;
+        let mut initial = network.memory()?;
+        network.conversation(&mut initial, "conversation")?;
+        let creation = network.task(&mut initial, "conversation", "task")?;
+        let accepted: u64 = initial.connection.query_row(
+            "SELECT count(*) FROM accepted_authorizations",
+            [],
+            |row| row.get(0),
+        )?;
+        let consumed_before: (u64,u64) = initial.connection.query_row(
+            "SELECT (SELECT count(*) FROM authorization_nonces),(SELECT count(*) FROM authorization_challenges WHERE consumed=1)",
+            [],|row| Ok((row.get(0)?,row.get(1)?)))?;
+        initial.connection.execute_batch("CREATE TRIGGER reject_binding_pointer BEFORE INSERT ON local_values WHEN NEW.key LIKE 'task-binding-current:%' BEGIN SELECT RAISE(ABORT,'binding commit failure'); END;")?;
+        assert!(
+            network
+                .bind(&mut initial, &creation, "task", "failed", &network.project)
+                .is_err()
+        );
+        assert_eq!(
+            initial.connection.query_row(
+                "SELECT count(*) FROM accepted_authorizations",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            accepted
+        );
+        assert_eq!(initial.connection.query_row(
+            "SELECT (SELECT count(*) FROM authorization_nonces),(SELECT count(*) FROM authorization_challenges WHERE consumed=1)",
+            [],|row| Ok((row.get::<_,u64>(0)?,row.get::<_,u64>(1)?)))?,consumed_before);
+        assert!(
+            initial
+                .task_binding(network.space.as_str(), &creation.hash)?
                 .is_none()
         );
-        assert_eq!(store.bind_task(&owner, &proof.binding)?, proof);
-        drop(store);
-        std::fs::remove_dir_all(dir)?;
+        assert_eq!(
+            initial.connection.query_row(
+                "SELECT count(*) FROM local_values WHERE key LIKE 'task-binding-record:%'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            0
+        );
+        initial
+            .connection
+            .execute_batch("DROP TRIGGER reject_binding_pointer;")?;
+        let store = std::sync::Mutex::new(initial);
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            ["first", "second"]
+                .into_iter()
+                .map(|session| {
+                    let store = &store;
+                    let network = &network;
+                    let creation = &creation;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        network.bind(
+                            &mut store.lock().unwrap(),
+                            creation,
+                            "task",
+                            session,
+                            &network.project,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let binding = results.into_iter().find_map(Result::ok).unwrap();
+        let store = store.into_inner().unwrap();
+        assert_eq!(
+            store
+                .task_binding(network.space.as_str(), &creation.hash)?
+                .unwrap(),
+            binding
+        );
         Ok(())
     }
 
     #[test]
     fn unknown_binding_cannot_move_and_seal_fences_delayed_commands() -> Result<()> {
-        let owner = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
-        let mut store = memory(&owner, None)?;
-        let root = conversation(&mut store, &owner)?;
-        let request = request(&mut store, &owner, "work", vec![root.hash])?;
-        let proof = request.binding.as_ref().unwrap();
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        network.conversation(&mut store, "conversation")?;
+        let request = network.request(&mut store, "work", "session")?;
+        let binding = request.binding.as_ref().unwrap();
         let mut unbound = request.clone();
         unbound.binding = None;
-        assert!(store.accept_operation(&network, &unbound).is_err());
+        assert!(network.admit(&mut store, &unbound).is_err());
         let mut wrong = request.clone();
         wrong.target_node = "0".repeat(64);
-        assert!(store.accept_operation(&network, &wrong).is_err());
-        store.accept_operation(&network, &request)?;
-        store.claim_operation(&network, "work")?;
+        assert!(network.admit(&mut store, &wrong).is_err());
+        network.admit(&mut store, &request)?;
+        network.claim(&mut store, "work")?;
         store.finish_operation(
-            &network,
+            space,
             "work",
             OperationState::Unknown,
             json!({"reason":"lost connection"}),
         )?;
-        assert!(store.seal_binding(&owner, proof).is_err());
-        let mut replacement = proof.binding.clone();
-        replacement.generation = 2;
-        replacement.session_id = "replacement".into();
-        replacement.previous_binding_hash = Some(crate::binding::binding_hash(&proof.binding)?);
-        assert!(store.bind_task(&owner, &replacement).is_err());
+        assert!(seal(&network, &mut store, binding).is_err());
+        let creation = store.event(space, &binding.binding.task_ref)?.unwrap();
+        assert!(
+            network
+                .bind(
+                    &mut store,
+                    &creation,
+                    &binding.binding.task_id,
+                    "replacement",
+                    &network.project
+                )
+                .is_err()
+        );
         store.finish_operation(
-            &network,
+            space,
             "work",
             OperationState::Failed,
-            json!({"verified":"external execution stopped"}),
+            json!({"verified":"stopped"}),
         )?;
         store.local_set(
-            &network,
+            space,
             "completion:work",
-            &json!({"state":"failed","result":"done"}),
+            &json!({"state":"failed","result":{"verified":"stopped"}}),
         )?;
-        assert!(store.seal_binding(&owner, proof).is_err());
-        store.append_event(
-            &owner,
-            &network,
-            "conversation",
-            EventBody::ExecutionObserved {
-                operation_id: "work".into(),
-                task_id: request.task_id.clone(),
-                target_node: request.target_node.clone(),
-                session_id: request.session_id.clone(),
-                status: "failed".into(),
-                detail: json!({"verified":"external execution stopped"}),
-            },
-            vec![],
-            3,
+        let mut session = store
+            .session(space, &network.node.node_id()?, "session")?
+            .unwrap();
+        session.state = "idle".into();
+        store.upsert_session(space, &session)?;
+        let error = seal(&network, &mut store, binding).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("execution completion is not durable")
+        );
+        network.complete(
+            &mut store,
+            &request,
+            OperationState::Failed,
+            json!({"verified":"stopped"}),
         )?;
-        let seal = store.seal_binding(&owner, proof)?;
-        assert_eq!(store.seal_binding(&owner, proof)?, seal);
+        let mut session = store
+            .session(space, &network.node.node_id()?, "session")?
+            .unwrap();
+        session.state = "idle".into();
+        store.upsert_session(space, &session)?;
+        let sealed = seal(&network, &mut store, binding)?;
         let mut delayed = request.clone();
         delayed.operation_id = "delayed".into();
-        assert!(store.accept_operation(&network, &delayed).is_err());
-        replacement.previous_seal = Some(seal);
-        let next = store.bind_task(&owner, &replacement)?;
-        assert_eq!(next.binding.generation, 2);
-        assert!(store.accept_operation(&network, &delayed).is_err());
-        store.install_binding(proof)?;
+        assert!(network.admit(&mut store, &delayed).is_err());
+        let replacement = rebind(&network, &mut store, binding, &sealed, "replacement")?;
+        store.install_binding(binding)?;
         assert_eq!(
             store
-                .task_binding(&network, &proof.binding.task_ref)?
+                .task_binding(space, &binding.binding.task_ref)?
                 .unwrap(),
-            next
+            replacement
         );
+        assert!(network.admit(&mut store, &delayed).is_err());
         Ok(())
     }
 
     #[test]
     fn two_scheduler_requests_at_one_revision_admit_only_one_side_effect() -> Result<()> {
-        let owner = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
-        let dir =
-            std::env::temp_dir().join(format!("vibeface-session-cas-{}", uuid::Uuid::new_v4()));
-        let db = dir.join("node.sqlite3");
-        let mut store = Store::open(&db)?;
-        store.install_trust_bundle(
-            &network,
-            &owner.sign_network_fixture(1, vec![owner.certificate(roles())?])?,
-        )?;
-        let root = conversation(&mut store, &owner)?;
-        let request = request(&mut store, &owner, "first", vec![root.hash])?;
-        store.upsert_session(&network, &session(&owner, "session")?)?;
-        drop(store);
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let mut threads = vec![];
-        for id in ["scheduler-a", "scheduler-c"] {
-            let mut store = Store::open(&db)?;
-            let mut request = request.clone();
-            request.operation_id = id.into();
-            let barrier = barrier.clone();
-            let network = network.clone();
-            threads.push(std::thread::spawn(move || {
-                barrier.wait();
-                store.accept_operation(&network, &request)
-            }));
-        }
-        let results = threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect::<Vec<_>>();
+        let network = TestNetwork::new()?;
+        let mut initial = network.memory()?;
+        network.conversation(&mut initial, "conversation")?;
+        let request = network.request(&mut initial, "first", "session")?;
+        let store = std::sync::Mutex::new(initial);
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            ["scheduler-a", "scheduler-b"]
+                .into_iter()
+                .map(|id| {
+                    let mut request = request.clone();
+                    request.operation_id = id.into();
+                    let network = &network;
+                    let barrier = &barrier;
+                    let store = &store;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        network.admit(&mut store.lock().unwrap(), &request)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        let store = Store::open(&db)?;
-        assert_eq!(store.operations(&network)?.len(), 1);
-        drop(store);
-        std::fs::remove_dir_all(dir)?;
+        let store = store.into_inner().unwrap();
+        assert_eq!(store.operations(network.space.as_str())?.len(), 1);
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT count(*) FROM accepted_authorizations WHERE operation_id IS NOT NULL",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            1
+        );
         Ok(())
     }
 
     #[test]
     fn operation_cas_reserves_resources_and_reconciles_unknown_without_replay() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let mut store = memory(&a, None)?;
-        let root = conversation(&mut store, &a)?;
-        store.upsert_session(&network, &session(&a, "session")?)?;
-        let mut first = request(&mut store, &a, "operation", vec![root.hash])?;
-        first.resources = vec!["/tmp/vibeface-lock/repo".into()];
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        network.conversation(&mut store, "conversation")?;
+        for path in ["repo/child", "repo-two"] {
+            fs::create_dir_all(network.project.join(path))?;
+        }
+        let first = network.request_at(
+            &mut store,
+            "operation",
+            "first",
+            &network.project.join("repo"),
+        )?;
         assert_eq!(
-            store.accept_operation(&network, &first)?.state,
+            network.admit(&mut store, &first)?.state,
             OperationState::Accepted
         );
         assert_eq!(
-            store.accept_operation(&network, &first)?.state,
+            network.admit(&mut store, &first)?.state,
             OperationState::Accepted
         );
         let mut changed = first.clone();
-        changed.action = json!({"type":"send"});
-        assert!(store.accept_operation(&network, &changed).is_err());
-        let mut overlap = first.clone();
-        overlap.operation_id = "other".into();
-        overlap.session_id = "second".into();
-        overlap.resources = vec!["/tmp/vibeface-lock/repo/child".into()];
-        overlap.task_id = None;
-        overlap.binding = None;
-        store.bind_test_operation(&a, &mut overlap)?;
-        assert!(store.accept_operation(&network, &overlap).is_err());
-        let mut sibling = overlap.clone();
-        sibling.resources = vec!["/tmp/vibeface-lock/repo-two".into()];
-        store.accept_operation(&network, &sibling)?;
-        store.claim_operation(&network, "operation")?;
-        assert!(store.claim_operation(&network, "operation").is_err());
+        changed.action = json!({"type":"send","text":"changed"});
+        assert!(network.admit(&mut store, &changed).is_err());
+        let overlap = network.request_at(
+            &mut store,
+            "overlap",
+            "second",
+            &network.project.join("repo/child"),
+        )?;
+        assert!(network.admit(&mut store, &overlap).is_err());
+        let sibling = network.request_at(
+            &mut store,
+            "sibling",
+            "third",
+            &network.project.join("repo-two"),
+        )?;
+        network.admit(&mut store, &sibling)?;
+        network.claim(&mut store, "operation")?;
+        assert!(network.claim(&mut store, "operation").is_err());
         assert_eq!(store.recover_running()?, 1);
         assert_eq!(
-            store.operation(&network, "operation")?.unwrap().state,
+            store.operation(space, "operation")?.unwrap().state,
             OperationState::Unknown
         );
-        assert!(store.claim_operation(&network, "operation").is_err());
-        assert!(store.accept_operation(&network, &overlap).is_err());
-        store.finish_operation(
-            &network,
-            "operation",
+        assert!(network.claim(&mut store, "operation").is_err());
+        assert!(network.admit(&mut store, &overlap).is_err());
+        network.complete(
+            &mut store,
+            &first,
             OperationState::Succeeded,
             json!({"actual":"reconciled"}),
         )?;
         assert_eq!(
             store
-                .session(&network, &a.node_id()?, "session")?
+                .session(space, &network.node.node_id()?, "first")?
                 .unwrap()
                 .revision,
             1
         );
         let mut stale = first.clone();
-        stale.operation_id = "stale".into();
-        assert!(store.accept_operation(&network, &stale).is_err());
+        stale.operation_id = "next".into();
+        stale.action = json!({"type":"send","text":"new work"});
+        assert!(network.admit(&mut store, &stale).is_err());
         stale.expected_revision = 1;
-        store.accept_operation(&network, &stale)?;
+        network.admit(&mut store, &stale)?;
         assert!(
             store
-                .finish_operation(&network, "operation", OperationState::Failed, Value::Null)
-                .is_err()
-        );
-        Ok(())
-    }
-    #[test]
-    fn running_send_allows_deduped_controls_but_blocks_other_sends_and_controls() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let mut store = memory(&a, None)?;
-        let root = conversation(&mut store, &a)?;
-        store.upsert_session(&network, &session(&a, "session")?)?;
-        let mut send = request(&mut store, &a, "send", vec![root.hash])?;
-        send.action = json!({"type":"send","text":"work"});
-        send.resources = vec!["/tmp/vibeface-active-turn".into()];
-        store.accept_operation(&network, &send)?;
-        store.claim_operation(&network, "send")?;
-        let mut another = send.clone();
-        another.operation_id = "send-again".into();
-        assert!(store.accept_operation(&network, &another).is_err());
-        assert!(store.accept_control_operation(&network, &another).is_err());
-        let mut control = send.clone();
-        control.operation_id = "interrupt".into();
-        control.action = json!({"type":"interrupt"});
-        control.resources.clear();
-        assert_eq!(
-            store.accept_control_operation(&network, &control)?.state,
-            OperationState::Accepted
-        );
-        store.claim_operation(&network, "interrupt")?;
-        assert_eq!(
-            store.accept_control_operation(&network, &control)?.state,
-            OperationState::Running
-        );
-        let mut second = control.clone();
-        second.operation_id = "steer".into();
-        second.action = json!({"type":"steer","text":"more"});
-        assert!(store.accept_control_operation(&network, &second).is_err());
-        store.finish_operation(
-            &network,
-            "interrupt",
-            OperationState::Succeeded,
-            Value::Null,
-        )?;
-        assert!(store.accept_operation(&network, &another).is_err());
-        second.expected_revision = 1;
-        store.accept_control_operation(&network, &second)?;
-        assert_eq!(
-            store.operation(&network, "send")?.unwrap().state,
-            OperationState::Running
-        );
-        let mut newer = store.session(&network, &a.node_id()?, "session")?.unwrap();
-        newer.revision = 2;
-        store.upsert_session(&network, &newer)?;
-        assert!(store.claim_operation(&network, "steer").is_err());
-        Ok(())
-    }
-    #[test]
-    fn root_recovery_preserves_revoked_authors_without_restoring_authority() -> Result<()> {
-        use crate::identity::{Genesis, GovernanceEvent, Member, NetworkState, RootCheckpoint};
-        let root = LocalIdentity::generate();
-        let admin = LocalIdentity::generate();
-        let current = LocalIdentity::generate();
-        let retired = LocalIdentity::generate();
-        let mut state = NetworkState::new(Genesis::create(
-            &root,
-            vec![
-                Member::client(&admin, "admin", true)?,
-                Member::node(&current, "current", roles())?,
-            ],
-        )?)?;
-        state.append(GovernanceEvent::grant(
-            &admin,
-            &state.project()?,
-            Member::node(&retired, "retired", roles())?,
-        )?)?;
-        state.append(GovernanceEvent::revoke(
-            &admin,
-            &state.project()?,
-            &retired.node_id()?,
-        )?)?;
-        let event = retired.sign_event(Event {
-            version: WIRE_VERSION,
-            network_id: root.network_id()?,
-            scope_id: "archive".into(),
-            author: retired.node_id()?,
-            sequence: 1,
-            previous: None,
-            parents: vec![],
-            created_at_ms: 0,
-            body: EventBody::ConversationCreated {
-                title: "retired author".into(),
-            },
-            blobs: vec![],
-        })?;
-        let members = state
-            .project()?
-            .members
-            .into_iter()
-            .filter(|member| member.subject_id != retired.node_id().unwrap())
-            .collect();
-        let checkpoint =
-            RootCheckpoint::create_with_history(&root, 2, members, state.historical_nodes()?)?;
-        state.recover(checkpoint)?;
-        let network = root.network_id()?;
-        let mut fresh = Store::open(":memory:")?;
-        fresh.install_trust_bundle(&network, &state)?;
-        assert_eq!(fresh.ingest_event(&network, &event)?.status, "ready");
-        assert!(
-            fresh
-                .authorize_node(&network, &retired.node_id()?, None)
+                .finish_operation(space, "operation", OperationState::Failed, Value::Null)
                 .is_err()
         );
         Ok(())
     }
 
     #[test]
-    fn management_clients_cannot_author_business_dag_events() -> Result<()> {
-        let root = LocalIdentity::generate();
-        let admin = LocalIdentity::generate();
-        let node = LocalIdentity::generate();
-        let state = crate::identity::NetworkState::new(crate::identity::Genesis::create(
-            &root,
-            vec![
-                crate::identity::Member::client(&admin, "management", true)?,
-                crate::identity::Member::node(&node, "Node", roles())?,
-            ],
-        )?)?;
-        let network = root.network_id()?;
-        let mut store = Store::open(":memory:")?;
-        store.install_trust_bundle(&network, &state)?;
-        let forged = admin.sign_event(Event {
-            version: WIRE_VERSION,
-            network_id: network.clone(),
-            scope_id: "conversation".into(),
-            author: admin.node_id()?,
-            sequence: 1,
-            previous: None,
-            parents: vec![],
-            created_at_ms: 0,
-            body: EventBody::ConversationCreated {
-                title: "invalid client event".into(),
-            },
-            blobs: vec![],
-        })?;
-        assert!(store.ingest_event(&network, &forged).is_err());
+    fn running_send_allows_deduped_controls_but_blocks_other_sends_and_controls() -> Result<()> {
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        network.conversation(&mut store, "conversation")?;
+        let open = network.request(&mut store, "open", "session")?;
+        network.admit(&mut store, &open)?;
+        network.claim(&mut store, "open")?;
+        network.complete(&mut store, &open, OperationState::Succeeded, Value::Null)?;
+        let mut send = open.clone();
+        send.operation_id = "send".into();
+        send.action = json!({"type":"send","text":"work"});
+        send.expected_revision = 1;
+        network.admit(&mut store, &send)?;
+        network.claim(&mut store, "send")?;
+        let mut another = send.clone();
+        another.operation_id = "another".into();
+        assert!(network.admit(&mut store, &another).is_err());
+        let mut control = send.clone();
+        control.operation_id = "interrupt".into();
+        control.action = json!({"type":"interrupt","turn_id":"turn"});
+        control.resources.clear();
+        network.admit(&mut store, &control)?;
+        network.claim(&mut store, "interrupt")?;
+        assert_eq!(
+            network.admit(&mut store, &control)?.state,
+            OperationState::Running
+        );
+        let mut second = control.clone();
+        second.operation_id = "steer".into();
+        second.action = json!({"type":"steer","turn_id":"turn","text":"more"});
+        assert!(network.admit(&mut store, &second).is_err());
+        network.complete(&mut store, &control, OperationState::Succeeded, Value::Null)?;
+        assert!(network.admit(&mut store, &another).is_err());
+        second.expected_revision = 2;
+        network.admit(&mut store, &second)?;
+        assert_eq!(
+            store.operation(space, "send")?.unwrap().state,
+            OperationState::Running
+        );
+        let mut session = store
+            .session(space, &network.node.node_id()?, "session")?
+            .unwrap();
+        session.revision = 3;
+        store.upsert_session(space, &session)?;
+        assert!(network.claim(&mut store, "steer").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn root_recovery_preserves_revoked_authors_without_restoring_authority() -> Result<()> {
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        let root = network.conversation(&mut store, "conversation")?;
+        let old = network.signed_message(
+            &mut store,
+            "retired author",
+            2,
+            Some(root.hash.clone()),
+            vec![root.hash.clone()],
+        )?;
+        let material = recovery::build_account_recovery_material(
+            &network.created,
+            &network.root,
+            &network.recovery,
+            "http://localhost:12345",
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let next_root = Identity::generate().map_err(anyhow::Error::msg)?;
+        let next_client = Identity::generate().map_err(anyhow::Error::msg)?;
+        let node = Identity::generate().map_err(anyhow::Error::msg)?;
+        let nonce = Nonce::random()?;
+        let recovered_at = (now() + 10) as f64;
+        let claim = bootstrap::create_node_claim(
+            &node,
+            nonce.as_str(),
+            recovered_at,
+            recovered_at + 100_000.0,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let claim = bootstrap::verify_node_claim(
+            &claim,
+            &node.public_key_hex(),
+            nonce.as_str(),
+            recovered_at,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let bundle = serde_json::to_string(&network.bundle)?;
+        let pins = serde_json::to_string(&network.pins)?;
+        let prepared = recovery::prepare_account_recovery(
+            &material,
+            &bundle,
+            &next_root,
+            &next_client,
+            &claim,
+            recovered_at + 10_000_000.0,
+            recovered_at,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let possession = recovery::sign_recovery_node_possession(
+            &prepared.node_request_json().map_err(anyhow::Error::msg)?,
+            &node,
+            &pins,
+            &bundle,
+            nonce.as_str(),
+            recovered_at,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let recovered =
+            recovery::finish_account_recovery(&prepared, &next_root, &possession, recovered_at)
+                .map_err(anyhow::Error::msg)?;
+        let recovered: ClientAuthorizationBundle =
+            serde_json::from_str(&recovered.bundle_json().map_err(anyhow::Error::msg)?)?;
+        store.install_policy_journal(&recovered.journal, recovered_at as u64)?;
         assert!(
             store
-                .authorize_node(&network, &admin.node_id()?, None)
+                .authorize_node(space, &network.node.node_id()?, None)
+                .is_err()
+        );
+        assert_eq!(store.ingest_event(space, &old)?.status, "ready");
+        assert!(
+            network
+                .message(&mut store, "conversation", "denied")
+                .is_err()
+        );
+        assert!(store.verify_event(space, &old).is_ok());
+        let mut fresh = Store::initialize(Path::new(":memory:"))?;
+        let update = fresh.policy.prepare_bootstrap(
+            &network.pins,
+            &recovered.journal,
+            recovered_at as u64,
+        )?;
+        let tx = fresh
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let policy = crate::identity::journal::commit_in(&tx, &update)?;
+        crate::identity::policy::project_policy_in(&tx, &policy)?;
+        tx.commit()?;
+        fresh.policy = policy;
+        assert_eq!(fresh.ingest_event(space, &root)?.status, "ready");
+        assert_eq!(fresh.ingest_event(space, &old)?.status, "ready");
+        assert!(
+            fresh
+                .authorize_node(space, &network.node.node_id()?, None)
+                .is_err()
+        );
+        assert_eq!(fresh.messages(space, "conversation")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn management_clients_cannot_author_business_dag_events() -> Result<()> {
+        let (network, mut store) = setup()?;
+        let root = network.conversation(&mut store, "conversation")?;
+        let mut event: Event = serde_json::from_str(&root.canonical_body)?;
+        let client = LocalIdentity {
+            secret_key_hex: network.client.secret_hex(),
+        };
+        event.author = client.node_id()?;
+        let forged = client.sign_event(event)?;
+        assert!(store.ingest_event(network.space.as_str(), &forged).is_err());
+        assert!(
+            store
+                .authorize_node(network.space.as_str(), &client.node_id()?, None)
                 .is_err()
         );
         assert!(
             store
-                .authorize_node(&network, &node.node_id()?, Some(NodeRole::Replica))
+                .authorize_node(
+                    network.space.as_str(),
+                    &network.node.node_id()?,
+                    Some(NodeRole::Replica)
+                )
                 .is_ok()
         );
         Ok(())
@@ -3091,366 +3274,307 @@ mod tests {
 
     #[test]
     fn all_replicated_and_local_ids_are_network_scoped() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let b = LocalIdentity::generate();
-        let mut store = memory(&a, None)?;
-        let na = a.fixture_network_id()?;
-        let nb = b.fixture_network_id()?;
-        store.install_trust_bundle(
-            &nb,
-            &b.sign_network_fixture(1, vec![b.certificate(roles())?])?,
-        )?;
-        let ea = conversation(&mut store, &a)?;
-        let eb = conversation(&mut store, &b)?;
-        assert!(store.ingest_event(&nb, &ea).is_err());
-        assert!(store.event(&na, &eb.hash)?.is_none());
-        assert_eq!(store.conversations(&na)?.len(), 1);
-        assert_eq!(store.conversations(&nb)?.len(), 1);
-        let ra = request(&mut store, &a, "same-id", vec![ea.hash])?;
-        let rb = request(&mut store, &b, "same-id", vec![eb.hash])?;
-        store.accept_operation(&na, &ra)?;
-        store.accept_operation(&nb, &rb)?;
+        let (left, mut store) = setup()?;
+        let right = TestNetwork::new()?;
+        right.install(&mut store)?;
+        let a = left.conversation(&mut store, "conversation")?;
+        let b = right.conversation(&mut store, "conversation")?;
+        assert!(store.ingest_event(right.space.as_str(), &a).is_err());
+        assert!(store.event(left.space.as_str(), &b.hash)?.is_none());
+        assert_eq!(store.conversations(left.space.as_str())?.len(), 1);
+        assert_eq!(store.conversations(right.space.as_str())?.len(), 1);
+        let ra = left.request(&mut store, "same-id", "session")?;
+        let rb = right.request(&mut store, "same-id", "session")?;
+        left.admit(&mut store, &ra)?;
+        right.admit(&mut store, &rb)?;
         assert_eq!(
             store
-                .operation(&na, "same-id")?
+                .operation(left.space.as_str(), "same-id")?
                 .unwrap()
                 .request
                 .target_node,
-            a.node_id()?
+            left.node.node_id()?
         );
         assert_eq!(
             store
-                .operation(&nb, "same-id")?
+                .operation(right.space.as_str(), "same-id")?
                 .unwrap()
                 .request
                 .target_node,
-            b.node_id()?
+            right.node.node_id()?
         );
-        store.local_set(&na, "auth", &json!("a"))?;
-        store.local_set(&nb, "auth", &json!("b"))?;
-        assert_eq!(store.local_value(&na, "auth")?, Some(json!("a")));
-        assert_eq!(store.local_value(&nb, "auth")?, Some(json!("b")));
+        store.local_set(left.space.as_str(), "auth", &json!("a"))?;
+        store.local_set(right.space.as_str(), "auth", &json!("b"))?;
+        assert_eq!(
+            store.local_value(left.space.as_str(), "auth")?,
+            Some(json!("a"))
+        );
+        assert_eq!(
+            store.local_value(right.space.as_str(), "auth")?,
+            Some(json!("b"))
+        );
         let blob = BlobRef {
             hash: digest(b"private"),
             size: 7,
         };
-        store.put_blob(&na, &blob, b"private")?;
-        assert!(store.get_blob(&nb, &blob.hash)?.is_none());
+        store.put_blob(left.space.as_str(), &blob, b"private")?;
+        assert!(store.get_blob(right.space.as_str(), &blob.hash)?.is_none());
         Ok(())
     }
+
     #[test]
     fn same_device_resources_are_reserved_across_networks_without_sharing_records() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let b = LocalIdentity::generate();
-        let na = a.fixture_network_id()?;
-        let nb = b.fixture_network_id()?;
-        let mut store = memory(&a, None)?;
-        store.install_trust_bundle(
-            &nb,
-            &b.sign_network_fixture(1, vec![a.certificate(roles())?, b.certificate(roles())?])?,
+        let (left, mut store) = setup()?;
+        let right = second_space(&left, &store)?;
+        right.install(&mut store)?;
+        store.local_set(
+            right.space.as_str(),
+            &format!("resource-root:{}", right.resource),
+            &json!(left.project),
         )?;
-        let ea = conversation(&mut store, &a)?;
-        let eb = conversation(&mut store, &b)?;
-        let mut ra = request(&mut store, &a, "same-op", vec![ea.hash])?;
-        ra.resources = vec!["/tmp/vibeface-shared-device".into()];
-        let mut rb = request(&mut store, &b, "same-op", vec![eb.hash])?;
-        rb.target_node = a.node_id()?;
-        rb.task_id = Some("other-device-task".into());
-        rb.binding = None;
-        store.bind_test_operation(&b, &mut rb)?;
-        rb.resources = ra.resources.clone();
-        store.accept_operation(&na, &ra)?;
-        assert!(store.accept_operation(&nb, &rb).is_err());
-        assert!(store.operation(&nb, "same-op")?.is_none());
-        rb.resources = vec!["/tmp/vibeface-separate-device".into()];
-        store.accept_operation(&nb, &rb)?;
+        for path in ["repo", "repo-two"] {
+            fs::create_dir_all(left.project.join(path))?;
+        }
+        left.conversation(&mut store, "conversation")?;
+        right.conversation(&mut store, "conversation")?;
+        let a = left.request_at(&mut store, "same-op", "left", &left.project.join("repo"))?;
+        let b = right.request_at(&mut store, "same-op", "right", &left.project.join("repo"))?;
+        left.admit(&mut store, &a)?;
+        assert!(right.admit(&mut store, &b).is_err());
+        assert!(store.operation(right.space.as_str(), "same-op")?.is_none());
+        let c = right.request_at(
+            &mut store,
+            "separate",
+            "separate",
+            &left.project.join("repo-two"),
+        )?;
+        right.admit(&mut store, &c)?;
+        assert_eq!(store.operations(left.space.as_str())?.len(), 1);
+        assert_eq!(store.operations(right.space.as_str())?.len(), 1);
         Ok(())
     }
+
     #[test]
     fn notifications_budget_and_continuation_claims_are_durable_deduped_state() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let mut store = memory(&a, None)?;
-        conversation(&mut store, &a)?;
-        let result = store.append_event(
-            &a,
-            &network,
-            "conversation",
-            EventBody::ExecutionObserved {
-                operation_id: "operation".into(),
-                task_id: None,
-                target_node: a.node_id()?,
-                session_id: "session".into(),
-                status: "completed".into(),
-                detail: json!({"turn":"finished"}),
-            },
-            vec![],
-            2,
-        )?;
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        network.conversation(&mut store, "conversation")?;
+        let (_, event) = result(&network, &mut store, "operation")?;
         let notification = Notification {
             notification_id: "notice".into(),
             conversation_id: "conversation".into(),
             kind: "turn_completed".into(),
             text: "awaiting acceptance".into(),
-            event_hash: result.hash.clone(),
+            event_hash: event.hash.clone(),
         };
-        store.queue_notification(&network, &notification)?;
-        store.queue_notification(&network, &notification)?;
-        assert_eq!(store.pending_notifications(&network, "phone")?.len(), 1);
-        store.ack_notification(&network, "notice", "phone")?;
-        assert!(store.pending_notifications(&network, "phone")?.is_empty());
-        assert_eq!(store.pending_notifications(&network, "laptop")?.len(), 1);
-        assert_eq!(store.reserve_budget(&network, "2026-10-16", 2, 3)?.used, 2);
-        assert!(store.reserve_budget(&network, "2026-10-16", 2, 3).is_err());
-        assert_eq!(store.budget_usage(&network, "2026-10-16", 3)?.used, 2);
-        store.claim_continuation(&network, &result.hash, "v1", &a.node_id()?)?;
+        store.queue_notification(space, &notification)?;
+        store.queue_notification(space, &notification)?;
+        assert_eq!(store.pending_notifications(space, "phone")?.len(), 1);
+        store.ack_notification(space, "notice", "phone")?;
+        assert!(store.pending_notifications(space, "phone")?.is_empty());
+        assert_eq!(store.pending_notifications(space, "laptop")?.len(), 1);
+        assert_eq!(store.reserve_budget(space, "2026-10-16", 2, 3)?.used, 2);
+        assert!(store.reserve_budget(space, "2026-10-16", 2, 3).is_err());
+        assert_eq!(store.budget_usage(space, "2026-10-16", 3)?.used, 2);
+        let node = network.node.node_id()?;
+        store.claim_continuation(space, &event.hash, "v1", &node)?;
         assert!(
             store
-                .claim_continuation(&network, &result.hash, "v1", &a.node_id()?)
+                .claim_continuation(space, &event.hash, "v1", &node)
                 .is_err()
         );
         store.recover_running()?;
         assert_eq!(
-            store
-                .continuation(&network, &result.hash, "v1")?
-                .unwrap()
-                .state,
+            store.continuation(space, &event.hash, "v1")?.unwrap().state,
             "unknown"
         );
         assert!(
             store
-                .claim_continuation(&network, &result.hash, "v1", &a.node_id()?)
+                .claim_continuation(space, &event.hash, "v1", &node)
                 .is_err()
         );
         store.finish_continuation(
-            &network,
-            &result.hash,
+            space,
+            &event.hash,
             "v1",
-            &a.node_id()?,
+            &node,
             "completed",
             json!({"next":"ask_user"}),
         )?;
-        store.rebuild_projections(&network)?;
-        assert_eq!(store.pending_notifications(&network, "laptop")?.len(), 1);
-        assert!(store.operations(&network)?.is_empty());
-        Ok(())
-    }
-    #[test]
-    fn replicated_notification_and_ack_rebuild_without_model_or_operation() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let mut source = memory(&a, None)?;
-        let mut target = memory(&a, None)?;
-        conversation(&mut source, &a)?;
-        source.append_event(
-            &a,
-            &network,
-            "conversation",
-            EventBody::NotificationRaised {
-                notification_id: "sync-notice".into(),
-                kind: "approval".into(),
-                text: "human response needed".into(),
-            },
-            vec![],
-            2,
-        )?;
-        target.import_snapshot(&network, &source.export_snapshot(&network, "conversation")?)?;
-        assert_eq!(target.pending_notifications(&network, "phone")?.len(), 1);
-        source.append_event(
-            &a,
-            &network,
-            "conversation",
-            EventBody::NotificationAcknowledged {
-                notification_id: "sync-notice".into(),
-                client_id: "phone".into(),
-            },
-            vec![],
-            3,
-        )?;
-        target.import_snapshot(&network, &source.export_snapshot(&network, "conversation")?)?;
-        assert!(target.pending_notifications(&network, "phone")?.is_empty());
-        assert_eq!(target.pending_notifications(&network, "laptop")?.len(), 1);
-        target.rebuild_projections(&network)?;
-        assert!(target.pending_notifications(&network, "phone")?.is_empty());
-        assert!(target.operations(&network)?.is_empty());
-        Ok(())
-    }
-    #[test]
-    fn replicated_notification_conflicts_converge_and_keep_acknowledgments() -> Result<()> {
-        let a = LocalIdentity::generate();
-        let b = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        let mut left = memory(&a, Some(&b))?;
-        let mut right = memory(&a, Some(&b))?;
-        conversation(&mut left, &a)?;
-        right.import_snapshot(&network, &left.export_snapshot(&network, "conversation")?)?;
-        let first = left.append_event(
-            &a,
-            &network,
-            "conversation",
-            EventBody::NotificationRaised {
-                notification_id: "same-id".into(),
-                kind: "approval".into(),
-                text: "left".into(),
-            },
-            vec![],
-            2,
-        )?;
-        let second = right.append_event(
-            &b,
-            &network,
-            "conversation",
-            EventBody::NotificationRaised {
-                notification_id: "same-id".into(),
-                kind: "approval".into(),
-                text: "right".into(),
-            },
-            vec![],
-            2,
-        )?;
-        left.ingest_event(&network, &second)?;
-        right.ingest_event(&network, &first)?;
-        let notices = left.pending_notifications(&network, "phone")?;
-        assert_eq!(notices.len(), 1);
-        assert_eq!(notices, right.pending_notifications(&network, "phone")?);
-        left.ack_notification(&network, "same-id", "phone")?;
-        left.rebuild_projections(&network)?;
-        assert!(left.pending_notifications(&network, "phone")?.is_empty());
-        assert_eq!(left.pending_notifications(&network, "laptop")?, notices);
-        let mut conflicting: Event = serde_json::from_str(&first.canonical_body)?;
-        conflicting.body = EventBody::NotificationRaised {
-            notification_id: "same-id".into(),
-            kind: "approval".into(),
-            text: "equivocation".into(),
-        };
-        let conflicting = a.sign_event(conflicting)?;
-        left.ingest_event(&network, &conflicting)?;
-        let remaining = left.pending_notifications(&network, "laptop")?;
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].event_hash, second.hash);
-        assert!(left.pending_notifications(&network, "phone")?.is_empty());
+        store.rebuild_projections(space)?;
+        assert_eq!(store.pending_notifications(space, "laptop")?.len(), 1);
         Ok(())
     }
 
     #[test]
-    fn incompatible_membership_is_rejected_before_recovery_mutates_operations() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!(
-            "vibeface-membership-preflight-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let db = dir.join("node.sqlite3");
-        let owner = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
-        let mut store = Store::open(&db)?;
-        store.install_trust_bundle(
-            &network,
-            &owner.sign_network_fixture(1, vec![owner.certificate(roles())?])?,
+    fn replicated_notification_and_ack_rebuild_without_model_or_operation() -> Result<()> {
+        let (network, mut source) = setup()?;
+        let space = network.space.as_str();
+        let mut target = network.memory()?;
+        network.conversation(&mut source, "conversation")?;
+        let (request, event) = result(&network, &mut source, "operation")?;
+        notify(&network, &mut source, &request, &event)?;
+        ack(&network, &mut source, "result:operation:succeeded")?;
+        target.import_snapshot(space, &source.export_snapshot(space, "conversation")?)?;
+        assert!(target.pending_notifications(space, "phone")?.is_empty());
+        assert_eq!(target.pending_notifications(space, "laptop")?.len(), 1);
+        target.rebuild_projections(space)?;
+        assert!(target.pending_notifications(space, "phone")?.is_empty());
+        assert!(target.operations(space)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn replicated_notification_conflicts_converge_and_keep_acknowledgments() -> Result<()> {
+        let (network, mut left) = setup()?;
+        let space = network.space.as_str();
+        let mut right = network.memory()?;
+        network.conversation(&mut left, "conversation")?;
+        let (request, event) = result(&network, &mut left, "operation")?;
+        let notice = notify(&network, &mut left, &request, &event)?;
+        right.import_snapshot(space, &left.export_snapshot(space, "conversation")?)?;
+        ack(&network, &mut left, "result:operation:succeeded")?;
+        right.import_snapshot(space, &left.export_snapshot(space, "conversation")?)?;
+        let notice: Event = serde_json::from_str(&notice.canonical_body)?;
+        let fork = network.signed_message(
+            &mut left,
+            "equivocated notification slot",
+            notice.sequence,
+            notice.previous,
+            notice.parents,
         )?;
-        let root = conversation(&mut store, &owner)?;
-        let request = request(&mut store, &owner, "running", vec![root.hash])?;
-        store.accept_operation(&network, &request)?;
-        store.claim_operation(&network, "running")?;
+        left.ingest_event(space, &fork)?;
+        right.ingest_event(space, &fork)?;
+        assert_eq!(
+            left.pending_notifications(space, "laptop")?,
+            right.pending_notifications(space, "laptop")?
+        );
+        assert!(left.pending_notifications(space, "laptop")?.is_empty());
+        assert!(left.pending_notifications(space, "phone")?.is_empty());
+        assert_eq!(
+            left.connection.query_row(
+                "SELECT count(*) FROM notification_acks WHERE client_id='phone'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    fn running_file() -> Result<(TestNetwork, PathBuf)> {
+        let network = TestNetwork::new()?;
+        let db = network.directory.join("node.sqlite3");
+        let mut store = network.at(&db)?;
+        network.conversation(&mut store, "conversation")?;
+        let request = network.request(&mut store, "running", "session")?;
+        network.admit(&mut store, &request)?;
+        network.claim(&mut store, "running")?;
         drop(store);
+        Ok((network, db))
+    }
+
+    #[test]
+    fn incompatible_membership_is_rejected_before_recovery_mutates_operations() -> Result<()> {
+        let (_network, db) = running_file()?;
         let connection = Connection::open(&db)?;
         connection.execute("UPDATE spaces SET bundle='{}'", [])?;
         drop(connection);
         assert!(Store::open(&db).is_err());
         let connection = Connection::open(&db)?;
-        let state: String = connection.query_row(
-            "SELECT state FROM operations WHERE operation_id='running'",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(state, "\"running\"");
-        let conversations: u64 =
-            connection.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
-        assert_eq!(conversations, 1);
-        drop(connection);
-        std::fs::remove_dir_all(dir)?;
+        assert_eq!(
+            connection.query_row(
+                "SELECT state FROM operations WHERE operation_id='running'",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            "\"running\""
+        );
+        assert_eq!(
+            connection.query_row("SELECT count(*) FROM conversations", [], |row| row
+                .get::<_, u64>(0))?,
+            1
+        );
         Ok(())
     }
 
     #[test]
     fn reopening_keeps_unknown_effects_reserved_and_rejects_future_schema() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("vibeface-core-{}", uuid::Uuid::new_v4()));
-        crate::config::private_dir(&root)?;
-        let db = root.join("node.sqlite3");
-        let a = LocalIdentity::generate();
-        let network = a.fixture_network_id()?;
-        {
-            let mut store = Store::open(&db)?;
-            store.install_trust_bundle(
-                &network,
-                &a.sign_network_fixture(1, vec![a.certificate(roles())?])?,
-            )?;
-            let event = conversation(&mut store, &a)?;
-            let request = request(&mut store, &a, "durable", vec![event.hash])?;
-            store.accept_operation(&network, &request)?;
-            store.claim_operation(&network, "durable")?;
-        }
-        {
-            let store = Store::open(&db)?;
-            assert_eq!(
-                store.operation(&network, "durable")?.unwrap().state,
-                OperationState::Unknown
-            );
-            assert_eq!(store.conversations(&network)?.len(), 1);
-        }
+        let (network, db) = running_file()?;
+        let store = Store::open(&db)?;
+        assert_eq!(
+            store
+                .operation(network.space.as_str(), "running")?
+                .unwrap()
+                .state,
+            OperationState::Unknown
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT count(*) FROM resource_reservations",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            1
+        );
+        assert_eq!(store.conversations(network.space.as_str())?.len(), 1);
+        drop(store);
         let connection = Connection::open(&db)?;
-        connection.execute_batch("PRAGMA user_version=3;")?;
+        connection.execute_batch("PRAGMA user_version=3")?;
         drop(connection);
         assert!(Store::open(&db).is_err());
-        std::fs::remove_dir_all(root)?;
         Ok(())
     }
+
     #[test]
     fn read_only_access_keeps_live_operations_and_projections_unchanged() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("vibeface-readonly-{}", uuid::Uuid::new_v4()));
-        crate::config::private_dir(&root)?;
-        let db = root.join("node.sqlite3");
-        let owner = LocalIdentity::generate();
-        let network = owner.fixture_network_id()?;
-        let mut live = Store::open(&db)?;
-        live.install_trust_bundle(
-            &network,
-            &owner.sign_network_fixture(1, vec![owner.certificate(roles())?])?,
-        )?;
-        let event = conversation(&mut live, &owner)?;
-        let operation = request(&mut live, &owner, "running", vec![event.hash])?;
-        live.accept_operation(&network, &operation)?;
-        live.claim_operation(&network, "running")?;
-        {
-            let access = Store::open_read_only(&db)?;
-            assert!(access.has_network()?);
-            assert_eq!(
-                access.operation(&network, "running")?.unwrap().state,
-                OperationState::Running
-            );
-            assert_eq!(access.conversations(&network)?.len(), 1);
-            assert!(
-                access
-                    .connection
-                    .execute("DELETE FROM operations", [])
-                    .is_err()
-            );
-        }
-        for suffix in ["-wal", "-shm"] {
-            let path = root.join(format!("node.sqlite3{suffix}"));
-            assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
-        }
+        let network = TestNetwork::new()?;
+        let db = network.directory.join("node.sqlite3");
+        let mut live = network.at(&db)?;
+        network.conversation(&mut live, "conversation")?;
+        let request = network.request(&mut live, "running", "session")?;
+        network.admit(&mut live, &request)?;
+        network.claim(&mut live, "running")?;
+        let access = Store::open_read_only(&db)?;
+        assert!(access.has_network()?);
         assert_eq!(
-            live.operation(&network, "running")?.unwrap().state,
+            access
+                .operation(network.space.as_str(), "running")?
+                .unwrap()
+                .state,
             OperationState::Running
         );
-        let reserved: u64 = live.connection.query_row(
-            "SELECT COUNT(*) FROM resource_reservations WHERE operation_id='running'",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(reserved, operation.resources.len() as u64);
-        assert_eq!(live.conversations(&network)?.len(), 1);
-        drop(live);
-        fs::remove_dir_all(root)?;
+        assert_eq!(access.conversations(network.space.as_str())?.len(), 1);
+        assert!(
+            access
+                .connection
+                .execute("DELETE FROM operations", [])
+                .is_err()
+        );
+        drop(access);
+        for suffix in ["-wal", "-shm"] {
+            assert_eq!(
+                fs::metadata(network.directory.join(format!("node.sqlite3{suffix}")))?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            live.operation(network.space.as_str(), "running")?
+                .unwrap()
+                .state,
+            OperationState::Running
+        );
+        assert_eq!(
+            live.connection
+                .query_row("SELECT count(*) FROM resource_reservations", [], |row| row
+                    .get::<_, u64>(
+                    0
+                ))?,
+            request.resources.len() as u64
+        );
         Ok(())
     }
 
@@ -3462,39 +3586,34 @@ mod tests {
             ("CREATE TABLE identity_network (state TEXT)", true),
             ("UPDATE events SET envelope='{}'", false),
             ("UPDATE spaces SET bundle='{}'", false),
+            ("UPDATE policy_journal SET entry='{}'", false),
+            (
+                "UPDATE accepted_authorizations SET actor_id='changed'",
+                false,
+            ),
+            ("DELETE FROM authorization_nonces", false),
+            (
+                "UPDATE local_values SET value=json_set(value,'$.deadline',0) WHERE key LIKE 'lease:%'",
+                false,
+            ),
         ] {
-            let root = std::env::temp_dir()
-                .join(format!("vibeface-schema-drift-{}", uuid::Uuid::new_v4()));
-            crate::config::private_dir(&root)?;
-            let db = root.join("node.sqlite3");
-            let owner = LocalIdentity::generate();
-            let network = owner.fixture_network_id()?;
-            {
-                let mut store = Store::open(&db)?;
-                store.install_trust_bundle(
-                    &network,
-                    &owner.sign_network_fixture(1, vec![owner.certificate(roles())?])?,
-                )?;
-                let event = conversation(&mut store, &owner)?;
-                let operation = request(&mut store, &owner, "running", vec![event.hash])?;
-                store.accept_operation(&network, &operation)?;
-                store.claim_operation(&network, "running")?;
-            }
-            {
-                let connection = Connection::open(&db)?;
-                connection.execute_batch(mutation)?;
-            }
+            let (network, db) = running_file()?;
+            let connection = Connection::open(&db)?;
+            connection.execute_batch(mutation)?;
+            drop(connection);
             let snapshot = || -> Result<BTreeMap<String, (Vec<u8>, u32)>> {
                 let mut files = BTreeMap::new();
-                for entry in fs::read_dir(&root)? {
+                for entry in fs::read_dir(&network.directory)? {
                     let entry = entry?;
-                    files.insert(
-                        entry.file_name().to_string_lossy().into_owned(),
-                        (
-                            fs::read(entry.path())?,
-                            entry.metadata()?.permissions().mode(),
-                        ),
-                    );
+                    if entry.file_type()?.is_file() {
+                        files.insert(
+                            entry.file_name().to_string_lossy().into_owned(),
+                            (
+                                fs::read(entry.path())?,
+                                entry.metadata()?.permissions().mode(),
+                            ),
+                        );
+                    }
                 }
                 Ok(files)
             };
@@ -3505,14 +3624,14 @@ mod tests {
                 assert_eq!(snapshot()?, before);
             }
             let connection = Connection::open(&db)?;
-            let state: String = connection.query_row(
-                "SELECT state FROM operations WHERE operation_id='running'",
-                [],
-                |r| r.get(0),
-            )?;
-            assert_eq!(state, "\"running\"");
-            drop(connection);
-            fs::remove_dir_all(root)?;
+            assert_eq!(
+                connection.query_row(
+                    "SELECT state FROM operations WHERE operation_id='running'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )?,
+                "\"running\""
+            );
         }
         Ok(())
     }
@@ -3520,16 +3639,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resource_normalization_follows_symlinks_before_parent_components() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("vibeface-resource-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(root.join("real/child"))?;
+        let network = TestNetwork::new()?;
+        let root = &network.project;
+        fs::create_dir_all(root.join("real/child"))?;
         std::os::unix::fs::symlink(root.join("real/child"), root.join("link"))?;
-        let resource = canonical_resource(root.join("link/..").to_str().unwrap())?;
         assert_eq!(
-            resource,
-            std::fs::canonicalize(root.join("real"))?.to_str().unwrap()
+            canonical_resource(root.join("link/..").to_str().unwrap())?,
+            root.join("real").canonicalize()?.to_str().unwrap()
         );
         assert!(canonical_resource(root.join("absent/../other").to_str().unwrap()).is_err());
-        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 }
