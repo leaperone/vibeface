@@ -981,6 +981,18 @@ pub async fn connect_direct(url: &str, service: Service) -> Result<NetworkSocket
     connect_service(url, Control::Direct { service }).await
 }
 
+pub async fn connect_relay(url: &str, target: &str, service: Service) -> Result<NetworkSocket> {
+    check_id(target)?;
+    connect_service(
+        url,
+        Control::Dial {
+            target: target.to_owned(),
+            service,
+        },
+    )
+    .await
+}
+
 async fn connect_service(url: &str, control: Control) -> Result<NetworkSocket> {
     let (mut socket, _) = open_control(url).await?;
     send_control(&mut socket, &control).await?;

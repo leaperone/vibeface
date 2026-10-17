@@ -76,7 +76,19 @@ pub struct Client {
 impl Client {
     pub async fn connect(url: &str, identity: &LocalIdentity, target: &str) -> Result<Self> {
         let endpoint = client_endpoint(url)?;
-        let mut socket = crate::network::connect_direct(&endpoint, Service::Client).await?;
+        if let Ok(socket) = crate::network::connect_direct(&endpoint, Service::Client).await {
+            if let Ok(client) = Self::from_socket(socket, identity, target).await {
+                return Ok(client);
+            }
+        }
+        let socket = crate::network::connect_relay(&endpoint, target, Service::Client).await?;
+        Self::from_socket(socket, identity, target).await
+    }
+    async fn from_socket(
+        mut socket: NetworkSocket,
+        identity: &LocalIdentity,
+        target: &str,
+    ) -> Result<Self> {
         let channel = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
             let mut handshake = secure(Handshake::new(
                 true,
@@ -221,7 +233,7 @@ async fn dispatch(
     };
     match method {
         "info" => Ok(
-            json!({"initialized":node.identities.has_network()?,"node_id":node.identity.node_id()?,"public_key":node.identity.public_key_hex()?,"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION")}),
+            json!({"initialized":node.has_membership().await?,"node_id":node.identity.node_id()?,"public_key":node.identity.public_key_hex()?,"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION")}),
         ),
         "authenticate" => {
             let authenticated = authentication(node, session).await?;
@@ -266,7 +278,7 @@ async fn dispatch(
         }
         "prepare_genesis" => {
             ensure!(
-                !node.identities.has_network()?,
+                !node.has_membership().await?,
                 "personal network already initialized"
             );
             let owner_public_key = text(&params, "owner_public_key")?.to_owned();
@@ -301,7 +313,7 @@ async fn dispatch(
         "bootstrap" => {
             let state: NetworkState = from_field(&params, "state")?;
             validate_local_node(node, &state, true)?;
-            if node.identities.has_network()? {
+            if node.has_membership().await? {
                 let current = node.membership_state().await?;
                 ensure!(
                     current.genesis == state.genesis
@@ -418,6 +430,7 @@ async fn dispatch(
             Ok(json!({"request":request,"signing":signing}))
         }
         "pair_request" => {
+            node.membership_state().await?;
             let request: PairRequest = from_field(&params, "request")?;
             ensure!(
                 request.member.subject_id == session.subject_id
@@ -430,6 +443,7 @@ async fn dispatch(
             Ok(json!({"request_id":request_id,"review":review,"signing":signing}))
         }
         "pair_accept" => {
+            node.membership_state().await?;
             let request_id = text(&params, "request_id")?;
             let review = node.identities.lookup_pair(request_id)?;
             ensure!(
@@ -512,6 +526,7 @@ async fn dispatch(
             authentication(node, session).await
         }
         "pair_status" => {
+            node.membership_state().await?;
             let request_id = text(&params, "request_id")?;
             let review = match node.identities.lookup_pair(request_id) {
                 Ok(review) => review,
@@ -582,7 +597,19 @@ async fn dispatch(
         "recovery_challenge" => recovery_challenge(node, session, &params).await,
         "recovery_context" => recovery_context(node, session, &params).await,
         "prepare_recovery" => {
+            let latest = if node.has_membership().await? {
+                Some(node.membership_state().await?)
+            } else {
+                None
+            };
             let recovery = authorized_recovery(session, &params)?;
+            if let Some(latest) = latest {
+                ensure!(
+                    latest.genesis == recovery.genesis,
+                    "recovery network changed"
+                );
+                recovery.state = Some(latest);
+            }
             let state = recovery
                 .state
                 .as_ref()
@@ -623,7 +650,18 @@ async fn dispatch(
                 .clone()
                 .context("recovery context is required")?;
             state.recover(checkpoint)?;
-            let fresh = !node.identities.has_network()?;
+            if node.has_membership().await? {
+                let current = node.membership_state().await?;
+                let prior = recovery
+                    .state
+                    .as_ref()
+                    .context("recovery context is required")?;
+                ensure!(
+                    current.genesis == prior.genesis && current.project()? == prior.project()?,
+                    "membership changed; review recovery again"
+                );
+            }
+            let fresh = !node.has_membership().await?;
             validate_local_node(node, &state, fresh)?;
             if fresh {
                 node.identities.bootstrap_recovered_network(
@@ -658,10 +696,14 @@ async fn manager_view(node: &Runtime, session: &Session) -> Result<Authorization
     Ok(view)
 }
 async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
-    let view = current_view(node, session).await?;
-    Ok(
-        json!({"principal":view.principal(&session.subject_id)?,"state":node.membership_state().await?,"view":view}),
-    )
+    let state = node.membership_state().await?;
+    let view = state.project()?;
+    let member = view.authorize_client(&session.subject_id)?;
+    ensure!(
+        member.public_key == session.public_key,
+        "client identity key mismatch"
+    );
+    Ok(json!({"principal":view.principal(&session.subject_id)?,"state":state,"view":view}))
 }
 fn session_member(
     session: &Session,
@@ -725,8 +767,8 @@ async fn recovery_challenge(
         crypto::fingerprint(&owner_public_key)? == network_id,
         "recovery root fingerprint mismatch"
     );
-    let genesis = if node.identities.has_network()? {
-        node.identities.public_state()?.genesis
+    let genesis = if node.has_membership().await? {
+        node.membership_state().await?.genesis
     } else {
         from_field(params, "genesis")?
     };
@@ -771,8 +813,8 @@ async fn recovery_context(node: &Runtime, session: &mut Session, params: &Value)
         &identity::canonical_json(&recovery.challenge)?,
         text(params, "signature")?,
     )?;
-    let state = if node.identities.has_network()? {
-        node.identities.public_state()?
+    let state = if node.has_membership().await? {
+        node.membership_state().await?
     } else {
         node.identities
             .verify_bootstrap_capability(text(params, "capability")?)?;
@@ -809,29 +851,12 @@ fn authorized_recovery<'a>(session: &'a mut Session, params: &Value) -> Result<&
     Ok(recovery)
 }
 fn bind_client_identity(input: &mut Value, subject: &str) -> Result<()> {
-    fn validate(value: &Value, subject: &str) -> Result<()> {
-        match value {
-            Value::Object(fields) => {
-                if let Some(client) = fields.get("client_id") {
-                    ensure!(
-                        client.as_str() == Some(subject),
-                        "client_id differs from authenticated client"
-                    );
-                }
-                for value in fields.values() {
-                    validate(value, subject)?;
-                }
-            }
-            Value::Array(values) => {
-                for value in values {
-                    validate(value, subject)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
+    if let Some(client) = input.get("client_id") {
+        ensure!(
+            client.as_str() == Some(subject),
+            "client_id differs from authenticated client"
+        );
     }
-    validate(input, subject)?;
     if matches!(
         input["method"].as_str(),
         Some("message" | "presence" | "notifications" | "ack")
@@ -896,7 +921,7 @@ fn request_id(params: &Value) -> Result<String> {
         None => uuid::Uuid::new_v4().to_string(),
     })
 }
-fn sort_roles(roles: &mut Vec<crate::model::NodeRole>) -> Result<()> {
+fn sort_roles(roles: &mut [crate::model::NodeRole]) -> Result<()> {
     roles.sort_by_key(|role| serde_json::to_string(role).unwrap_or_default());
     ensure!(
         !roles.windows(2).any(|r| r[0] == r[1]),
@@ -983,13 +1008,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            bind_client_identity(
-                &mut json!({"method":"operate","request":{"client_id":"another-client"}}),
-                "actual-client"
-            )
-            .is_err()
-        );
+        assert!(bind_client_identity(&mut json!({"method":"operate","request":{"action":{"response":{"client_id":"business-data"}}}}), "actual-client").is_ok());
         assert!(
             bind_client_identity(
                 &mut json!({"method":"message","client_id":"actual-client"}),
