@@ -4624,6 +4624,12 @@ mod tests {
         let f = Fixture::new();
         let signed = Signed::sign(f.invocation(), &f.user).unwrap();
         assert!(DeviceId::parse(&format!("dev2_{}", "AA".repeat(32))).is_err());
+        assert_eq!(
+            node_fingerprint(&f.node.public_key_hex()).unwrap(),
+            f.node.node_id()
+        );
+        assert!(node_fingerprint(&"AA".repeat(32)).is_err());
+        assert!(node_fingerprint("bad-key").is_err());
         let bytes = serde_json::to_vec(&signed).unwrap();
         assert_eq!(decode_signed::<Invocation>(&bytes).unwrap(), signed);
         let text = String::from_utf8(bytes).unwrap();
@@ -5434,6 +5440,12 @@ pub fn sign_invocation(invocation_json: &str, identity: &Identity) -> crate::Res
             .map_err(|_| AuthorizationError::InvalidProof("invocation encoding failed"))
     }
     sign(invocation_json, identity).map_err(|e| e.to_string())
+}
+/// Raw transport fingerprint for a pinned Ed25519 public key.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = nodeFingerprint))]
+pub fn node_fingerprint(public_key_hex: &str) -> crate::Result<String> {
+    let key = PublicKey::parse(public_key_hex).map_err(|e| e.to_string())?;
+    Ok(hex::encode(Sha256::digest(crate::decode32(key.as_str())?)))
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = deriveAuthorizationId))]
 pub fn derive_authorization_id(kind: &str, input: &str) -> crate::Result<String> {
