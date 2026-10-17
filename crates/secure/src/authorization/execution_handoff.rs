@@ -2414,6 +2414,12 @@ impl ExecutionProofUsage {
     pub fn record_historical_handoff(&mut self, wire: &SignedExecutionHandoff) -> Result<()> {
         let mut historical = Self::default();
         historical.record_handoff(wire)?;
+        self.metadata.extend(
+            historical
+                .objects
+                .iter()
+                .map(|(hash, size)| (hash.clone(), *size)),
+        );
         self.historical_wrappers.extend(
             historical
                 .objects
@@ -2422,8 +2428,9 @@ impl ExecutionProofUsage {
         );
         self.historical_wrappers
             .extend(historical.historical_wrappers);
+        self.metadata.extend(historical.metadata);
         self.task_payloads.extend(historical.task_payloads);
-        self.record_metadata(wire)
+        Ok(())
     }
     pub fn counts(&self) -> ExecutionProofCounts {
         ExecutionProofCounts {
