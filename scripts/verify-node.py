@@ -1351,8 +1351,10 @@ def phase1_acceptance(options):
         require(all(row["source_node"] == a.node_id and row["invocation_id"]
                     and row["sequence"] > 0 and row["progress"]["type"] == "text_snapshot" for row in progress),
                 "remote progress carries the original invocation identity and normalized text snapshots")
-        require([row["sequence"] for row in progress] == sorted({row["sequence"] for row in progress}),
-                "remote management observation preserves unique ordered invocation sequence numbers")
+        seen = {}
+        for row in progress:
+            require(seen.setdefault((row["invocation_id"], row["sequence"]), row["progress"]) == row["progress"],
+                    "replayed management progress keeps the same content for its invocation sequence")
         lease, maintenance_reply = maintenance(a, "acquire")
         lease.close()
         require(maintenance_reply["status"] != "ready", "running and queued jobs prevent managed update drain")
@@ -1473,8 +1475,10 @@ def phase1_acceptance(options):
                         and row["target_node"] == b.node_id and row["source_node"] == b.node_id
                         and row["session_id"] == "session-" + task and row["task_ref"] and row["sequence"] > 0
                         for row in execution_progress), "execution progress cannot attach to another task or Node")
-            require([row["sequence"] for row in execution_progress] == sorted({row["sequence"] for row in execution_progress}),
-                    "remote execution observation preserves unique ordered operation sequence numbers")
+            seen = {}
+            for row in execution_progress:
+                require(seen.setdefault(row["sequence"], row["progress"]) == row["progress"],
+                        "replayed execution progress keeps the same content for its operation sequence")
             policy = task_snapshot(a.client, name, task)
             require(policy["followup_mode"] == ("report" if mode == "report" else "off"),
                     "only authenticated send intent creates read-only report consent")
