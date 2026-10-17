@@ -139,7 +139,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     catch (error) { authorization.release(); if (active.authorization === authorization) active.authorization = undefined; throw error }
     const connection: ReadyConnection = {
       generation: active.generation, entry: active.entry, scope: authorization.scope, audience: authorization.audience, info: active.info,
-      authorization: { canManage: authorization.canManage, actions: authorization.actions, authorityEpoch: authorization.authorityEpoch },
+      authorization: { enrollmentRights: authorization.enrollmentRights, actions: authorization.actions, authorityEpoch: authorization.authorityEpoch },
       request: (method, params) => { if (session.current !== active) return Promise.reject(changed()); return request(method, params) },
       rpc: async (method, params) => {
         if (session.current !== active) throw changed()
@@ -147,8 +147,10 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         const bodyJson = JSON.stringify(prepared.body)
         const body = record(JSON.parse(bodyJson))
         const template = record(await request('prepare_invocation', { body }))
-        const invocation = record(JSON.parse(authorization.sign(JSON.stringify(record(template.invocation)), bodyJson, prepared.action, prepared.authorizationId)))
-        return callSession(active, 'rpc', body, invocation)
+        const normalized = record(template.body)
+        if (!same(normalized, body)) throw new Error('节点准备的请求与当前操作不同。请核对最终路径、目标和权限后重新提交。')
+        const invocation = record(JSON.parse(authorization.sign(JSON.stringify(record(template.invocation)), JSON.stringify(normalized), prepared.action, prepared.authorizationId)))
+        return callSession(active, 'rpc', normalized, invocation)
       },
       subscribe(listener) { if (session.current !== active) return () => {}; listeners.current.add(listener); return () => { listeners.current.delete(listener) } },
       isCurrent: () => session.current === active && generation.current === active.generation,
@@ -206,12 +208,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const response = record(await request('directory'))
     const view = verifiedView(response.state, ready.scope.space_id, ownerOf(response.state))
     if (!same(response.view, view)) throw new Error('成员目录与已签名的授权不一致。')
-    const pending = ready.authorization.canManage ? array(await request('pair_requests')).map(parsePairReceipt) : []
+    const pending = ready.authorization.enrollmentRights.includes('enroll_device') ? array(await request('pair_requests')).map(parsePairReceipt) : []
     if (!ready.isCurrent()) throw changed()
     setDirectory(view); setPairs(pending)
   }
   async function createInvitation(kind: 'client' | 'node', selectedRoles: NodeRole[]) {
-    if (!ready?.authorization.canManage || !identityRef.current) throw new Error('此设备没有管理权限。')
+    if (!ready?.authorization.enrollmentRights.includes('enroll_device') || !identityRef.current) throw new Error('此设备没有管理权限。')
     const request = scoped()
     const requestedRoles = kind === 'node' ? [...new Set(selectedRoles)].sort() : []
     if (kind === 'node' && (!requestedRoles.includes('relay') || requestedRoles.some(role => ['gateway', 'scheduler', 'executor'].includes(role)) && !requestedRoles.includes('replica'))) throw new Error('运行节点需要中继权限，接入、调度和执行同时需要同步权限。')
@@ -226,7 +228,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     return JSON.stringify({ url: ready.entry.address, node_id: ready.entry.node_id, relay: ready.entry.relay, invite: result })
   }
   async function approvePair(requestId: string) {
-    if (!ready?.authorization.canManage || !identityRef.current) throw new Error('此设备没有管理权限。')
+    if (!ready?.authorization.enrollmentRights.includes('enroll_device') || !identityRef.current) throw new Error('此设备没有管理权限。')
     const request = scoped()
     const pending = pairs.find(item => item.request_id === requestId)
     if (!pending || !pending.new_subject_signature || pending.review.expires_at_ms <= Date.now()) throw new Error('新设备尚未确认，或请求已过期。请刷新后核对。')
@@ -239,7 +241,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     await request('pair_confirm', { request_id: requestId, inviter_signature, event }); await refreshDirectory()
   }
   async function revoke(subjectId: string) {
-    if (!ready?.authorization.canManage || !identityRef.current || !directory) throw new Error('此设备没有管理权限。')
+    if (!ready?.authorization.enrollmentRights.includes('revoke_device') || !identityRef.current || !directory) throw new Error('此设备没有管理权限。')
     const request = scoped()
     const member = directory.members.find(item => item.subject_id === subjectId)
     if (!member || member.manage) throw new Error('管理客户端的变更需要根恢复确认。')

@@ -1,6 +1,6 @@
 import { signAuthorizedClientInvocation } from '../../transport.js'
 import { verifyClientAuthorization } from '../../generated/vibeface_secure.js'
-import { array, boolean, record, strings, text } from './node'
+import { array, record, strings, text } from './node'
 import { parseIdentityScope, sameScope } from './scope'
 import type { PublicIdentity } from './node'
 
@@ -78,13 +78,10 @@ export function verifyScopedAuthentication(value: unknown, own: PublicIdentity, 
     const authorityEpoch = heads.find(head => head.domain.kind === 'space' && head.domain.id === scope.space_id)?.authority_epoch
     if (authorityEpoch === undefined) throw new Error('授权缺少当前空间政策。')
     const actions = strings(policy.actions)
-    const grantScope = record(policy.scope)
-    const constraints = record(policy.constraints)
-    const context = record(constraints.context)
-    const canManage = actions.includes('member_manage') && grantScope.kind === 'whole_space' && grantScope.value === scope.space_id && !boolean(constraints.require_webauthn_uv) && Object.values(context).every(value => value === null)
+    const enrollmentRights = strings(policy.account_enrollment_rights)
     const pins = trust.pins.map(pin => ({ ...pin, minimum_head: heads.find(head => head.domain.kind === pin.domain.kind && head.domain.id === pin.domain.id) ?? pin.minimum_head }))
     return {
-      scope, audience, actions, policy, canManage, authorityEpoch, trust: { ...trust, pins },
+      scope, audience, actions, policy, enrollmentRights, authorityEpoch, trust: { ...trust, pins },
       sign(templateJson: string, bodyJson: string, action: string, operationId: string) {
         if (released) throw new Error('账户授权已释放，请重新连接。')
         return signAuthorizedClientInvocation(verified, templateJson, bodyJson, action, operationId)

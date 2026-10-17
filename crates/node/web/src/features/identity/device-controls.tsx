@@ -84,7 +84,8 @@ export function DeviceControls() {
     })
   }
 
-  const canManage = ready?.authorization.canManage === true
+  const canEnroll = ready?.authorization.enrollmentRights.includes('enroll_device') === true
+  const canRevoke = ready?.authorization.enrollmentRights.includes('revoke_device') === true
   const needsReplica = roles.some((role) => role === 'gateway' || role === 'scheduler' || role === 'executor')
   const currentReview = review && pairs.find((pair) => pair.request_id === review.request_id && JSON.stringify(pair) === JSON.stringify(review))
 
@@ -146,11 +147,11 @@ export function DeviceControls() {
         <button type="button" className={button} disabled={busy || !ready} onClick={() => void run(() => device.refreshDirectory(), '设备目录已刷新。')}>刷新设备</button>
       </div>
       {directory ? <>
-        <p className="text-sm text-muted-foreground">当前授权版本 {directory.epoch}。{canManage ? '此浏览器可以管理普通设备。' : '此浏览器仅可查看授权目录。'}</p>
+        <p className="text-sm text-muted-foreground">当前授权版本 {directory.epoch}。{canEnroll || canRevoke ? '此浏览器拥有账户设备授权权限。' : '此浏览器仅可查看授权目录。'}</p>
         <ul className="divide-y divide-border">
           {directory.members.map((member) => <li key={member.subject_id} className="space-y-3 py-4">
             <MemberDetails member={member} />
-            {canManage && !member.manage && (revokeSubject === member.subject_id ? <div className="space-y-2 rounded-lg border border-destructive p-3">
+            {canRevoke && !member.manage && (revokeSubject === member.subject_id ? <div className="space-y-2 rounded-lg border border-destructive p-3">
               <p className="text-sm">撤销后，此设备将失去网络访问权限。确认撤销「{member.name || member.subject_id}」？</p>
               <div className="flex flex-wrap gap-2">
                 <button type="button" className={`${button} text-destructive`} disabled={busy} onClick={() => void run(async () => { await device.revoke(member.subject_id); setRevokeSubject('') }, '设备授权已撤销。')}>确认撤销此设备</button>
@@ -164,7 +165,7 @@ export function DeviceControls() {
       </> : <p className="text-sm text-muted-foreground">尚未读取设备目录。</p>}
     </section>
 
-    {canManage && <>
+    {canEnroll && <>
       <section className={panel} aria-labelledby="invite-device-title">
         <h2 id="invite-device-title" className="font-semibold">邀请新设备</h2>
         <form className="space-y-3" onSubmit={(event) => {

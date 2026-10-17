@@ -11,7 +11,7 @@ export type ReadyConnection = {
   readonly scope: IdentityScope
   readonly audience: { device: string; service: string }
   entry: ConnectionEntry
-  authorization: { canManage: boolean; actions: string[]; authorityEpoch: number }
+  authorization: { enrollmentRights: string[]; actions: string[]; authorityEpoch: number }
   info: EntryInfo
   request(method: string, params?: Record<string, unknown>): Promise<unknown>
   rpc(method: string, params?: Record<string, unknown>): Promise<unknown>
