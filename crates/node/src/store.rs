@@ -45,7 +45,6 @@ impl Store {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
         let version: u32 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         match version {
             0 => {
@@ -57,6 +56,16 @@ impl Store {
             _ => bail!("unsupported database schema version {version}"),
         }
         let mut store = Self { connection };
+        // Reject incompatible membership before recovery changes operations or rebuilds projections.
+        for network in store.networks()? {
+            store
+                .trust_bundle(&network)?
+                .context("membership is missing")?
+                .project()?;
+        }
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
         store.recover_running()?;
         for network in store.networks()? {
             store.rebuild_projections(&network)?;
@@ -2830,6 +2839,44 @@ mod tests {
         assert!(target.operations(&network)?.is_empty());
         Ok(())
     }
+    #[test]
+    fn incompatible_membership_is_rejected_before_recovery_mutates_operations() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "vibeface-membership-preflight-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db = dir.join("node.sqlite3");
+        let owner = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut store = Store::open(&db)?;
+        store.install_trust_bundle(
+            &network,
+            &owner.sign_network_fixture(1, vec![owner.certificate(roles())?])?,
+        )?;
+        let root = conversation(&mut store, &owner)?;
+        let request = request(&mut store, &owner, "running", vec![root.hash])?;
+        store.accept_operation(&network, &request)?;
+        store.claim_operation(&network, "running")?;
+        drop(store);
+        let connection = Connection::open(&db)?;
+        connection.execute("UPDATE networks SET bundle='{}'", [])?;
+        drop(connection);
+        assert!(Store::open(&db).is_err());
+        let connection = Connection::open(&db)?;
+        let state: String = connection.query_row(
+            "SELECT state FROM operations WHERE operation_id='running'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(state, "\"running\"");
+        let conversations: u64 =
+            connection.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
+        assert_eq!(conversations, 1);
+        drop(connection);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[test]
     fn reopening_keeps_unknown_effects_reserved_and_rejects_future_schema() -> Result<()> {
         let root = std::env::temp_dir().join(format!("vibeface-core-{}", uuid::Uuid::new_v4()));

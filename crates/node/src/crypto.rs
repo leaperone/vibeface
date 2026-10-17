@@ -89,7 +89,9 @@ impl LocalIdentity {
         revision: u64,
         nodes: Vec<NodeCertificate>,
     ) -> Result<crate::identity::NetworkState> {
-        use crate::identity::{Genesis, IdentityKind, Member, NetworkState, RootCheckpoint};
+        use crate::identity::{
+            Genesis, HistoricalNode, IdentityKind, Member, NetworkState, RootCheckpoint,
+        };
 
         let mut admin_seed = b"vibeface:network-fixture-admin:v1:".to_vec();
         admin_seed.extend_from_slice(self.secret_key_hex.as_bytes());
@@ -100,6 +102,13 @@ impl LocalIdentity {
         let admin_member = Member::client(&admin, "fixture-admin", true)?;
         let root = self.fixture_root();
         let genesis = Genesis::create(&root, vec![admin_member.clone()])?;
+        let history = nodes
+            .iter()
+            .map(|node| HistoricalNode {
+                subject_id: node.node_id.clone(),
+                public_key: node.public_key.clone(),
+            })
+            .collect();
         let mut members = vec![admin_member];
         for certificate in nodes.into_iter().filter(|certificate| !certificate.revoked) {
             let node_id = certificate.node_id;
@@ -130,7 +139,9 @@ impl LocalIdentity {
         let epoch = revision
             .checked_add(1)
             .context("network fixture revision overflow")?;
-        state.recover(RootCheckpoint::create(&root, epoch, members)?)?;
+        state.recover(RootCheckpoint::create_with_history(
+            &root, epoch, members, history,
+        )?)?;
         Ok(state)
     }
 }
