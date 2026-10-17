@@ -624,6 +624,87 @@ impl VerifiedPolicySet {
         handoff: &ExecutionHandoff,
         now_ms: u64,
     ) -> Result<VerifiedProjectExecutionSource> {
+        let mut verified = self.verify_execution_observation_source(handoff, now_ms)?;
+        let (_, proof, _, _) = original_dispatch(handoff)?;
+        if let Some(parent) = verified.sdk_parent_admission(handoff, now_ms)? {
+            let origin = handoff
+                .sdk_origin
+                .as_ref()
+                .ok_or(AuthorizationError::InvalidProof("missing SDK origin"))?;
+            let invocation = &proof.invocation.payload;
+            let Actor::Service(service) = &invocation.actor else {
+                return Err(AuthorizationError::InvalidProof(
+                    "SDK origin has no Service child",
+                ));
+            };
+            let session =
+                invocation
+                    .context
+                    .sdk_session
+                    .as_ref()
+                    .ok_or(AuthorizationError::InvalidProof(
+                        "SDK origin has no session",
+                    ))?;
+            require(
+                session.target == invocation.device
+                    && session.session_id == origin.sdk_trigger.as_str()
+                    && proof.source_body["parent_invocation"].as_str()
+                        == Some(origin.invocation.hash()?.as_str())
+                    && proof.source_body["sdk_session"]
+                        == serde_json::to_value(session).map_err(invalid_shape)?
+                    && proof.transport.clone().into_evidence()
+                        == TransportEvidence::LocalAgentAdapter {
+                            service: service.clone(),
+                            session: session.clone(),
+                        },
+                "SDK checkpoint changed its Account source or adapter session",
+            )?;
+            let parent_value = &origin.invocation.payload;
+            let parent_facts = RequestFacts {
+                resource: parent_value.resource.clone(),
+                action: parent_value.action,
+                audience: parent_value.audience.clone(),
+                operation_id: parent_value.operation_id.clone(),
+                body_hash: parent_value.body_hash.clone(),
+                context: parent_value.context.clone(),
+            };
+            let parent = self.verify_operation_authorization(
+                &parent,
+                &parent_facts,
+                &origin.transport.clone().into_evidence(),
+                now_ms,
+            )?;
+            let child_facts = RequestFacts {
+                resource: invocation.resource.clone(),
+                action: invocation.action,
+                audience: invocation.audience.clone(),
+                operation_id: invocation.operation_id.clone(),
+                body_hash: invocation.body_hash.clone(),
+                context: invocation.context.clone(),
+            };
+            let delegation = self.verify_service_delegation(
+                &parent,
+                service,
+                &invocation.grant_leaf,
+                &child_facts,
+                now_ms,
+            )?;
+            require(
+                delegation.device() == &invocation.device
+                    && delegation.initiator() == &invocation.initiator
+                    && delegation.initiating_grant() == invocation.initiating_grant.as_ref(),
+                "SDK checkpoint changed its current delegation",
+            )?;
+            verified.usage.record_authorization(&parent)?;
+        }
+        Ok(verified)
+    }
+
+    pub fn verify_execution_observation_source(
+        &self,
+        handoff: &ExecutionHandoff,
+        now_ms: u64,
+    ) -> Result<VerifiedProjectExecutionSource> {
         let mut capsule_usage = ExecutionProofUsage::default();
         capsule_usage.record_capsule(handoff)?;
         capsule_usage.enforce_limits()?;
@@ -698,82 +779,22 @@ impl VerifiedPolicySet {
         let mut usage = ExecutionProofUsage::default();
         usage.record_budget(&source_budget)?;
         usage.record_signed(signed)?;
+        let EventCause::Invocation {
+            admission: task_admission,
+        } = &task.event().cause
+        else {
+            return Err(AuthorizationError::InvalidProof(
+                "Task source has no admission",
+            ));
+        };
+        usage.record_event_signature(&handoff.task_creation, task.event(), task_admission)?;
+        usage.record_event_signature(&handoff.project_dispatch, &dispatch, &proof)?;
+        usage.record_binding(&binding)?;
         let mut verified = VerifiedProjectExecutionSource {
             capsule_hash: statement.capsule_hash,
             usage,
         };
         verified.original_admission(handoff, now_ms)?;
-        if let Some(parent) = verified.sdk_parent_admission(handoff, now_ms)? {
-            let origin = handoff
-                .sdk_origin
-                .as_ref()
-                .ok_or(AuthorizationError::InvalidProof("missing SDK origin"))?;
-            let invocation = &proof.invocation.payload;
-            let Actor::Service(service) = &invocation.actor else {
-                return Err(AuthorizationError::InvalidProof(
-                    "SDK origin has no Service child",
-                ));
-            };
-            let session =
-                invocation
-                    .context
-                    .sdk_session
-                    .as_ref()
-                    .ok_or(AuthorizationError::InvalidProof(
-                        "SDK origin has no session",
-                    ))?;
-            require(
-                session.target == invocation.device
-                    && session.session_id == origin.sdk_trigger.as_str()
-                    && proof.source_body["parent_invocation"].as_str()
-                        == Some(origin.invocation.hash()?.as_str())
-                    && proof.source_body["sdk_session"]
-                        == serde_json::to_value(session).map_err(invalid_shape)?
-                    && proof.transport.clone().into_evidence()
-                        == TransportEvidence::LocalAgentAdapter {
-                            service: service.clone(),
-                            session: session.clone(),
-                        },
-                "SDK checkpoint changed its Account source or adapter session",
-            )?;
-            let parent_value = &origin.invocation.payload;
-            let parent_facts = RequestFacts {
-                resource: parent_value.resource.clone(),
-                action: parent_value.action,
-                audience: parent_value.audience.clone(),
-                operation_id: parent_value.operation_id.clone(),
-                body_hash: parent_value.body_hash.clone(),
-                context: parent_value.context.clone(),
-            };
-            let parent = self.verify_operation_authorization(
-                &parent,
-                &parent_facts,
-                &origin.transport.clone().into_evidence(),
-                now_ms,
-            )?;
-            let child_facts = RequestFacts {
-                resource: invocation.resource.clone(),
-                action: invocation.action,
-                audience: invocation.audience.clone(),
-                operation_id: invocation.operation_id.clone(),
-                body_hash: invocation.body_hash.clone(),
-                context: invocation.context.clone(),
-            };
-            let delegation = self.verify_service_delegation(
-                &parent,
-                service,
-                &invocation.grant_leaf,
-                &child_facts,
-                now_ms,
-            )?;
-            require(
-                delegation.device() == &invocation.device
-                    && delegation.initiator() == &invocation.initiator
-                    && delegation.initiating_grant() == invocation.initiating_grant.as_ref(),
-                "SDK checkpoint changed its current delegation",
-            )?;
-            verified.usage.record_authorization(&parent)?;
-        }
         Ok(verified)
     }
 
@@ -1520,6 +1541,41 @@ impl VerifiedExecutionResolution {
 pub struct VerifiedExecutionResolutionAdmission {
     resolution_hash: ObjectHash,
     submission: VerifiedAdmission,
+    usage: ExecutionProofUsage,
+}
+
+pub fn verify_execution_resolution_admission_checkpoint(
+    result: &ExecutionHandoffResolutionResult,
+    freshness: &ExecutionHandoffResolutionFreshness,
+    transport: &StoredTransport,
+    resolved_at_ms: u64,
+) -> Result<VerifiedExecutionResolutionAdmission> {
+    verify_execution_resolution_receipt_signature(result)?;
+    let invocation = &result.resolution.invocation.payload;
+    require(
+        result.freshness == *freshness
+            && result.receipt.payload.issued_at_ms == resolved_at_ms
+            && invocation.not_before_ms <= resolved_at_ms
+            && resolved_at_ms < invocation.expires_at_ms
+            && transport.clone().into_evidence()
+                == TransportEvidence::VerifiedPeer {
+                    origin: invocation.device.clone(),
+                },
+        "executor resolution checkpoint changed",
+    )?;
+    let mut usage = ExecutionProofUsage::default();
+    usage.record_signed(&result.receipt)?;
+    usage.record_signed(&result.handoff_receipt)?;
+    usage.record_metadata(freshness)?;
+    usage.record_metadata(transport)?;
+    Ok(VerifiedExecutionResolutionAdmission {
+        resolution_hash: result.resolution.hash()?,
+        submission: VerifiedAdmission {
+            invocation: result.resolution.invocation.clone(),
+            admitted_at_ms: resolved_at_ms,
+        },
+        usage,
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1650,6 +1706,62 @@ pub fn verify_execution_resolution_receipt_signature(
 }
 
 impl VerifiedPolicySet {
+    pub fn verify_execution_resolution_account_checkpoint(
+        &self,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<VerifiedAuthorization> {
+        let proof = &wire.resolution.account_admission;
+        let source = &proof.invocation.payload;
+        let project = self
+            .resource(&source.resource.space, &source.resource.resource)
+            .ok_or(AuthorizationError::InvalidProof(
+                "missing resolution source Project",
+            ))?;
+        let certificate = self.find_device(&source.audience.device)?;
+        require(
+            project.payload.kind == ResourceKind::Project
+                && project.payload.host == source.audience.service
+                && certificate.payload.subject == Actor::Service(project.payload.host.clone())
+                && certificate
+                    .payload
+                    .uses
+                    .contains(&DeviceUse::ServiceInvocation)
+                && wire.invocation.issuer == certificate.payload.public_key
+                && wire.invocation.payload.actor == certificate.payload.subject
+                && wire.invocation.payload.device == certificate.payload.device
+                && wire.invocation.payload.presenter == certificate.payload.device
+                && wire.invocation.payload.action == Action::ExecutionResolve
+                && wire.invocation.payload.body_hash == ObjectHash::body(&wire.resolution)?
+                && matches!(transport, TransportEvidence::VerifiedPeer { origin } if origin == &certificate.payload.device),
+            "resolution admission checkpoint is not from its actual current Project host",
+        )?;
+        let mut budget = Budget::default();
+        self.validate_certificate(
+            certificate,
+            now_ms,
+            &mut budget,
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+        )?;
+        budget.verify(project)?;
+        budget.verify(&wire.invocation)?;
+        let facts = execution_resolution_account_facts(&wire.resolution)?;
+        let admitted = attested_admission(
+            &proof.invocation,
+            &proof.challenge,
+            proof.admitted_at_ms,
+            now_ms,
+        )?;
+        self.verify_operation_authorization(
+            &admitted,
+            &facts,
+            &proof.transport.clone().into_evidence(),
+            now_ms,
+        )
+    }
+
     pub fn verify_execution_resolution(
         &self,
         wire: &SignedExecutionHandoffResolution,
@@ -1754,13 +1866,16 @@ impl VerifiedPolicySet {
         let mut usage = ExecutionProofUsage::default();
         usage.record_authorization(resolver)?;
         usage.record_authorization(&submission)?;
-        usage.record_admission(&wire.resolution.account_admission)?;
+        usage.record_admission_kind(&wire.resolution.account_admission, true)?;
         usage.record_signed(&wire.resolution.observation.receipt)?;
         usage.record_signed(&wire.invocation)?;
         usage.record_metadata(
             &serde_json::json!({"version":wire.resolution.version,"purpose":wire.resolution.purpose,
             "result_hash":ObjectHash::body(&wire.resolution.observation.result)?}),
         )?;
+        if let Some(admitted) = admitted {
+            usage.merge(&admitted.usage);
+        }
         usage.enforce_limits()?;
         Ok(VerifiedExecutionResolution {
             wire: wire.clone(),
@@ -1858,6 +1973,7 @@ impl VerifiedPolicySet {
                 invocation: value.wire.invocation.clone(),
                 admitted_at_ms: now_ms,
             },
+            usage: ExecutionProofUsage::default(),
         })
     }
 
@@ -1874,12 +1990,16 @@ impl VerifiedPolicySet {
                     >= result.resolution.invocation.payload.not_before_ms,
             "resolution acknowledgement has an invalid clock",
         )?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_signed(&result.receipt)?;
+        usage.record_signed(&result.handoff_receipt)?;
         let admission = VerifiedExecutionResolutionAdmission {
             resolution_hash: result.resolution.hash()?,
             submission: VerifiedAdmission {
                 invocation: result.resolution.invocation.clone(),
                 admitted_at_ms: result.receipt.payload.issued_at_ms,
             },
+            usage,
         };
         self.verify_execution_resolution(
             &result.resolution,
@@ -1952,6 +2072,7 @@ pub struct ExecutionProofUsage {
     max_chain_depth: usize,
     historical_wrappers: BTreeMap<ObjectHash, usize>,
     task_payloads: BTreeMap<ObjectHash, usize>,
+    actual: Option<crate::signature_verification::SignatureVerificationCounts>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ExecutionProofCounts {
@@ -1962,8 +2083,15 @@ pub struct ExecutionProofCounts {
     pub historical_wrappers: usize,
     pub historical_wrapper_bytes: usize,
     pub task_payload_bytes: usize,
+    pub actual: Option<crate::signature_verification::SignatureVerificationCounts>,
 }
 impl ExecutionProofUsage {
+    pub fn record_actual_signature_counts(
+        &mut self,
+        counts: crate::signature_verification::SignatureVerificationCounts,
+    ) {
+        self.actual = Some(counts);
+    }
     pub fn merge(&mut self, other: &Self) {
         self.objects.extend(
             other
@@ -1997,7 +2125,7 @@ impl ExecutionProofUsage {
         self.max_chain_depth = self.max_chain_depth.max(auth.grant_path().len());
         Ok(())
     }
-    fn record_budget(&mut self, budget: &Budget) -> Result<()> {
+    pub(super) fn record_budget(&mut self, budget: &Budget) -> Result<()> {
         for (hash, size) in &budget.object_bytes {
             self.objects.insert(hash.clone(), *size);
         }
@@ -2130,6 +2258,14 @@ impl ExecutionProofUsage {
             ));
         };
         self.record_admission_kind(admission, true)?;
+        self.record_event_signature(envelope, &event, admission)
+    }
+    fn record_event_signature(
+        &mut self,
+        envelope: &SignedEvent,
+        event: &Event,
+        admission: &AdmissionProof,
+    ) -> Result<()> {
         let metadata = serde_json::json!({"hash":envelope.hash,"signature":envelope.signature,"version":event.version,
             "space_id":event.network_id,"scope_id":event.scope_id,"resource_id":event.resource_id,"author":event.author,
             "sequence":event.sequence,"previous":event.previous,"parents":event.parents,"created_at_ms":event.created_at_ms,
@@ -2216,6 +2352,7 @@ impl ExecutionProofUsage {
                 .map(|(_, size)| *size)
                 .sum(),
             task_payload_bytes: self.task_payloads.values().sum(),
+            actual: self.actual.clone(),
         }
     }
     pub fn enforce_limits(&self) -> Result<()> {
