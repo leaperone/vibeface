@@ -2,7 +2,7 @@ import type { PendingMessage, TranscriptMessage } from "../chat/types"
 import type {
   ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, OperationRecord,
   OperationRequest, OperateAction, PendingOperation, SessionRecord, TaskRecord,
-  PendingConversation, PendingTask, FollowupMode, HumanRequest, TaskBinding, SchedulerSnapshot, TaskControlRequest,
+  PendingConversation, PendingTask, FollowupMode, HumanRequest, TaskBinding, SchedulerSnapshot, TaskControlRequest, HumanQuestion,
 } from "./types"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
@@ -68,20 +68,26 @@ export function parseFollowupMode(value: unknown): FollowupMode {
 }
 function humanRequest(value: unknown): HumanRequest {
   const data = record(value)
-  return { request_id: typeof data.request_id === "string" ? text(data.request_id) : number(data.request_id), kind: text(data.kind), title: optionalText(data.title), text: text(data.text), choices: data.choices == null ? undefined : list(data.choices).map((item) => { const choice = record(item); if (!("response" in choice)) throw new Error("人工决定缺少回复内容。"); return { label: text(choice.label), response: choice.response } }) }
+  const questions: HumanQuestion[] | undefined = data.questions == null ? undefined : list(data.questions).map((item) => {
+    const question = record(item)
+    return { id: text(question.id), header: text(question.header), question: text(question.question), is_secret: question.is_secret == null ? undefined : flag(question.is_secret), options: question.options == null ? undefined : list(question.options).map((item) => { const option = record(item); return { label: text(option.label), description: optionalText(option.description) } }) }
+  })
+  if (questions?.some((question) => !question.id) || questions && new Set(questions.map((question) => question.id)).size !== questions.length) throw new Error("人工问题编号无效或重复。")
+  return { request_id: typeof data.request_id === "string" ? text(data.request_id) : number(data.request_id), kind: text(data.kind), title: optionalText(data.title), text: text(data.text), choices: data.choices == null ? undefined : list(data.choices).map((item) => { const choice = record(item); if (!("response" in choice)) throw new Error("人工决定缺少回复内容。"); return { label: text(choice.label), response: choice.response } }), questions }
 }
 function taskBinding(value: unknown): TaskBinding {
   const data = record(value)
-  return { target_node: text(data.target_node), session_id: text(data.session_id), operation_id: optionalText(data.operation_id), state: optionalText(data.state), capabilities: texts(data.capabilities), pending_requests: list(data.pending_requests).map(humanRequest), current_turn: optionalText(data.current_turn), latest_progress: optionalText(data.latest_progress), revision: number(data.revision) }
+  if (data.freshness != null && data.freshness !== "local_ledger" && data.freshness !== "cached" && data.freshness !== "unknown") throw new Error("未知的执行状态读取来源。")
+  return { target_node: text(data.target_node), session_id: text(data.session_id), operation_id: optionalText(data.operation_id), state: optionalText(data.state), capabilities: texts(data.capabilities), pending_requests: list(data.pending_requests).map(humanRequest), current_turn: optionalText(data.current_turn), latest_progress: optionalText(data.latest_progress), revision: number(data.revision), freshness: data.freshness ?? undefined, checked_at_ms: data.checked_at_ms == null ? undefined : number(data.checked_at_ms) }
 }
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities)
-  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), kind: text(job.kind), sequence: number(job.sequence), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), read_only: job.read_only == null ? undefined : flag(job.read_only), error: optionalText(job.error) } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined, write_frozen: data.write_frozen == null ? undefined : flag(data.write_frozen) }
+  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), kind: text(job.kind), sequence: number(job.sequence), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), read_only: job.read_only == null ? undefined : flag(job.read_only), error: optionalText(job.error), delivery_error: optionalText(job.delivery_error) } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined, write_frozen: data.write_frozen == null ? undefined : flag(data.write_frozen) }
 }
 function task(value: unknown): TaskRecord {
   const data = record(value)
-  return { task_id: text(data.task_id), title: text(data.title), goal: text(data.goal), acceptance: text(data.acceptance), detail: text(data.detail), status: text(data.status), followup_mode: data.followup_mode == null ? undefined : parseFollowupMode(data.followup_mode), followup_version: data.followup_version == null ? undefined : number(data.followup_version), followup_scheduler_node: optionalText(data.followup_scheduler_node), binding: data.binding == null ? undefined : taskBinding(data.binding), blobs: blobReferences(data.blobs) }
+  return { task_id: text(data.task_id), title: text(data.title), goal: text(data.goal), acceptance: text(data.acceptance), detail: text(data.detail), status: text(data.status), followup_mode: data.followup_mode == null ? undefined : parseFollowupMode(data.followup_mode), followup_version: data.followup_version == null ? undefined : number(data.followup_version), followup_scheduler_node: optionalText(data.followup_scheduler_node), binding: data.binding == null ? undefined : taskBinding(data.binding), blobs: blobReferences(data.blobs), followup_error: optionalText(data.followup_error), binding_error: optionalText(data.binding_error) }
 }
 export function parseSession(value: unknown): SessionRecord {
   const data = record(value)

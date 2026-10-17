@@ -20,10 +20,13 @@ export type TaskRecord = {
   followup_version?: number
   followup_scheduler_node?: string
   blobs?: { hash: string; size: number }[]
+  followup_error?: string
+  binding_error?: string
   binding?: TaskBinding
 }
 export type FollowupMode = "off" | "report" | "continue"
-export type HumanRequest = { request_id: string | number; kind: string; title?: string; text: string; choices?: { label: string; response: unknown }[] }
+export type HumanQuestion = { id: string; header: string; question: string; options?: { label: string; description?: string }[]; is_secret?: boolean }
+export type HumanRequest = { request_id: string | number; kind: string; title?: string; text: string; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] }
 export type TaskBinding = {
   target_node: string
   session_id: string
@@ -34,6 +37,8 @@ export type TaskBinding = {
   current_turn?: string
   latest_progress?: string
   revision: number
+  freshness?: "local_ledger" | "cached" | "unknown"
+  checked_at_ms?: number
 }
 export type ManagerJob = {
   trigger: string
@@ -44,6 +49,7 @@ export type ManagerJob = {
   reply_message_id?: string
   read_only?: boolean
   error?: string
+  delivery_error?: string
 }
 export type SchedulerSnapshot = {
   jobs: ManagerJob[]

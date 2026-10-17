@@ -26,6 +26,7 @@ export function ManagerStatus({ job, progress, hasLiveProgress }: { job: Manager
         {job.read_only ? <span className="text-xs text-muted-foreground">只读交谈</span> : null}
       </div>
       {job.error ? <p className="whitespace-pre-wrap break-words text-sm">{job.error}</p> : null}
+      {job.delivery_error ? <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">投递提示：{job.delivery_error}</p> : null}
       {progress ? <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">{progress}</p> : null}
       {job.state === 'running' && !hasLiveProgress ? <p className="text-sm text-muted-foreground">当前只取得持久状态，尚未取得这轮实时片段；最终结果会在此显示。</p> : null}
       {canStop ? <>

@@ -68,6 +68,12 @@ test("queue, task authorization, requests and result references parse as explici
   assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], sequence: -1 }] } }))
   assert.throws(() => parseConversation({ ...context, tasks: [{ ...task, followup_mode: "approve_everything" }] }))
   assert.throws(() => parseConversation({ ...context, tasks: [{ ...task, binding: { ...task.binding, capabilities: undefined } }] }))
+  assert.equal(parseConversation({ ...context, tasks: [{ ...task, binding: { ...task.binding, freshness: "cached", checked_at_ms: 100 } }] }).tasks[0].binding?.freshness, "cached")
+  assert.throws(() => parseConversation({ ...context, tasks: [{ ...task, binding: { ...task.binding, freshness: "live_because_online" } }] }))
+  const input = { request_id: "input", kind: "input", text: "请补充需求", questions: [{ id: "scope", header: "范围", question: "选择本次操作范围", options: [{ label: "当前目录", description: "仅处理当前目录" }] }] }
+  const inputTask = { ...task, binding: { ...task.binding, pending_requests: [input] } }
+  assert.equal(parseConversation({ ...context, tasks: [inputTask] }).tasks[0].binding?.pending_requests[0].questions?.[0].options?.[0].label, "当前目录")
+  assert.throws(() => parseConversation({ ...context, tasks: [{ ...inputTask, binding: { ...inputTask.binding, pending_requests: [{ ...input, questions: [...input.questions, ...input.questions] }] } }] }))
 })
 test("artifact pages stay bound to their original reference and advance without skipping the end", () => {
   const page = { blob_hash: "result", text: "first", offset: 0, next_offset: 5, size: 10 }

@@ -23,7 +23,7 @@ export function ConversationScreen() {
   const jobs = data?.scheduler?.jobs ?? []
   const activeJobs = jobs.filter((job) => ['delivery_pending', 'queued', 'claimed', 'running', 'cancelling', 'unknown'].includes(job.state))
   const visibleJobs = activeJobs.length ? activeJobs : jobs.slice(-1)
-  const liveMessages = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (['completed', 'failed', 'cancelled', 'unknown', 'rejected'].includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id)))).map((progress) => ({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0 }))
+  const liveMessages = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (['completed', 'failed', 'cancelled', 'unknown', 'rejected'].includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id)))).map((progress) => ({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.needsRefresh ? `实时片段不完整，等待最终结果。\n\n${progress.text}` : progress.text, created_at_ms: 0 }))
   const messages = [...(data?.messages ?? []), ...liveMessages]
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const sendDisabled = !workspace.writable || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })

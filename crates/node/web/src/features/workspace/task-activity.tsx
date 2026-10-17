@@ -29,7 +29,7 @@ export function TaskActivity({ task, conversationId }: { task: TaskRecord; conve
   const hasFollowupVersion = task.followup_version !== undefined
   const targetOnline = workspace.nodes.some((node) => node.node_id === binding?.target_node && node.online && !node.revoked)
   const pendingControls = workspace.pending.filter((operation) => operation.control?.task_id === task.task_id || (binding && operation.target_node === binding.target_node && operation.session_id === binding.session_id))
-  const canControl = workspace.writable && targetOnline && Boolean(binding?.operation_id) && binding?.state !== "unknown" && pendingControls.length === 0
+  const canControl = workspace.writable && targetOnline && Boolean(binding?.operation_id) && binding?.state !== "unknown" && binding?.freshness !== "unknown" && pendingControls.length === 0
 
   return (
     <Card>
@@ -39,12 +39,15 @@ export function TaskActivity({ task, conversationId }: { task: TaskRecord; conve
       </CardHeader>
       <CardContent className="space-y-3">
         {task.detail ? <p className="line-clamp-3 whitespace-pre-line break-words text-sm text-muted-foreground">{task.detail}</p> : null}
+        {task.binding_error ? <p role="status" className="text-sm">执行状态待核对：{task.binding_error}</p> : null}
+        {task.followup_error ? <p role="status" className="text-sm">后续授权待核对：{task.followup_error}</p> : null}
         {binding ? (
           <section className="space-y-3 rounded-lg border p-3" aria-label="后台执行">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h3 className="text-sm font-medium">后台执行 · {nodeName(binding.target_node)}</h3>
               <StatusBadge value={binding.state} />
             </div>
+            <p className="text-xs text-muted-foreground">{binding.freshness === "cached" ? "上次读取的执行状态" : binding.freshness === "local_ledger" ? "本机账本状态" : "尚未取得当前执行状态"}{binding.checked_at_ms ? ` · ${new Date(binding.checked_at_ms).toLocaleString('zh-CN')}` : ''}</p>
             {binding.latest_progress ? <p className="whitespace-pre-line break-words text-sm">{binding.latest_progress}</p> : null}
             {!targetOnline ? <p role="status" className="text-sm text-muted-foreground">当前只能看到已同步进展；执行设备恢复连接后才能核对实时状态。</p> : null}
             {binding.state === "unknown" ? <p role="status" className="text-sm">执行结果未知，请核对当前进程与外部结果，避免重复执行。</p> : null}
@@ -190,6 +193,8 @@ function TaskPendingControl({ operation }: { operation: PendingOperation }) {
 function TaskApproval({ task, request, canRespond, disabled }: { task: TaskRecord; request: NonNullable<TaskRecord["binding"]>["pending_requests"][number]; canRespond: boolean; disabled: boolean }) {
   const workspace = useWorkspace()
   const [busy, setBusy] = useState(false)
+  const id = useId()
+  const questions = request.questions ?? []
   return (
     <section className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3" aria-label="人工审批">
       <h4 className="text-sm font-semibold">{request.title || "等待本人决定"}</h4>
@@ -205,7 +210,37 @@ function TaskApproval({ task, request, canRespond, disabled }: { task: TaskRecor
             }
           }}>{choice.label}</ActionButton>)}
         </div>
-      ) : <p className="text-sm text-muted-foreground">此请求暂无可用的回复选项，请查看请求详情并到执行设备人工核对。</p>}
+      ) : canRespond && questions.length > 0 && !questions.some((question) => question.is_secret) ? (
+        <form onSubmit={(event) => {
+          event.preventDefault()
+          const form = event.currentTarget
+          if (!form.reportValidity()) return
+          const values = new FormData(form)
+          setBusy(true)
+          void workspace.run(async () => {
+            const answers = Object.fromEntries(questions.map((question, index) => {
+              const answer = String(values.get(`answer-${index}`) ?? '').trim()
+              if (!answer) throw new Error('请回答每个问题后再提交。')
+              return [question.id, { answers: [answer] }]
+            }))
+            await workspace.taskControl(task.task_id, "respond_request", { request_id: request.request_id, response: { answers } })
+          }).finally(() => setBusy(false))
+        }}>
+          <fieldset disabled={disabled || busy || !workspace.writable} className="min-w-0">
+            <FieldGroup>
+              {questions.map((question, index) => <Field key={question.id}>
+                <FieldLabel htmlFor={`${id}-answer-${index}`}>{question.header || question.question}</FieldLabel>
+                {question.header ? <p className="text-sm">{question.question}</p> : null}
+                {question.options?.length ? <NativeSelect id={`${id}-answer-${index}`} name={`answer-${index}`} defaultValue="" required>
+                  <NativeSelectOption value="" disabled>请选择</NativeSelectOption>
+                  {question.options.map((option) => <NativeSelectOption key={option.label} value={option.label}>{option.label}{option.description ? ` · ${option.description}` : ''}</NativeSelectOption>)}
+                </NativeSelect> : <Textarea id={`${id}-answer-${index}`} name={`answer-${index}`} rows={2} required maxLength={50000} />}
+              </Field>)}
+              <SubmitButton busy={busy} variant="secondary">发送本人回答</SubmitButton>
+            </FieldGroup>
+          </fieldset>
+        </form>
+      ) : <p className="text-sm text-muted-foreground">{questions.some((question) => question.is_secret) ? '此请求包含敏感输入，请在执行设备填写；答案不会保存到浏览器待核对记录。' : '此请求暂无可用的回复选项，请查看请求详情并到执行设备人工核对。'}</p>}
       <RawDetails title="查看请求详情" value={request} />
     </section>
   )
