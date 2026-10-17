@@ -2232,7 +2232,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vibeface-bridge"
-version = "0.0.1-nightly.20261017.1"
+version = "0.1.0-nightly.20261017.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2246,11 +2246,11 @@ dependencies = [
 
 [[package]]
 name = "vibeface-node"
-version = "0.0.1-nightly.20261017.1"
+version = "0.1.0-nightly.20261017.1"
 dependencies = [
  "anyhow",
- "argon2",
  "axum",
+ "base64 0.22.1",
  "clap",
  "ed25519-dalek",
  "flate2",
@@ -2274,11 +2274,12 @@ dependencies = [
  "vibeface-bridge",
  "vibeface-protocol",
  "vibeface-secure",
+ "zeroize",
 ]
 
 [[package]]
 name = "vibeface-protocol"
-version = "0.0.1-nightly.20261017.1"
+version = "0.1.0-nightly.20261017.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2286,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-secure"
-version = "0.0.1-nightly.20261017.1"
+version = "0.1.0-nightly.20261017.1"
 dependencies = [
  "argon2",
  "chacha20poly1305",

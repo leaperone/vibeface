@@ -1,6 +1,5 @@
 //! Personal node runtime, with role-independent replication and execution adapters.
 pub mod api;
-pub mod auth;
 pub mod binding;
 pub mod client;
 pub mod config;

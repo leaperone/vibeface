@@ -20,6 +20,8 @@ pub struct Config {
     pub roles: Vec<NodeRole>,
     pub roots: Vec<PathBuf>,
     pub peers: Vec<PeerConfig>,
+    #[serde(default)]
+    pub network: crate::network::NetworkConfig,
     pub manager: Option<ManagerSettings>,
     pub codex_socket: Option<PathBuf>,
     pub codex_bin: PathBuf,
@@ -60,6 +62,7 @@ impl Config {
             ],
             roots,
             peers: vec![],
+            network: crate::network::NetworkConfig::default(),
             manager: None,
             codex_socket: None,
             codex_bin: "codex".into(),
