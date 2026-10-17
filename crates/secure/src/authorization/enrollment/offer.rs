@@ -35,6 +35,10 @@ pub struct VerifiedEnrollmentOffer {
     account_head: PolicyStamp,
 }
 
+pub fn enrollment_offer_hash(offer: &Signed<EnrollmentOffer>) -> Result<ObjectHash> {
+    offer.hash()
+}
+
 fn account_entry(entry: &JournalEntry, account: &AccountId) -> bool {
     match entry {
         JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
@@ -238,6 +242,12 @@ pub fn verify_device_enrollment_offer(
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedEnrollmentOffer {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = offerHash))]
+    pub fn offer_hash(&self) -> crate::Result<String> {
+        enrollment_offer_hash(&self.signed)
+            .map(|hash| hash.to_string())
+            .map_err(|error| error.to_string())
+    }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = pinsJson))]
     pub fn pins_json(&self) -> crate::Result<String> {
         encode(&self.signed.payload.pins)
