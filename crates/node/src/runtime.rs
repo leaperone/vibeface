@@ -2090,11 +2090,7 @@ impl Runtime {
     ) -> Result<Access> {
         let space = SpaceId::parse(field(&body, "space_id")?)?;
         let audience = self.audience()?;
-        ensure!(
-            !self.is_execution_metadata(&body)?
-                || matches!(invocation.payload.actor, Actor::Account(_)),
-            "Project execution metadata requires an account actor"
-        );
+        self.check_execution_metadata_actor(&body, &invocation.payload)?;
         let authorization = {
             let store = self.store.lock().await;
             let raw = vibeface_secure::authorization::RequestFacts {
@@ -2780,10 +2776,10 @@ impl Runtime {
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         access.require_body(&input)?;
-        ensure!(
-            !self.is_execution_metadata(&input)? || access.account_actor(),
-            "Project execution metadata requires an account actor"
-        );
+        self.check_execution_metadata_actor(
+            &input,
+            &access.authorization.signed_invocation().payload,
+        )?;
         let network = &access.network_id;
         {
             let store = self.store.lock().await;
@@ -3384,6 +3380,11 @@ impl Runtime {
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         ensure!(args.is_object(), "tool arguments must be an object");
+        let execution_args = matches!(
+            name,
+            "bind_execution" | "open_execution" | "send_execution" | "execution_status"
+        )
+        .then(|| args.clone());
         self.store.lock().await.manager_tool_authorization(
             session.space_id.as_str(),
             &format!("manager:{}", session.sdk_session.session_id),
@@ -3462,6 +3463,10 @@ impl Runtime {
         if body.get("authorization_id").is_none() {
             body["authorization_id"] = json!(call_id);
         }
+        if let Some(args) = execution_args {
+            self.prepare_execution_tool_body(&session, name, &args, &mut body)
+                .await?;
+        }
         let body = self.normalize_request_body(&session.space_id, body).await?;
         let access = self.authorize_agent(&session, body.clone()).await?;
         let body = access.body.clone();
@@ -3508,7 +3513,7 @@ impl Runtime {
                     }
                 };
             }
-            let facts = store.request_facts(&body, &self.audience()?)?;
+            let facts = self.authorization_facts(&store, &body, &self.audience()?, now)?;
             (session, facts)
         };
         let identity = vibeface_secure::Identity::from_secret_hex(&self.identity.secret_key_hex)

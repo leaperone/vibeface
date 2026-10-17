@@ -550,8 +550,8 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
         ),
         (
             "execution_status",
-            "Read actual status from the execution Node; this does not send a task or approve anything.",
-            json!({"target_node":string(),"session_id":string()}),
+            "Read actual status without sending a task or approving anything. For a remote Node, supply operation_id from its original Project dispatch.",
+            json!({"target_node":string(),"session_id":string(),"operation_id":string()}),
             vec!["target_node", "session_id"],
         ),
         (
@@ -561,11 +561,20 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
             vec!["task_id", "status", "detail"],
         ),
     ];
-    specs.into_iter().map(|(name, description, properties, required)| (name.into(), CustomToolConfig {
+    specs.into_iter().map(|(name, description, mut properties, required)| {
+        if matches!(name, "bind_execution" | "open_execution" | "send_execution") {
+            properties["execution_resource"] = json!({"type":"object","properties":{"space":string(),"resource":string()},"required":["space","resource"],"additionalProperties":false,"description":"Required for a remote Node: the explicitly authorized execution resource."});
+            properties["target_public_key"] = json!({"type":"string","minLength":1,"description":"Required for a remote Node: its independently verified public key."});
+            properties["execution_grant"] = json!({"type":"string","minLength":1,"description":"Required for a remote Node: select an existing authorized execution grant ID."});
+        }
+        if name == "send_execution" {
+            properties["prior_operation_id"] = json!({"type":"string","minLength":1,"description":"Required for a remote Node: the original known terminal operation for this exact task binding and session. Unknown outcomes require reconciliation."});
+        }
+        (name.into(), CustomToolConfig {
         description: Some(description.into()),
         input_schema: json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
         output_schema: None,
-    })).collect()
+    })}).collect()
 }
 
 fn utc_day(seconds: u64) -> String {

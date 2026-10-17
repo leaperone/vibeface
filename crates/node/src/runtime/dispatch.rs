@@ -29,6 +29,32 @@ impl Runtime {
             .is_some_and(|target| target != local))
     }
 
+    pub(super) fn check_execution_metadata_actor(
+        &self,
+        body: &Value,
+        invocation: &Invocation,
+    ) -> Result<()> {
+        if !self.is_execution_metadata(body)? {
+            return Ok(());
+        }
+        match invocation.actor {
+            Actor::Account(_) => ensure!(
+                invocation.context.sdk_session.is_none()
+                    && body["sdk_session"].is_null()
+                    && body["parent_invocation"].is_null(),
+                "account metadata cannot claim an SDK session"
+            ),
+            Actor::Service(_) => ensure!(
+                invocation.context.sdk_session.is_some()
+                    && serde_json::to_value(&invocation.context.sdk_session)?
+                        == body["sdk_session"]
+                    && body["parent_invocation"].as_str().is_some(),
+                "service metadata requires its actual admitted SDK session and parent"
+            ),
+        }
+        Ok(())
+    }
+
     pub(super) fn is_execution_dispatch(&self, body: &Value) -> Result<bool> {
         let selected = ["execution_resource", "target_public_key", "execution_grant"];
         let target = match body["method"].as_str() {
@@ -64,6 +90,10 @@ impl Runtime {
             if let Some(facts) = store.execution_dispatch_metadata_facts(body, audience, now)? {
                 return Ok(facts);
             }
+            ensure!(
+                body["sdk_session"].is_null(),
+                "SDK metadata requires its original durable Project dispatch"
+            );
             store.request_facts(body, audience)
         } else if self.is_execution_dispatch(body)? {
             Ok(store
@@ -73,6 +103,207 @@ impl Runtime {
         } else {
             store.request_facts(body, audience)
         }
+    }
+
+    pub(super) async fn prepare_execution_tool_body(
+        &self,
+        session: &AgentSession,
+        tool: &str,
+        args: &Value,
+        body: &mut Value,
+    ) -> Result<()> {
+        ensure!(
+            [
+                "execution_session_receipt",
+                "execution_source",
+                "binding",
+                "native_session_id"
+            ]
+            .iter()
+            .all(|field| args.get(*field).is_none()),
+            "execution tools accept stored authorization identifiers, not session receipts or native handles"
+        );
+        let target = if body["method"] == "operate" {
+            field(&body["request"], "target_node")?
+        } else {
+            field(body, "target_node")?
+        }
+        .to_owned();
+        let selected = ["execution_resource", "target_public_key", "execution_grant"];
+        if target == self.identity.node_id()? {
+            ensure!(
+                selected.iter().all(|field| args.get(*field).is_none())
+                    && args.get("prior_operation_id").is_none(),
+                "local execution tools cannot select a remote destination or prior remote operation"
+            );
+            return Ok(());
+        }
+        if tool == "execution_status" {
+            let operation_id = id(args, "operation_id")?;
+            let store = self.store.lock().await;
+            let operation = store
+                .operation(session.space_id.as_str(), &operation_id)?
+                .context("remote status requires a known original Project operation ID")?;
+            self.check_execution_tool_operation(
+                &store,
+                session,
+                &operation,
+                &target,
+                field(body, "session_id")?,
+                None,
+            )?;
+            let wire = store
+                .execution_dispatch_handoff(session.space_id.as_str(), &operation_id)?
+                .context("remote status requires the original durable execution handoff")?;
+            let binding = operation
+                .request
+                .binding
+                .as_ref()
+                .context("remote operation has no signed task binding")?;
+            body["operation_id"] = json!(operation_id);
+            body["execution_source"] = serde_json::to_value(
+                wire.handoff
+                    .source_attestation
+                    .context("remote operation has no signed Project source")?,
+            )?;
+            body["binding"] = serde_json::to_value(binding)?;
+            body["task_id"] = json!(operation.request.task_id);
+            body["task_ref"] = json!(binding.binding.task_ref);
+            return Ok(());
+        }
+        for field in selected {
+            body[field] = args
+                .get(field)
+                .with_context(|| format!("remote execution requires the authorized {field}"))?
+                .clone();
+        }
+        if tool != "send_execution" {
+            return Ok(());
+        }
+        let prior_id = id(args, "prior_operation_id")?;
+        let request: OperationRequest = serde_json::from_value(body["request"].clone())?;
+        let (wire, binding, prior_state) = {
+            let store = self.store.lock().await;
+            let operation = store
+                .operation(session.space_id.as_str(), &prior_id)?
+                .context("remote send requires a known original prior operation ID")?;
+            self.check_execution_tool_operation(
+                &store,
+                session,
+                &operation,
+                &target,
+                &request.session_id,
+                request.task_id.as_deref(),
+            )?;
+            ensure!(
+                operation.state.terminal(),
+                "reconcile the original remote operation before sending another task"
+            );
+            let task = request
+                .task_id
+                .as_deref()
+                .context("remote send requires its original task")?;
+            let creation =
+                store.task_creation(session.space_id.as_str(), &session.conversation_id, task)?;
+            let binding = store
+                .task_binding(session.space_id.as_str(), &creation.hash)?
+                .context("remote send requires its confirmed signed task binding")?;
+            ensure!(
+                operation.request.binding.as_ref() == Some(&binding),
+                "prior operation belongs to another task binding generation"
+            );
+            let wire = store
+                .execution_dispatch_handoff(session.space_id.as_str(), &prior_id)?
+                .context("prior operation has no durable execution handoff")?;
+            ensure!(
+                serde_json::to_value(&wire.handoff.execution_resource)?
+                    == body["execution_resource"]
+                    && serde_json::to_value(&wire.handoff.target_public_key)?
+                        == body["target_public_key"],
+                "remote send changed the prior operation's executor resource or public key"
+            );
+            (wire, binding, operation.state)
+        };
+        let actual = self
+            .request_execution_dispatch(session.space_id.as_str(), &target, &wire, false)
+            .await?;
+        ensure!(
+            serde_json::to_value(actual.receipt.payload.state)?
+                == serde_json::to_value(prior_state)?,
+            "executor status differs from the original terminal operation"
+        );
+        let project = ResourceRef {
+            space: session.space_id.clone(),
+            resource: session.resource_id.clone(),
+        };
+        let snapshot =
+            vibeface_secure::authorization::execution_handoff::verify_execution_session_snapshot(
+                &actual.receipt,
+                &project,
+                &wire.handoff.execution_resource,
+                &wire.handoff.target_public_key,
+                &binding,
+                &PublicKey::parse(&self.identity.public_key_hex()?)?,
+                now_ms() as u64,
+            )?;
+        ensure!(
+            !matches!(
+                snapshot.state.as_str(),
+                "unknown" | "closed" | "opening" | "resolved"
+            ),
+            "remote session is unresolved or closed; confirm a new binding and session before sending"
+        );
+        ensure!(
+            snapshot.revision == request.expected_revision,
+            "remote session revision changed; read its actual status before sending"
+        );
+        body["execution_session_receipt"] = serde_json::to_value(actual.receipt)?;
+        Ok(())
+    }
+
+    fn check_execution_tool_operation(
+        &self,
+        store: &Store,
+        session: &AgentSession,
+        operation: &OperationRecord,
+        target: &str,
+        execution_session: &str,
+        task: Option<&str>,
+    ) -> Result<()> {
+        let request = &operation.request;
+        let original =
+            store.operation_admission_proof(session.space_id.as_str(), &request.operation_id)?;
+        ensure!(
+            request.network_id == session.space_id.as_str()
+                && request.conversation_id == session.conversation_id
+                && request.target_node == target
+                && request.session_id == execution_session
+                && original.invocation.payload.resource.space == session.space_id
+                && original.invocation.payload.resource.resource == session.resource_id
+                && original.invocation.payload.initiator == session.initiator
+                && task.is_none_or(|task| request.task_id.as_deref() == Some(task)),
+            "remote operation belongs to another Project, task or execution session"
+        );
+        let origin = store.agent_origin(session, now_ms() as u64)?;
+        if let Some((task, reference)) = origin.task {
+            ensure!(
+                request.task_id.as_deref() == Some(task.as_str())
+                    && request
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.binding.task_ref == reference.as_str()),
+                "automatic continuation cannot inspect another task's remote operation"
+            );
+        }
+        if let Some(original) = origin.execution {
+            ensure!(
+                request.target_node == original.target_node
+                    && request.session_id == original.session_id
+                    && request.binding == original.binding,
+                "automatic continuation cannot inspect another execution binding or session"
+            );
+        }
+        Ok(())
     }
 
     pub(super) async fn normalize_execution_dispatch(&self, mut body: Value) -> Result<Value> {
