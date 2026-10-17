@@ -4680,16 +4680,16 @@ impl Runtime {
         Ok(json!({"sessions":sessions,"operations":records,"facts":facts}))
     }
     async fn handle_peer(self: &Arc<Self>, message: &Inbound) -> Result<Value> {
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
         let envelope = &message.payload;
         let kind = field(envelope, "type")?;
-        let certificate = self
-            .store
-            .lock()
-            .await
-            .authorize_transport_node(&message.origin, now_ms() as u64)?;
+        let certificate = {
+            let store = self.store.lock().await;
+            verification.run(|| store.authorize_transport_node(&message.origin, now_ms() as u64))?
+        };
         if matches!(kind, "execution_handoff_submit" | "execution_handoff_status" | "execution_handoff_receipts" | "execution_handoff_resolve" | "execution_handoff_resolution_receipts") {
             let origin = DeviceId::from_key(&PublicKey::parse(&certificate.public_key)?);
-            return self.handle_handoff_peer(message, origin).await;
+            return self.handle_handoff_peer(message, origin, &verification).await;
         }
         if kind == "freshness_receipt" {
             let challenge: FreshnessChallenge =

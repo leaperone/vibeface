@@ -6,6 +6,7 @@ use vibeface_secure::authorization::execution_handoff::{
     ExecutionHandoffTerminalReconciliationResult, ExecutionResolutionPurpose,
     SignedExecutionHandoff, SignedExecutionHandoffResolution,
 };
+use vibeface_secure::signature_verification::SignatureVerification;
 
 fn original(wire: &SignedExecutionHandoff) -> Result<(ResourceRef, String)> {
     let event: Event = serde_json::from_str(&wire.handoff.project_dispatch.canonical_body)?;
@@ -238,18 +239,21 @@ impl Runtime {
         &self,
         wire: &SignedExecutionHandoffResolution,
         transport: &TransportEvidence,
+        verification: &SignatureVerification,
     ) -> Result<ExecutionHandoffResolutionFreshness> {
         let (challenge, receipts) = {
             let mut store = self.store.lock().await;
-            let now = now_ms() as u64;
-            let challenge =
-                store.issue_execution_handoff_resolution_challenge(wire, transport, now)?;
-            let receipts = store.sign_execution_handoff_resolution_receipts(
-                &challenge,
-                &self.identity,
-                now,
-            )?;
-            (challenge, receipts)
+            verification.run(|| {
+                let now = now_ms() as u64;
+                let challenge =
+                    store.issue_execution_handoff_resolution_challenge(wire, transport, now)?;
+                let receipts = store.sign_execution_handoff_resolution_receipts(
+                    &challenge,
+                    &self.identity,
+                    now,
+                )?;
+                Ok::<_, anyhow::Error>((challenge, receipts))
+            })?
         };
         let (project, _) = original(&wire.resolution.observation.handoff)?;
         let receipts = self
@@ -271,6 +275,7 @@ impl Runtime {
         self: &Arc<Self>,
         message: &Inbound,
         origin: DeviceId,
+        verification: &SignatureVerification,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         let wire: SignedExecutionHandoffResolution =
@@ -285,47 +290,92 @@ impl Runtime {
                 && handoff.handoff.target_public_key.as_str() == self.identity.public_key_hex()?,
             "resolution reached another executor"
         );
-        let (project, operation) = original(handoff)?;
+        let (project, _) = original(handoff)?;
         ensure!(
             project.space.as_str() == message.network_id,
             "resolution route differs from its original Project"
         );
         let transport = TransportEvidence::VerifiedPeer { origin };
         let _resolution = self.handoff_resolution_lock.lock().await;
-        {
+        let completed = {
             let store = self.store.lock().await;
-            if let Some(result) =
-                store.execution_handoff_resolution_status(&wire, &transport, now_ms() as u64)?
-            {
-                return Ok(json!(result));
-            }
-            store.execution_handoff_resolution_authorization(&wire, &transport, now_ms() as u64)?;
+            verification.run(|| {
+                if let Some(result) =
+                    store.execution_handoff_resolution_status(&wire, &transport, now_ms() as u64)?
+                {
+                    return Ok(Some(result));
+                }
+                store.execution_handoff_resolution_authorization(
+                    &wire,
+                    &transport,
+                    now_ms() as u64,
+                )?;
+                Ok::<_, anyhow::Error>(None)
+            })?
+        };
+        if let Some(result) = completed {
+            return Ok(json!(result));
         }
         if wire.resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal {
-            let proof = self.handoff_resolution_freshness(&wire, &transport).await?;
+            let proof = self
+                .handoff_resolution_freshness(&wire, &transport, verification)
+                .await?;
             let store = self.store.lock().await;
-            let auth = store.execution_handoff_resolution_authorization(
-                &wire,
-                &transport,
-                now_ms() as u64,
-            )?;
-            return Ok(json!(
-                store.authorize_execution_handoff_terminal_reconciliation(
-                    &auth,
-                    &proof,
+            return verification.run(|| {
+                let auth = store.execution_handoff_resolution_authorization(
+                    &wire,
+                    &transport,
                     now_ms() as u64,
-                )?
-            ));
+                )?;
+                Ok(json!(
+                    store.authorize_execution_handoff_terminal_reconciliation(
+                        &auth,
+                        &proof,
+                        now_ms() as u64,
+                    )?
+                ))
+            });
         }
-        let proof = self.handoff_resolution_freshness(&wire, &transport).await?;
+        let proof = self
+            .handoff_resolution_freshness(&wire, &transport, verification)
+            .await?;
+        let stopped = self
+            .fence_execution_handoff_resolution(&wire, &transport, &proof, verification)
+            .await?;
+        let proof = self
+            .handoff_resolution_freshness(&wire, &transport, verification)
+            .await?;
+        let mut store = self.store.lock().await;
+        verification.run(|| {
+            Ok(json!(store.resolve_execution_handoff(
+                &self.identity,
+                &wire,
+                &proof,
+                &transport,
+                &stopped,
+                now_ms() as u64,
+            )?))
+        })
+    }
+
+    async fn fence_execution_handoff_resolution(
+        self: &Arc<Self>,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        proof: &ExecutionHandoffResolutionFreshness,
+        verification: &SignatureVerification,
+    ) -> Result<crate::engine::StoppedExecution> {
+        let (project, operation) = original(&wire.resolution.observation.handoff)?;
         {
             let store = self.store.lock().await;
-            let auth = store.execution_handoff_resolution_authorization(
-                &wire,
-                &transport,
-                now_ms() as u64,
-            )?;
-            store.authorize_execution_handoff_resolution_fence(&auth, &proof, now_ms() as u64)?;
+            verification.run(|| {
+                let auth = store.execution_handoff_resolution_authorization(
+                    wire,
+                    transport,
+                    now_ms() as u64,
+                )?;
+                store.authorize_execution_handoff_resolution_fence(&auth, proof, now_ms() as u64)
+            })?;
         }
         let context = ExecutionContext {
             space_id: project.space,
@@ -344,29 +394,25 @@ impl Runtime {
             affected,
             "execution stopped for an explicit unknown-result resolution",
             stopped.is_ok(),
+            Some(verification),
         )
         .await?;
         let (stopped, _) = stopped?;
         self.engine.complete_fenced_operation(&stopped).await?;
-        let proof = self.handoff_resolution_freshness(&wire, &transport).await?;
-        Ok(json!(self.store.lock().await.resolve_execution_handoff(
-            &self.identity,
-            &wire,
-            &proof,
-            &transport,
-            &stopped,
-            now_ms() as u64,
-        )?))
+        Ok(stopped)
     }
 
     pub(super) async fn handle_handoff_peer(
         self: &Arc<Self>,
         message: &Inbound,
         origin: DeviceId,
+        verification: &SignatureVerification,
     ) -> Result<Value> {
         let envelope = &message.payload;
         if envelope["type"] == "execution_handoff_resolve" {
-            return self.resolve_handoff_peer(message, origin).await;
+            return self
+                .resolve_handoff_peer(message, origin, verification)
+                .await;
         }
         if envelope["type"] == "execution_handoff_resolution_receipts" {
             let challenge: ExecutionHandoffResolutionChallenge =
@@ -466,13 +512,19 @@ impl Runtime {
         mut result: Value,
     ) -> Result<()> {
         let _completion = self.handoff_resolution_lock.lock().await;
-        let current = self.store.lock().await.execution_handoff_status(
-            &self.identity,
-            value.execution_context.execution_space_id.as_str(),
-            value.execution_context.space_id.as_str(),
-            &value.original_request.operation_id,
-            now_ms() as u64,
-        )?;
+        let verification = SignatureVerification::new();
+        let current = {
+            let store = self.store.lock().await;
+            verification.run(|| {
+                store.execution_handoff_status(
+                    &self.identity,
+                    value.execution_context.execution_space_id.as_str(),
+                    value.execution_context.space_id.as_str(),
+                    &value.original_request.operation_id,
+                    now_ms() as u64,
+                )
+            })?
+        };
         if current.state.terminal() || current.state == OperationState::Unknown {
             return Ok(());
         }
@@ -489,7 +541,7 @@ impl Runtime {
                 cleanup_affected = affected;
             }
         }
-        self.persist_handoff_result(&current, state.clone(), result)
+        self.persist_handoff_result(&current, state.clone(), result, &verification)
             .await?;
         if state == OperationState::Unknown {
             let mut affected = cleanup_affected;
@@ -503,6 +555,7 @@ impl Runtime {
                 affected,
                 "execution outcome requires reconciliation",
                 stopped.is_ok(),
+                Some(&verification),
             )
             .await?;
             stopped?;
@@ -515,29 +568,32 @@ impl Runtime {
         value: &AdmittedExecutionHandoff,
         state: OperationState,
         result: Value,
+        verification: &SignatureVerification,
     ) -> Result<()> {
         let project = ResourceRef {
             space: value.execution_context.space_id.clone(),
             resource: value.execution_context.resource_id.clone(),
         };
         let mut store = self.store.lock().await;
-        let session = store.execution_handoff_session(
-            value.execution_context.execution_space_id.as_str(),
-            &project,
-            &value.original_request.target_node,
-            &value.original_request.session_id,
-        )?;
-        store.finish_execution_handoff(
-            &self.identity,
-            value.execution_context.execution_space_id.as_str(),
-            project.space.as_str(),
-            &value.original_request.operation_id,
-            state,
-            result,
-            session.as_ref(),
-            now_ms() as u64,
-        )?;
-        Ok(())
+        verification.run(|| {
+            let session = store.execution_handoff_session(
+                value.execution_context.execution_space_id.as_str(),
+                &project,
+                &value.original_request.target_node,
+                &value.original_request.session_id,
+            )?;
+            store.finish_execution_handoff(
+                &self.identity,
+                value.execution_context.execution_space_id.as_str(),
+                project.space.as_str(),
+                &value.original_request.operation_id,
+                state,
+                result,
+                session.as_ref(),
+                now_ms() as u64,
+            )?;
+            Ok(())
+        })
     }
 
     async fn execute_handoff(self: Arc<Self>, accepted: AdmittedExecutionHandoff) -> Result<()> {
@@ -777,7 +833,7 @@ impl Runtime {
             affected.extend(operations.iter().cloned());
         }
         affected.push(context.operation_id.clone());
-        self.mark_fenced_operations(&context, affected, reason, stopped.is_ok())
+        self.mark_fenced_operations(&context, affected, reason, stopped.is_ok(), None)
             .await?;
         stopped.map(|_| ())
     }
@@ -788,7 +844,9 @@ impl Runtime {
         mut affected: Vec<String>,
         reason: &str,
         confirmed: bool,
+        verification: Option<&SignatureVerification>,
     ) -> Result<()> {
+        let verification = verification.cloned().unwrap_or_default();
         let project = ResourceRef {
             space: context.space_id.clone(),
             resource: context.resource_id.clone(),
@@ -796,24 +854,30 @@ impl Runtime {
         affected.sort();
         affected.dedup();
         for operation in affected {
-            let scope = self
-                .store
-                .lock()
-                .await
-                .find_execution_handoff_by_original(&project, &operation)?;
-            if let Some(scope) = scope {
-                let current = self.store.lock().await.execution_handoff_status(
-                    &self.identity,
-                    scope.execution_space_id.as_str(),
-                    project.space.as_str(),
-                    &operation,
-                    now_ms() as u64,
-                )?;
+            let handoff = {
+                let store = self.store.lock().await;
+                verification.run(|| {
+                    store
+                        .find_execution_handoff_by_original(&project, &operation)?
+                        .map(|scope| {
+                            store.execution_handoff_status(
+                                &self.identity,
+                                scope.execution_space_id.as_str(),
+                                project.space.as_str(),
+                                &operation,
+                                now_ms() as u64,
+                            )
+                        })
+                        .transpose()
+                })?
+            };
+            if let Some(current) = handoff {
                 if current.state == OperationState::Running {
                     self.persist_handoff_result(
                         &current,
                         OperationState::Unknown,
                         json!({"error":reason,"cancellation_confirmed":confirmed}),
+                        &verification,
                     )
                     .await?;
                 }
@@ -960,6 +1024,386 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::execution_handoff::tests::Fixture;
+    use vibeface_secure::{
+        Identity,
+        authorization::{EXECUTION_LEASE_MS, MAX_PROOF_SIGNATURES},
+        signature_verification::{SignatureVerification, SignatureVerificationCounts},
+    };
+
+    #[derive(PartialEq)]
+    struct HandoffStateSnapshot {
+        total_changes: u64,
+        rows: Vec<Vec<Vec<rusqlite::types::Value>>>,
+    }
+
+    impl HandoffStateSnapshot {
+        fn read(store: &Store) -> Result<Self> {
+            let mut rows = Vec::new();
+            for table in [
+                "execution_handoffs",
+                "execution_handoff_nonces",
+                "execution_handoff_reservations",
+                "execution_handoff_challenges",
+                "execution_handoff_resolution_challenges",
+                "execution_handoff_resolutions",
+                "execution_handoff_sessions",
+            ] {
+                let mut statement = store
+                    .connection
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))?;
+                let columns = statement.column_count();
+                rows.push(
+                    statement
+                        .query_map([], |row| {
+                            (0..columns)
+                                .map(|column| row.get(column))
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?,
+                );
+            }
+            Ok(Self {
+                total_changes: store.connection.total_changes(),
+                rows,
+            })
+        }
+    }
+
+    struct PreparedHandoffRuntime {
+        fixture: Fixture,
+        node: Arc<Runtime>,
+        wire: SignedExecutionHandoffResolution,
+        proof: ExecutionHandoffResolutionFreshness,
+        context: ExecutionContext,
+        docker: PathBuf,
+        containers: Vec<String>,
+    }
+
+    impl PreparedHandoffRuntime {
+        async fn open() -> Result<Self> {
+            let mut fixture = Fixture::with_executor("claude_code")?;
+            fixture.start_unknown()?;
+            let wire = fixture.resolution(ExecutionResolutionPurpose::ResolveUnknown)?;
+            let active_at = wire
+                .invocation
+                .payload
+                .not_before_ms
+                .max(wire.resolution.account_admission.admitted_at_ms);
+            tokio::time::sleep(Duration::from_millis(
+                active_at.saturating_sub(now_ms() as u64),
+            ))
+            .await;
+            let proof = fixture.resolution_freshness(&wire, now_ms() as u64)?;
+            let dir = fixture.executor.directory.join("prefence-runtime");
+            config::private_dir(&dir)?;
+            fixture.store.connection.execute(
+                "VACUUM main INTO ?",
+                [dir.join("node.sqlite3")
+                    .to_str()
+                    .context("test database path must be UTF-8")?],
+            )?;
+            config::private_write(
+                &dir.join("data-epoch.json"),
+                &serde_json::to_vec(&config::data_format())?,
+            )?;
+            config::private_write(
+                &dir.join("identity.json"),
+                &serde_json::to_vec(&fixture.executor.node)?,
+            )?;
+            let docker = PathBuf::from(std::env::var("VIBEFACE_ISOLATION_TEST_DOCKER")?);
+            let mut cfg = Config::local(
+                "127.0.0.1:4790".parse()?,
+                vec![fixture.executor.project.clone()],
+                false,
+            );
+            cfg.roles = vec![NodeRole::Executor];
+            cfg.codex_socket = Some(dir.join("unavailable.sock"));
+            cfg.codex_bin = dir.join("missing-codex");
+            cfg.claude_bin = dir.join("missing-claude");
+            cfg.cursor_bin = dir.join("missing-cursor");
+            cfg.execution_isolation = Some(crate::engine::ExecutionIsolationConfig {
+                image: std::env::var("VIBEFACE_ISOLATION_TEST_IMAGE")?,
+                docker_bin: docker.clone(),
+                egress: None,
+            });
+            cfg.save(&dir)?;
+            let node = Arc::new(Runtime::open(&dir).await?);
+            let (project, operation) = original(&fixture.wire)?;
+            let context = ExecutionContext {
+                space_id: project.space,
+                resource_id: project.resource,
+                operation_id: operation,
+                shared: true,
+                lease_expires_at_ms: now_ms() as u64 + EXECUTION_LEASE_MS,
+            };
+            Ok(Self {
+                fixture,
+                node,
+                wire,
+                proof,
+                context,
+                docker,
+                containers: Vec::new(),
+            })
+        }
+
+        async fn prepare(&mut self, context: &ExecutionContext) -> Result<String> {
+            let id = self
+                .node
+                .engine
+                .prepare_operation_for_test(context, &self.fixture.executor.project)
+                .await?;
+            self.containers.push(id.clone());
+            self.assert_running(&id).await?;
+            Ok(id)
+        }
+
+        async fn inspect(&self, id: &str) -> Result<Option<Value>> {
+            let output = tokio::time::timeout(
+                Duration::from_secs(15),
+                tokio::process::Command::new(&self.docker)
+                    .args(["container", "inspect", id])
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await??;
+            if !output.status.success() {
+                let error = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+                ensure!(
+                    error.contains("no such container") || error.contains("no such object"),
+                    "test could not inspect its container"
+                );
+                return Ok(None);
+            }
+            let mut containers: Vec<Value> = serde_json::from_slice(&output.stdout)?;
+            ensure!(
+                containers.len() == 1 && containers[0]["Id"] == id,
+                "test inspected another container"
+            );
+            Ok(containers.pop())
+        }
+
+        async fn assert_running(&self, id: &str) -> Result<()> {
+            let container = self
+                .inspect(id)
+                .await?
+                .context("prepared test container disappeared")?;
+            ensure!(
+                container["State"]["Running"] == true
+                    && container["State"]["Pid"]
+                        .as_u64()
+                        .is_some_and(|pid| pid > 0),
+                "prepared test container is no longer running"
+            );
+            Ok(())
+        }
+
+        async fn snapshot(&self) -> Result<HandoffStateSnapshot> {
+            HandoffStateSnapshot::read(&*self.node.store.lock().await)
+        }
+
+        async fn assert_unfenced(&self, id: &str, before: &HandoffStateSnapshot) -> Result<()> {
+            self.assert_running(id).await?;
+            ensure!(
+                !self
+                    .node
+                    .engine
+                    .operation_is_fenced_for_test(&self.context)
+                    .await,
+                "a rejected request fenced the original generation"
+            );
+            ensure!(
+                *before == self.snapshot().await?,
+                "a rejected request changed handoff state, result, nonce, reservations, or challenge consumption"
+            );
+            Ok(())
+        }
+
+        fn bounded_counts(
+            verification: &SignatureVerification,
+        ) -> Result<SignatureVerificationCounts> {
+            let counts = verification.counts();
+            ensure!(
+                counts.actual_verifications <= MAX_PROOF_SIGNATURES,
+                "runtime request exceeded the signature verification limit"
+            );
+            Ok(counts)
+        }
+
+        async fn reject(
+            &self,
+            proof: &ExecutionHandoffResolutionFreshness,
+            expected: &str,
+        ) -> Result<SignatureVerificationCounts> {
+            let verification = SignatureVerification::new();
+            let error = match self
+                .node
+                .fence_execution_handoff_resolution(
+                    &self.wire,
+                    &self.fixture.transport,
+                    proof,
+                    &verification,
+                )
+                .await
+            {
+                Ok(_) => bail!("invalid authorization stopped a prepared container"),
+                Err(error) => error,
+            };
+            ensure!(
+                error
+                    .chain()
+                    .any(|cause| cause.to_string().contains(expected)),
+                "runtime rejected before expected gate {expected}: {error:#}; actual_verifications={}",
+                verification.counts().actual_verifications
+            );
+            Self::bounded_counts(&verification)
+        }
+
+        async fn cleanup(&self) -> Result<()> {
+            let mut failed = false;
+            for id in &self.containers {
+                let removed = async {
+                    let output = tokio::time::timeout(
+                        Duration::from_secs(15),
+                        tokio::process::Command::new(&self.docker)
+                            .args(["rm", "--force", id])
+                            .kill_on_drop(true)
+                            .output(),
+                    )
+                    .await??;
+                    let error = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+                    ensure!(
+                        output.status.success() || error.contains("no such container"),
+                        "test container cleanup failed"
+                    );
+                    ensure!(
+                        self.inspect(id).await?.is_none(),
+                        "test container survived cleanup"
+                    );
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                failed |= removed.is_err();
+            }
+            ensure!(
+                !failed,
+                "one or more exact test containers could not be removed"
+            );
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the pinned isolation fixture image and a local Docker daemon"]
+    async fn production_resolution_prefence_rejects_missing_expired_and_revoked_authorization()
+    -> Result<()> {
+        let mut prepared = PreparedHandoffRuntime::open().await?;
+        let outcome = async {
+            let original_context = prepared.context.clone();
+            let id = prepared.prepare(&original_context).await?;
+            {
+                let store = prepared.node.store.lock().await;
+                let state: String = store.connection.query_row("SELECT state FROM execution_handoffs", [], |row| row.get(0))?;
+                ensure!(state == "unknown", "runtime fixture did not preserve the original unknown result");
+            }
+            let before = prepared.snapshot().await?;
+            let mut missing = prepared.proof.clone();
+            missing.receipts.pop().context("fixture has no freshness receipts")?;
+            let missing_counts = prepared.reject(&missing, "resolution requires both current authority closures").await?;
+            prepared.assert_unfenced(&id, &before).await?;
+
+            let mut expired = prepared.proof.clone();
+            let receipt = expired.receipts.first_mut().context("fixture has no authority receipt")?;
+            let local = if receipt.issuer.as_str() == prepared.fixture.project.node.public_key_hex()? {
+                &prepared.fixture.project.node
+            } else {
+                ensure!(receipt.issuer.as_str() == prepared.fixture.executor.node.public_key_hex()?, "fixture receipt has an unknown authority");
+                &prepared.fixture.executor.node
+            };
+            let signer = Identity::from_secret_hex(&local.secret_key_hex).map_err(anyhow::Error::msg)?;
+            let mut shortened = receipt.payload.clone();
+            shortened.expires_at_ms = expired.challenge.expires_at_ms.min(now_ms() as u64 + 1_000);
+            let expires_at = shortened.expires_at_ms;
+            *receipt = Signed::sign(shortened, &signer)?;
+            let verification = SignatureVerification::new();
+            {
+                let store = prepared.node.store.lock().await;
+                verification.run(|| {
+                    let at = now_ms() as u64;
+                    let auth = store.execution_handoff_resolution_authorization(&prepared.wire, &prepared.fixture.transport, at)?;
+                    store.authorize_execution_handoff_resolution_fence(&auth, &expired, at)
+                })?;
+            }
+            PreparedHandoffRuntime::bounded_counts(&verification)?;
+            ensure!(before == prepared.snapshot().await?, "valid freshness inspection consumed runtime state");
+            tokio::time::sleep(Duration::from_millis(expires_at.saturating_sub(now_ms() as u64) + 1)).await;
+            let expired_counts = prepared.reject(&expired, "Expired").await?;
+            prepared.assert_unfenced(&id, &before).await?;
+
+            let verification = SignatureVerification::new();
+            let stopped = prepared.node.fence_execution_handoff_resolution(&prepared.wire, &prepared.fixture.transport, &prepared.proof, &verification).await?;
+            ensure!(prepared.inspect(&id).await?.is_none(), "authorized resolution did not clean the original container");
+            ensure!(prepared.node.engine.operation_is_fenced_for_test(&prepared.context).await, "authorized resolution did not permanently fence the old operation");
+            ensure!(before == prepared.snapshot().await?, "stopping an already unknown operation consumed its resolution or released its reservations");
+            let result = {
+                let mut store = prepared.node.store.lock().await;
+                verification.run(|| store.resolve_execution_handoff(&prepared.node.identity, &prepared.wire, &prepared.proof, &prepared.fixture.transport, &stopped, now_ms() as u64))?
+            };
+            let legal_counts = PreparedHandoffRuntime::bounded_counts(&verification)?;
+            {
+                let store = prepared.node.store.lock().await;
+                let state: String = store.connection.query_row("SELECT state FROM execution_handoffs", [], |row| row.get(0))?;
+                let consumed: bool = store.connection.query_row("SELECT consumed FROM execution_handoff_resolution_challenges WHERE nonce=?", [prepared.proof.challenge.nonce.as_str()], |row| row.get(0))?;
+                let reservations: u64 = store.connection.query_row("SELECT COUNT(*) FROM execution_handoff_reservations", [], |row| row.get(0))?;
+                let audit: u64 = store.connection.query_row("SELECT COUNT(*) FROM execution_handoff_resolutions", [], |row| row.get(0))?;
+                ensure!(state == "succeeded" && consumed && reservations == 0 && audit == 1, "resolution did not atomically record its outcome, consume its challenge, and release reservations");
+            }
+            let mut replacement = prepared.context.clone();
+            replacement.operation_id = "replacement-after-explicit-resolution".into();
+            replacement.lease_expires_at_ms = now_ms() as u64 + EXECUTION_LEASE_MS;
+            let replacement_id = prepared.prepare(&replacement).await?;
+            ensure!(replacement_id != id, "replacement reused the stopped container generation");
+            let before_retry = prepared.snapshot().await?;
+            let message = Inbound {
+                network_id: prepared.context.space_id.to_string(), origin: prepared.fixture.project.node.node_id()?,
+                request_id: "retry-successful-resolution".into(),
+                payload: json!({"type":"execution_handoff_resolve","resolution":prepared.wire}), broadcast: false,
+            };
+            let retry_verification = SignatureVerification::new();
+            let response = prepared.node.handle_handoff_peer(&message, prepared.wire.invocation.payload.device.clone(), &retry_verification).await?;
+            let retried: ExecutionHandoffResolutionResult = serde_json::from_value(response)?;
+            ensure!(retried == result, "resolution retry did not return its original committed receipt");
+            prepared.assert_running(&replacement_id).await?;
+            ensure!(!prepared.node.engine.operation_is_fenced_for_test(&replacement).await, "successful resolution retry fenced the replacement generation");
+            ensure!(before_retry == prepared.snapshot().await?, "successful resolution retry changed the database");
+            let retry_counts = PreparedHandoffRuntime::bounded_counts(&retry_verification)?;
+            println!("PREFENCE_RUNTIME_PROOF {}", json!({"missing_receipt":missing_counts,"expired_receipt":expired_counts,"authorized_resolution":legal_counts,"successful_retry":retry_counts,"prepared_containers":2,"rejected_requests_preserved_database":2,"successful_resolution_audit_rows":1,"retry_preserved_replacement":true,"provider_launches":0}));
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        let cleaned = prepared.cleanup().await;
+        outcome?;
+        cleaned?;
+
+        let mut revoked = PreparedHandoffRuntime::open().await?;
+        let outcome = async {
+            let original_context = revoked.context.clone();
+            let id = revoked.prepare(&original_context).await?;
+            {
+                let mut store = revoked.node.store.lock().await;
+                revoked.fixture.executor.revoke_client(&mut store)?;
+            }
+            let before = revoked.snapshot().await?;
+            let counts = revoked.reject(&revoked.proof, "Revoked").await?;
+            revoked.assert_unfenced(&id, &before).await?;
+            println!("PREFENCE_RUNTIME_PROOF {}", json!({"revoked_resolver":counts,"prepared_containers":1,"rejected_requests_preserved_database":1,"provider_launches":0}));
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        let cleaned = revoked.cleanup().await;
+        outcome?;
+        cleaned?;
+        Ok(())
+    }
 
     #[test]
     fn public_provider_result_preserves_output_without_native_handles() {

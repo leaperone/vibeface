@@ -431,6 +431,36 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn prepare_operation_for_test(
+        &self,
+        context: &ExecutionContext,
+        project: &std::path::Path,
+    ) -> Result<String> {
+        ensure!(context.shared, "only isolated execution can be prepared");
+        let fenced = self.fenced_operations.lock().await;
+        ensure!(
+            !fenced.contains(&execution_generation(context)),
+            "execution generation was fenced; reconcile its original operation"
+        );
+        let prepared = self
+            .isolation
+            .as_ref()
+            .context("shared execution isolation is not configured")?
+            .prepare(context, project)
+            .await?;
+        drop(fenced);
+        Ok(prepared.container_id().to_owned())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn operation_is_fenced_for_test(&self, context: &ExecutionContext) -> bool {
+        self.fenced_operations
+            .lock()
+            .await
+            .contains(&execution_generation(context))
+    }
+
     pub async fn complete_operation(&self, context: &ExecutionContext) -> Result<()> {
         if let Some(isolation) = &self.isolation {
             isolation.complete(context).await?;
