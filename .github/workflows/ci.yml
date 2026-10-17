@@ -97,7 +97,9 @@ jobs:
         with:
           version: v1.3.0
       - name: Validate migration files without opening a database
-        run: atlas migrate validate --dir file://crates/node/migrations
+        run: |
+          atlas migrate validate --dir file://crates/node/migrations
+          atlas migrate validate --dir file://crates/node/identity-migrations
       - name: Check workflow and shell scripts
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12

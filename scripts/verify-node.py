@@ -9,20 +9,21 @@ explicit stream-json fixture, never a model. All state and logs stay beneath
 
 import argparse
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
-import secrets
 import shutil
 import signal
+import select
 import socket
 import sqlite3
 import subprocess
 import sys
-import threading
 import time
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -89,8 +90,7 @@ def verify_maintenance(node):
     try:
         require(value["status"] == "ready", "idle node enters maintenance")
         require(value["health"]["node_id"] == node.node_id, "lease pins the running node")
-        node.client.request("/api/rpc", {"method": "nodes"}, status=503)
-        node.client.request("/api/login", {"username": "owner_a", "password": "wrong"}, status=503)
+        node.client.rpc("nodes", status=503)
         probe, health = maintenance(node, "probe")
         probe.close()
         require(health["status"] == "healthy", "health is readable while writes are closed")
@@ -102,7 +102,8 @@ def verify_maintenance(node):
     marker = node.directory / "update-pending.json"
     private_json(marker, {"protocol": 1})
     node.start()
-    node.client.request("/api/rpc", {"method": "nodes"}, status=503)
+    node.client.connect()
+    node.client.call("authenticate", {"network_id": node.client.network_id}, status=503)
     commit, value = maintenance(node, "commit")
     commit.close()
     require(value["status"] == "error", "pending marker prevents premature commit")
@@ -110,6 +111,7 @@ def verify_maintenance(node):
     commit, value = maintenance(node, "commit")
     commit.close()
     require(value["status"] == "committed", "verified startup opens only after explicit commit")
+    node.client.authenticate()
     node.client.rpc("nodes")
     result = subprocess.run([str(node.binary), "update", "status", "--data-dir", str(node.directory)],
                             capture_output=True, timeout=10)
@@ -125,73 +127,341 @@ def available_port():
         return stream.getsockname()[1]
 
 
-class Client:
-    def __init__(self, url):
-        self.url = url
-        self.cookie = None
-        self.csrf = None
-        self.account = None
+class RelayCapture:
+    def __init__(self, upstream_port):
+        self.port = available_port()
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.upstream_port = upstream_port
+        self.listener = socket.socket()
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", self.port))
+        self.listener.listen(32)
+        self.listener.settimeout(0.2)
+        self.stopped = threading.Event()
+        self.connections = []
+        self.payloads = []
+        self.errors = []
+        self.thread = threading.Thread(target=self.accept, daemon=True)
+        self.thread.start()
 
-    def request(self, path, payload=None, *, status=200, csrf=True, origin=True,
-                authenticated=True, headers=None, timeout=20):
+    def accept(self):
+        while not self.stopped.is_set():
+            try:
+                client, _ = self.listener.accept()
+                server = socket.create_connection(("127.0.0.1", self.upstream_port), timeout=5)
+                client.settimeout(None)
+                server.settimeout(None)
+            except socket.timeout:
+                continue
+            except OSError:
+                if not self.stopped.is_set():
+                    self.errors.append("relay proxy failed to accept")
+                return
+            self.connections.extend([client, server])
+            for source, target in ((client, server), (server, client)):
+                threading.Thread(target=self.forward, args=(source, target), daemon=True).start()
+
+    def forward(self, source, target):
+        buffer = bytearray()
+        headers = True
+        try:
+            while not self.stopped.is_set():
+                part = source.recv(65536)
+                if not part:
+                    return
+                target.sendall(part)
+                buffer.extend(part)
+                if headers:
+                    end = buffer.find(b"\r\n\r\n")
+                    if end < 0:
+                        require(len(buffer) < 16384, "bounded relay upgrade headers")
+                        continue
+                    del buffer[:end + 4]
+                    headers = False
+                while len(buffer) >= 2:
+                    masked = bool(buffer[1] & 128)
+                    length = buffer[1] & 127
+                    offset = 2
+                    if length in (126, 127):
+                        width = 2 if length == 126 else 8
+                        if len(buffer) < offset + width:
+                            break
+                        length = int.from_bytes(buffer[offset:offset + width], "big")
+                        offset += width
+                    require(length <= 16 * 1024 * 1024, "bounded captured WebSocket frame")
+                    key = buffer[offset:offset + 4] if masked else None
+                    offset += 4 if masked else 0
+                    if len(buffer) < offset + length:
+                        break
+                    payload = bytes(buffer[offset:offset + length])
+                    if masked:
+                        payload = bytes(value ^ key[index % 4] for index, value in enumerate(payload))
+                    self.payloads.append(payload)
+                    del buffer[:offset + length]
+        except (OSError, AssertionError) as error:
+            if isinstance(error, AssertionError):
+                self.errors.append(str(error))
+        finally:
+            for stream in (source, target):
+                try:
+                    stream.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def close(self):
+        self.stopped.set()
+        self.listener.close()
+        for stream in self.connections:
+            stream.close()
+        self.thread.join(timeout=2)
+
+
+CLIENT_SOURCE = r"""
+import init, { Identity, Handshake, recoverySeal, recoveryOpen } from "MODULE_URL";
+import { readFile } from 'node:fs/promises';
+import { createInterface } from 'node:readline';
+await init({ module_or_path: await readFile(new URL('./vibeface_secure_bg.wasm', "MODULE_URL")) });
+const encoder = new TextEncoder();
+const decoder = new TextDecoder('utf-8', { fatal: true });
+const keys = new Map([['client', Identity.generate()], ['root', Identity.generate()]]);
+const connections = new Map();
+const identity = name => { const key = keys.get(name); if (!key) throw new Error('unknown local identity'); return key; };
+const exposed = key => ({ public_key: key.publicKeyHex(), subject_id: key.nodeId() });
+async function connect(input) {
+  const key = identity(input.identity || 'client');
+  const socket = new WebSocket(new URL('/api/network/ws', input.url.replace(/^http/, 'ws')));
+  socket.binaryType = 'arraybuffer';
+  const queue = [], waiting = [], pending = new Map(), events = [], frames = [];
+  let channel, closed = false, sequence = 0;
+  function close(error = new Error('channel closed')) {
+    if (closed) return;
+    closed = true;
+    for (const waiter of waiting.splice(0)) waiter.reject(error);
+    for (const request of pending.values()) { clearTimeout(request.timer); request.reject(error); }
+    pending.clear(); socket.close();
+  }
+  const receive = () => queue.length ? Promise.resolve(queue.shift()) : closed ? Promise.reject(new Error('channel closed')) : new Promise((resolve, reject) => waiting.push({resolve, reject}));
+  socket.addEventListener('message', event => { const waiter = waiting.shift(); if (waiter) waiter.resolve(event.data); else if (queue.length < 512) queue.push(event.data); else close(new Error('bounded receive queue')); });
+  socket.addEventListener('close', () => close());
+  socket.addEventListener('error', () => close(new Error('WebSocket transport failed')));
+  async function control(type) { const frame = await receive(); if (typeof frame !== 'string') throw new Error('control frame is not text'); const value = JSON.parse(frame); if (value.type !== type) throw new Error(`expected ${type}`); }
+  const timer = setTimeout(() => close(new Error('handshake timeout')), 15000);
+  try {
+    await control('welcome');
+    socket.send(JSON.stringify(input.relay ? {type:'dial', target:input.node_id, service:'client'} : {type:'direct', service:'client'}));
+    await control('ready');
+    const handshake = new Handshake(true, key.secretHex(), input.node_id, encoder.encode('vibeface:client:v1'));
+    socket.send(handshake.write(new Uint8Array()));
+    const response = await receive();
+    if (!(response instanceof ArrayBuffer)) throw new Error('Noise response must be binary');
+    handshake.read(new Uint8Array(response));
+    socket.send(handshake.write(new Uint8Array()));
+    if (!handshake.isFinished() || handshake.remoteId() !== input.node_id) throw new Error('target identity mismatch');
+    channel = handshake.finish(); handshake.free();
+  } catch (error) { close(error); throw error; }
+  finally { clearTimeout(timer); }
+  (async () => {
+    try {
+      while (!closed) {
+        const frame = await receive();
+        if (!(frame instanceof ArrayBuffer)) throw new Error('plaintext application frame rejected');
+        const plaintext = channel.openRecord(new Uint8Array(frame));
+        if (plaintext === null) continue;
+        const value = JSON.parse(decoder.decode(plaintext));
+        const request = pending.get(value.id);
+        if (request) { pending.delete(value.id); clearTimeout(request.timer); request.resolve(value); }
+        else events.push(value);
+      }
+    } catch (error) { close(error); }
+    finally { channel.free(); }
+  })();
+  return {
+    events, frames,
+    request(method, params) {
+      if (closed) throw new Error('channel closed');
+      const id = String(++sequence);
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { pending.delete(id); reject(new Error('request timeout')); }, 20000);
+        pending.set(id, {resolve, reject, timer});
+        for (const record of channel.sealMessage(encoder.encode(JSON.stringify({id,method,params})))) { frames.push(Buffer.from(record)); socket.send(record); }
+      });
+    },
+    async attack(kind) {
+      if (!frames.length) throw new Error('no protected request to attack');
+      const record = Buffer.from(frames[frames.length - 1]);
+      if (kind === 'tamper') record[record.length - 1] ^= 1;
+      socket.send(record);
+      for (let attempt = 0; attempt < 50 && !closed; attempt++) await new Promise(resolve => setTimeout(resolve, 100));
+      if (!closed) throw new Error('invalid protected frame did not close the channel');
+      return {rejected:true};
+    },
+    close,
+  };
+}
+for await (const line of createInterface({input:process.stdin})) {
+  try {
+    const input = JSON.parse(line);
+    let result;
+    if (input.op === 'identity') result = exposed(identity(input.identity || 'client'));
+    else if (input.op === 'sign') result = identity(input.identity || 'client').sign(input.domain, encoder.encode(typeof input.payload === 'string' ? input.payload : JSON.stringify(input.payload)));
+    else if (input.op === 'backup') {
+      const root = identity('root');
+      const payload = encoder.encode(JSON.stringify({version:1,network_id:root.nodeId(),root_secret_key:root.secretHex(),genesis:input.state.genesis,recovery_epoch:1,decryption_keys:[]}));
+      try { result = {version:1,network_id:root.nodeId(),recovery_epoch:1,envelope:JSON.parse(decoder.decode(recoverySeal(payload,input.password)))}; }
+      finally { payload.fill(0); }
+    }
+    else if (input.op === 'recover_material') {
+      const plaintext = recoveryOpen(encoder.encode(JSON.stringify(input.backup.envelope)),input.password);
+      try {
+        const payload = JSON.parse(decoder.decode(plaintext));
+        const root = Identity.fromSecretHex(payload.root_secret_key);
+        keys.get('recovered')?.free(); keys.set('recovered',root);
+        result = {network_id:root.nodeId(),recovery_epoch:payload.recovery_epoch,genesis:payload.genesis};
+      } finally { plaintext.fill(0); }
+    }
+    else if (input.op === 'forget_root') { identity('root').free(); keys.delete('root'); result = {forgotten:true}; }
+    else if (input.op === 'connect') { const old = connections.get(input.connection || 'main'); old?.close(); const value = await connect(input); connections.set(input.connection || 'main', value); result = {connected:true}; }
+    else { const connection = connections.get(input.connection || 'main'); if (!connection) throw new Error('no connection');
+      if (input.op === 'request') result = await connection.request(input.method,input.params || {});
+      else if (input.op === 'events') result = connection.events;
+      else if (input.op === 'wire') result = connection.frames.map(frame => frame.toString('hex'));
+      else if (input.op === 'attack') result = await connection.attack(input.kind);
+      else if (input.op === 'close') { connection.close(); result = {closed:true}; }
+      else throw new Error('unknown client command');
+    }
+    process.stdout.write(`${JSON.stringify({ok:true,result})}\n`);
+  } catch (error) { process.stdout.write(`${JSON.stringify({ok:false,error:String(error)})}\n`); }
+}
+for (const connection of connections.values()) connection.close();
+"""
+
+
+class Client:
+    def __init__(self, url, helper, module):
+        self.url = url
+        self.helper = helper
+        self.module = module
+        self.network_id = None
+        self.principal = None
+        self.process = None
+        self.node_id = None
+
+    def command(self, op, *, check=True, **arguments):
+        if self.process is None:
+            self.process = subprocess.Popen(
+                ["node", str(self.helper)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        self.process.stdin.write(json.dumps({"op": op, **arguments}) + "\n")
+        self.process.stdin.flush()
+        require(select.select([self.process.stdout], [], [], 30)[0], "WASM client command completed before timeout")
+        line = self.process.stdout.readline()
+        require(line, "WASM client returned a bounded JSON response")
+        value = json.loads(line)
+        if not check:
+            return value
+        require(value.get("ok"), f"client {op} failed: {value.get('error', 'unknown error')}")
+        return value.get("result")
+
+    def connect(self, node_id=None, *, relay=False, connection="main"):
+        self.node_id = node_id or self.node_id
+        return self.command("connect", url=self.url, node_id=self.node_id,
+                            relay=relay, connection=connection)
+
+    def call(self, method, params=None, *, status=200, connection="main"):
+        response = self.command("request", method=method, params=params or {}, connection=connection)
+        error = response.get("error")
+        if status == 200:
+            require(not error, f"encrypted {method} rejected: {error}")
+            return response.get("result")
+        require(error is not None, f"encrypted {method} expected rejection")
+        if isinstance(error, dict) and error.get("status"):
+            require(error["status"] == status, f"encrypted {method} rejection status")
+        return response
+
+    def authenticate(self, network=None):
+        self.network_id = network or self.network_id
+        result = self.call("authenticate", {"network_id": self.network_id})
+        self.principal = result["principal"]
+        require(self.principal["network_id"] == self.network_id, "client authenticates the pinned personal network")
+        return result
+
+    def rpc(self, method, *, status=200, **arguments):
+        return self.call("rpc", {"method": method, **arguments}, status=status)
+
+    def request(self, path, payload=None, *, status=200, origin=True, headers=None, timeout=20, **unused):
         request_headers = dict(headers or {})
         if origin:
             request_headers.setdefault("Origin", self.url)
-        if authenticated and self.cookie:
-            request_headers["Cookie"] = self.cookie
-        if csrf and self.csrf:
-            request_headers["X-CSRF-Token"] = self.csrf
         body = None
         if payload is not None:
             body = json.dumps(payload).encode()
             request_headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.url + path, body, request_headers)
-        description = f"{request.get_method()} {self.url}{urllib.parse.urlsplit(path).path}"
-        if path == "/api/rpc" and isinstance(payload, dict):
-            description += f" RPC {payload.get('method', '?')}"
         try:
+            response = urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            observed = response.status
+            encoded = response.read(4 * 1024 * 1024 + 1)
+            require(len(encoded) <= 4 * 1024 * 1024, "HTTP response is bounded")
+            require(observed == status, f"{path}: expected HTTP {status}, received {observed}")
+            return json.loads(encoded) if encoded and "application/json" in response.headers.get("Content-Type", "") else encoded or None
+
+    def invite(self, kind, roles=None):
+        prepared = self.call("prepare_invite", {"kind": kind, "node_roles": sorted(roles or []),
+                                                 "request_id": uuid.uuid4().hex})
+        prepared["invite"]["inviter_signature"] = self.command("sign", **prepared["signing"])
+        tampered = copy.deepcopy(prepared["invite"])
+        tampered["payload"]["network_id"] = "ab" * 32
+        self.call("commit_invite", {"invite": tampered, "capability": prepared["capability"]}, status=400)
+        return self.call("commit_invite", {"invite": prepared["invite"], "capability": prepared["capability"]})
+
+    def approve(self, request_id):
+        prepared = self.call("prepare_pair", {"request_id": request_id})
+        prepared["event"]["signature"] = self.command("sign", **prepared["signing"])
+        review_signature = self.command("sign", **prepared["review_signing"])
+        return self.call("pair_confirm", {"request_id": request_id, "event": prepared["event"],
+                                           "inviter_signature": review_signature})
+
+    def pair_client(self, owner, network, name):
+        self.url = owner.url
+        self.connect(owner.node_id)
+        invitation = owner.invite("client")
+        prepared = self.call("prepare_pair_request", {**invitation, "name": name,
+                                                       "request_id": uuid.uuid4().hex})
+        prepared["request"]["proof"] = self.command("sign", **prepared["signing"])
+        invalid = copy.deepcopy(prepared["request"])
+        invalid["proof"] = "00" * 64
+        self.call("pair_request", {"request": invalid}, status=400)
+        receipt = self.call("pair_request", {"request": prepared["request"]})
+        review_signature = self.command("sign", **receipt["signing"])
+        self.call("pair_accept", {"request_id": receipt["request_id"], "signature": review_signature})
+        owner.approve(receipt["request_id"])
+        result = self.call("pair_status", {"request_id": receipt["request_id"]})
+        require(result["status"] == "granted", "new client pairing completes after both signatures")
+        self.authenticate(network)
+        self.call("prepare_revoke", {"subject_id": owner.node_id}, status=403)
+
+    def close(self):
+        if self.process is not None:
+            self.process.stdin.close()
             try:
-                response = urllib.request.urlopen(request, timeout=timeout)
-            except urllib.error.HTTPError as error:
-                response = error
-            with response:
-                observed = response.status
-                encoded = response.read(4 * 1024 * 1024 + 1)
-                require(len(encoded) <= 4 * 1024 * 1024, "HTTP response is bounded")
-                require(observed == status,
-                        f"{path}: expected HTTP {status}, received {observed}")
-                value = json.loads(encoded) if encoded else None
-                cookie = response.headers.get("Set-Cookie")
-                if cookie and observed == 200 and path == "/api/login":
-                    require("HttpOnly" in cookie and "SameSite=Strict" in cookie,
-                            "login cookie has HttpOnly and SameSite")
-                    attributes = {value.strip().lower() for value in cookie.split(";")[1:]}
-                    require(("secure" in attributes) == request_headers["Origin"].startswith("https:"),
-                            "login cookie Secure follows the actual entry origin")
-                    self.cookie = cookie.split(";", 1)[0]
-                    self.csrf = value["csrf"]
-                    self.account = value["account"]
-                return value
-        except (TimeoutError, urllib.error.URLError) as error:
-            if isinstance(error, urllib.error.URLError) and not isinstance(error.reason, TimeoutError):
-                raise
-            raise TimeoutError(f"{description} exceeded HTTP timeout of {timeout}s") from None
-
-    def login(self, username, password):
-        return self.request("/api/login", {"username": username, "password": password})
-
-    def rpc(self, method, *, status=200, **arguments):
-        return self.request("/api/rpc", {"method": method, **arguments}, status=status)
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+            self.process = None
 
 
 class Node:
-    def __init__(self, run, name, binary, workspace, fixture):
+    def __init__(self, run, name, binary, workspace, fixture, helper, module):
         self.name = name
         self.binary = binary
         self.directory = run / name
         self.port = available_port()
         self.url = f"http://127.0.0.1:{self.port}"
-        self.client = Client(self.url)
+        self.client = Client(self.url, helper, module)
         self.process = None
         self.log = None
         try:
@@ -203,6 +473,12 @@ class Node:
             raise RuntimeError(f"{name}: CLI initialization timed out") from None
         require(result.returncode == 0, f"{name}: CLI initialization succeeds")
         self.configure(claude_bin=str(fixture), timeout_secs=60)
+        result = subprocess.run([str(binary), "access", "--json", "--data-dir", str(self.directory)],
+                                capture_output=True, timeout=15)
+        require(result.returncode == 0, f"{name}: local access material is available")
+        self.access = json.loads(result.stdout)
+        require(self.access["node_id"], "local access pins the Node identity")
+        self.node_id = self.access["node_id"]
 
     def configure(self, **values):
         path = self.directory / "config.json"
@@ -236,55 +512,64 @@ class Node:
             self.log.close()
             self.log = None
 
-    def pair(self, owner, network, username, password):
-        invitation = owner.client.rpc("invite", roles=["gateway", "relay", "replica", "scheduler", "executor"])
+    def pair(self, owner, network):
+        invitation = owner.client.invite("node", ["gateway", "relay", "replica", "scheduler", "executor"])
+        path = self.directory / "pair-invitation.json"
+        private_json(path, {"url": owner.url, "node_id": owner.node_id, "invite": invitation})
+        process = subprocess.Popen([str(self.binary), "pair", "--data-dir", str(self.directory),
+                                    "--invite-file", str(path), "--name", f"Node {self.name}"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            result = subprocess.run(
-                [str(self.binary), "pair", "--data-dir", str(self.directory),
-                 "--url", owner.url, "--network-id", network, "--code", invitation["code"],
-                 "--username", username, "--password-stdin"],
-                input=(password + "\n").encode(), capture_output=True, timeout=40)
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"{self.name}: CLI pairing timed out") from None
-        require(result.returncode == 0, f"{self.name}: pinned CLI pairing succeeds")
+            def pending():
+                requests = owner.client.call("pair_requests")
+                return next((item for item in requests if item["review"]["new_member"]["subject_id"] == self.node_id
+                             and item.get("new_subject_signature")), None)
+            review = wait_for(f"{self.name} signed CLI pairing review", pending)
+            owner.client.approve(review["request_id"])
+            stdout, stderr = process.communicate(timeout=40)
+            require(process.returncode == 0, f"{self.name}: pinned CLI pairing completes after management approval")
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+        self.client.pair_client(owner.client, network, f"{self.name} independent client")
+        self.client.url = self.url
+        self.client.node_id = self.node_id
+        self.configure(peers=[])
+
+    def bootstrap(self):
+        self.client.connect(self.node_id)
+        root = self.client.command("identity", identity="root")
+        prepared = self.client.call("prepare_genesis", {"owner_public_key": root["public_key"],
+                                                        "client_name": f"{self.name} management client"})
+        state = prepared["state"]
+        signing = prepared["signing"]
+        state["genesis"]["signature"] = self.client.command("sign", identity="root", **signing)
+        self.backup_password = "acceptance-only-encrypted-recovery-passphrase"
+        self.backup = self.client.command("backup", state=state, password=self.backup_password)
+        private_json(self.directory / "recovery-package.json", self.backup)
+        self.client.command("forget_root")
+        self.client.call("bootstrap", {"capability": "invalid-capability", "state": state}, status=400)
+        result = self.client.call("bootstrap", {"capability": self.access["capability"], "state": state})
+        self.client.network_id = state["genesis"]["network_id"]
+        self.client.principal = result["principal"]
+        require(self.client.principal["can_manage"], "bootstrap grants the local management client")
+        return self.client.network_id
 
 
 class Events:
     def __init__(self, client):
         self.client = client
-        self.lines = []
-        self.ready = threading.Event()
-        self.stopped = threading.Event()
-        self.connection = None
-        self.thread = threading.Thread(target=self.read, daemon=True)
 
-    def read(self):
-        parsed = urllib.parse.urlparse(self.client.url)
-        self.connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=3)
-        try:
-            self.connection.request("GET", "/api/events", headers={"Cookie": self.client.cookie})
-            response = self.connection.getresponse()
-            if response.status != 200:
-                return
-            self.ready.set()
-            while not self.stopped.is_set():
-                line = response.readline()
-                if not line:
-                    return
-                if line.startswith(b"data:"):
-                    self.lines.append(json.loads(line[5:].strip()))
-        except (OSError, ValueError, http.client.HTTPException):
-            pass
+    @property
+    def lines(self):
+        return self.client.command("events")
 
     def start(self):
-        self.thread.start()
-        require(self.ready.wait(8), "authenticated SSE subscription opens")
+        self.client.call("subscribe")
 
     def close(self):
-        self.stopped.set()
-        self.thread.join(timeout=4)
-        if self.connection and not self.thread.is_alive():
-            self.connection.close()
+        pass
 
 
 def fixture_executor(arguments):
@@ -371,24 +656,120 @@ def verify_no_model_budget(nodes):
             connection.close()
 
 
-def verify_browser_origins(node, password, origins):
-    # Exercise Host/Origin routing through loopback; this does not test LAN or TLS transport.
-    for index, origin in enumerate(origins):
+def verify_incompatible_data(run, binary, workspace, fixture, helper, module):
+    node = Node(run, "INCOMPATIBLE", binary, workspace, fixture, helper, module)
+    marker = node.directory / "data-epoch.json"
+    private_json(marker, {"data_epoch": 1})
+    database = node.directory / "node.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA user_version=1")
+        connection.execute("CREATE TABLE preserved(value TEXT)")
+        connection.execute("INSERT INTO preserved VALUES('keep this data')")
+    protected = [database, node.directory / "identity.json", node.directory / "config.json",
+                 node.directory / "identity.sqlite3", node.directory / "bootstrap.json"]
+    for missing_marker in (False, True):
+        if missing_marker:
+            marker.unlink()
+        checked = protected + ([] if missing_marker else [marker])
+        before = {path: file_sha256(path) for path in checked}
+        process = subprocess.Popen([str(binary), "serve", "--data-dir", str(node.directory)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=10)
+            require(process.returncode != 0 and b"epoch" in (stdout + stderr).lower(),
+                    "incompatible or missing data epoch rejects startup before opening stores or providers")
+            require(all(file_sha256(path) == digest for path, digest in before.items()),
+                    "rejected startup preserves data, identity, config and epoch marker byte for byte")
+            require(not missing_marker or not marker.exists(), "rejected startup does not invent a data epoch")
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
+
+
+def verify_recovery(node, other, nodes, network):
+    wrong = other.command("recover_material", backup=node.backup,
+                          password="wrong-acceptance-passphrase", check=False)
+    require(wrong["ok"] is False, "encrypted recovery package rejects a wrong password")
+    missing = copy.deepcopy(node.backup)
+    missing["envelope"] = {}
+    rejected = other.command("recover_material", backup=missing,
+                             password=node.backup_password, check=False)
+    require(rejected["ok"] is False, "recovery rejects missing encrypted key material")
+    material = other.command("recover_material", backup=node.backup, password=node.backup_password)
+    require(material["network_id"] == network, "recovered root retains the original personal fingerprint")
+    other.url = node.url
+    other.connect(node.node_id)
+    challenge = other.call("recovery_challenge", {"network_id": network,
+                           "owner_public_key": material["genesis"]["owner_public_key"],
+                           "genesis": material["genesis"]})
+    signature = other.command("sign", identity="recovered", **challenge["signing"])
+    context = other.call("recovery_context", {"challenge_id": challenge["challenge_id"], "signature": signature})
+    view = context["view"]
+    keep = [member for member in view["members"] if member["subject_id"] not in view["revoked"] and not member["manage"]]
+    identity = other.command("identity")
+    keep.append({**identity, "kind": "client", "name": "Recovered management client", "node_roles": [], "manage": True})
+    keep.sort(key=lambda member: member["subject_id"])
+    prepared = other.call("prepare_recovery", {"challenge_id": challenge["challenge_id"], "members": keep})
+    prepared["checkpoint"]["signature"] = other.command("sign", identity="recovered", **prepared["signing"])
+    result = other.call("recover", {"challenge_id": challenge["challenge_id"], "checkpoint": prepared["checkpoint"]})
+    other.network_id = network
+    require(result["principal"]["can_manage"] and result["view"]["epoch"] > view["epoch"],
+            "root recovery establishes an independent manager in a higher epoch")
+    require(other.rpc("conversations")["conversations"], "recovering identity preserves stored business history")
+    node.client.connect()
+    node.client.call("authenticate", {"network_id": network}, status=403)
+    for peer in nodes:
+        if peer is node or peer.name == "C":
+            continue
+        wait_for("authorized peer installs recovered management epoch", lambda: peer.client.call("directory")["view"]["epoch"] == result["view"]["epoch"])
+
+
+def verify_binding_race(a, b, c, network, conversation, workspace):
+    task_id = "concurrent-binding-task"
+    a.client.rpc("create_task", conversation_id=conversation, task_id=task_id,
+                 title="Unique execution binding", goal="Accept only one execution location",
+                 acceptance="Conflicting concurrent dispatch is rejected")
+    wait_for("C receives the exact task creation", lambda: any(item["task_id"] == task_id
+             for item in c.client.rpc("conversation", conversation_id=conversation)["tasks"]))
+    requests = [request(network, conversation, target, "binding-race-" + label,
+                        "binding-session-" + label,
+                        {"type": "open", "executor": "claude_code", "cwd": str(workspace)}, task=task_id)
+                for label, target in (("B", b), ("C", c))]
+    def submit(client, value):
+        return client.command("request", method="rpc", params={"method": "operate", "request": value})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(submit, client, value) for client, value in zip((a.client, c.client), requests)]
+        responses = [future.result() for future in futures]
+    accepted = [index for index, value in enumerate(responses) if not value.get("error")]
+    require(len(accepted) == 1, "two schedulers confirm exactly one execution location")
+    winner = accepted[0]
+    targets = (b, c)
+    wait_for("winning binding open succeeds", lambda: succeeded(a.client, targets[winner], requests[winner]["operation_id"]))
+    require(operation(a.client, targets[1 - winner], requests[1 - winner]["operation_id"]) is None,
+            "losing execution target never accepts a conflicting operation")
+
+
+def verify_channel_security(node):
+    wrong = node.client.command("connect", url=node.url, node_id="ab" * 32,
+                                connection="wrong-identity", check=False)
+    require(wrong["ok"] is False, "Noise refuses a substituted target identity")
+    for kind in ("tamper", "replay"):
+        connection = "negative-" + kind
+        node.client.connect(connection=connection)
+        node.client.call("authenticate", {"network_id": node.client.network_id}, connection=connection)
+        result = node.client.command("attack", kind=kind, connection=connection)
+        require(result == {"rejected": True}, "invalid protected record closes the real Node channel")
+    require(node.client.rpc("nodes")["nodes"], "valid channel remains usable after separate attack connections")
+
+
+def verify_browser_origins(node, origins):
+    for origin in origins:
         headers = {"Host": urllib.parse.urlsplit(origin).netloc, "Origin": origin}
-        client = Client(node.url)
-        client.request("/api/info", headers=headers)
-        client.request("/api/rpc", {"method": "nodes"}, headers=headers, status=401)
-        client.request("/api/login", {"username": "owner_a", "password": password}, headers=headers)
-        require(client.account["network_id"] == node.client.account["network_id"],
-                "allowed entry login retains the same personal network")
-        client.request("/api/rpc", {"method": "create_conversation",
-                       "conversation_id": "entry-" + hashlib.sha256(origin.encode()).hexdigest()[:12],
-                       "title": f"Entry {index}"}, headers=headers)
-        client.request("/api/rpc", {"method": "nodes"},
-                       headers={**headers, "Origin": node.url}, status=403)
+        node.client.request("/api/info", headers=headers)
+        node.client.request("/api/info", headers={**headers, "Origin": "https://hostile.invalid"}, status=403)
         wrong_scheme = ("https:" if origin.startswith("http:") else "http:") + origin.split(":", 1)[1]
-        client.request("/api/rpc", {"method": "nodes"},
-                       headers={**headers, "Origin": wrong_scheme}, status=403)
+        node.client.request("/api/info", headers={**headers, "Origin": wrong_scheme}, status=403)
     node.client.request("/api/info", headers={"Host": "unconfigured.invalid"}, origin=False, status=403)
 
 
@@ -404,64 +785,88 @@ def acceptance(options):
     fixture = run / "fixture-executor"
     fixture.write_text(f"#!{sys.executable}\nimport os\nos.execv({sys.executable!r}, [{sys.executable!r}, {str(Path(__file__).resolve())!r}, '--fixture-executor', '--fixture-root', {str(run)!r}] + __import__('sys').argv[1:])\n")
     fixture.chmod(0o700)
-    password_a, password_b, password_c = [secrets.token_urlsafe(24) for _ in range(3)]
+    module = options.crypto_module.resolve(strict=True)
+    require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
+            "real browser cryptography WASM is available")
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    helper.chmod(0o600)
     nodes = []
     report = {"status": "running", "evidence": [], "provider_calls": 0,
               "binary_sha256": file_sha256(binary),
               "not_checked": ["paid model output and SDK reasoning", "real LAN/public ingress",
                               "rendered browser UI", "hostile DAG import rejection (run store module tests separately)"]}
     stream = None
+    capture = None
+    recovery_client = None
 
     def passed(description, kind="real_node_processes"):
         report["evidence"].append({"check": description, "kind": kind})
         print("PASS " + description, flush=True)
 
     try:
-        for name in ("A", "B", "C"):
-            nodes.append(Node(run, name, binary, workspace, fixture))
-        a, b, c = nodes
+        for name in ("A", "B", "C", "R"):
+            nodes.append(Node(run, name, binary, workspace, fixture, helper, module))
+        a, b, c, relay = nodes
+        verify_incompatible_data(run, binary, workspace, fixture, helper, module)
+        passed("incompatible data epoch refuses startup without changing existing files")
         for node in nodes:
             node.configure(codex_bin=options.codex_bin)
+        capture = RelayCapture(relay.port)
+        relay.configure(allowed_origins=[capture.url], network={"bootstrap_urls": [], "advertise_urls": [],
+                                                "mdns": False, "relay_enabled": True})
+        relay.start()
+        for node in (a, b, c):
+            node.configure(network={"bootstrap_urls": [capture.url.replace("http:", "ws:") + "/api/network/ws"],
+                                    "advertise_urls": [], "mdns": False, "relay_enabled": False})
         a.start()
-        a.client.request("/api/rpc", {"method": "nodes"}, authenticated=False, status=401)
-        a.client.request("/api/register", {"username": "owner_a", "password": password_a}, status=201)
-        a.client.login("owner_a", password_a)
-        network = a.client.account["network_id"]
-        a.client.request("/api/rpc", {"method": "nodes"}, csrf=False, status=403)
-        a.client.request("/api/rpc", {"method": "nodes"}, origin=False, status=403)
-        a.client.request("/api/rpc", {"method": "nodes"}, headers={"Origin": "https://hostile.invalid"}, status=403)
+        a.client.connect(a.node_id)
+        a.client.call("rpc", {"method": "nodes"}, status=401)
+        for path in ("/api/register", "/api/login", "/api/rpc"):
+            a.client.request(path, {}, status=404)
+        network = a.bootstrap()
         a.client.request("/api/tools", {"name": "nodes", "arguments": {}, "call_id": "human-call"}, status=401)
-        a.client.request("/api/pair", {"code": "invalid", "node_id": "unknown", "public_key": "00", "proof": "00"}, status=400)
-        passed("login, CSRF, Origin and scoped-tool boundaries")
+        passed("independent client/root identity, local bootstrap capability and encrypted authorization")
+
+        verify_channel_security(a)
+        passed("Noise target binding, tamper and replay reject on real Node channels")
 
         verify_maintenance(a)
         passed("private maintenance lease, write admission, startup health gate and disabled updates")
 
-        verify_browser_origins(a, password_a, [f"http://localhost:{a.port}", f"http://0.0.0.0:{a.port}"])
+        verify_browser_origins(a, [f"http://localhost:{a.port}", f"http://0.0.0.0:{a.port}"])
         a.stop()
         extra_origins = [f"http://192.0.2.10:{a.port}", "https://node.example"]
         a.configure(allowed_origins=extra_origins, allow_insecure_lan=True)
         a.start()
-        verify_browser_origins(a, password_a, extra_origins)
-        passed("local aliases and explicit entries permit authenticated writes; cross-entry requests are rejected", "real_http_origin_boundaries")
+        a.client.connect()
+        a.client.authenticate()
+        verify_browser_origins(a, extra_origins)
+        passed("local aliases and explicit entries validate Host/Origin without account cookies", "real_http_origin_boundaries")
 
-        b.pair(a, network, "owner_b", password_b)
-        c.pair(a, network, "owner_c", password_c)
-        c.configure(peers=[{"network_id": network, "url": b.url.replace("http:", "ws:") + "/peer"}])
+        b.pair(a, network)
+        c.pair(a, network)
         b.start()
         c.start()
-        b.client.login("owner_b", password_b)
-        c.client.login("owner_c", password_c)
-        wait_for("A routes to C through B", lambda: any(n["node_id"] == c.node_id and n["online"] for n in a.client.rpc("nodes")["nodes"]))
+        b.client.connect()
+        wait_for("B receives its independently paired client grant", lambda: b.client.authenticate())
+        c.client.connect()
+        wait_for("C receives its independently paired client grant", lambda: c.client.authenticate())
+        wait_for("A reaches C through the public relay", lambda: any(n["node_id"] == c.node_id and n["online"] for n in a.client.rpc("nodes")["nodes"]))
         require(len({a.node_id, b.node_id, c.node_id}) == 3, "nodes have distinct stable identities")
-        require(c.client.account["network_id"] == b.client.account["network_id"] == network, "all local accounts use paired network")
-        passed("three independent nodes pair and route over A-B-C WebSockets")
+        require(len({node.client.command("identity")["subject_id"] for node in (a, b, c)}) == 3,
+                "each client installation owns an independent identity")
+        require(c.client.network_id == b.client.network_id == network, "independent local clients use the same paired network")
+        passed("three independent nodes pair and route through a foreign public relay")
 
-        other = Client(a.url)
-        other_password = secrets.token_urlsafe(24)
-        other.request("/api/register", {"username": "separate", "password": other_password}, status=201)
-        other.login("separate", other_password)
-        require(other.account["network_id"] != network, "separate account gets separate network")
+        other = relay.client
+        other_network = relay.bootstrap()
+        require(other_network != network, "public relay owns an independent personal network")
+        report["topology"] = {"network_id": network, "nodes": [node.node_id for node in (a, b, c)],
+                              "relay_node_id": relay.node_id, "relay_network_id": other_network}
+        other.command("connect", url=a.url, node_id=a.node_id, connection="foreign")
+        other.call("authenticate", {"network_id": network}, connection="foreign", status=401)
+        other.call("rpc", {"method": "nodes"}, connection="foreign", status=401)
         conversation, task = "acceptance-conversation", "acceptance-task"
         a.client.rpc("create_conversation", conversation_id=conversation, title="Failover acceptance")
         a.client.rpc("create_task", conversation_id=conversation, task_id=task, title="Explicit acceptance", goal="Keep history across node changes", acceptance="User accepts explicitly")
@@ -470,15 +875,27 @@ def acceptance(options):
         a.client.rpc("message", conversation_id=conversation, message_id="message-original", text="changed content", status=400)
         other.rpc("conversation", conversation_id=conversation, status=400)
         require(other.rpc("conversations")["conversations"] == [], "other network cannot list conversation")
-        foreign = request(other.account["network_id"], conversation, b, "foreign", "foreign", {"type": "open", "executor": "claude_code", "cwd": str(workspace)})
+        foreign = request(other_network, conversation, b, "foreign", "foreign", {"type": "open", "executor": "claude_code", "cwd": str(workspace)})
         dispatch(a.client, foreign, status=400)
         history = wait_for("shared message and task at C", lambda: shared_history(c.client, conversation, task))
         require(len([m for m in history["messages"] if m["message_id"] == "message-original"]) == 1, "message retry is idempotent")
-        passed("shared conversation sync and hosted-account network isolation")
+        passed("shared private history stays isolated from a separately owned public relay")
+        require(capture.payloads and not capture.errors, "relay path captured valid unmasked WebSocket records")
+        require(b"Keep this context after A disconnects." not in b"".join(capture.payloads),
+                "public relay cannot see the private message present on C")
+        with sqlite3.connect(f"file:{relay.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
+            require(connection.execute("SELECT COUNT(*) FROM events WHERE network_id=?", (network,)).fetchone()[0] == 0,
+                    "foreign relay stores no private business events")
+        report["relay_capture"] = {"frames": len(capture.payloads), "plaintext_canary_found": False}
+        passed("foreign relay transports protected history without plaintext context or private replicas")
+
+        verify_binding_race(a, b, c, network, conversation, workspace)
+        passed("concurrent schedulers obtain one task binding and the losing target accepts nothing")
 
         if not options.skip_codex:
             require(shutil.which(options.codex_bin) is not None or Path(options.codex_bin).is_file(), "Codex executable is available; use --skip-codex for fixture-only run")
-            native_open = request(network, conversation, b, "codex-native-open", "native-codex", {"type": "open", "executor": "codex", "cwd": str(workspace)}, task=task)
+            a.client.rpc("create_task", conversation_id=conversation, task_id="native-transport-task", title="Native transport", goal="Open one native thread without a model", acceptance="Native thread ID persists")
+            native_open = request(network, conversation, b, "codex-native-open", "native-codex", {"type": "open", "executor": "codex", "cwd": str(workspace)}, task="native-transport-task")
             dispatch(a.client, native_open)
             wait_for("real Codex native thread open", lambda: succeeded(a.client, b, "codex-native-open"))
             native = a.client.rpc("session", target_node=b.node_id, session_id="native-codex")
@@ -523,7 +940,7 @@ def acceptance(options):
         wait_for("C receives durable B result notification", lambda: any(n["notification_id"] == notification for n in c.client.rpc("notifications", client_id="phone")["notifications"]))
         wait_for("C receives live event stream update", lambda: len(stream.lines) > 0)
         after = c.client.rpc("conversation", conversation_id=conversation)
-        require(after["tasks"][0]["status"] != "accepted", "turn completion never accepts a task")
+        require(next(item for item in after["tasks"] if item["task_id"] == task)["status"] != "accepted", "turn completion never accepts a task")
         require(any(s["session_id"] == "fixture-main" for s in after["sessions"]), "C reads actual B execution state after A exits")
         require(len(invocations(run, "delayed")) == 1, "retries and imported history do not repeat execution")
         wait_for("large result blob replicated to C", lambda: verify_blobs(c, network) >= 1)
@@ -547,7 +964,8 @@ def acceptance(options):
         offline_gate.touch(mode=0o600)
         wait_for("B completes without any connected client", lambda: succeeded(b.client, b, "fixture-offline-send"))
         c.start()
-        c.client.login("owner_c", password_c)
+        c.client.connect()
+        c.client.authenticate()
         wait_for("persistent notification delivered after reconnect", lambda: any(n["notification_id"] == "result:fixture-offline-send:succeeded" for n in c.client.rpc("notifications", client_id="phone")["notifications"]))
         require(all(n["notification_id"] != notification for n in c.client.rpc("notifications", client_id="phone")["notifications"]), "client ACK remains durable after restart")
         passed("offline notifications replay after reconnect and per-client ACK persists", "real_nodes_with_stream_json_fixture")
@@ -561,7 +979,8 @@ def acceptance(options):
         require(state["status"] == "busy", "running execution postpones updates")
         b.stop()
         b.start()
-        b.client.login("owner_b", password_b)
+        b.client.connect()
+        b.client.authenticate()
         record = wait_for("running operation recovers as Unknown", lambda: unknown_record(b.client, b, unknown["operation_id"]))
         require(record["state"] == "unknown", "restart does not report success")
         lease, state = maintenance(b, "acquire")
@@ -578,16 +997,23 @@ def acceptance(options):
         passed("execution interruption preserves Unknown and reserves resources until human resolution", "real_nodes_with_stream_json_fixture")
 
         a.start()
-        a.client.login("owner_a", password_a)
+        a.client.connect()
+        a.client.authenticate()
         wait_for("owner reconnects to B", lambda: any(n["node_id"] == b.node_id and n["online"] for n in a.client.rpc("nodes")["nodes"]))
-        a.client.rpc("revoke", node_id=c.node_id)
+        proposal = a.client.call("prepare_revoke", {"subject_id": c.node_id})
+        proposal["event"]["signature"] = a.client.command("sign", **proposal["signing"])
+        a.client.call("revoke", {"event": proposal["event"]})
         wait_for("B installs device revocation", lambda: any(n["node_id"] == c.node_id and n["revoked"] for n in b.client.rpc("nodes")["nodes"]))
         wait_for("known revocation rejects C remote access", lambda: revoked_remote(c.client, b))
         a.client.rpc("operation", target_node=c.node_id, operation_id="anything", status=400)
         require(len(invocations(run)) == 3, "sync/restart/revocation never creates extra executor calls")
-        verify_no_model_budget(nodes)
         passed("known revocation rejects further cross-node data and execution access")
-        passed("ordinary notifications and history replay use no management-model budget")
+        recovery_client = Client(a.url, helper, module)
+        verify_recovery(a, recovery_client, [a, b, c], network)
+        passed("encrypted recovery rejects wrong or missing material and restores independent management without losing history")
+        verify_no_model_budget(nodes)
+        require(len(invocations(run)) == 3, "recovery never replays previously accepted execution")
+        passed("ordinary notifications, history replay and identity recovery use no management-model budget")
         require(file_sha256(binary) == report["binary_sha256"], "binary did not change during acceptance")
         report["status"] = "passed"
         report["fixture_invocations"] = len(invocations(run))
@@ -600,8 +1026,13 @@ def acceptance(options):
     finally:
         if stream:
             stream.close()
+        if recovery_client:
+            recovery_client.close()
+        if capture:
+            capture.close()
         for node in reversed(nodes):
             node.stop()
+            node.client.close()
         private_json(run / "report.json", report)
 
 
@@ -630,6 +1061,7 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--binary", type=Path, required=True)
         parser.add_argument("--artifacts", type=Path, required=True)
+        parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "crates/node/web/generated/vibeface_secure.js")
         parser.add_argument("--codex-bin", default="codex")
         parser.add_argument("--skip-codex", action="store_true", help="omit real Codex transport checks and report that omission")
         arguments = parser.parse_args()
