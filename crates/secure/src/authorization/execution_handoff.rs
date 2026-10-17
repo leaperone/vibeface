@@ -877,7 +877,7 @@ impl VerifiedPolicySet {
         usage.record_event_signature(&handoff.task_creation, task.event(), task_admission)?;
         usage.record_event_signature(&handoff.project_dispatch, &dispatch, &proof)?;
         usage.record_binding(&binding)?;
-        let mut verified = VerifiedProjectExecutionSource {
+        let verified = VerifiedProjectExecutionSource {
             capsule_hash: statement.capsule_hash,
             usage,
         };
@@ -2111,6 +2111,9 @@ pub struct VerifiedExecutionTerminalReconciliation {
     authorization: VerifiedExecutionResolution,
 }
 impl VerifiedExecutionTerminalReconciliation {
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        self.authorization.proof_usage()
+    }
     pub fn resolver(&self) -> &VerifiedAuthorization {
         self.authorization.resolver()
     }

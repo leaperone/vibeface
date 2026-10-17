@@ -5,7 +5,7 @@ use crate::{
     model::{Event, EventBody, ExecutionSession, OperationRequest, OperationState},
     store::{
         Store, StoredEvent, canonical_resource, check_execution_resources_in,
-        check_execution_session_in, load_events_from,
+        check_execution_session_in,
     },
 };
 use anyhow::{Context, Result, ensure};
@@ -977,6 +977,37 @@ fn signed_receipt(
     Ok(receipt)
 }
 
+pub(crate) fn public_execution_result(mut value: Value, native: Option<&str>) -> Value {
+    fn clean(value: &mut Value, native: Option<&str>) {
+        match value {
+            Value::Object(fields) => {
+                for key in ["native_session_id", "threadId", "thread_id"] {
+                    fields.remove(key);
+                }
+                for value in fields.values_mut() {
+                    clean(value, native);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    clean(value, native);
+                }
+            }
+            Value::String(text) if native.is_some_and(|native| native == text) => {
+                *value = Value::Null
+            }
+            Value::String(text) => {
+                if let Some(native) = native.filter(|native| !native.is_empty()) {
+                    *text = text.replace(native, "[private session]");
+                }
+            }
+            _ => {}
+        }
+    }
+    clean(&mut value, native);
+    value
+}
+
 fn dto(
     connection: &Connection,
     identity: &LocalIdentity,
@@ -1808,10 +1839,14 @@ impl Store {
         let result = keys
             .into_iter()
             .map(|(execution, original, operation)| {
-                let stored = stored_from(&tx, &execution, &original, &operation)?
-                    .context("recovery handoff disappeared")?;
-                reconstruct_handoff(&tx, &self.policy, &stored)?;
-                dto(&tx, identity, &stored, now_ms)
+                let verification =
+                    vibeface_secure::signature_verification::SignatureVerification::new();
+                verification.run(|| {
+                    let stored = stored_from(&tx, &execution, &original, &operation)?
+                        .context("recovery handoff disappeared")?;
+                    reconstruct_handoff(&tx, &self.policy, &stored)?;
+                    dto(&tx, identity, &stored, now_ms)
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         tx.commit()?;
@@ -1845,6 +1880,24 @@ impl Store {
             identity.public_key_hex()? == stored.wire.handoff.target_public_key.as_str(),
             "completion signer is not this executor"
         );
+        let dispatch: Event =
+            serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
+        let local_session = session_from(
+            &tx,
+            execution,
+            original,
+            dispatch.resource_id.as_str(),
+            &stored.request.target_node,
+            &stored.request.session_id,
+        )?;
+        let native = session
+            .and_then(|session| session.native_session_id.as_deref())
+            .or_else(|| {
+                local_session
+                    .as_ref()
+                    .and_then(|(session, _)| session.native_session_id.as_deref())
+            });
+        result = public_execution_result(result, native);
         if stored.state.terminal() {
             ensure!(
                 stored.state == state && stored.result == result,
@@ -1874,8 +1927,6 @@ impl Store {
                 result = json!({"reason":"execution authorization lease is unavailable","observed_result":result});
             }
         }
-        let dispatch: Event =
-            serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
         if let Some(updated) = session {
             let (previous, binding) = session_from(
                 &tx,
@@ -2600,7 +2651,7 @@ pub(crate) fn validate_execution_handoff_storage(
     for (execution, original, operation) in keys {
         let stored = stored_from(connection, &execution, &original, &operation)?
             .context("stored handoff disappeared")?;
-        let admission = reconstruct_handoff(connection, policy, &stored)?;
+        reconstruct_handoff(connection, policy, &stored)?;
         verify_challenge_record(connection, &stored.wire, &stored.admission, true)?;
         let nonce: (String, String, String, String, String) = connection.query_row(
             "SELECT device_id,nonce,invocation_hash,body_hash,operation_id FROM execution_handoff_nonces WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",
@@ -2703,6 +2754,7 @@ pub(crate) mod tests {
         binding::{self, TaskBinding},
         identity::test_support::{TestNetwork, now},
         model::{AdmissionProof, EventCause, WIRE_VERSION},
+        store::load_events_from,
     };
     use anyhow::Result;
     use vibeface_secure::{Identity, authorization::*};
@@ -4880,7 +4932,14 @@ pub(crate) mod tests {
                 .renew_execution_handoff(&fixture.executor.node, &auth, &proof, now() + 5)
                 .is_err()
         );
-        let result = json!({"operation_id":"original-operation","native_session_id":"provider-keeps-original-id"});
+        fixture.store.persist_execution_handoff_native(
+            fixture.executor.space.as_str(),
+            &fixture.wire.handoff.source_statement()?.project,
+            "original-operation",
+            "provider-keeps-original-id",
+            now() + 5,
+        )?;
+        let result = json!({"operation_id":"original-operation","native_session_id":"provider-keeps-original-id","message":"process provider-keeps-original-id completed","events":[{"threadId":"provider-keeps-original-id","text":"done"}]});
         let completed = fixture.store.finish_execution_handoff(
             &fixture.executor.node,
             fixture.executor.space.as_str(),
@@ -4892,6 +4951,20 @@ pub(crate) mod tests {
             now() + 6,
         )?;
         assert_eq!(completed.state, OperationState::Succeeded);
+        assert!(
+            verify_execution_handoff_receipt_signature(
+                &fixture.wire,
+                completed.receipt.as_ref().unwrap(),
+                &result
+            )
+            .is_err()
+        );
+        let result = completed.result.clone();
+        assert_eq!(
+            result,
+            json!({"operation_id":"original-operation","message":"process [private session] completed","events":[{"text":"done"}]})
+        );
+        assert!(!serde_json::to_string(&result)?.contains("provider-keeps-original-id"));
         verify_execution_handoff_receipt_signature(
             &fixture.wire,
             completed.receipt.as_ref().unwrap(),
