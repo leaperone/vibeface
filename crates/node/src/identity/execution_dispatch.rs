@@ -272,6 +272,7 @@ impl Store {
             "target discovery refers to another Project task"
         );
         let task_ref = EventRef::parse(&creation.hash)?;
+        let binding = self.task_binding(session.space_id.as_str(), &creation.hash)?;
         if let Some((current_task, current_ref)) = &origin.task {
             ensure!(
                 current_task == task_id && current_ref == &task_ref,
@@ -281,16 +282,17 @@ impl Store {
             let crate::model::EventCause::Invocation { admission } = &event.cause else {
                 anyhow::bail!("SDK task has no admitted creation");
             };
-            ensure!(
-                admission.invocation.payload.actor == Actor::Service(session.service.clone())
+            let own_sdk = admission.invocation.payload.actor == Actor::Service(session.service.clone())
                     && admission.invocation.payload.context.sdk_session.as_ref()
                         == Some(&session.sdk_session)
                     && admission.source_body["parent_invocation"].as_str()
-                        == Some(session.parent_invocation.as_str()),
-                "initial SDK discovery can select only its own created task"
-            );
+                        == Some(session.parent_invocation.as_str());
+            let account_bound = matches!(admission.invocation.payload.actor,Actor::Account(_))
+                && admission.invocation.payload.actor == session.initiator
+                && binding.is_some();
+            ensure!(own_sdk || account_bound,
+                "initial SDK discovery requires its own task or its initiator's confirmed binding");
         }
-        let binding = self.task_binding(session.space_id.as_str(), &creation.hash)?;
         if let Some(binding) = &binding {
             self.verify_historical_binding(binding)?;
             ensure!(
