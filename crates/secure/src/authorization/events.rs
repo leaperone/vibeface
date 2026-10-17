@@ -493,6 +493,17 @@ mod tests {
         let (event, identity) = fixture();
         let envelope = sign_bytes(serde_json::to_string(&event).unwrap(), &identity);
         let verified = verify(&event, &envelope, &identity).unwrap();
+        if let Ok(path) = std::env::var("VIBEFACE_EVENT_VECTOR_PATH") {
+            std::fs::write(
+                path,
+                serde_json::to_vec(&serde_json::json!({
+                    "envelope":envelope,"space":event.network_id,"resource":event.resource_id,
+                    "key":identity.public_key_hex(),"context_hash":verified.context_hash(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
         assert_eq!(verified.event(), &event);
         assert_eq!(verified.envelope(), &envelope);
         assert_eq!(verified.hash(), envelope.hash);
