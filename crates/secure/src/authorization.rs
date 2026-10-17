@@ -666,6 +666,7 @@ impl Action {
             self,
             Self::ConversationRead
                 | Self::OperationStatusRead
+                | Self::OperationReconcile
                 | Self::AttachmentRead
                 | Self::Export
                 | Self::NotificationRead

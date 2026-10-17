@@ -1039,6 +1039,77 @@ pub(crate) mod tests {
                 .await
                 .is_err()
         );
+        let request = queued(&network, &node, "reconcile-only", "codex").await?;
+        claim(&network, &node, &request).await?;
+        node.finish(
+            &request,
+            OperationState::Unknown,
+            json!({"error":"unknown outcome"}),
+        )
+        .await?;
+        let before = operation(&network, &node, &request.operation_id).await?;
+        let snapshot = {
+            let store = node.store.lock().await;
+            (
+                serde_json::to_value(store.context(
+                    network.space.as_str(),
+                    "conversation",
+                    &[],
+                )?)?,
+                store.connection.query_row(
+                    "SELECT count(*) FROM authorization_nonces",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )?,
+                store.connection.query_row(
+                    "SELECT count(*) FROM resource_reservations",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )?,
+            )
+        };
+        let mut body = network.body("reconcile", "conversation");
+        body["target_node"] = json!(request.target_node);
+        body["operation_id"] = json!(request.operation_id);
+        let access = access(&network, &node, &body).await?;
+        assert_eq!(access.freshness.challenge.stage, CheckStage::RemoteRead);
+        let changes = node.store.lock().await.connection.total_changes();
+        let observed = node.rpc(access, body).await?;
+        assert_eq!(observed["operation"]["state"], "unknown");
+        let store = node.store.lock().await;
+        assert_eq!(
+            store
+                .operation(network.space.as_str(), &request.operation_id)?
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(store.context(network.space.as_str(), "conversation", &[])?)?,
+            snapshot.0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM authorization_nonces", [], |row| row
+                    .get::<_, u64>(
+                    0
+                ))?,
+            snapshot.1
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT count(*) FROM resource_reservations",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            snapshot.2
+        );
+        assert_eq!(
+            store.connection.total_changes(),
+            changes,
+            "reconciliation changed persistent state"
+        );
+        drop(store);
         assert!(node._codex_process.lock().await.is_none());
         Ok(())
     }
@@ -4618,16 +4689,7 @@ impl Runtime {
                     Some("completed" | "failed" | "interrupted")
                 )
             {
-                self.finish(
-                    &operation.request,
-                    if turn["status"] == "completed" {
-                        OperationState::Succeeded
-                    } else {
-                        OperationState::Failed
-                    },
-                    json!({"reconciled_turn":turn}),
-                )
-                .await?;
+                actual["reconciled_turn"] = turn;
             }
         }
         Ok(
