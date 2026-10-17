@@ -789,7 +789,10 @@ mod tests {
         let mut f = Fixture::new()?;
         let (prepared, request) = f.commit_request()?;
         let response = f.source_commit(&request, now())?;
-        assert_eq!(f.source_commit(&request, now() + 200_000)?, response);
+        assert_eq!(
+            ObjectHash::body(&f.source_commit(&request, now() + 200_000)?)?,
+            ObjectHash::body(&response)?
+        );
         let result = cross_node::finish_cross_node_recovery_commit(
             &prepared,
             &serde_json::to_string(&response["committed"])?,
@@ -879,14 +882,14 @@ mod tests {
         let mut reopened_source = Store::open(source_path)?;
         let mut reopened_target = Store::open(target_path)?;
         assert_eq!(
-            reopened_source.cross_node_recovery_command(
+            ObjectHash::body(&reopened_source.cross_node_recovery_command(
                 &f.network.node,
                 &f.next_client.public_key_hex(),
                 "cross_node_recovery_commit",
                 &request,
                 now() + 200_000
-            )?,
-            response
+            )?)?,
+            ObjectHash::body(&response)?
         );
         assert_eq!(
             reopened_target.cross_node_recovery_command(
@@ -1068,7 +1071,10 @@ mod tests {
         let mut changed = request.clone();
         changed["pins"][0]["minimum_head"]["sequence"] = json!(999);
         assert!(f.source_commit(&changed, now() + 200_000).is_err());
-        assert_eq!(f.source_commit(&request, now() + 200_000)?, response);
+        assert_eq!(
+            ObjectHash::body(&f.source_commit(&request, now() + 200_000)?)?,
+            ObjectHash::body(&response)?
+        );
         let committed = &response["committed"];
         let mut forged = committed.clone();
         forged["receipt"]["payload"]["input_hash"] = json!(ObjectHash::body(&"forged transition")?);
