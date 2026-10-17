@@ -532,36 +532,66 @@ fn reconstruct_handoff(
     )?)
 }
 
+fn lease_checkpoint_key(
+    wire: &SignedExecutionHandoff,
+    proof: &ExecutionHandoffFreshness,
+) -> Result<String> {
+    Ok(format!(
+        "execution-handoff-lease:{}:{}",
+        wire.hash()?,
+        proof.challenge.hash()?
+    ))
+}
+
 fn verified_lease_deadline(
     connection: &Connection,
-    policy: &PolicyState,
+    _policy: &PolicyState,
     stored: &StoredHandoff,
+    current: Option<&VerifiedExecutionHandoff>,
+    next: Option<&ExecutionHandoffFreshness>,
 ) -> Result<u64> {
     let (lease, at, deadline) = stored
         .lease
         .as_ref()
         .context("handoff has no execution lease")?;
-    ensure!(
-        *at >= stored.admitted_at_ms
-            && matches!(lease.challenge.stage, CheckStage::Start | CheckStage::Renew),
-        "invalid persisted handoff lease stage or time"
-    );
-    let admission = reconstruct_handoff(connection, policy, stored)?;
-    let historical = policy.historical(&lease.challenge.policies, *at)?;
-    let original = original_authorization_from(connection, policy, &historical, &stored.wire, *at)?;
-    let auth = historical.verify_execution_handoff(
+    verify_local_handoff_checkpoint(connection, stored)?;
+    let encoded: String = connection
+        .query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![
+                stored.wire.handoff.execution_resource.space.as_str(),
+                lease_checkpoint_key(&stored.wire, lease)?
+            ],
+            |row| row.get(0),
+        )
+        .context("executor lease has no immutable checkpoint")?;
+    let receipt: Signed<ExecutionHandoffLeaseReceipt> = serde_json::from_str(&encoded)?;
+    let mut usage = verify_execution_handoff_lease_checkpoint(
         &stored.wire,
-        &original,
-        &stored.transport,
-        Some(&admission),
+        &stored.admission_receipt,
+        lease,
         *at,
+        *deadline,
+        &receipt,
     )?;
-    let freshness = historical.verify_execution_handoff_freshness(&auth, lease, *at)?;
-    verify_challenge_record(connection, &stored.wire, lease, true)?;
-    ensure!(
-        freshness.expires_at_ms() == *deadline,
-        "persisted handoff lease deadline changed"
-    );
+    let admitted = verify_execution_handoff_admission_checkpoint(
+        &stored.wire,
+        &stored.admission_receipt,
+        &stored.admission,
+        &StoredTransport::from(&stored.transport),
+        stored.admitted_at_ms,
+    )?;
+    usage.merge(admitted.proof_usage());
+    if let Some(current) = current {
+        usage.merge(current.proof_usage());
+    }
+    if let Some(next) = next {
+        usage.record_metadata(&next.challenge)?;
+        for receipt in &next.receipts {
+            usage.record_signed(receipt)?;
+        }
+    }
+    usage.enforce_limits()?;
     Ok(*deadline)
 }
 
@@ -1576,9 +1606,7 @@ impl Store {
         }
         let deadline =
             consume_freshness_in(&tx, &self.policy, auth, proof, CheckStage::Start, now_ms)?;
-        save_lease_in(
-            &tx, &execution, &original, &operation, proof, now_ms, deadline,
-        )?;
+        save_lease_in(&tx, identity, auth, proof, now_ms, deadline)?;
         ensure!(tx.execute("UPDATE execution_handoffs SET state='running' WHERE execution_space_id=? AND original_space_id=? AND operation_id=? AND state='accepted'",
             params![execution, original, operation])? == 1, "execution handoff was already claimed");
         let stored = stored_from(&tx, &execution, &original, &operation)?
@@ -1590,6 +1618,7 @@ impl Store {
 
     pub fn renew_execution_handoff(
         &mut self,
+        identity: &LocalIdentity,
         auth: &VerifiedExecutionHandoff,
         proof: &ExecutionHandoffFreshness,
         now_ms: u64,
@@ -1605,14 +1634,13 @@ impl Store {
         ensure!(
             stored.wire == *auth.wire()
                 && stored.state == OperationState::Running
-                && now_ms < verified_lease_deadline(&tx, &self.policy, &stored)?,
+                && now_ms
+                    < verified_lease_deadline(&tx, &self.policy, &stored, Some(auth), Some(proof))?,
             "only a running handoff with a live lease may renew"
         );
         let deadline =
             consume_freshness_in(&tx, &self.policy, auth, proof, CheckStage::Renew, now_ms)?;
-        save_lease_in(
-            &tx, &execution, &original, &operation, proof, now_ms, deadline,
-        )?;
+        save_lease_in(&tx, identity, auth, proof, now_ms, deadline)?;
         tx.commit()?;
         Ok(deadline)
     }
@@ -1671,7 +1699,7 @@ impl Store {
         .context("unknown execution handoff")?;
         ensure!(
             stored.state == OperationState::Running
-                && now_ms < verified_lease_deadline(&tx, &self.policy, &stored)?,
+                && now_ms < verified_lease_deadline(&tx, &self.policy, &stored, Some(&auth), None)?,
             "native session update requires a running handoff and live lease"
         );
         check_policy_heads_in(&tx, self.policy.verified(), auth.original(), now_ms)?;
@@ -1835,7 +1863,8 @@ impl Store {
             "handoff was not running or requires an explicit reconciliation decision"
         );
         if stored.state == OperationState::Running && state.terminal() {
-            let lease_valid = now_ms < verified_lease_deadline(&tx, &self.policy, &stored)?;
+            let lease_valid = now_ms
+                < verified_lease_deadline(&tx, &self.policy, &stored, auth.as_ref().ok(), None)?;
             if let Ok(auth) = &auth {
                 check_policy_heads_in(&tx, self.policy.verified(), auth.original(), now_ms)?;
                 check_policy_heads_in(&tx, self.policy.verified(), auth.submission(), now_ms)?;
@@ -2501,15 +2530,56 @@ impl Store {
 
 fn save_lease_in(
     tx: &Transaction<'_>,
-    execution: &str,
-    original: &str,
-    operation: &str,
+    identity: &LocalIdentity,
+    auth: &VerifiedExecutionHandoff,
     proof: &ExecutionHandoffFreshness,
     now_ms: u64,
     deadline: u64,
 ) -> Result<()> {
-    tx.execute("UPDATE execution_handoffs SET lease_challenge=?,lease_receipts=?,lease_verified_at_ms=?,lease_deadline_ms=? WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",
-        params![serde_json::to_string(&proof.challenge)?, serde_json::to_string(&proof.receipts)?, now_ms, deadline, execution, original, operation])?;
+    let (execution, original, operation) = scope(auth.wire())?;
+    let stored = stored_from(tx, &execution, &original, &operation)?
+        .context("lease acceptance checkpoint disappeared")?;
+    ensure!(
+        identity.public_key_hex()? == stored.wire.handoff.target_public_key.as_str(),
+        "lease signer is not this executor"
+    );
+    let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
+        .map_err(anyhow::Error::msg)?;
+    let receipt = Signed::sign(
+        ExecutionHandoffLeaseReceipt::new(
+            &stored.wire,
+            &stored.admission_receipt,
+            proof,
+            now_ms,
+            deadline,
+        )?,
+        &signer,
+    )?;
+    let mut usage = verify_execution_handoff_lease_checkpoint(
+        &stored.wire,
+        &stored.admission_receipt,
+        proof,
+        now_ms,
+        deadline,
+        &receipt,
+    )?;
+    usage.merge(auth.proof_usage());
+    usage.record_metadata(&proof.challenge)?;
+    for receipt in &proof.receipts {
+        usage.record_signed(receipt)?;
+    }
+    usage.enforce_limits()?;
+    tx.execute(
+        "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
+        params![
+            execution,
+            lease_checkpoint_key(&stored.wire, proof)?,
+            serde_json::to_string(&receipt)?
+        ],
+    )?;
+    ensure!(tx.execute("UPDATE execution_handoffs SET lease_challenge=?,lease_receipts=?,lease_verified_at_ms=?,lease_deadline_ms=? WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",
+        params![serde_json::to_string(&proof.challenge)?, serde_json::to_string(&proof.receipts)?, now_ms, deadline, execution, original, operation])? == 1,
+        "lease operation disappeared");
     Ok(())
 }
 
@@ -2546,29 +2616,10 @@ pub(crate) fn validate_execution_handoff_storage(
                 ),
             "stored handoff invocation nonce binding changed"
         );
-        if let Some((lease, at, deadline)) = &stored.lease {
-            ensure!(
-                *at >= stored.admitted_at_ms
-                    && matches!(lease.challenge.stage, CheckStage::Start | CheckStage::Renew),
-                "stored handoff lease has an invalid stage or time"
-            );
-            let historical = policy.historical(&lease.challenge.policies, *at)?;
-            let original_auth =
-                original_authorization_from(connection, policy, &historical, &stored.wire, *at)?;
-            let auth = historical.verify_execution_handoff(
-                &stored.wire,
-                &original_auth,
-                &stored.transport,
-                Some(&admission),
-                *at,
-            )?;
-            let freshness = historical.verify_execution_handoff_freshness(&auth, lease, *at)?;
-            ensure!(
-                freshness.expires_at_ms() == *deadline,
-                "stored handoff lease deadline changed"
-            );
-            verify_challenge_record(connection, &stored.wire, lease, true)?;
+        if stored.lease.is_some() {
+            verified_lease_deadline(connection, policy, &stored, None, None)?;
         }
+
         ensure!(
             !matches!(
                 stored.state,
@@ -4411,6 +4462,72 @@ pub(crate) mod tests {
             Some("native-stable")
         );
         let renewal = fixture.freshness(CheckStage::Renew, now() + 6)?;
+        let stored = stored_from(
+            &fixture.store.connection,
+            fixture.executor.space.as_str(),
+            fixture.project.space.as_str(),
+            "original-operation",
+        )?
+        .unwrap();
+        let lease = &stored.lease.as_ref().unwrap().0;
+        let key = lease_checkpoint_key(&fixture.wire, lease)?;
+        let encoded: String = fixture.store.connection.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![fixture.executor.space.as_str(), key],
+            |row| row.get(0),
+        )?;
+        let original_checkpoint: Signed<ExecutionHandoffLeaseReceipt> =
+            serde_json::from_str(&encoded)?;
+        let signer = Identity::from_secret_hex(&fixture.executor.node.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        for field in [
+            "wrong_c",
+            "handoff_hash",
+            "admission_receipt_hash",
+            "freshness_hash",
+            "verified_at_ms",
+            "deadline_ms",
+        ] {
+            let mut payload = serde_json::to_value(&original_checkpoint.payload)?;
+            if field.ends_with("_hash") {
+                payload[field] = json!(ObjectHash::body(&field)?);
+            }
+            if field == "verified_at_ms" {
+                payload[field] = json!(original_checkpoint.payload.verified_at_ms + 1);
+            }
+            if field == "deadline_ms" {
+                payload[field] = json!(original_checkpoint.payload.deadline_ms + 1);
+            }
+            let altered = Signed::sign(
+                serde_json::from_value::<ExecutionHandoffLeaseReceipt>(payload)?,
+                if field == "wrong_c" {
+                    &fixture.project.client
+                } else {
+                    &signer
+                },
+            )?;
+            fixture.store.connection.execute(
+                "UPDATE local_values SET value=? WHERE space_id=? AND key=?",
+                params![
+                    serde_json::to_string(&altered)?,
+                    fixture.executor.space.as_str(),
+                    key
+                ],
+            )?;
+            let before = fixture.store.connection.total_changes();
+            assert!(
+                fixture
+                    .store
+                    .renew_execution_handoff(&fixture.executor.node, &auth, &renewal, now() + 7)
+                    .is_err(),
+                "accepted replaced lease checkpoint field {field}"
+            );
+            assert_eq!(before, fixture.store.connection.total_changes());
+        }
+        fixture.store.connection.execute(
+            "UPDATE local_values SET value=? WHERE space_id=? AND key=?",
+            params![encoded, fixture.executor.space.as_str(), key],
+        )?;
         fixture.store.connection.execute(
             "UPDATE execution_handoffs SET lease_deadline_ms=lease_deadline_ms+1",
             [],
@@ -4418,16 +4535,51 @@ pub(crate) mod tests {
         assert!(
             fixture
                 .store
-                .renew_execution_handoff(&auth, &renewal, now() + 7)
+                .renew_execution_handoff(&fixture.executor.node, &auth, &renewal, now() + 7)
                 .is_err()
         );
         fixture.store.connection.execute(
             "UPDATE execution_handoffs SET lease_deadline_ms=lease_deadline_ms-1",
             [],
         )?;
-        fixture
-            .store
-            .renew_execution_handoff(&auth, &renewal, now() + 7)?;
+        fixture.store.renew_execution_handoff(
+            &fixture.executor.node,
+            &auth,
+            &renewal,
+            now() + 7,
+        )?;
+        let new_key = lease_checkpoint_key(&fixture.wire, &renewal)?;
+        let new_checkpoint: String = fixture.store.connection.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![fixture.executor.space.as_str(), new_key],
+            |row| row.get(0),
+        )?;
+        fixture.store.connection.execute(
+            "UPDATE local_values SET value=? WHERE space_id=? AND key=?",
+            params![
+                serde_json::to_string(&original_checkpoint)?,
+                fixture.executor.space.as_str(),
+                new_key
+            ],
+        )?;
+        let before = fixture.store.connection.total_changes();
+        assert!(
+            fixture
+                .store
+                .persist_execution_handoff_native(
+                    fixture.executor.space.as_str(),
+                    &project,
+                    "original-operation",
+                    "native-stable",
+                    now() + 8
+                )
+                .is_err()
+        );
+        assert_eq!(before, fixture.store.connection.total_changes());
+        fixture.store.connection.execute(
+            "UPDATE local_values SET value=? WHERE space_id=? AND key=?",
+            params![new_checkpoint, fixture.executor.space.as_str(), new_key],
+        )?;
         validate_execution_handoff_storage(&fixture.store.connection, &fixture.store.policy)?;
         Ok(())
     }
@@ -4725,7 +4877,7 @@ pub(crate) mod tests {
         assert!(
             fixture
                 .store
-                .renew_execution_handoff(&auth, &proof, now() + 5)
+                .renew_execution_handoff(&fixture.executor.node, &auth, &proof, now() + 5)
                 .is_err()
         );
         let result = json!({"operation_id":"original-operation","native_session_id":"provider-keeps-original-id"});

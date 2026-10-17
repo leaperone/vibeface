@@ -356,6 +356,88 @@ impl SignedObject for ExecutionHandoffAdmissionReceipt {
     const DOMAIN: &'static str = "execution-handoff-admission-receipt-v2";
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionHandoffLeaseReceipt {
+    pub version: u16,
+    pub admission_receipt_hash: ObjectHash,
+    pub handoff_hash: ObjectHash,
+    pub freshness_hash: ObjectHash,
+    pub verified_at_ms: u64,
+    pub deadline_ms: u64,
+}
+impl sealed::Sealed for ExecutionHandoffLeaseReceipt {}
+impl SignedObject for ExecutionHandoffLeaseReceipt {
+    const DOMAIN: &'static str = "execution-handoff-lease-receipt-v2";
+}
+
+impl ExecutionHandoffLeaseReceipt {
+    pub fn new(
+        wire: &SignedExecutionHandoff,
+        admission: &Signed<ExecutionHandoffAdmissionReceipt>,
+        proof: &ExecutionHandoffFreshness,
+        verified_at_ms: u64,
+        deadline_ms: u64,
+    ) -> Result<Self> {
+        require(
+            matches!(proof.challenge.stage, CheckStage::Start | CheckStage::Renew)
+                && admission.payload.admitted_at_ms <= verified_at_ms
+                && proof.challenge.issued_at_ms <= verified_at_ms
+                && verified_at_ms < deadline_ms
+                && proof.receipts.len() <= MAX_POLICY_DOMAINS
+                && proof.challenge.policies.len() <= MAX_POLICY_DOMAINS
+                && deadline_ms
+                    == proof
+                        .receipts
+                        .iter()
+                        .map(|receipt| receipt.payload.expires_at_ms)
+                        .fold(proof.challenge.expires_at_ms, u64::min),
+            "invalid executor lease checkpoint interval",
+        )?;
+        Ok(Self {
+            version: AUTH_VERSION,
+            admission_receipt_hash: admission.hash()?,
+            handoff_hash: wire.hash()?,
+            freshness_hash: ObjectHash::body(proof)?,
+            verified_at_ms,
+            deadline_ms,
+        })
+    }
+}
+
+pub fn verify_execution_handoff_lease_checkpoint(
+    wire: &SignedExecutionHandoff,
+    admission: &Signed<ExecutionHandoffAdmissionReceipt>,
+    proof: &ExecutionHandoffFreshness,
+    verified_at_ms: u64,
+    deadline_ms: u64,
+    receipt: &Signed<ExecutionHandoffLeaseReceipt>,
+) -> Result<ExecutionProofUsage> {
+    receipt.verify_signature()?;
+    require(
+        receipt.issuer == wire.handoff.target_public_key
+            && receipt.payload
+                == ExecutionHandoffLeaseReceipt::new(
+                    wire,
+                    admission,
+                    proof,
+                    verified_at_ms,
+                    deadline_ms,
+                )?,
+        "executor lease checkpoint changed",
+    )?;
+    let mut usage = ExecutionProofUsage::default();
+    usage.record_signed(receipt)?;
+    usage.record_metadata(proof)?;
+    for receipt in &proof.receipts {
+        usage
+            .historical_wrappers
+            .insert(receipt.hash()?, canonical(receipt)?.len());
+    }
+    usage.enforce_limits()?;
+    Ok(usage)
+}
+
 impl ExecutionHandoffAdmissionReceipt {
     pub fn new(
         wire: &SignedExecutionHandoff,
@@ -464,6 +546,11 @@ pub struct VerifiedExecutionAdmission {
     handoff_hash: ObjectHash,
     submission: VerifiedAdmission,
     usage: ExecutionProofUsage,
+}
+impl VerifiedExecutionAdmission {
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
 }
 
 #[derive(Clone, Debug)]
