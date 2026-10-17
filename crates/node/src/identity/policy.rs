@@ -57,19 +57,25 @@ pub(crate) fn request_facts_from(
         .map(|request| request.conversation_id.clone())
         .or_else(|| body["conversation_id"].as_str().map(str::to_owned));
     if matches!(method, "operation" | "reconcile" | "resolve_unknown") {
-        let encoded: String = connection.query_row(
-            "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
-            params![space.as_str(), text("operation_id")?],
-            |row| row.get(0),
-        )?;
-        let operation: crate::model::OperationRequest = serde_json::from_str(&encoded)?;
-        if let Some(scope) = &conversation {
-            ensure!(
-                scope == &operation.conversation_id,
-                "operation conversation mismatch"
-            );
+        let encoded: Option<String> = connection
+            .query_row(
+                "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
+                params![space.as_str(), text("operation_id")?],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(encoded) = encoded {
+            let operation: crate::model::OperationRequest = serde_json::from_str(&encoded)?;
+            if let Some(scope) = &conversation {
+                ensure!(
+                    scope == &operation.conversation_id,
+                    "operation conversation mismatch"
+                );
+            }
+            conversation = Some(operation.conversation_id);
+        } else {
+            ensure!(method == "operation", "operation is unavailable");
         }
-        conversation = Some(operation.conversation_id);
     }
     if method == "ack" {
         let encoded: String = connection.query_row(
@@ -991,6 +997,13 @@ impl crate::runtime::Runtime {
                 &self.config.roots,
                 now_ms,
             ),
+            "recovery_context" => {
+                store.recovery_context(&self.identity, noise_public_key, params, now_ms)
+            }
+            "recovery_node_possession" => {
+                store.recovery_node_possession(&self.identity, noise_public_key, params, now_ms)
+            }
+            "recover" => store.recover_account(&self.identity, noise_public_key, params, now_ms),
             "authenticate" => store.authenticate_account(noise_public_key, params, now_ms),
             "device_directory" => {
                 let authenticated = store.authenticate_account(noise_public_key, params, now_ms)?;

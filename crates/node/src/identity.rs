@@ -7,6 +7,8 @@ pub(crate) mod event_authorization;
 pub(crate) mod journal;
 pub mod local;
 pub mod policy;
+pub(crate) mod recovery;
+pub mod services;
 pub mod webauthn;
 
 #[cfg(test)]

@@ -807,21 +807,27 @@ impl Store {
             .context("task creation envelope is missing")
     }
 
-    fn verify_binding_creation(&self, proof: &crate::binding::SignedBinding) -> Result<()> {
+    pub(crate) fn verify_binding_creation(
+        &self,
+        proof: &crate::binding::SignedBinding,
+    ) -> Result<()> {
         let binding = &proof.binding;
         let key = self.public_key(&binding.network_id, &binding.authority_node)?;
         crate::binding::verify_binding(proof, &key)?;
         self.verify_binding_task(binding, true)
     }
 
-    fn verify_historical_binding(&self, proof: &crate::binding::SignedBinding) -> Result<()> {
+    pub(crate) fn verify_historical_binding(
+        &self,
+        proof: &crate::binding::SignedBinding,
+    ) -> Result<()> {
         let binding = &proof.binding;
         let key = self.public_key(&binding.network_id, &binding.authority_node)?;
         crate::binding::verify_binding(proof, &key)?;
         self.verify_binding_task(binding, false)
     }
 
-    fn verify_binding_task(
+    pub(crate) fn verify_binding_task(
         &self,
         binding: &crate::binding::TaskBinding,
         require_current_executor: bool,
