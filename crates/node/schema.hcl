@@ -999,6 +999,9 @@ table "execution_handoffs" {
   column "admission_receipts" {
     type = text
   }
+  column "admission_receipt" {
+    type = text
+  }
   column "admitted_at_ms" {
     type = integer
   }
@@ -1057,6 +1060,9 @@ table "execution_handoffs" {
   index "handoffs_original_operation_once" {
     unique  = true
     columns = [column.original_space_id, column.operation_id]
+  }
+  check {
+    expr = "json_valid(admission_receipt)"
   }
   check {
     expr = "(admitted_at_ms >= 0)"
