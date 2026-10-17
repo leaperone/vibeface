@@ -178,7 +178,7 @@ pub fn authorization_action(
 
     Ok(match body["method"].as_str() {
         Some("context") if body["blob_hash"].is_string() => Action::AttachmentRead,
-        Some("conversations" | "conversation" | "context") => Action::ConversationRead,
+        Some("conversations" | "conversation" | "context" | "execution_share_request") => Action::ConversationRead,
         Some("nodes" | "session" | "operation") => Action::OperationStatusRead,
         Some("create_conversation") => Action::ConversationCreate,
         Some("bind_execution") => Action::ExecutionOpen,

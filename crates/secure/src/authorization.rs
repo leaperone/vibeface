@@ -8,6 +8,8 @@ pub use authenticator_management::{
 pub mod bootstrap;
 pub mod directory;
 pub mod execution_handoff;
+pub mod execution_service;
+pub mod remote_share;
 pub mod enrollment;
 pub mod passkey_node;
 pub mod projection;
