@@ -28,14 +28,14 @@ while (($#)); do
 done
 
 cd "$repo"
-build_args=(build --release -p vibeface-node --locked)
+build_args=(build --release -p vibeface --locked)
 target_dir="${CARGO_TARGET_DIR:-$repo/target}"
 if [[ -n "$target" ]]; then
   build_args+=(--target "$target")
-  binary="$target_dir/$target/release/vibeface-node"
+  binary="$target_dir/$target/release/vibeface"
 else
   target="$(rustc -vV | sed -n 's/^host: //p')"
-  binary="$target_dir/release/vibeface-node"
+  binary="$target_dir/release/vibeface"
 fi
 crypto="$repo/crates/node/web/generated"
 [[ -s "$crypto/vibeface_secure.js" && -s "$crypto/vibeface_secure_bg.wasm" ]] || {
@@ -61,11 +61,11 @@ mkdir -p "$output"
 output="$(cd "$output" && pwd)"
 staging="$(mktemp -d "$output/.vibeface-package.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
-name="vibeface-node-$version-$target"
+name="vibeface-$version-$target"
 package="$staging/$name"
 mkdir -p "$package/sidecars" "$package/scripts" "$package/web"
-cp "$binary" "$package/vibeface-node"
-printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":1,"data_epoch":2}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
+cp "$binary" "$package/vibeface"
+printf '{"version":"%s","target":"%s","source_commit":%s,"update_protocol":2,"data_epoch":2}\n' "$version" "$target" "$source_commit" > "$package/BUILD-INFO.json"
 cp "$crypto/vibeface_secure.js" "$crypto/vibeface_secure_bg.wasm" "$package/web/"
 cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
 cp "$repo/README.md" "$package/"

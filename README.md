@@ -1,6 +1,6 @@
 # Vibeface
 
-在自己的 Mac 或 Linux 设备上运行 `vibeface-node`，通过网页与管理 Agent 聊天，让它把任务交给指定设备上的编码 Agent。会话、工单和执行记录在本人授权的节点间同步，换一个入口也能查询原来的工作。
+在自己的 Mac 或 Linux 设备上运行 `vibeface`，通过网页与管理 Agent 聊天，让它把任务交给指定设备上的编码 Agent。会话、工单和执行记录在本人授权的节点间同步，换一个入口也能查询原来的工作。
 
 ```mermaid
 flowchart LR
@@ -25,7 +25,7 @@ Rust 核心负责认证、路由、DAG 同步、SQLite 存储、执行去重和�
 
 ## 安装与开始
 
-主程序是 Rust 二进制 CLI `vibeface-node`。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64（glibc），运行网页不需要 Node.js。首次安装选最新正式版：
+主程序是 Rust 二进制 CLI `vibeface`。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64（glibc），运行网页不需要 Node.js。首次安装选最新正式版：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash
@@ -37,7 +37,7 @@ curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh 
 curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --channel nightly
 ```
 
-以上入口在本 PR 合并后可用。安装器验证完整包及 SHA256，不创建身份、启动服务或配置自动更新；没有 Stable 时也不会自动改装 Nightly。安装、初始化和通过 CLI 管理节点见 [安装说明](docs/install.md)。现有安装请使用 `vibeface-node update apply`，不要重复运行首次安装器。
+以上入口在本 PR 合并后可用。安装器验证完整包及 SHA256，不创建身份、启动服务或配置自动更新；没有 Stable 时也不会自动改装 Nightly。安装、初始化和通过 CLI 管理节点见 [安装说明](docs/install.md)。现有安装请使用 `vibeface update apply`，不要重复运行首次安装器。
 
 ## 从源码开始
 
@@ -47,17 +47,17 @@ curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh 
 rustup target add wasm32-unknown-unknown
 bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
-cargo build --release -p vibeface-node --locked
-./target/release/vibeface-node init \
+cargo build --release -p vibeface --locked
+./target/release/vibeface init \
 	--data-dir "$HOME/.vibeface" \
 	--root /absolute/path/to/projects
-./target/release/vibeface-node serve --data-dir "$HOME/.vibeface"
+./target/release/vibeface serve --data-dir "$HOME/.vibeface"
 ```
 
 `init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、`identity.sqlite3`、一次性 `bootstrap.json` 和 `data-epoch.json`（当前数据格式 epoch 为 2），不注册网站账号，也不保存个人根私钥。业务历史在进程打开后写入同目录的 `node.sqlite3`。`serve` 和 `pair` 用目录锁独占该目录。
 
 ```sh
-./target/release/vibeface-node access --data-dir "$HOME/.vibeface"
+./target/release/vibeface access --data-dir "$HOME/.vibeface"
 ```
 
 在自己信任的浏览器打开 `access` 打印的链接，填写此浏览器的设备名称，核对个人网络指纹，并保存加密恢复包。保存密钥的页面需要安全上下文，推荐 `http://localhost:4790`。之后自动核验设备指纹和成员授权，不使用账号密码。可以创建会话、工单，查看设备和执行记录。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。Node 默认尝试启动私有 Codex App Server；未安装 Codex 时，网页可用不代表执行器可用。

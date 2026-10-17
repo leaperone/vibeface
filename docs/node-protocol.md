@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`。产品入口为 `vibeface-node`，共享协议以 `crates/node/src/model.rs` 为准。本文描述 Node HTTP、对等传输、事件和执行账本。
+协议版本为 `1`。产品入口为 `vibeface`，共享协议以 `crates/node/src/model.rs` 为准。本文描述 Node HTTP、对等传输、事件和执行账本。
 
 ## 身份与数据范围
 

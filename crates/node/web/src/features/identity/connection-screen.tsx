@@ -61,7 +61,7 @@ export function ConnectionScreen() {
     </section>
     <section className={panel} aria-labelledby="invitation-title">
       <h2 id="invitation-title" className="font-semibold">初始化或配对新浏览器</h2>
-      <p className="text-sm text-muted-foreground">首次创建网络，请在节点终端运行 vibeface-node access，粘贴其输出。已有网络，请从管理设备取得一次性邀请。</p>
+      <p className="text-sm text-muted-foreground">首次创建网络，请在节点终端运行 vibeface access，粘贴其输出。已有网络，请从管理设备取得一次性邀请。</p>
       <form className="space-y-3" onSubmit={event => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {

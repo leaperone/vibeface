@@ -1,16 +1,16 @@
 # 部署与使用 Node
 
-本文使用 `vibeface-node` 管理自己的设备。HTTP 与同步协议见 [协议参考](node-protocol.md)。
+本文使用 `vibeface` 管理自己的设备。HTTP 与同步协议见 [协议参考](node-protocol.md)。
 
 ## 安装制品
 
-选择对应操作系统与 CPU 架构的 `vibeface-node-<version>-<target>.tar.gz`，先校验同名 `.sha256` 文件，再解压。
+选择对应操作系统与 CPU 架构的 `vibeface-<version>-<target>.tar.gz`，先校验同名 `.sha256` 文件，再解压。
 
 ```sh
-shasum -a 256 -c vibeface-node-<version>-<target>.tar.gz.sha256
-tar -xzf vibeface-node-<version>-<target>.tar.gz
-cd vibeface-node-<version>-<target>
-./vibeface-node --help
+shasum -a 256 -c vibeface-<version>-<target>.tar.gz.sha256
+tar -xzf vibeface-<version>-<target>.tar.gz
+cd vibeface-<version>-<target>
+./vibeface --help
 ```
 
 包内包括 Rust 程序、SDK sidecar 源码、文档和用户级服务安装脚本，不包含模型凭证、Provider 程序或 npm 依赖。若使用 Codex SDK 管理 Agent，先安装 Node.js 18+，然后在 `sidecars/` 运行 `npm ci --omit=dev`。仅使用 Cursor SDK 管理 Agent 时，无需 Node.js。
@@ -31,16 +31,16 @@ bash scripts/build-web-crypto.sh
 `--root` 指向允许编码执行器使用的现有绝对目录，可重复指定。省略时没有允许的执行目录。
 
 ```sh
-./vibeface-node init \
+./vibeface init \
 	--data-dir "$HOME/.vibeface" \
 	--root /absolute/path/to/projects
-./vibeface-node serve --data-dir "$HOME/.vibeface"
+./vibeface serve --data-dir "$HOME/.vibeface"
 ```
 
 `init` 创建本机独立密钥、配置及一次性本机接入材料，不注册网站账号，也不把个人根私钥放进 Node。用本机终端取得可信接入链接：
 
 ```sh
-./vibeface-node access --data-dir "$HOME/.vibeface"
+./vibeface access --data-dir "$HOME/.vibeface"
 ```
 
 在自己信任的浏览器打开链接，核对设备指纹，为设备网络命名并保存加密恢复包。客户端独立生成个人根身份和自己的设备身份，签署首个成员目录。Node 验证一次性本机授权后安装该目录，日常连接使用客户端设备密钥。
@@ -64,7 +64,7 @@ bash scripts/build-web-crypto.sh
 在运行 Node 的环境中配置 `CURSOR_API_KEY`。不要把密钥写进命令行、URL、Git 或聊天记录。模型使用账户实际可用的名称。
 
 ```sh
-./vibeface-node init \
+./vibeface init \
 	--data-dir "$HOME/.vibeface" \
 	--root /absolute/path/to/projects \
 	--manager cursor_sdk \
@@ -82,7 +82,7 @@ Cursor 使用 SDK 原生自定义工具回调连接 Rust Node。产品链路不�
 Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它，需要 Node.js 18+、已安装的锁定 npm 依赖和已登录的 Codex CLI。
 
 ```sh
-./vibeface-node init \
+./vibeface init \
 	--data-dir "$HOME/.vibeface" \
 	--root /absolute/path/to/projects \
 	--manager codex_sdk \
@@ -93,7 +93,7 @@ Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它�
 
 可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。源码运行时先在 `crates/node/sdk/` 安装依赖，将 `--codex-sdk-script` 指向该目录的入口。
 
-这个适配器通过本机 `vibeface-node tool` 命令调用受限工具，使用只读文件系统权限，保留 shell 和网络访问。Codex 子进程环境按变量名筛选，shell 只获得运行及当前会话工具所需的变量；Provider 凭证不放进 shell 环境。它没有 shell 命令白名单或已验证的外部域名隔离，不能当作隔离不可信模型或不可信插件的安全边界。Cursor SDK 与 Codex SDK 的工具运行方式不同，不承诺完全相同的权限隔离。
+这个适配器通过本机 `vibeface tool` 命令调用受限工具，使用只读文件系统权限，保留 shell 和网络访问。Codex 子进程环境按变量名筛选，shell 只获得运行及当前会话工具所需的变量；Provider 凭证不放进 shell 环境。它没有 shell 命令白名单或已验证的外部域名隔离，不能当作隔离不可信模型或不可信插件的安全边界。Cursor SDK 与 Codex SDK 的工具运行方式不同，不承诺完全相同的权限隔离。
 
 ## 添加自己的设备
 
@@ -104,7 +104,7 @@ Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它�
 添加另一台 Node 时，先在新设备用独立数据目录运行 `init`，再把完整邀请保存为私有 JSON 文件。邀请文件包含接入地址、钉住的 NodeID、签名邀请和一次性 capability，不公开分享。
 
 ```sh
-./vibeface-node pair \
+./vibeface pair \
 	--data-dir "$HOME/.vibeface" \
 	--invite-file /private/path/to/invitation.json \
 	--name "My Linux Node"
@@ -190,25 +190,25 @@ A 已派发 B 后掉线时，从 C 打开原业务会话，等待 DAG 补齐，�
 
 ## 作为后台应用运行
 
-`vibeface-node` 是节点主进程，也是本机管理 CLI。先用前台 `serve` 确认配置，再按 Ctrl-C 停止前台进程，安装用户级服务：
+`vibeface` 是节点主进程，也是本机管理 CLI。先用前台 `serve` 确认配置，再按 Ctrl-C 停止前台进程，安装用户级服务：
 
 ```sh
-vibeface-node service install --data-dir "$HOME/.vibeface"
-vibeface-node status --data-dir "$HOME/.vibeface"
-vibeface-node service status --data-dir "$HOME/.vibeface"
+vibeface service install --data-dir "$HOME/.vibeface"
+vibeface status --data-dir "$HOME/.vibeface"
+vibeface service status --data-dir "$HOME/.vibeface"
 ```
 
-服务管理命令需要完整的受管安装，启动路径始终为安装根目录下的 `current/vibeface-node`。通过 `~/.local/bin/vibeface-node` 链接调用也保留该路径，升级后不会固定在旧 release。直接运行 `cargo build` 的程序不安装服务。自定义安装根先使用 `update configure --install-root /absolute/path` 保存路径。
+服务管理命令需要完整的受管安装，启动路径始终为安装根目录下的 `current/vibeface`。通过 `~/.local/bin/vibeface` 链接调用也保留该路径，升级后不会固定在旧 release。直接运行 `cargo build` 的程序不安装服务。自定义安装根先使用 `update configure --install-root /absolute/path` 保存路径。
 
 每个系统用户管理一个 Node 服务。各服务命令核对 `--data-dir` 与已安装服务一致，再操作该服务。省略时使用 `$HOME/.vibeface`。管理其他数据目录时显式传入绝对路径。
 
 `status` 通过私有维护 socket 检查运行中的 Node，并核对 NodeID，不要求安装服务。`status --json` 输出状态、NodeID、监听地址、角色及运行版本，不输出接入授权材料。已停止或无法连接时返回非零退出码。`service status` 则展示 launchd 或 systemd 的 Node 和更新服务状态。
 
 ```sh
-vibeface-node status --json --data-dir "$HOME/.vibeface"
-vibeface-node service stop --data-dir "$HOME/.vibeface"
-vibeface-node service start --data-dir "$HOME/.vibeface"
-vibeface-node service restart --data-dir "$HOME/.vibeface"
+vibeface status --json --data-dir "$HOME/.vibeface"
+vibeface service stop --data-dir "$HOME/.vibeface"
+vibeface service start --data-dir "$HOME/.vibeface"
+vibeface service restart --data-dir "$HOME/.vibeface"
 ```
 
 macOS 使用当前登录用户的 launchd agent，日志位于数据目录的 `service.stdout.log` 和 `service.stderr.log`。Linux 使用 `systemd --user`，Node 日志由用户 journal 保存。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
@@ -218,7 +218,7 @@ macOS 使用当前登录用户的 launchd agent，日志位于数据目录的 `s
 卸载同时移除 Node 服务和更新定时服务，不删除身份、配置和历史：
 
 ```sh
-vibeface-node service uninstall --data-dir "$HOME/.vibeface"
+vibeface service uninstall --data-dir "$HOME/.vibeface"
 ```
 
 ## 选择更新渠道
@@ -228,7 +228,7 @@ vibeface-node service uninstall --data-dir "$HOME/.vibeface"
 选择 Stable 并开启自动更新：
 
 ```sh
-"$HOME/.local/share/vibeface/current/vibeface-node" update configure \
+"$HOME/.local/share/vibeface/current/vibeface" update configure \
 	--data-dir "$HOME/.vibeface" \
 	--install-root "$HOME/.local/share/vibeface" \
 	--channel stable \
@@ -240,26 +240,26 @@ vibeface-node service uninstall --data-dir "$HOME/.vibeface"
 查看策略和最近结果、主动检查或立即尝试升级：
 
 ```sh
-"$HOME/.local/share/vibeface/current/vibeface-node" update status --data-dir "$HOME/.vibeface"
-"$HOME/.local/share/vibeface/current/vibeface-node" update check --data-dir "$HOME/.vibeface"
-"$HOME/.local/share/vibeface/current/vibeface-node" update apply --data-dir "$HOME/.vibeface"
+"$HOME/.local/share/vibeface/current/vibeface" update status --data-dir "$HOME/.vibeface"
+"$HOME/.local/share/vibeface/current/vibeface" update check --data-dir "$HOME/.vibeface"
+"$HOME/.local/share/vibeface/current/vibeface" update apply --data-dir "$HOME/.vibeface"
 ```
 
 `check` 只查询与校验版本信息。`apply` 仅安装声明与当前数据格式兼容的包，需要安全的空闲窗口。活动任务、管理 Agent 调用和结果未知的操作都会阻止安装，先完成或核对原任务，不需要关闭网页。升级不会调用模型或修改 Provider 密钥。
 
-开启自动更新会安装独立的用户定时服务。macOS 的 `com.leaperone.vibeface.update` 在载入时和每小时尝试更新；Linux 的 `vibeface-update.timer` 每小时启动一次独立 oneshot 服务。Linux 关机期间不能更新，用户服务能否在退出登录后运行取决于 lingering。更新日志位于数据目录的 `update.stdout.log` 与 `update.stderr.log`，文件权限为 600。`vibeface-node service status` 同时展示 Node 与更新服务的真实状态。
+开启自动更新会安装独立的用户定时服务。macOS 的 `com.leaperone.vibeface.update` 在载入时和每小时尝试更新；Linux 的 `vibeface-update.timer` 每小时启动一次独立 oneshot 服务。Linux 关机期间不能更新，用户服务能否在退出登录后运行取决于 lingering。更新日志位于数据目录的 `update.stdout.log` 与 `update.stderr.log`，文件权限为 600。`vibeface service status` 同时展示 Node 与更新服务的真实状态。
 
 关闭自动更新时，保留所选渠道与受管路径，重新执行 `configure`：
 
 ```sh
-"$HOME/.local/share/vibeface/current/vibeface-node" update configure \
+"$HOME/.local/share/vibeface/current/vibeface" update configure \
 	--data-dir "$HOME/.vibeface" \
 	--install-root "$HOME/.local/share/vibeface" \
 	--channel stable \
 	--automatic false
 ```
 
-这会移除更新定时服务，手动 `check` 和 `apply` 仍可使用。`vibeface-node service install-updater` 和 `uninstall-updater` 可单独安装或移除定时服务，不改变已保存的更新策略。策略的 `automatic` 为 `false` 时，即使手动安装定时服务也不会自动更新。重新配置自动更新会重新安装或移除定时服务。
+这会移除更新定时服务，手动 `check` 和 `apply` 仍可使用。`vibeface service install-updater` 和 `uninstall-updater` 可单独安装或移除定时服务，不改变已保存的更新策略。策略的 `automatic` 为 `false` 时，即使手动安装定时服务也不会自动更新。重新配置自动更新会重新安装或移除定时服务。
 
 更新器先核对包和存储兼容声明，再停止 Node 并切换 `current`。新进程健康检查失败时只恢复上一份程序入口，不自动还原数据库；会话、身份、配置和凭证仍保存在原数据目录。校验、网络和安装失败可通过 `update status` 与更新日志查看。
 

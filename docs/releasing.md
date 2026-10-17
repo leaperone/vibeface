@@ -4,7 +4,7 @@
 
 ## 可下载的包
 
-每个平台的 Actions artifact 包含 `vibeface-node-<version>-<target>.tar.gz` 和同名 `.sha256`。三种包均在对应架构的原生 runner 构建，解包后运行 Node 多进程验收，不调用模型。
+每个平台的 Actions artifact 包含 `vibeface-<version>-<target>.tar.gz` 和同名 `.sha256`。三种包均在对应架构的原生 runner 构建，解包后运行 Node 多进程验收，不调用模型。
 
 | 平台 | Rust target | 构建和验收环境 |
 | --- | --- | --- |
@@ -15,11 +15,11 @@
 Linux 包依赖 glibc，未在旧版发行版验收。macOS 包没有 Apple 开发者签名或 notarization。根据设备选择包，在存放包的目录先校验再解压：
 
 ```sh
-shasum -a 256 -c vibeface-node-<version>-<target>.tar.gz.sha256
-tar -xzf vibeface-node-<version>-<target>.tar.gz
-cd vibeface-node-<version>-<target>
-./vibeface-node --version
-./vibeface-node --help
+shasum -a 256 -c vibeface-<version>-<target>.tar.gz.sha256
+tar -xzf vibeface-<version>-<target>.tar.gz
+cd vibeface-<version>-<target>
+./vibeface --version
+./vibeface --help
 ```
 
 包内有 Rust 程序、SDK sidecar 源码、浏览器密码学 JS/WASM、文档、用户级服务安装脚本和 `BUILD-INFO.json`，不含身份、配置、数据库、Provider 程序、模型凭证或 npm 依赖。干净 Git 提交的正常构建会记录版本、target 和源码提交；`--skip-build` 或未提交源码构建的 `source_commit` 为 `null`，不能作为提交身份的证明。
@@ -77,7 +77,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序和随包 sidecar，不覆盖身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。使用 Codex SDK 时，更新器在停服务前按新包的 lock 安装 sidecar 依赖，需要可用的 npm；安装失败保留现版，不复制旧 `node_modules`。Cursor SDK 不需要这一步。
 
-`BUILD-INFO.json` 声明 `update_protocol=1` 和 `data_epoch=2`。更新器只安装与本机存储 epoch 一致的包。账号数据库格式不属于 epoch 2，不能让自动更新覆盖该数据目录，也不在启动时隐式转换或清空。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
+`BUILD-INFO.json` 声明 `update_protocol=2` 和 `data_epoch=2`。更新器只安装与本机存储 epoch 一致的包。账号数据库格式不属于 epoch 2，不能让自动更新覆盖该数据目录，也不在启动时隐式转换或清空。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
 
 ## 首次安装
 
@@ -93,7 +93,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 校验并解压新包到受管安装根目录下的独立目录，通过 `current` 符号链接选择程序。例如，先将解压后的包移动到 `$HOME/.local/share/vibeface/releases/<version>`，再创建指向它的 `$HOME/.local/share/vibeface/current`。保留整个包，不单独复制 Rust binary；更新器需要同包的脚本、sidecar 和 `BUILD-INFO.json`。
 
-用 `current/vibeface-node` 前台启动并核对设备身份和历史，随后按 [后台运行说明](node.md#作为后台应用运行) 安装指向这一固定路径的用户服务。停止前台进程后再启动用户服务，不更改原数据目录。已有私有凭证启动脚本时，保留它，并让它通过 `current` 启动 Node。
+用 `current/vibeface` 前台启动并核对设备身份和历史，随后按 [后台运行说明](node.md#作为后台应用运行) 安装指向这一固定路径的用户服务。停止前台进程后再启动用户服务，不更改原数据目录。已有私有凭证启动脚本时，保留它，并让它通过 `current` 启动 Node。
 
 确认新程序可用后，再执行 `update configure` 设置渠道和自动更新。普通 `cargo install` 或直接复制 binary 不构成受管安装，更新器会要求先建立完整包与 `current` 链接。
 

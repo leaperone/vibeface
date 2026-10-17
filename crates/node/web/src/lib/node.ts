@@ -82,7 +82,7 @@ export function parseInvitation(value: unknown): Invitation {
   const envelope = record(v.invite, '配对邀请')
   const invite = record(envelope.invite, '配对授权')
   const payload = record(invite.payload, '邀请权限')
-  if (payload.new_kind !== 'client') throw new Error('这是运行节点邀请。请在目标电脑上运行 vibeface-node pair。')
+  if (payload.new_kind !== 'client') throw new Error('这是运行节点邀请。请在目标电脑上运行 vibeface pair。')
   if (payload.manage !== false || roles(payload.node_roles).length || integer(payload.expires_at_ms) <= Date.now()) throw new Error('邀请已过期或权限无效。请创建新邀请。')
   validTarget(payload.network_id)
   return { kind: 'pair', entry, invite, capability: text(envelope.capability), payload }

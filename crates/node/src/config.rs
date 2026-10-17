@@ -205,7 +205,7 @@ pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 pub fn identity(dir: &Path) -> Result<LocalIdentity> {
     serde_json::from_slice(
-        &std::fs::read(dir.join("identity.json")).context("run vibeface-node init first")?,
+        &std::fs::read(dir.join("identity.json")).context("run vibeface init first")?,
     )
     .context("invalid local identity")
 }

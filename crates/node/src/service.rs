@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use clap::{Args, Subcommand};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
-use vibeface_node::{config, update};
+use vibeface::{config, update};
 
 #[derive(Args)]
 pub struct Service {
@@ -49,7 +49,7 @@ impl Action {
 }
 
 fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Result<Command> {
-    let binary = root.join("current/vibeface-node");
+    let binary = root.join("current/vibeface");
     ensure!(
         std::fs::canonicalize(&binary)? == std::fs::canonicalize(executable)?,
         "service management requires the current managed binary; run {}",
@@ -72,7 +72,7 @@ pub async fn run(options: Service) -> Result<()> {
         "--data-dir must be absolute"
     );
     let data = std::fs::canonicalize(options.data_dir)
-        .context("initialized data directory is required; run vibeface-node init first")?;
+        .context("initialized data directory is required; run vibeface init first")?;
     config::identity(&data)?;
     let root = update::managed_install_root(&data)?;
     let status = command(&root, &data, &std::env::current_exe()?, options.action)?
@@ -92,7 +92,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("vibeface-service-{}", uuid::Uuid::new_v4()));
         let package = root.join("releases/fixture");
         std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("vibeface-node"), b"binary").unwrap();
+        std::fs::write(package.join("vibeface"), b"binary").unwrap();
         std::os::unix::fs::symlink(&package, root.join("current")).unwrap();
         let data = root.join("data with spaces");
         std::fs::create_dir(&data).unwrap();
@@ -105,7 +105,7 @@ mod tests {
         )
         .save(&data)
         .unwrap();
-        let executable = package.join("vibeface-node");
+        let executable = package.join("vibeface");
         let install = command(&root, &data, &executable, Action::Install).unwrap();
         let install = install.as_std();
         assert_eq!(
@@ -119,7 +119,7 @@ mod tests {
                 std::ffi::OsStr::new("--data-dir"),
                 data.as_os_str(),
                 std::ffi::OsStr::new("--binary"),
-                root.join("current/vibeface-node").as_os_str(),
+                root.join("current/vibeface").as_os_str(),
             ]
         );
         let stop = command(&root, &data, &executable, Action::Stop).unwrap();

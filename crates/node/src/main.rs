@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use vibeface_node::{
+use vibeface::{
     api,
     client::Client,
     config::{self, Config, ManagerSettings},
@@ -202,7 +202,7 @@ async fn main() -> Result<()> {
 
 async fn status(options: Access) -> Result<()> {
     let data = fs::canonicalize(&options.data.data_dir)
-        .context("initialized data directory is required; run vibeface-node init first")?;
+        .context("initialized data directory is required; run vibeface init first")?;
     let configuration = Config::load(&data)?;
     let node_id = config::identity(&data)?.node_id()?;
     let health = maintenance::probe(&data).await.and_then(|health| {
@@ -774,10 +774,10 @@ mod tests {
 
     #[test]
     fn cli_requires_one_invitation_and_supports_accountless_flags() {
-        assert!(Cli::try_parse_from(["vibeface-node", "pair"]).is_err());
+        assert!(Cli::try_parse_from(["vibeface", "pair"]).is_err());
         assert!(
             Cli::try_parse_from([
-                "vibeface-node",
+                "vibeface",
                 "pair",
                 "--invite",
                 "abc",
@@ -788,7 +788,7 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from([
-                "vibeface-node",
+                "vibeface",
                 "pair",
                 "--invite",
                 "abc",
@@ -797,8 +797,8 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["vibeface-node", "access", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["vibeface-node", "status", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface", "access", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface", "status", "--json"]).is_ok());
         for action in [
             "install",
             "start",
@@ -811,7 +811,7 @@ mod tests {
         ] {
             assert!(
                 Cli::try_parse_from([
-                    "vibeface-node",
+                    "vibeface",
                     "service",
                     action,
                     "--data-dir",
@@ -820,10 +820,10 @@ mod tests {
                 .is_ok()
             );
         }
-        assert!(Cli::try_parse_from(["vibeface-node", "service", "unknown"]).is_err());
+        assert!(Cli::try_parse_from(["vibeface", "service", "unknown"]).is_err());
         assert!(
             Cli::try_parse_from([
-                "vibeface-node",
+                "vibeface",
                 "init",
                 "--bootstrap-url",
                 "wss://relay.test/api/network/ws",
@@ -836,7 +836,7 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from([
-                "vibeface-node",
+                "vibeface",
                 "init",
                 "--manager",
                 "cursor_sdk",
@@ -845,7 +845,7 @@ mod tests {
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["vibeface-node", "tool", "dispatch", "--json", "{}"]).is_ok());
+        assert!(Cli::try_parse_from(["vibeface", "tool", "dispatch", "--json", "{}"]).is_ok());
     }
 
     #[test]
@@ -885,7 +885,7 @@ mod tests {
 
     #[test]
     fn pairing_review_binds_the_exact_local_request() {
-        use vibeface_node::{identity::local::InvitePayload, model::NodeRole};
+        use vibeface::{identity::local::InvitePayload, model::NodeRole};
         let device = LocalIdentity::generate();
         let member = Member::node(&device, "Build Node", vec![NodeRole::Replica]).unwrap();
         let invite = InviteEnvelope {
@@ -960,8 +960,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("existing-data"), b"original").unwrap();
         let parsed =
-            Cli::try_parse_from(["vibeface-node", "init", "--data-dir", dir.to_str().unwrap()])
-                .unwrap();
+            Cli::try_parse_from(["vibeface", "init", "--data-dir", dir.to_str().unwrap()]).unwrap();
         let Action::Init(options) = parsed.command else {
             panic!("expected init")
         };

@@ -1,6 +1,6 @@
 # 安装与管理节点
 
-Vibeface 的主程序是 Rust 二进制 CLI `vibeface-node`，网页随程序内嵌分发。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 包尚无 Apple 开发者签名或 notarization。
+Vibeface 的主程序是 Rust 二进制 CLI `vibeface`，网页随程序内嵌分发。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 包尚无 Apple 开发者签名或 notarization。
 
 ## 选择安装渠道
 
@@ -31,7 +31,7 @@ bash install.sh --channel nightly
 ```text
 ~/.local/share/vibeface/releases/<version>/
 ~/.local/share/vibeface/current -> releases/<version>
-~/.local/bin/vibeface-node -> ~/.local/share/vibeface/current/vibeface-node
+~/.local/bin/vibeface -> ~/.local/share/vibeface/current/vibeface
 ```
 
 它不创建节点数据、不创建个人网络、不启动后台服务、不安装 Provider，也不开启自动更新。安装后按提示把 `~/.local/bin` 加入 PATH，或直接使用该目录下的 CLI。SHA256 与包同由 GitHub 提供，不能替代独立发布签名。
@@ -49,17 +49,17 @@ bash install.sh --channel nightly \
 ## 初始化与前台运行
 
 ```sh
-vibeface-node --version
-vibeface-node --help
-vibeface-node init --root /absolute/path/to/projects
-vibeface-node status
-vibeface-node serve
+vibeface --version
+vibeface --help
+vibeface init --root /absolute/path/to/projects
+vibeface status
+vibeface serve
 ```
 
 `init` 默认使用 `~/.vibeface`，拒绝覆盖非空数据目录。`serve` 默认仅监听回环地址。保持前台进程运行，在另一个终端执行：
 
 ```sh
-vibeface-node access
+vibeface access
 ```
 
 在可信浏览器打开本机链接，创建个人网络并保存加密恢复包。已有个人网络时应配对，不能重新创建网络代替配对。见 [添加自己的设备](node.md#添加自己的设备)。编码执行需要另装并登录 Codex 等 Provider；聊天调度需要 [配置管理 Agent](node.md#配置管理-agent)。
@@ -69,18 +69,18 @@ vibeface-node access
 先停止前台进程，再安装当前用户的后台服务：
 
 ```sh
-vibeface-node service install
-vibeface-node service status
-vibeface-node status
-vibeface-node service stop
-vibeface-node service start
-vibeface-node service restart
+vibeface service install
+vibeface service status
+vibeface status
+vibeface service stop
+vibeface service start
+vibeface service restart
 ```
 
 macOS 使用 launchd 用户服务，Linux 使用 `systemd --user`。CLI 管理当前用户的一套受管节点服务，服务通过固定的 `current` 路径启动，以便升级后使用新程序。卸载服务保留数据：
 
 ```sh
-vibeface-node service uninstall
+vibeface service uninstall
 ```
 
 使用自定义数据目录时，在对应节点命令中显式传入 `--data-dir /absolute/path/to/data`。服务命令不能用另一个数据目录操作已绑定的节点服务。更多平台要求见 [作为后台应用运行](node.md#作为后台应用运行)。
@@ -90,22 +90,22 @@ vibeface-node service uninstall
 首次下载渠道与运行时更新策略分别配置。默认运行时策略是 Stable，自动更新关闭。Nightly 安装初始化后建议明确配置：
 
 ```sh
-vibeface-node update configure --channel nightly --automatic false
-vibeface-node update status
-vibeface-node update check
-vibeface-node update apply
+vibeface update configure --channel nightly --automatic false
+vibeface update status
+vibeface update check
+vibeface update apply
 ```
 
 手动应用更新需已安装并运行用户服务，更新器才可取得维护租约并确认重启健康状态。希望在空闲时自动更新：
 
 ```sh
-vibeface-node update configure --channel nightly --automatic true
+vibeface update configure --channel nightly --automatic true
 ```
 
 将来改用正式版：
 
 ```sh
-vibeface-node update configure --channel stable --automatic true
+vibeface update configure --channel stable --automatic true
 ```
 
 Stable 不存在时不会切换 Nightly，更新器也不自动降级。自定义安装根需在首次 `update configure` 时加上 `--install-root /absolute/path/to/vibeface`。更新行为、维护检查和备份边界见 [构建与发布](releasing.md#更新渠道)。
