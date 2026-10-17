@@ -472,7 +472,11 @@ pub fn finish_account_creation(
         account_document.devices.sort();
         account_document.enrollment = vec![EnrollmentAuthority {
             device: prepared.client_certificate.payload.device.clone(),
-            rights: vec![AccountRight::EnrollDevice, AccountRight::RevokeDevice],
+            rights: vec![
+                AccountRight::EnrollDevice,
+                AccountRight::RevokeDevice,
+                AccountRight::ManageAuthenticators,
+            ],
             expires_at_ms: prepared.client_certificate.payload.expires_at_ms,
         }];
         let account_document = Signed::sign(account_document, root)?;
@@ -694,7 +698,15 @@ mod tests {
         .unwrap();
         assert_eq!(
             auth.account_enrollment_rights(),
-            &[AccountRight::EnrollDevice, AccountRight::RevokeDevice]
+            &[
+                AccountRight::EnrollDevice,
+                AccountRight::RevokeDevice,
+                AccountRight::ManageAuthenticators
+            ]
+        );
+        assert_eq!(
+            auth.account_enrollment_expires_at_ms(),
+            Some(CERT_END as u64)
         );
         assert!(
             verify_client_authorization(

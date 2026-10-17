@@ -2540,6 +2540,18 @@ impl VerifiedPolicySet {
         self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
         Ok(certificate)
     }
+    /// Authenticates a transport service; it grants no space membership or operation rights.
+    pub fn verify_transport_device(
+        &self,
+        device: &DeviceId,
+        now_ms: u64,
+    ) -> Result<&Signed<DeviceCertificate>> {
+        let mut budget = Budget::default();
+        let mut dependencies = BTreeMap::new();
+        self.validate_presenter(device, now_ms, &mut budget, &mut dependencies)?;
+        self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
+        self.find_device(device)
+    }
     fn validate_presenter(
         &self,
         device: &DeviceId,
@@ -3380,6 +3392,16 @@ mod tests {
             f.state
                 .verify_service_device(&f.space, &f.audience.device, NOW)
                 .is_ok()
+        );
+        assert!(
+            f.state
+                .verify_transport_device(&f.audience.device, NOW)
+                .is_ok()
+        );
+        assert!(
+            f.state
+                .verify_transport_device(&DeviceId::from_key(&PublicKey::of(&f.user)), NOW)
+                .is_err()
         );
         assert!(
             f.state
@@ -5405,6 +5427,7 @@ pub struct VerifiedClientAuthorization {
     audience_public_key: PublicKey,
     constraints: GrantConstraints,
     account_enrollment_rights: Vec<AccountRight>,
+    account_enrollment_expires_at_ms: Option<u64>,
     resources: Vec<Signed<ResourceRecord>>,
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
@@ -5416,7 +5439,7 @@ impl VerifiedClientAuthorization {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = policyJson))]
     pub fn policy_json(&self) -> crate::Result<String> {
         serde_json::to_string(
-            &serde_json::json!({"heads": self.heads, "grant_leaf": self.grant_leaf,"actions": self.actions,"scope": self.grant_scope,"audience": self.audience,"audience_public_key": self.audience_public_key,"constraints": self.constraints,"account_enrollment_rights":self.account_enrollment_rights,"resources":self.resources}),
+            &serde_json::json!({"heads": self.heads, "grant_leaf": self.grant_leaf,"actions": self.actions,"scope": self.grant_scope,"audience": self.audience,"audience_public_key": self.audience_public_key,"constraints": self.constraints,"account_enrollment_rights":self.account_enrollment_rights,"account_enrollment_expires_at_ms":self.account_enrollment_expires_at_ms,"resources":self.resources}),
         )
         .map_err(|_| "policy encoding failed".to_owned())
     }
@@ -5539,7 +5562,7 @@ pub fn verify_client_authorization(
                 }
             }
         }
-        let account_enrollment_rights = state
+        let account_enrollment_rights: Vec<AccountRight> = state
             .account(&account)
             .and_then(|a| {
                 a.enrollment
@@ -5557,6 +5580,18 @@ pub fn verify_client_authorization(
                     .collect()
             })
             .unwrap_or_default();
+        let account_enrollment_expires_at_ms = if account_enrollment_rights.is_empty() {
+            None
+        } else {
+            state
+                .account(&account)
+                .and_then(|a| {
+                    a.enrollment
+                        .iter()
+                        .find(|e| e.device == certificate.payload.device)
+                })
+                .map(|e| e.expires_at_ms.min(certificate.payload.expires_at_ms))
+        };
         Ok(VerifiedClientAuthorization {
             scope: ClientScope {
                 account_id: account,
@@ -5571,6 +5606,7 @@ pub fn verify_client_authorization(
             audience_public_key: target.payload.public_key.clone(),
             constraints: leaf.constraints.clone(),
             account_enrollment_rights,
+            account_enrollment_expires_at_ms,
             resources,
         })
     }
@@ -6002,6 +6038,9 @@ impl VerifiedClientAuthorization {
     }
     pub fn account_enrollment_rights(&self) -> &[AccountRight] {
         &self.account_enrollment_rights
+    }
+    pub fn account_enrollment_expires_at_ms(&self) -> Option<u64> {
+        self.account_enrollment_expires_at_ms
     }
     pub fn resources(&self) -> &[Signed<ResourceRecord>] {
         &self.resources

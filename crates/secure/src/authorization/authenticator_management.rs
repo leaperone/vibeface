@@ -103,11 +103,15 @@ impl VerifiedPolicySet {
             "authenticator management intent lifetime too long",
         )?;
         if signed.issuer != account.current_root {
-            self.validate_authenticator_manager(
+            let deadline = self.validate_authenticator_manager(
                 &intent.account,
                 &signed.issuer,
                 now_ms,
                 &mut Budget::default(),
+            )?;
+            require(
+                intent.expires_at_ms <= deadline,
+                "authenticator management intent exceeds current manager expiry",
             )?;
         }
         signed.verify_signature()?;
@@ -639,5 +643,23 @@ mod tests {
             ObjectHash::body(&first.payload).unwrap(),
             ObjectHash::body(&second.payload).unwrap()
         );
+        let mut state = f.state.clone();
+        let mut account = state.account(&f.account).unwrap().clone();
+        account.previous = state
+            .head(&PolicyDomain::Account(f.account.clone()))
+            .cloned();
+        account.sequence += 1;
+        account.enrollment[0].expires_at_ms = NOW + 100;
+        state
+            .install_account(Signed::sign(account, &f.root).unwrap())
+            .unwrap();
+        let mut next = state.account(&f.account).unwrap().clone();
+        next.previous = state
+            .head(&PolicyDomain::Account(f.account.clone()))
+            .cloned();
+        next.sequence += 1;
+        next.authenticators.clear();
+        assert!(create_management_intent(&state, &next, &manager, NOW, NOW + 10_000).is_err());
+        assert!(create_management_intent(&state, &next, &manager, NOW, NOW + 100).is_ok());
     }
 }
