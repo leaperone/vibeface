@@ -65,6 +65,7 @@ export function WorkspaceShell() {
           {workspace.info.node_id ? <span> {nodeName(workspace.info.node_id)}</span> : null}
         </p>
         {device.spaces.length > 1 && <label className="flex items-center gap-2 text-sm">当前空间<NativeSelect aria-label="切换空间" value={device.ready?.scope.space_id ?? ''} onChange={event => void workspace.run(() => device.selectSpace(event.target.value))}>{device.spaces.map(space => <NativeSelectOption key={space.spaceId} value={space.spaceId}>{space.spaceId.slice(0, 17)}</NativeSelectOption>)}</NativeSelect></label>}
+        {device.ready && <label className="flex min-w-0 items-center gap-2 text-sm">当前项目<NativeSelect aria-label="切换项目" value={device.ready.project.id} onChange={event => void workspace.run(() => device.selectProject(event.target.value))}>{device.ready.projects.map(project => <NativeSelectOption key={project.id} value={project.id}>{project.id.slice(0, 17)}</NativeSelectOption>)}</NativeSelect></label>}
         <Button type="button" variant="ghost" onClick={device.lockVault}>锁定设备仓库</Button>
       </header>
       {workspace.writeNotice ? <Alert role="status"><AlertDescription>{workspace.writeNotice}</AlertDescription></Alert> : null}

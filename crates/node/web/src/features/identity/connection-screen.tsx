@@ -16,8 +16,7 @@ export function ConnectionScreen() {
   const [busy, setBusy] = useState(false)
   const pending = useRef(false)
   const [error, setError] = useState('')
-  const [confirmed, setConfirmed] = useState(false)
-  async function run(action: () => Promise<void>) {
+    async function run(action: () => Promise<void>) {
     if (pending.current) return
     pending.current = true; setBusy(true); setError('')
     try { await action() } catch (cause) { setError(messageOf(cause)) }
@@ -39,14 +38,6 @@ export function ConnectionScreen() {
     {device.identity && <p className="break-all rounded-lg bg-muted p-3 text-xs text-muted-foreground">此浏览器设备指纹 <span className="font-mono">{device.identity.nodeId}</span></p>}
     {device.identity && <button className={button} type="button" onClick={device.lockVault}>锁定设备仓库</button>}
     {device.review && <RecoveryReview />}
-    {device.waiting && <section className={panel} aria-labelledby="pair-review-title">
-      <h2 id="pair-review-title" className="font-semibold">{device.waiting.accepted ? '等待管理设备确认' : '确认加入自己的网络'}</h2>
-      <p className="text-sm text-muted-foreground">请与管理设备核对以下完整指纹。双方确认后，此浏览器获得普通客户端权限。</p>
-      <dl className="space-y-3 text-sm"><div><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono">{device.waiting.network_id}</dd></div><div><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono">{device.waiting.review.inviter_subject_id}</dd></div><div><dt className="text-muted-foreground">此浏览器</dt><dd className="break-all font-mono">{device.waiting.review.new_member.subject_id}</dd></div><div><dt className="text-muted-foreground">设备名称</dt><dd>{device.waiting.review.new_member.name}</dd></div></dl>
-      {!device.waiting.accepted && <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} />我已核对个人网络及双方设备指纹</label>}
-      <div className="flex flex-wrap gap-2"><button className={button} type="button" disabled={busy || !device.waiting.accepted && !confirmed} onClick={() => void run(device.waiting?.accepted ? device.checkPair : device.acceptPair)}>{device.waiting.accepted ? '检查配对进度' : '确认此浏览器加入'}</button><button className={button} type="button" onClick={() => { device.cancelPair(); setConfirmed(false) }}>取消本地配对</button></div>
-      <p className="text-xs text-muted-foreground">取消仅清除此浏览器的等待记录。若已发送确认，请在管理设备上核对设备授权。</p>
-    </section>}
     <section className={panel} aria-labelledby="connect-title">
       <h2 id="connect-title" className="font-semibold">通过已知入口连接</h2>
       {device.entries.length > 0 && <ul className="space-y-2">{device.entries.map(entry => <li key={`${entry.address}:${entry.node_id}:${entry.relay}`} className="space-y-2 rounded-lg border border-border p-3"><p className="break-all text-sm">{entry.address}{entry.relay ? ' · 中继' : ' · 直连'}</p><p className="break-all font-mono text-xs text-muted-foreground">{entry.node_id}</p><div className="flex gap-2"><button className={button} type="button" disabled={busy || !usable} onClick={() => void run(() => device.connect(entry))}>连接</button><button className={button} type="button" disabled={busy} onClick={() => void run(async () => device.removeEntry(entry))}>移除</button></div></li>)}</ul>}
@@ -62,20 +53,19 @@ export function ConnectionScreen() {
       {device.entry && <button className={button} type="button" onClick={device.disconnect}>取消并断开</button>}
     </section>
     <section className={panel} aria-labelledby="invitation-title">
-      <h2 id="invitation-title" className="font-semibold">初始化或配对新浏览器</h2>
-      <p className="text-sm text-muted-foreground">首次创建网络，请在节点终端运行 vibeface access，粘贴其输出。已有网络，请从管理设备取得一次性邀请。</p>
+      <h2 id="invitation-title" className="font-semibold">使用可信 Node 连接卡</h2>
+      <p className="text-sm text-muted-foreground">在自己的 Node 终端运行 vibeface access，粘贴其输出。认领首台 Node 时会创建账户，已认领的 Node 仅供已授权设备连接。</p>
       <form className="space-y-3" onSubmit={event => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
           const password = value(form, 'password'); const confirmation = value(form, 'confirmation')
-          try { await device.pair(value(form, 'invitation'), value(form, 'name'), password || confirmation ? passphrase(password, confirmation) : undefined) }
+          try { await device.useConnectionCard(value(form, 'invitation'), password || confirmation ? passphrase(password, confirmation) : undefined) }
           finally { form.reset() }
         })
       }}><fieldset disabled={busy || !usable || !!device.review} className="space-y-3">
-        <label className="grid gap-1 text-sm">邀请内容<textarea className={`${input} min-h-28 font-mono text-xs`} name="invitation" required defaultValue={device.initialInvitation} autoComplete="off" spellCheck={false} /></label>
-        <label className="grid gap-1 text-sm">此浏览器名称<input className={input} name="name" required maxLength={128} autoComplete="off" /></label>
-        <details><summary className="cursor-pointer py-2 text-sm">首次创建网络时设置恢复包口令</summary><div className="space-y-3 pt-2"><p className="text-sm text-muted-foreground">至少 12 个字符。请独立保存口令，网站无法找回。</p><label className="grid gap-1 text-sm">加密恢复包口令<input className={input} type="password" name="password" autoComplete="new-password" minLength={12} /></label><label className="grid gap-1 text-sm">再次填写口令<input className={input} type="password" name="confirmation" autoComplete="new-password" minLength={12} /></label></div></details>
-        <button className={button} type="submit">读取邀请并核对授权</button>
+        <label className="grid gap-1 text-sm">可信连接卡<textarea className={`${input} min-h-28 font-mono text-xs`} name="invitation" required defaultValue={device.initialInvitation} autoComplete="off" spellCheck={false} /></label>
+        <details><summary className="cursor-pointer py-2 text-sm">首次创建账户时设置恢复包口令</summary><div className="space-y-3 pt-2"><p className="text-sm text-muted-foreground">至少 12 个字符。请独立保存口令，网站无法找回。</p><label className="grid gap-1 text-sm">加密恢复包口令<input className={input} type="password" name="password" autoComplete="new-password" minLength={12} /></label><label className="grid gap-1 text-sm">再次填写口令<input className={input} type="password" name="confirmation" autoComplete="new-password" minLength={12} /></label></div></details>
+        <button className={button} type="submit">读取连接卡并核对授权</button>
       </fieldset></form>
     </section>
     {usable && <RecoveryControls />}

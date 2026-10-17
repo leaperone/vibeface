@@ -13,6 +13,7 @@ export function rpcAction(method: string, body: Record<string, unknown>) {
     case 'reconcile': return 'operation_reconcile'
     case 'resolve_unknown': return 'operation_resolve'
     case 'ack': return 'notification_ack'
+    case 'bind_execution': return 'execution_open'
     case 'rebind_execution': return 'execution_rebind'
     case 'export': return 'export'
     case 'operate': {
@@ -53,6 +54,7 @@ export function prepareRpc(input: { method: string; params: Record<string, unkno
     case 'message': authorizationId = stableAuthorizationId('message', params.message_id); break
     case 'create_conversation': authorizationId = stableAuthorizationId('conversation', params.conversation_id); break
     case 'create_task': authorizationId = stableAuthorizationId('task', params.task_id); break
+    case 'bind_execution': authorizationId = stableAuthorizationId('bind', params.session_id); break
     case 'ack': authorizationId = stableAuthorizationId('ack', params.notification_id); break
   }
   if (!/^[A-Za-z0-9_:.\-]{1,128}$/.test(authorizationId)) throw new Error('授权调用编号无效。请保留原请求内容。')

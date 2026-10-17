@@ -1,9 +1,10 @@
-import init, { Identity, Handshake, signClientInvocation } from "/generated/vibeface_secure.js";
+import init, { Identity, Handshake, signClientInvocation, signForwardedClientInvocation, prepareAccountCreation, prepareAccountRecovery, buildRecoveryContextRequest } from "/generated/vibeface_secure.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const nodePattern = /^[a-f0-9]{64}$/;
 const vaultFormat = "vibeface-device-vault-v3";
+const prfVaultFormat = "vibeface-device-prf-v3";
 const vaultIterations = 600000;
 const vaultMarker = "vibeface.v3.device-created";
 let identity;
@@ -11,6 +12,7 @@ let initializing;
 let identityGeneration = 0;
 let activeProfileId = null;
 const pendingIdentities = new Map();
+const pendingVaultWrites = new Set();
 
 export function validTarget(value) {
   if (typeof value !== "string" || !nodePattern.test(value)) throw new Error("填写完整的 64 位设备指纹。请从本机终端或可信邀请中取得，不要使用中继提供的替代指纹。");
@@ -76,9 +78,10 @@ async function vaultRecords(id, write) {
 }
 
 function parseProfile(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value) || value.format !== "vibeface-device-profile-v3" || typeof value.id !== "string" || !/^[a-f0-9-]{36}$/.test(value.id) || typeof value.name !== "string" || !value.name.trim() || encoder.encode(value.name).length > 128 || /[\u0000-\u001f\u007f]/.test(value.name) || Object.keys(value).sort().join(",") !== "format,id,name,public_key,vault") throw new Error("加密设备配置格式无效。旧版仓库不会导入。");
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.format !== "vibeface-device-profile-v3" || typeof value.id !== "string" || !/^[a-f0-9-]{36}$/.test(value.id) || typeof value.name !== "string" || !value.name.trim() || encoder.encode(value.name).length > 128 || /[\u0000-\u001f\u007f]/.test(value.name) || !["format,id,name,public_key,vault", "format,id,name,passkey,public_key,vault"].includes(Object.keys(value).sort().join(","))) throw new Error("加密设备配置格式无效。旧版仓库不会导入。");
   unhex(value.public_key, 32);
   parseVault(value.vault);
+  if (Object.hasOwn(value, "passkey")) parsePrfVault(value.passkey);
   return value;
 }
 
@@ -127,6 +130,103 @@ export async function openDeviceVault(value, password) {
   finally { cleartext?.fill(0); }
 }
 
+function base64url(bytes) { return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+function parseCredentialId(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value) || value.length > 1366) throw new Error("本地 Passkey 凭证编号无效。");
+  let bytes;
+  try { bytes = Uint8Array.from(atob(value.replace(/-/g, "+").replace(/_/g, "/")), character => character.charCodeAt(0)); }
+  catch { throw new Error("本地 Passkey 凭证编号无效。"); }
+  if (!bytes.length || bytes.length > 1024 || base64url(bytes) !== value) throw new Error("本地 Passkey 凭证编号无效。");
+}
+function parsePrfVault(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).sort().join(",") !== "cipher,ciphertext,credential_id,format,iv,kdf,origin,rp_id,salt" || value.format !== prfVaultFormat || value.kdf !== "HKDF-SHA256" || value.cipher !== "AES-256-GCM") throw new Error("本地 Passkey 保护格式无效。");
+  parseCredentialId(value.credential_id);
+  let origin;
+  try { origin = new URL(value.origin); } catch { throw new Error("本地 Passkey 站点格式无效。"); }
+  if (origin.origin !== value.origin || origin.hostname !== value.rp_id || !["https:", "http:"].includes(origin.protocol) || origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/") throw new Error("本地 Passkey 站点格式无效。");
+  return { salt: unhex(value.salt, 32), iv: unhex(value.iv, 12), ciphertext: unhex(value.ciphertext, 48) };
+}
+function prfAdditionalData(profile, value) {
+  return encoder.encode(JSON.stringify({ format: value.format, kdf: value.kdf, cipher: value.cipher, credential_id: value.credential_id, origin: value.origin, rp_id: value.rp_id, salt: value.salt, profile_id: profile.id, public_key: profile.public_key }));
+}
+async function prfVaultKey(prf, salt, usage) {
+  if (!(prf instanceof Uint8Array) || prf.length !== 32) throw new Error("Passkey 本地保护密钥必须恰好为 32 字节。");
+  const material = await crypto.subtle.importKey("raw", prf, "HKDF", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "HKDF", hash: "SHA-256", salt, info: encoder.encode(prfVaultFormat) }, material, { name: "AES-GCM", length: 256 }, false, [usage]);
+}
+async function sealPrfVault(profile, secret, options) {
+  let cleartext;
+  try {
+    parseCredentialId(options.credentialId);
+    if (!(options.salt instanceof Uint8Array) || options.salt.length !== 32) throw new Error("本地 Passkey 保护盐必须恰好为 32 字节。");
+    const value = { format: prfVaultFormat, kdf: "HKDF-SHA256", cipher: "AES-256-GCM", credential_id: options.credentialId, origin: location.origin, rp_id: location.hostname, salt: hex(options.salt), iv: hex(crypto.getRandomValues(new Uint8Array(12))) };
+    const key = await prfVaultKey(options.prf, options.salt, "encrypt");
+    cleartext = unhex(secret, 32);
+    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv: unhex(value.iv, 12), additionalData: prfAdditionalData(profile, value) }, key, cleartext);
+    return { ...value, ciphertext: hex(new Uint8Array(ciphertext)) };
+  } finally { cleartext?.fill(0); if (options?.prf instanceof Uint8Array) options.prf.fill(0); }
+}
+async function openPrfVault(profile, prf) {
+  let cleartext;
+  try {
+    const value = profile.passkey;
+    const { salt, iv, ciphertext } = parsePrfVault(value);
+    if (value.origin !== location.origin || value.rp_id !== location.hostname) throw new Error("本地 Passkey 属于其他站点。请明确选择独立口令解锁。");
+    const key = await prfVaultKey(prf, salt, "decrypt");
+    cleartext = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: prfAdditionalData(profile, value) }, key, ciphertext));
+    if (cleartext.length !== 32) throw new Error("invalid key length");
+    return hex(cleartext);
+  } catch { throw new Error("无法使用本地 Passkey 解锁。请保留设备配置，或明确选择独立口令解锁。"); }
+  finally { cleartext?.fill(0); if (prf instanceof Uint8Array) prf.fill(0); }
+}
+
+export async function passkeyVaultUnlockOptions(profileId) {
+  requireSecureClient();
+  if (typeof profileId !== "string" || !/^[a-f0-9-]{36}$/.test(profileId)) throw new Error("请选择有效设备配置。");
+  const profile = parseProfile(await vaultRecords(profileId));
+  if (profile.id !== profileId) throw new Error("设备配置编号不一致。");
+  const { salt } = parsePrfVault(profile.passkey);
+  if (profile.passkey.origin !== location.origin || profile.passkey.rp_id !== location.hostname) throw new Error("本地 Passkey 属于其他站点。请明确选择独立口令解锁。");
+  return { credentialId: profile.passkey.credential_id, salt, options: { publicKey: { challenge: base64url(crypto.getRandomValues(new Uint8Array(32))), rpId: profile.passkey.rp_id, userVerification: "required", allowCredentials: [{ type: "public-key", id: profile.passkey.credential_id }] } } };
+}
+
+export async function protectClientVaultWithPrf(options) {
+  try {
+    requireSecureClient();
+    if (!identity || !activeProfileId) throw new Error("请先使用独立口令解锁本地设备配置，再启用 Passkey 保护。");
+    if (!globalThis.navigator?.locks?.request) throw new Error("此浏览器不支持安全保存本地 Passkey 保护。独立口令仓库保持可用。");
+    const profileId = activeProfileId, generation = identityGeneration, own = identity;
+    await navigator.locks.request(`${vaultFormat}:${profileId}:writer`, async () => {
+      const previous = parseProfile(await vaultRecords(profileId));
+      if (generation !== identityGeneration || identity !== own || previous.id !== profileId || previous.public_key !== own.publicKeyHex()) throw new Error("设备配置已改变，未保存本地 Passkey 保护。");
+      const profile = { ...previous, passkey: await sealPrfVault(previous, own.secretHex(), options) };
+      parseProfile(profile);
+      const db = await database();
+      try {
+        await new Promise((resolve, reject) => {
+          const transaction = db.transaction("keys", "readwrite"), keys = transaction.objectStore("keys");
+          pendingVaultWrites.add(transaction);
+          const request = keys.get(profileId);
+          request.onsuccess = () => {
+            try {
+              const current = parseProfile(request.result);
+              if (generation !== identityGeneration || identity !== own || activeProfileId !== profileId || current.id !== profileId || JSON.stringify(current) !== JSON.stringify(previous)) throw new Error("设备配置已改变。");
+              keys.put(profile, profileId);
+            } catch { transaction.abort(); }
+          };
+          transaction.oncomplete = () => {
+            pendingVaultWrites.delete(transaction);
+            if (generation !== identityGeneration || identity !== own || activeProfileId !== profileId) reject(new Error("设备配置已改变，保存操作已取消。"));
+            else resolve();
+          };
+          transaction.onerror = () => { pendingVaultWrites.delete(transaction); reject(new Error("无法保存本地 Passkey 保护。独立口令仓库保持可用。")); };
+          transaction.onabort = transaction.onerror;
+        });
+      } finally { db.close(); }
+    });
+  } finally { if (options?.prf instanceof Uint8Array) options.prf.fill(0); }
+}
+
 export async function clientVaultStatus() {
   requireSecureClient();
   await init();
@@ -134,7 +234,7 @@ export async function clientVaultStatus() {
   let profiles;
   try {
     const records = await vaultRecords();
-    profiles = records.map(record => { const profile = parseProfile(record); return { id: profile.id, name: profile.name }; });
+    profiles = records.map(record => { const profile = parseProfile(record); return { id: profile.id, name: profile.name, passkey: Object.hasOwn(profile, "passkey") }; });
   } catch { return { status: "unavailable", profiles: [], error: "无法读取加密设备仓库。请保留浏览器数据并检查站点存储权限，或明确选择临时会话。" }; }
   let created = false;
   try { created = localStorage.getItem(vaultMarker) === "true"; } catch {}
@@ -143,6 +243,8 @@ export async function clientVaultStatus() {
 
 export function lockClient() {
   identityGeneration += 1;
+  for (const transaction of pendingVaultWrites) { try { transaction.abort(); } catch {} }
+  pendingVaultWrites.clear();
   identity?.free();
   for (const candidate of pendingIdentities.values()) candidate.free();
   pendingIdentities.clear();
@@ -152,14 +254,16 @@ export function lockClient() {
 }
 
 export async function initClient(options) {
-  requireSecureClient();
-  if (identity) throw new Error("请先锁定当前设备配置，再解锁或创建其他账户的设备配置。");
-  if (!options || !["unlock", "create", "temporary", "restore"].includes(options.mode)) throw new Error("请先解锁加密仓库，或明确选择临时会话。");
-  if (initializing) throw new Error("设备仓库正在处理，请等待完成。");
-  const generation = identityGeneration;
-  const work = initializeIdentity(options, generation);
-  initializing = work;
-  try { return await work; } finally { if (initializing === work) initializing = undefined; }
+  try {
+    requireSecureClient();
+    if (identity) throw new Error("请先锁定当前设备配置，再解锁或创建其他账户的设备配置。");
+    if (!options || !["unlock", "unlock_prf", "create", "temporary", "restore"].includes(options.mode)) throw new Error("请先解锁加密仓库，或明确选择临时会话。");
+    if (initializing) throw new Error("设备仓库正在处理，请等待完成。");
+    const generation = identityGeneration;
+    const work = initializeIdentity(options, generation);
+    initializing = work;
+    try { return await work; } finally { if (initializing === work) initializing = undefined; }
+  } finally { if (options?.prf instanceof Uint8Array) options.prf.fill(0); }
 }
 
 async function initializeIdentity(options, generation) {
@@ -170,13 +274,14 @@ async function initializeIdentity(options, generation) {
     if (generation !== identityGeneration) throw new Error("设备仓库操作已取消。");
     if (options.mode === "temporary") { candidate = Identity.generate(); pendingIdentities.set(generation, candidate); }
     else {
-      if (options.mode === "unlock") {
+      if (options.mode === "unlock" || options.mode === "unlock_prf") {
         if (typeof options.profileId !== "string" || !/^[a-f0-9-]{36}$/.test(options.profileId)) throw new Error("请选择有效设备配置。");
         const stored = await vaultRecords(options.profileId);
         if (generation !== identityGeneration) throw new Error("设备仓库操作已取消。");
         if (!stored) throw new Error("此浏览器没有所选设备配置。请恢复备份，或明确创建新设备。");
         profile = parseProfile(stored);
-        const secret = await openDeviceVault(profile.vault, options.password);
+        if (profile.id !== options.profileId) throw new Error("设备配置编号不一致。");
+        const secret = options.mode === "unlock_prf" ? await openPrfVault(profile, options.prf) : await openDeviceVault(profile.vault, options.password);
         if (generation !== identityGeneration) throw new Error("设备仓库操作已取消。");
         candidate = Identity.fromSecretHex(secret);
         pendingIdentities.set(generation, candidate);
@@ -217,14 +322,26 @@ export async function exportDeviceVault() {
   return JSON.stringify(parseProfile(await vaultRecords(activeProfileId)));
 }
 
-export function signClient(domain, payload) {
-  if (!identity) throw new Error("浏览器设备密钥尚未初始化。");
-  return identity.sign(domain, encoder.encode(payload));
+export function signAuthorizedClientInvocation(authorization, templateJson, bodyJson, expectedAction, operationId, gatewayPublicKey) {
+  if (!identity) throw new Error("请先解锁当前账户的设备配置。");
+  if (gatewayPublicKey) return signForwardedClientInvocation(authorization, templateJson, bodyJson, expectedAction, operationId, gatewayPublicKey, identity, Date.now());
+  return signClientInvocation(authorization, templateJson, bodyJson, expectedAction, operationId, identity, Date.now());
 }
 
-export function signAuthorizedClientInvocation(authorization, templateJson, bodyJson, expectedAction, operationId) {
+export function prepareClientAccountCreation(root, recovery, claim, certificateExpiresAt) {
   if (!identity) throw new Error("请先解锁当前账户的设备配置。");
-  return signClientInvocation(authorization, templateJson, bodyJson, expectedAction, operationId, identity, Date.now());
+  return prepareAccountCreation(root, recovery, identity, claim, certificateExpiresAt, Date.now());
+}
+
+export function prepareClientAccountRecovery(materialJson, latestBundleJson, nextRoot, claim, certificateExpiresAt) {
+  if (!identity) throw new Error("请先解锁新的独立设备配置。");
+  return prepareAccountRecovery(materialJson, latestBundleJson, nextRoot, identity, claim, certificateExpiresAt, Date.now());
+}
+
+export function prepareClientRecoveryContext(materialJson, expectedNodePublicKey) {
+  if (!identity) throw new Error("请先解锁新的独立设备配置。");
+  const now = Date.now();
+  return buildRecoveryContextRequest(materialJson, identity, expectedNodePublicKey, now, now + 120000);
 }
 
 export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
@@ -285,7 +402,7 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
     await control("welcome");
     socket.send(JSON.stringify(entry.relay ? { type: "dial", target, service: "client" } : { type: "direct", service: "client" }));
     await control("ready");
-    handshake = new Handshake(true, identity.secretHex(), target, encoder.encode("vibeface:client:v1"));
+    handshake = new Handshake(true, identity.secretHex(), target, encoder.encode("vibeface:client:v2"));
     socket.send(handshake.write(new Uint8Array()));
     const response = await receive();
     if (!(response instanceof ArrayBuffer)) throw new Error("设备未返回加密握手。");

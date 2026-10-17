@@ -27,13 +27,16 @@ export function SessionsScreen() {
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [executorId, setExecutorId] = useState("")
+  const [taskId, setTaskId] = useState("")
   const [kind, setKind] = useState("codex")
   const devices = workspace.nodes.filter((node) => node.roles?.includes("executor"))
   const selected = devices.find((node) => node.node_id === executorId)
   const kinds = selected?.capabilities?.executors ?? []
   const sessions = workspace.data?.sessions ?? []
+  const tasks = (workspace.data?.tasks ?? []).filter(task => task.binding === null && !["accepted", "cancelled"].includes(task.status))
   const operations = [...(workspace.data?.operations ?? [])].reverse()
   const pending = workspace.pending.filter((item) => item.conversation_id === workspace.conversationId)
+  const pendingBindings = workspace.pendingBindings.filter(item => item.request.conversation_id === workspace.conversationId)
 
   useEffect(() => {
     if (typeof document !== "undefined" && document.activeElement?.id === "executor-node") return
@@ -44,6 +47,10 @@ export function SessionsScreen() {
     if (kinds.length > 0 && !kinds.includes(kind)) setKind(kinds[0])
   }, [kind, kinds])
 
+  useEffect(() => {
+    setTaskId(current => tasks.some(task => task.task_id === current) ? current : tasks[0]?.task_id ?? "")
+  }, [tasks])
+
   return (
     <section aria-label="执行会话" hidden={workspace.view !== "sessions"}>
       <div>
@@ -51,9 +58,19 @@ export function SessionsScreen() {
         <p>操作发到指定设备。结果未知时先核对，避免重复执行。</p>
       </div>
       {pending.map((operation) => <PendingCard key={operation.operation_id} operation={operation} />)}
+      {pendingBindings.map(item => (
+        <Card key={item.request.operation_id}>
+          <CardHeader><CardTitle>有一笔工单绑定尚未确认</CardTitle></CardHeader>
+          <CardContent>
+            <p>{item.task.title} · {nodeName(item.request.target_node)} · {item.request.action.cwd}</p>
+            <p>保留原会话编号和绑定内容。先向节点核对；仍未找到时，按原内容重试绑定，验证后打开会话。</p>
+            <ActionButton action={() => workspace.run(() => workspace.resumeBinding(item.request.operation_id))}>核对原绑定并打开会话</ActionButton>
+          </CardContent>
+        </Card>
+      ))}
       {sessions.length ? sessions.map((session) => (
         <SessionCard key={`${session.target_node}:${session.session_id}`} session={session} conversationId={workspace.conversationId} />
-      )) : <EmptyState title="还没有执行会话" detail="让调度 Agent 派发任务，或在下方打开指定设备的执行器。" />}
+      )) : <EmptyState title="还没有执行会话" detail="先创建工单，再把工单绑定到指定设备的执行器。" />}
       <Collapsible open={open} onOpenChange={setOpen}>
         <CollapsibleTrigger>打开执行会话</CollapsibleTrigger>
         <CollapsibleContent>
@@ -66,8 +83,9 @@ export function SessionsScreen() {
               setBusy(true)
               void workspace.run(async () => {
                 if (!target?.online) throw new Error("执行设备离线，请先恢复连接。")
+                if (!tasks.some(task => task.task_id === taskId)) throw new Error("先选择尚未绑定的工单。")
                 await workspace.operate(
-                  { target_node: target.node_id, session_id: newId(), revision: 0 },
+                  { target_node: target.node_id, session_id: newId(), task_id: taskId, revision: 0 },
                   { type: "open", executor: kind, cwd: String(new FormData(form).get("cwd") ?? "").trim() },
                   workspace.conversationId,
                 )
@@ -76,6 +94,14 @@ export function SessionsScreen() {
             }}
           >
             <FieldGroup>
+              <Field>
+                <FieldLabel htmlFor="executor-task">工单</FieldLabel>
+                <NativeSelect id="executor-task" name="task_id" required value={taskId} onChange={(event: ChangeEvent<HTMLSelectElement>) => setTaskId(event.target.value)}>
+                  {tasks.length ? tasks.map(task => (
+                    <NativeSelectOption key={task.task_id} value={task.task_id}>{task.title}</NativeSelectOption>
+                  )) : <NativeSelectOption value="">先创建尚未绑定的工单</NativeSelectOption>}
+                </NativeSelect>
+              </Field>
               <Field>
                 <FieldLabel htmlFor="executor-node">执行设备</FieldLabel>
                 <NativeSelect id="executor-node" name="target_node" required value={executorId} onChange={(event: ChangeEvent<HTMLSelectElement>) => setExecutorId(event.target.value)}>
@@ -99,7 +125,7 @@ export function SessionsScreen() {
                 <Input id="session-cwd" name="cwd" required placeholder="/Users/you/project" maxLength={4096} />
                 <p>目录须位于目标设备配置的允许范围内。</p>
               </Field>
-              <SubmitButton busy={busy}>打开会话</SubmitButton>
+              <Button type="submit" disabled={busy || !tasks.length || !workspace.writable} aria-busy={busy}>绑定工单并打开会话</Button>
             </FieldGroup>
           </form>
         </CollapsibleContent>
@@ -169,7 +195,7 @@ function SessionCard({ session, conversationId }: { session: SessionRecord; conv
         <StatusBadge value={session.state} />
       </CardHeader>
       <CardContent>
-        <DetailList pairs={[["工作目录", session.cwd], ["会话", session.session_id], ["版本", session.revision === undefined ? undefined : String(session.revision)]]} />
+        <DetailList pairs={[["工单", session.task_id], ["工作目录", session.cwd], ["会话", session.session_id], ["版本", session.revision === undefined ? undefined : String(session.revision)]]} />
         {session.state === "unknown" ? <p>结果未知。执行器可能仍在运行，先读取实际状态，不要重新派发同一任务。</p> : null}
         <Button
           type="button"

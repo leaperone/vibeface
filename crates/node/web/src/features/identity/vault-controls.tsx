@@ -1,9 +1,11 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { passkeyVaultUnlockOptions } from '../../../transport.js'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Label } from '@/components/ui/label'
 import { messageOf } from '@/lib/node'
+import { assertPasskey } from '@/lib/passkey'
 import { passphrase } from '@/lib/secure'
 import { useDevice } from './context'
 
@@ -12,10 +14,14 @@ export function VaultControls() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const pending = useRef(false)
+  const passkeyRequest = useRef<AbortController | null>(null)
   const [creating, setCreating] = useState(false)
+  const [selectedProfileId, setSelectedProfileId] = useState('')
+  const selectedProfile = device.vaults.find(profile => profile.id === selectedProfileId) ?? device.vaults[0]
   const locked = device.phase === 'vault_locked' && !creating
   const lost = device.phase === 'key_lost'
   const unavailable = device.phase === 'vault_unavailable'
+  useEffect(() => () => { passkeyRequest.current?.abort() }, [])
   async function run(action: () => Promise<void>) {
     if (pending.current) return
     pending.current = true; setBusy(true); setError('')
@@ -24,7 +30,7 @@ export function VaultControls() {
   }
   return <section className="space-y-4 rounded-xl border border-border bg-card p-5" aria-labelledby="vault-title">
     <h2 id="vault-title" className="font-semibold">{locked ? '解锁设备仓库' : unavailable ? '加密设备仓库暂不可用' : lost ? '设备仓库已丢失' : '创建账户的独立设备配置'}</h2>
-    <p className="text-sm text-muted-foreground">{locked ? '口令仅在此页面解密设备密钥，不会发送给节点。锁定会结束连接，原操作仍需在原空间核对。' : '使用至少 12 个字符的本地口令加密保存设备密钥。请独立保存口令，无法通过网站找回。旧版明文仓库不会导入。'}</p>
+    <p className="text-sm text-muted-foreground">{locked ? '独立口令仅在此页面解密设备密钥，不会发送给节点。锁定会结束连接，原操作仍需在原空间核对。' : '使用至少 12 个字符的本地独立口令加密保存设备密钥。请独立保存口令，无法通过网站找回。旧版明文仓库不会导入。'}</p>
     {lost && <p className="text-sm">请恢复加密设备备份，或创建新设备并重新取得批准。原设备的授权不会自动转移。</p>}
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
     <form className="space-y-3" onSubmit={event => {
@@ -43,11 +49,35 @@ export function VaultControls() {
         } finally { form.reset() }
       })
     }}><fieldset disabled={busy || unavailable} className="space-y-3">
-      {locked ? <div className="space-y-1"><Label htmlFor="vault-profile">设备配置</Label><NativeSelect id="vault-profile" name="profile" required>{device.vaults.map(profile => <NativeSelectOption key={profile.id} value={profile.id}>{profile.name}</NativeSelectOption>)}</NativeSelect></div> : <div className="space-y-1"><Label htmlFor="vault-name">设备配置名称</Label><Input id="vault-name" name="name" required maxLength={128} placeholder="例如：个人账户的手机" autoComplete="off" /></div>}
-      <div className="space-y-1"><Label htmlFor="vault-password">设备仓库口令</Label><Input id="vault-password" name="password" type="password" autoComplete={locked ? 'current-password' : 'new-password'} required minLength={locked ? undefined : 12} /></div>
+      {locked ? <div className="space-y-1"><Label htmlFor="vault-profile">设备配置</Label><NativeSelect id="vault-profile" name="profile" value={selectedProfile?.id ?? ''} onChange={event => { setSelectedProfileId(event.target.value); setError('') }} required>{device.vaults.map(profile => <NativeSelectOption key={profile.id} value={profile.id}>{profile.name}</NativeSelectOption>)}</NativeSelect></div> : <div className="space-y-1"><Label htmlFor="vault-name">设备配置名称</Label><Input id="vault-name" name="name" required maxLength={128} placeholder="例如：个人账户的手机" autoComplete="off" /></div>}
+      <div className="space-y-1"><Label htmlFor="vault-password">设备仓库独立口令</Label><Input id="vault-password" name="password" type="password" autoComplete={locked ? 'current-password' : 'new-password'} required minLength={locked ? undefined : 12} /></div>
       {!locked && <div className="space-y-1"><Label htmlFor="vault-confirmation">再次填写口令</Label><Input id="vault-confirmation" name="confirmation" type="password" autoComplete="new-password" required minLength={12} /></div>}
-      <Button type="submit">{busy ? '正在处理…' : locked ? '解锁设备仓库' : '创建加密设备仓库'}</Button>
+      <Button type="submit">{busy ? '正在处理…' : locked ? '使用独立口令解锁' : '创建加密设备仓库'}</Button>
     </fieldset></form>
+    {locked && selectedProfile?.passkey && <div className="space-y-2">
+      <p className="text-sm text-muted-foreground">本地 Passkey 只解密此浏览器的设备密钥。连接节点时仍会核验设备授权。失败后可自行选择独立口令解锁。</p>
+      <Button type="button" variant="outline" disabled={busy || unavailable} onClick={() => {
+        const profileId = selectedProfile.id
+        void run(async () => {
+          const controller = new AbortController()
+          passkeyRequest.current = controller
+          let prf: Uint8Array | null = null
+          try {
+            const local = await passkeyVaultUnlockOptions(profileId)
+            if (controller.signal.aborted) throw new Error('本地 Passkey 解锁已取消。')
+            const result = await assertPasskey(local.options, controller.signal, local.salt)
+            prf = result.prf
+            if (controller.signal.aborted) throw new Error('本地 Passkey 解锁已取消。')
+            if (result.response.id !== local.credentialId) throw new Error('Passkey 与所选设备配置不一致。')
+            if (!prf) throw new Error('此 Passkey 不支持本地密钥保护。请自行选择独立口令解锁。')
+            await device.initializeVault({ mode: 'unlock_prf', profileId, prf })
+          } finally {
+            prf?.fill(0)
+            if (passkeyRequest.current === controller) passkeyRequest.current = null
+          }
+        })
+      }}>使用本地 Passkey 解锁</Button>
+    </div>}
     {device.vaults.length > 0 && <Button type="button" variant="ghost" disabled={busy} onClick={() => { setCreating(!creating); setError('') }}>{creating ? '返回已有设备配置' : '为其他账户创建独立设备配置'}</Button>}
     <details className="space-y-3">
       <summary className="cursor-pointer py-2 text-sm">恢复设备密钥备份</summary>
@@ -76,6 +106,6 @@ export function VaultControls() {
       <p className="text-sm text-muted-foreground">临时会话仅在当前页面保留新设备密钥。关闭或锁定后无法恢复，需要重新批准。已有仓库保持不变。</p>
       <Button type="button" variant="outline" disabled={busy} onClick={() => void run(() => device.initializeVault({ mode: 'temporary' }))}>仅使用临时会话</Button>
     </div>
-    {busy && <Button type="button" variant="ghost" onClick={device.lockVault}>取消并锁定</Button>}
+    {busy && <Button type="button" variant="ghost" onClick={() => { passkeyRequest.current?.abort(); device.lockVault() }}>取消并锁定</Button>}
   </section>
 }

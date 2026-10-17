@@ -1,4 +1,5 @@
 import type { PendingMessage, TranscriptMessage } from "../chat/types"
+import type { AuthorizedRequest } from "../../lib/node"
 
 export type NodeInfo = {
   node_id: string
@@ -16,6 +17,9 @@ export type TaskRecord = {
   acceptance: string
   detail: string
   status: string
+  task_creation: Record<string, unknown>
+  authority_public_key: string
+  binding: Record<string, unknown> | null
 }
 export type SessionRecord = {
   executor: string
@@ -24,11 +28,15 @@ export type SessionRecord = {
   cwd: string
   session_id: string
   revision: number
+  task_id: string
+  binding: Record<string, unknown>
+  task_creation: Record<string, unknown>
+  authority_public_key: string
   native_session_id?: string
 }
 export type OperationRecord = {
   state: string
-  request: { space_id: string; operation_id: string; target_node: string; conversation_id: string; session_id: string }
+  request: OperationRequest
   raw: unknown
 }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
@@ -54,7 +62,8 @@ export type OperationRequest = {
   operation_id: string
   space_id: string
   conversation_id: string
-  task_id: null
+  task_id: string
+  binding: Record<string, unknown>
   target_node: string
   session_id: string
   expected_revision: number
@@ -64,7 +73,13 @@ export type OperationRequest = {
 }
 export type PendingOperation = Pick<OperationRequest, "space_id" | "operation_id" | "target_node" | "session_id" | "conversation_id"> & { request: OperationRequest }
 export type PendingConversation = { conversation_id: string; title: string }
-export type PendingTask = { conversation_id: string; task_id: string; title: string; goal: string; acceptance: string; auto_followup: boolean }
+export type TaskCreationRequest = { conversation_id: string; task_id: string; title: string; goal: string; acceptance: string; auto_followup: boolean }
+export type PendingTask = TaskCreationRequest & { attempts: AuthorizedRequest[] }
+export type PendingBinding = {
+  request: Omit<OperationRequest, "binding"> & { action: Extract<OperateAction, { type: "open" }> }
+  task: TaskRecord
+  attempt: AuthorizedRequest | null
+}
 export type WorkspaceView = "chat" | "tasks" | "sessions" | "devices" | "notifications"
 export type ChatSlotState = {
   conversationId: string | null

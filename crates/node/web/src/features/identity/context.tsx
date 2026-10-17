@@ -1,21 +1,21 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { clientVaultStatus, connectDevice, exportDeviceVault, initClient, lockClient, readInvitation, signClient } from '../../../transport.js'
+import { clientVaultStatus, connectDevice, exportDeviceVault, initClient, lockClient, prepareClientRecoveryContext, readInvitation } from '../../../transport.js'
 import type { ClientVaultOptions, DeviceChannel, VaultProfile } from '../../../transport.js'
 import {
-  array, boolean, deviceName, digest, entryKey, integer, messageOf, parseEntry, parseInfo, parseInvitation,
-  parseMember, parsePairReceipt, parseReview, parseSigning, parseView, record, same, signingPayload, text,
+  array, entryKey, integer, messageOf, parseEntry, parseInfo, parseConnectionCard, record, same, text,
 } from '@/lib/node'
-import type { ConnectionEntry, EntryInfo, Member, MembershipView, NodeRole, PairReceipt, PublicIdentity, ReadyConnection, WaitingPair } from '@/lib/node'
-import type { AuthenticationTrust } from '@/lib/secure'
+import type { AuthorizedRequest, ConnectionCard, ConnectionEntry, EntryInfo, AccountDeviceDirectory, PublicIdentity, ReadyConnection } from '@/lib/node'
 import { prepareRpc } from '@/lib/rpc-action'
-import type { AuthorizationTrust } from '@/lib/authorization'
-import { mergeAuthorizationTrust, parseAuthorizationTrust, subscriptionRenewalDelay, verifyScopedAuthentication } from '@/lib/authorization'
-import { Identity, downloadPackage, openPackage, sealPackage, verifiedView, verifyRecoveryResult, verifyState } from '@/lib/secure'
+import type { AuthorizationSelection, AuthorizationTrust } from '@/lib/authorization'
+import { mergeAuthorizationTrust, parseAuthorizationSelection, parseAuthorizationTrust, subscriptionRenewalDelay, verifyScopedAuthentication } from '@/lib/authorization'
+import { downloadPackage } from '@/lib/secure'
+import { createAccount, openAccountPackage, recoverAccount, sealAccountPackage } from '@/lib/account'
+import { nodeFingerprint } from '../../../generated/vibeface_secure.js'
 
-type Phase = 'initializing' | 'blocked' | 'vault_empty' | 'vault_locked' | 'vault_unavailable' | 'key_lost' | 'disconnected' | 'connecting' | 'unpaired' | 'ready'
-type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
-type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (members: Member[]) => Promise<void> }
+type Phase = 'initializing' | 'blocked' | 'vault_empty' | 'vault_locked' | 'vault_unavailable' | 'key_lost' | 'disconnected' | 'connecting' | 'unpaired' | 'no_project' | 'ready'
+type Review = { kind: 'bootstrap' | 'recovery'; accountId: string; spaceId: string; serviceGrant: { projectId: string; actions: string[] }; targetChanged: boolean }
+type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (saved: boolean) => Promise<void> }
 type Session = { renewal?: number; authorization?: ReturnType<typeof verifyScopedAuthentication>; channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number }
 function releaseSession(active: Session | null) {
   if (active?.renewal !== undefined) window.clearTimeout(active.renewal)
@@ -23,37 +23,23 @@ function releaseSession(active: Session | null) {
 }
 type DeviceContextValue = {
   identity: PublicIdentity | null; vaults: VaultProfile[]; spaces: AuthorizationTrust[]; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
-  entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; pairs: PairReceipt[]; waiting: WaitingPair | null; review: Review | null; initialInvitation: string
-  connect(entry: ConnectionEntry, spaceId?: string): Promise<void>; selectSpace(spaceId: string): Promise<void>; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
-  initializeVault(options: ClientVaultOptions): Promise<void>; lockVault(): void; backupVault(): Promise<void>; pair(invitation: string, name: string, password?: string): Promise<void>; acceptPair(): Promise<void>; checkPair(): Promise<void>; cancelPair(): void
-  refreshDirectory(): Promise<void>; createInvitation(kind: 'client' | 'node', roles: NodeRole[]): Promise<string>; approvePair(requestId: string): Promise<void>; revoke(subjectId: string): Promise<void>
-  beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry; bootstrap: string }): Promise<void>
+  entry: ConnectionEntry | null; info: EntryInfo | null; directory: AccountDeviceDirectory | null; review: Review | null; initialInvitation: string
+  connect(entry: ConnectionEntry, spaceId?: string, projectId?: string): Promise<void>; selectSpace(spaceId: string): Promise<void>; selectProject(projectId: string): Promise<void>; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
+  initializeVault(options: ClientVaultOptions): Promise<void>; lockVault(): void; backupVault(): Promise<void>; useConnectionCard(content: string, password?: string): Promise<void>
+  refreshDirectory(): Promise<void>
+  beginRecovery(input: { file: File; password: string; connectionCard: string }): Promise<void>
   reencrypt(input: { file: File; oldPassword: string; password: string }): Promise<void>
-  downloadBackup(): void; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
+  downloadBackup(): void; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(saved: boolean): Promise<void>; cancelSensitive(): void
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
 const changed = () => new Error('设备连接已切换。原操作结果需要核对，不会自动重发。')
-function load(key: string, required = false): unknown { try { const value = localStorage.getItem(`vibeface.v3.${key}`); return value ? JSON.parse(value) : null } catch { if (required) throw new Error('无法读取已保存的账户信任，请保留浏览器数据并检查存储权限。'); return null } }
-function store(key: string, value: unknown) { try { localStorage.setItem(`vibeface.v3.${key}`, JSON.stringify(value)) } catch { throw new Error('浏览器无法保存设备记录。请允许此站点使用本地存储。') } }
-function savedEntries(profile: string): ConnectionEntry[] {
-  const value = load(`profile.${profile}.connections`)
+function readPersistent(key: string, required = false): unknown { try { const value = localStorage.getItem(`vibeface.v3.${key}`); return value ? JSON.parse(value) : null } catch { if (required) throw new Error('无法读取已保存的账户信任，请保留浏览器数据并检查存储权限。'); return null } }
+function writePersistent(key: string, value: unknown) { try { localStorage.setItem(`vibeface.v3.${key}`, JSON.stringify(value)) } catch { throw new Error('浏览器无法保存设备记录。请允许此站点使用本地存储。') } }
+function savedEntries(profile: string, read: (key: string) => unknown): ConnectionEntry[] {
+  const value = read(`profile.${profile}.connections`)
   if (!Array.isArray(value)) return []
   return value.flatMap(item => { try { return [parseEntry(item)] } catch { return [] } })
 }
-function loadWaiting(profile: string): WaitingPair | null {
-  try {
-    const value = load(`profile.${profile}.waiting-pair`)
-    if (!value) return null
-    const v = record(value)
-    const review = parseReview(v.review)
-    const signing = parseSigning(v.signing)
-    signingPayload(signing, 'identity-pair-review', review)
-    if (review.expires_at_ms <= Date.now()) return null
-    return { request_id: text(v.request_id), network_id: text(v.network_id), entry: parseEntry(v.entry), review, signing, accepted: boolean(v.accepted) }
-  } catch { return null }
-}
-function ownerOf(state: unknown) { return text(record(record(state).genesis).owner_public_key) }
-function sign(signing: unknown, domain: string, expected: unknown) { return signClient(domain, signingPayload(signing, domain, expected)) }
 function isResponseError(error: unknown) { return error instanceof Error && 'responded' in error && error.responded === true }
 
 export function DeviceProvider({ children }: { children: ReactNode }) {
@@ -66,9 +52,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState('')
   const [entry, setEntry] = useState<ConnectionEntry | null>(null)
   const [info, setInfo] = useState<EntryInfo | null>(null)
-  const [directory, setDirectory] = useState<MembershipView | null>(null)
-  const [pairs, setPairs] = useState<PairReceipt[]>([])
-  const [waiting, setWaiting] = useState<WaitingPair | null>(null)
+  const [directory, setDirectory] = useState<AccountDeviceDirectory | null>(null)
   const [review, setReview] = useState<Review | null>(null)
   const [initialInvitation, setInitialInvitation] = useState('')
   const generation = useRef(0)
@@ -77,7 +61,14 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const sensitive = useRef<Sensitive | null>(null)
   const listeners = useRef(new Set<() => void>())
   const identityRef = useRef<PublicIdentity | null>(null)
-  const waitingRef = useRef<WaitingPair | null>(null)
+  const temporaryRecords = useRef(new Map<string, unknown>())
+  function load(key: string, required = false): unknown {
+    return identityRef.current?.profileId === null ? temporaryRecords.current.get(key) ?? null : readPersistent(key, required)
+  }
+  function store(key: string, value: unknown) {
+    if (identityRef.current?.profileId === null) temporaryRecords.current.set(key, JSON.parse(JSON.stringify(value)))
+    else writePersistent(key, value)
+  }
 
   function storageProfile(own = identityRef.current) {
     if (!own) throw new Error('请先解锁设备配置。')
@@ -93,16 +84,16 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     connecting.current?.abort(); connecting.current = null
     const previous = session.current; session.current = null
     releaseSession(previous); previous?.channel.close()
-    listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setInfo(null); setEntry(null)
-    waitingRef.current = null; setWaiting(null); setPhase('disconnected'); setError('')
+    listeners.current.clear(); setReady(null); setDirectory(null); setInfo(null); setEntry(null)
+    setPhase('disconnected'); setError('')
   }, [cancelSensitive])
   const saveEntry = useCallback((candidate: ConnectionEntry) => {
     const parsed = parseEntry(candidate)
-    const next = [...savedEntries(storageProfile()).filter(item => entryKey(item) !== entryKey(parsed)), parsed]
+    const next = [...savedEntries(storageProfile(), load).filter(item => entryKey(item) !== entryKey(parsed)), parsed]
     store(profileKey('connections'), next); setEntries(next)
   }, [])
   const removeEntry = useCallback((candidate: ConnectionEntry) => {
-    const next = savedEntries(storageProfile()).filter(item => entryKey(item) !== entryKey(candidate))
+    const next = savedEntries(storageProfile(), load).filter(item => entryKey(item) !== entryKey(candidate))
     store(profileKey('connections'), next); setEntries(next)
   }, [])
   function current() { const value = session.current; if (!value) throw new Error('先连接并核对自己的设备。'); return value }
@@ -113,11 +104,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     return result
   }
   function scoped(active = current()) { return (method: string, params: Record<string, unknown> = {}) => callSession(active, method, params) }
-  async function authenticate(authValue: unknown, active = current(), expected: AuthenticationTrust | AuthorizationTrust | null = null) {
+  const targetKey = (spaceId: string, entry: ConnectionEntry) => profileKey(`target.${JSON.stringify([spaceId, entryKey(entry)])}`)
+  async function authenticate(authValue: unknown, active = current(), expected: AuthorizationTrust | null = null, projectId?: string, selection?: AuthorizationSelection) {
     const request = scoped(active)
     const own = identityRef.current
     if (!own) throw new Error('浏览器密钥尚未初始化。')
-    if (expected && expected.kind !== 'policy') throw new Error('旧格式账户授权不能用于当前版本。请使用新格式账户连接卡。')
     if (!('locks' in navigator)) throw new Error('此浏览器需要支持 Web Locks 才能安全保存账户政策。请更换安全浏览器入口。')
     const authorization = await navigator.locks.request(profileKey('policy-trust-writer'), () => {
       if (session.current !== active) throw changed()
@@ -125,7 +116,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const selectedSpace = load(profileKey('last-space'))
       const candidate = expected ?? known.find(trust => trust.spaceId === selectedSpace) ?? known[0]
       const trust = mergeAuthorizationTrust(parseAuthorizationTrust(candidate), known)
-      const verified = verifyScopedAuthentication(authValue, own, trust, active.channel.publicKey)
+      const verified = verifyScopedAuthentication(authValue, own, trust, active.channel.publicKey, selection)
       try {
         const others = known.filter(trust => trust.spaceId !== verified.trust.spaceId)
         const next = [...others.map(trust => mergeAuthorizationTrust(trust, [verified.trust])), verified.trust]
@@ -139,8 +130,21 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     releaseSession(active); active.authorization = authorization
     saveEntry(active.entry)
     store(profileKey('last-entry'), active.entry)
-    async function signedCall(method: string, params: Record<string, unknown> = {}, channelMethod = 'rpc') {
+    const projectKey = profileKey(`project.${authorization.scope.space_id}.${authorization.audience.service}`)
+    const selectedProject = projectId ?? load(projectKey)
+    const project = authorization.projects.find(project => project.id === selectedProject) ?? (projectId ? undefined : authorization.projects[0])
+    if (!project) {
+      setReady(null); setPhase('no_project')
+      setError(projectId ? '所选项目已不在当前授权内，请重新核对项目权限。' : '账户已验证，当前入口没有可用的已授权项目。请在 Node 上登记项目并授权后重新连接。')
+      return
+    }
+    store(projectKey, project.id)
+    store(targetKey(authorization.scope.space_id, active.entry), { resourceId: project.id, audience: authorization.audience })
+    const selectedProjectId = project.id
+    async function signedCall(method: string, params: Record<string, unknown> = {}, channelMethod = 'rpc', beforeSend?: (proof: AuthorizedRequest) => void) {
       if (session.current !== active) throw changed()
+      if (params.resource_id !== undefined && params.resource_id !== selectedProjectId) throw new Error('请求属于其他项目，已拒绝签名。')
+      params = { ...params, resource_id: selectedProjectId }
       if (['notifications', 'ack'].includes(method)) {
         if (params.client_id !== undefined && params.client_id !== authorization.scope.device_id) throw new Error('通知请求属于其他设备，已拒绝签名。')
         params = { ...params, client_id: authorization.scope.device_id }
@@ -151,6 +155,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const normalized = record(template.body)
       if (!same(normalized, body)) throw new Error('节点准备的请求与当前操作不同。请核对最终路径、目标和权限后重新提交。')
       const invocation = record(JSON.parse(authorization.sign(JSON.stringify(record(template.invocation)), JSON.stringify(normalized), prepared.action, prepared.authorizationId)))
+      beforeSend?.({ body: normalized, invocation })
       const result = await callSession(active, channelMethod, normalized, invocation)
       if (channelMethod === 'subscribe') {
         const expiresAt = integer(record(invocation.payload).expires_at_ms)
@@ -164,21 +169,23 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           })
         }, delay)
       }
-      return result
+      return { result, body: normalized, invocation }
     }
     try { await signedCall('conversations', {}, 'subscribe') }
     catch (error) { authorization.release(); if (active.authorization === authorization) active.authorization = undefined; throw error }
     const connection: ReadyConnection = {
       generation: active.generation, entry: active.entry, scope: authorization.scope, audience: authorization.audience, info: active.info,
+      project, projects: authorization.projects, audiencePublicKey: text(authorization.policy.audience_public_key),
       authorization: { enrollmentRights: authorization.enrollmentRights, actions: authorization.actions, authorityEpoch: authorization.authorityEpoch },
       request: (method, params) => { if (session.current !== active) return Promise.reject(changed()); return request(method, params) },
-      rpc: (method, params) => signedCall(method, params),
+      rpc: (method, params) => signedCall(method, params).then(reply => reply.result),
+      rpcWithProof: (method, params, beforeSend) => signedCall(method, params, 'rpc', beforeSend),
       subscribe(listener) { if (session.current !== active) return () => {}; listeners.current.add(listener); return () => { listeners.current.delete(listener) } },
       isCurrent: () => session.current === active && generation.current === active.generation,
     }
-    setDirectory(null); setReady(connection); setPhase('ready'); setError(''); waitingRef.current = null; setWaiting(null); store(profileKey('waiting-pair'), null)
+    setDirectory(null); setReady(connection); setPhase('ready'); setError('')
   }
-  async function open(entryValue: ConnectionEntry) {
+  async function open(entryValue: ConnectionEntry, expectedPublicKey?: string) {
     const parsed = parseEntry(entryValue)
     disconnect(); setPhase('connecting'); setEntry(parsed)
     const version = generation.current
@@ -189,11 +196,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         onEvent(value) { const event = record(value); if (version === generation.current && event.type === 'changed') for (const listener of listeners.current) listener() },
         onClose(reason) {
           if (version !== generation.current) return
-          generation.current += 1; releaseSession(session.current); session.current = null; cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setWaiting(null); waitingRef.current = null; setPhase('disconnected'); setError(messageOf(reason))
+          generation.current += 1; releaseSession(session.current); session.current = null; cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPhase('disconnected'); setError(messageOf(reason))
         },
       })
       if (version !== generation.current) { channel.close(); throw changed() }
-      const details = parseInfo(await channel.request('info'))
+      if (expectedPublicKey && channel.publicKey !== expectedPublicKey) { channel.close(); throw new Error('连接卡中的可信公钥与加密连接目标不一致。') }
+      const details = parseInfo(await channel.request('identity', { method: 'status', params: {} }))
       if (version !== generation.current) { channel.close(); throw changed() }
       if (details.node_id !== parsed.node_id || details.public_key !== channel.publicKey) { channel.close(); throw new Error('入口报告的设备与已核验指纹不一致。') }
       const active = { channel, entry: parsed, info: details, generation: version }
@@ -203,251 +211,187 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       throw cause
     }
   }
-  async function connect(candidate: ConnectionEntry, spaceId?: string) {
+  async function connect(candidate: ConnectionEntry, spaceId?: string, projectId?: string) {
     const known = savedSpaces()
     const selectedSpace = spaceId ?? load(profileKey('last-space'), true)
     if (selectedSpace !== null && typeof selectedSpace !== 'string') throw new Error('已保存的空间选择无效。请保留浏览器数据并核查。')
     const trust = selectedSpace ? known.find(trust => trust.spaceId === selectedSpace) : known[0]
     if (!trust) throw new Error('请先使用新格式连接卡为此设备配置取得账户授权。')
+    const savedTarget = load(targetKey(trust.spaceId, candidate), true)
+    const selection = savedTarget ? parseAuthorizationSelection(savedTarget) : undefined
+    if (selection && projectId) selection.resourceId = projectId
     const active = await open(candidate)
     const request = scoped(active)
     let auth: unknown
     try {
-      auth = await request('authenticate', { account_id: trust.accountId, space_id: trust.spaceId, device_public_key: identityRef.current?.publicKey })
+      auth = await request('identity', { method: 'authenticate', params: { account_id: trust.accountId, space_id: trust.spaceId, device_public_key: identityRef.current?.publicKey, ...(selection ? { resource_id: selection.resourceId, audience: selection.audience } : projectId ? { resource_id: projectId } : {}) } })
     }
     catch (cause) { if (isResponseError(cause)) { setError('此设备尚未取得所选空间授权。请在已授权设备上批准。'); return }; throw cause }
-    await authenticate(auth, active, trust)
+    await authenticate(auth, active, trust, projectId ?? selection?.resourceId, selection)
   }
   async function selectSpace(spaceId: string) {
     if (!ready?.isCurrent()) throw changed()
     if (ready.scope.space_id === spaceId) return
     await connect(ready.entry, spaceId)
   }
+  async function selectProject(projectId: string) {
+    if (!ready?.isCurrent()) throw changed()
+    if (ready.project.id === projectId) return
+    if (!ready.projects.some(project => project.id === projectId)) throw new Error('项目不在已验证授权内。')
+    await connect(ready.entry, ready.scope.space_id, projectId)
+  }
   async function refreshDirectory() {
     if (!ready?.isCurrent()) return
-    const request = scoped()
-    const response = record(await request('directory'))
-    const view = verifiedView(response.state, ready.scope.space_id, ownerOf(response.state))
-    if (!same(response.view, view)) throw new Error('成员目录与已签名的授权不一致。')
-    const pending = ready.authorization.enrollmentRights.includes('enroll_device') ? array(await request('pair_requests')).map(parsePairReceipt) : []
+    const active = current()
+    const authorization = active.authorization
+    if (!authorization || !authorization.enrollmentRights.some(right => right === 'enroll_device' || right === 'revoke_device')) throw new Error('此设备没有账户设备管理权限。')
+    const response = await callSession(active, 'identity', { method: 'device_directory', params: { account_id: authorization.scope.account_id, space_id: authorization.scope.space_id, device_public_key: identityRef.current?.publicKey, resource_id: ready.project.id, audience: authorization.audience } })
+    const directory = authorization.directory(response)
     if (!ready.isCurrent()) throw changed()
-    setDirectory(view); setPairs(pending)
+    setDirectory(directory)
   }
-  async function createInvitation(kind: 'client' | 'node', selectedRoles: NodeRole[]) {
-    if (!ready?.authorization.enrollmentRights.includes('enroll_device') || !identityRef.current) throw new Error('此设备没有管理权限。')
-    const request = scoped()
-    const requestedRoles = kind === 'node' ? [...new Set(selectedRoles)].sort() : []
-    if (kind === 'node' && (!requestedRoles.includes('relay') || requestedRoles.some(role => ['gateway', 'scheduler', 'executor'].includes(role)) && !requestedRoles.includes('replica'))) throw new Error('运行节点需要中继权限，接入、调度和执行同时需要同步权限。')
-    const prepared = record(await request('prepare_invite', { kind, node_roles: requestedRoles, request_id: crypto.randomUUID() }))
-    const invite = record(prepared.invite); const payload = record(invite.payload)
-    if (payload.new_kind !== kind || !same(payload.node_roles, requestedRoles) || payload.manage !== false || payload.inviter_subject_id !== identityRef.current.nodeId || payload.network_id !== ready.scope.space_id || payload.epoch !== ready.authorization.authorityEpoch || integer(payload.expires_at_ms) <= Date.now()) throw new Error('邀请模板与所选权限不一致。')
-    const capabilityHash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text(prepared.capability))))].map(byte => byte.toString(16).padStart(2, '0')).join('')
-    if (payload.capability_hash !== capabilityHash) throw new Error('邀请密钥与签名模板不一致。')
-    invite.inviter_signature = sign(prepared.signing, 'identity-invite', payload)
-    const result = record(await request('commit_invite', { invite, capability: prepared.capability }))
-    if (!same(result.invite, invite) || result.capability !== prepared.capability) throw new Error('保存后的邀请与已签名内容不一致。')
-    return JSON.stringify({ url: ready.entry.address, node_id: ready.entry.node_id, relay: ready.entry.relay, invite: result })
-  }
-  async function approvePair(requestId: string) {
-    if (!ready?.authorization.enrollmentRights.includes('enroll_device') || !identityRef.current) throw new Error('此设备没有管理权限。')
-    const request = scoped()
-    const pending = pairs.find(item => item.request_id === requestId)
-    if (!pending || !pending.new_subject_signature || pending.review.expires_at_ms <= Date.now()) throw new Error('新设备尚未确认，或请求已过期。请刷新后核对。')
-    const proposal = record(await request('prepare_pair', { request_id: requestId }))
-    const event = record(proposal.event)
-    const expected = { version: 1, network_id: ready.scope.space_id, epoch: ready.authorization.authorityEpoch, parents: pending.review.parents, issuer: identityRef.current.nodeId, action: { type: 'grant', member: pending.review.new_member }, signature: '' }
-    if (!same(proposal.review, pending.review) || !same(event, expected)) throw new Error('配对设备或权限发生变化。请刷新后核对。')
-    const inviter_signature = sign(proposal.review_signing, 'identity-pair-review', pending.review)
-    event.signature = sign(proposal.signing, 'identity-governance', expected)
-    await request('pair_confirm', { request_id: requestId, inviter_signature, event }); await refreshDirectory()
-  }
-  async function revoke(subjectId: string) {
-    if (!ready?.authorization.enrollmentRights.includes('revoke_device') || !identityRef.current || !directory) throw new Error('此设备没有管理权限。')
-    const request = scoped()
-    const member = directory.members.find(item => item.subject_id === subjectId)
-    if (!member || member.manage) throw new Error('管理客户端的变更需要根恢复确认。')
-    const prepared = record(await request('prepare_revoke', { subject_id: subjectId }))
-    const event = record(prepared.event)
-    const expected = { version: 1, network_id: ready.scope.space_id, epoch: ready.authorization.authorityEpoch, parents: directory.heads, issuer: identityRef.current.nodeId, action: { type: 'revoke', subject_id: subjectId }, signature: '' }
-    if (!same(event, expected)) throw new Error('撤销模板与当前选择不一致。请刷新目录后重试。')
-    event.signature = sign(prepared.signing, 'identity-governance', expected)
-    await request('revoke', { event }); await refreshDirectory()
-  }
-  async function pair(invitationText: string, nameValue: string, password?: string) {
-    const invitation = parseInvitation(readInvitation(invitationText))
-    setInitialInvitation('')
-    const name = deviceName(nameValue)
-    const active = await open(invitation.entry)
-    const request = scoped(active)
-    const own = identityRef.current
-    if (!own) throw new Error('浏览器密钥尚未初始化。')
-    if (invitation.kind === 'bootstrap') {
-      if (active.info.initialized) throw new Error('此节点已创建个人网络。请使用配对邀请或恢复包。')
-      if (!password) throw new Error('请设置加密恢复包口令。')
-      const root = Identity.generate()
-      let recovery: Uint8Array
-      let prepared: Record<string, unknown>
-      let networkId: string
-      try {
-        networkId = root.nodeId()
-        prepared = record(await request('prepare_genesis', { owner_public_key: root.publicKeyHex(), client_name: name }))
-        const state = record(prepared.state); const genesis = record(state.genesis)
-        const members = array(genesis.initial_members).map(parseMember)
-        const expectedMembers = [
-          { subject_id: own.nodeId, public_key: own.publicKey, kind: 'client', name, node_roles: [], manage: true },
-          { subject_id: active.entry.node_id, public_key: active.info.public_key, kind: 'node', name: 'This device', node_roles: [...active.info.roles].sort(), manage: false },
-        ] satisfies Member[]
-        expectedMembers.sort((a, b) => a.subject_id.localeCompare(b.subject_id))
-        if (genesis.version !== 1 || genesis.network_id !== networkId || genesis.owner_public_key !== root.publicKeyHex() || genesis.signature !== '' || state.checkpoint !== null || !same(state.events, []) || !same(members, expectedMembers)) throw new Error('首台设备的授权模板与当前设备不一致。')
-        genesis.signature = root.sign('identity-genesis', new TextEncoder().encode(signingPayload(prepared.signing, 'identity-genesis', genesis)))
-        const verified = verifyState(state, networkId, root.publicKeyHex()); verified.free()
-        const payload = { version: 1, network_id: networkId, root_secret_key: root.secretHex(), genesis, recovery_epoch: 1, decryption_keys: [] }
-        try { recovery = sealPackage(payload, password) } finally { payload.root_secret_key = '' }
-      } finally { root.free(); password = '' }
-      if (session.current !== active) { recovery.fill(0); throw changed() }
-      let downloaded = false
-      let cancelled = false
-      const flow: Sensitive = {
-        cancel() { cancelled = true; recovery.fill(0); invitation.capability = '' },
-        download() { if (cancelled || session.current !== active) throw changed(); downloadPackage(recovery, networkId); downloaded = true },
-        async bootstrap(saved) {
-          if (!saved || !downloaded) throw new Error('请先下载加密恢复包，并确认妥善保存。')
-          if (cancelled || session.current !== active) throw changed()
-          try {
-            const auth = await request('bootstrap', { capability: invitation.capability, state: prepared.state })
-            if (cancelled) throw new Error('初始化已提交，但本地确认已取消。请重新连接核对网络状态。')
-            const state = record(prepared.state)
-            await authenticate(auth, active, { kind: 'root', networkId, ownerPublicKey: ownerOf(state), genesis: state.genesis })
-          }
-          finally { if (sensitive.current === flow) cancelSensitive(); else flow.cancel() }
-        },
-      }
-      sensitive.current = flow; setReview({ kind: 'bootstrap', networkId }); return
-    }
-    const prepared = record(await request('prepare_pair_request', { invite: invitation.invite, capability: invitation.capability, name }))
-    const pairRequest = record(prepared.request)
-    const member: Member = { subject_id: own.nodeId, public_key: own.publicKey, kind: 'client', name, node_roles: [], manage: false }
-    if (!same(pairRequest.member, member) || pairRequest.invite_id !== invitation.payload.invite_id || pairRequest.capability !== invitation.capability) throw new Error('配对请求与此浏览器身份不一致。')
-    const expectedProposal = [text(pairRequest.request_id), text(pairRequest.invite_id), text(pairRequest.capability), member, text(pairRequest.nonce)]
-    pairRequest.proof = sign(prepared.signing, 'identity-pair', expectedProposal)
-    const receipt = record(await request('pair_request', { request: pairRequest }))
-    const pairReview = parseReview(receipt.review)
-    const signing = parseSigning(receipt.signing)
-    signingPayload(signing, 'identity-pair-review', pairReview)
-    if (receipt.request_id !== pairRequest.request_id || pairReview.network_id !== invitation.payload.network_id || pairReview.invite_id !== invitation.payload.invite_id || pairReview.epoch !== invitation.payload.epoch || pairReview.inviter_subject_id !== invitation.payload.inviter_subject_id || pairReview.proposal_hash !== await digest(expectedProposal) || !same(pairReview.new_member, member) || pairReview.expires_at_ms > integer(invitation.payload.expires_at_ms) || pairReview.expires_at_ms <= Date.now()) throw new Error('配对确认与原邀请或已签名请求不一致。')
-    if (session.current !== active) throw changed()
-    const next = { request_id: text(receipt.request_id), network_id: pairReview.network_id, entry: active.entry, review: pairReview, signing, accepted: false }
-    waitingRef.current = next; store(profileKey('waiting-pair'), next); setWaiting(next)
-  }
-  async function acceptPair() {
-    const request = scoped()
-    const pending = waitingRef.current
-    if (!pending || pending.review.new_member.subject_id !== identityRef.current?.nodeId || pending.review.expires_at_ms <= Date.now()) throw new Error('配对信息失效。请重新取得邀请。')
-    await request('pair_accept', { request_id: pending.request_id, signature: sign(pending.signing, 'identity-pair-review', pending.review) })
-    if (waitingRef.current !== pending) return
-    const next = { ...pending, accepted: true }; waitingRef.current = next; store(profileKey('waiting-pair'), next); setWaiting(next)
-    await checkPair()
-  }
-  async function checkPair() {
-    const request = scoped()
-    const pending = waitingRef.current
-    if (!pending?.accepted) return
-    const response = record(await request('pair_status', { request_id: pending.request_id }))
-    if (waitingRef.current !== pending) return
-    if (response.status === 'granted') await authenticate(await request('authenticate', { network_id: pending.network_id }), current(), { kind: 'network', networkId: pending.network_id })
-    else if (response.status !== 'pending') throw new Error('配对请求未完成。请在管理设备上核对，或创建新邀请。')
-  }
-  function cancelPair() { waitingRef.current = null; setWaiting(null); store(profileKey('waiting-pair'), null) }
-  async function beginRecovery(input: { file: File; password: string; name: string; entry: ConnectionEntry; bootstrap: string }) {
-    const name = deviceName(input.name)
-    const active = await open(input.entry)
-    const request = scoped(active)
-    let password = input.password
-    input.password = ''
-    const opened = await openPackage(input.file, password)
-    let capability = ''
-    let verified: ReturnType<typeof verifyState> | null = null
-    let released = false
-    const release = () => { if (released) return; released = true; opened.release(); verified?.free(); verified = null; password = ''; capability = '' }
-    try {
-      if (session.current !== active) throw changed()
-      if (input.bootstrap.trim()) {
-        const bootstrap = parseInvitation(readInvitation(input.bootstrap))
-        if (bootstrap.kind !== 'bootstrap' || entryKey(bootstrap.entry) !== entryKey(active.entry)) throw new Error('初始化邀请与恢复目标不一致。')
-        capability = bootstrap.capability
-      }
-      if (!active.info.initialized && !capability) throw new Error('新节点恢复需要此节点本机生成的初始化邀请。')
+  async function useConnectionCard(content: string, password?: string) {
+    const card = parseConnectionCard(readInvitation(content))
+    setInitialInvitation(''); content = ''
+    if (card.kind === 'connection') {
+      password = ''
+      const active = await open(card.entry, card.nodePublicKey)
       const own = identityRef.current
-      if (!own) throw new Error('浏览器密钥尚未初始化。')
-      const challengeResult = record(await request('recovery_challenge', { network_id: opened.networkId, owner_public_key: opened.root.publicKeyHex(), genesis: opened.payload.genesis }))
-      const challenge = record(challengeResult.challenge)
-      if (challenge.network_id !== opened.networkId || challenge.owner_public_key !== opened.root.publicKeyHex() || challenge.subject_id !== own.nodeId || challenge.target_node_id !== active.entry.node_id || challenge.challenge_id !== challengeResult.challenge_id || challenge.genesis_hash !== await digest(opened.payload.genesis) || integer(challenge.expires_at_ms) <= Date.now() || integer(challenge.expires_at_ms) > Date.now() + 120000 || !/^[a-f0-9]{64}$/.test(text(challenge.nonce))) throw new Error('恢复挑战与当前设备或恢复包不一致。')
-      const proof = opened.root.sign('identity-recovery-access', new TextEncoder().encode(signingPayload(challengeResult.signing, 'identity-recovery-access', challenge)))
-      const result = record(await request('recovery_context', { challenge_id: challenge.challenge_id, signature: proof, recovery_epoch: opened.epoch, ...(!active.info.initialized ? { state: { genesis: opened.payload.genesis, checkpoint: null, events: [] }, capability } : {}) }))
-      if (!same(record(result.state).genesis, opened.payload.genesis)) throw new Error('恢复目标的创世授权与恢复包不一致。')
-      verified = verifyState(result.state, opened.networkId, opened.root.publicKeyHex())
-      const view = parseView(JSON.parse(verified.viewJson()))
-      if (!same(result.view, view)) throw new Error('恢复目录与已签名的成员记录不一致。')
-      const members = view.members.filter(member => !view.revoked.includes(member.subject_id) && member.subject_id !== own.nodeId)
-      if (!members.some(member => member.subject_id === active.entry.node_id)) members.push({ subject_id: active.entry.node_id, public_key: active.info.public_key, kind: 'node', name: `恢复入口 ${active.entry.node_id.slice(0, 10)}`, node_roles: [...active.info.roles].sort(), manage: false })
-      const newManager: Member = { subject_id: own.nodeId, public_key: own.publicKey, kind: 'client', name, node_roles: [], manage: true }
-      const allowed = new Map(members.map(member => [member.subject_id, member]))
-      const flow: Sensitive = {
-        cancel: release,
-        async recover(selectedInput) {
-          if (released || !verified || session.current !== active) throw new Error('恢复材料已清除。请重新导入。')
-          const selected = selectedInput.map(member => {
-            const original = allowed.get(member.subject_id)
-            if (!original || !same({ ...member, manage: original.manage }, original) || member.kind === 'node' && member.manage) throw new Error('所选成员与已验证目录不一致。')
-            return member
-          })
-          if (!selected.some(member => member.subject_id === active.entry.node_id) || new Set(selected.map(member => member.subject_id)).size !== selected.length) throw new Error('恢复必须保留当前目标，且不能重复选择成员。')
-          selected.push(newManager); selected.sort((a, b) => a.subject_id.localeCompare(b.subject_id))
-          try {
-            const prepared = await request('prepare_recovery', { challenge_id: challenge.challenge_id, members: selected })
-            if (released || !verified) throw changed()
-            const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, JSON.stringify(selected), opened.epoch, JSON.stringify(prepared)))
-            const authValue = await request('recover', { challenge_id: challenge.challenge_id, checkpoint, ...(!active.info.initialized ? { state: result.state, capability } : {}) })
-            if (released) throw new Error('恢复授权已提交，但本地恢复已取消。请重新连接核对授权，并使用原恢复包。')
-            const { auth, epoch } = verifyRecoveryResult(authValue, { networkId: opened.networkId, ownerPublicKey: opened.root.publicKeyHex(), genesis: opened.payload.genesis, checkpoint, manager: newManager })
-            opened.payload.recovery_epoch = epoch
-            const bytes = sealPackage(opened.payload, password)
-            try { downloadPackage(bytes, opened.networkId) } finally { bytes.fill(0) }
-            await authenticate(auth, active, { kind: 'root', networkId: opened.networkId, ownerPublicKey: opened.root.publicKeyHex(), genesis: opened.payload.genesis, checkpoint })
-          } finally { if (sensitive.current === flow) cancelSensitive(); else release() }
-        },
-      }
-      sensitive.current = flow
-      setReview({ kind: 'recovery', networkId: opened.networkId, members, newManager, requiredNode: active.entry.node_id })
-    } catch (cause) { release(); throw cause }
+      const trust = savedSpaces().find(trust => trust.spaceId === load(profileKey('last-space'))) ?? savedSpaces()[0]
+      if (!trust || !own) throw new Error('此设备配置没有账户信任。请导入完整账户恢复包，或取得新设备授权。')
+      const auth = await callSession(active, 'identity', { method: 'authenticate', params: { account_id: trust.accountId, space_id: trust.spaceId, device_public_key: own.publicKey } })
+      await authenticate(auth, active, trust)
+      return
+    }
+    if (savedSpaces().length) throw new Error('此设备配置已属于一个账户。请为新账户创建独立设备配置。')
+    if (!password) throw new Error('请设置完整账户恢复包的加密口令。')
+    const active = await open(card.entry, card.nodePublicKey)
+    if (active.info.initialized) throw new Error('此节点已被认领，请使用已授权设备登录或账户恢复。')
+    const controller = new AbortController()
+    let prepared: Awaited<ReturnType<typeof createAccount>> | null = null
+    let downloaded = false
+    let submitted = false
+    const flow: Sensitive = {
+      cancel() { controller.abort(); prepared?.bytes.fill(0); card.capability = ''; card.claimNonce = '' },
+      download() {
+        if (controller.signal.aborted || session.current !== active || !prepared) throw changed()
+        downloadPackage(prepared.bytes, prepared.scope.account_id); downloaded = true
+      },
+      async bootstrap(saved) {
+        if (!saved || !downloaded || !prepared) throw new Error('请先下载完整账户恢复包，并确认妥善保存。')
+        if (controller.signal.aborted || session.current !== active || submitted) throw changed()
+        const created = prepared
+        if (!('locks' in navigator)) throw new Error('此浏览器需要支持 Web Locks 才能保存账户信任。')
+        await navigator.locks.request(profileKey('policy-trust-writer'), () => {
+          if (controller.signal.aborted || session.current !== active) throw changed()
+          const trust = mergeAuthorizationTrust(created.trust, savedSpaces())
+          store(profileKey('policy-trusts'), [trust]); store(profileKey('last-space'), trust.spaceId); setSpaces([trust])
+          saveEntry(active.entry); store(profileKey('last-entry'), active.entry)
+        })
+        if (controller.signal.aborted || session.current !== active) throw changed()
+        submitted = true
+        try {
+          const auth = await callSession(active, 'identity', { method: 'bootstrap', params: { pins: created.trust.pins, authorization: created.authorization } })
+          if (controller.signal.aborted) throw new Error('初始化已提交，但本地确认已取消。请重新连接核对账户状态。')
+          await authenticate(auth, active, created.trust)
+        } finally { if (sensitive.current === flow) cancelSensitive(); else flow.cancel() }
+      },
+    }
+    sensitive.current = flow
+    try {
+      prepared = await createAccount({ card, password, signal: controller.signal, call: (method, params) => callSession(active, 'identity', { method, params }) })
+      if (controller.signal.aborted || session.current !== active) { prepared.bytes.fill(0); throw changed() }
+      setReview({ kind: 'bootstrap', accountId: prepared.scope.account_id, spaceId: prepared.scope.space_id, serviceGrant: prepared.serviceGrant, targetChanged: false })
+    } catch (error) { if (sensitive.current === flow) cancelSensitive(); else flow.cancel(); throw error }
+    finally { password = '' }
+  }
+  async function beginRecovery(input: { file: File; password: string; connectionCard: string }) {
+    if (savedSpaces().length) throw new Error('账户恢复需要新的独立设备配置。请先锁定并创建新配置。')
+    const version = generation.current
+    let password = input.password; input.password = ''
+    const opened = await openAccountPackage(input.file, password).catch(error => { password = ''; throw error })
+    if (version !== generation.current) { opened.release(); password = ''; throw changed() }
+    let card: ConnectionCard | null = null
+    let publicKey: string
+    let active: Session
+    try {
+      card = input.connectionCard.trim() ? parseConnectionCard(readInvitation(input.connectionCard)) : null
+      publicKey = card?.nodePublicKey ?? opened.entry.nodePublicKey
+      if (publicKey !== opened.entry.nodePublicKey) throw new Error('换 Node 恢复需要可信源政策见证，当前还不能在此页面提交。请先连接原 Node 恢复。')
+      const target = card?.entry ?? { address: opened.entry.endpoint, node_id: nodeFingerprint(publicKey), relay: false }
+      active = await open(target, publicKey)
+    } catch (error) { opened.release(); password = ''; throw error }
+    const controller = new AbortController()
+    let prepared: Awaited<ReturnType<typeof recoverAccount>> | null = null
+    let downloaded = false
+    let submitted = false
+    const flow: Sensitive = {
+      cancel() { controller.abort(); opened.release(); password = ''; prepared?.bytes.fill(0); if (card?.kind === 'claim') { card.capability = ''; card.claimNonce = '' } },
+      download() {
+        if (controller.signal.aborted || session.current !== active || !prepared) throw changed()
+        downloadPackage(prepared.bytes, prepared.scope.account_id); downloaded = true
+      },
+      async recover(saved) {
+        if (!saved || !downloaded || !prepared) throw new Error('请先下载更新后的完整账户恢复包，并确认妥善保存。')
+        if (controller.signal.aborted || session.current !== active || submitted) throw changed()
+        const recovered = prepared
+        if (!('locks' in navigator)) throw new Error('此浏览器需要支持 Web Locks 才能保存账户信任。')
+        await navigator.locks.request(profileKey('policy-trust-writer'), () => {
+          if (controller.signal.aborted || session.current !== active) throw changed()
+          const trust = mergeAuthorizationTrust(recovered.trust, savedSpaces())
+          store(profileKey('policy-trusts'), [trust]); store(profileKey('last-space'), trust.spaceId); setSpaces([trust])
+          saveEntry(active.entry); store(profileKey('last-entry'), active.entry)
+        })
+        if (controller.signal.aborted || session.current !== active) throw changed()
+        submitted = true
+        try {
+          const auth = await callSession(active, 'identity', { method: 'recover', params: recovered.commit })
+          if (controller.signal.aborted) throw new Error('恢复已提交，但本地确认已取消。请重新连接核对授权状态。')
+          await authenticate(auth, active, recovered.trust)
+        } finally { if (sensitive.current === flow) cancelSensitive(); else flow.cancel() }
+      },
+    }
+    sensitive.current = flow
+    try {
+      if (!active.info.initialized && card?.kind !== 'claim') throw new Error('恢复到新 Node 需要它本机生成的认领连接卡。')
+      const request = record(JSON.parse(prepareClientRecoveryContext(opened.material, publicKey)))
+      const nonce = text(record(request.payload).nonce)
+      const response = record(await callSession(active, 'identity', { method: 'recovery_context', params: { request, ...(card?.kind === 'claim' ? { capability: card.capability } : {}) } }))
+      if (controller.signal.aborted || session.current !== active) throw changed()
+      prepared = await recoverAccount({ material: opened.material, latestBundle: response.authorization, claim: response.claim,
+        nodePublicKey: publicKey, claimNonce: nonce, endpoint: active.entry.address, password, signal: controller.signal,
+        possession: params => callSession(active, 'identity', { method: 'recovery_node_possession', params }),
+      })
+      if (controller.signal.aborted || session.current !== active) { prepared.bytes.fill(0); throw changed() }
+      setReview({ kind: 'recovery', accountId: prepared.scope.account_id, spaceId: prepared.scope.space_id, serviceGrant: prepared.serviceGrant, targetChanged: publicKey !== opened.entry.nodePublicKey })
+    } catch (error) { if (sensitive.current === flow) cancelSensitive(); else flow.cancel(); throw error }
+    finally { opened.release(); password = '' }
   }
   async function reencrypt(input: { file: File; oldPassword: string; password: string }) {
     const version = generation.current
-    const opened = await openPackage(input.file, input.oldPassword)
+    const opened = await openAccountPackage(input.file, input.oldPassword)
+      .catch(error => { input.password = ''; throw error })
+      .finally(() => { input.oldPassword = '' })
     try {
       if (version !== generation.current) throw changed()
-      if (ready && opened.networkId !== ready.scope.space_id) throw new Error('恢复包属于其他个人网络。')
-      const bytes = sealPackage(opened.payload, input.password)
-      try { downloadPackage(bytes, opened.networkId) } finally { bytes.fill(0) }
-    } finally { opened.release(); input.oldPassword = ''; input.password = '' }
+      if (ready && opened.scope.account_id !== ready.scope.account_id) throw new Error('恢复包属于其他账户。')
+      const bytes = sealAccountPackage(opened.material, input.password)
+      try { downloadPackage(bytes, opened.scope.account_id) } finally { bytes.fill(0) }
+    } finally { opened.release(); input.password = '' }
   }
   async function initializeVault(options: ClientVaultOptions) {
     const version = generation.current
     const own = await initClient(options)
     if (version !== generation.current) throw changed()
     identityRef.current = own; setIdentity(own); setPhase('disconnected'); setError('')
-    setEntries(savedEntries(storageProfile(own))); setSpaces(savedSpaces())
-    const pending = initialInvitation ? null : loadWaiting(storageProfile(own))
-    if (pending && pending.review.new_member.subject_id === own.nodeId) {
-      await open(pending.entry)
-      waitingRef.current = pending; setWaiting(pending)
-    } else if (!initialInvitation) {
+    setEntries(savedEntries(storageProfile(own), load)); setSpaces(savedSpaces())
+    if (!initialInvitation) {
       const lastEntry = load(profileKey('last-entry'), true)
       if (lastEntry) await connect(parseEntry(lastEntry))
     }
   }
   function lockVault() {
-    disconnect(); lockClient(); identityRef.current = null; setIdentity(null); setEntries([]); setSpaces([])
+    disconnect(); lockClient(); temporaryRecords.current.clear(); identityRef.current = null; setIdentity(null); setEntries([]); setSpaces([])
     setPhase('initializing')
     const version = generation.current
     void clientVaultStatus().then(status => {
@@ -473,20 +417,14 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     clientVaultStatus().then(status => {
       if (mounted) { setVaults(status.profiles); setPhase(status.status === 'locked' ? 'vault_locked' : status.status === 'key_lost' ? 'key_lost' : status.status === 'unavailable' ? 'vault_unavailable' : 'vault_empty'); if (status.status === 'unavailable') setError(status.error) }
     }).catch(cause => { if (mounted) { setPhase('blocked'); setError(messageOf(cause)) } })
-    return () => { mounted = false; generation.current += 1; lockClient(); sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; releaseSession(previous); previous?.channel.close(); listeners.current.clear() }
+    return () => { mounted = false; generation.current += 1; lockClient(); temporaryRecords.current.clear(); sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; releaseSession(previous); previous?.channel.close(); listeners.current.clear() }
   }, [])
-  useEffect(() => {
-    if (!waiting?.accepted) return
-    const version = generation.current
-    const timer = setInterval(() => { checkPair().catch(cause => { if (version === generation.current) setError(messageOf(cause)) }) }, 3000)
-    return () => clearInterval(timer)
-  }, [waiting])
   const value: DeviceContextValue = {
-    identity, vaults, spaces, ready, entries, phase, error, entry, info, directory, pairs, waiting, review, initialInvitation,
-    connect, selectSpace, disconnect, saveEntry, removeEntry, initializeVault, lockVault, backupVault, pair, acceptPair, checkPair, cancelPair, refreshDirectory, createInvitation, approvePair, revoke, beginRecovery, reencrypt,
+    identity, vaults, spaces, ready, entries, phase, error, entry, info, directory, review, initialInvitation,
+    connect, selectSpace, selectProject, disconnect, saveEntry, removeEntry, initializeVault, lockVault, backupVault, useConnectionCard, refreshDirectory, beginRecovery, reencrypt,
     downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有待下载的恢复包。'); sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },
-    async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('恢复确认已失效。'); await sensitive.current.recover(members) },
+    async confirmRecovery(saved) { if (!sensitive.current?.recover) throw new Error('恢复确认已失效。'); await sensitive.current.recover(saved) },
     cancelSensitive,
   }
   return <DeviceContext.Provider value={value}>{children}</DeviceContext.Provider>
