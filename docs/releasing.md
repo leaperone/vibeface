@@ -28,16 +28,19 @@ cd vibeface-node-<version>-<target>
 
 ## CI 验证范围
 
-`crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。检查和四个平台的打包任务下载同一份资源，缺少资源时构建失败，不用空模块替代。
+`crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。`web` 下载这份资源及其真实 TypeScript 声明，以锁定的 pnpm 依赖生成 TanStack Start 静态 SPA。检查和三个平台的打包任务下载同一份密码学资源和 SPA，再由 Rust 构建脚本内嵌。缺少资源时构建失败，不用空模块替代。
 
-质量检查包含 Rust fmt、workspace tests、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch，再启动解包后的程序运行无账号网络验收。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
+质量检查包含 Rust fmt、workspace tests、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch，再启动解包后的程序运行无账号网络验收。网页验收检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
 
-源码打包前先生成浏览器资源。安装 Rust 的 `wasm32-unknown-unknown` target 和 `wasm-bindgen-cli 0.2.129`，然后执行：
+源码打包前先生成密码学资源，再构建网页。安装 Node.js 22.12+、pnpm 11.9.0、Rust 的 `wasm32-unknown-unknown` target 和 `wasm-bindgen-cli 0.2.129`，然后执行：
 
 ```sh
 bash scripts/build-web-crypto.sh
+bash scripts/build-web.sh
 bash scripts/package-node.sh
 ```
+
+`build-web.sh` 校验生成资源、按 lockfile 安装依赖、生成路由、检查类型，再构建 `crates/node/web/dist/client`。Rust 只内嵌这个目录，不运行 Start 的 SSR 输出。页面和密码学资源使用 `no-store`，成功命中的 `/assets/` 内容使用 immutable 缓存。CSP 根据最终 HTML 生成脚本 hash，并允许 WASM、WebSocket 和 Radix 所需的动态样式。
 
 验收失败时只上传报告和四个测试进程日志，不上传测试目录或数据库。正常制品保留 14 天，诊断保留 7 天。CI 不验证真实模型调用、实体手机、物理局域网、公网反向代理或用户后台服务安装。
 
@@ -66,7 +69,7 @@ nightly 表示开发预发布，需选择 Nightly 更新渠道或手动下载，
 
 Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `vX.Y.Z` 正式版，Nightly 只选择 `vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。更新器比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
 
-自动更新默认关闭，默认渠道为 Stable。策略保存在数据目录的私有 `update.json`，不进入共享会话或 DAG。配置、检查及手动应用命令见 [选择更新渠道](node.md#选择更新渠道)。首次建立受管安装时按下一节放置完整包。
+自动更新默认关闭，默认渠道为 Stable。策略保存在数据目录的私有 `update.json`，不进入共享会话或 DAG。配置、检查及手动应用命令见 [选择更新渠道](node.md#选择更新渠道)。首次建立受管安装可使用 [公开安装命令](install.md)，已安装的节点使用 `update apply`。
 
 匿名 GitHub API 请求被限流时，更新器明确报错并保留现版，自动更新在下轮再次检查。可在更新服务的运行环境提供 `GITHUB_TOKEN` 提高额度；token 只发往 `api.github.com`，不发给下载 CDN，也不写入配置或更新策略。后台服务不保证继承终端的临时环境变量。
 
@@ -76,7 +79,15 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 `BUILD-INFO.json` 声明 `update_protocol=1` 和 `data_epoch=2`。更新器只安装与本机存储 epoch 一致的包。账号数据库格式不属于 epoch 2，不能让自动更新覆盖该数据目录，也不在启动时隐式转换或清空。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
 
-## 首次安装更新器或手动更换程序
+## 首次安装
+
+公开安装入口为仓库根 `install.sh`。默认选择最新 Stable，显式 `--channel nightly` 选择最新 Nightly；按数值版本比较，忽略 rc 和 draft，不使用 `/releases/latest` 获取 Nightly。当前只有 Nightly，Stable 安装会明确失败。命令和后续 CLI 管理见 [安装说明](install.md)；脚本 URL 在包含它的 PR 合并后才可用。
+
+安装器只依赖 Bash、curl、tar、gzip、系统文本工具及 `sha256sum` 或 `shasum`，不需要 jq、Python、Node.js 或 Rust。它解析公开 Releases 和 tag 对应的源码提交，下载完整包与准确同名的 SHA256，校验版本、target、源码身份、协议和 data epoch，并拒绝危险包路径、符号链接和特殊文件。校验通过后建立 `releases/<version>`、`current` 与用户 bin 链接，不覆盖已有安装、身份或服务。
+
+`bash install.sh --self-test` 使用临时目录、模拟 GitHub 响应和测试包验证渠道、数值排序、校验拒绝及已有安装保护，不改当前用户的正式安装或服务。CI 与 preflight 均运行它。SHA256 的信任边界与更新器一致，不是独立发布签名。
+
+## 手动建立受管安装或更换程序
 
 先停止 Node 用户服务，确认进程退出，再备份完整数据目录。备份包括身份和历史，应保持私密。不要让新旧程序同时使用同一数据目录。
 

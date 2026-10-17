@@ -41,11 +41,41 @@ jobs:
           path: |
             crates/node/web/generated/vibeface_secure.js
             crates/node/web/generated/vibeface_secure_bg.wasm
+            crates/node/web/generated/*.d.ts
+          if-no-files-found: error
+          retention-days: 14
+
+  web:
+    needs: crypto-web
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: crypto-web-${{ github.sha }}
+          path: crates/node/web/generated
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: crates/node/web/pnpm-lock.yaml
+      - name: Build and typecheck the static web client
+        run: bash scripts/build-web.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-${{ github.sha }}
+          path: crates/node/web/dist/client
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 
   check:
-    needs: crypto-web
+    needs: [crypto-web, web]
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.metadata.outputs.version }}
@@ -60,6 +90,10 @@ jobs:
         with:
           name: crypto-web-${{ github.sha }}
           path: crates/node/web/generated
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-${{ github.sha }}
+          path: crates/node/web/dist/client
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -103,12 +137,13 @@ jobs:
       - name: Check workflow and shell scripts
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh
-          shellcheck scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh
+          bash -n install.sh
+          bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
+          shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
+          bash install.sh --self-test
       - name: Check JavaScript syntax
         run: |
           node --check crates/node/sdk/codex-manager.mjs
-          node --check crates/node/web/app.js
           node --check crates/node/web/transport.js
           node --check scripts/crypto-client.mjs
       - run: cargo fmt --all -- --check
@@ -122,7 +157,7 @@ jobs:
           cargo +"$MSRV" check --workspace --locked
 
   package:
-    needs: crypto-web
+    needs: [crypto-web, web]
     name: package (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -145,6 +180,10 @@ jobs:
         with:
           name: crypto-web-${{ github.sha }}
           path: crates/node/web/generated
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-${{ github.sha }}
+          path: crates/node/web/dist/client
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

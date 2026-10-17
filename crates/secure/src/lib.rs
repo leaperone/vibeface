@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
+pub mod membership;
+
 mod recovery;
 pub use recovery::{recovery_open, recovery_seal};
 

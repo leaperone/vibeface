@@ -158,15 +158,13 @@ pub fn router(node: Arc<Runtime>) -> Router {
 fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
     let app = App { sites, node };
     Router::new()
-        .route("/", get(index))
-        .route("/app.js", get(javascript))
         .route("/transport.js", get(transport_javascript))
         .route("/generated/vibeface_secure.js", get(crypto_javascript))
         .route("/generated/vibeface_secure_bg.wasm", get(crypto_wasm))
-        .route("/style.css", get(stylesheet))
         .route("/api/info", get(info))
         .route("/peer", get(peer))
         .route("/api/network/ws", get(network))
+        .fallback(frontend)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(app.clone(), boundary))
         .with_state(app)
@@ -208,7 +206,9 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         Err(error) => error.into_response(),
     };
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -218,7 +218,10 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(web_assets::CONTENT_SECURITY_POLICY),
+    );
     response
 }
 
@@ -393,25 +396,48 @@ async fn peer(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
         })
 }
 
-async fn index() -> impl IntoResponse {
+mod web_assets {
+    include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
+}
+
+async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
+    let path = uri.path();
+    if path == "/api"
+        || path.starts_with("/api/")
+        || path == "/peer"
+        || path.starts_with("/peer/")
+        || path.starts_with("/sdk.v1.")
+    {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    }
+    if method != Method::GET && method != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    if let Some(file) = web_assets::get(path) {
+        let mut response = ([(header::CONTENT_TYPE, file.content_type)], file.body).into_response();
+        if path.starts_with("/assets/") {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            );
+        }
+        return response;
+    }
+    if path == "/assets"
+        || path.starts_with("/assets/")
+        || path == "/generated"
+        || path.starts_with("/generated/")
+        || path.rsplit('/').next().unwrap_or("").contains('.')
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("../web/index.html"),
+        web_assets::get("/_shell.html")
+            .expect("embedded SPA shell")
+            .body,
     )
-}
-
-async fn javascript() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../web/app.js"),
-    )
-}
-
-async fn stylesheet() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../web/style.css"),
-    )
+        .into_response()
 }
 
 async fn transport_javascript() -> impl IntoResponse {

@@ -190,13 +190,25 @@ A 已派发 B 后掉线时，从 C 打开原业务会话，等待 DAG 补齐，�
 
 ## 作为后台应用运行
 
-先用前台 `serve` 确认配置，再安装用户级服务。路径必须为绝对路径：
+`vibeface-node` 是节点主进程，也是本机管理 CLI。先用前台 `serve` 确认配置，再按 Ctrl-C 停止前台进程，安装用户级服务：
 
 ```sh
-./scripts/install-node-service.sh install \
-	--binary /absolute/path/to/vibeface-node \
-	--data-dir "$HOME/.vibeface"
-./scripts/install-node-service.sh status
+vibeface-node service install --data-dir "$HOME/.vibeface"
+vibeface-node status --data-dir "$HOME/.vibeface"
+vibeface-node service status --data-dir "$HOME/.vibeface"
+```
+
+服务管理命令需要完整的受管安装，启动路径始终为安装根目录下的 `current/vibeface-node`。通过 `~/.local/bin/vibeface-node` 链接调用也保留该路径，升级后不会固定在旧 release。直接运行 `cargo build` 的程序不安装服务。自定义安装根先使用 `update configure --install-root /absolute/path` 保存路径。
+
+每个系统用户管理一个 Node 服务。各服务命令核对 `--data-dir` 与已安装服务一致，再操作该服务。省略时使用 `$HOME/.vibeface`。管理其他数据目录时显式传入绝对路径。
+
+`status` 通过私有维护 socket 检查运行中的 Node，并核对 NodeID，不要求安装服务。`status --json` 输出状态、NodeID、监听地址、角色及运行版本，不输出接入授权材料。已停止或无法连接时返回非零退出码。`service status` 则展示 launchd 或 systemd 的 Node 和更新服务状态。
+
+```sh
+vibeface-node status --json --data-dir "$HOME/.vibeface"
+vibeface-node service stop --data-dir "$HOME/.vibeface"
+vibeface-node service start --data-dir "$HOME/.vibeface"
+vibeface-node service restart --data-dir "$HOME/.vibeface"
 ```
 
 macOS 使用当前登录用户的 launchd agent，日志位于数据目录的 `service.stdout.log` 和 `service.stderr.log`。Linux 使用 `systemd --user`，Node 日志由用户 journal 保存。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
@@ -206,7 +218,7 @@ macOS 使用当前登录用户的 launchd agent，日志位于数据目录的 `s
 卸载同时移除 Node 服务和更新定时服务，不删除身份、配置和历史：
 
 ```sh
-./scripts/install-node-service.sh uninstall
+vibeface-node service uninstall --data-dir "$HOME/.vibeface"
 ```
 
 ## 选择更新渠道
@@ -235,7 +247,7 @@ macOS 使用当前登录用户的 launchd agent，日志位于数据目录的 `s
 
 `check` 只查询与校验版本信息。`apply` 仅安装声明与当前数据格式兼容的包，需要安全的空闲窗口。活动任务、管理 Agent 调用和结果未知的操作都会阻止安装，先完成或核对原任务，不需要关闭网页。升级不会调用模型或修改 Provider 密钥。
 
-开启自动更新会安装独立的用户定时服务。macOS 的 `com.leaperone.vibeface.update` 在载入时和每小时尝试更新；Linux 的 `vibeface-update.timer` 每小时启动一次独立 oneshot 服务。Linux 关机期间不能更新，用户服务能否在退出登录后运行取决于 lingering。更新日志位于数据目录的 `update.stdout.log` 与 `update.stderr.log`，文件权限为 600。`scripts/install-node-service.sh status` 同时展示 Node 与更新服务的真实状态。
+开启自动更新会安装独立的用户定时服务。macOS 的 `com.leaperone.vibeface.update` 在载入时和每小时尝试更新；Linux 的 `vibeface-update.timer` 每小时启动一次独立 oneshot 服务。Linux 关机期间不能更新，用户服务能否在退出登录后运行取决于 lingering。更新日志位于数据目录的 `update.stdout.log` 与 `update.stderr.log`，文件权限为 600。`vibeface-node service status` 同时展示 Node 与更新服务的真实状态。
 
 关闭自动更新时，保留所选渠道与受管路径，重新执行 `configure`：
 
@@ -247,7 +259,7 @@ macOS 使用当前登录用户的 launchd agent，日志位于数据目录的 `s
 	--automatic false
 ```
 
-这会移除更新定时服务，手动 `check` 和 `apply` 仍可使用。只移除定时服务也可运行 `scripts/install-node-service.sh uninstall-updater`；该命令不更改策略文件，若重新配置自动更新，定时服务会再次安装。
+这会移除更新定时服务，手动 `check` 和 `apply` 仍可使用。`vibeface-node service install-updater` 和 `uninstall-updater` 可单独安装或移除定时服务，不改变已保存的更新策略。策略的 `automatic` 为 `false` 时，即使手动安装定时服务也不会自动更新。重新配置自动更新会重新安装或移除定时服务。
 
 更新器先核对包和存储兼容声明，再停止 Node 并切换 `current`。新进程健康检查失败时只恢复上一份程序入口，不自动还原数据库；会话、身份、配置和凭证仍保存在原数据目录。校验、网络和安装失败可通过 `update status` 与更新日志查看。
 

@@ -99,38 +99,7 @@ pub struct SignedEvent {
     pub signature: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeRole {
-    Gateway,
-    Relay,
-    Replica,
-    Scheduler,
-    Executor,
-}
-
-pub fn validate_role_dependencies(roles: &[NodeRole]) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        roles.contains(&NodeRole::Replica)
-            || !roles.iter().any(|role| {
-                matches!(
-                    role,
-                    NodeRole::Gateway | NodeRole::Scheduler | NodeRole::Executor
-                )
-            }),
-        "gateway, scheduler and executor roles require replica"
-    );
-    Ok(())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct NodeCertificate {
-    pub node_id: NodeId,
-    pub public_key: String,
-    pub roles: Vec<NodeRole>,
-    pub revoked: bool,
-}
+pub use vibeface_secure::membership::{NodeCertificate, NodeRole, validate_role_dependencies};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct MissingDependencies {

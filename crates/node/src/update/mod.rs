@@ -100,6 +100,25 @@ fn default_install_root() -> PathBuf {
         .join(".local/share/vibeface")
 }
 
+fn policy(data: &Path) -> Result<Policy> {
+    let path = data.join("update.json");
+    if path.exists() {
+        Ok(serde_json::from_slice(&fs::read(path)?)?)
+    } else {
+        Ok(Policy::default())
+    }
+}
+
+/// Resolve the same managed installation used by this node's update policy.
+pub fn managed_install_root(data: &Path) -> Result<PathBuf> {
+    let root = policy(data)?.install_root;
+    ensure!(root.is_absolute(), "install-root must be absolute");
+    let root = fs::canonicalize(root)
+        .context("managed installation is required; install a published Vibeface package first")?;
+    installed(&root)?;
+    Ok(root)
+}
+
 pub async fn run(options: Update) -> Result<()> {
     let data = match &options.action {
         Action::Configure { data, .. }
@@ -112,11 +131,7 @@ pub async fn run(options: Update) -> Result<()> {
     config::identity(&data)?;
     let _lock = update_lock(&data)?;
     let policy_path = data.join("update.json");
-    let policy: Policy = if policy_path.exists() {
-        serde_json::from_slice(&fs::read(&policy_path)?)?
-    } else {
-        Policy::default()
-    };
+    let policy = policy(&data)?;
     match options.action {
         Action::Status(_) => {
             let current = installed(&policy.install_root)
@@ -323,12 +338,11 @@ async fn configure_timer(policy: &Policy, data: &Path) -> Result<()> {
         command
             .arg("install-updater")
             .arg("--binary")
-            .arg(policy.install_root.join("current/vibeface-node"))
-            .arg("--data-dir")
-            .arg(data);
+            .arg(policy.install_root.join("current/vibeface-node"));
     } else {
         command.arg("uninstall-updater");
     }
+    command.arg("--data-dir").arg(data);
     checked(&mut command, "configure automatic update service").await
 }
 
@@ -882,6 +896,17 @@ mod tests {
         let new = package(&root, "1.1.0");
         std::os::unix::fs::symlink(&old, root.join("current")).unwrap();
         assert_eq!(installed(&root).unwrap(), old);
+        let data = root.join("data");
+        fs::create_dir(&data).unwrap();
+        persist(
+            &data.join("update.json"),
+            &Policy {
+                install_root: root.clone(),
+                ..Policy::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(managed_install_root(&data).unwrap(), root);
         switch(&root, &new).unwrap();
         assert_eq!(installed(&root).unwrap(), new);
         assert!(old.join("vibeface-node").is_file());

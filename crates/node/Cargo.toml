@@ -31,3 +31,7 @@ uuid.workspace = true
 vibeface-protocol.workspace = true
 vibeface-bridge.workspace = true
 vibeface-secure = { path = "../secure" }
+
+[build-dependencies]
+base64 = "0.22"
+sha2.workspace = true

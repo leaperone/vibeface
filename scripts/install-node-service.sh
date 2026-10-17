@@ -6,9 +6,8 @@ usage() {
   cat <<'USAGE'
 Usage: install-node-service.sh install --binary /absolute/vibeface-node --data-dir /absolute/data
        install-node-service.sh install-updater --binary /install-root/current/vibeface-node --data-dir /absolute/data
-       install-node-service.sh status
-       install-node-service.sh uninstall-updater
-       install-node-service.sh uninstall
+       install-node-service.sh start|stop|restart|status [--data-dir /absolute/data]
+       install-node-service.sh uninstall-updater|uninstall [--data-dir /absolute/data]
 
 Installs user-level launchd agents on macOS or systemd user services on Linux.
 Initialize the node before installing. Uninstall keeps all node data.
@@ -33,7 +32,13 @@ while (($#)); do
     *) usage >&2; exit 2 ;;
   esac
 done
-case "$action" in install|install-updater|status|uninstall-updater|uninstall) ;; *) usage >&2; exit 2 ;; esac
+case "$action" in install|install-updater|start|stop|restart|status|uninstall-updater|uninstall) ;; *) usage >&2; exit 2 ;; esac
+
+if [[ -n "$data_dir" ]]; then
+  [[ "$data_dir" == /* && -f "$data_dir/config.json" && -f "$data_dir/identity.json" ]] || { echo 'An initialized absolute --data-dir is required.' >&2; exit 2; }
+  case "$data_dir" in *$'\n'*|*$'\r'*) echo 'Paths must not contain line breaks.' >&2; exit 2 ;; esac
+  data_dir="$(cd "$data_dir" && pwd -P)"
+fi
 
 if [[ "$action" == install || "$action" == install-updater ]]; then
   [[ "$binary" == /* && -x "$binary" ]] || { echo 'An absolute executable --binary is required.' >&2; exit 2; }
@@ -72,6 +77,11 @@ systemd_exec_escape() {
   printf '%s' "$value"
 }
 
+different_data() {
+  echo 'Installed service uses a different data directory or unsupported arguments; no service was changed.' >&2
+  exit 1
+}
+
 case "$(uname -s)" in
   Darwin)
     label='com.leaperone.vibeface.node'
@@ -80,6 +90,25 @@ case "$(uname -s)" in
     service_dir="$HOME/Library/LaunchAgents"
     service="$service_dir/$label.plist"
     update_service="$service_dir/$update_label.plist"
+    check_service_data() {
+      local file="$1" index="$2" installed_data
+      [[ -n "$data_dir" && -f "$file" ]] || return 0
+      [[ "$(plutil -extract "ProgramArguments.$((index - 1))" raw -o - "$file")" == --data-dir ]] || different_data
+      if plutil -extract "ProgramArguments.$((index + 1))" raw -o - "$file" >/dev/null 2>&1; then different_data; fi
+      if [[ "$index" == 3 ]]; then
+        [[ "$(plutil -extract ProgramArguments.1 raw -o - "$file")" == serve ]] || different_data
+      else
+        [[ "$(plutil -extract ProgramArguments.1 raw -o - "$file")" == update && "$(plutil -extract ProgramArguments.2 raw -o - "$file")" == apply && "$(plutil -extract ProgramArguments.3 raw -o - "$file")" == --automatic ]] || different_data
+      fi
+      installed_data="$(plutil -extract "ProgramArguments.$index" raw -o - "$file")" || different_data
+      [[ -d "$installed_data" ]] || different_data
+      [[ "$(cd "$installed_data" && pwd -P)" == "$data_dir" ]] || different_data
+    }
+    case "$action" in
+      start|stop|restart) check_service_data "$service" 3 ;;
+      uninstall-updater) check_service_data "$update_service" 5 ;;
+      install|install-updater|status|uninstall) check_service_data "$service" 3; check_service_data "$update_service" 5 ;;
+    esac
     case "$action" in
       install|install-updater)
         mkdir -p "$service_dir"
@@ -133,6 +162,20 @@ PLIST
         if [[ "$action" == install ]]; then launchctl kickstart "$domain/$label"; fi
         printf 'Installed %s\n' "$service"
         ;;
+      start|stop|restart)
+        [[ -f "$service" ]] || { echo 'Installed node service is required.' >&2; exit 1; }
+        if [[ "$action" == stop || "$action" == restart ]]; then
+          if launchctl print "$domain/$label" >/dev/null 2>&1; then
+            launchctl bootout "$domain/$label"
+          fi
+        fi
+        if [[ "$action" == start || "$action" == restart ]]; then
+          if ! launchctl print "$domain/$label" >/dev/null 2>&1; then
+            launchctl bootstrap "$domain" "$service"
+          fi
+          launchctl kickstart "$domain/$label"
+        fi
+        ;;
       status)
         status_code=0
         launchctl print "$domain/$label" || status_code=$?
@@ -161,6 +204,26 @@ PLIST
     service="$service_dir/vibeface-node.service"
     update_service="$service_dir/vibeface-update.service"
     update_timer="$service_dir/vibeface-update.timer"
+    check_service_data() {
+      local file="$1" unit="$2" expected="$3" contents line start='' count=0
+      [[ -n "$data_dir" && -f "$file" ]] || return 0
+      contents="$(systemctl --user cat "$unit")" || different_data
+      while IFS= read -r line; do
+        case "$line" in
+          ExecStart=) start=''; count=0 ;;
+          ExecStart=*) start="$line"; count=$((count + 1)) ;;
+        esac
+      done <<< "$contents"
+      [[ "$count" == 1 && "$start" == ExecStart=*" $expected --data-dir \"$(systemd_exec_escape "$data_dir")\"" ]] || different_data
+    }
+    case "$action" in
+      start|stop|restart) check_service_data "$service" vibeface-node.service serve ;;
+      uninstall-updater) check_service_data "$update_service" vibeface-update.service 'update apply --automatic' ;;
+      install|install-updater|status|uninstall)
+        check_service_data "$service" vibeface-node.service serve
+        check_service_data "$update_service" vibeface-update.service 'update apply --automatic'
+        ;;
+    esac
     case "$action" in
       install|install-updater)
         command -v systemctl >/dev/null || { echo 'systemd user services are unavailable on this host.' >&2; exit 1; }
@@ -227,17 +290,21 @@ UNIT
           printf 'Installed %s\n' "$service"
         fi
         ;;
+      start|stop|restart)
+        [[ -f "$service" ]] || { echo 'Installed node service is required.' >&2; exit 1; }
+        systemctl --user "$action" vibeface-node.service
+        ;;
       status)
         status_code=0
-        systemctl --user status vibeface-node.service || status_code=$?
-        if ! systemctl --user status vibeface-update.timer; then
+        systemctl --user --no-pager status vibeface-node.service || status_code=$?
+        if ! systemctl --user --no-pager status vibeface-update.timer; then
           if [[ -f "$update_timer" ]]; then
             printf 'Updater is installed but its timer is not active.\n'
           else
             printf 'Updater is not installed.\n'
           fi
         fi
-        systemctl --user status vibeface-update.service || true
+        systemctl --user --no-pager status vibeface-update.service || true
         exit "$status_code"
         ;;
       uninstall|uninstall-updater)
