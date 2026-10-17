@@ -1,0 +1,9 @@
+.conversation-screen { display: flex; flex-direction: column; gap: 1rem; min-height: 28rem; }
+.conversation-screen [data-slot="message"] > div { max-width: min(42rem, 100%); }
+.conversation-screen [data-slot="message"] header { display: flex; flex-wrap: wrap; align-items: baseline; gap: .75rem; color: var(--muted-foreground); font-size: .875rem; }
+.conversation-screen [data-slot="bubble-content"] { white-space: pre-wrap; overflow-wrap: anywhere; }
+.conversation-screen > form { margin-top: auto; }
+.conversation-screen > form > p { margin-top: .5rem; color: var(--muted-foreground); font-size: .875rem; }
+.conversation-screen > section { display: grid; justify-items: start; gap: .75rem; padding: 1rem; border: 1px solid var(--border); border-radius: var(--radius); }
+.conversation-screen > section dl { display: grid; gap: .5rem; }
+.conversation-screen > section dd { overflow-wrap: anywhere; }
