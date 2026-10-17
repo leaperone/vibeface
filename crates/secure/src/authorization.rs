@@ -5679,6 +5679,7 @@ pub struct VerifiedClientAuthorization {
     space_genesis_hash: ObjectHash,
     space_kind: &'static str,
     resources: Vec<Signed<ResourceRecord>>,
+    budget: Budget,
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedClientAuthorization {
@@ -5890,6 +5891,7 @@ pub fn verify_client_authorization(
             space_genesis_hash,
             space_kind,
             resources,
+            budget,
         })
     }
     verify(
