@@ -1000,3 +1000,107 @@ table "policy_nonces" {
     expr = "domain_kind IN ('account', 'space')"
   }
 }
+
+table "passkey_pending" {
+  schema = schema.main
+  column "account_id" {
+    type = text
+  }
+  column "envelope_hash" {
+    type = text
+  }
+  column "nonce" {
+    type = text
+  }
+  column "pending" {
+    type = text
+  }
+  column "expires_at_ms" {
+    type = integer
+  }
+  primary_key {
+    columns = [column.account_id, column.envelope_hash]
+  }
+  index "passkey_pending_account_nonce" {
+    unique = true
+    columns = [column.account_id, column.nonce]
+  }
+  check "passkey_pending_expiry" {
+    expr = "expires_at_ms >= 0"
+  }
+}
+
+table "passkey_authenticators" {
+  schema = schema.main
+  column "account_id" {
+    type = text
+  }
+  column "credential_id" {
+    type = text
+  }
+  column "rp_id" {
+    type = text
+  }
+  column "record_hash" {
+    type = text
+  }
+  column "sign_count" {
+    type = integer
+  }
+  column "backup_state" {
+    type = integer
+  }
+  column "last_envelope_hash" {
+    type = text
+  }
+  primary_key {
+    columns = [column.account_id, column.credential_id]
+  }
+  index "passkey_authenticators_rp_credential" {
+    unique = true
+    columns = [column.rp_id, column.credential_id]
+  }
+  index "passkey_authenticators_record" {
+    unique = true
+    columns = [column.record_hash]
+  }
+  foreign_key "passkey_authenticators_pending" {
+    columns = [column.account_id, column.last_envelope_hash]
+    ref_columns = [table.passkey_pending.column.account_id, table.passkey_pending.column.envelope_hash]
+  }
+  check "passkey_authenticators_counter" {
+    expr = "sign_count BETWEEN 0 AND 4294967295"
+  }
+  check "passkey_authenticators_backup" {
+    expr = "backup_state IN (0, 1)"
+  }
+}
+
+table "passkey_receipts" {
+  schema = schema.main
+  column "account_id" {
+    type = text
+  }
+  column "envelope_hash" {
+    type = text
+  }
+  column "completion_hash" {
+    type = text
+  }
+  column "receipt" {
+    type = text
+  }
+  column "accepted_at_ms" {
+    type = integer
+  }
+  primary_key {
+    columns = [column.account_id, column.envelope_hash]
+  }
+  foreign_key "passkey_receipts_pending" {
+    columns = [column.account_id, column.envelope_hash]
+    ref_columns = [table.passkey_pending.column.account_id, table.passkey_pending.column.envelope_hash]
+  }
+  check "passkey_receipts_accepted_at" {
+    expr = "accepted_at_ms >= 0"
+  }
+}
