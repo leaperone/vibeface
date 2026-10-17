@@ -24,8 +24,13 @@ struct State {
 #[derive(Clone, Default)]
 pub struct SignatureVerification(Arc<Mutex<State>>);
 
+struct Scope {
+    id: Rc<()>,
+    handle: SignatureVerification,
+}
+
 thread_local! {
-    static ACTIVE: RefCell<Option<SignatureVerification>> = const { RefCell::new(None) };
+    static ACTIVE: RefCell<Vec<Scope>> = const { RefCell::new(Vec::new()) };
 }
 
 impl SignatureVerification {
@@ -34,9 +39,15 @@ impl SignatureVerification {
     }
 
     pub fn enter(&self) -> ScopedSignatureVerification {
-        let previous = ACTIVE.with(|active| active.replace(Some(self.clone())));
+        let id = Rc::new(());
+        ACTIVE.with(|active| {
+            active.borrow_mut().push(Scope {
+                id: id.clone(),
+                handle: self.clone(),
+            })
+        });
         ScopedSignatureVerification {
-            previous,
+            id,
             handle: self.clone(),
             _not_send: PhantomData,
         }
@@ -56,12 +67,12 @@ impl SignatureVerification {
     }
 
     pub fn current_counts() -> Option<SignatureVerificationCounts> {
-        ACTIVE.with(|active| active.borrow().as_ref().map(Self::counts))
+        ACTIVE.with(|active| active.borrow().last().map(|scope| scope.handle.counts()))
     }
 }
 
 pub struct ScopedSignatureVerification {
-    previous: Option<SignatureVerification>,
+    id: Rc<()>,
     handle: SignatureVerification,
     _not_send: PhantomData<Rc<()>>,
 }
@@ -75,7 +86,7 @@ impl Default for ScopedSignatureVerification {
 impl ScopedSignatureVerification {
     pub fn new() -> Self {
         let handle = ACTIVE
-            .with(|active| active.borrow().clone())
+            .with(|active| active.borrow().last().map(|scope| scope.handle.clone()))
             .unwrap_or_default();
         handle.enter()
     }
@@ -87,9 +98,34 @@ impl ScopedSignatureVerification {
 impl Drop for ScopedSignatureVerification {
     fn drop(&mut self) {
         ACTIVE.with(|active| {
-            active.replace(self.previous.take());
+            active
+                .borrow_mut()
+                .retain(|scope| !Rc::ptr_eq(&scope.id, &self.id));
         });
     }
+}
+
+pub fn verify_ed25519_message(
+    public_key: &str,
+    domain: &str,
+    signing_bytes: &[u8],
+    signature: &str,
+) -> Result<(), String> {
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&crate::decode32(public_key)?)
+        .map_err(|_| "invalid identity public key")?;
+    let signature_bytes = hex::decode(signature).map_err(|_| "invalid signature encoding")?;
+    let signature = ed25519_dalek::Signature::from_slice(&signature_bytes)
+        .map_err(|_| "invalid signature size")?;
+    verify_cached(
+        key.as_bytes(),
+        domain,
+        signing_bytes,
+        &signature_bytes,
+        || {
+            key.verify_strict(signing_bytes, &signature)
+                .map_err(|_| "invalid identity signature".to_owned())
+        },
+    )
 }
 
 pub(crate) fn verify_cached(
@@ -99,7 +135,7 @@ pub(crate) fn verify_cached(
     signature: &[u8],
     verify: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    let handle = ACTIVE.with(|active| active.borrow().clone());
+    let handle = ACTIVE.with(|active| active.borrow().last().map(|scope| scope.handle.clone()));
     let Some(handle) = handle else {
         return verify();
     };
@@ -183,5 +219,19 @@ mod tests {
         });
         assert_eq!(scope.counts().actual_verifications, 4);
         assert_eq!(scope.counts().cache_hits, 1);
+    }
+    #[test]
+    fn out_of_order_drop_and_panic_do_not_restore_an_exited_scope() {
+        let first = SignatureVerification::new();
+        let second = SignatureVerification::new();
+        let outer = first.enter();
+        let inner = second.enter();
+        drop(outer);
+        assert!(SignatureVerification::current_counts().is_some());
+        drop(inner);
+        assert!(SignatureVerification::current_counts().is_none());
+        let result = std::panic::catch_unwind(|| first.run(|| panic!("scope unwind")));
+        assert!(result.is_err());
+        assert!(SignatureVerification::current_counts().is_none());
     }
 }

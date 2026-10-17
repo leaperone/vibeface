@@ -1,6 +1,6 @@
 //! Authenticated Noise channels shared by native nodes and browser clients.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(target_arch = "wasm32")]
@@ -70,15 +70,8 @@ impl Identity {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn verify(public_key: &str, domain: &str, payload: &[u8], signature: &str) -> Result<()> {
-    let key = VerifyingKey::from_bytes(&decode32(public_key)?)
-        .map_err(|_| "invalid identity public key")?;
-    let bytes = hex::decode(signature).map_err(|_| "invalid signature encoding")?;
-    let signature = Signature::from_slice(&bytes).map_err(|_| "invalid signature size")?;
     let message = signing_message(domain, payload)?;
-    signature_verification::verify_cached(key.as_bytes(), domain, &message, &bytes, || {
-        key.verify_strict(&message, &signature)
-            .map_err(|_| "invalid identity signature".to_owned())
-    })
+    signature_verification::verify_ed25519_message(public_key, domain, &message, signature)
 }
 
 fn decode32(value: &str) -> Result<[u8; 32]> {

@@ -1,6 +1,6 @@
 use crate::model::*;
 use anyhow::{Context as _, Result, ensure};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -78,10 +78,13 @@ fn domain_message(domain: &[u8], hash: &str) -> Vec<u8> {
     [domain, hash.as_bytes()].concat()
 }
 fn verify(public_key: &str, signature: &str, message: &[u8]) -> Result<()> {
-    let key = VerifyingKey::from_bytes(&decode32(public_key)?)?;
-    let signature = Signature::from_slice(&hex::decode(signature)?)?;
-    key.verify_strict(message, &signature)
-        .context("invalid signature")
+    vibeface_secure::signature_verification::verify_ed25519_message(
+        public_key,
+        "vibeface:event:v2",
+        message,
+        signature,
+    )
+    .map_err(anyhow::Error::msg)
 }
 pub fn verify_signed_event(
     network_id: &str,
@@ -123,7 +126,7 @@ pub fn verify_payload(
     payload: &[u8],
     signature: &str,
 ) -> Result<()> {
-    verify(public_key, signature, &payload_message(domain, payload)?)
+    vibeface_secure::verify(public_key, domain, payload, signature).map_err(anyhow::Error::msg)
 }
 fn payload_message(domain: &str, payload: &[u8]) -> Result<Vec<u8>> {
     ensure!(
