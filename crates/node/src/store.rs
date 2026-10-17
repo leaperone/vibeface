@@ -569,6 +569,383 @@ impl Store {
             })
             .collect()
     }
+    pub fn task_creation(&self, network: &str, scope: &str, task_id: &str) -> Result<SignedEvent> {
+        let context = self.context(network, scope, &[])?;
+        ensure!(
+            context.missing.is_complete(),
+            "task history is incomplete or conflicting"
+        );
+        let matches = context.events.iter().filter(|event| {
+            event.scope_id == scope && matches!(&event.body, EventBody::TaskCreated { task_id: id, .. } if id == task_id)
+        }).collect::<Vec<_>>();
+        ensure!(matches.len() == 1, "task creation is missing or ambiguous");
+        let hash = digest(&serde_json::to_vec(matches[0])?);
+        self.event(network, &hash)?
+            .context("task creation envelope is missing")
+    }
+
+    fn verify_binding_creation(&self, proof: &crate::binding::SignedBinding) -> Result<()> {
+        let binding = &proof.binding;
+        let key = self.public_key(&binding.network_id, &binding.authority_node)?;
+        crate::binding::verify_binding(proof, &key)?;
+        self.verify_binding_task(binding)
+    }
+
+    fn verify_binding_task(&self, binding: &crate::binding::TaskBinding) -> Result<()> {
+        crate::binding::validate_binding(binding)?;
+        let envelope = self
+            .event(&binding.network_id, &binding.task_ref)?
+            .context("task creation is missing")?;
+        let creation = self.verify_event(&binding.network_id, &envelope)?;
+        ensure!(
+            creation.author == binding.authority_node
+                && creation.scope_id == binding.conversation_id,
+            "binding authority does not match signed task creation"
+        );
+        ensure!(
+            matches!(&creation.body, EventBody::TaskCreated { task_id, .. } if task_id == &binding.task_id),
+            "binding references a different task"
+        );
+        ensure!(
+            self.missing_dependencies(&binding.network_id, &[binding.task_ref.clone()])?
+                .is_complete(),
+            "binding task history is incomplete or conflicting"
+        );
+        self.authorize_node(
+            &binding.network_id,
+            &binding.target_node,
+            Some(NodeRole::Executor),
+        )?;
+        if let Some(seal) = &binding.previous_seal {
+            let previous = binding
+                .previous_binding_hash
+                .as_ref()
+                .context("missing previous binding")?;
+            let value = self
+                .local_value(
+                    &binding.network_id,
+                    &format!("task-binding-record:{previous}"),
+                )?
+                .context("previous binding is missing")?;
+            let prior: crate::binding::TaskBinding =
+                serde_json::from_value(value["binding"].clone())?;
+            ensure!(
+                crate::binding::binding_hash(&prior)? == *previous
+                    && prior.task_ref == binding.task_ref
+                    && prior.generation.checked_add(1) == Some(binding.generation),
+                "binding history does not extend previous generation"
+            );
+            let key = self.public_key(&binding.network_id, &prior.target_node)?;
+            crate::binding::verify_seal(seal, &key)?;
+            ensure!(
+                seal.seal.network_id == binding.network_id
+                    && seal.seal.binding_hash == *previous
+                    && seal.seal.target_node == prior.target_node,
+                "seal does not close previous binding"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn task_binding(
+        &self,
+        network: &str,
+        task_ref: &str,
+    ) -> Result<Option<crate::binding::SignedBinding>> {
+        let Some(value) = self.local_value(network, &format!("task-binding-current:{task_ref}"))?
+        else {
+            return Ok(None);
+        };
+        let hash = value.as_str().context("invalid binding pointer")?;
+        let record = self
+            .local_value(network, &format!("task-binding-record:{hash}"))?
+            .context("missing binding record")?;
+        if record["signature"].is_null() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_value(record)?))
+    }
+
+    pub fn bind_task(
+        &mut self,
+        identity: &LocalIdentity,
+        binding: &crate::binding::TaskBinding,
+    ) -> Result<crate::binding::SignedBinding> {
+        ensure!(
+            binding.authority_node == identity.node_id()?,
+            "this Node is not the task binding authority"
+        );
+        let authority = self.authorize_node(&binding.network_id, &binding.authority_node, None)?;
+        ensure!(
+            authority.roles.contains(&NodeRole::Gateway)
+                || authority.roles.contains(&NodeRole::Scheduler),
+            "task authority cannot bind execution"
+        );
+        self.verify_binding_task(binding)?;
+        let hash = crate::binding::binding_hash(binding)?;
+        let record_key = format!("task-binding-record:{hash}");
+        let current_key = format!("task-binding-current:{}", binding.task_ref);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ready: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE network_id=? AND hash=? AND status='ready')",
+            params![binding.network_id, binding.task_ref],
+            |r| r.get(0),
+        )?;
+        ensure!(ready, "task creation changed before binding confirmation");
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT value FROM local_values WHERE network_id=? AND key=?",
+                params![binding.network_id, current_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(current) = current {
+            let current: String = serde_json::from_str(&current)?;
+            if current != hash {
+                ensure!(
+                    binding.previous_binding_hash.as_ref() == Some(&current),
+                    "task is already bound to another execution; query its existing binding"
+                );
+                ensure!(
+                    binding.previous_seal.is_some(),
+                    "changing executor requires a sealed previous binding"
+                );
+            }
+        } else {
+            ensure!(
+                binding.generation == 1 && binding.previous_binding_hash.is_none(),
+                "initial binding must be generation one"
+            );
+        }
+        let unsigned = serde_json::json!({"binding":binding,"signature":null});
+        tx.execute(
+            "INSERT OR IGNORE INTO local_values(network_id,key,value) VALUES(?,?,?)",
+            params![
+                binding.network_id,
+                record_key,
+                serde_json::to_string(&unsigned)?
+            ],
+        )?;
+        tx.execute("INSERT INTO local_values(network_id,key,value) VALUES(?,?,?) ON CONFLICT(network_id,key) DO UPDATE SET value=excluded.value",params![binding.network_id,current_key,serde_json::to_string(&hash)?])?;
+        tx.commit()?;
+        // No binding proof leaves this Node before its unique value is durable.
+        let proof = crate::binding::sign_binding(identity, binding)?;
+        self.local_set(
+            &binding.network_id,
+            &record_key,
+            &serde_json::to_value(&proof)?,
+        )?;
+        Ok(proof)
+    }
+
+    pub fn install_binding(&mut self, proof: &crate::binding::SignedBinding) -> Result<()> {
+        self.verify_binding_creation(proof)?;
+        let binding = &proof.binding;
+        let hash = crate::binding::binding_hash(binding)?;
+        let current_key = format!("task-binding-current:{}", binding.task_ref);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT value FROM local_values WHERE network_id=? AND key=?",
+                params![binding.network_id, current_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(current) = current {
+            let current: String = serde_json::from_str(&current)?;
+            if current != hash {
+                let record: String = tx.query_row(
+                    "SELECT value FROM local_values WHERE network_id=? AND key=?",
+                    params![binding.network_id, format!("task-binding-record:{current}")],
+                    |r| r.get(0),
+                )?;
+                let previous: crate::binding::TaskBinding = serde_json::from_value(
+                    serde_json::from_str::<Value>(&record)?["binding"].clone(),
+                )?;
+                ensure!(
+                    binding.generation != previous.generation,
+                    "conflicting signed binding generation"
+                );
+                if binding.generation < previous.generation {
+                    // Historical proof may be retained, but must never move the current fence backwards.
+                    tx.execute(
+                        "INSERT OR IGNORE INTO local_values(network_id,key,value) VALUES(?,?,?)",
+                        params![
+                            binding.network_id,
+                            format!("task-binding-record:{hash}"),
+                            serde_json::to_string(proof)?
+                        ],
+                    )?;
+                    tx.commit()?;
+                    return Ok(());
+                }
+                ensure!(
+                    binding.previous_binding_hash.as_ref() == Some(&current),
+                    "binding generation has missing predecessors"
+                );
+            }
+        }
+        tx.execute("INSERT INTO local_values(network_id,key,value) VALUES(?,?,?) ON CONFLICT(network_id,key) DO UPDATE SET value=excluded.value",params![binding.network_id,format!("task-binding-record:{hash}"),serde_json::to_string(proof)?])?;
+        tx.execute("INSERT INTO local_values(network_id,key,value) VALUES(?,?,?) ON CONFLICT(network_id,key) DO UPDATE SET value=excluded.value",params![binding.network_id,current_key,serde_json::to_string(&hash)?])?;
+        if let Some(seal) = &binding.previous_seal {
+            tx.execute(
+                "INSERT OR IGNORE INTO local_values(network_id,key,value) VALUES(?,?,?)",
+                params![
+                    binding.network_id,
+                    format!("task-binding-seal:{}", seal.seal.binding_hash),
+                    serde_json::to_string(seal)?
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn seal_binding(
+        &mut self,
+        identity: &LocalIdentity,
+        proof: &crate::binding::SignedBinding,
+    ) -> Result<crate::binding::SignedSeal> {
+        self.verify_binding_creation(proof)?;
+        let binding = &proof.binding;
+        ensure!(
+            binding.target_node == identity.node_id()?,
+            "only the bound executor can seal execution"
+        );
+        let hash = crate::binding::binding_hash(binding)?;
+        let key = format!("task-binding-seal:{hash}");
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT value FROM local_values WHERE network_id=? AND key=?",
+                params![binding.network_id, key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let value: Value = serde_json::from_str(&existing)?;
+            let seal: crate::binding::BindingSeal = serde_json::from_value(value["seal"].clone())?;
+            tx.commit()?;
+            let signed = crate::binding::sign_seal(identity, &seal)?;
+            self.local_set(&binding.network_id, &key, &serde_json::to_value(&signed)?)?;
+            return Ok(signed);
+        }
+        let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE network_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"'))",params![binding.network_id,binding.target_node,binding.session_id],|r|r.get(0))?;
+        ensure!(
+            !busy,
+            "cannot seal an unresolved execution; reconcile unknown results first"
+        );
+        let pending:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations o JOIN local_values v ON v.network_id=o.network_id AND v.key='completion:' || o.operation_id WHERE o.network_id=? AND o.target_node=? AND o.session_id=?)",params![binding.network_id,binding.target_node,binding.session_id],|r|r.get(0))?;
+        ensure!(
+            !pending,
+            "execution completion must be durable and flushed before sealing"
+        );
+        let session:Option<String>=tx.query_row("SELECT record FROM execution_sessions WHERE network_id=? AND target_node=? AND session_id=?",params![binding.network_id,binding.target_node,binding.session_id],|r|r.get(0)).optional()?;
+        let revision = if let Some(session) = session {
+            let session: ExecutionSession = serde_json::from_str(&session)?;
+            ensure!(
+                matches!(session.state.as_str(), "idle" | "closed"),
+                "native execution session is not idle"
+            );
+            session.revision
+        } else {
+            0
+        };
+        let seal = crate::binding::BindingSeal {
+            network_id: binding.network_id.clone(),
+            binding_hash: hash,
+            target_node: binding.target_node.clone(),
+            final_revision: revision,
+        };
+        tx.execute(
+            "INSERT INTO local_values(network_id,key,value) VALUES(?,?,?)",
+            params![
+                binding.network_id,
+                key,
+                serde_json::to_string(&serde_json::json!({"seal":seal,"signature":null}))?
+            ],
+        )?;
+        tx.commit()?;
+        let signed = crate::binding::sign_seal(identity, &seal)?;
+        self.local_set(&binding.network_id, &key, &serde_json::to_value(&signed)?)?;
+        Ok(signed)
+    }
+
+    pub fn validate_operation_binding(&self, request: &OperationRequest) -> Result<()> {
+        let proof = request
+            .binding
+            .as_ref()
+            .context("execution requires a confirmed task binding")?;
+        self.verify_binding_creation(proof)?;
+        validate_operation_binding_from(&self.connection, request)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_test_operation(
+        &mut self,
+        identity: &LocalIdentity,
+        request: &mut OperationRequest,
+    ) -> Result<()> {
+        let task_id = request
+            .task_id
+            .get_or_insert_with(|| format!("fixture-{}", request.operation_id))
+            .clone();
+        let creation =
+            match self.task_creation(&request.network_id, &request.conversation_id, &task_id) {
+                Ok(event) => event,
+                Err(_) => self.append_event(
+                    identity,
+                    &request.network_id,
+                    &request.conversation_id,
+                    EventBody::TaskCreated {
+                        task_id: task_id.clone(),
+                        title: "fixture".into(),
+                        goal: "fixture".into(),
+                        acceptance: "fixture".into(),
+                    },
+                    vec![],
+                    2,
+                )?,
+            };
+        if let Some(proof) = self.task_binding(&request.network_id, &creation.hash)? {
+            request.binding = Some(proof);
+            return Ok(());
+        }
+        let open_spec =
+            if request.action["type"] == "open" && request.action["executor"].is_string() {
+                request.action.clone()
+            } else if let Some(session) = self.session(
+                &request.network_id,
+                &request.target_node,
+                &request.session_id,
+            )? {
+                serde_json::json!({"type":"open","executor":session.executor,"cwd":session.cwd})
+            } else {
+                serde_json::json!({"type":"open","executor":"codex","cwd":"/tmp"})
+            };
+        let binding = crate::binding::TaskBinding {
+            network_id: request.network_id.clone(),
+            conversation_id: request.conversation_id.clone(),
+            task_ref: creation.hash,
+            task_id,
+            authority_node: identity.node_id()?,
+            generation: 1,
+            target_node: request.target_node.clone(),
+            session_id: request.session_id.clone(),
+            open_spec,
+            previous_binding_hash: None,
+            previous_seal: None,
+        };
+        request.binding = Some(self.bind_task(identity, &binding)?);
+        Ok(())
+    }
+
     pub fn accept_operation(
         &mut self,
         network_id: &str,
@@ -616,6 +993,7 @@ impl Store {
             request.resources.len() <= 128,
             "too many resource reservations"
         );
+        self.validate_operation_binding(request)?;
         let encoded = serde_json::to_string(request)?;
         ensure!(encoded.len() <= MAX_EVENT_BYTES, "operation too large");
         if let Some(old) = self.operation(network_id, &request.operation_id)? {
@@ -656,6 +1034,7 @@ impl Store {
                 result: serde_json::from_str(&result)?,
             });
         }
+        validate_operation_binding_from(&tx, request)?;
         for event in &complete.events {
             let hash = digest(serde_json::to_string(event)?.as_bytes());
             let ready:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE network_id=? AND hash=? AND status='ready')",params![network_id,hash],|r|r.get(0))?;
@@ -706,6 +1085,7 @@ impl Store {
             |r| r.get(0),
         )?;
         let request: OperationRequest = serde_json::from_str(&encoded)?;
+        validate_operation_binding_from(&tx, &request)?;
         authorize_node_from(
             &tx,
             network_id,
@@ -1203,6 +1583,69 @@ fn authorize_node_from(
     }
     Ok(node)
 }
+fn validate_operation_binding_from(
+    connection: &Connection,
+    request: &OperationRequest,
+) -> Result<()> {
+    let proof = request
+        .binding
+        .as_ref()
+        .context("execution requires a confirmed task binding")?;
+    let binding = &proof.binding;
+    ensure!(
+        binding.network_id == request.network_id
+            && binding.conversation_id == request.conversation_id
+            && Some(binding.task_id.as_str()) == request.task_id.as_deref(),
+        "operation does not match its bound task"
+    );
+    ensure!(
+        binding.target_node == request.target_node && binding.session_id == request.session_id,
+        "operation target or session differs from confirmed task binding"
+    );
+    if request.action["type"] == "open" {
+        ensure!(
+            request.action == binding.open_spec,
+            "open execution differs from confirmed binding"
+        );
+    }
+    let ready: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE network_id=? AND hash=? AND status='ready')",
+        params![binding.network_id, binding.task_ref],
+        |r| r.get(0),
+    )?;
+    ensure!(ready, "task creation is incomplete or conflicting");
+    let hash = crate::binding::binding_hash(binding)?;
+    let current: Option<String> = connection
+        .query_row(
+            "SELECT value FROM local_values WHERE network_id=? AND key=?",
+            params![
+                request.network_id,
+                format!("task-binding-current:{}", binding.task_ref)
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
+    ensure!(
+        current
+            .as_deref()
+            .map(serde_json::from_str::<String>)
+            .transpose()?
+            .as_deref()
+            == Some(hash.as_str()),
+        "task binding is missing or superseded"
+    );
+    let sealed: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_values WHERE network_id=? AND key=?)",
+        params![request.network_id, format!("task-binding-seal:{hash}")],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        !sealed,
+        "execution binding is sealed; old commands cannot resume it"
+    );
+    Ok(())
+}
+
 fn heads_from_events(events: &BTreeMap<String, StoredEvent>, scope_id: &str) -> Vec<String> {
     let mut heads: BTreeSet<String> = events
         .iter()
@@ -1438,8 +1881,13 @@ mod tests {
             blobs,
         })
     }
-    fn request(owner: &LocalIdentity, id: &str, heads: Vec<String>) -> Result<OperationRequest> {
-        Ok(OperationRequest {
+    fn request(
+        store: &mut Store,
+        owner: &LocalIdentity,
+        id: &str,
+        heads: Vec<String>,
+    ) -> Result<OperationRequest> {
+        let mut request = OperationRequest {
             operation_id: id.into(),
             network_id: owner.network_id()?,
             conversation_id: "conversation".into(),
@@ -1448,9 +1896,12 @@ mod tests {
             session_id: "session".into(),
             expected_revision: 0,
             basis_heads: heads,
-            action: json!({"type":"open"}),
+            action: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
             resources: vec![],
-        })
+            binding: None,
+        };
+        store.bind_test_operation(owner, &mut request)?;
+        Ok(request)
     }
     fn session(owner: &LocalIdentity, id: &str) -> Result<ExecutionSession> {
         Ok(ExecutionSession {
@@ -1676,7 +2127,7 @@ mod tests {
         let network = a.network_id()?;
         let mut store = memory(&a, None)?;
         let event = conversation(&mut store, &a)?;
-        let request = request(&a, "queued", vec![event.hash])?;
+        let request = request(&mut store, &a, "queued", vec![event.hash])?;
         store.accept_operation(&network, &request)?;
         let mut certificate = a.certificate(roles())?;
         certificate.revoked = true;
@@ -1758,13 +2209,190 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn task_binding_cas_rejects_competing_targets_and_recovers_unsigned_commit() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let executor = LocalIdentity::generate();
+        let network = owner.network_id()?;
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-binding-cas-{}", uuid::Uuid::new_v4()));
+        let db = dir.join("node.sqlite3");
+        let mut store = Store::open(&db)?;
+        store.install_trust_bundle(
+            &network,
+            &owner.sign_trust_bundle(
+                1,
+                vec![owner.certificate(roles())?, executor.certificate(roles())?],
+            )?,
+        )?;
+        conversation(&mut store, &owner)?;
+        let creation = store.append_event(
+            &owner,
+            &network,
+            "conversation",
+            EventBody::TaskCreated {
+                task_id: "task".into(),
+                title: "task".into(),
+                goal: "task".into(),
+                acceptance: "task".into(),
+            },
+            vec![],
+            2,
+        )?;
+        let first = crate::binding::TaskBinding {
+            network_id: network.clone(),
+            conversation_id: "conversation".into(),
+            task_ref: creation.hash,
+            task_id: "task".into(),
+            authority_node: owner.node_id()?,
+            generation: 1,
+            target_node: owner.node_id()?,
+            session_id: "first".into(),
+            open_spec: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
+            previous_binding_hash: None,
+            previous_seal: None,
+        };
+        let mut second = first.clone();
+        second.target_node = executor.node_id()?;
+        second.session_id = "second".into();
+        drop(store);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut threads = vec![];
+        for proposal in [first, second] {
+            let mut store = Store::open(&db)?;
+            let owner = owner.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.bind_task(&owner, &proposal)
+            }));
+        }
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let proof = results.into_iter().find_map(Result::ok).unwrap();
+        let mut store = Store::open(&db)?;
+        let hash = crate::binding::binding_hash(&proof.binding)?;
+        // Simulate commit succeeding while the process exits before its signature is persisted.
+        store.local_set(
+            &network,
+            &format!("task-binding-record:{hash}"),
+            &json!({"binding":proof.binding,"signature":null}),
+        )?;
+        assert!(
+            store
+                .task_binding(&network, &proof.binding.task_ref)?
+                .is_none()
+        );
+        assert_eq!(store.bind_task(&owner, &proof.binding)?, proof);
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_binding_cannot_move_and_seal_fences_delayed_commands() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let network = owner.network_id()?;
+        let mut store = memory(&owner, None)?;
+        let root = conversation(&mut store, &owner)?;
+        let request = request(&mut store, &owner, "work", vec![root.hash])?;
+        let proof = request.binding.as_ref().unwrap();
+        let mut unbound = request.clone();
+        unbound.binding = None;
+        assert!(store.accept_operation(&network, &unbound).is_err());
+        let mut wrong = request.clone();
+        wrong.target_node = "0".repeat(64);
+        assert!(store.accept_operation(&network, &wrong).is_err());
+        store.accept_operation(&network, &request)?;
+        store.claim_operation(&network, "work")?;
+        store.finish_operation(
+            &network,
+            "work",
+            OperationState::Unknown,
+            json!({"reason":"lost connection"}),
+        )?;
+        assert!(store.seal_binding(&owner, proof).is_err());
+        let mut replacement = proof.binding.clone();
+        replacement.generation = 2;
+        replacement.session_id = "replacement".into();
+        replacement.previous_binding_hash = Some(crate::binding::binding_hash(&proof.binding)?);
+        assert!(store.bind_task(&owner, &replacement).is_err());
+        store.finish_operation(
+            &network,
+            "work",
+            OperationState::Failed,
+            json!({"verified":"external execution stopped"}),
+        )?;
+        let seal = store.seal_binding(&owner, proof)?;
+        assert_eq!(store.seal_binding(&owner, proof)?, seal);
+        let mut delayed = request.clone();
+        delayed.operation_id = "delayed".into();
+        assert!(store.accept_operation(&network, &delayed).is_err());
+        replacement.previous_seal = Some(seal);
+        let next = store.bind_task(&owner, &replacement)?;
+        assert_eq!(next.binding.generation, 2);
+        assert!(store.accept_operation(&network, &delayed).is_err());
+        store.install_binding(proof)?;
+        assert_eq!(
+            store
+                .task_binding(&network, &proof.binding.task_ref)?
+                .unwrap(),
+            next
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_scheduler_requests_at_one_revision_admit_only_one_side_effect() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let network = owner.network_id()?;
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-session-cas-{}", uuid::Uuid::new_v4()));
+        let db = dir.join("node.sqlite3");
+        let mut store = Store::open(&db)?;
+        store.install_trust_bundle(
+            &network,
+            &owner.sign_trust_bundle(1, vec![owner.certificate(roles())?])?,
+        )?;
+        let root = conversation(&mut store, &owner)?;
+        let request = request(&mut store, &owner, "first", vec![root.hash])?;
+        store.upsert_session(&network, &session(&owner, "session")?)?;
+        drop(store);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut threads = vec![];
+        for id in ["scheduler-a", "scheduler-c"] {
+            let mut store = Store::open(&db)?;
+            let mut request = request.clone();
+            request.operation_id = id.into();
+            let barrier = barrier.clone();
+            let network = network.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.accept_operation(&network, &request)
+            }));
+        }
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let store = Store::open(&db)?;
+        assert_eq!(store.operations(&network)?.len(), 1);
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn operation_cas_reserves_resources_and_reconciles_unknown_without_replay() -> Result<()> {
         let a = LocalIdentity::generate();
         let network = a.network_id()?;
         let mut store = memory(&a, None)?;
         let root = conversation(&mut store, &a)?;
         store.upsert_session(&network, &session(&a, "session")?)?;
-        let mut first = request(&a, "operation", vec![root.hash])?;
+        let mut first = request(&mut store, &a, "operation", vec![root.hash])?;
         first.resources = vec!["/tmp/vibeface-lock/repo".into()];
         assert_eq!(
             store.accept_operation(&network, &first)?.state,
@@ -1781,6 +2409,9 @@ mod tests {
         overlap.operation_id = "other".into();
         overlap.session_id = "second".into();
         overlap.resources = vec!["/tmp/vibeface-lock/repo/child".into()];
+        overlap.task_id = None;
+        overlap.binding = None;
+        store.bind_test_operation(&a, &mut overlap)?;
         assert!(store.accept_operation(&network, &overlap).is_err());
         let mut sibling = overlap.clone();
         sibling.resources = vec!["/tmp/vibeface-lock/repo-two".into()];
@@ -1826,7 +2457,7 @@ mod tests {
         let mut store = memory(&a, None)?;
         let root = conversation(&mut store, &a)?;
         store.upsert_session(&network, &session(&a, "session")?)?;
-        let mut send = request(&a, "send", vec![root.hash])?;
+        let mut send = request(&mut store, &a, "send", vec![root.hash])?;
         send.action = json!({"type":"send","text":"work"});
         send.resources = vec!["/tmp/vibeface-active-turn".into()];
         store.accept_operation(&network, &send)?;
@@ -1885,8 +2516,8 @@ mod tests {
         assert!(store.event(&na, &eb.hash)?.is_none());
         assert_eq!(store.conversations(&na)?.len(), 1);
         assert_eq!(store.conversations(&nb)?.len(), 1);
-        let ra = request(&a, "same-id", vec![ea.hash])?;
-        let rb = request(&b, "same-id", vec![eb.hash])?;
+        let ra = request(&mut store, &a, "same-id", vec![ea.hash])?;
+        let rb = request(&mut store, &b, "same-id", vec![eb.hash])?;
         store.accept_operation(&na, &ra)?;
         store.accept_operation(&nb, &rb)?;
         assert_eq!(
@@ -1930,10 +2561,13 @@ mod tests {
         )?;
         let ea = conversation(&mut store, &a)?;
         let eb = conversation(&mut store, &b)?;
-        let mut ra = request(&a, "same-op", vec![ea.hash])?;
+        let mut ra = request(&mut store, &a, "same-op", vec![ea.hash])?;
         ra.resources = vec!["/tmp/vibeface-shared-device".into()];
-        let mut rb = request(&b, "same-op", vec![eb.hash])?;
+        let mut rb = request(&mut store, &b, "same-op", vec![eb.hash])?;
         rb.target_node = a.node_id()?;
+        rb.task_id = Some("other-device-task".into());
+        rb.binding = None;
+        store.bind_test_operation(&b, &mut rb)?;
         rb.resources = ra.resources.clone();
         store.accept_operation(&na, &ra)?;
         assert!(store.accept_operation(&nb, &rb).is_err());
@@ -2065,7 +2699,7 @@ mod tests {
                 &a.sign_trust_bundle(1, vec![a.certificate(roles())?])?,
             )?;
             let event = conversation(&mut store, &a)?;
-            let request = request(&a, "durable", vec![event.hash])?;
+            let request = request(&mut store, &a, "durable", vec![event.hash])?;
             store.accept_operation(&network, &request)?;
             store.claim_operation(&network, "durable")?;
         }

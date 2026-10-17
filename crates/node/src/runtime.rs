@@ -76,7 +76,7 @@ mod tests {
                 native_session_id: Some("native-test".into()),
             },
         )?;
-        let request = OperationRequest {
+        let mut request = OperationRequest {
             operation_id: operation.into(),
             network_id: network.into(),
             conversation_id: "chat".into(),
@@ -87,7 +87,9 @@ mod tests {
             basis_heads: store.heads(network, "chat")?,
             action,
             resources: vec![node.config.roots[0].to_string_lossy().into_owned()],
+            binding: None,
         };
+        store.bind_test_operation(&node.identity, &mut request)?;
         store.accept_operation(network, &request)?;
         Ok(request)
     }
@@ -133,6 +135,7 @@ mod tests {
             basis_heads: store.heads(&network, "chat")?,
             action: json!({"type":"send","text":"test"}),
             resources: vec![],
+            binding: None,
         };
         store.append_event(
             &node.identity,
@@ -312,6 +315,7 @@ mod tests {
                 .unwrap()
                 .revision;
             request.basis_heads = store.heads(&network, "chat")?;
+            store.bind_test_operation(&node.identity, &mut request)?;
             store.accept_operation(&network, &request)?;
             store.claim_operation(&network, &request.operation_id)?;
         }
@@ -456,6 +460,7 @@ mod tests {
                 basis_heads: node.store.lock().await.heads(&network, "chat")?,
                 action: json!({"type":"open","executor":"claude_code","cwd":dir}),
                 resources: vec![],
+                binding: None,
             };
             assert!(
                 node.dispatch(agent.clone(), request.clone())
@@ -480,39 +485,6 @@ mod tests {
     }
     #[tokio::test]
     async fn agent_cannot_silently_detach_a_session_from_its_latest_admitted_task() -> Result<()> {
-        async fn admit_steer(
-            node: &Arc<Runtime>,
-            request: &OperationRequest,
-            human: bool,
-        ) -> Result<()> {
-            node.admit_operation(request.clone(), human).await?;
-            let operation = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let operation = node
-                        .store
-                        .lock()
-                        .await
-                        .operation(&request.network_id, &request.operation_id)
-                        .unwrap()
-                        .unwrap();
-                    if operation.state.terminal() {
-                        break operation;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await?;
-            assert_eq!(operation.state, OperationState::Failed);
-            assert!(
-                operation.result["error"]
-                    .as_str()
-                    .unwrap()
-                    .contains("unsupported")
-            );
-            drop(node.completion_lock.lock().await);
-            Ok(())
-        }
-
         let dir = fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
@@ -537,10 +509,12 @@ mod tests {
             associated.operation_id = "associated".into();
             associated.task_id = Some("task".into());
             associated.expected_revision = 1;
+            associated.binding = None;
+            store.bind_test_operation(&node.identity, &mut associated)?;
             store.accept_operation(&network, &associated)?;
             let mut concurrent = associated.clone();
             concurrent.operation_id = "concurrent-untasked-steer".into();
-            concurrent.task_id = None;
+            concurrent.task_id = Some("task".into());
             concurrent.action = json!({"type":"steer","turn_id":"turn","text":"test"});
             concurrent.resources.clear();
             store.accept_control_operation(&network, &concurrent)?;
@@ -607,23 +581,8 @@ mod tests {
             request.operation_id = operation.into();
             request.task_id = task_id.map(String::from);
             request.basis_heads = node.store.lock().await.heads(&network, "chat")?;
-            admit_steer(&node, &request, human).await?;
-            request.expected_revision += 1;
+            assert!(node.admit_operation(request.clone(), human).await.is_err());
         }
-        request.operation_id = "never-task-associated".into();
-        request.session_id = "plain-session".into();
-        request.expected_revision = 0;
-        request.basis_heads = node.store.lock().await.heads(&network, "chat")?;
-        {
-            let mut store = node.store.lock().await;
-            let mut session = store
-                .session(&network, &request.target_node, "seed")?
-                .unwrap();
-            session.session_id = request.session_id.clone();
-            session.revision = 0;
-            store.upsert_session(&network, &session)?;
-        }
-        admit_steer(&node, &request, false).await?;
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -1446,6 +1405,9 @@ mod tests {
             remote_request.operation_id = "remote".into();
             remote_request.target_node = remote.node_id()?;
             remote_request.resources.clear();
+            remote_request.task_id = Some("remote-fixture".into());
+            remote_request.binding = None;
+            store.bind_test_operation(&node.identity, &mut remote_request)?;
             store.accept_operation(&network, &remote_request)?;
         }
         node.maintenance_idle().await?;
@@ -2449,6 +2411,7 @@ impl Runtime {
                 self.publish_changed(network, &scope, &event.hash);
                 Ok(json!(event))
             }
+            "rebind_execution" => self.rebind_execution(&access, &input).await,
             "operate" => {
                 let request: OperationRequest = serde_json::from_value(input["request"].clone())?;
                 self.require_scope(&access, &request.conversation_id)
@@ -2695,6 +2658,7 @@ impl Runtime {
                     basis_heads: basis,
                     action,
                     resources: vec![],
+                    binding: None,
                 };
                 self.dispatch(access, request).await
             }
@@ -2716,10 +2680,247 @@ impl Runtime {
             _ => bail!("unknown or unavailable tool"),
         }
     }
+    async fn cache_context_bindings(&self, network: &str, scope: &str) -> Result<()> {
+        let context = self.store.lock().await.context(network, scope, &[])?;
+        let mut proofs = context
+            .events
+            .iter()
+            .filter_map(|event| {
+                if let EventBody::DispatchRecorded { action, .. } = &event.body {
+                    serde_json::from_value::<OperationRequest>(action.clone())
+                        .ok()
+                        .and_then(|request| request.binding)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        proofs.sort_by_key(|proof| proof.binding.generation);
+        let mut store = self.store.lock().await;
+        for proof in proofs {
+            store.install_binding(&proof)?;
+        }
+        Ok(())
+    }
+
+    async fn confirm_binding(
+        self: &Arc<Self>,
+        binding: crate::binding::TaskBinding,
+    ) -> Result<crate::binding::SignedBinding> {
+        let proof = if binding.authority_node == self.identity.node_id()? {
+            self.store
+                .lock()
+                .await
+                .bind_task(&self.identity, &binding)?
+        } else {
+            let reply = self
+                .peer_request(
+                    &binding.network_id,
+                    &binding.authority_node,
+                    serde_json::json!({"type":"bind_task","binding":binding}),
+                )
+                .await
+                .context("task binding authority is unreachable; execution was not reassigned")?;
+            serde_json::from_value(reply["binding"].clone())?
+        };
+        self.store.lock().await.install_binding(&proof)?;
+        Ok(proof)
+    }
+
+    async fn prepare_operation_binding(
+        self: &Arc<Self>,
+        request: &mut OperationRequest,
+    ) -> Result<()> {
+        self.cache_context_bindings(&request.network_id, &request.conversation_id)
+            .await?;
+        if let Some(proof) = &request.binding {
+            self.store.lock().await.install_binding(proof)?;
+            return self.store.lock().await.validate_operation_binding(request);
+        }
+        if request.task_id.is_none() {
+            let context = self.store.lock().await.context(
+                &request.network_id,
+                &request.conversation_id,
+                &[],
+            )?;
+            if let Some(proof) = context.events.iter().rev().find_map(|event| {
+                if let EventBody::DispatchRecorded {
+                    action,
+                    target_node,
+                    session_id,
+                    ..
+                } = &event.body
+                    && target_node == &request.target_node
+                    && session_id == &request.session_id
+                {
+                    serde_json::from_value::<OperationRequest>(action.clone())
+                        .ok()
+                        .and_then(|request| request.binding)
+                } else {
+                    None
+                }
+            }) {
+                request.task_id = Some(proof.binding.task_id.clone());
+                request.binding = Some(proof);
+                return self.store.lock().await.validate_operation_binding(request);
+            }
+            let task_id = format!(
+                "execution-{}",
+                crypto::digest(&serde_json::to_vec(&(
+                    &request.target_node,
+                    &request.session_id
+                ))?)
+            );
+            if !self
+                .store
+                .lock()
+                .await
+                .tasks(&request.network_id, &request.conversation_id)?
+                .iter()
+                .any(|task| task.task_id == task_id)
+            {
+                self.append(
+                    &request.network_id,
+                    &request.conversation_id,
+                    EventBody::TaskCreated {
+                        task_id: task_id.clone(),
+                        title: "Execution session".into(),
+                        goal: "User-requested execution".into(),
+                        acceptance: "The user verifies the result".into(),
+                    },
+                )
+                .await?;
+            }
+            request.task_id = Some(task_id);
+        }
+        let task_id = request
+            .task_id
+            .as_ref()
+            .context("task binding requires a task")?;
+        let (creation, event) = {
+            let store = self.store.lock().await;
+            let creation =
+                store.task_creation(&request.network_id, &request.conversation_id, task_id)?;
+            let event = store.verify_event(&request.network_id, &creation)?;
+            (creation, event)
+        };
+        let mut existing = self
+            .store
+            .lock()
+            .await
+            .task_binding(&request.network_id, &creation.hash)?;
+        if event.author != self.identity.node_id()?
+            && existing.as_ref().is_none_or(|proof| {
+                proof.binding.target_node != request.target_node
+                    || proof.binding.session_id != request.session_id
+            })
+        {
+            if let Ok(reply) = self
+                .peer_request(
+                    &request.network_id,
+                    &event.author,
+                    serde_json::json!({"type":"task_binding","task_ref":creation.hash}),
+                )
+                .await
+                && !reply["binding"].is_null()
+            {
+                let proof: crate::binding::SignedBinding =
+                    serde_json::from_value(reply["binding"].clone())?;
+                self.store.lock().await.install_binding(&proof)?;
+                existing = Some(proof);
+            }
+        }
+        if let Some(proof) = existing {
+            request.binding = Some(proof);
+            return self.store.lock().await.validate_operation_binding(request);
+        }
+        let open_spec = if request.action["type"] == "open" {
+            request.action.clone()
+        } else {
+            let value = self
+                .session_fact(
+                    &request.network_id,
+                    &request.target_node,
+                    &request.session_id,
+                )
+                .await?;
+            serde_json::json!({"type":"open","executor":value["session"]["executor"],"cwd":value["session"]["cwd"]})
+        };
+        let binding = crate::binding::TaskBinding {
+            network_id: request.network_id.clone(),
+            conversation_id: request.conversation_id.clone(),
+            task_ref: creation.hash,
+            task_id: task_id.clone(),
+            authority_node: event.author,
+            generation: 1,
+            target_node: request.target_node.clone(),
+            session_id: request.session_id.clone(),
+            open_spec,
+            previous_binding_hash: None,
+            previous_seal: None,
+        };
+        request.binding = Some(self.confirm_binding(binding).await?);
+        self.store.lock().await.validate_operation_binding(request)
+    }
+
+    async fn rebind_execution(self: &Arc<Self>, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "moving execution requires the user");
+        let scope = field(input, "conversation_id")?;
+        self.require_scope(access, scope).await?;
+        self.sync_all(&access.network_id).await?;
+        self.cache_context_bindings(&access.network_id, scope)
+            .await?;
+        let creation = self.store.lock().await.task_creation(
+            &access.network_id,
+            scope,
+            field(input, "task_id")?,
+        )?;
+        let previous = self
+            .store
+            .lock()
+            .await
+            .task_binding(&access.network_id, &creation.hash)?
+            .context("task has no confirmed execution binding")?;
+        let old = &previous.binding;
+        let seal = if old.target_node == self.identity.node_id()? {
+            self.store
+                .lock()
+                .await
+                .seal_binding(&self.identity, &previous)?
+        } else {
+            let reply = self
+                .peer_request(
+                    &access.network_id,
+                    &old.target_node,
+                    serde_json::json!({"type":"seal_binding","binding":previous,"human":true}),
+                )
+                .await
+                .context("original executor is unreachable; task was not reassigned")?;
+            serde_json::from_value(reply["seal"].clone())?
+        };
+        let next = crate::binding::TaskBinding {
+            network_id: old.network_id.clone(),
+            conversation_id: old.conversation_id.clone(),
+            task_ref: old.task_ref.clone(),
+            task_id: old.task_id.clone(),
+            authority_node: old.authority_node.clone(),
+            generation: old
+                .generation
+                .checked_add(1)
+                .context("binding generation overflow")?,
+            target_node: field(input, "target_node")?.into(),
+            session_id: id(input, "session_id")?,
+            open_spec: serde_json::json!({"type":"open","executor":field(input,"executor")?,"cwd":field(input,"cwd")?}),
+            previous_binding_hash: Some(crate::binding::binding_hash(old)?),
+            previous_seal: Some(seal),
+        };
+        Ok(serde_json::json!({"binding":self.confirm_binding(next).await?}))
+    }
+
     pub async fn dispatch(
         self: &Arc<Self>,
         access: Access,
-        request: OperationRequest,
+        mut request: OperationRequest,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         ensure!(
@@ -2749,6 +2950,22 @@ impl Runtime {
             Some(NodeRole::Executor),
         )?;
         self.sync_all(&access.network_id).await?;
+        if !access.human
+            && matches!(
+                request.action["type"].as_str(),
+                Some("open" | "send" | "steer")
+            )
+            && let Some(task) = &request.task_id
+        {
+            require_task_write(
+                &*self.store.lock().await,
+                &request.network_id,
+                &request.conversation_id,
+                task,
+                false,
+            )?;
+        }
+        self.prepare_operation_binding(&mut request).await?;
         let context = self.store.lock().await.context(
             &access.network_id,
             &request.conversation_id,
@@ -2995,6 +3212,7 @@ impl Runtime {
                     &request.session_id,
                 )?
                 .context("accepted operation has no local session")?;
+            store.validate_operation_binding(&request)?;
             self.allowed_path(&session.cwd)?;
             for resource in &request.resources {
                 self.allowed_path(resource)?;
@@ -3355,7 +3573,7 @@ impl Runtime {
         let kind = field(input, "type")?;
         let _work = (!matches!(
             kind,
-            "capabilities" | "inventory" | "event" | "blob" | "operation"
+            "capabilities" | "inventory" | "event" | "blob" | "operation" | "task_binding"
         ))
         .then(|| self.maintenance.enter())
         .transpose()?;
@@ -3417,6 +3635,43 @@ impl Runtime {
                 }
                 Ok(json!({"received":true}))
             }
+            "task_binding" => Ok(
+                json!({"binding":self.store.lock().await.task_binding(network,field(input,"task_ref")?)?}),
+            ),
+            "bind_task" => {
+                let sender =
+                    self.store
+                        .lock()
+                        .await
+                        .authorize_node(network, &message.origin, None)?;
+                ensure!(
+                    sender.roles.contains(&NodeRole::Scheduler)
+                        || sender.roles.contains(&NodeRole::Gateway),
+                    "origin cannot propose execution binding"
+                );
+                let binding: crate::binding::TaskBinding =
+                    serde_json::from_value(input["binding"].clone())?;
+                ensure!(binding.network_id == *network, "wrong binding network");
+                Ok(json!({"binding":self.store.lock().await.bind_task(&self.identity,&binding)?}))
+            }
+            "seal_binding" => {
+                let sender = self.store.lock().await.authorize_node(
+                    network,
+                    &message.origin,
+                    Some(NodeRole::Gateway),
+                )?;
+                ensure!(
+                    input["human"] == true && sender.roles.contains(&NodeRole::Gateway),
+                    "sealing execution requires the user"
+                );
+                let proof: crate::binding::SignedBinding =
+                    serde_json::from_value(input["binding"].clone())?;
+                ensure!(
+                    proof.binding.network_id == *network,
+                    "wrong binding network"
+                );
+                Ok(json!({"seal":self.store.lock().await.seal_binding(&self.identity,&proof)?}))
+            }
             "execute" => {
                 let sender =
                     self.store
@@ -3449,6 +3704,13 @@ impl Runtime {
                         .is_complete(),
                     "dispatch context is incomplete"
                 );
+                self.cache_context_bindings(network, &request.conversation_id)
+                    .await?;
+                let proof = request
+                    .binding
+                    .as_ref()
+                    .context("execute requires a confirmed task binding")?;
+                self.store.lock().await.install_binding(proof)?;
                 self.admit_operation(request, human).await
             }
             "session" => {

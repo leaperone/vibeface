@@ -212,6 +212,8 @@ pub struct OperationRequest {
     pub basis_heads: Vec<EventHash>,
     pub action: Value,
     pub resources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<crate::binding::SignedBinding>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
