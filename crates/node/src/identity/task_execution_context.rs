@@ -123,7 +123,7 @@ impl TaskScopedAuthorization {
             let context = PrepareContext {
                 context: facts.context.clone(),
                 binding_generation: Some(binding.binding.generation),
-                canonical_cwd: None,
+                canonical_cwd: binding.binding.open_spec["cwd"].as_str().map(str::to_owned),
                 execution_target_public_key: Some(selection.target_public_key.clone()),
             };
             Some(current_task_readonly_policy_in(
