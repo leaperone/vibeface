@@ -2448,9 +2448,19 @@ mod tests {
         assert!(!store.connection.is_autocommit());
         store.connection.execute_batch("ROLLBACK")?;
         let other_resource = "another-local-resource";
+        let mut record = store
+            .policy
+            .verified()
+            .resource(&network.space, &network.resource)
+            .context("original resource is missing")?
+            .payload
+            .clone();
+        record.resource = ResourceId::parse(other_resource)?;
+        record.nonce = Nonce::random()?;
+        let record = Signed::sign(record, &network.root)?;
         store.connection.execute(
-            "INSERT INTO resource_records(space_id,resource_id,record_hash,kind,host_service_id,signed_record) SELECT space_id,?,record_hash,kind,host_service_id,signed_record FROM resource_records WHERE space_id=? AND resource_id=?",
-            params![other_resource, space, network.resource.as_str()],
+            "INSERT INTO resource_records(space_id,resource_id,record_hash,kind,host_service_id,signed_record) SELECT space_id,?,?,kind,host_service_id,? FROM resource_records WHERE space_id=? AND resource_id=?",
+            params![other_resource, record.hash()?.as_str(), serde_json::to_string(&record)?, space, network.resource.as_str()],
         )?;
         assert_eq!(
             store.connection.execute(
