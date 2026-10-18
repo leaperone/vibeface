@@ -1223,7 +1223,7 @@ mod tests {
     use crate::identity::test_support::{TestNetwork, now};
     use vibeface_secure::{
         authorization::{
-            Audience, DeviceId, JournalEntry, ResourceId, ServiceId,
+            Audience, DeviceId, JournalEntry, PolicyPin, ResourceId, ServiceId, SpaceId,
             bootstrap::{
                 self,
                 recovery::{self, node_enrollment},
@@ -2028,6 +2028,156 @@ mod tests {
             )
         })?;
         assert_eq!(authorization.grant_leaf(), &network.bundle.grant_leaf);
+        use vibeface_secure::authorization::execution_service;
+        let source = snapshot.payload.selection.resource.clone();
+        let source_json = serde_json::to_string(&source)?;
+        let mut cursor = "null".to_owned();
+        let management = loop {
+            let page = measured_native("12_node_execution_management", || {
+                execution_service::select_execution_service_management(
+                    &authorization,
+                    &source_json,
+                    &node,
+                    &cursor,
+                    now() as f64,
+                )
+            })?;
+            let metadata: Value =
+                serde_json::from_str(&page.metadata_json().map_err(anyhow::Error::msg)?)?;
+            assert!(serde_json::to_vec(&metadata)?.len() <= MAX_PROOF_BYTES);
+            if let Some(management) = page.selection() {
+                break management;
+            }
+            ensure!(
+                !metadata["next_cursor"].is_null(),
+                "12-node account has no source-management selection"
+            );
+            cursor = metadata["next_cursor"].to_string();
+        };
+        let owner_material = recovery::build_account_recovery_material(
+            &network.created,
+            &network.root,
+            &network.recovery,
+            "https://node.example",
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let prepared = measured_native("12_node_execution_prepare", || {
+            execution_service::prepare_execution_service_registration(
+                &authorization,
+                &management,
+                &authorization,
+                &owner_material,
+                &network.client,
+                &node,
+                now() as f64,
+                (now() + 60_000) as f64,
+            )
+        })?;
+        let prepare_usage: Value =
+            serde_json::from_str(&prepared.proof_usage_json().map_err(anyhow::Error::msg)?)?;
+        assert!(prepare_usage["objects"].as_u64().unwrap() <= 32);
+        assert!(prepare_usage["signatures"].as_u64().unwrap() <= 32);
+        assert!(prepare_usage["bytes"].as_u64().unwrap() <= MAX_PROOF_BYTES as u64);
+        assert!(prepare_usage["max_depth"].as_u64().unwrap() <= 8);
+        let request_json = prepared.request_json().map_err(anyhow::Error::msg)?;
+        assert!(request_json.len() <= MAX_PROOF_BYTES);
+        let params: Value = serde_json::from_str(&request_json)?;
+        let response = measured("12_node_execution_store_commit", || {
+            store.governance_command(
+                &network.node,
+                &network.client.public_key_hex(),
+                "execution_service_register",
+                &params,
+                now(),
+            )
+        })?;
+        let committed_json = serde_json::to_string(&response["committed"])?;
+        let finished = measured_native("12_node_execution_finish", || {
+            execution_service::finish_execution_service_registration(
+                &prepared,
+                &committed_json,
+                now() as f64,
+            )
+        })?;
+        let finish_usage: Value =
+            serde_json::from_str(&finished.proof_usage_json().map_err(anyhow::Error::msg)?)?;
+        assert!(finish_usage["objects"].as_u64().unwrap() <= 32);
+        assert!(finish_usage["signatures"].as_u64().unwrap() <= 32);
+        assert!(finish_usage["bytes"].as_u64().unwrap() <= MAX_PROOF_BYTES as u64);
+        assert!(finish_usage["max_depth"].as_u64().unwrap() <= 8);
+        let material_json = finished.recovery_material_json();
+        assert!(material_json.len() <= MAX_PROOF_BYTES);
+        let material: recovery::RecoveryMaterial = serde_json::from_str(&material_json)?;
+        assert!(material.policy_checkpoint.is_some());
+        let inspected = measured_native("12_node_execution_private_backup_inspect", || {
+            recovery::inspect_account_recovery_material(&material_json, now() as f64)
+        })?;
+        let inspected: Value = serde_json::from_str(&inspected)?;
+        assert_eq!(
+            inspected["scope"]["account_id"],
+            serde_json::to_value(&network.account)?
+        );
+        let execution_authorization = finished.authorization();
+        let execution = ResourceRef {
+            space: SpaceId::parse(&finished.space_id())?,
+            resource: ResourceId::parse(&finished.resource_id())?,
+        };
+        let pins: Vec<PolicyPin> =
+            serde_json::from_str(&finished.pins_json().map_err(anyhow::Error::msg)?)?;
+        let confirmed_execution = verified_client_policy_for_test(
+            &mut store,
+            &network.node,
+            &network.client,
+            &network.account,
+            AuthorizationSelection {
+                resource: execution.clone(),
+                audience: execution_authorization.audience().clone(),
+                grant_leaf: execution_authorization.grant_leaf().clone(),
+            },
+            &pins,
+            now(),
+        )?;
+        assert_eq!(
+            confirmed_execution.resources()[0].payload.kind,
+            vibeface_secure::authorization::ResourceKind::ExecutionService
+        );
+        assert_eq!(
+            confirmed_execution.resources()[0].payload.resource,
+            execution.resource
+        );
+        let installed = measured("12_node_execution_server_session", || {
+            let params: Value = serde_json::from_str(
+                &confirmed_execution
+                    .client_policy_context_json()
+                    .map_err(anyhow::Error::msg)?,
+            )?;
+            let (session, metadata) = store.authenticate_confirmed_client_policy(
+                &network.node,
+                &network.client.public_key_hex(),
+                &params,
+                now(),
+            )?;
+            assert_eq!(session.grant_leaf(), confirmed_execution.grant_leaf());
+            Ok(metadata)
+        })?;
+        assert!(serde_json::to_vec(&installed)?.len() <= MAX_PROOF_BYTES);
+        let retry = measured("12_node_execution_commit_retry", || {
+            store.governance_command(
+                &network.node,
+                &network.client.public_key_hex(),
+                "execution_service_register",
+                &params,
+                now(),
+            )
+        })?;
+        assert_eq!(retry, response);
+        eprintln!(
+            "client_policy twelve_node_execution prepare_usage={prepare_usage} finish_usage={finish_usage} request_bytes={} committed_bytes={} private_bytes={}",
+            request_json.len(),
+            committed_json.len(),
+            material_json.len()
+        );
         eprintln!(
             "client_policy twelve_node_public_history_bytes={public_bytes}; entries={}",
             entries.len()
