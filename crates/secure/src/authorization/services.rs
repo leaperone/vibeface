@@ -607,13 +607,13 @@ mod tests {
             let trigger = EventRef::parse(&sdk.session_id).unwrap();
             let body = serde_json::json!({
                 "method":"agent_start","space_id":self.space,"resource_id":self.resource.resource,
-                "conversation_id":"chat","authorization_id":format!("manager:{}",trigger.as_str()),
-                "trigger":trigger,"sdk_session":sdk,"parent_invocation":parent.invocation_hash(),
+                "conversation_id":"chat","authorization_id":format!("manager:{}:fixture-attempt",trigger.as_str()),
+                "trigger":trigger,"attempt_id":"fixture-attempt","sdk_session":sdk,"parent_invocation":parent.invocation_hash(),
                 "sdk_config":"actual-fixture-configuration",
             });
             let mut facts = self.agent_facts();
             facts.context.sdk_session = Some(sdk.clone());
-            facts.operation_id = format!("manager:{}", trigger.as_str());
+            facts.operation_id = format!("manager:{}:fixture-attempt", trigger.as_str());
             facts.body_hash = ObjectHash::body(&body).unwrap();
             let delegation = self
                 .state
