@@ -1289,8 +1289,10 @@ pub(crate) mod tests {
         assert_eq!(
             store
                 .pending_notifications(network.space.as_str(), "client")?
-                .len(),
-            1
+                .into_iter()
+                .map(|notification| notification.notification_id)
+                .collect::<Vec<_>>(),
+            ["result:done:succeeded", "result:open:done:succeeded"]
         );
         assert!(
             store
@@ -6897,129 +6899,134 @@ impl Runtime {
         }
         self.rpc(access, body).await
     }
-    async fn observe_engine(self: &Arc<Self>, envelope: Value) -> Result<()> {
-        let _work = self.maintenance.enter_when_open().await;
-        let context = &envelope["execution_context"];
-        let space = SpaceId::parse(field(context, "space_id")?)?;
-        let operation_id = id(context, "operation_id")?;
-        let operation = self
-            .store
-            .lock()
-            .await
-            .operation(space.as_str(), &operation_id)?;
-        let Some(operation) = operation else {
-            return self
-                .observe_handoff(
-                    &envelope,
-                    ResourceRef {
-                        space: space.clone(),
-                        resource: ResourceId::parse(field(context, "resource_id")?)?,
-                    },
-                    &operation_id,
-                )
-                .await;
-        };
-        if !matches!(
-            operation.state,
-            OperationState::Running | OperationState::Unknown
-        ) || operation.request.action["type"] != "send"
-        {
-            return Ok(());
-        }
-        let request = &operation.request;
-        let expected = execution_context(&*self.store.lock().await, request, 0)?;
-        ensure!(
-            context["resource_id"].as_str() == Some(expected.resource_id.as_str()),
-            "Provider event belongs to another resource"
-        );
-        ensure!(
-            if expected.shared {
-                context["container_id"]
-                    .as_str()
-                    .is_some_and(|id| id.len() == 64)
-            } else {
-                context["container_id"].is_null()
-            },
-            "Provider event isolation context differs"
-        );
-        let event = &envelope["event"];
-        let cli_progress = event["kind"] == "executor_progress";
-        let method = event["method"].as_str().unwrap_or(if cli_progress {
-            "executor/progress"
-        } else {
-            ""
-        });
-        let session = self
-            .store
-            .lock()
-            .await
-            .session(
-                space.as_str(),
-                &request.target_node,
-                request
-                    .session_id
-                    .as_deref()
-                    .context("Provider operation has no SDK session")?,
-            )?
-            .context("running operation lost its session")?;
-        if method == "bridge.codex_disconnected" && session.executor == "codex" {
-            if operation.state == OperationState::Running {
-                self.finish(
-                    request,
-                    OperationState::Unknown,
-                    json!({"error":"Codex disconnected; reconcile before any retry"}),
-                )
-                .await?;
-            }
-            return Ok(());
-        }
-        let thread = event["params"]["threadId"]
-            .as_str()
-            .or_else(|| event["params"]["thread_id"].as_str())
-            .or_else(|| event["params"]["session_id"].as_str())
-            .or_else(|| event["native_session_id"].as_str());
-        if thread.is_none()
-            || thread != session.native_session_id.as_deref()
-            || (cli_progress && event["executor"] != session.executor)
-        {
-            return Ok(());
-        }
-        let sequence = {
-            let mut sequences = self
-                .progress_sequences
-                .lock()
-                .expect("progress sequence lock");
-            let value = sequences
-                .entry((space.to_string(), operation_id.clone()))
-                .or_default();
-            *value += 1;
-            *value
-        };
-        self.publish_progress(space.as_str(),json!({"type":"execution_progress","conversation_id":request.conversation_id,
-            "target_node":request.target_node,"operation_id":request.operation_id,"session_id":request.session_id,
-            "sequence":sequence,"attempt":request.operation_id,"progress":progress_observation::execution_progress(event)}));
-        if method == "turn/completed" && operation.state == OperationState::Running {
-            let turn = field(&event["params"]["turn"], "id")?;
-            let known = self
+    fn observe_engine<'a>(
+        self: &'a Arc<Self>,
+        envelope: Value,
+    ) -> futures_util::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let _work = self.maintenance.enter_when_open().await;
+            let context = &envelope["execution_context"];
+            let space = SpaceId::parse(field(context, "space_id")?)?;
+            let operation_id = id(context, "operation_id")?;
+            let operation = self
                 .store
                 .lock()
                 .await
-                .local_value(space.as_str(), &format!("turn:{operation_id}"))?;
-            if known
-                .as_ref()
-                .and_then(|value| value["turn"]["id"].as_str())
-                != Some(turn)
+                .operation(space.as_str(), &operation_id)?;
+            let Some(operation) = operation else {
+                return self
+                    .observe_handoff(
+                        &envelope,
+                        ResourceRef {
+                            space: space.clone(),
+                            resource: ResourceId::parse(field(context, "resource_id")?)?,
+                        },
+                        &operation_id,
+                    )
+                    .await;
+            };
+            if !matches!(
+                operation.state,
+                OperationState::Running | OperationState::Unknown
+            ) || operation.request.action["type"] != "send"
             {
                 return Ok(());
             }
-            let state = if event["params"]["turn"]["status"] == "completed" {
-                OperationState::Succeeded
+            let request = &operation.request;
+            let expected = execution_context(&*self.store.lock().await, request, 0)?;
+            ensure!(
+                context["resource_id"].as_str() == Some(expected.resource_id.as_str()),
+                "Provider event belongs to another resource"
+            );
+            ensure!(
+                if expected.shared {
+                    context["container_id"]
+                        .as_str()
+                        .is_some_and(|id| id.len() == 64)
+                } else {
+                    context["container_id"].is_null()
+                },
+                "Provider event isolation context differs"
+            );
+            let event = &envelope["event"];
+            let cli_progress = event["kind"] == "executor_progress";
+            let method = event["method"].as_str().unwrap_or(if cli_progress {
+                "executor/progress"
             } else {
-                OperationState::Failed
+                ""
+            });
+            let session = self
+                .store
+                .lock()
+                .await
+                .session(
+                    space.as_str(),
+                    &request.target_node,
+                    request
+                        .session_id
+                        .as_deref()
+                        .context("Provider operation has no SDK session")?,
+                )?
+                .context("running operation lost its session")?;
+            if method == "bridge.codex_disconnected" && session.executor == "codex" {
+                if operation.state == OperationState::Running {
+                    self.finish(
+                        request,
+                        OperationState::Unknown,
+                        json!({"error":"Codex disconnected; reconcile before any retry"}),
+                    )
+                    .await?;
+                }
+                return Ok(());
+            }
+            let thread = event["params"]["threadId"]
+                .as_str()
+                .or_else(|| event["params"]["thread_id"].as_str())
+                .or_else(|| event["params"]["session_id"].as_str())
+                .or_else(|| event["native_session_id"].as_str());
+            if thread.is_none()
+                || thread != session.native_session_id.as_deref()
+                || (cli_progress && event["executor"] != session.executor)
+            {
+                return Ok(());
+            }
+            let sequence = {
+                let mut sequences = self
+                    .progress_sequences
+                    .lock()
+                    .expect("progress sequence lock");
+                let value = sequences
+                    .entry((space.to_string(), operation_id.clone()))
+                    .or_default();
+                *value += 1;
+                *value
             };
-            self.finish(request, state, event.clone()).await?;
-        }
-        Ok(())
+            self.publish_progress(space.as_str(),json!({"type":"execution_progress","conversation_id":request.conversation_id,
+                "target_node":request.target_node,"operation_id":request.operation_id,"session_id":request.session_id,
+                "sequence":sequence,"attempt":request.operation_id,"progress":progress_observation::execution_progress(event)}));
+            if method == "turn/completed" && operation.state == OperationState::Running {
+                let turn = field(&event["params"]["turn"], "id")?;
+                let known = self
+                    .store
+                    .lock()
+                    .await
+                    .local_value(space.as_str(), &format!("turn:{operation_id}"))?;
+                if known
+                    .as_ref()
+                    .and_then(|value| value["turn"]["id"].as_str())
+                    != Some(turn)
+                {
+                    return Ok(());
+                }
+                let state = if event["params"]["turn"]["status"] == "completed" {
+                    OperationState::Succeeded
+                } else {
+                    OperationState::Failed
+                };
+                self.finish(request, state, event.clone()).await?;
+            }
+            Ok(())
+        })
     }
     async fn reconcile(
         self: &Arc<Self>,
