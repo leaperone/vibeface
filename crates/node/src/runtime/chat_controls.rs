@@ -888,7 +888,7 @@ impl Runtime {
                 .iter()
                 .find(|task| task["task_id"].as_str() == request.task_id.as_deref())
             {
-                projected["goal"] = json!({"title":task["title"],"acceptance":task["acceptance"],"status":task["status"]});
+                projected["goal"] = json!({"task_id":task["task_id"],"title":task["title"],"acceptance":task["acceptance"],"status":task["status"],"followup_mode":task["followup_mode"],"followup_version":task["followup_version"],"followup_scheduler_node":task["followup_scheduler_node"]});
             }
             if let Some(session) = session
                 && session_ids.insert((session.target_node.clone(), session.session_id.clone()))
