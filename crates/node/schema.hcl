@@ -1103,10 +1103,6 @@ table "execution_handoffs" {
     columns     = [column.execution_space_id, column.target_node]
     ref_columns = [table.node_certificates.column.space_id, table.node_certificates.column.node_id]
   }
-  foreign_key "execution_handoffs_fk_1" {
-    columns     = [column.original_space_id]
-    ref_columns = [table.spaces.column.space_id]
-  }
   foreign_key "execution_handoffs_fk_2" {
     columns     = [column.execution_space_id]
     ref_columns = [table.spaces.column.space_id]
@@ -1172,10 +1168,6 @@ table "execution_handoff_challenges" {
   }
   primary_key {
     columns = [column.execution_space_id, column.nonce]
-  }
-  foreign_key "execution_handoff_challenges_fk_0" {
-    columns     = [column.original_space_id]
-    ref_columns = [table.spaces.column.space_id]
   }
   foreign_key "execution_handoff_challenges_fk_1" {
     columns     = [column.execution_space_id]
@@ -1286,14 +1278,6 @@ table "execution_handoff_sessions" {
   foreign_key "execution_handoff_sessions_fk_0" {
     columns     = [column.execution_space_id, column.target_node]
     ref_columns = [table.node_certificates.column.space_id, table.node_certificates.column.node_id]
-  }
-  foreign_key "execution_handoff_sessions_fk_1" {
-    columns     = [column.original_space_id, column.original_resource_id]
-    ref_columns = [table.resource_records.column.space_id, table.resource_records.column.resource_id]
-  }
-  foreign_key "execution_handoff_sessions_fk_2" {
-    columns     = [column.original_space_id]
-    ref_columns = [table.spaces.column.space_id]
   }
   check {
     expr = "(revision >= 0)"
