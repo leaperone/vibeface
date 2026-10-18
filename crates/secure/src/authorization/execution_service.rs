@@ -1,6 +1,13 @@
 //! Execution services require their physical owner's current personal root.
 
-use super::{bootstrap::recovery::RecoveryMaterial, governance, *};
+use super::{
+    bootstrap::recovery::RecoveryMaterial,
+    client_policy_import::require_confirmed_client_policy,
+    execution_handoff::ExecutionProofUsage,
+    governance,
+    policy_import::{VerifiedPolicySnapshot, merge_same_head_snapshots},
+    *,
+};
 use crate::signature_verification::{
     ScopedSignatureVerification, SignatureVerification, SignatureVerificationCounts,
 };
@@ -49,8 +56,7 @@ pub struct ExecutionServiceRegistrationRequest {
 pub struct ExecutionServiceSelection {
     pub source_project: ResourceRef,
     pub execution_resource: ResourceRef,
-    pub authorization: ClientAuthorizationBundle,
-    pub pins: Vec<PolicyPin>,
+    pub management_parent: ObjectHash,
 }
 
 pub struct VerifiedExecutionServiceRegistrationRequest {
@@ -73,6 +79,15 @@ impl VerifiedExecutionServiceRegistrationRequest {
     }
     pub fn proof_usage_json(&self) -> crate::Result<String> {
         json(&self.proof_counts())
+    }
+    pub fn proof_usage(&self) -> Result<ExecutionProofUsage> {
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_budget(&self.budget)?;
+        usage.record_chain_depth(self.max_depth);
+        if let Some(counts) = &self.crypto_counts {
+            usage.record_actual_signature_counts(counts.clone());
+        }
+        Ok(usage)
     }
     pub fn proof_counts(&self) -> RegistrationProofCounts {
         RegistrationProofCounts {
@@ -224,7 +239,7 @@ pub fn verify_execution_service_source_management(
     source_grant: &ObjectHash,
     node: &PublicKey,
     now: u64,
-) -> Result<()> {
+) -> Result<VerifiedExecutionServiceRegistrationRequest> {
     let _signature_scope = ScopedSignatureVerification::new();
     authorization(
         state,
@@ -235,8 +250,7 @@ pub fn verify_execution_service_source_management(
         node,
         now,
         &mut Budget::default(),
-    )?;
-    Ok(())
+    )
 }
 
 fn verify_management_parent(
@@ -247,7 +261,7 @@ fn verify_management_parent(
     parent: &ObjectHash,
     node: &PublicKey,
     now: u64,
-) -> Result<()> {
+) -> Result<Budget> {
     let personal = SpaceId::personal(account);
     require(
         resource.space == personal,
@@ -313,13 +327,11 @@ fn verify_management_parent(
     )?;
     let path = state.grant_chain(Some(parent))?;
     state.verify_grant_path(&path, now, &mut budget, &mut dependencies, true)?;
-    Ok(())
+    Ok(budget)
 }
 
 pub fn project_execution_service_selection(
     state: &VerifiedPolicySet,
-    pins: &[PolicyPin],
-    journal: &[JournalEntry],
     account: &AccountId,
     signer: &PublicKey,
     source: &ResourceRef,
@@ -327,35 +339,29 @@ pub fn project_execution_service_selection(
     parent: &ObjectHash,
     node: &PublicKey,
     now: u64,
-) -> Result<ExecutionServiceSelection> {
+) -> Result<(ExecutionServiceSelection, ExecutionProofUsage)> {
     let _signature_scope = ScopedSignatureVerification::new();
-    verify_management_parent(state, account, signer, resource, parent, node, now)?;
-    let authorization = state.client_authorization_projection(
-        pins,
-        journal,
-        account,
-        &resource.space,
-        signer,
-        parent,
-        now,
-    )?;
-    Ok(ExecutionServiceSelection {
-        source_project: source.clone(),
-        execution_resource: resource.clone(),
-        pins: projection_pins(pins, &authorization),
-        authorization,
-    })
+    let budget = verify_management_parent(state, account, signer, resource, parent, node, now)?;
+    let mut usage = ExecutionProofUsage::default();
+    usage.record_budget(&budget)?;
+    usage.record_chain_depth(state.grant_chain(Some(parent))?.len());
+    Ok((
+        ExecutionServiceSelection {
+            source_project: source.clone(),
+            execution_resource: resource.clone(),
+            management_parent: parent.clone(),
+        },
+        usage,
+    ))
 }
 
 /// The authenticated physical Node supplies the source mapping. Pins remain independent.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyExecutionServiceSelection))]
 pub fn verify_execution_service_selection(
+    authorization: &VerifiedClientAuthorization,
     selection_json: &str,
-    pinned_roots_json: &str,
     expected_source_project_json: &str,
     expected_execution_resource_json: &str,
-    expected_account: &str,
-    expected_device_public_key: &str,
     expected_target_node_public_key: &str,
     now_ms: f64,
 ) -> crate::Result<VerifiedClientAuthorization> {
@@ -368,32 +374,44 @@ pub fn verify_execution_service_selection(
             selection.source_project == source && selection.execution_resource == resource,
             "execution selection differs from the requested source and service",
         )?;
-        let pins: Vec<PolicyPin> = parse(pinned_roots_json)?;
-        let account = AccountId::parse(expected_account)?;
-        let signer = PublicKey::parse(expected_device_public_key)?;
+        let snapshot = require_confirmed_client_policy(authorization)?;
         let node = PublicKey::parse(expected_target_node_public_key)?;
         let now = bootstrap::timestamp(now_ms)?;
-        let state = replay_policies(&pins, &selection.authorization.journal)?;
-        verify_management_parent(
-            &state,
-            &account,
+        let signer = snapshot
+            .state()
+            .find_device(&authorization.scope.device_id)?
+            .payload
+            .public_key
+            .clone();
+        require(
+            authorization.grant_leaf == selection.management_parent
+                && authorization.scope.space_id == resource.space
+                && authorization.audience_public_key == node,
+            "execution selection differs from its imported authorization",
+        )?;
+        let parent_budget = verify_management_parent(
+            snapshot.state(),
+            &authorization.scope.account_id,
             &signer,
             &resource,
-            &selection.authorization.grant_leaf,
+            &selection.management_parent,
             &node,
             now,
         )?;
-        verify_client_authorization(
-            &serde_json::to_string(&selection.authorization).map_err(|_| {
-                AuthorizationError::InvalidProof("execution selection encoding failed")
-            })?,
-            pinned_roots_json,
-            expected_account,
-            resource.space.as_str(),
-            expected_device_public_key,
-            now_ms,
-        )
-        .map_err(|_| AuthorizationError::InvalidProof("invalid execution selection authorization"))
+        let mut current = revalidate_selected(authorization, snapshot, &resource, &signer, now)?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_budget(&parent_budget)?;
+        usage.record_budget(&current.budget)?;
+        usage.record_metadata(&selection)?;
+        usage.record_chain_depth(
+            snapshot
+                .state()
+                .grant_chain(Some(&selection.management_parent))?
+                .len(),
+        );
+        finish_native_usage(&mut usage)?;
+        current.client_policy_usage = Some(usage);
+        Ok(current)
     };
     verify().map_err(|error| error.to_string())
 }
@@ -701,178 +719,320 @@ pub fn verify_execution_service_registration_commit(
     Ok(verified)
 }
 
-fn merged_context(
-    account: &AccountId,
-    owner_pins: Vec<PolicyPin>,
-    owner_bundle: ClientAuthorizationBundle,
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
-) -> Result<(Vec<PolicyPin>, ClientAuthorizationBundle, VerifiedPolicySet)> {
-    let saved = replay_policies(&owner_pins, &owner_bundle.journal)?;
-    let source = replay_policies(&pins, &bundle.journal)?;
-    let domain = PolicyDomain::Account(account.clone());
-    let saved_head = saved
-        .head(&domain)
-        .ok_or(AuthorizationError::PolicyConflict)?;
-    let source_head = source
-        .head(&domain)
-        .ok_or(AuthorizationError::PolicyConflict)?;
-    let saved_first = source.roots.contains_key(saved_head);
+fn revalidate_selected(
+    authorization: &VerifiedClientAuthorization,
+    snapshot: &VerifiedPolicySnapshot,
+    resource: &ResourceRef,
+    signer: &PublicKey,
+    now: u64,
+) -> Result<VerifiedClientAuthorization> {
     require(
-        saved_first || saved.roots.contains_key(source_head),
-        "source and personal account histories conflict",
+        authorization.scope.device_id == DeviceId::from_key(signer)
+            && authorization.scope.space_id == resource.space
+            && authorization.resources.len() == 1
+            && authorization.resources[0].payload.resource == resource.resource,
+        "execution operation changed its selected client or resource",
     )?;
-    let mut combined: BTreeMap<_, _> = owner_pins
-        .iter()
-        .map(|pin| (pin.domain.clone(), pin.clone()))
-        .collect();
-    for pin in pins {
-        if let Some(previous) = combined.get(&pin.domain) {
-            require(
-                previous.genesis_root == pin.genesis_root,
-                "source changed saved personal trust",
-            )?;
-        }
-        combined.insert(pin.domain.clone(), pin);
-    }
-    let mut journal = Vec::new();
-    let mut seen = BTreeSet::new();
-    let histories = if saved_first {
-        [&owner_bundle.journal, &bundle.journal]
-    } else {
-        [&bundle.journal, &owner_bundle.journal]
+    let bundle = ClientAuthorizationBundle {
+        journal: Vec::new(),
+        grant_leaf: authorization.grant_leaf.clone(),
     };
-    for history in histories {
-        for entry in history {
-            if seen.insert(ObjectHash::body(entry)?) {
-                journal.push(entry.clone());
-            }
-        }
-    }
-    require(
-        journal.len() <= 124,
-        "execution registration history requires checkpoint",
+    let mut current = verify_client_policy_state_selected(
+        snapshot.state().clone(),
+        &bundle,
+        snapshot.pins(),
+        authorization.scope.account_id.clone(),
+        resource.space.clone(),
+        signer.clone(),
+        Some(resource),
+        now,
     )?;
-    let pins: Vec<_> = combined.into_values().collect();
-    let state = replay_policies(&pins, &journal)?;
-    for pin in &owner_pins {
-        require(
-            pin.minimum_head
-                .as_ref()
-                .is_none_or(|head| state.roots.contains_key(head)),
-            "execution registration rolled back personal history",
-        )?;
+    require(
+        current.audience == authorization.audience,
+        "execution operation changed its selected audience",
+    )?;
+    current.imported_snapshot = Some(snapshot.clone());
+    current.client_policy_context = authorization.client_policy_context.clone();
+    Ok(current)
+}
+
+fn finish_native_usage(usage: &mut ExecutionProofUsage) -> Result<RegistrationProofCounts> {
+    if let Some(counts) = SignatureVerification::current_counts() {
+        usage.record_actual_signature_counts(counts);
     }
-    Ok((
-        pins,
-        ClientAuthorizationBundle {
-            journal,
-            grant_leaf: bundle.grant_leaf,
-        },
-        state,
-    ))
+    usage.enforce_limits()?;
+    let counts = usage.counts();
+    Ok(RegistrationProofCounts {
+        objects: counts.unique_signed_objects,
+        bytes: counts.authorization_bytes,
+        signatures: counts.unique_signatures,
+        max_depth: counts.max_chain_depth,
+        actual_verifications: counts
+            .actual
+            .as_ref()
+            .map_or(0, |value| value.actual_verifications as usize),
+        cache_hits: counts
+            .actual
+            .as_ref()
+            .map_or(0, |value| value.cache_hits as usize),
+    })
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+pub struct VerifiedExecutionServiceManagementSelection {
+    snapshot: VerifiedPolicySnapshot,
+    source_project: ResourceRef,
+    source_scope: ClientScope,
+    source_data_grant: ObjectHash,
+    target_node: PublicKey,
+    management_grant: ObjectHash,
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+pub struct ExecutionServiceManagementPage {
+    selection: Option<VerifiedExecutionServiceManagementSelection>,
+    source_project: ResourceRef,
+    target_node: PublicKey,
+    next_cursor: Option<ObjectHash>,
+    proof_counts: RegistrationProofCounts,
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+impl ExecutionServiceManagementPage {
+    pub fn selection(&self) -> Option<VerifiedExecutionServiceManagementSelection> {
+        self.selection.clone()
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = metadataJson))]
+    pub fn metadata_json(&self) -> crate::Result<String> {
+        json(&serde_json::json!({"source_project":self.source_project,
+            "target_node_public_key":self.target_node,
+            "management_grant":self.selection.as_ref().map(|value| &value.management_grant),
+            "next_cursor":self.next_cursor}))
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = proofUsageJson))]
+    pub fn proof_usage_json(&self) -> crate::Result<String> {
+        json(&self.proof_counts)
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = selectExecutionServiceManagement))]
+pub fn select_execution_service_management(
+    source: &VerifiedClientAuthorization,
+    source_project_json: &str,
+    target_node_public_key: &str,
+    grant_cursor_json: &str,
+    now_ms: f64,
+) -> crate::Result<ExecutionServiceManagementPage> {
+    let _signature_scope = ScopedSignatureVerification::new();
+    let select = || -> Result<_> {
+        let snapshot = require_confirmed_client_policy(source)?;
+        let project: ResourceRef = parse(source_project_json)?;
+        let target = PublicKey::parse(target_node_public_key)?;
+        let cursor: Option<ObjectHash> = parse(grant_cursor_json)?;
+        let now = bootstrap::timestamp(now_ms)?;
+        let signer = snapshot
+            .state()
+            .find_device(&source.scope.device_id)?
+            .payload
+            .public_key
+            .clone();
+        let current = revalidate_selected(source, snapshot, &project, &signer, now)?;
+        require(
+            current.audience_public_key == target
+                && current.resources[0].payload.kind == ResourceKind::Project,
+            "execution management selection changed its source Project host",
+        )?;
+        let document = snapshot
+            .state()
+            .space(&project.space)
+            .ok_or(AuthorizationError::PolicyConflict)?;
+        let index = cursor.as_ref().map_or(0, |cursor| {
+            document.grants.partition_point(|hash| hash <= cursor)
+        });
+        let candidate = document.grants.get(index);
+        let next_cursor = if index.saturating_add(1) < document.grants.len() {
+            candidate.cloned()
+        } else {
+            None
+        };
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_budget(&current.budget)?;
+        usage.record_metadata(&(
+            source_project_json,
+            target_node_public_key,
+            grant_cursor_json,
+        ))?;
+        let selection = if let Some(candidate) = candidate {
+            match authorization(
+                snapshot.state(),
+                &source.scope.account_id,
+                &signer,
+                &project,
+                candidate,
+                &target,
+                now,
+                &mut Budget::default(),
+            ) {
+                Ok(verified) => {
+                    usage.record_budget(&verified.budget)?;
+                    usage.record_chain_depth(verified.max_depth);
+                    Some(VerifiedExecutionServiceManagementSelection {
+                        snapshot: snapshot.clone(),
+                        source_project: project.clone(),
+                        source_scope: source.scope.clone(),
+                        source_data_grant: source.grant_leaf.clone(),
+                        target_node: target.clone(),
+                        management_grant: candidate.clone(),
+                    })
+                }
+                Err(error @ AuthorizationError::BudgetExceeded) => return Err(error),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let proof_counts = finish_native_usage(&mut usage)?;
+        Ok(ExecutionServiceManagementPage {
+            selection,
+            source_project: project,
+            target_node: target,
+            next_cursor,
+            proof_counts,
+        })
+    };
+    select().map_err(|error| error.to_string())
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct PreparedExecutionServiceRegistration {
     request: ExecutionServiceRegistrationRequest,
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
+    snapshot: VerifiedPolicySnapshot,
+    owner_snapshot: VerifiedPolicySnapshot,
+    owner_grant: ObjectHash,
     material: RecoveryMaterial,
     proof_counts: RegistrationProofCounts,
 }
 
-/// Public owner and source histories come from verified Node reads, never private checkpoints.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = prepareExecutionServiceRegistration))]
 pub fn prepare_execution_service_registration(
-    source_project_json: &str,
+    source: &VerifiedClientAuthorization,
+    management: &VerifiedExecutionServiceManagementSelection,
+    owner: &VerifiedClientAuthorization,
     owner_material_json: &str,
     signer: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
-    owner_pins_json: &str,
-    owner_bundle_json: &str,
     target_node_public_key: &str,
     now_ms: f64,
     expires_at_ms: f64,
 ) -> crate::Result<PreparedExecutionServiceRegistration> {
     let _signature_scope = ScopedSignatureVerification::new();
     let prepare = || -> Result<_> {
-        bootstrap::recovery::inspect_account_recovery_material(owner_material_json, now_ms)
-            .map_err(|_| {
-                AuthorizationError::InvalidProof("invalid execution owner's private material")
-            })?;
-        let material: RecoveryMaterial = parse(owner_material_json)?;
-        let private_state = bootstrap::recovery::material_state(&material)?;
-        let root = Identity::from_secret_hex(&material.root_secret_hex)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid execution owner root"))?;
-        let source: ResourceRef = parse(source_project_json)?;
-        let account = material.scope.account_id.clone();
-        let personal = SpaceId::personal(&account);
+        let source_snapshot = require_confirmed_client_policy(source)?;
+        let owner_snapshot = require_confirmed_client_policy(owner)?;
+        let target = PublicKey::parse(target_node_public_key)?;
         let now = bootstrap::timestamp(now_ms)?;
-        let owner_bundle: ClientAuthorizationBundle = parse(owner_bundle_json)?;
-        require(
-            owner_bundle.grant_leaf == material.bundle.grant_leaf,
-            "execution registration requires the current public owner entry authorization",
-        )?;
-        verify_client_authorization(
-            owner_bundle_json,
-            owner_pins_json,
-            account.as_str(),
-            personal.as_str(),
-            &signer.public_key_hex(),
-            now_ms,
-        )
-        .map_err(|_| {
-            AuthorizationError::InvalidProof("invalid public execution owner authorization")
-        })?;
-        let (pins, bundle, state) = merged_context(
-            &account,
-            parse(owner_pins_json)?,
-            owner_bundle,
-            parse(pins_json)?,
-            parse(bundle_json)?,
-        )?;
-        for pin in material.pins.iter().filter(|pin| {
-            pin.domain == PolicyDomain::Account(account.clone())
-                || pin.domain == PolicyDomain::Space(personal.clone())
-        }) {
-            require(
-                pins.iter().any(|public| {
-                    public.domain == pin.domain && public.genesis_root == pin.genesis_root
-                }) && pin
-                    .minimum_head
-                    .as_ref()
-                    .is_none_or(|head| state.roots.contains_key(head)),
-                "public execution owner history conflicts with private recovery trust",
-            )?;
-        }
-        require(
-            state.account(&account).is_some_and(|current| {
-                current.current_root == PublicKey::of(&root)
-                    && private_state
-                        .account(&account)
-                        .is_some_and(|saved| saved.recovery == current.recovery)
-            }) && state.space(&personal).is_some_and(|current| {
-                private_state.space(&personal).is_some_and(|saved| {
-                    current.current_root == saved.current_root && current.recovery == saved.recovery
-                })
-            }),
-            "execution owner's material is not its current root",
-        )?;
         let expiry = bootstrap::timestamp(expires_at_ms)?;
         validate_window(now, expiry, now)?;
-        let target = PublicKey::parse(target_node_public_key)?;
+        require(
+            management.source_scope == source.scope
+                && management.source_data_grant == source.grant_leaf
+                && management.target_node == target,
+            "execution management selection belongs to another source, actor or Node",
+        )?;
+        let checked_source = merge_same_head_snapshots(source_snapshot, &management.snapshot)?;
+        let material: RecoveryMaterial = parse(owner_material_json)?;
+        let root = Identity::from_secret_hex(&material.root_secret_hex)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid execution owner root"))?;
+        let recovery = Identity::from_secret_hex(&material.recovery_secret_hex).map_err(|_| {
+            AuthorizationError::InvalidProof("invalid execution owner recovery key")
+        })?;
+        let account = material.scope.account_id.clone();
+        let personal = SpaceId::personal(&account);
+        require(
+            material.format == "vibeface-account-recovery"
+                && material.version == AUTH_VERSION
+                && material.scope == owner.scope
+                && owner.scope.space_id == personal
+                && material.bundle.grant_leaf == owner.grant_leaf
+                && source.scope.account_id == account
+                && source.scope.device_id == DeviceId::from_key(&PublicKey::of(signer))
+                && owner.scope.device_id == source.scope.device_id
+                && material.pins.len() == 2
+                && material.pins[0].domain < material.pins[1].domain
+                && material
+                    .pins
+                    .iter()
+                    .any(|pin| pin.domain == PolicyDomain::Account(account.clone()))
+                && material
+                    .pins
+                    .iter()
+                    .any(|pin| pin.domain == PolicyDomain::Space(personal.clone())),
+            "execution registration requires this client's current PersonalSpace owner material",
+        )?;
+        let mut saved_pins = owner_snapshot.pins().to_vec();
+        for pin in &material.pins {
+            let saved = saved_pins
+                .iter_mut()
+                .find(|saved| saved.domain == pin.domain)
+                .ok_or(AuthorizationError::InvalidProof(
+                    "execution owner material changed saved trust domains",
+                ))?;
+            *saved = pin.clone();
+        }
+        let owner_snapshot = owner_snapshot.with_independent_pins(&saved_pins)?;
+        let snapshot = merge_same_head_snapshots(&checked_source, &owner_snapshot)?;
+        let state = snapshot.state();
+        let current_account = state
+            .account(&account)
+            .ok_or(AuthorizationError::PolicyConflict)?;
+        let current_personal = state
+            .space(&personal)
+            .ok_or(AuthorizationError::PolicyConflict)?;
+        require(
+            current_account.current_root == PublicKey::of(&root)
+                && current_personal.current_root == PublicKey::of(&root)
+                && current_account.recovery.threshold == 1
+                && current_account.recovery.keys == [PublicKey::of(&recovery)]
+                && current_personal.recovery == current_account.recovery
+                && material.entry.node_public_key == current_account.authority.public_key,
+            "execution owner's material is not its current public root and recovery policy",
+        )?;
+        let source_project = &management.source_project;
+        let source_current = revalidate_selected(
+            source,
+            &snapshot,
+            source_project,
+            &PublicKey::of(signer),
+            now,
+        )?;
+        let owner_project = owner
+            .resources
+            .first()
+            .ok_or(AuthorizationError::InvalidProof(
+                "missing execution owner Project",
+            ))?;
+        let owner_ref = ResourceRef {
+            space: personal.clone(),
+            resource: owner_project.payload.resource.clone(),
+        };
+        let owner_current =
+            revalidate_selected(owner, &snapshot, &owner_ref, &PublicKey::of(signer), now)?;
         let verified = authorization(
-            &state,
+            state,
             &account,
             &PublicKey::of(signer),
-            &source,
-            &bundle.grant_leaf,
+            source_project,
+            &management.management_grant,
             &target,
             now,
             &mut Budget::default(),
         )?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_budget(&source_current.budget)?;
+        usage.record_budget(&owner_current.budget)?;
+        usage.record_budget(&verified.budget)?;
+        usage.record_chain_depth(verified.max_depth);
+        usage.record_metadata(&owner_material_json)?;
         let execution_resource = ResourceRef {
             space: personal.clone(),
             resource: ResourceId::random()?,
@@ -942,8 +1102,8 @@ pub fn prepare_execution_service_registration(
             ExecutionServiceRegistrationIntent {
                 version: AUTH_VERSION,
                 account,
-                source_project: source,
-                source_grant: bundle.grant_leaf.clone(),
+                source_project: source_project.clone(),
+                source_grant: management.management_grant.clone(),
                 execution_resource,
                 target_node_public_key: target.clone(),
                 expected_heads: verified.expected_heads,
@@ -966,12 +1126,15 @@ pub fn prepare_execution_service_registration(
             root_approval,
             request,
         };
-        let proof_counts =
-            verify_execution_service_registration(&state, &request, &target, now)?.proof_counts();
+        let final_verified = verify_execution_service_registration(state, &request, &target, now)?;
+        usage.record_budget(&final_verified.budget)?;
+        usage.record_metadata(&request)?;
+        let proof_counts = finish_native_usage(&mut usage)?;
         Ok(PreparedExecutionServiceRegistration {
             request,
-            pins,
-            bundle,
+            snapshot,
+            owner_snapshot,
+            owner_grant: owner.grant_leaf.clone(),
             material,
             proof_counts,
         })
@@ -1009,38 +1172,10 @@ impl PreparedExecutionServiceRegistration {
     }
 }
 
-fn projection_pins(pins: &[PolicyPin], bundle: &ClientAuthorizationBundle) -> Vec<PolicyPin> {
-    let domains: BTreeSet<_> = bundle
-        .journal
-        .iter()
-        .filter_map(|entry| match entry {
-            JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
-                Some(PolicyDomain::Account(value.payload.account.clone()))
-            }
-            JournalEntry::AccountCommit(value) => Some(PolicyDomain::Account(
-                value.proposal.payload.account.clone(),
-            )),
-            JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => {
-                Some(PolicyDomain::Space(value.payload.space.clone()))
-            }
-            JournalEntry::SpaceCommit(value) => {
-                Some(PolicyDomain::Space(value.proposal.payload.space.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    pins.iter()
-        .filter(|pin| domains.contains(&pin.domain))
-        .cloned()
-        .collect()
-}
-
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct VerifiedExecutionServiceRegistration {
     resource: ResourceRef,
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
-    scope: ClientScope,
+    authorization: VerifiedClientAuthorization,
     material_json: zeroize::Zeroizing<String>,
     proof_counts: RegistrationProofCounts,
 }
@@ -1060,95 +1195,89 @@ pub fn finish_execution_service_registration(
             accepted <= now,
             "execution registration receipt is from the future",
         )?;
-        let mut state = replay_policies(&prepared.pins, &prepared.bundle.journal)?;
-        let mut verified = verify_execution_service_registration_commit(
-            &state,
+        let verified = verify_execution_service_registration_commit(
+            prepared.snapshot.state(),
             &prepared.request,
             &committed,
             None,
             &prepared.request.intent.payload.target_node_public_key,
             accepted,
         )?;
-        require(
-            committed.proposal == prepared.request.request.proposal
-                && committed.commit.payload.nonce == prepared.request.request.nonce
-                && committed.commit.payload.dependencies == verified.commit_heads,
-            "execution registration receipt belongs to another root approval",
-        )?;
-        let [
-            JournalEntry::Resource(resource),
-            JournalEntry::Grant(parent),
-        ] = prepared.request.request.new_objects.as_slice()
+        let [JournalEntry::Resource(_), JournalEntry::Grant(parent)] =
+            prepared.request.request.new_objects.as_slice()
         else {
             return Err(AuthorizationError::InvalidProof(
                 "missing prepared execution objects",
             ));
         };
-        state.install_resource(resource.clone())?;
-        state.install_grant(parent.clone(), accepted)?;
-        let head = state.replay_space_committed(committed.clone())?;
-        let mut pins = prepared.pins.clone();
-        pins.iter_mut()
-            .find(|pin| pin.domain == head.domain)
-            .ok_or(AuthorizationError::PolicyConflict)?
-            .minimum_head = Some(head.clone());
-        let mut journal = prepared.bundle.journal.clone();
-        journal.extend(prepared.request.request.new_objects.clone());
-        journal.push(JournalEntry::SpaceCommit(committed));
+        let mut delta = prepared.request.request.new_objects.clone();
+        delta.push(JournalEntry::SpaceCommit(committed.clone()));
+        let snapshot = prepared.snapshot.apply_delta(&delta)?;
+        let mut new_pins = snapshot.pins().to_vec();
+        for pin in &mut new_pins {
+            pin.minimum_head = snapshot.state().head(&pin.domain).cloned();
+        }
+        let snapshot = snapshot.with_independent_pins(&new_pins)?;
+        let owner_snapshot = prepared.owner_snapshot.apply_delta(&delta)?;
         let intent = &prepared.request.intent;
         let personal = &intent.payload.execution_resource.space;
-        let bundle = state.client_authorization_projection(
-            &pins,
-            &journal,
-            &intent.payload.account,
-            personal,
-            &intent.issuer,
-            &parent.hash()?,
-            accepted,
-        )?;
-        let personal_pins = projection_pins(&pins, &bundle);
-        let owner_bundle = state.client_authorization_projection(
-            &pins,
-            &journal,
-            &intent.payload.account,
-            personal,
-            &intent.issuer,
-            &prepared.material.bundle.grant_leaf,
-            accepted,
-        )?;
-        let owner_pins = projection_pins(&pins, &owner_bundle);
-        let scope = ClientScope {
-            account_id: intent.payload.account.clone(),
-            space_id: personal.clone(),
-            device_id: DeviceId::from_key(&intent.issuer),
+        let bundle = ClientAuthorizationBundle {
+            journal: Vec::new(),
+            grant_leaf: parent.hash()?,
         };
+        let mut authorization = verify_client_policy_state_selected(
+            snapshot.state().clone(),
+            &bundle,
+            snapshot.pins(),
+            intent.payload.account.clone(),
+            personal.clone(),
+            intent.issuer.clone(),
+            Some(&intent.payload.execution_resource),
+            accepted,
+        )?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_budget(&verified.budget)?;
+        usage.record_budget(&authorization.budget)?;
+        usage.record_chain_depth(verified.max_depth);
+        usage.record_metadata(&committed)?;
+        let (owner_state, mut owner_pins, owner_journal) = owner_snapshot.into_parts();
+        for pin in &mut owner_pins {
+            pin.minimum_head = owner_state.head(&pin.domain).cloned();
+        }
         let mut material = RecoveryMaterial {
             format: prepared.material.format.clone(),
             version: prepared.material.version,
             root_secret_hex: prepared.material.root_secret_hex.clone(),
             recovery_secret_hex: prepared.material.recovery_secret_hex.clone(),
-            scope: scope.clone(),
+            scope: prepared.material.scope.clone(),
             pins: owner_pins,
-            bundle: owner_bundle,
+            bundle: ClientAuthorizationBundle {
+                journal: owner_journal,
+                grant_leaf: prepared.owner_grant.clone(),
+            },
             entry: prepared.material.entry.clone(),
             policy_checkpoint: None,
         };
-        bootstrap::recovery::compact_recovery_material(&mut material, now)?;
+        bootstrap::recovery::compact_recovery_material_in_state(&mut material, &owner_state, now)?;
+        usage.merge(&bootstrap::recovery::recovery_material_usage(&material)?);
         let material_json =
             zeroize::Zeroizing::new(json(&material).map_err(|_| {
                 AuthorizationError::InvalidProof("private material encoding failed")
             })?);
-        bootstrap::recovery::inspect_account_recovery_material(&material_json, now_ms).map_err(
-            |_| AuthorizationError::InvalidProof("updated execution owner material is invalid"),
+        require(
+            material_json.len() <= MAX_PROOF_BYTES,
+            "updated private material exceeds its bounded carrier",
         )?;
-        verified.crypto_counts = SignatureVerification::current_counts();
+        usage.record_metadata(&material)?;
+        usage.record_metadata(&prepared.request)?;
+        let proof_counts = finish_native_usage(&mut usage)?;
+        authorization.imported_snapshot = Some(snapshot);
+        authorization.client_policy_usage = Some(usage);
         Ok(VerifiedExecutionServiceRegistration {
             resource: intent.payload.execution_resource.clone(),
-            pins: personal_pins,
-            bundle,
-            scope,
+            authorization,
             material_json,
-            proof_counts: verified.proof_counts(),
+            proof_counts,
         })
     };
     finish().map_err(|error| error.to_string())
@@ -1168,17 +1297,16 @@ impl VerifiedExecutionServiceRegistration {
     pub fn space_id(&self) -> String {
         self.resource.space.to_string()
     }
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = bundleJson))]
-    pub fn bundle_json(&self) -> crate::Result<String> {
-        json(&self.bundle)
+    pub fn authorization(&self) -> VerifiedClientAuthorization {
+        self.authorization.clone()
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = pinsJson))]
     pub fn pins_json(&self) -> crate::Result<String> {
-        json(&self.pins)
+        json(&self.authorization.policy_pins)
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = scopeJson))]
     pub fn scope_json(&self) -> crate::Result<String> {
-        json(&self.scope)
+        json(&self.authorization.scope)
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = recoveryMaterialJson))]
     pub fn recovery_material_json(&self) -> String {
@@ -1193,7 +1321,194 @@ mod tests {
     fn key(byte: u8) -> Identity {
         Identity::from_secret_hex(&hex::encode([byte; 32])).unwrap()
     }
-    fn registration() -> (VerifiedPolicySet, PreparedExecutionServiceRegistration) {
+    fn confirmed_authorization(
+        state: &VerifiedPolicySet,
+        pins: &[PolicyPin],
+        bundle: &ClientAuthorizationBundle,
+        resource: &ResourceRef,
+    ) -> VerifiedClientAuthorization {
+        use client_policy_import::*;
+        let own = key(3);
+        let node = key(4);
+        let audience = state
+            .grant(&bundle.grant_leaf)
+            .unwrap()
+            .payload
+            .audience
+            .clone();
+        let account = match &state
+            .find_device(&DeviceId::from_key(&PublicKey::of(&own)))
+            .unwrap()
+            .payload
+            .subject
+        {
+            Actor::Account(account) => account.clone(),
+            _ => unreachable!(),
+        };
+        let selection = AuthorizationSelection {
+            resource: resource.clone(),
+            audience,
+            grant_leaf: bundle.grant_leaf.clone(),
+        };
+        let request_json = build_client_policy_read_request(
+            account.as_str(),
+            resource.space.as_str(),
+            &own,
+            &node.public_key_hex(),
+            &json(&pins).unwrap(),
+            &json(&Some(&selection)).unwrap(),
+            NOW,
+            NOW + 60_000.0,
+        )
+        .unwrap();
+        let request: Signed<ClientPolicyReadRequest> = parse(&request_json).unwrap();
+        let current = verify_client_policy_read(
+            state,
+            &request,
+            &PublicKey::of(&node),
+            &PublicKey::of(&own),
+            NOW as u64,
+        )
+        .unwrap();
+        let snapshot = Signed::sign(
+            ClientPolicySnapshot {
+                version: AUTH_VERSION,
+                request_hash: request.hash().unwrap(),
+                snapshot_id: Nonce::random().unwrap(),
+                saved_pins_hash: client_policy_saved_pins_hash(pins).unwrap(),
+                target_heads: current.heads().to_vec(),
+                selection: selection.clone(),
+                source_node_public_key: PublicKey::of(&node),
+                issued_at_ms: NOW as u64,
+                expires_at_ms: NOW as u64 + 60_000,
+            },
+            &node,
+        )
+        .unwrap();
+        let mut import = begin_client_policy_import(
+            &json(&pins).unwrap(),
+            &request_json,
+            &json(&snapshot).unwrap(),
+            &own,
+            &node.public_key_hex(),
+            NOW,
+        )
+        .unwrap();
+        let mut previous = snapshot.hash().unwrap();
+        for (index, entry) in bundle.journal.iter().enumerate() {
+            let complete = index + 1 == bundle.journal.len();
+            let page = Signed::sign(
+                ClientPolicyPage {
+                    version: AUTH_VERSION,
+                    request_hash: request.hash().unwrap(),
+                    snapshot_id: snapshot.payload.snapshot_id.clone(),
+                    target_heads_hash: client_policy_target_heads_hash(current.heads()).unwrap(),
+                    page_index: index as u64,
+                    previous_page_hash: previous,
+                    entry: Some(entry.clone()),
+                    next_cursor: if complete {
+                        None
+                    } else {
+                        Some(ObjectHash::body(&("native-test-cursor", index)).unwrap())
+                    },
+                    complete,
+                },
+                &node,
+            )
+            .unwrap();
+            previous = page.hash().unwrap();
+            import.append_page(&json(&page).unwrap(), NOW).unwrap();
+        }
+        let witness = Signed::sign(
+            ClientPolicyWitness {
+                version: AUTH_VERSION,
+                request_hash: request.hash().unwrap(),
+                snapshot_id: snapshot.payload.snapshot_id.clone(),
+                target_heads: current.heads().to_vec(),
+                final_page_hash: previous,
+                page_count: bundle.journal.len() as u64,
+                entry_count: bundle.journal.len() as u64,
+                snapshot_hash: snapshot.hash().unwrap(),
+                source_node_public_key: PublicKey::of(&node),
+                issued_at_ms: NOW as u64,
+                expires_at_ms: NOW as u64 + 60_000,
+            },
+            &node,
+        )
+        .unwrap();
+        let authorization = import
+            .finish(&json(&witness).unwrap(), &json(&selection).unwrap(), NOW)
+            .unwrap();
+        let confirmation_request_json =
+            build_client_policy_auth_confirm_request(&authorization, &own, NOW, NOW + 30_000.0)
+                .unwrap();
+        let confirmation_request: Signed<ClientPolicyAuthConfirmRequest> =
+            parse(&confirmation_request_json).unwrap();
+        verify_client_policy_auth_confirm(
+            state,
+            &request,
+            &snapshot,
+            &witness,
+            &confirmation_request,
+            &PublicKey::of(&node),
+            &PublicKey::of(&own),
+            NOW as u64,
+        )
+        .unwrap();
+        let confirmation = Signed::sign(
+            ClientPolicyAuthConfirmation {
+                version: AUTH_VERSION,
+                context: confirmation_request.payload.context.clone(),
+                confirmation_request_hash: confirmation_request.hash().unwrap(),
+                selection,
+                target_heads: current.heads().to_vec(),
+                device_public_key: PublicKey::of(&own),
+                source_node_public_key: PublicKey::of(&node),
+                accepted_at_ms: NOW as u64,
+            },
+            &node,
+        )
+        .unwrap();
+        confirm_client_policy_authorization(
+            &authorization,
+            &confirmation_request_json,
+            &json(&confirmation).unwrap(),
+            &node.public_key_hex(),
+            NOW,
+        )
+        .unwrap()
+    }
+    fn management_selection(
+        source: &VerifiedClientAuthorization,
+        project: &ResourceRef,
+    ) -> VerifiedExecutionServiceManagementSelection {
+        let mut cursor = "null".to_owned();
+        loop {
+            let page = select_execution_service_management(
+                source,
+                &json(project).unwrap(),
+                &key(4).public_key_hex(),
+                &cursor,
+                NOW,
+            )
+            .unwrap();
+            if let Some(selection) = page.selection() {
+                return selection;
+            }
+            let metadata: serde_json::Value =
+                serde_json::from_str(&page.metadata_json().unwrap()).unwrap();
+            assert!(
+                !metadata["next_cursor"].is_null(),
+                "missing execution management grant"
+            );
+            cursor = metadata["next_cursor"].to_string();
+        }
+    }
+    fn registration() -> (
+        VerifiedPolicySet,
+        PreparedExecutionServiceRegistration,
+        VerifiedClientAuthorization,
+    ) {
         let nonce = Nonce::from_bytes([9; 32]).to_string();
         let claim = bootstrap::verify_node_claim(
             &bootstrap::create_node_claim(&key(4), &nonce, NOW, NOW + 100_000.0).unwrap(),
@@ -1242,21 +1557,22 @@ mod tests {
                 _ => None,
             })
             .unwrap();
+        let authorization = confirmed_authorization(&state, &pins, &bundle, &source);
+        let management = management_selection(&authorization, &source);
         let registration = prepare_execution_service_registration(
-            &json(&source).unwrap(),
+            &authorization,
+            &management,
+            &authorization,
             &material,
             &key(3),
-            &json(&pins).unwrap(),
-            &json(&bundle).unwrap(),
-            &json(&pins).unwrap(),
-            &json(&bundle).unwrap(),
             &key(4).public_key_hex(),
             NOW,
             NOW + 60_000.0,
         )
         .unwrap();
-        (state, registration)
+        (state, registration, authorization)
     }
+
     fn committed(
         state: &VerifiedPolicySet,
         prepared: &PreparedExecutionServiceRegistration,
@@ -1321,32 +1637,30 @@ mod tests {
     }
 
     #[test]
-    fn registration_requires_independent_public_owner_history() {
-        let (_, prepared) = registration();
-        let mut incomplete = prepared.bundle.clone();
-        incomplete
-            .journal
-            .retain(|entry| !matches!(entry, JournalEntry::AccountGenesis(_)));
+    fn registration_rejects_legacy_owner_without_genuine_public_import() {
+        let (_, prepared, authorization) = registration();
+        let management = management_selection(
+            &authorization,
+            &prepared.request.intent.payload.source_project,
+        );
+        let mut legacy = authorization.clone();
+        legacy.imported_snapshot = None;
         let result = prepare_execution_service_registration(
-            &json(&prepared.request.intent.payload.source_project).unwrap(),
+            &authorization,
+            &management,
+            &legacy,
             &json(&prepared.material).unwrap(),
             &key(3),
-            &json(&prepared.pins).unwrap(),
-            &json(&prepared.bundle).unwrap(),
-            &json(&prepared.pins).unwrap(),
-            &json(&incomplete).unwrap(),
             &key(4).public_key_hex(),
             NOW,
             NOW + 60_000.0,
         );
-        assert!(
-            matches!(result, Err(error) if error.contains("invalid public execution owner authorization"))
-        );
+        assert!(matches!(result,Err(error) if error.contains("genuine policy snapshot")));
     }
 
     #[test]
     fn registration_commit_counts_root_source_and_receipt_objects_in_one_budget() {
-        let (state, prepared) = registration();
+        let (state, prepared, _) = registration();
         let main = verify_execution_service_registration(
             &state,
             &prepared.request,
@@ -1408,7 +1722,7 @@ mod tests {
 
     #[test]
     fn registration_cost_gate_accepts_exact_byte_limit_and_rejects_one_more_byte() {
-        let (state, prepared) = registration();
+        let (state, prepared, _) = registration();
         let main = verify_execution_service_registration(
             &state,
             &prepared.request,

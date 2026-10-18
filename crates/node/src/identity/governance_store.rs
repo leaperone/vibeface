@@ -35,6 +35,8 @@ struct ExecutionServiceSelectParams {
     source_project: ResourceRef,
     target_node_public_key: PublicKey,
     execution_resource: Option<ResourceRef>,
+    source_grant: ObjectHash,
+    cursor: Option<ResourceId>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -305,60 +307,44 @@ impl Store {
             "execution selection must use the physical owner's personal space"
         );
         let tx = self.connection.transaction()?;
-        let policy = journal::PolicyState::reload_verified(&tx, &self.policy)?;
-        let state = policy.verified();
-        let source = state
-            .space(&params.source_project.space)
-            .context("unknown execution source space")?;
-        let mut allowed = false;
-        for leaf in &source.grants {
-            if !state
-                .grant(leaf)
-                .is_some_and(|grant| grant.payload.actions.contains(&Action::ResourceManage))
-            {
-                continue;
-            }
-            match execution_service::verify_execution_service_source_management(
-                state,
-                &params.account_id,
-                &principal,
-                &params.source_project,
-                leaf,
-                &node,
-                now_ms,
-            ) {
-                Ok(()) => {
-                    allowed = true;
-                    break;
-                }
-                Err(error @ AuthorizationError::BudgetExceeded) => return Err(error.into()),
-                Err(_) => {}
-            }
-        }
-        ensure!(
-            allowed,
-            "execution selection requires current physical owner resource management"
-        );
+        let state = self.policy.verified();
+        let source = execution_service::verify_execution_service_source_management(
+            state,
+            &params.account_id,
+            &principal,
+            &params.source_project,
+            &params.source_grant,
+            &node,
+            now_ms,
+        )?;
+        super::client_policy_read::check_heads_in(&tx, &self.policy, source.expected_heads())?;
         let root = source_root(&tx, &params.source_project)?;
-        let journal = {
-            let mut statement = tx.prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .map(|row| Ok(serde_json::from_str::<JournalEntry>(&row?)?))
-                .collect::<Result<Vec<_>>>()?
+        let mapping = if let Some(resource) = &params.execution_resource {
+            ensure!(
+                params.cursor.is_none(),
+                "exact execution selection cannot carry a paging cursor"
+            );
+            let key = format!("execution-service-source:{}", resource.resource);
+            tx.query_row(
+                "SELECT key,value FROM local_values WHERE space_id=? AND key=?",
+                params![personal.as_str(), key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        } else {
+            let cursor = params
+                .cursor
+                .as_ref()
+                .map(|value| format!("execution-service-source:{value}"))
+                .unwrap_or_else(|| "execution-service-source:".to_owned());
+            tx.query_row(
+                "SELECT key,value FROM local_values WHERE space_id=? AND key LIKE 'execution-service-source:%' AND key>? ORDER BY key LIMIT 1",
+                params![personal.as_str(), cursor], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?
         };
-        let mappings = {
-            let mut statement = tx.prepare(
-                "SELECT key,value FROM local_values WHERE space_id=? AND key LIKE 'execution-service-source:%' ORDER BY key"
-            )?;
-            statement
-                .query_map([personal.as_str()], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let mut usage = source.proof_usage()?;
         let mut selections = Vec::new();
-        for (key, encoded) in mappings {
+        let mut next_cursor = None;
+        if let Some((key, encoded)) = mapping {
             let resource = ResourceRef {
                 space: personal.clone(),
                 resource: ResourceId::parse(
@@ -366,45 +352,52 @@ impl Store {
                         .context("invalid execution service mapping")?,
                 )?,
             };
-            if params
-                .execution_resource
-                .as_ref()
-                .is_some_and(|expected| expected != &resource)
-            {
-                continue;
+            if params.execution_resource.is_none() {
+                next_cursor = Some(resource.resource.clone());
             }
             let mapping: ExecutionServiceMapping = serde_json::from_str(&encoded)?;
-            if mapping.source_project != params.source_project {
-                continue;
-            }
-            ensure!(
-                source_root(&tx, &resource)? == root,
-                "execution source mapping changed"
-            );
-            match execution_service::project_execution_service_selection(
-                state,
-                policy.pins(),
-                &journal,
-                &params.account_id,
-                &principal,
-                &mapping.source_project,
-                &resource,
-                &mapping.management_parent,
-                &node,
-                now_ms,
-            ) {
-                Ok(selection) => selections.push(selection),
-                Err(error @ AuthorizationError::BudgetExceeded) => return Err(error.into()),
-                Err(_) => {}
+            if mapping.source_project == params.source_project {
+                ensure!(
+                    source_root(&tx, &resource)? == root,
+                    "execution source mapping changed"
+                );
+                match execution_service::project_execution_service_selection(
+                    state,
+                    &params.account_id,
+                    &principal,
+                    &mapping.source_project,
+                    &resource,
+                    &mapping.management_parent,
+                    &node,
+                    now_ms,
+                ) {
+                    Ok((selection, candidate_usage)) => {
+                        usage.merge(&candidate_usage);
+                        selections.push(selection);
+                    }
+                    Err(error @ AuthorizationError::BudgetExceeded) => return Err(error.into()),
+                    Err(_) => {}
+                }
             }
         }
         ensure!(
             params.execution_resource.is_none() || selections.len() == 1,
             "execution service has no current registered management selection"
         );
+        let response = serde_json::json!({"selections":selections,"next_cursor":next_cursor});
+        ensure!(
+            serde_json::to_vec(&response)?.len() <= MAX_PROOF_BYTES,
+            "execution selection response too large"
+        );
+        usage.record_metadata(&response)?;
+        if let Some(counts) =
+            vibeface_secure::signature_verification::SignatureVerification::current_counts()
+        {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
         tx.commit()?;
-        self.policy = policy;
-        Ok(serde_json::json!({"selections": selections}))
+        Ok(response)
     }
 
     pub(crate) fn execution_service_registration_challenge(
