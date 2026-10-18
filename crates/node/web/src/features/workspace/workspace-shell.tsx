@@ -168,6 +168,9 @@ function WorkspaceLayout() {
             const link = device.recoveryReadProjects.find(item => `${item.spaceId}/${item.projectId}` === event.target.value)
             if (link) void workspace.run(() => device.connect(link.entry, link.spaceId, link.projectId))
           }}><NativeSelectOption value="">选择原项目，需原 Node 在线</NativeSelectOption>{device.recoveryReadProjects.map(link => <NativeSelectOption key={`${link.spaceId}/${link.projectId}`} value={`${link.spaceId}/${link.projectId}`} disabled={link.expiresAt <= Date.now()}>{link.projectId.slice(0, 17)} · {link.expiresAt <= Date.now() ? '已过期' : '只读'}</NativeSelectOption>)}</NativeSelect></label>}
+          {device.ready?.gateway && <p role="status" className="break-all text-xs text-muted-foreground" title={`${device.ready.gateway.entry.node_id} → ${device.ready.entry.node_id}`}>
+            {device.ready.gateway.status === 'ready' ? '经网关' : device.ready.gateway.status === 'connecting' ? '连接网关中' : '网关不可用'} {device.ready.gateway.entry.address.replace(/^https?:\/\//, '')} → 项目 Node
+          </p>}
           <Button type="button" size="sm" variant="ghost" className="h-8 justify-start px-0 text-muted-foreground" onClick={device.lockVault}>锁定设备仓库</Button>
           <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground" data-connection={workspace.connectionOnline ? "online" : "offline"} title={workspace.connectionText}>
             <span className={`size-1.5 shrink-0 rounded-full ${workspace.connectionOnline ? "bg-emerald-500" : "bg-destructive"}`} aria-hidden="true" />

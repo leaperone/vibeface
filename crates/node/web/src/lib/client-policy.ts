@@ -6,6 +6,11 @@ import type { AuthorizationSelection, AuthorizationTrust } from './authorization
 import { typedId } from './authorization-trust'
 import { array, record } from './node'
 
+export type ClientPolicyFrame =
+  | { kind: 'begin'; request: Record<string, unknown>; snapshot: Record<string, unknown> }
+  | { kind: 'page'; page: Record<string, unknown> }
+  | { kind: 'finish'; witness: Record<string, unknown>; confirm_request: Record<string, unknown>; confirmation: Record<string, unknown> }
+
 type PolicyRead = {
   call(method: string, params: Record<string, unknown>): Promise<unknown>
   trust: AuthorizationTrust
@@ -14,6 +19,7 @@ type PolicyRead = {
   resourceId?: string
   signal?: AbortSignal
   check?(): void
+  onFrame?(frame: ClientPolicyFrame): void
 }
 
 function selectedValue(selection: AuthorizationSelection, space: string) {
@@ -73,11 +79,13 @@ export async function readClientPolicyAuthorization(input: PolicyRead): Promise<
   let confirmed: VerifiedClientAuthorization | null = null
   try {
     importer = beginClientPolicyImport(pinsJson, requestJson, JSON.stringify(begun.snapshot), input.gatewayPublicKey)
+    input.onFrame?.({ kind: 'begin', request: record(JSON.parse(requestJson)), snapshot: record(begun.snapshot) })
     for (;;) {
       const params = record(JSON.parse(importer.pageRequestJson()))
       const response = await call('client_policy_page', params)
       const page = record(response.page)
       importer.appendPage(JSON.stringify(page), Date.now())
+      input.onFrame?.({ kind: 'page', page })
       if (record(page.payload).complete === true) break
     }
     const witnessParams = record(JSON.parse(importer.pageRequestJson()))
@@ -91,6 +99,7 @@ export async function readClientPolicyAuthorization(input: PolicyRead): Promise<
     const reply = await call('confirm_client_policy_auth', record(JSON.parse(confirmationRequest)))
     confirmed = confirmClientPolicyAuthorization(authorization, confirmationRequest, JSON.stringify(reply.confirmation), input.gatewayPublicKey, Date.now())
     check()
+    input.onFrame?.({ kind: 'finish', witness: record(witnessed.witness), confirm_request: record(JSON.parse(confirmationRequest)), confirmation: record(reply.confirmation) })
     const result = confirmed
     confirmed = null
     return result

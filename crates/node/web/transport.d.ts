@@ -1,4 +1,4 @@
-import type { Identity, PreparedAccountCreation, PreparedAccountRecovery, PreparedAccountDeviceChange, PreparedFirstAuthenticatorRegistration, VerifiedAccountEnrollment, VerifiedClientAuthorization, VerifiedEnrollmentOffer, VerifiedNodeClaim, VerifiedPasskeyEnrollmentRequest, VerifiedPasskeyRegistration, VerifiedRemoteExecution, prepareAccountNodeEnrollment, prepareTeamCreation, prepareSpaceMembershipChange, prepareDirectionalGrant, prepareSpaceGrantRevocation, buildCrossNodeRecoveryRequest, prepareCrossNodeAccountRecovery, restorePreparedCrossNodeRecoveryCommit, prepareExecutionServiceRegistration, prepareRemoteExecutionShare } from './generated/vibeface_secure.js'
+import type { GatewayClientReplyHandle, Identity, PreparedAccountCreation, PreparedAccountRecovery, PreparedAccountDeviceChange, PreparedFirstAuthenticatorRegistration, VerifiedAccountEnrollment, VerifiedClientAuthorization, VerifiedEnrollmentOffer, VerifiedNodeClaim, VerifiedPasskeyEnrollmentRequest, VerifiedPasskeyRegistration, VerifiedRemoteExecution, prepareAccountNodeEnrollment, prepareTeamCreation, prepareSpaceMembershipChange, prepareDirectionalGrant, prepareSpaceGrantRevocation, buildCrossNodeRecoveryRequest, prepareCrossNodeAccountRecovery, restorePreparedCrossNodeRecoveryCommit, prepareExecutionServiceRegistration, prepareRemoteExecutionShare } from './generated/vibeface_secure.js'
 
 export type DeviceChannel = {
   nodeId: string
@@ -74,3 +74,5 @@ export function beginClientEnrollmentOfferImport(offer: Parameters<typeof import
 export function buildClientRemoteExecutionPolicyReadIntent(source: VerifiedClientAuthorization, inputJson: string, expiresAt: number): string
 
 export function buildClientRemoteExecutionHistoryPolicyReadIntent(source: VerifiedClientAuthorization, inputJson: string, independentPinsJson: string, expiresAt: number): string
+
+export function prepareClientGatewayReply(authorization: VerifiedClientAuthorization, originalJson: string, routeHash: string, gatewayPublicKey: string): GatewayClientReplyHandle

@@ -1,26 +1,27 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { buildClientRemoteShareIntent, approveClientEnrollmentIntent, clientVaultStatus, connectDevice, createClientEnrollmentOffer, exportDeviceVault, initClient, lockClient, prepareClientDeviceEnrollment, prepareClientDeviceRevocation, prepareClientAccountNodeEnrollment, prepareClientFirstAuthenticatorIntent, prepareClientFirstAuthenticatorRegistration, prepareClientMembershipChange, prepareClientDirectionalGrant, prepareClientGrantRevocation, prepareClientTeamCreation, restoreClientTeamCreation, prepareClientPasskeyDeviceEnrollment, prepareClientRecoveryContext, prepareClientExecutionServiceRegistration, prepareClientRemoteExecutionShare, protectClientVaultWithPrf, readInvitation, signClientEnrollmentPossession, signClientPasskeyEnrollmentIntent, signClientPasskeyEnrollmentPossession } from '../../../transport.js'
+import { prepareClientGatewayReply, buildClientRemoteShareIntent, approveClientEnrollmentIntent, clientVaultStatus, connectDevice, createClientEnrollmentOffer, exportDeviceVault, initClient, lockClient, prepareClientDeviceEnrollment, prepareClientDeviceRevocation, prepareClientAccountNodeEnrollment, prepareClientFirstAuthenticatorIntent, prepareClientFirstAuthenticatorRegistration, prepareClientMembershipChange, prepareClientDirectionalGrant, prepareClientGrantRevocation, prepareClientTeamCreation, restoreClientTeamCreation, prepareClientPasskeyDeviceEnrollment, prepareClientRecoveryContext, prepareClientExecutionServiceRegistration, prepareClientRemoteExecutionShare, protectClientVaultWithPrf, readInvitation, signClientEnrollmentPossession, signClientPasskeyEnrollmentIntent, signClientPasskeyEnrollmentPossession } from '../../../transport.js'
 import type { ClientVaultOptions, DeviceChannel, VaultProfile } from '../../../transport.js'
 import {
-  array, entryKey, integer, messageOf, parseEntry, parseInfo, parseConnectionCard, record, same, text,
+  array, entryKey, integer, messageOf, parseEntry, parseInfo, parseConnectionCard, parseGatewayConnectionCard, record, same, text,
 } from '@/lib/node'
-import type { AuthorizedRequest, ConnectionCard, ConnectionEntry, EntryInfo, AccountDeviceDirectory, PublicIdentity, ReadyConnection, RpcFacts } from '@/lib/node'
+import type { AuthorizedRequest, ConnectionCard, ConnectionEntry, EntryInfo, AccountDeviceDirectory, PublicIdentity, ReadyConnection, RpcFacts, GatewayConnectionCard } from '@/lib/node'
 import { prepareRpc } from '@/lib/rpc-action'
 import { prepareContext, verifyPreparedBody } from '@/lib/rpc-prepare'
 import { validateRpcReplay } from '@/lib/rpc-replay'
 import type { AuthorizationSelection, AuthorizationTrust } from '@/lib/authorization'
 import { mergeAuthorizationTrust, parseAuthorizationSelection, parseAuthorizationTrust, subscriptionRenewalDelay, verifyScopedAuthentication } from '@/lib/authorization'
 import { readClientPolicyAuthorization } from '@/lib/client-policy'
+import type { ClientPolicyFrame } from '@/lib/client-policy'
 import { readRemoteSharePolicy } from '@/lib/source-share-policy'
 import { readRemoteExecutionPolicy } from '@/lib/remote-execution-policy'
 import type { RemoteExecutionPolicyUse } from '@/lib/remote-execution-policy-ingress'
 import { readRemoteExecutionHistoryPolicy } from '@/lib/remote-execution-history-policy'
 import { callExecutionResource as callPinnedExecutionResource } from '@/lib/execution-resource-call'
-import type { VerifiedClientAuthorization, VerifiedEnrollmentOffer } from '../../../generated/vibeface_secure.js'
+import type { GatewayClientReplyHandle, VerifiedClientAuthorization, VerifiedEnrollmentOffer } from '../../../generated/vibeface_secure.js'
 import { downloadPackage } from '@/lib/secure'
 import { createAccount, openAccountPackage, recoverAccount, restoreAccountRecovery, sealAccountPackage } from '@/lib/account'
-import { finishAccountDeviceChange, finishFirstAuthenticatorRegistration, finishSpaceGovernanceChange, finishExecutionServiceRegistration, selectExecutionServiceManagement, revalidateClientPolicyAuthorization, finishRemoteExecutionShare, verifyExecutionServiceSelection, finishTeamCreation, Identity, recoveryOpen, recoverySeal, deriveAuthorizationId, nodeFingerprint, verifySignedEvent, verifyAccountEnrollment, verifyAccountEnrollmentFromOffer, verifyDeviceEnrollmentIntentForManager, verifyDeviceEnrollmentOffer, verifyPasskeyEnrollmentRequestFromOffer } from '../../../generated/vibeface_secure.js'
+import { finishAccountDeviceChange, finishFirstAuthenticatorRegistration, finishSpaceGovernanceChange, gatewayRouteApprovalHash, finishExecutionServiceRegistration, selectExecutionServiceManagement, revalidateClientPolicyAuthorization, finishRemoteExecutionShare, verifyExecutionServiceSelection, finishTeamCreation, Identity, recoveryOpen, recoverySeal, deriveAuthorizationId, nodeFingerprint, verifySignedEvent, verifyAccountEnrollment, verifyAccountEnrollmentFromOffer, verifyDeviceEnrollmentIntentForManager, verifyDeviceEnrollmentOffer, verifyPasskeyEnrollmentRequestFromOffer } from '../../../generated/vibeface_secure.js'
 import { enrollmentHref, parseEnrollmentReference } from '@/lib/enrollment-reference'
 import type { EnrollmentReference } from '@/lib/enrollment-reference'
 import { parseEnrollmentRequest, requestDeviceEnrollment, verifyEnrollmentStatus } from '@/lib/enrollment'
@@ -41,7 +42,14 @@ type RecoveryReadProject = { accountId: string; spaceId: string; projectId: stri
 type RecoveryInput = { file: File; password: string; connectionCard: string; targetConnectionCard?: string; sourceReadProjectIds?: string[]; sourceReadExpiresAt?: number }
 type IncomingEnrollment = { accountId: string; newDevicePublicKey: string; requestedRights: string[]; status: EnrollmentStatus }
 type ManagerEnrollment = { offer: string; reference: EnrollmentReference; material: ReturnType<ReturnType<typeof verifyScopedAuthentication>['enrollmentMaterial']> }
-type Session = { renewal?: number; authorization?: ReturnType<typeof verifyScopedAuthentication>; channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number }
+type BusinessRoute = { kind: 'direct' } | {
+  kind: 'gateway'; channel: DeviceChannel | null; card: GatewayConnectionCard; approvalHash: string; sourceRef: string;
+  generation: number; status: 'connecting' | 'ready' | 'unavailable'; error: string
+}
+type Session = {
+  renewal?: number; authorization?: ReturnType<typeof verifyScopedAuthentication>; channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number;
+  businessRoute: BusinessRoute; businessGeneration: number; policyFrames: ClientPolicyFrame[]; connection?: ReadyConnection
+}
 type GovernanceConfirmation = { trust: AuthorizationTrust; authorized: boolean; grantLeaf?: string }
 type GovernanceProtocol = {
   method: string
@@ -64,6 +72,7 @@ type DeviceContextValue = {
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: AccountDeviceDirectory | null; review: Review | null; initialInvitation: string
   connect(entry: ConnectionEntry, spaceId?: string, projectId?: string): Promise<void>; selectSpace(spaceId: string): Promise<void>; selectProject(projectId: string): Promise<void>; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   initializeVault(options: ClientVaultOptions): Promise<void>; lockVault(): void; backupVault(): Promise<void>; useConnectionCard(content: string, password?: string): Promise<void>
+  connectGatewayCard(content: string): Promise<void>; disconnectGateway(): void
   refreshDirectory(): Promise<void>
   createEnrollmentOffer(manageDevices: boolean): Promise<string>
   incomingEnrollment: IncomingEnrollment | null; enrollmentRequests: EnrollmentRequest[]; managerEnrollmentActive: boolean
@@ -129,6 +138,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const [vaults, setVaults] = useState<VaultProfile[]>([])
   const [spaces, setSpaces] = useState<AuthorizationTrust[]>([])
   const [ready, setReady] = useState<ReadyConnection | null>(null)
+  const [, setRouteRevision] = useState(0)
+  const policyFrames = useRef(new WeakMap<VerifiedClientAuthorization, ClientPolicyFrame[]>())
   const [entries, setEntries] = useState<ConnectionEntry[]>([])
   const [phase, setPhase] = useState<Phase>('initializing')
   const [error, setError] = useState('')
@@ -184,7 +195,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     for (const controller of independentReads.current) controller.abort()
     independentReads.current.clear()
     const previous = session.current; session.current = null
-    releaseSession(previous); previous?.channel.close()
+    releaseSession(previous); if (previous?.businessRoute.kind === 'gateway') previous.businessRoute.channel?.close(); previous?.channel.close()
     listeners.current.clear(); setReady(null); setDirectory(null); setInfo(null); setEntry(null)
     managerEnrollment.current = null; setEnrollmentRequests([]); setManagerEnrollmentActive(false)
     for (const authorization of executionAuthorizations.current) authorization.free()
@@ -278,21 +289,137 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const grantLeaf = text(record(bundle).grant_leaf)
     return { ...parseAuthorizationSelection({ resourceId: projectId, audience: { device: deriveAuthorizationId('device', nodePublicKey), service: deriveAuthorizationId('service', nodePublicKey) }, grantLeaf }), ownerGrantLeaf: grantLeaf }
   }
+  function gatewayKey(connection: ReadyConnection) {
+    return profileKey(`gateway.${connection.scope.space_id}.${connection.project.id}.${connection.audiencePublicKey}`)
+  }
+  async function attachGateway(card: GatewayConnectionCard, active: Session, connection: ReadyConnection, persist: boolean) {
+    const own = identityRef.current, payload = record(card.approval.payload), resource = record(payload.resource)
+    const approvalHash = gatewayRouteApprovalHash(JSON.stringify(card.approval)), routeGeneration = integer(payload.generation)
+    const route: Extract<BusinessRoute, { kind: 'gateway' }> = { kind: 'gateway', channel: null, card, approvalHash, sourceRef: '',
+      generation: routeGeneration, status: 'connecting', error: '' }
+    const previous = active.businessRoute
+    active.businessRoute = route; active.businessGeneration += 1
+    if (previous.kind === 'gateway') previous.channel?.close()
+    const generation = active.businessGeneration
+    const check = () => {
+      if (session.current !== active || active.connection !== connection || identityRef.current !== own
+        || active.businessRoute !== route || active.businessGeneration !== generation) throw changed()
+    }
+    setRouteRevision(value => value + 1)
+    let opened: DeviceChannel | null = null
+    try {
+      if (!own || !connection.isCurrent() || payload.version !== 2 || payload.state !== 'active'
+        || payload.gateway !== card.gateway.nodePublicKey || payload.client_key !== own.publicKey || payload.client_account !== connection.scope.account_id
+        || payload.target_key !== connection.audiencePublicKey || resource.space !== connection.scope.space_id || resource.resource !== connection.project.id
+        || nodeFingerprint(card.gateway.nodePublicKey) !== card.gateway.entry.node_id || integer(payload.issued_at_ms) > Date.now() || integer(payload.expires_at_ms) <= Date.now()) {
+        throw new Error('网关路由与当前浏览器、项目、目标 Node 或有效期不同。')
+      }
+      const saved = load(gatewayKey(connection), true)
+      if (saved) {
+        const previous = record(saved), previousCard = parseGatewayConnectionCard(previous.card), previousPayload = record(previousCard.approval.payload)
+        if (previousPayload.route_id === payload.route_id && (integer(previousPayload.generation) > routeGeneration
+          || previousPayload.generation === routeGeneration && previous.approvalHash !== approvalHash)) throw new Error('网关路由版本回退或同版本批准内容发生了变化。')
+      }
+      if (persist) store(gatewayKey(connection), { card: { version: 2, kind: 'vibeface-gateway', gateway: {
+        url: card.gateway.entry.address, node_id: card.gateway.entry.node_id, node_public_key: card.gateway.nodePublicKey, relay: card.gateway.entry.relay,
+      }, approval: card.approval }, approvalHash })
+      opened = await connectDevice(card.gateway.entry, { onClose(reason) {
+        if (active.businessRoute !== route || session.current !== active) return
+        route.channel = null; route.status = 'unavailable'; route.error = messageOf(reason)
+        active.businessGeneration += 1; setRouteRevision(value => value + 1)
+      } })
+      check()
+      if (opened.publicKey !== card.gateway.nodePublicKey) throw new Error('网关的实际加密公钥与连接卡不同。')
+      route.channel = opened
+      const send = async (params: Record<string, unknown>) => {
+        check()
+        if (!opened) throw changed()
+        const result = record(await opened.request('gateway_source', params))
+        check()
+        return result
+      }
+      const committed = await send({ stage: 'route', approval: card.approval })
+      if (committed.approval !== approvalHash || committed.route_id !== payload.route_id || committed.generation !== routeGeneration) throw new Error('网关安装的路由与本地固定的批准不同。')
+      const totalPages = active.policyFrames.filter(frame => frame.kind === 'page').length
+      let reference = '', pages = 0, remotePages = 0, remoteComplete = false, finished = false
+      for (const frame of active.policyFrames) {
+        let response: Record<string, unknown>
+        if (frame.kind === 'begin') {
+          if (reference) throw new Error('项目授权原件包含重复起点。')
+          response = await send({ stage: 'begin', route_id: payload.route_id, request: frame.request, snapshot: frame.snapshot })
+          reference = text(response.reference)
+          if (!/^h2_[a-f0-9]{64}$/.test(reference)) throw new Error('网关返回了无效的项目授权引用。')
+        } else if (frame.kind === 'page') {
+          if (!reference || finished) throw new Error('项目授权原件顺序无效。')
+          response = await send({ stage: 'page', reference, page: frame.page }); pages += 1
+        } else {
+          if (!reference || finished || pages === 0) throw new Error('项目授权原件缺少完整分页。')
+          response = await send({ stage: 'finish', reference, witness: frame.witness, confirm_request: frame.confirm_request, confirmation: frame.confirmation })
+          finished = true
+        }
+        if (response.reference !== reference || typeof response.pages !== 'number' || !Number.isSafeInteger(response.pages)
+          || response.pages < pages || response.pages < remotePages || response.pages > totalPages || typeof response.complete !== 'boolean'
+          || response.complete && response.pages !== totalPages || remoteComplete && !response.complete || finished && !response.complete) {
+          throw new Error('网关导入的项目授权进度与原件不同。')
+        }
+        remotePages = response.pages; remoteComplete = response.complete
+      }
+      if (!finished) throw new Error('没有可上传的完整项目授权，请重新连接项目后再启用网关。')
+      check(); route.sourceRef = reference; route.status = 'ready'; setError(''); setRouteRevision(value => value + 1)
+    } catch (cause) {
+      opened?.close()
+      if (active.businessRoute === route && session.current === active) {
+        route.channel = null; route.status = 'unavailable'; route.error = messageOf(cause); setRouteRevision(value => value + 1)
+      }
+      throw cause
+    }
+  }
+  async function connectGatewayCard(content: string) {
+    const active = current(), connection = active.connection, authorization = active.authorization
+    const stored = connection ? load(gatewayKey(connection), true) : null
+    const card = parseGatewayConnectionCard(content.trim() ? readInvitation(content) : record(stored).card)
+    if (!connection?.isCurrent() || !authorization) throw changed()
+    let reuseSource = false
+    const own = identityRef.current
+    if (!content.trim() && own && active.policyFrames.length) {
+      try { await withSessionAuthorization(active, own, () => { reuseSource = true }) }
+      catch { if (!connection.isCurrent()) throw changed() }
+    }
+    if (!reuseSource) {
+      const selection = { resourceId: connection.project.id, audience: connection.audience, grantLeaf: authorization.grantLeaf }
+      const fresh = await readAuthentication(active, authorization.trust, selection)
+      await authenticate(fresh, active, authorization.trust, selection.resourceId, selection, undefined, false)
+    }
+    if (!active.connection) throw changed()
+    await attachGateway(card, active, active.connection, true)
+  }
+  function disconnectGateway() {
+    const active = current(), connection = active.connection, previous = active.businessRoute
+    if (!connection?.isCurrent()) throw changed()
+    store(gatewayKey(connection), null)
+    active.businessRoute = { kind: 'direct' }; active.businessGeneration += 1
+    if (previous.kind === 'gateway') previous.channel?.close()
+    setError(''); setRouteRevision(value => value + 1)
+  }
   async function readAuthentication(active: Session, trust: AuthorizationTrust, selection?: AuthorizationSelection, signal?: AbortSignal, projectId = selection?.resourceId) {
     const own = identityRef.current
     if (!own) throw changed()
     const currentTrust = mergedRemotePolicyTrust(mergeAuthorizationTrust(trust, savedSpaces()), own)
-    return readClientPolicyAuthorization({ call: (method, params) => callSession(active, 'identity', { method, params }), trust: currentTrust,
-      gatewayPublicKey: active.channel.publicKey, selection, resourceId: projectId, signal,
+    const frames: ClientPolicyFrame[] = []
+    const authorization = await readClientPolicyAuthorization({ call: (method, params) => callSession(active, 'identity', { method, params }), trust: currentTrust,
+      gatewayPublicKey: active.channel.publicKey, selection, resourceId: projectId, signal, onFrame: frame => frames.push(frame),
       check() { if (session.current !== active || identityRef.current !== own) throw changed() } })
+    policyFrames.current.set(authorization, frames)
+    return authorization
   }
-  async function authenticate(authValue: VerifiedClientAuthorization, active: Session, expected: AuthorizationTrust | null = null, projectId?: string, selection?: AuthorizationSelection, signal?: AbortSignal) {
+  async function authenticate(authValue: VerifiedClientAuthorization, active: Session, expected: AuthorizationTrust | null = null, projectId?: string, selection?: AuthorizationSelection, signal?: AbortSignal, restoreGateway = true) {
     const cancel = () => { if (session.current === active) active.channel.close() }
     signal?.addEventListener('abort', cancel, { once: true })
-    try { await authenticateSession(authValue, active, expected, projectId, selection, signal) }
+    try { await authenticateSession(authValue, active, expected, projectId, selection, signal, restoreGateway) }
     finally { signal?.removeEventListener('abort', cancel) }
   }
-  async function authenticateSession(authValue: VerifiedClientAuthorization, active: Session, expected: AuthorizationTrust | null, projectId?: string, selection?: AuthorizationSelection, signal?: AbortSignal) {
+  async function authenticateSession(authValue: VerifiedClientAuthorization, active: Session, expected: AuthorizationTrust | null, projectId?: string, selection?: AuthorizationSelection, signal?: AbortSignal, restoreGateway = true) {
+    const frames = policyFrames.current.get(authValue) ?? []
     const request = scoped(active)
     const own = identityRef.current
     if (!own) { authValue.free(); throw new Error('浏览器密钥尚未初始化。') }
@@ -332,7 +459,9 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       } finally { incoming?.free(); verified?.release() }
     })()
     if (session.current !== active || signal?.aborted) { authorization.release(); throw changed() }
-    releaseSession(active); active.authorization = authorization
+    releaseSession(active); active.authorization = authorization; active.policyFrames = frames
+    active.businessGeneration += 1
+    if (active.businessRoute.kind === 'gateway') { active.businessRoute.channel?.close(); active.businessRoute.channel = null; active.businessRoute.status = 'unavailable'; active.businessRoute.error = '项目授权已刷新，正在重新连接网关。' }
     saveEntry(active.entry)
     store(profileKey('last-entry'), active.entry)
     const projectKey = profileKey(`project.${authorization.scope.space_id}.${authorization.audience.service}`)
@@ -418,8 +547,40 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       } finally { policy?.free(); if (bChannel !== active.channel) bChannel?.close(); cChannel?.close(); independentReads.current.delete(controller) }
     }
     async function signedCall(method: string, params: Record<string, unknown> = {}, channelMethod = 'rpc', beforeSend?: (proof: AuthorizedRequest) => void, facts?: RpcFacts, replay?: AuthorizedRequest) {
-      const check = () => { if (session.current !== active || active.authorization !== authorization || identityRef.current !== signingProfile) throw changed() }
+      const route: BusinessRoute = channelMethod === 'rpc' ? active.businessRoute : { kind: 'direct' }
+      const routeGeneration = active.businessGeneration
+      const check = () => {
+        if (session.current !== active || active.authorization !== authorization || identityRef.current !== signingProfile
+          || channelMethod === 'rpc' && (active.businessGeneration !== routeGeneration || active.businessRoute !== route)) throw changed()
+      }
       check()
+      const presenter = route.kind === 'gateway' ? route.card.gateway.nodePublicKey : active.channel.publicKey
+      if (route.kind === 'gateway' && (route.status !== 'ready' || !route.channel)) throw new Error(route.error || '网关尚未连接，请重新启用网关或明确恢复直接连接。')
+      const forward = async (original: Record<string, unknown>) => {
+        if (route.kind !== 'gateway' || !route.channel) throw changed()
+        const channel = route.channel
+        const handle: GatewayClientReplyHandle = await withPolicyTrust(signingProfile, () => {
+          check(); currentProjectTrust()
+          return authorization.withNative(value => prepareClientGatewayReply(value, JSON.stringify(original), route.approvalHash, presenter))
+        })
+        try {
+          check()
+          let rawReply: unknown
+          try { rawReply = await channel.request('gateway_source', { stage: 'forward', reference: route.sourceRef, original }) }
+          catch (cause) { throw new Error(messageOf(cause)) }
+          const reply = record(rawReply)
+          check()
+          const outcome = record(JSON.parse(handle.verifyReply(JSON.stringify(reply.forward), JSON.stringify(reply.reply), JSON.stringify(reply.outcome), Date.now())))
+          check()
+          if (outcome.kind === 'ok') return outcome.value
+          if (outcome.kind !== 'error') throw new Error('网关返回的已验证结果格式无效。')
+          const failure = record(outcome.value)
+          throw Object.assign(new Error(typeof failure.message === 'string' ? failure.message : '项目节点拒绝了此请求。'), { responded: true })
+        } finally { handle.free() }
+      }
+      const invoke = (body: Record<string, unknown>, invocation: unknown) => route.kind === 'gateway'
+        ? forward({ kind: body.method === 'operation' ? 'status' : 'invoke', body, invocation })
+        : callSession(active, channelMethod, body, invocation)
       if (params.resource_id !== undefined && params.resource_id !== selectedProjectId) throw new Error('请求属于其他项目，已拒绝签名。')
       params = { ...params, resource_id: selectedProjectId }
       if (['notifications', 'ack'].includes(method)) {
@@ -438,24 +599,25 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         if (replay) {
           if (channelMethod !== 'rpc') throw new Error('原签名仅能用于显式核对原业务请求。')
           remote = await openRemote()
+          const replayRemote = remote
           const proof = await withPolicyTrust(signingProfile, () => {
             check(); currentProjectTrust()
             return validateRpcReplay({ proof: replay, body, facts, scope: authorization.scope, projectId: selectedProjectId, audience: authorization.audience,
-              ownPublicKey, gatewayPublicKey: active.channel.publicKey, audiencePublicKey: text(authorization.policy.audience_public_key), action: prepared.action, operationId: prepared.authorizationId, remoteReplay: remote?.validateReplay, projectMetadata })
+              ownPublicKey, gatewayPublicKey: presenter, audiencePublicKey: text(authorization.policy.audience_public_key), action: prepared.action, operationId: prepared.authorizationId, remoteReplay: replayRemote ? (body, invocation, action, operationId) => replayRemote.validateReplay(body, invocation, action, operationId, presenter) : undefined, projectMetadata })
           })
           check()
           beforeSend?.(proof)
-          const result = await callSession(active, 'rpc', proof.body, proof.invocation)
+          const result = await invoke(proof.body, proof.invocation)
           check()
           return { ...proof, result }
         }
         remote = await openRemote()
         const intent = await withPolicyTrust(signingProfile, () => {
           check(); currentProjectTrust()
-          return record(JSON.parse((remote ?? authorization).prepare(JSON.stringify(body), JSON.stringify(rawContext), prepared.action, prepared.authorizationId)))
+          return record(JSON.parse((remote ?? authorization).prepare(JSON.stringify(body), JSON.stringify(rawContext), prepared.action, prepared.authorizationId, presenter)))
         })
         check()
-        const template = record(await request('prepare_invocation', { body, intent }))
+        const template = record(await (route.kind === 'gateway' ? forward({ kind: 'prepare', body, intent }) : request('prepare_invocation', { body, intent })))
         check()
         const normalized = record(template.body)
         verifyPreparedBody(body, normalized, facts)
@@ -464,11 +626,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         releaseRemote(); remote = await openRemote()
         const invocation = await withPolicyTrust(signingProfile, () => {
           check(); currentProjectTrust()
-          return record(JSON.parse((remote ?? authorization).sign(JSON.stringify(invocationTemplate), JSON.stringify(normalized), prepared.action, prepared.authorizationId)))
+          return record(JSON.parse((remote ?? authorization).sign(JSON.stringify(invocationTemplate), JSON.stringify(normalized), prepared.action, prepared.authorizationId, presenter)))
         })
         check()
         beforeSend?.({ body: normalized, invocation })
-        const result = await callSession(active, channelMethod, normalized, invocation)
+        const result = await invoke(normalized, invocation)
         check()
         if (channelMethod === 'subscribe') {
           const expiresAt = integer(record(invocation.payload).expires_at_ms)
@@ -491,6 +653,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     }
     catch (error) { authorization.release(); if (active.authorization === authorization) active.authorization = undefined; throw error }
     const connection: ReadyConnection = {
+      get gateway() {
+        const route = active.businessRoute
+        return route.kind === 'direct' ? null : { entry: route.card.gateway.entry, publicKey: route.card.gateway.nodePublicKey,
+          routeId: text(record(route.card.approval.payload).route_id), status: route.status, error: route.error }
+      },
       generation: active.generation, entry: active.entry, scope: authorization.scope, audience: authorization.audience, info: active.info,
       project, projects: authorization.projects, audiencePublicKey: text(authorization.policy.audience_public_key),
       authorization: { enrollmentRights: authorization.enrollmentRights, actions: authorization.actions, authorityEpoch: authorization.authorityEpoch, spaceGenesis: authorization.spaceGenesis, isTeam: authorization.isTeam },
@@ -607,7 +774,18 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       subscribe(listener) { if (session.current !== active || active.authorization !== authorization) return () => {}; listeners.current.add(listener); return () => { listeners.current.delete(listener) } },
       isCurrent: () => session.current === active && active.authorization === authorization && generation.current === active.generation,
     }
-    setDirectory(null); setReady(connection); setPhase('ready'); setError('')
+    active.connection = connection
+    setReady(null)
+    const saved = restoreGateway ? load(gatewayKey(connection), true) : null
+    if (saved) {
+      const stored = record(saved), card = parseGatewayConnectionCard(stored.card)
+      if (gatewayRouteApprovalHash(JSON.stringify(card.approval)) !== stored.approvalHash) throw new Error('已保存的网关路由与原批准不同，请重新核对连接卡。')
+      try { await attachGateway(card, active, connection, false) }
+      catch (cause) { if (session.current === active) setError(messageOf(cause)) }
+    }
+    if (session.current !== active || active.authorization !== authorization || active.connection !== connection || identityRef.current !== signingProfile) throw changed()
+    setDirectory(null); setReady(connection); setPhase('ready')
+    if (active.businessRoute.kind === 'direct' || active.businessRoute.status === 'ready') setError('')
   }
   async function open(entryValue: ConnectionEntry, expectedPublicKey?: string) {
     const parsed = parseEntry(entryValue)
@@ -621,7 +799,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         onEvent(value) { const event = record(value); if (version === generation.current && event.type === 'changed') for (const listener of listeners.current) listener() },
         onClose(reason) {
           if (version !== generation.current) return
-          generation.current += 1; for (const controller of independentReads.current) controller.abort(); independentReads.current.clear(); releaseSession(session.current); session.current = null; if (!sensitive.current?.keepOnNetworkClose?.()) cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPhase('disconnected'); setError(messageOf(reason))
+          generation.current += 1; for (const controller of independentReads.current) controller.abort(); independentReads.current.clear(); if (session.current?.businessRoute.kind === 'gateway') session.current.businessRoute.channel?.close(); releaseSession(session.current); session.current = null; if (!sensitive.current?.keepOnNetworkClose?.()) cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPhase('disconnected'); setError(messageOf(reason))
         },
       })
       if (version !== generation.current) { channel.close(); throw changed() }
@@ -629,7 +807,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const details = parseInfo(await channel.request('identity', { method: 'status', params: {} }))
       if (version !== generation.current) { channel.close(); throw changed() }
       if (details.node_id !== parsed.node_id || details.public_key !== channel.publicKey) { channel.close(); throw new Error('入口报告的设备与已核验指纹不一致。') }
-      const active = { channel, entry: parsed, info: details, generation: version }
+      const active: Session = { channel, entry: parsed, info: details, generation: version, businessRoute: { kind: 'direct' }, businessGeneration: 0, policyFrames: [] }
       session.current = active; setInfo(details); setPhase('unpaired'); return active
     } catch (cause) {
       if (version === generation.current) { closeConnection(preserveSensitive); setError(messageOf(cause)) }
@@ -1888,11 +2066,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     clientVaultStatus().then(status => {
       if (mounted) { setVaults(status.profiles); setPhase(status.status === 'locked' ? 'vault_locked' : status.status === 'key_lost' ? 'key_lost' : status.status === 'unavailable' ? 'vault_unavailable' : 'vault_empty'); if (status.status === 'unavailable') setError(status.error) }
     }).catch(cause => { if (mounted) { setPhase('blocked'); setError(messageOf(cause)) } })
-    return () => { mounted = false; generation.current += 1; lockClient(); temporaryRecords.current.clear(); sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); for (const controller of independentReads.current) controller.abort(); independentReads.current.clear(); const previous = session.current; session.current = null; releaseSession(previous); previous?.channel.close(); listeners.current.clear(); for (const authorization of executionAuthorizations.current) authorization.free(); executionAuthorizations.current.clear() }
+    return () => { mounted = false; generation.current += 1; lockClient(); temporaryRecords.current.clear(); sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); for (const controller of independentReads.current) controller.abort(); independentReads.current.clear(); const previous = session.current; session.current = null; releaseSession(previous); if (previous?.businessRoute.kind === 'gateway') previous.businessRoute.channel?.close(); previous?.channel.close(); listeners.current.clear(); for (const authorization of executionAuthorizations.current) authorization.free(); executionAuthorizations.current.clear() }
   }, [])
   const value: DeviceContextValue = {
     identity, vaults, spaces, ready, entries, phase, error, entry, info, directory, review, initialInvitation,
-    connect, selectSpace, selectProject, disconnect, saveEntry, removeEntry, initializeVault, lockVault, backupVault, useConnectionCard, refreshDirectory, createEnrollmentOffer, beginRecovery, restorePendingAccountRecovery, reencrypt,
+    connectGatewayCard, disconnectGateway, connect, selectSpace, selectProject, disconnect, saveEntry, removeEntry, initializeVault, lockVault, backupVault, useConnectionCard, refreshDirectory, createEnrollmentOffer, beginRecovery, restorePendingAccountRecovery, reencrypt,
     incomingEnrollment, enrollmentRequests, managerEnrollmentActive, localProtectionNotice, governancePending, retryGovernance, createTeam, restoreTeamCreation, changeMembership, grantProject, revokeProjectGrant, teamCreationReview, confirmTeamCreation, nodeEnrollmentReview, beginNodeEnrollment, confirmNodeEnrollment, refreshIncomingEnrollment, refreshEnrollmentRequests, approveEnrollmentRequest, completeEnrollmentRequest, revokeDevice, joinWithPasskey,
     firstPasskeyPending, registerAccountPasskey, resumePasskeyRegistration, crossRecoveryPending, recoveryReadProjects, resumeCrossRecoveryPreparation, restorePendingCrossRecovery,
     registerExecutionService, latestExecutionServiceResource: currentExecutionService()?.resourceId ?? '', downloadExecutionServiceBackup, executionServiceBackupAvailable: currentExecutionServiceBackup() !== null,

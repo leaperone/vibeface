@@ -62,17 +62,17 @@ export function verifyScopedAuthentication(handle: secure.VerifiedClientAuthoriz
         const requireRemoteActive = () => { if (released || disposed) throw new Error('远端执行授权已释放，请重新核对。') }
         return {
           selection, trust: nextTrust, context: record(metadata.context),
-          prepare(bodyJson: string, preparedContextJson: string, expectedAction: string, operationId: string) {
+          prepare(bodyJson: string, preparedContextJson: string, expectedAction: string, operationId: string, presenter = gatewayPublicKey) {
             requireRemoteActive()
-            return prepareRemoteClientExecution(handle, verified, bodyJson, preparedContextJson, expectedAction, operationId, gatewayPublicKey)
+            return prepareRemoteClientExecution(handle, verified, bodyJson, preparedContextJson, expectedAction, operationId, presenter)
           },
-          sign(templateJson: string, bodyJson: string, expectedAction: string, operationId: string) {
+          sign(templateJson: string, bodyJson: string, expectedAction: string, operationId: string, presenter = gatewayPublicKey) {
             requireRemoteActive()
-            return signRemoteClientExecution(handle, verified, templateJson, bodyJson, expectedAction, operationId, gatewayPublicKey)
+            return signRemoteClientExecution(handle, verified, templateJson, bodyJson, expectedAction, operationId, presenter)
           },
-          validateReplay(bodyJson: string, invocationJson: string, expectedAction: string, operationId: string) {
+          validateReplay(bodyJson: string, invocationJson: string, expectedAction: string, operationId: string, presenter = gatewayPublicKey) {
             requireRemoteActive()
-            handle.validateReplay(verified, bodyJson, invocationJson, expectedAction, operationId, gatewayPublicKey, Date.now())
+            handle.validateReplay(verified, bodyJson, invocationJson, expectedAction, operationId, presenter, Date.now())
           },
           session(receipt: Record<string, unknown>, binding: Record<string, unknown>) {
             requireRemoteActive()
@@ -127,13 +127,13 @@ export function verifyScopedAuthentication(handle: secure.VerifiedClientAuthoriz
         if (released) throw new Error('账户授权已释放，请重新连接。')
         return { pins: currentTrust.pins, grantLeaf, expiresAt: policy.account_enrollment_expires_at_ms === null ? null : counter(policy.account_enrollment_expires_at_ms) }
       },
-      prepare(bodyJson: string, contextJson: string, action: string, operationId: string) {
+      prepare(bodyJson: string, contextJson: string, action: string, operationId: string, presenter = gatewayPublicKey) {
         if (released) throw new Error('账户授权已释放，请重新连接。')
-        return signAuthorizedClientPrepare(verified, bodyJson, contextJson, action, operationId, gatewayPublicKey)
+        return signAuthorizedClientPrepare(verified, bodyJson, contextJson, action, operationId, presenter)
       },
-      sign(templateJson: string, bodyJson: string, action: string, operationId: string) {
+      sign(templateJson: string, bodyJson: string, action: string, operationId: string, presenter = gatewayPublicKey) {
         if (released) throw new Error('账户授权已释放，请重新连接。')
-        return signAuthorizedClientInvocation(verified, templateJson, bodyJson, action, operationId, policy.audience_public_key === gatewayPublicKey ? undefined : gatewayPublicKey)
+        return signAuthorizedClientInvocation(verified, templateJson, bodyJson, action, operationId, policy.audience_public_key === presenter ? undefined : presenter)
       },
       adoptRemote,
       remote(value: TrustedRemoteExecution, policy: secure.VerifiedRemoteExecutionPolicy): ReturnType<typeof adoptRemote> {

@@ -5,7 +5,9 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Input } from '@/components/ui/input'
-import { entryKey, messageOf } from '@/lib/node'
+import { Textarea } from '@/components/ui/textarea'
+import { readInvitation } from '../../../transport.js'
+import { entryKey, messageOf, parseGatewayConnectionCard } from '@/lib/node'
 import { useDevice } from './context'
 import { RecoveryControls } from './recovery-controls'
 import { EnrollmentQr } from './enrollment-qr'
@@ -29,10 +31,13 @@ export function DeviceControls() {
   const [status, setStatus] = useState('')
   const [address, setAddress] = useState('')
   const [nodeId, setNodeId] = useState('')
+  const [gatewayCard, setGatewayCard] = useState('')
   const [relay, setRelay] = useState(false)
   const [enrollmentLink, setEnrollmentLink] = useState('')
   const [manageDevices, setManageDevices] = useState(false)
   const [revokeId, setRevokeId] = useState('')
+  let gatewayPreview: ReturnType<typeof parseGatewayConnectionCard> | null = null
+  try { if (gatewayCard.trim()) gatewayPreview = parseGatewayConnectionCard(readInvitation(gatewayCard)) } catch {}
   const canManageDevices = ready?.authorization.enrollmentRights.some(right => right === 'enroll_device' || right === 'revoke_device') === true
 
   useEffect(() => {
@@ -43,12 +48,12 @@ export function DeviceControls() {
     return () => { mounted = false }
   }, [ready, canManageDevices])
 
-  async function run(action: () => Promise<void>, success = '') {
+  async function run(action: () => Promise<void>, success = '', connectionMayChange = false) {
     if (pending.current) return
     pending.current = true; setBusy(true); setError(''); setStatus('')
     const connection = ready
-    try { await action(); if (connection?.isCurrent()) setStatus(success) }
-    catch (error) { if (connection?.isCurrent()) setError(messageOf(error)) }
+    try { await action(); if (connectionMayChange || connection?.isCurrent()) setStatus(success) }
+    catch (error) { if (connectionMayChange || connection?.isCurrent()) setError(messageOf(error)) }
     finally { pending.current = false; setBusy(false) }
   }
 
@@ -125,6 +130,29 @@ export function DeviceControls() {
               </div>
             </li>)}
           </ul>}
+          {ready && <section aria-labelledby="gateway-connection-title" className="space-y-3 rounded-lg border border-border p-3">
+            <h3 id="gateway-connection-title" className="text-sm font-medium">通过网关访问此项目</h3>
+            <p className="text-xs text-muted-foreground">项目保留在当前 Node。网关仅转发你为此项目签名的业务请求。</p>
+            <dl className="grid gap-2 text-xs">
+              <div><dt className="text-muted-foreground">当前项目</dt><dd className="break-all font-mono">{ready.project.id}</dd></div>
+              <div><dt className="text-muted-foreground">项目 Node 指纹</dt><dd className="break-all font-mono">{ready.entry.node_id}</dd></div>
+            </dl>
+            {ready.gateway && <div role="status" className="space-y-2 rounded-md bg-muted/50 p-3 text-sm">
+              <p>{ready.gateway.status === 'ready' ? '业务请求已通过网关' : ready.gateway.status === 'connecting' ? '正在连接网关…' : '网关不可用'}</p>
+              <p className="break-all text-xs">{ready.gateway.entry.address} → 当前项目</p>
+              <p className="break-all font-mono text-xs text-muted-foreground">{ready.gateway.entry.node_id}</p>
+              {ready.gateway.error && <p className="text-xs text-destructive">{ready.gateway.error}</p>}
+              <div className="flex flex-wrap gap-2">
+                <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => void run(() => device.connectGatewayCard(''), '网关已重新连接。', true)}>重新连接网关</Button>
+                <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => void run(async () => device.disconnectGateway(), '业务请求已恢复直接连接。')}>恢复直接连接</Button>
+              </div>
+            </div>}
+            <form className="space-y-3" onSubmit={event => { event.preventDefault(); void run(() => device.connectGatewayCard(gatewayCard), '网关已启用。', true) }}>
+              <label className="grid gap-2 text-sm">受信网关连接卡<Textarea name="gateway-card" required rows={4} spellCheck={false} autoCapitalize="none" autoComplete="off" disabled={busy} value={gatewayCard} onChange={event => setGatewayCard(event.target.value)} placeholder="粘贴包含网关地址、指纹和已批准路由的连接卡" /></label>
+              {gatewayPreview && <div className="space-y-1 text-xs"><p className="break-all">网关地址 {gatewayPreview.gateway.entry.address}</p><p className="break-all font-mono text-muted-foreground">网关指纹 {gatewayPreview.gateway.entry.node_id}</p></div>}
+              <Button type="submit" className={button} disabled={busy || !gatewayCard.trim()}>启用网关</Button>
+            </form>
+          </section>}
           <form className="space-y-4" onSubmit={event => {
             event.preventDefault()
             void run(async () => { device.saveEntry({ address: address.trim(), node_id: nodeId.trim(), relay }); setAddress(''); setNodeId(''); setRelay(false) }, '入口已保存。')
@@ -149,6 +177,7 @@ export function DeviceControls() {
             <div className="space-y-1"><dt className="text-muted-foreground">账户</dt><dd className="break-all font-mono">{ready?.scope.account_id}</dd></div>
             <div className="space-y-1"><dt className="text-muted-foreground">空间</dt><dd className="break-all font-mono">{ready?.scope.space_id}</dd></div>
             <div className="space-y-1"><dt className="text-muted-foreground">项目</dt><dd className="break-all font-mono">{ready?.project.id}</dd></div>
+            {ready?.gateway && <div className="space-y-1"><dt className="text-muted-foreground">业务网关</dt><dd className="break-all">{ready.gateway.entry.address} → {ready.entry.address}</dd></div>}
             <div className="space-y-1"><dt className="text-muted-foreground">浏览器设备证书</dt><dd className="break-all font-mono">{ready?.scope.device_id}</dd></div>
             <div className="space-y-1"><dt className="text-muted-foreground">浏览器传输指纹</dt><dd className="break-all font-mono">{identity?.nodeId}</dd></div>
             <div className="space-y-1"><dt className="text-muted-foreground">浏览器传输公钥</dt><dd className="break-all font-mono">{identity?.publicKey}</dd></div>

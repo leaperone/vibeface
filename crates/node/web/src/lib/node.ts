@@ -7,6 +7,8 @@ import type { RemoteExecutionPolicyUse } from './remote-execution-policy-ingress
 
 export type ConnectionEntry = { address: string; node_id: string; relay: boolean }
 export type ConnectionCard = { kind: 'connection'; entry: ConnectionEntry; nodePublicKey: string } | { kind: 'claim'; entry: ConnectionEntry; nodePublicKey: string; capability: string; claimNonce: string }
+export type GatewayConnectionCard = { kind: 'vibeface-gateway'; version: 2; gateway: ConnectionCard & { kind: 'connection' }; approval: Record<string, unknown> }
+export type GatewaySummary = { entry: ConnectionEntry; publicKey: string; routeId: string; status: 'connecting' | 'ready' | 'unavailable'; error: string }
 export type PublicIdentity = { nodeId: string; publicKey: string; profileId?: string | null }
 export type NodeRole = 'gateway' | 'relay' | 'replica' | 'scheduler' | 'executor'
 export type EntryInfo = { node_id: string; public_key: string; version: string; roles: NodeRole[]; initialized: boolean }
@@ -24,6 +26,7 @@ export type RpcFacts = {
 }
 export type ReadyConnection = {
   readonly generation: number
+  readonly gateway: GatewaySummary | null
   readonly scope: IdentityScope
   readonly audience: { device: string; service: string }
   readonly project: ProjectResource
@@ -79,6 +82,13 @@ export function parseConnectionCard(value: unknown): ConnectionCard {
   const claimNonce = validTarget(card.claim_nonce)
   if (capability !== claimNonce) throw new Error('连接卡的认领凭证与挑战随机数不一致。')
   return { kind: 'claim', entry, nodePublicKey, capability, claimNonce }
+}
+export function parseGatewayConnectionCard(value: unknown): GatewayConnectionCard {
+  const card = record(value, '网关连接卡')
+  if (card.kind !== 'vibeface-gateway' || card.version !== 2 || Object.keys(card).some(key => !['kind', 'version', 'gateway', 'approval'].includes(key))) throw new Error('请使用包含已批准路由的网关连接卡。')
+  const gateway = parseConnectionCard(card.gateway)
+  if (gateway.kind !== 'connection') throw new Error('网关连接卡不能包含设备认领凭证。')
+  return { kind: 'vibeface-gateway', version: 2, gateway, approval: record(card.approval, '网关路由批准') }
 }
 export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.node_id}:${entry.relay}`
 export function parseInfo(value: unknown): EntryInfo {
