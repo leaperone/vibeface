@@ -532,6 +532,40 @@ fn consume_authorization_with_facts_in(
     source_matches(auth, source_body)?;
     if source_body["method"] != "agent_start" {
         check_request_manager_tool_in(tx, policy, auth, transport, now_ms)?;
+        if let Some(TransportEvidence::LocalAgentAdapter { session, .. }) = transport.existing()
+            && auth.action() == Action::AgentStart
+        {
+            let space = auth.resource().space.as_str();
+            let manager_id = active_manager_id(tx, space, &session.session_id)?;
+            if now_ms >= manager_lease_from(tx, policy, space, &manager_id)? {
+                let (claim, _, job) = load_manager_from(tx, space, &manager_id)?;
+                let known: crate::scheduling::SchedulerKnownResult = crate::store::scheduler_load(
+                    tx,
+                    space,
+                    &scheduler_key(
+                        "known-result",
+                        &claim.conversation_id,
+                        &claim.target_node,
+                        &claim.trigger,
+                    ),
+                )?
+                .context("expired manager has no retained terminal result")?;
+                let mut known_job = known.job.clone();
+                known_job.state = job.state.clone();
+                ensure!(
+                    known_job == job
+                        && known.job.state.attempt() == job.state.attempt()
+                        && source_body["method"] == "agent_result"
+                        && source_body["message_id"].as_str() == Some(job.message_id.as_str())
+                        && source_body["decision_id"].as_str()
+                            == Some(format!("decision:{}", job.message_id).as_str())
+                        && source_body["output"].as_str() == Some(known.output.as_str())
+                        && source_body["text"].as_str() == Some(known.output.as_str())
+                        && source_body["blobs"] == serde_json::to_value(&known.blobs)?,
+                    "expired manager can only publish its retained terminal result"
+                );
+            }
+        }
     }
     let signed = auth.signed_invocation();
     let checked = super::policy::authorize_request_invocation_for_body(
@@ -4944,6 +4978,15 @@ mod manager_tests {
             let mut body = fixture.body.clone();
             body["method"] = json!(method);
             body["authorization_id"] = json!(format!("tool:{}", Nonce::random()?));
+            if method == "agent_result" {
+                body["message_id"] = json!(first.job.message_id);
+                body["decision_id"] = json!(format!("decision:{}", first.job.message_id));
+                body["output"] = json!("retained completed output");
+                body["text"] = body["output"].clone();
+                body["blobs"] = json!([]);
+                body["effective_constraints"] = json!([]);
+                body["tool_configuration"] = json!({});
+            }
             let facts = fixture
                 .store
                 .request_facts(&body, fixture.auth.audience())?;
@@ -5012,6 +5055,61 @@ mod manager_tests {
             )?,
             0
         );
+        fixture.store.retain_scheduler_result(
+            fixture.network.space.as_str(),
+            &first.job,
+            "retained completed output",
+            &[],
+        )?;
+        assert!(
+            fixture
+                .store
+                .manager_tool_authorization(
+                    fixture.network.space.as_str(),
+                    &first.manager_id,
+                    first.lease_expires_at_ms,
+                )
+                .is_err()
+        );
+        {
+            let tx = fixture
+                .store
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            assert_eq!(tx.execute(
+                "UPDATE local_values SET value=json_set(value,'$.output','changed output') WHERE space_id=? AND key=?",
+                params![fixture.network.space.as_str(), scheduler_key("known-result", &first.job.conversation_id, &first.job.target_node, &first.job.trigger)],
+            )?, 1);
+            assert!(
+                consume_authorization_in(
+                    &tx,
+                    &fixture.store.policy,
+                    auth,
+                    proof,
+                    &fixture.transport,
+                    body,
+                    None,
+                    first.lease_expires_at_ms,
+                )
+                .is_err()
+            );
+            tx.rollback()?;
+        }
+        let tx = fixture
+            .store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        consume_authorization_in(
+            &tx,
+            &fixture.store.policy,
+            auth,
+            proof,
+            &fixture.transport,
+            body,
+            None,
+            first.lease_expires_at_ms,
+        )?;
+        tx.rollback()?;
         Ok(())
     }
 
