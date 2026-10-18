@@ -92,6 +92,7 @@ fn endpoint_is_valid(endpoint: &str) -> bool {
             .is_some_and(|(_, tail)| !tail.is_empty() && !tail.starts_with('/'))
 }
 
+#[cfg(test)]
 fn read_bundle(json: &str) -> Result<ClientAuthorizationBundle> {
     require(
         json.len() <= MAX_RECOVERY_JOURNAL_BYTES,
@@ -150,50 +151,6 @@ fn validate_material(material: &RecoveryMaterial) -> Result<Identity> {
     Ok(recovery)
 }
 
-pub(super) fn current_root_material_context(
-    material_json: &str,
-    pins_json: &str,
-    bundle_json: &str,
-) -> Result<(
-    AccountId,
-    Identity,
-    VerifiedPolicySet,
-    Vec<PolicyPin>,
-    ClientAuthorizationBundle,
-)> {
-    require(
-        pins_json.len() <= MAX_PROOF_BYTES,
-        "registration pins too large",
-    )?;
-    let material = read_material(material_json)?;
-    validate_material(&material)?;
-    let root = Identity::from_secret_hex(&material.root_secret_hex)
-        .map_err(|_| AuthorizationError::InvalidProof("invalid first registration root"))?;
-    let pins: Vec<PolicyPin> = serde_json::from_str(pins_json)
-        .map_err(|_| AuthorizationError::InvalidProof("invalid first registration pins"))?;
-    let bundle = read_bundle(bundle_json)?;
-    let state = replay_policies(&pins, &bundle.journal)?;
-    for saved in &material.pins {
-        require(
-            pins.iter()
-                .any(|pin| pin.domain == saved.domain && pin.genesis_root == saved.genesis_root)
-                && saved
-                    .minimum_head
-                    .as_ref()
-                    .is_none_or(|head| state.roots.contains_key(head)),
-            "first registration changed saved recovery pins",
-        )?;
-    }
-    let account = state
-        .account(&material.scope.account_id)
-        .ok_or(AuthorizationError::Revoked)?;
-    require(
-        account.current_root == PublicKey::of(&root)
-            && account.authority.public_key == material.entry.node_public_key,
-        "first registration changed current root or saved node",
-    )?;
-    Ok((material.scope.account_id.clone(), root, state, pins, bundle))
-}
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = inspectAccountRecoveryMaterial))]
 pub fn inspect_account_recovery_material(
