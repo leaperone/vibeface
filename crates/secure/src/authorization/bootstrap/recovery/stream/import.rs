@@ -625,6 +625,8 @@ pub(super) mod tests {
         let mut pages = Vec::new();
         for (index, entry) in created.bundle.journal.iter().enumerate() {
             let complete = index + 1 == created.bundle.journal.len();
+            let page_request: auth::ClientPolicyPageRequest =
+                serde_json::from_str(&import.page_request_json().unwrap()).unwrap();
             let page = Signed::sign(
                 auth::ClientPolicyPage {
                     version: AUTH_VERSION,
@@ -633,6 +635,7 @@ pub(super) mod tests {
                     target_heads_hash: auth::client_policy_target_heads_hash(verified.heads())
                         .unwrap(),
                     page_index: index as u64,
+                    request_cursor: page_request.cursor,
                     previous_page_hash: previous,
                     entry: Some(entry.clone()),
                     next_cursor: (!complete)

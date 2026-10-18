@@ -2060,6 +2060,8 @@ pub(crate) mod tests {
         let mut previous = snapshot.hash().unwrap();
         for (index, entry) in bundle.journal.iter().enumerate() {
             let complete = index + 1 == bundle.journal.len();
+            let page_request: ClientPolicyPageRequest =
+                serde_json::from_str(&import.page_request_json().unwrap()).unwrap();
             let page = Signed::sign(
                 ClientPolicyPage {
                     version: AUTH_VERSION,
@@ -2067,6 +2069,7 @@ pub(crate) mod tests {
                     snapshot_id: snapshot.payload.snapshot_id.clone(),
                     target_heads_hash: client_policy_target_heads_hash(current.heads()).unwrap(),
                     page_index: index as u64,
+                    request_cursor: page_request.cursor,
                     previous_page_hash: previous,
                     entry: Some(entry.clone()),
                     next_cursor: if complete {

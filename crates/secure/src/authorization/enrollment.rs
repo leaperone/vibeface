@@ -1411,6 +1411,8 @@ mod tests {
         let mut previous = snapshot.hash().unwrap();
         for (index, entry) in bundle.journal.iter().enumerate() {
             let complete = index + 1 == bundle.journal.len();
+            let page_request: ClientPolicyPageRequest =
+                serde_json::from_str(&import.page_request_json().unwrap()).unwrap();
             let page = Signed::sign(
                 ClientPolicyPage {
                     version: AUTH_VERSION,
@@ -1418,6 +1420,7 @@ mod tests {
                     snapshot_id: snapshot.payload.snapshot_id.clone(),
                     target_heads_hash: client_policy_target_heads_hash(current.heads()).unwrap(),
                     page_index: index as u64,
+                    request_cursor: page_request.cursor,
                     previous_page_hash: previous,
                     entry: Some(entry.clone()),
                     next_cursor: if complete {
@@ -1615,6 +1618,13 @@ mod tests {
             )
         }
         fn import_offer(&self, offer_json: &str, reader: &Identity) -> VerifiedEnrollmentOffer {
+            self.import_offer_with_evidence(offer_json, reader).0
+        }
+        fn import_offer_with_evidence(
+            &self,
+            offer_json: &str,
+            reader: &Identity,
+        ) -> (VerifiedEnrollmentOffer, serde_json::Value) {
             use crate::authorization::enrollment_policy_import::*;
             let descriptor = verify_device_enrollment_offer(offer_json, NOW as f64).unwrap();
             let request_json = build_enrollment_offer_policy_read_request(
@@ -1658,6 +1668,7 @@ mod tests {
             .unwrap();
             let mut previous = snapshot.hash().unwrap();
             let mut cursor = None;
+            let mut pages = Vec::new();
             for (index, entry) in self.bundle.journal.iter().enumerate() {
                 let complete = index + 1 == self.bundle.journal.len();
                 let page = Signed::sign(
@@ -1689,6 +1700,7 @@ mod tests {
                 import
                     .append_page(&encode(&page).unwrap(), NOW as f64)
                     .unwrap();
+                pages.push(page);
             }
             let witness = Signed::sign(
                 EnrollmentPolicyWitness {
@@ -1708,9 +1720,13 @@ mod tests {
                 &key(4),
             )
             .unwrap();
-            import
+            let verified = import
                 .finish(&encode(&witness).unwrap(), NOW as f64)
-                .unwrap()
+                .unwrap();
+            (
+                verified,
+                serde_json::json!({"request":request,"snapshot":snapshot,"pages":pages,"witness":witness}),
+            )
         }
         fn intent(&self, child: u8, rights: Vec<AccountRight>) -> DeviceEnrollmentIntent {
             DeviceEnrollmentIntent {
@@ -2639,6 +2655,7 @@ mod tests {
 
     #[test]
     fn passkey_offer_finish_returns_only_delta_without_inventing_client_authority() {
+        use crate::authorization::passkey_node::*;
         let f = Fixture::new();
         let offer_json = create_device_enrollment_offer(
             &key(3),
@@ -2651,7 +2668,7 @@ mod tests {
             NOW as f64,
         )
         .unwrap();
-        let offer = f.import_offer(&offer_json, &key(5));
+        let (offer, offer_policy) = f.import_offer_with_evidence(&offer_json, &key(5));
         let proof = f.passkey_proof(5);
         let signed = sign_passkey_enrollment_intent_from_offer(
             &encode(&proof.intent.payload).unwrap(),
@@ -2666,6 +2683,148 @@ mod tests {
         );
         let qualified =
             verify_passkey_enrollment_request_from_offer(&signed, &offer, NOW as f64).unwrap();
+        let signed_pending = Signed::sign(
+            NodePasskeyPending {
+                version: AUTH_VERSION,
+                pending: proof.assertion.pending.clone(),
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + 10_000,
+            },
+            &key(4),
+        )
+        .unwrap();
+        let pending = verify_node_passkey_pending(
+            &encode(&signed_pending).unwrap(),
+            &key(4).public_key_hex(),
+            &signed,
+            "client.example",
+            "https://client.example",
+            NOW as f64,
+        )
+        .unwrap();
+        let signed_state = Signed::sign(
+            NodePasskeyState {
+                version: AUTH_VERSION,
+                pending: proof.assertion.pending.clone(),
+                credential_id: proof.assertion.record.payload.credential_id.clone(),
+                record_hash: proof.assertion.record.hash().unwrap(),
+                state: proof.assertion.state,
+                response_hash: ObjectHash::body(&proof.assertion.response).unwrap(),
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + 10_000,
+            },
+            &key(4),
+        )
+        .unwrap();
+        let node_state = verify_node_passkey_state(
+            &encode(&signed_state).unwrap(),
+            &pending,
+            &encode(&proof.assertion).unwrap(),
+            &encode(&proof.assertion.response).unwrap(),
+            NOW as f64,
+        )
+        .unwrap();
+        let envelope_hash = pending.envelope_hash().unwrap();
+        let verify_assertion =
+            |proof: &PasskeyAssertionProof, hash: &str, rp: &str, origin: &str, now: f64| {
+                verify_passkey_assertion_from_enrollment_offer(
+                    &encode(proof).unwrap(),
+                    &node_state,
+                    &offer,
+                    hash,
+                    rp,
+                    origin,
+                    now,
+                )
+            };
+        let actual = crate::signature_verification::SignatureVerification::new();
+        let assertion = actual
+            .run(|| {
+                verify_assertion(
+                    &proof.assertion,
+                    &envelope_hash,
+                    "client.example",
+                    "https://client.example",
+                    NOW as f64,
+                )
+            })
+            .unwrap();
+        assert!(actual.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
+        assert_eq!(assertion.sign_count(), 1);
+        assert_eq!(assertion.previous_state().sign_count, 0);
+        assert_eq!(
+            assertion.record_hash(),
+            &proof.assertion.record.hash().unwrap()
+        );
+        assert!(!assertion.backup_state());
+        let mut changed = proof.assertion.clone();
+        changed.response.client_extension_results = serde_json::json!({"changed":true});
+        assert!(
+            verify_assertion(
+                &changed,
+                &envelope_hash,
+                "client.example",
+                "https://client.example",
+                NOW as f64
+            )
+            .is_err()
+        );
+        changed = proof.assertion.clone();
+        changed.state.sign_count = 1;
+        assert!(
+            verify_assertion(
+                &changed,
+                &envelope_hash,
+                "client.example",
+                "https://client.example",
+                NOW as f64
+            )
+            .is_err()
+        );
+        for (hash, rp, origin, now) in [
+            ("wrong", "client.example", "https://client.example", NOW),
+            (
+                envelope_hash.as_str(),
+                "other.example",
+                "https://client.example",
+                NOW,
+            ),
+            (
+                envelope_hash.as_str(),
+                "client.example",
+                "https://other.example",
+                NOW,
+            ),
+            (
+                envelope_hash.as_str(),
+                "client.example",
+                "https://client.example",
+                NOW + 10_000,
+            ),
+        ] {
+            assert!(verify_assertion(&proof.assertion, hash, rp, origin, now as f64).is_err());
+        }
+        #[cfg(unix)]
+        if let Ok(path) = std::env::var("VIBEFACE_OFFER_ASSERTION_VECTOR") {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            file.write_all(&serde_json::to_vec(&serde_json::json!({
+                "now":NOW,"reader_fixture_byte":5,"node_public_key":key(4).public_key_hex(),
+                "offer":parse::<serde_json::Value>(&offer_json).unwrap(),"offer_policy":offer_policy,
+                "intent":proof.intent,"signed_pending":signed_pending,"signed_state":signed_state,
+                "proof":proof.assertion,"browser_response":proof.assertion.response,"envelope_hash":envelope_hash,
+                "rp_id":"client.example","origin":"https://client.example","actual":actual.counts(),
+            })).unwrap()).unwrap();
+        }
         let certificate = sign_passkey_enrollment_possession(
             &qualified,
             &key(5),

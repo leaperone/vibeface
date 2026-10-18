@@ -40,12 +40,21 @@ impl SignedObject for NodePasskeyState {
 pub struct VerifiedNodePasskeyPending {
     node: PublicKey,
     signed: Signed<NodePasskeyPending>,
+    intent: VerifiedNodePasskeyIntent,
+}
+
+#[derive(Clone, Debug)]
+enum VerifiedNodePasskeyIntent {
+    Registration,
+    DeviceEnrollment(Signed<enrollment::DeviceEnrollmentIntent>),
+    Management,
 }
 
 #[derive(Clone, Debug)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct VerifiedNodePasskeyState {
-    state: AuthenticatorState,
+    signed: Signed<NodePasskeyState>,
+    intent: VerifiedNodePasskeyIntent,
 }
 
 pub fn commit_passkey_policy_at_authority(
@@ -150,7 +159,10 @@ fn signed_window(pending: &PendingPasskey, issued: u64, expires: u64, now: u64) 
         .map_err(|_| AuthorizationError::InvalidProof("invalid node passkey pending"))
 }
 
-fn intent_binding(pending: &PendingPasskey, expected_json: &str) -> Result<()> {
+fn intent_binding(
+    pending: &PendingPasskey,
+    expected_json: &str,
+) -> Result<VerifiedNodePasskeyIntent> {
     let envelope = pending.envelope();
     match envelope.purpose {
         PasskeyPurpose::RegisterAuthenticator => {
@@ -167,7 +179,8 @@ fn intent_binding(pending: &PendingPasskey, expected_json: &str) -> Result<()> {
                     && envelope.not_before_ms >= intent.credential_not_before_ms
                     && envelope.expires_at_ms <= intent.credential_expires_at_ms,
                 "node registration pending changed its signed intent",
-            )
+            )?;
+            Ok(VerifiedNodePasskeyIntent::Registration)
         }
         PasskeyPurpose::EnrollDevice => {
             let signed: Signed<enrollment::DeviceEnrollmentIntent> = parse(expected_json)?;
@@ -183,7 +196,8 @@ fn intent_binding(pending: &PendingPasskey, expected_json: &str) -> Result<()> {
                     && envelope.not_before_ms >= intent.certificate_not_before_ms
                     && envelope.expires_at_ms <= intent.certificate_expires_at_ms,
                 "node device pending changed its signed intent",
-            )
+            )?;
+            Ok(VerifiedNodePasskeyIntent::DeviceEnrollment(signed))
         }
         PasskeyPurpose::ManageAuthenticators => {
             let signed: Signed<AuthenticatorManagementIntent> = parse(expected_json)?;
@@ -199,7 +213,8 @@ fn intent_binding(pending: &PendingPasskey, expected_json: &str) -> Result<()> {
                     && envelope.not_before_ms >= intent.issued_at_ms
                     && envelope.expires_at_ms <= intent.expires_at_ms,
                 "node management pending changed its signed intent",
-            )
+            )?;
+            Ok(VerifiedNodePasskeyIntent::Management)
         }
     }
 }
@@ -236,8 +251,12 @@ pub fn verify_node_passkey_pending(
                 && pending.relying_party().origin() == expected_origin,
             "node passkey pending changed its trusted RP or origin",
         )?;
-        intent_binding(pending, expected_signed_intent_json)?;
-        Ok(VerifiedNodePasskeyPending { node, signed })
+        let intent = intent_binding(pending, expected_signed_intent_json)?;
+        Ok(VerifiedNodePasskeyPending {
+            node,
+            signed,
+            intent,
+        })
     };
     verify().map_err(|e| e.to_string())
 }
@@ -285,7 +304,8 @@ pub fn verify_node_passkey_state(
             "passkey state does not bind the exact proof and current counter",
         )?;
         Ok(VerifiedNodePasskeyState {
-            state: statement.state,
+            signed,
+            intent: trusted_pending.intent.clone(),
         })
     };
     verify().map_err(|e| e.to_string())
@@ -324,8 +344,55 @@ impl VerifiedNodePasskeyPending {
 impl VerifiedNodePasskeyState {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = trustedStateJson))]
     pub fn trusted_state_json(&self) -> crate::Result<String> {
-        serde_json::to_string(&self.state)
+        serde_json::to_string(&self.signed.payload.state)
             .map_err(|_| "node passkey state encoding failed".to_owned())
+    }
+}
+
+impl VerifiedNodePasskeyState {
+    pub(crate) fn enrollment_for_proof(
+        &self,
+        proof: &PasskeyAssertionProof,
+        expected_node: &PublicKey,
+        now: u64,
+    ) -> Result<(
+        &Signed<enrollment::DeviceEnrollmentIntent>,
+        AuthenticatorState,
+    )> {
+        let VerifiedNodePasskeyIntent::DeviceEnrollment(intent) = &self.intent else {
+            return Err(AuthorizationError::InvalidProof(
+                "passkey state is not for device enrollment",
+            ));
+        };
+        let statement = &self.signed.payload;
+        require(
+            self.signed.issuer == *expected_node
+                && statement.pending == proof.pending
+                && statement.record_hash == proof.record.hash()?
+                && statement.credential_id == proof.record.payload.credential_id
+                && statement.credential_id == proof.response.raw_id
+                && statement.response_hash == ObjectHash::body(&proof.response)?
+                && statement.state == proof.state,
+            "passkey state belongs to another node, proof or credential state",
+        )?;
+        signed_window(
+            &statement.pending,
+            statement.issued_at_ms,
+            statement.expires_at_ms,
+            now,
+        )?;
+        Ok((intent, statement.state))
+    }
+
+    pub(crate) fn record_enrollment_usage(
+        &self,
+        usage: &mut execution_handoff::ExecutionProofUsage,
+    ) -> Result<()> {
+        usage.record_signed(&self.signed)?;
+        if let VerifiedNodePasskeyIntent::DeviceEnrollment(intent) = &self.intent {
+            usage.record_signed(intent)?;
+        }
+        usage.enforce_limits()
     }
 }
 

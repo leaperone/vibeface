@@ -777,7 +777,7 @@ fn decode_json<T: for<'de> Deserialize<'de>>(json: &str, limit: usize) -> Result
     require(json.len() <= limit, "passkey JSON input too large")?;
     serde_json::from_str(json).map_err(|_| "invalid passkey JSON input".to_owned())
 }
-fn expected_pending(
+pub(crate) fn expected_pending(
     pending: &PendingPasskey,
     expected_hash: &str,
     rp_id: &str,
@@ -833,8 +833,7 @@ pub struct PasskeyAssertionProof {
     pub state: AuthenticatorState,
     pub response: AssertionResponse,
 }
-/// Browser pins and the ledger come from the saved account. The Node re-verifies its own current state.
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyPasskeyAssertion))]
+#[cfg(test)]
 pub fn verify_assertion_json(
     proof_json: &str,
     trusted_state_json: &str,

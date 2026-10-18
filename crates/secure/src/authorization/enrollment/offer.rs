@@ -914,6 +914,125 @@ pub fn verify_passkey_enrollment_request_from_offer(
     verify().map_err(|error| error.to_string())
 }
 
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyPasskeyAssertionFromEnrollmentOffer))]
+pub fn verify_passkey_assertion_from_enrollment_offer(
+    proof_json: &str,
+    trusted_state: &crate::authorization::passkey_node::VerifiedNodePasskeyState,
+    offer: &VerifiedEnrollmentOffer,
+    expected_envelope_hash: &str,
+    expected_rp_id: &str,
+    expected_origin: &str,
+    now_ms: f64,
+) -> crate::Result<crate::webauthn::VerifiedPasskeyAssertion> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
+    let verify = || -> Result<_> {
+        require(
+            proof_json
+                .len()
+                .saturating_add(expected_envelope_hash.len())
+                .saturating_add(expected_rp_id.len())
+                .saturating_add(expected_origin.len())
+                <= MAX_PROOF_BYTES,
+            "offer passkey assertion carrier too large",
+        )?;
+        let now = time(now_ms)?;
+        let proof: crate::webauthn::PasskeyAssertionProof = parse(proof_json)?;
+        let (intent, previous_state) = trusted_state.enrollment_for_proof(
+            &proof,
+            &offer.signed.payload.entry.node_public_key,
+            now,
+        )?;
+        let state = intent_state_from_offer(
+            offer,
+            &intent.payload,
+            &intent.payload.new_device_public_key,
+            now,
+        )?;
+        let eligible = verify_passkey_enrollment_request(&state, intent, now)?;
+        crate::webauthn::expected_pending(
+            &proof.pending,
+            expected_envelope_hash,
+            expected_rp_id,
+            expected_origin,
+        )
+        .map_err(|_| {
+            AuthorizationError::InvalidProof(
+                "offer passkey pending changed its expected envelope or origin",
+            )
+        })?;
+        let envelope = proof.pending.envelope();
+        require(
+            envelope.purpose == crate::webauthn::PasskeyPurpose::EnrollDevice
+                && envelope.account == intent.payload.account
+                && envelope.device_public_key == offer.reader_public_key
+                && envelope.rights == intent.payload.requested_rights
+                && envelope.target == intent.payload.target
+                && envelope.enrollment_hash == *eligible.intent_hash()
+                && envelope.expected_heads == intent.payload.expected_heads
+                && envelope.not_before_ms >= intent.payload.certificate_not_before_ms
+                && envelope.expires_at_ms <= eligible.expires_at_ms(),
+            "offer passkey assertion changed its exact device enrollment",
+        )?;
+        let authorized = state.verify_authenticator(&proof.record, now)?;
+        require(
+            authorized.account() == &offer.signed.payload.account
+                && proof.record.payload.client_enrollment == PasskeyClientEnrollment::AccountClient,
+            "offer passkey credential is not current for this account",
+        )?;
+        let credential = crate::webauthn::RegisteredPasskey::from_authorized(
+            &authorized,
+            authorized.assertion_state(previous_state)?,
+        )
+        .map_err(|_| {
+            AuthorizationError::InvalidProof("offer passkey credential state is invalid")
+        })?;
+        let assertion = crate::webauthn::verify_passkey_assertion(
+            &proof.pending,
+            &credential,
+            &proof.response,
+            now,
+        )
+        .map_err(|_| AuthorizationError::InvalidProof("offer passkey user verification failed"))?;
+        let mut usage = verify_enrollment_offer_current(&state, &offer.signed, now)?;
+        let account_history = state
+            .account_history(&offer.signed.payload.account)
+            .ok_or(AuthorizationError::Revoked)?;
+        for value in account_history
+            .first()
+            .into_iter()
+            .chain(account_history.last())
+        {
+            usage.record_verified_object(value)?;
+        }
+        let space_history = state
+            .space_history(&SpaceId::personal(&offer.signed.payload.account))
+            .ok_or(AuthorizationError::Revoked)?;
+        for value in space_history
+            .first()
+            .into_iter()
+            .chain(space_history.last())
+        {
+            usage.record_verified_object(value)?;
+        }
+        trusted_state.record_enrollment_usage(&mut usage)?;
+        usage.merge(&crate::authorization::policy_proof::policy_entry_usage(
+            &state,
+            &JournalEntry::Authenticator(proof.record.clone()),
+        )?);
+        let mut assertion_budget = Budget::default();
+        assertion_budget.external_signature(ObjectHash::body(&proof)?)?;
+        usage.record_budget(&assertion_budget)?;
+        usage.record_metadata(&(proof.pending, proof.response, previous_state))?;
+        if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts()
+        {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
+        Ok(assertion)
+    };
+    verify().map_err(|error| error.to_string())
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = preparePasskeyDeviceEnrollmentFromOffer))]
 pub fn prepare_passkey_device_enrollment_from_offer(
     signed_intent_json: &str,
