@@ -9,7 +9,6 @@ pub struct CompactSdkOrigin {
     pub message_event: EventRef,
     pub sdk_trigger: EventRef,
     pub invocation: Signed<Invocation>,
-    pub source_body: Value,
     pub challenge: FreshnessChallenge,
     pub receipts: Vec<Signed<FreshnessReceipt>>,
     pub admitted_at_ms: u64,
@@ -910,32 +909,18 @@ impl VerifiedPolicySet {
         let original =
             self.verify_original_admission(&proof, &admission_facts(&proof.invocation.payload))?;
         usage.merge(original.proof_usage());
-        let sdk_parent = handoff
-            .sdk_origin
-            .as_ref()
-            .map(|origin| -> Result<VerifiedAdmission> {
-                let parent = self.verify_original_admission(
-                    &AdmissionProof {
-                        invocation: origin.invocation.clone(),
-                        source_body: origin.source_body.clone(),
-                        challenge: origin.challenge.clone(),
-                        receipts: origin.receipts.clone(),
-                        admitted_at_ms: origin.admitted_at_ms,
-                        transport: origin.transport.clone(),
-                    },
-                    &admission_facts(&origin.invocation.payload),
-                )?;
-                usage.merge(parent.proof_usage());
-                Ok(parent)
-            })
-            .transpose()?;
         usage.enforce_limits()?;
-        let verified = VerifiedProjectExecutionSource {
+        let mut verified = VerifiedProjectExecutionSource {
             capsule_hash: statement.capsule_hash,
             usage,
             original,
-            sdk_parent,
+            sdk_parent: None,
         };
+        verified.sdk_parent = self.verify_compact_sdk_parent_admission(&verified, handoff, now_ms)?;
+        if let Some(parent) = &verified.sdk_parent {
+            verified.usage.merge(parent.proof_usage());
+            verified.usage.enforce_limits()?;
+        }
         verified.original_admission(handoff, now_ms)?;
         verified.sdk_parent_admission(handoff, now_ms)?;
         Ok(verified)
@@ -2592,7 +2577,6 @@ impl ExecutionProofUsage {
             }
             let transport = self.transport_metadata(&origin.transport)?;
             self.record_metadata(&serde_json::json!({"message_event":origin.message_event,"sdk_trigger":origin.sdk_trigger,
-                "source_body_hash":ObjectHash::body(&origin.source_body)?,
                 "challenge":origin.challenge,"admitted_at_ms":origin.admitted_at_ms,"transport":transport}))?;
         }
         self.record_metadata(&serde_json::json!({"version":handoff.version,"execution_resource":handoff.execution_resource,
