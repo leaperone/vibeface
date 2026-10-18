@@ -2,8 +2,8 @@
 pub mod api;
 pub mod binding;
 pub mod client;
-pub mod config;
 pub mod command;
+pub mod config;
 pub mod crypto;
 pub mod engine;
 pub mod identity;

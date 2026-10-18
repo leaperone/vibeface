@@ -1787,7 +1787,7 @@ def chat_agent_acceptance(options):
             node.pair(a, network)
             node.start()
             node.client.connect()
-            node.client.authenticate()
+            wait_for(node.name + " receives its paired client grant", lambda: node.client.authenticate())
         wait_for("private Nodes can reach each other", lambda:
             all(any(row["node_id"] == target.node_id and row["online"] for row in a.client.rpc("nodes")["nodes"])
                 for target in (b, c)))
