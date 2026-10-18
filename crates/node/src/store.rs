@@ -1554,6 +1554,7 @@ impl Store {
             |r| r.get(0),
         )?;
         ensure!(ready, "task creation changed before binding confirmation");
+        validate_session_ownership_from(&tx, &binding.network_id, &binding.target_node, &binding.session_id, &binding.conversation_id)?;
         let current: Option<String> = tx
             .query_row(
                 "SELECT value FROM local_values WHERE network_id=? AND key=?",
@@ -1612,6 +1613,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_session_ownership_from(&tx, &binding.network_id, &binding.target_node, &binding.session_id, &binding.conversation_id)?;
         let current: Option<String> = tx
             .query_row(
                 "SELECT value FROM local_values WHERE network_id=? AND key=?",
@@ -3076,6 +3078,9 @@ fn validate_operation_binding_from(
     connection: &Connection,
     request: &OperationRequest,
 ) -> Result<()> {
+    if let Some(session) = request.session_id.as_deref() {
+        validate_session_ownership_from(connection, &request.network_id, &request.target_node, session, &request.conversation_id)?;
+    }
     match (&request.task_id, &request.binding) {
         (None, None) => return validate_unbound_operation_from(connection, request),
         (Some(_), Some(_)) => {}
@@ -3135,6 +3140,29 @@ fn validate_operation_binding_from(
         !sealed,
         "execution binding is sealed; old commands cannot resume it"
     );
+    Ok(())
+}
+
+fn validate_session_ownership_from(connection: &Connection, network: &str, target: &str, session: &str, conversation: &str) -> Result<()> {
+    let mut query = connection.prepare("SELECT request FROM operations WHERE network_id=? AND target_node=? AND session_id=?")?;
+    for encoded in query.query_map(params![network, target, session], |row| row.get::<_, String>(0))? {
+        let previous: OperationRequest = serde_json::from_str(&encoded?)?;
+        ensure!(previous.conversation_id == conversation, "execution session belongs to another conversation");
+    }
+    let mut query = connection.prepare("SELECT value FROM local_values WHERE network_id=? AND key LIKE 'task-binding-record:%'")?;
+    for encoded in query.query_map([network], |row| row.get::<_, String>(0))? {
+        let value: Value = serde_json::from_str(&encoded?)?;
+        let binding: crate::binding::TaskBinding = serde_json::from_value(value["binding"].clone())?;
+        if binding.target_node == target && binding.session_id == session {
+            ensure!(binding.conversation_id == conversation, "execution session binding belongs to another conversation");
+        }
+    }
+    for stored in load_events_from(connection, network)?.values().filter(|event| event.status == "ready") {
+        if let EventBody::DispatchRecorded { target_node, session_id, .. } = &stored.event.body
+            && target_node == target && session_id.as_deref() == Some(session) {
+            ensure!(stored.event.scope_id == conversation, "execution session belongs to another conversation");
+        }
+    }
     Ok(())
 }
 
@@ -5637,6 +5665,30 @@ mod tests {
                 .to_string()
                 .contains("task-bound session")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn task_bindings_cannot_capture_another_conversations_ordinary_session() -> Result<()> {
+        let owner = LocalIdentity::generate(); let network = owner.fixture_network_id()?;
+        let mut store = memory(&owner, None)?; let created = conversation(&mut store, &owner)?;
+        let open = OperationRequest { operation_id:"ordinary".into(), network_id:network.clone(), conversation_id:"conversation".into(), task_id:None, target_node:owner.node_id()?, session_id:Some("private-native".into()), expected_revision:0, basis_heads:vec![created.hash], action:json!({"type":"open","executor":"codex","cwd":"/tmp"}), resources:vec![], binding:None, manager_authority:None };
+        store.accept_operation(&network,&open)?;
+        store.upsert_session(&network,&session(&owner,"private-native")?)?;
+        store.claim_operation(&network,"ordinary")?;
+        store.finish_operation(&network,"ordinary",OperationState::Succeeded,json!({"opened":true}))?;
+        store.append_event(&owner,&network,"other-chat",EventBody::ConversationCreated { title:"Other Bot".into() },vec![],2)?;
+        let task = store.append_event(&owner,&network,"other-chat",EventBody::TaskCreated { task_id:"task".into(),title:"Task".into(),goal:"Goal".into(),acceptance:"Check".into() },vec![],3)?;
+        let binding = crate::binding::TaskBinding { network_id:network.clone(),conversation_id:"other-chat".into(),task_ref:task.hash.clone(),task_id:"task".into(),authority_node:owner.node_id()?,generation:1,target_node:owner.node_id()?,session_id:"private-native".into(),open_spec:open.action.clone(),previous_binding_hash:None,previous_seal:None };
+        assert!(store.bind_task(&owner,&binding).unwrap_err().to_string().contains("another conversation"));
+        let proof = crate::binding::sign_binding(&owner,&binding)?;
+        assert!(store.install_binding(&proof).unwrap_err().to_string().contains("another conversation"));
+        assert!(store.task_binding(&network,&task.hash)?.is_none());
+        let mut attempted = open.clone(); attempted.operation_id="capture".into();attempted.conversation_id="other-chat".into();attempted.task_id=Some("task".into());attempted.binding=Some(proof);attempted.expected_revision=1;attempted.basis_heads=store.heads(&network,"other-chat")?;attempted.action=json!({"type":"send","text":"private Bot B request"});
+        assert!(store.accept_operation(&network,&attempted).unwrap_err().to_string().contains("another conversation"));
+        store.connection.execute("INSERT INTO operations(network_id,operation_id,target_node,session_id,request,state,control,result) VALUES(?,?,?,?,?,'"accepted"',0,'null')",params![network,attempted.operation_id,attempted.target_node,attempted.session_id,serde_json::to_string(&attempted)?])?;
+        assert!(store.claim_operation(&network,"capture").unwrap_err().to_string().contains("another conversation"));
+        assert_eq!(store.session(&network,&open.target_node,"private-native")?.unwrap().revision,1);
         Ok(())
     }
 
