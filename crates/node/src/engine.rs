@@ -1058,7 +1058,8 @@ mod tests {
         );
         let mut context = personal_context();
         context.shared = true;
-        context.lease_expires_at_ms = vibeface_protocol::now_ms() + 60_000;
+        context.lease_expires_at_ms = vibeface_protocol::now_ms()
+            + vibeface_secure::authorization::EXECUTION_LEASE_MS;
         let original = engine
             .prepare_operation_for_test(&context, &project)
             .await?;
@@ -1081,7 +1082,8 @@ mod tests {
             }).await?;
             let mut replacement = context.clone();
             replacement.operation_id.push_str("-replacement");
-            replacement.lease_expires_at_ms = vibeface_protocol::now_ms() + 60_000;
+            replacement.lease_expires_at_ms = vibeface_protocol::now_ms()
+                + vibeface_secure::authorization::EXECUTION_LEASE_MS;
             let starting = engine.clone();
             let next = replacement.clone();
             let next_project = project.clone();
