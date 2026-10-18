@@ -8,6 +8,7 @@ use vibeface_secure::authorization::{
 
 const MAX_UPDATE_ENTRIES: usize = 64;
 const MAX_UPDATE_BYTES: usize = 256 * 1024;
+const MAX_RECOVERY_SCAN_ENTRIES: usize = 32;
 
 #[derive(Clone, Default)]
 pub(crate) struct PolicyState {
@@ -22,6 +23,36 @@ struct AcceptedEntry {
     entry: JournalEntry,
     encoded: String,
     received_at_ms: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcceptedJournalSnapshot {
+    accepted_len: usize,
+    last_hash: Option<ObjectHash>,
+    last_ordinal: Option<i64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AcceptedJournalCursor {
+    next_index: usize,
+    after_ordinal: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AcceptedRecoveryEntry {
+    pub(crate) entry_hash: ObjectHash,
+    pub(crate) entry: JournalEntry,
+    pub(crate) accepted_at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AcceptedJournalPage {
+    pub(crate) entry: Option<AcceptedRecoveryEntry>,
+    pub(crate) next_cursor: AcceptedJournalCursor,
+    pub(crate) scanned: usize,
+    pub(crate) complete: bool,
 }
 
 pub(crate) struct PreparedPolicyUpdate {
@@ -111,6 +142,56 @@ fn issued_under(entry: &JournalEntry) -> Option<&PolicyStamp> {
         JournalEntry::Resource(value) => Some(&value.payload.issued_under),
         _ => None,
     }
+}
+
+fn entry_matches_domains(entry: &JournalEntry, domains: &BTreeSet<PolicyDomain>) -> bool {
+    let domain = match entry {
+        JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
+            PolicyDomain::Account(value.payload.account.clone())
+        }
+        JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => {
+            PolicyDomain::Space(value.payload.space.clone())
+        }
+        JournalEntry::AccountCommit(value) => {
+            PolicyDomain::Account(value.proposal.payload.account.clone())
+        }
+        JournalEntry::SpaceCommit(value) => {
+            PolicyDomain::Space(value.proposal.payload.space.clone())
+        }
+        _ => issued_under(entry)
+            .expect("policy object has an issued-under domain")
+            .domain
+            .clone(),
+    };
+    domains.contains(&domain)
+}
+
+fn checked_accepted_ordinal(
+    connection: &Connection,
+    hash: &ObjectHash,
+    accepted: &AcceptedEntry,
+) -> Result<i64> {
+    let (ordinal, bytes, clock): (i64, u64, u64) = connection
+        .query_row(
+            "SELECT ordinal,length(CAST(entry AS BLOB)),accepted_at_ms FROM policy_journal WHERE entry_hash=?",
+            [hash.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .context("accepted recovery journal boundary is missing")?;
+    ensure!(
+        bytes == accepted.encoded.len() as u64 && clock == accepted.received_at_ms,
+        "accepted recovery journal boundary changed"
+    );
+    let encoded: String = connection.query_row(
+        "SELECT entry FROM policy_journal WHERE entry_hash=? AND ordinal=?",
+        params![hash.as_str(), ordinal],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        encoded == accepted.encoded,
+        "accepted recovery journal boundary changed"
+    );
+    Ok(ordinal)
 }
 
 fn apply_entry(
@@ -242,6 +323,160 @@ impl PolicyState {
 
     pub(crate) fn pins(&self) -> &[PolicyPin] {
         &self.pins
+    }
+
+    pub(crate) fn accepted_journal_snapshot(
+        &self,
+        connection: &Connection,
+    ) -> Result<AcceptedJournalSnapshot> {
+        let last_hash = self.order.last().cloned();
+        let last_ordinal = if let Some(hash) = &last_hash {
+            Some(checked_accepted_ordinal(
+                connection,
+                hash,
+                &self.accepted[hash],
+            )?)
+        } else {
+            let nonempty: bool =
+                connection.query_row("SELECT EXISTS(SELECT 1 FROM policy_journal)", [], |row| {
+                    row.get(0)
+                })?;
+            ensure!(!nonempty, "unverified recovery journal entries exist");
+            None
+        };
+        Ok(AcceptedJournalSnapshot {
+            accepted_len: self.order.len(),
+            last_hash,
+            last_ordinal,
+        })
+    }
+
+    // The caller keeps this read and its recovery cursor update in one transaction.
+    pub(crate) fn accepted_journal_page(
+        &self,
+        connection: &Connection,
+        snapshot: &AcceptedJournalSnapshot,
+        cursor: Option<&AcceptedJournalCursor>,
+        domains: &BTreeSet<PolicyDomain>,
+    ) -> Result<AcceptedJournalPage> {
+        ensure!(
+            snapshot.accepted_len <= self.order.len()
+                && snapshot.last_hash.as_ref()
+                    == snapshot
+                        .accepted_len
+                        .checked_sub(1)
+                        .and_then(|index| self.order.get(index))
+                && snapshot.last_ordinal.is_some() == (snapshot.accepted_len != 0),
+            "invalid accepted recovery journal snapshot"
+        );
+        if let Some(hash) = &snapshot.last_hash {
+            ensure!(
+                Some(checked_accepted_ordinal(
+                    connection,
+                    hash,
+                    &self.accepted[hash]
+                )?) == snapshot.last_ordinal,
+                "accepted recovery journal snapshot boundary moved"
+            );
+        }
+        let mut next_cursor = cursor.cloned().unwrap_or(AcceptedJournalCursor {
+            next_index: 0,
+            after_ordinal: None,
+        });
+        ensure!(
+            next_cursor.next_index <= snapshot.accepted_len
+                && next_cursor.after_ordinal.is_some() == (next_cursor.next_index != 0),
+            "invalid accepted recovery journal cursor"
+        );
+        if let Some(index) = next_cursor.next_index.checked_sub(1) {
+            let hash = &self.order[index];
+            ensure!(
+                Some(checked_accepted_ordinal(
+                    connection,
+                    hash,
+                    &self.accepted[hash]
+                )?) == next_cursor.after_ordinal,
+                "accepted recovery journal cursor boundary moved"
+            );
+        }
+        if next_cursor.next_index == snapshot.accepted_len {
+            ensure!(
+                next_cursor.after_ordinal == snapshot.last_ordinal,
+                "accepted recovery journal did not reach its snapshot boundary"
+            );
+            return Ok(AcceptedJournalPage {
+                entry: None,
+                next_cursor,
+                scanned: 0,
+                complete: true,
+            });
+        }
+        let start = match next_cursor.after_ordinal {
+            Some(ordinal) => ordinal
+                .checked_add(1)
+                .context("accepted recovery journal cursor overflow")?,
+            None => i64::MIN,
+        };
+        let limit = MAX_RECOVERY_SCAN_ENTRIES.min(snapshot.accepted_len - next_cursor.next_index);
+        let mut statement = connection.prepare(
+            "SELECT ordinal,entry_hash,length(CAST(entry AS BLOB)),accepted_at_ms FROM policy_journal WHERE ordinal>=? AND ordinal<=? ORDER BY ordinal LIMIT ?",
+        )?;
+        let rows = statement
+            .query_map(params![start, snapshot.last_ordinal, limit as u64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(
+            !rows.is_empty(),
+            "accepted recovery journal prefix was deleted"
+        );
+        let mut entry = None;
+        let mut scanned = 0;
+        for (ordinal, hash, bytes, clock) in rows {
+            let expected = &self.order[next_cursor.next_index];
+            let accepted = &self.accepted[expected];
+            ensure!(
+                expected.as_str() == hash
+                    && accepted.encoded.len() as u64 == bytes
+                    && accepted.received_at_ms == clock,
+                "accepted recovery journal prefix changed or reordered"
+            );
+            ensure!(
+                checked_accepted_ordinal(connection, expected, accepted)? == ordinal,
+                "accepted recovery journal prefix moved"
+            );
+            next_cursor.next_index += 1;
+            next_cursor.after_ordinal = Some(ordinal);
+            scanned += 1;
+            if entry_matches_domains(&accepted.entry, domains) {
+                entry = Some(AcceptedRecoveryEntry {
+                    entry_hash: expected.clone(),
+                    entry: accepted.entry.clone(),
+                    accepted_at_ms: accepted.received_at_ms,
+                });
+                break;
+            }
+        }
+        let complete = next_cursor.next_index == snapshot.accepted_len;
+        ensure!(
+            !complete || next_cursor.after_ordinal == snapshot.last_ordinal,
+            "accepted recovery journal has extra prefix entries"
+        );
+        ensure!(
+            complete || entry.is_some() || scanned == limit,
+            "accepted recovery journal prefix was truncated"
+        );
+        Ok(AcceptedJournalPage {
+            entry,
+            next_cursor,
+            scanned,
+            complete,
+        })
     }
 
     pub(crate) fn load(connection: &Connection) -> Result<Self> {
@@ -813,6 +1048,188 @@ mod tests {
     };
 
     const NOW: u64 = 1_000;
+
+    fn append_fixture(target: &mut Fixture, other: &Fixture) {
+        let journal = other
+            .state
+            .order
+            .iter()
+            .map(|hash| other.state.accepted[hash].entry.clone())
+            .collect::<Vec<_>>();
+        let update = target
+            .state
+            .prepare_bootstrap(&other.state.pins, &journal, NOW)
+            .unwrap();
+        let tx = target.connection.transaction().unwrap();
+        target.state = commit_in(&tx, &update).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn accepted_pages_bound_scanning_and_preserve_snapshot_and_exact_retries() {
+        let mut fixture = Fixture::with_root(40);
+        for seed in 41..56 {
+            append_fixture(&mut fixture, &Fixture::with_root(seed));
+        }
+        let selected = Fixture::new();
+        append_fixture(&mut fixture, &selected);
+        let domains = BTreeSet::from([
+            PolicyDomain::Account(selected.account.clone()),
+            PolicyDomain::Space(selected.space.clone()),
+        ]);
+        let snapshot = fixture
+            .state
+            .accepted_journal_snapshot(&fixture.connection)
+            .unwrap();
+        assert_eq!(snapshot.accepted_len, 34);
+        append_fixture(&mut fixture, &Fixture::with_root(60));
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        let mut cursor = None;
+        let mut hashes = Vec::new();
+        for index in 0..3 {
+            let page = verification
+                .run(|| {
+                    fixture.state.accepted_journal_page(
+                        &fixture.connection,
+                        &snapshot,
+                        cursor.as_ref(),
+                        &domains,
+                    )
+                })
+                .unwrap();
+            let retry = fixture
+                .state
+                .accepted_journal_page(&fixture.connection, &snapshot, cursor.as_ref(), &domains)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&page.next_cursor).unwrap(),
+                serde_json::to_value(&retry.next_cursor).unwrap()
+            );
+            assert_eq!(page.scanned, if index == 0 { 32 } else { 1 });
+            assert_eq!(page.complete, index == 2);
+            assert_eq!(
+                page.entry.as_ref().map(|entry| &entry.entry_hash),
+                retry.entry.as_ref().map(|entry| &entry.entry_hash)
+            );
+            if let Some(entry) = page.entry {
+                assert_eq!(entry.accepted_at_ms, NOW);
+                assert_eq!(entry_hash(&entry.entry).unwrap(), entry.entry_hash);
+                hashes.push(entry.entry_hash);
+            } else {
+                assert_eq!(index, 0);
+            }
+            cursor = Some(page.next_cursor);
+        }
+        assert_eq!(hashes, selected.state.order);
+        let complete = fixture
+            .state
+            .accepted_journal_page(&fixture.connection, &snapshot, cursor.as_ref(), &domains)
+            .unwrap();
+        assert!(complete.complete && complete.entry.is_none() && complete.scanned == 0);
+        assert_eq!(verification.counts().actual_verifications, 0);
+    }
+
+    #[test]
+    fn accepted_pages_reject_changed_unread_rows_and_cursor_boundaries() {
+        for mutation in [
+            "UPDATE policy_journal SET entry=entry || ' ' WHERE ordinal=1",
+            "UPDATE policy_journal SET accepted_at_ms=accepted_at_ms+1 WHERE ordinal=1",
+            "DELETE FROM policy_journal WHERE ordinal=1",
+            "UPDATE policy_journal SET ordinal=ordinal+100; UPDATE policy_journal SET ordinal=103-ordinal",
+        ] {
+            let fixture = Fixture::new();
+            let snapshot = fixture
+                .state
+                .accepted_journal_snapshot(&fixture.connection)
+                .unwrap();
+            fixture.connection.execute_batch(mutation).unwrap();
+            assert!(
+                fixture
+                    .state
+                    .accepted_journal_page(&fixture.connection, &snapshot, None, &BTreeSet::new(),)
+                    .is_err(),
+                "accepted mutation: {mutation}"
+            );
+        }
+        let fixture = Fixture::new();
+        fixture
+            .connection
+            .execute("UPDATE policy_journal SET ordinal=ordinal*10", [])
+            .unwrap();
+        let snapshot = fixture
+            .state
+            .accepted_journal_snapshot(&fixture.connection)
+            .unwrap();
+        let other = Fixture::with_root(70);
+        let hash = &other.state.order[0];
+        let accepted = &other.state.accepted[hash];
+        fixture.connection.execute(
+            "INSERT INTO policy_journal(ordinal,entry_hash,entry,accepted_at_ms) VALUES(15,?,?,?)",
+            params![hash.as_str(), accepted.encoded, accepted.received_at_ms],
+        ).unwrap();
+        assert!(
+            fixture
+                .state
+                .accepted_journal_page(&fixture.connection, &snapshot, None, &BTreeSet::new(),)
+                .is_err()
+        );
+
+        let fixture = Fixture::new();
+        let snapshot = fixture
+            .state
+            .accepted_journal_snapshot(&fixture.connection)
+            .unwrap();
+        let domains = BTreeSet::from([PolicyDomain::Account(fixture.account.clone())]);
+        let page = fixture
+            .state
+            .accepted_journal_page(&fixture.connection, &snapshot, None, &domains)
+            .unwrap();
+        fixture
+            .connection
+            .execute(
+                "UPDATE policy_journal SET entry=entry || ' ' WHERE ordinal=1",
+                [],
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .state
+                .accepted_journal_page(
+                    &fixture.connection,
+                    &snapshot,
+                    Some(&page.next_cursor),
+                    &domains,
+                )
+                .is_err()
+        );
+        let invalid = AcceptedJournalCursor {
+            next_index: 3,
+            after_ordinal: Some(3),
+        };
+        assert!(
+            fixture
+                .state
+                .accepted_journal_page(&fixture.connection, &snapshot, Some(&invalid), &domains,)
+                .is_err()
+        );
+
+        let connection = database();
+        let state = PolicyState::default();
+        let snapshot = state.accepted_journal_snapshot(&connection).unwrap();
+        assert!(
+            state
+                .accepted_journal_page(&connection, &snapshot, None, &BTreeSet::new(),)
+                .unwrap()
+                .complete
+        );
+        connection
+            .execute(
+                "INSERT INTO policy_journal(entry_hash,entry,accepted_at_ms) VALUES(?,?,?)",
+                params![hash.as_str(), accepted.encoded, accepted.received_at_ms],
+            )
+            .unwrap();
+        assert!(state.accepted_journal_snapshot(&connection).is_err());
+    }
 
     fn key(byte: u8) -> Identity {
         Identity::from_secret_hex(&hex::encode([byte; 32])).unwrap()
