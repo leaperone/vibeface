@@ -1815,6 +1815,35 @@ pub(crate) mod tests {
             result["actual"],
             serde_json::to_value(&fixture.actual).unwrap()
         );
+        let merged = policy_import::merge_same_head_snapshots(
+            require_confirmed_client_policy(&fixture.source).unwrap(), history.snapshot(),
+        ).unwrap();
+        let event: events::Event = serde_json::from_str(
+            &fixture.actual.handoff.handoff.project_dispatch.canonical_body,
+        ).unwrap();
+        let events::EventCause::Invocation { mut admission } = event.cause else {
+            panic!("fixture has no original admission");
+        };
+        let original = &admission.invocation.payload;
+        let facts = RequestFacts {
+            resource: original.resource.clone(), action: original.action,
+            audience: original.audience.clone(), operation_id: original.operation_id.clone(),
+            body_hash: original.body_hash.clone(), context: original.context.clone(),
+        };
+        let execution_domain = PolicyDomain::Space(
+            fixture.actual.handoff.handoff.execution_resource.space.clone(),
+        );
+        assert!(original.expected_policies.iter().any(|head| head.domain == execution_domain));
+        let mut missing = original.clone();
+        missing.expected_policies.retain(|head| head.domain != execution_domain);
+        admission.invocation = Signed::sign(missing, &fixture.client).unwrap();
+        let AuthorizationError::NeedPolicySync(heads) = remote_resolution_history::admitted(
+            merged.state(), &admission, &facts,
+        ).unwrap_err() else {
+            panic!("missing signed execution policy must require explicit synchronization");
+        };
+        assert_eq!(heads, admission.challenge.policies);
+        assert!(heads.iter().any(|head| head.domain == execution_domain));
         let mut wrong = fixture.body.clone();
         wrong["authorization_id"] = json!("another-history");
         assert!(

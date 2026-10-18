@@ -1295,7 +1295,7 @@ impl VerifiedRemoteExecution {
     }
 }
 
-fn remote_selection(body: &Value) -> Result<Option<(ResourceRef, PublicKey, ObjectHash)>> {
+pub(super) fn remote_selection(body: &Value) -> Result<Option<(ResourceRef, PublicKey, ObjectHash)>> {
     let fields = [
         body.get("execution_resource"),
         body.get("target_public_key"),

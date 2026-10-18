@@ -143,15 +143,27 @@ pub(super) fn at_heads(
     Ok(historical)
 }
 
-fn admitted(
+pub(super) fn admitted(
     current: &VerifiedPolicySet,
     proof: &events::AdmissionProof,
     facts: &RequestFacts,
 ) -> Result<VerifiedAdmission> {
     let historical = at_heads(current, &proof.challenge.policies)?;
     let transport = proof.transport.clone().into_evidence();
-    let request =
-        historical.verify_invocation(&proof.invocation, facts, &transport, proof.admitted_at_ms)?;
+    let request = match prepare::remote_selection(&proof.source_body)? {
+        Some((resource, key, grant)) => {
+            let destination = historical.verify_execution_destination(
+                &facts.resource, &facts.audience, &resource, &key, &grant,
+                &facts.context, facts.action, proof.admitted_at_ms,
+            )?;
+            historical.verify_invocation_with_execution_destination(
+                &proof.invocation, facts, &transport, &destination, proof.admitted_at_ms,
+            )?
+        }
+        None => historical.verify_invocation(
+            &proof.invocation, facts, &transport, proof.admitted_at_ms,
+        )?,
+    };
     let fresh = historical.verify_freshness(
         &request,
         &proof.challenge,

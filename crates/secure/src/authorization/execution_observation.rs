@@ -1189,18 +1189,7 @@ pub(crate) mod tests {
             body_hash: ObjectHash::body(&proof.source_body).unwrap(),
             context: proof.invocation.payload.context.clone(),
         };
-        let original = historical
-            .verify_invocation(
-                &proof.invocation,
-                &facts,
-                &proof.transport.clone().into_evidence(),
-                NOW,
-            )
-            .unwrap();
-        let fresh = historical
-            .verify_freshness(&original, &proof.challenge, &proof.receipts, NOW)
-            .unwrap();
-        let admitted = historical.admit_operation(&original, &fresh, NOW).unwrap();
+        let admitted = remote_resolution_history::admitted(&historical, &proof, &facts).unwrap();
         let original = historical
             .verify_operation_authorization(
                 &admitted,
@@ -1406,18 +1395,23 @@ pub(crate) mod tests {
             expires_at_ms: NOW + 100_000,
         };
         let transport = TransportEvidence::DirectNoise { device };
+        let destination = prepare::remote_selection(&body).unwrap().map(|(resource, key, grant)| {
+            state.verify_execution_destination(&facts.resource, &facts.audience,
+                &resource, &key, &grant, &facts.context, facts.action, NOW).unwrap()
+        });
+        let authorize = |signed: &Signed<Invocation>| match &destination {
+            Some(destination) => state.verify_invocation_with_execution_destination(
+                signed, &facts, &transport, destination, NOW,
+            ),
+            None => state.verify_invocation(signed, &facts, &transport, NOW),
+        };
         let initial = Signed::sign(invocation.clone(), &network.client).unwrap();
-        let AuthorizationError::NeedPolicySync(heads) = state
-            .verify_invocation(&initial, &facts, &transport, NOW)
-            .unwrap_err()
-        else {
+        let AuthorizationError::NeedPolicySync(heads) = authorize(&initial).unwrap_err() else {
             panic!("fixture must discover a real policy closure");
         };
         invocation.expected_policies = heads;
         let invocation = Signed::sign(invocation, &network.client).unwrap();
-        let auth = state
-            .verify_invocation(&invocation, &facts, &transport, NOW)
-            .unwrap();
+        let auth = authorize(&invocation).unwrap();
         let challenge = FreshnessChallenge::new(
             &auth,
             CheckStage::Admit,
