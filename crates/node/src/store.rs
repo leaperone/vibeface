@@ -1497,6 +1497,29 @@ pub(crate) fn rebuild_projections_from(connection: &Connection, network_id: &str
             params![e.status, network_id, hash],
         )?;
     }
+    project_events_from(connection, network_id, &events, &ordered)
+}
+
+pub(crate) fn rebuild_admitted_projections_from(
+    connection: &Connection,
+    network_id: &str,
+) -> Result<()> {
+    ensure!(
+        !connection.is_autocommit(),
+        "admitted projections require their admission transaction"
+    );
+    let events = load_retained_event_rows_from(connection, network_id)?;
+    let all = events.keys().cloned().collect();
+    let ordered = topological(&events, &all);
+    project_events_from(connection, network_id, &events, &ordered)
+}
+
+fn project_events_from(
+    connection: &Connection,
+    network_id: &str,
+    events: &BTreeMap<String, StoredEvent>,
+    ordered: &[String],
+) -> Result<()> {
     connection.execute("DELETE FROM messages WHERE space_id=?", [network_id])?;
     connection.execute("DELETE FROM tasks WHERE space_id=?", [network_id])?;
     connection.execute("DELETE FROM conversations WHERE space_id=?", [network_id])?;
@@ -1696,42 +1719,16 @@ pub(crate) fn load_events_from(
     connection: &Connection,
     network_id: &str,
 ) -> Result<BTreeMap<String, StoredEvent>> {
-    let mut query = connection
-        .prepare("SELECT hash,envelope,status,scope_id,author,sequence,resource_id FROM events WHERE space_id=? ORDER BY hash")?;
-    let rows = query.query_map([network_id], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, u64>(5)?,
-            r.get::<_, String>(6)?,
-        ))
-    })?;
-    let mut result = BTreeMap::new();
+    let result = load_retained_event_rows_from(connection, network_id)?;
     let policy = crate::identity::journal::PolicyState::load(connection)?;
-    for row in rows {
-        let (hash, envelope, status, scope, author, sequence, resource) = row?;
-        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
-        ensure!(envelope.hash == hash, "stored event hash mismatch");
-        let event = crate::identity::event_authorization::verify_event_envelope(
-            &policy, network_id, &envelope,
-        )?;
+    for stored in result.values() {
         ensure!(
-            event.scope_id == scope
-                && event.author == author
-                && event.sequence == sequence
-                && event.resource_id.as_str() == resource,
-            "stored event metadata does not match signed body"
-        );
-        result.insert(
-            hash,
-            StoredEvent {
-                envelope,
-                event,
-                status,
-            },
+            crate::identity::event_authorization::verify_event_envelope(
+                &policy,
+                network_id,
+                &stored.envelope,
+            )? == stored.event,
+            "stored event differs from signed envelope"
         );
     }
     for stored in result.values() {
@@ -1748,6 +1745,59 @@ pub(crate) fn load_events_from(
                     crate::identity::event_authorization::EventEvidenceStatus::Valid
                 ),
             "ready event has incomplete admission or causal evidence"
+        );
+    }
+    Ok(result)
+}
+
+fn load_retained_event_rows_from(
+    connection: &Connection,
+    network_id: &str,
+) -> Result<BTreeMap<String, StoredEvent>> {
+    let mut query = connection
+        .prepare("SELECT hash,envelope,status,scope_id,author,sequence,resource_id FROM events WHERE space_id=? ORDER BY hash")?;
+    let rows = query.query_map([network_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, u64>(5)?,
+            r.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut result = BTreeMap::new();
+    for row in rows {
+        let (hash, envelope, status, scope, author, sequence, resource) = row?;
+        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+        ensure!(envelope.hash == hash, "stored event hash mismatch");
+        ensure!(
+            envelope.canonical_body.len() <= MAX_EVENT_BYTES
+                && digest(envelope.canonical_body.as_bytes()) == hash,
+            "stored event body hash mismatch"
+        );
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+        ensure!(
+            event.network_id == network_id
+                && serde_json::to_string(&event)? == envelope.canonical_body,
+            "stored event body is not canonical for its space"
+        );
+        crate::crypto::validate_event_shape(&event)?;
+        ensure!(
+            event.scope_id == scope
+                && event.author == author
+                && event.sequence == sequence
+                && event.resource_id.as_str() == resource,
+            "stored event metadata does not match signed body"
+        );
+        result.insert(
+            hash,
+            StoredEvent {
+                envelope,
+                event,
+                status,
+            },
         );
     }
     Ok(result)
@@ -2197,6 +2247,66 @@ mod tests {
         let (auth, transport) = network.authorization(store, &body, now())?;
         let proof = network.freshness(store, &auth, CheckStage::Admit, now())?;
         store.rebind_task_authorized(&network.node, &auth, &proof, &transport, &body, now())
+    }
+
+    #[test]
+    fn admitted_projection_fold_matches_full_rebuild_without_replaying_ledger() -> Result<()> {
+        fn snapshot(store: &Store, space: &str) -> Result<Vec<Vec<String>>> {
+            [
+                "SELECT json_array(resource_id,conversation_id,title) FROM conversations WHERE space_id=? ORDER BY conversation_id",
+                "SELECT json_array(conversation_id,event_hash,message_id,role,text,created_at_ms,ordinal) FROM messages WHERE space_id=? ORDER BY event_hash",
+                "SELECT json_array(conversation_id,task_id,title,goal,acceptance,status,detail,event_hash) FROM tasks WHERE space_id=? ORDER BY conversation_id,task_id",
+                "SELECT json_array(notification_id,record,derived) FROM notification_outbox WHERE space_id=? ORDER BY notification_id",
+                "SELECT json_array(notification_id,client_id,event_hash) FROM notification_acks WHERE space_id=? ORDER BY notification_id,client_id",
+                "SELECT json_array(operation_id,target_node,session_id,request,state,control,result) FROM operations WHERE space_id=? ORDER BY operation_id",
+                "SELECT json_array(device_id,nonce,authorization_id,body_hash) FROM authorization_nonces WHERE space_id=? ORDER BY device_id,nonce",
+                "SELECT json_array(nonce,invocation_hash,stage,challenge,expires_at_ms,consumed) FROM authorization_challenges WHERE space_id=? ORDER BY nonce",
+                "SELECT json_array(hash,status) FROM events WHERE space_id=? ORDER BY hash",
+            ].into_iter().map(|sql| {
+                Ok(store.connection.prepare(sql)?.query_map([space], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?)
+            }).collect()
+        }
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        network.conversation(&mut store, "conversation")?;
+        network.conversation(&mut store, "parallel")?;
+        network.message(&mut store, "conversation", "first")?;
+        network.message(&mut store, "parallel", "other conversation")?;
+        network.task(&mut store, "parallel", "parallel-task")?;
+        let (request, result) = result(&network, &mut store, "projection-fold")?;
+        notify(&network, &mut store, &request, &result)?;
+        ack(&network, &mut store, "result:projection-fold:succeeded")?;
+        network.message(&mut store, "conversation", "last")?;
+        let expected = snapshot(&store, space)?;
+        assert_eq!(
+            store.messages(space, "parallel")?[0].text,
+            "other conversation"
+        );
+        assert!(!store.operations(space)?.is_empty());
+        assert!(!expected[3].is_empty() && !expected[4].is_empty() && !expected[6].is_empty());
+        assert!(rebuild_admitted_projections_from(&store.connection, space).is_err());
+        let tx = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM messages WHERE space_id=?", [space])?;
+        tx.execute("DELETE FROM tasks WHERE space_id=?", [space])?;
+        tx.execute(
+            "UPDATE conversations SET title='changed projection' WHERE space_id=?",
+            [space],
+        )?;
+        tx.execute(
+            "UPDATE notification_outbox SET record='{}' WHERE space_id=? AND derived=1",
+            [space],
+        )?;
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        verification.run(|| rebuild_admitted_projections_from(&tx, space))?;
+        assert_eq!(verification.counts().actual_verifications, 0);
+        tx.commit()?;
+        assert_eq!(snapshot(&store, space)?, expected);
+        store.rebuild_projections(space)?;
+        assert_eq!(snapshot(&store, space)?, expected);
+        Ok(())
     }
 
     #[test]
