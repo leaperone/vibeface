@@ -1301,6 +1301,53 @@ impl VerifiedPolicySet {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Select an accepted journal dependency closure without replaying its signatures.
+    pub fn historical_subset(&self, selected: &BTreeSet<ObjectHash>) -> Result<Self> {
+        let heads: BTreeMap<_, _> = self
+            .roots
+            .keys()
+            .filter(|stamp| selected.contains(&stamp.head))
+            .map(|stamp| (stamp.domain.clone(), stamp.clone()))
+            .collect();
+        let mut historical =
+            remote_resolution_history::at_heads(self, &heads.into_values().collect::<Vec<_>>())?;
+        historical
+            .accounts
+            .retain(|_, state| selected.contains(&state.stamp.head));
+        historical
+            .spaces
+            .retain(|_, state| selected.contains(&state.stamp.head));
+        historical
+            .roots
+            .retain(|stamp, _| selected.contains(&stamp.head));
+        let enrolled = historical
+            .accounts
+            .values()
+            .flat_map(|state| &state.history)
+            .filter_map(|entry| entry.payload.device_enrollment.as_ref())
+            .map(|proof| proof.certificate.hash())
+            .collect::<Result<BTreeSet<_>>>()?;
+        historical
+            .devices
+            .retain(|hash, _| selected.contains(hash) || enrolled.contains(hash));
+        historical
+            .authenticators
+            .retain(|hash, _| selected.contains(hash));
+        historical
+            .authenticator_states
+            .retain(|hash, _| historical.authenticators.contains_key(hash));
+        historical
+            .resources
+            .retain(|hash, _| selected.contains(hash));
+        historical
+            .memberships
+            .retain(|hash, _| selected.contains(hash));
+        historical.grants.retain(|hash, _| selected.contains(hash));
+        historical
+            .commits
+            .retain(|_, commit| selected.contains(&commit.payload.proposal_hash));
+        Ok(historical)
+    }
     pub fn head(&self, domain: &PolicyDomain) -> Option<&PolicyStamp> {
         match domain {
             PolicyDomain::Account(id) => self.accounts.get(id).map(|s| &s.stamp),

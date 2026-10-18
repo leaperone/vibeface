@@ -891,16 +891,7 @@ impl PolicyState {
                 _ => {}
             }
         }
-        let mut state = VerifiedPolicySet::new();
-        for hash in self.order.iter().filter(|hash| selected.contains(*hash)) {
-            apply_entry(
-                &mut state,
-                &self.pins,
-                &self.accepted[hash].entry,
-                admitted_at_ms,
-                true,
-            )?;
-        }
+        let state = self.verified().historical_subset(&selected)?;
         ensure!(
             expected
                 .iter()
@@ -2067,12 +2058,16 @@ mod tests {
         fixture.accept(&[fixture.space_commit(7)], NOW).unwrap();
         let first: Vec<_> = fixture.state.heads().into_values().collect();
         fixture.accept(&[fixture.space_commit(8)], NOW).unwrap();
-        for expected in [&before, &first] {
-            let historical = fixture.state.historical(expected, NOW).unwrap();
-            for head in expected {
-                assert_eq!(historical.head(&head.domain), Some(head));
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        verification.run(|| {
+            for expected in [&before, &first] {
+                let historical = fixture.state.historical(expected, NOW).unwrap();
+                for head in expected {
+                    assert_eq!(historical.head(&head.domain), Some(head));
+                }
             }
-        }
+        });
+        assert_eq!(verification.counts().actual_verifications, 0);
         assert!(fixture.state.historical(&first, NOW - 1).is_err());
         let current: Vec<_> = fixture.state.heads().into_values().collect();
         let verification = vibeface_secure::signature_verification::SignatureVerification::new();
@@ -2111,6 +2106,10 @@ mod tests {
         assert!(imported.current_heads_at(&expected, NOW - 1).unwrap());
         for head in &expected {
             assert_eq!(historical.head(&head.domain), Some(head));
+        }
+        for head in first.state.heads().values() {
+            assert!(historical.head(&head.domain).is_none());
+            assert!(historical.policy_commit(&head.head).is_none());
         }
     }
 
