@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh 
 vibeface
 ```
 
-首次运行仅在不存在或为空的数据目录中初始化，默认使用 `~/.vibeface` 并监听 `127.0.0.1:4790`，不授予执行目录或启用管理 Agent。已有节点使用原身份和配置启动。安装和 CLI 管理见 [安装说明](docs/install.md)。受管安装使用 `vibeface update apply`；包协议 1 的旧预览版需按 [手动更换程序](docs/releasing.md#手动建立受管安装或更换程序) 一次性切换，不重新初始化身份。
+首次运行仅在不存在或为空的数据目录中初始化，默认使用 `~/.vibeface` 并监听 `127.0.0.1:4790`，不授予执行目录或启用管理 Agent。同一数据格式的节点重启保留原身份和配置。安装和 CLI 管理见 [安装说明](docs/install.md)。本数据格式内的受管更新使用 `vibeface update apply`；从旧版本部署此版本时，使用新的数据目录重新初始化。
 
 ## 从源码开始
 
