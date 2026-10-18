@@ -2878,16 +2878,23 @@ impl Runtime {
                     body_hash: ObjectHash::body(&body)?,
                     context: invocation.payload.context.clone(),
                 };
-                store.authorization_state().verify_invocation(
+                store.authorize_request_for_body(
                     &invocation,
                     &raw,
                     &transport,
+                    &body,
                     now_ms() as u64,
                 )?;
                 let facts = self
                     .authorization_facts(&store, &body, &audience, now_ms() as u64)
                     .map_err(|_| anyhow::anyhow!("request facts do not match authorization"))?;
-                store.authorize_request(&invocation, &facts, &transport, now_ms() as u64)
+                store.authorize_request_for_body(
+                    &invocation,
+                    &facts,
+                    &transport,
+                    &body,
+                    now_ms() as u64,
+                )
             })?
         };
         ensure!(
@@ -3611,10 +3618,11 @@ impl Runtime {
             let _verification = access.verification.enter();
             let facts =
                 self.authorization_facts(&store, &input, &self.audience()?, now_ms() as u64)?;
-            store.authorize_request(
+            store.authorize_request_for_body(
                 access.authorization.signed_invocation(),
                 &facts,
                 &access.transport,
+                &input,
                 now_ms() as u64,
             )?;
         }
@@ -4458,7 +4466,20 @@ impl Runtime {
                 && delegated.initiator() == &session.initiator
                 && delegated.initiating_grant() == session.initiating_grant.as_ref(),
                 "SDK request differs from its current admitted delegation");
-            session.expected_policies = delegated.heads().to_vec();
+            let mut expected: BTreeMap<_, _> = delegated.heads().iter().cloned()
+                .map(|head| (head.domain.clone(), head)).collect();
+            if let Some(destination) = crate::identity::policy::execution_destination_for_body(
+                store.authorization_state(), &facts, &body, now,
+            )? {
+                for head in destination.heads() {
+                    ensure!(
+                        expected.insert(head.domain.clone(), head.clone())
+                            .is_none_or(|previous| previous == *head),
+                        "SDK execution destination has conflicting policy heads"
+                    );
+                }
+            }
+            session.expected_policies = expected.into_values().collect();
             session.expires_at_ms = session.expires_at_ms.min(delegated.expires_at_ms());
             Ok((session, facts))
             })?
