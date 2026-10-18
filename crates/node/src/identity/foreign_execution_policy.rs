@@ -888,6 +888,7 @@ pub(crate) mod tests {
             "task_ref":context.context.task,
             "target_node":fixture.executor.node.node_id()?,
             "session_id":"foreign-session",
+            "binding_generation":1,
             "executor":"codex",
             "cwd":fixture.project.project,
         });
