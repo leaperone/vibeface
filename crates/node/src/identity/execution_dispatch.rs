@@ -1012,7 +1012,7 @@ impl Store {
     {
         use vibeface_secure::{
             Identity,
-            authorization::{Actor, DeviceId, execution_handoff::SignedExecutionHandoff},
+            authorization::{Actor, execution_handoff::SignedExecutionHandoff},
         };
         let _signatures =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
@@ -1048,48 +1048,14 @@ impl Store {
             |row| row.get(0),
         )?;
         let original: SignedExecutionHandoff = serde_json::from_str(&encoded)?;
-        let encoded: String = tx.query_row(
-            "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
-            params![space, operation],
-            |row| row.get(0),
-        )?;
-        let operation: OperationRequest = serde_json::from_str(&encoded)?;
-        let accepted =
-            super::admission::admission_for_operation_from(&tx, space, &operation.operation_id)?;
-        let dispatch: crate::model::Event =
-            serde_json::from_str(&original.handoff.project_dispatch.canonical_body)?;
-        let saved: String = tx.query_row(
-            "SELECT envelope FROM events WHERE space_id=? AND hash=? AND status='ready'",
-            params![space, original.handoff.project_dispatch.hash],
-            |row| row.get(0),
-        )?;
-        let source = original
-            .handoff
-            .source_attestation
-            .as_ref()
-            .context("observed handoff has no durable Project source checkpoint")?;
-        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        let retained = retained_dispatch_from(&tx, identity, &original)?;
         ensure!(
-            source.issuer == local
-                && original.invocation.issuer == local
-                && invocation.audience.device == DeviceId::from_key(&local)
-                && accepted.invocation.payload.resource == target.source.project
-                && accepted.invocation.payload.audience == invocation.audience
-                && serde_json::from_value::<OperationRequest>(
-                    accepted.source_body["request"].clone()
-                )? == operation
-                && serde_json::from_str::<crate::model::SignedEvent>(&saved)?
-                    == original.handoff.project_dispatch
-                && matches!(&dispatch.cause, crate::model::EventCause::Invocation { admission }
-                    if admission == &accepted)
-                && dispatch.network_id == space
-                && dispatch.resource_id == target.source.project.resource
-                && dispatch.scope_id == operation.conversation_id
-                && matches!(&dispatch.body, crate::model::EventBody::DispatchRecorded {operation_id,action,..}
-                    if operation_id == &operation.operation_id
-                        && *action == serde_json::to_value(&operation)?),
-            "observation differs from the original locally admitted dispatch"
+            retained.admission.invocation.payload.audience == invocation.audience,
+            "observation targets another Project host"
         );
+        super::event_authorization::validate_retained_execution_scope_in(
+            &tx, identity, &retained.source,
+        )?;
         let verified = current
             .verified()
             .verify_execution_observation_request(request, &original, now_ms)?;
@@ -1316,6 +1282,10 @@ impl Store {
             if old_state == state && previous.result == result.result {
                 if old_state.terminal() {
                     crate::store::validate_released_operation_reservations_from(&tx,space,operation)?;
+                } else {
+                    super::admission::check_operation_reservations_in(&tx,&OperationRecord {
+                        request:request.clone(),state:old_state.clone(),result:old_result.clone(),
+                    })?;
                 }
                 tx.execute(
                     "UPDATE operations SET result=? WHERE space_id=? AND operation_id=?",
