@@ -80,11 +80,9 @@ impl Runtime {
     }
 
     async fn validate_bot_project(&self, network: &str, project: &BotProject) -> Result<()> {
-        self.store.lock().await.authorize_node(
-            network,
-            &project.target_node,
-            Some(NodeRole::Executor),
-        )?;
+        let store = self.store.lock().await;
+        let target =
+            store.authorize_node(network, &project.target_node, Some(NodeRole::Executor))?;
         let cwd = Path::new(&project.cwd);
         ensure!(
             cwd.is_absolute()
@@ -103,21 +101,28 @@ impl Runtime {
             );
             self.allowed_path(&project.cwd)?;
         } else {
-            let capabilities = self
-                .peer_request(
-                    network,
-                    &project.target_node,
-                    json!({"type":"capabilities"}),
-                )
-                .await?;
+            let space = SpaceId::parse(network)?;
+            let host = ServiceId::from_key(&PublicKey::parse(&target.public_key)?);
+            let state = store.authorization_state();
+            let mut resources = store
+                .connection
+                .prepare("SELECT resource_id FROM resource_records WHERE space_id=?")?;
+            let resources = resources.query_map([space.as_str()], |row| row.get::<_, String>(0))?;
+            let mut registered = false;
+            for resource in resources {
+                let resource = ResourceId::parse(&resource?)?;
+                if state.resource(&space, &resource).is_some_and(|record| {
+                    record.payload.kind
+                        == vibeface_secure::authorization::ResourceKind::ExecutionService
+                        && record.payload.host == host
+                }) {
+                    registered = true;
+                    break;
+                }
+            }
             ensure!(
-                capabilities["roots"].as_array().is_some_and(|roots| {
-                    roots
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .any(|root| cwd.starts_with(root))
-                }),
-                "Bot project is outside the execution Node's configured roots"
+                registered,
+                "Bot project Node has no registered execution service in this space"
             );
         }
         Ok(())

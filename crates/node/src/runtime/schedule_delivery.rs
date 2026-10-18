@@ -1007,18 +1007,6 @@ impl Runtime {
         {
             return Ok(());
         }
-        let capability = self
-            .peer_request(
-                &entry.space_id,
-                &entry.target_node,
-                json!({"type":"capabilities"}),
-            )
-            .await?;
-        ensure!(
-            capability["reliable_schedule"]["version"].as_u64()
-                == Some(u64::from(SCHEDULING_VERSION)),
-            "target does not support reliable scheduling protocol 1; upgrade the original target"
-        );
         let request = if entry.delivered || !acknowledge {
             json!({"method":"manager_status","space_id":entry.space_id,"resource_id":entry.resource_id,"authorization_id":uuid::Uuid::new_v4().to_string(),"conversation_id":entry.conversation_id,"trigger":entry.trigger})
         } else {
