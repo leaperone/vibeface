@@ -3194,24 +3194,6 @@ fn validate_session_ownership_from(
             );
         }
     }
-    for stored in load_events_from(connection, network)?
-        .values()
-        .filter(|event| event.status == "ready")
-    {
-        if let EventBody::DispatchRecorded {
-            target_node,
-            session_id,
-            ..
-        } = &stored.event.body
-            && target_node == target
-            && session_id.as_deref() == Some(session)
-        {
-            ensure!(
-                stored.event.scope_id == conversation,
-                "execution session belongs to another conversation"
-            );
-        }
-    }
     Ok(())
 }
 
@@ -3254,31 +3236,6 @@ fn validate_unbound_operation_from(
             binding.target_node != request.target_node || binding.session_id != session,
             "task-bound session cannot be downgraded to ordinary execution"
         );
-    }
-    for stored in load_events_from(connection, &request.network_id)?
-        .values()
-        .filter(|event| event.status == "ready")
-    {
-        if let EventBody::DispatchRecorded {
-            target_node,
-            session_id,
-            task_id,
-            action,
-            ..
-        } = &stored.event.body
-            && target_node == &request.target_node
-            && session_id.as_deref() == Some(session)
-        {
-            ensure!(
-                stored.event.scope_id == request.conversation_id,
-                "execution session belongs to another conversation"
-            );
-            let previous: OperationRequest = serde_json::from_value(action.clone())?;
-            ensure!(
-                task_id.is_none() && previous.binding.is_none(),
-                "task-bound dispatch cannot be downgraded"
-            );
-        }
     }
     Ok(())
 }
@@ -5812,6 +5769,28 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("another conversation")
+        );
+        store.append_event(
+            &owner,
+            &network,
+            "other-chat",
+            EventBody::DispatchRecorded {
+                operation_id: attempted.operation_id.clone(),
+                task_id: attempted.task_id.clone(),
+                target_node: attempted.target_node.clone(),
+                session_id: attempted.session_id.clone(),
+                action: json!(attempted),
+            },
+            vec![],
+            4,
+        )?;
+        let mut legitimate = open.clone();
+        legitimate.operation_id = "legitimate-after-rejection".into();
+        legitimate.expected_revision = 1;
+        legitimate.action = json!({"type":"send","text":"continue original Bot A"});
+        assert_eq!(
+            store.accept_operation(&network, &legitimate)?.state,
+            OperationState::Accepted
         );
         store.connection.execute(r#"INSERT INTO operations(network_id,operation_id,target_node,session_id,request,state,control,result) VALUES(?,?,?,?,?,'"accepted"',0,'null')"#,params![network,attempted.operation_id,attempted.target_node,attempted.session_id,serde_json::to_string(&attempted)?])?;
         assert!(
