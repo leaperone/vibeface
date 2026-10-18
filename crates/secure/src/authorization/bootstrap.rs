@@ -163,6 +163,7 @@ fn initial_owner_grant(
             Action::TaskCancel,
             Action::ExecutionOpen,
             Action::ExecutionSend,
+            Action::ExecutionCommand,
             Action::ExecutionSteer,
             Action::ExecutionInterrupt,
             Action::ExecutionRespondApproval,
@@ -182,6 +183,7 @@ fn initial_owner_grant(
             Action::ServiceEnroll,
             Action::ReplicaRead,
             Action::AgentStart,
+            Action::AgentInterrupt,
         ],
         audience: audience.clone(),
         constraints: GrantConstraints::default(),
@@ -210,6 +212,7 @@ fn initial_service_grant(
         Action::TaskProgress,
         Action::ExecutionOpen,
         Action::ExecutionSend,
+        Action::ExecutionCommand,
         Action::OperationStatusRead,
         Action::AttachmentRead,
         Action::AgentStart,
@@ -667,6 +670,8 @@ mod tests {
             ResourceScope::WholeSpace(scope.space_id.clone())
         );
         assert!(grant.payload.actions.contains(&Action::GrantIssue));
+        assert!(grant.payload.actions.contains(&Action::ExecutionCommand));
+        assert!(grant.payload.actions.contains(&Action::AgentInterrupt));
         assert!(
             grant
                 .payload
@@ -678,7 +683,9 @@ mod tests {
         assert_eq!(service.issuer, PublicKey::of(&key(3)));
         assert_eq!(service.payload.remaining_delegations, 0);
         assert_eq!(service.payload.parent, Some(grant.hash().unwrap()));
-        assert_eq!(service.payload.actions.len(), 8);
+        assert_eq!(service.payload.actions.len(), 9);
+        assert!(service.payload.actions.contains(&Action::ExecutionCommand));
+        assert!(!service.payload.actions.contains(&Action::AgentInterrupt));
         assert!(
             service
                 .payload

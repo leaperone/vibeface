@@ -451,6 +451,7 @@ pub(super) fn verify_delta_shape_in_state(
         Action::TaskProgress,
         Action::ExecutionOpen,
         Action::ExecutionSend,
+        Action::ExecutionCommand,
         Action::OperationStatusRead,
         Action::AttachmentRead,
         Action::AgentStart,

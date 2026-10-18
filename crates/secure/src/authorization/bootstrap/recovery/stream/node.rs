@@ -391,6 +391,7 @@ fn verify_delta_shape(
         Action::TaskProgress,
         Action::ExecutionOpen,
         Action::ExecutionSend,
+        Action::ExecutionCommand,
         Action::OperationStatusRead,
         Action::AttachmentRead,
         Action::AgentStart,

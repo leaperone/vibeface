@@ -898,6 +898,7 @@ fn owner_actions() -> Vec<Action> {
         Action::TaskCancel,
         Action::ExecutionOpen,
         Action::ExecutionSend,
+        Action::ExecutionCommand,
         Action::ExecutionSteer,
         Action::ExecutionInterrupt,
         Action::ExecutionRespondApproval,
@@ -917,6 +918,7 @@ fn owner_actions() -> Vec<Action> {
         Action::ServiceEnroll,
         Action::ReplicaRead,
         Action::AgentStart,
+        Action::AgentInterrupt,
     ]
 }
 

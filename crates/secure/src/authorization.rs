@@ -657,6 +657,7 @@ pub enum Action {
     TaskCancel,
     ExecutionOpen,
     ExecutionSend,
+    ExecutionCommand,
     ExecutionSteer,
     ExecutionInterrupt,
     ExecutionRespondApproval,
@@ -678,6 +679,7 @@ pub enum Action {
     ServiceEnroll,
     ReplicaRead,
     AgentStart,
+    AgentInterrupt,
 }
 impl Action {
     pub fn is_read(self) -> bool {
@@ -699,6 +701,7 @@ impl Action {
                 | Self::ExecutionRespondApproval
                 | Self::ExecutionRebind
                 | Self::OperationResolve
+                | Self::AgentInterrupt
         )
     }
 }
@@ -3562,12 +3565,20 @@ mod tests {
             f.check(forged, &f.node, NOW).unwrap_err(),
             AuthorizationError::InvalidProof("forged initiator")
         );
-        let mut forbidden = f.service_invocation(&child);
-        forbidden.action = Action::TaskAccept;
-        assert_eq!(
-            f.check(forbidden, &f.node, NOW).unwrap_err(),
-            AuthorizationError::InvalidProof("action requires account actor")
-        );
+        for action in [
+            Action::TaskAccept,
+            Action::ExecutionRespondApproval,
+            Action::ExecutionRebind,
+            Action::OperationResolve,
+            Action::AgentInterrupt,
+        ] {
+            let mut forbidden = f.service_invocation(&child);
+            forbidden.action = action;
+            assert_eq!(
+                f.check(forbidden, &f.node, NOW).unwrap_err(),
+                AuthorizationError::InvalidProof("action requires account actor")
+            );
+        }
     }
     #[test]
     fn endpoint_body_operation_and_expiry_are_bound() {
