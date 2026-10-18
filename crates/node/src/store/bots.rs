@@ -158,7 +158,8 @@ pub(super) fn validate_bot_projections_from(
             .entry(bot.conversation_id.clone())
             .or_default()
             .push(hash.clone());
-        let ancestors = closure_hashes(events, &stored.event.parents);
+        let dependencies = dependencies(&stored.event).cloned().collect::<Vec<_>>();
+        let ancestors = closure_hashes(events, &dependencies);
         let conversation_exists = ancestors.iter().any(|ancestor| {
             events.get(ancestor).is_some_and(|parent| {
                 parent.status == "ready"
