@@ -484,9 +484,6 @@ impl VerifiedRecoveryPolicyContext {
     pub(crate) fn verified_state(&self) -> &VerifiedPolicySet {
         self.policy.state()
     }
-    pub(crate) fn verified_entries(&self) -> &[JournalEntry] {
-        self.policy.journal()
-    }
     pub(crate) fn policy(&self) -> &VerifiedPolicySnapshot {
         &self.policy
     }

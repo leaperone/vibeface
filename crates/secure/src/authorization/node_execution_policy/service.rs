@@ -8,12 +8,6 @@ pub(super) struct NodeTaskPolicySourceScope {
     pub(super) facts: RequestFacts,
     pub(super) context: prepare::PrepareContext,
     pub(super) request: NodeExecutionPolicyReadRequest,
-    parent: Option<VerifiedAuthorization>,
-    service: Option<ServiceId>,
-    service_grant: Option<ObjectHash>,
-    current_binding: Option<SignedBinding>,
-    lease_expires_at_ms: u64,
-    provenance: Option<SdkPolicySourceProvenance>,
 }
 
 impl NodeTaskPolicySourceScope {
@@ -30,12 +24,6 @@ impl NodeTaskPolicySourceScope {
             facts: source.facts().clone(),
             context: request.context()?,
             request: request.clone(),
-            parent: Some(source.parent().clone()),
-            service: Some(raw.session.service.clone()),
-            service_grant: Some(raw.service_grant.clone()),
-            current_binding: raw.current_binding.clone(),
-            lease_expires_at_ms: source.expires_at_ms(),
-            provenance: Some(raw.clone()),
         })
     }
 }
@@ -296,12 +284,6 @@ pub fn verify_node_service_policy_source(
             facts: child_facts.clone(),
             context: read_context.clone(),
             request: request.clone(),
-            parent: Some(parent.clone()),
-            service: Some(service.clone()),
-            service_grant: Some(service_grant.clone()),
-            current_binding: current_binding.cloned(),
-            lease_expires_at_ms: lease_expires_at,
-            provenance: Some(provenance.clone()),
         })),
         verified_at_ms: now,
         expires_at_ms: expires.min(lease_expires_at),
@@ -463,12 +445,6 @@ pub fn verify_node_history_policy_source(
             },
             context,
             request: request.clone(),
-            parent: Some(current_reader.clone()),
-            service: None,
-            service_grant: None,
-            current_binding: original_binding.cloned(),
-            lease_expires_at_ms: current_reader.expires_at_ms(),
-            provenance: provenance.cloned(),
         })),
         verified_at_ms: now,
         expires_at_ms: expires.min(current_reader.expires_at_ms()),

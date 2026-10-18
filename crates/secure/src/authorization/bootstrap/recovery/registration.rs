@@ -421,9 +421,3 @@ impl VerifiedFirstAuthenticatorRegistration {
         encode(&self.usage.counts())
     }
 }
-
-impl VerifiedFirstAuthenticatorRegistration {
-    pub(crate) fn snapshot(&self) -> &VerifiedPolicySnapshot {
-        &self.snapshot
-    }
-}

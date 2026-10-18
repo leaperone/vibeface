@@ -7,7 +7,6 @@ pub struct VerifiedServiceDelegation {
     grant_leaf: ObjectHash,
     initiator: Actor,
     initiating_grant: Option<ObjectHash>,
-    account_grant: Option<ObjectHash>,
     heads: Vec<PolicyStamp>,
     expires_at_ms: u64,
 }
@@ -32,7 +31,6 @@ impl ServiceGrantCore {
             grant_leaf: self.grant_leaf,
             initiator: self.initiator,
             initiating_grant: self.initiating_grant,
-            account_grant: self.account_grant,
             heads: self.heads,
             expires_at_ms: self.expires_at_ms,
         }
@@ -879,7 +877,15 @@ mod tests {
         assert_eq!(proof.service(), &fixture.audience().service);
         assert_eq!(proof.initiator(), &Actor::Account(fixture.account.clone()));
         assert_eq!(proof.initiating_grant(), Some(&fixture.service_grant));
-        assert_eq!(proof.account_grant.as_ref(), Some(&fixture.owner_grant));
+        let initiating = fixture
+            .state
+            .grant(proof.initiating_grant().unwrap())
+            .unwrap();
+        assert_eq!(initiating.hash().unwrap(), fixture.service_grant);
+        assert_eq!(
+            initiating.payload.parent.as_ref(),
+            Some(&fixture.owner_grant)
+        );
         assert!(proof.expires_at_ms() > NOW + 100_000);
     }
 

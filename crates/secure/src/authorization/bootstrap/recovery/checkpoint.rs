@@ -142,14 +142,6 @@ fn object_hash(entry: &JournalEntry) -> Result<ObjectHash> {
     }
 }
 
-pub(crate) fn compact_recovery_material(material: &mut RecoveryMaterial, now: u64) -> Result<()> {
-    if zeroize::Zeroizing::new(canonical(material)?).len() <= MAX_RECOVERY_MATERIAL_BYTES {
-        return Ok(());
-    }
-    let state = replay_policies(&material.pins, &material.bundle.journal)?;
-    compact_recovery_material_in_state(material, &state, now)
-}
-
 pub(crate) fn compact_recovery_material_in_state(
     material: &mut RecoveryMaterial,
     state: &VerifiedPolicySet,

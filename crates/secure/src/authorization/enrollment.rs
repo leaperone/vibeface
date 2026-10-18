@@ -1371,7 +1371,7 @@ mod tests {
             &node.public_key_hex(),
             &encode(&pins).unwrap(),
             &encode(&Some(&selection)).unwrap(),
-            (NOW as f64),
+            NOW as f64,
             (NOW as f64) + 60_000.0,
         )
         .unwrap();
@@ -1405,7 +1405,7 @@ mod tests {
             &encode(&snapshot).unwrap(),
             &own,
             &node.public_key_hex(),
-            (NOW as f64),
+            NOW as f64,
         )
         .unwrap();
         let mut previous = snapshot.hash().unwrap();
@@ -1435,7 +1435,7 @@ mod tests {
             .unwrap();
             previous = page.hash().unwrap();
             import
-                .append_page(&encode(&page).unwrap(), (NOW as f64))
+                .append_page(&encode(&page).unwrap(), NOW as f64)
                 .unwrap();
         }
         let witness = Signed::sign(
@@ -1459,13 +1459,13 @@ mod tests {
             .finish(
                 &encode(&witness).unwrap(),
                 &encode(&selection).unwrap(),
-                (NOW as f64),
+                NOW as f64,
             )
             .unwrap();
         let confirmation_request_json = build_client_policy_auth_confirm_request(
             &authorization,
             &own,
-            (NOW as f64),
+            NOW as f64,
             (NOW as f64) + 30_000.0,
         )
         .unwrap();
@@ -1501,7 +1501,7 @@ mod tests {
             &confirmation_request_json,
             &encode(&confirmation).unwrap(),
             &node.public_key_hex(),
-            (NOW as f64),
+            NOW as f64,
         )
         .unwrap()
     }

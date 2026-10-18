@@ -444,10 +444,6 @@ impl EnrollmentPolicyImport {
         &self.usage
     }
 
-    pub(crate) fn descriptor(&self) -> &EnrollmentPolicyDescriptor {
-        &self.descriptor
-    }
-
     pub(crate) fn request(&self) -> &Signed<EnrollmentPolicyReadRequest> {
         &self.request
     }
