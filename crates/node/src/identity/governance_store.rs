@@ -27,7 +27,7 @@ struct SpaceCommitParams {
     request: SpaceGovernanceRequest,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionServiceSelectParams {
     account_id: AccountId,
@@ -338,10 +338,11 @@ impl Store {
                 .map(|value| format!("execution-service-source:{value}"))
                 .unwrap_or_else(|| "execution-service-source:".to_owned());
             tx.query_row(
-                "SELECT key,value FROM local_values WHERE space_id=? AND key LIKE 'execution-service-source:%' AND key>? ORDER BY key LIMIT 1",
+                "SELECT key,value FROM local_values WHERE space_id=? AND key LIKE 'execution-service-source:%' AND key>? AND key<'execution-service-source;' ORDER BY key LIMIT 1",
                 params![personal.as_str(), cursor], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?
         };
         let mut usage = source.proof_usage()?;
+        usage.record_metadata(&params)?;
         let mut selections = Vec::new();
         let mut next_cursor = None;
         if let Some((key, encoded)) = mapping {
@@ -370,11 +371,9 @@ impl Store {
                     &mapping.management_parent,
                     &node,
                     now_ms,
+                    &mut usage,
                 ) {
-                    Ok((selection, candidate_usage)) => {
-                        usage.merge(&candidate_usage);
-                        selections.push(selection);
-                    }
+                    Ok(selection) => selections.push(selection),
                     Err(error @ AuthorizationError::BudgetExceeded) => return Err(error.into()),
                     Err(_) => {}
                 }

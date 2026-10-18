@@ -267,20 +267,20 @@ fn verify_management_parent(
     parent: &ObjectHash,
     node: &PublicKey,
     now: u64,
-) -> Result<Budget> {
+    budget: &mut Budget,
+) -> Result<()> {
     let personal = SpaceId::personal(account);
     require(
         resource.space == personal,
         "execution service must belong to the physical owner's personal space",
     )?;
-    let mut budget = Budget::default();
     let mut dependencies = BTreeMap::new();
     let client = state.find_device(&DeviceId::from_key(signer))?;
     require(
         client.payload.owner == PolicyDomain::Account(account.clone())
             && client.payload.uses.contains(&DeviceUse::Noise)
             && client.payload.uses.contains(&DeviceUse::AccountInvocation)
-            && state.actor_for_signer(signer, now, &mut budget, &mut dependencies)?
+            && state.actor_for_signer(signer, now, budget, &mut dependencies)?
                 == Actor::Account(account.clone()),
         "execution selection requires the current physical owner's account client",
     )?;
@@ -297,13 +297,7 @@ fn verify_management_parent(
         .ok_or(AuthorizationError::PolicyConflict)?;
     state.ensure_personal_current(document)?;
     state.validate_service_reference(&personal, target)?;
-    state.validate_certificate(
-        target,
-        now,
-        &mut budget,
-        &mut dependencies,
-        &mut BTreeSet::new(),
-    )?;
+    state.validate_certificate(target, now, budget, &mut dependencies, &mut BTreeSet::new())?;
     let record = state.resource(&resource.space, &resource.resource).ok_or(
         AuthorizationError::InvalidProof("missing execution service resource"),
     )?;
@@ -332,8 +326,8 @@ fn verify_management_parent(
         "selected grant is not the execution service management parent",
     )?;
     let path = state.grant_chain(Some(parent))?;
-    state.verify_grant_path(&path, now, &mut budget, &mut dependencies, true)?;
-    Ok(budget)
+    state.verify_grant_path(&path, now, budget, &mut dependencies, true)?;
+    Ok(())
 }
 
 pub fn project_execution_service_selection(
@@ -345,20 +339,31 @@ pub fn project_execution_service_selection(
     parent: &ObjectHash,
     node: &PublicKey,
     now: u64,
-) -> Result<(ExecutionServiceSelection, ExecutionProofUsage)> {
+    usage: &mut ExecutionProofUsage,
+) -> Result<ExecutionServiceSelection> {
     let _signature_scope = ScopedSignatureVerification::new();
-    let budget = verify_management_parent(state, account, signer, resource, parent, node, now)?;
-    let mut usage = ExecutionProofUsage::default();
+    let mut budget = Budget::default();
+    let checked = verify_management_parent(
+        state,
+        account,
+        signer,
+        resource,
+        parent,
+        node,
+        now,
+        &mut budget,
+    );
     usage.record_budget(&budget)?;
-    usage.record_chain_depth(state.grant_chain(Some(parent))?.len());
-    Ok((
-        ExecutionServiceSelection {
-            source_project: source.clone(),
-            execution_resource: resource.clone(),
-            management_parent: parent.clone(),
-        },
-        usage,
-    ))
+    if let Ok(path) = state.grant_chain(Some(parent)) {
+        usage.record_chain_depth(path.len());
+    }
+    usage.enforce_limits()?;
+    checked?;
+    Ok(ExecutionServiceSelection {
+        source_project: source.clone(),
+        execution_resource: resource.clone(),
+        management_parent: parent.clone(),
+    })
 }
 
 /// The authenticated physical Node supplies the source mapping. Pins remain independent.
@@ -395,7 +400,8 @@ pub fn verify_execution_service_selection(
                 && authorization.audience_public_key == node,
             "execution selection differs from its imported authorization",
         )?;
-        let parent_budget = verify_management_parent(
+        let mut parent_budget = Budget::default();
+        verify_management_parent(
             snapshot.state(),
             &authorization.scope.account_id,
             &signer,
@@ -403,6 +409,7 @@ pub fn verify_execution_service_selection(
             &selection.management_parent,
             &node,
             now,
+            &mut parent_budget,
         )?;
         let mut current = revalidate_selected(authorization, snapshot, &resource, &signer, now)?;
         let mut usage = ExecutionProofUsage::default();
