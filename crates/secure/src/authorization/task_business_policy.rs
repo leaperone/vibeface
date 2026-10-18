@@ -778,15 +778,20 @@ impl VerifiedTaskBusinessSource {
         wire: &TaskBusinessWire,
         now: u64,
     ) -> Result<TaskBusinessScopedView> {
+        let _signatures = ScopedSignatureVerification::new();
         self.verify_wire(wire, now)?;
         self.verify_current_grant(primary, local_c, now)?;
+        let (_, mut usage) = task_business_primary_heads(primary, self.scope(), local_c, now)?;
+        usage.merge(self.proof_usage());
         let authority = local_authority(primary, self.scope())?;
         let local = policy_import::native_task_business_primary_snapshot(&authority)?;
         let combined = policy_import::merge_same_head_snapshots(&local, &self.snapshot)?;
+        finish_usage(&mut usage)?;
         Ok(TaskBusinessScopedView {
             source: self.clone(),
             combined,
             primary_heads: authority.heads,
+            usage,
         })
     }
 }
@@ -796,6 +801,7 @@ pub struct TaskBusinessScopedView {
     source: VerifiedTaskBusinessSource,
     combined: VerifiedPolicySnapshot,
     primary_heads: Vec<PolicyStamp>,
+    usage: ExecutionProofUsage,
 }
 
 impl TaskBusinessScopedView {
@@ -810,6 +816,9 @@ impl TaskBusinessScopedView {
     }
     pub fn foreign_heads(&self) -> &[PolicyStamp] {
         self.source.heads()
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
     }
     pub fn source(&self) -> &VerifiedTaskBusinessSource {
         &self.source
@@ -915,7 +924,12 @@ pub fn build_task_business_policy_export(
                 canonical_cwd: None,
                 execution_target_public_key: Some(scope.target_public_key.clone()),
             };
-            current.check_scope(&request_facts(request), current.selection(), &context, now)?;
+            current.check_business_observation_scope(
+                &request_facts(request),
+                current.selection(),
+                &context,
+                now,
+            )?;
         }
         TaskBusinessWire::Resolve(value) => {
             let admission = &value.resolution.account_admission;
@@ -1160,5 +1174,334 @@ impl TaskBusinessPolicyExport {
         self.complete = page.payload.complete;
         self.usage = usage;
         Ok(page)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        client_policy_import::require_confirmed_client_policy,
+        execution_observation::tests::{
+            RetainedHistoryFixture, retained_history_fixture_with_execution_source,
+        },
+        node_execution_policy::{
+            PolicyCarrierOrigin, approve_task_execution_policy, begin_task_policy_import,
+            task_policy_source_from_current,
+        },
+        remote_execution_policy::{
+            RemoteExecutionPolicyPurpose, RemoteExecutionPolicySelection,
+            tests::{confirmed_source, remote_policy_stream},
+            verify_remote_execution_policy_delegation_source,
+        },
+    };
+    use super::*;
+
+    fn current_policy(fixture: &RetainedHistoryFixture) -> VerifiedTaskCurrentPolicy {
+        let now = fixture.invocation.payload.not_before_ms;
+        let retained = require_confirmed_client_policy(&fixture.source).unwrap();
+        let project = fixture
+            .actual
+            .handoff
+            .handoff
+            .source_statement()
+            .unwrap()
+            .project;
+        let grant_leaf = retained
+            .state()
+            .grants
+            .values()
+            .find(|grant| {
+                grant.payload.actions.contains(&Action::ExecutionOpen)
+                    && grant.payload.grantee
+                        == Grantee::Actor(Actor::Account(fixture.source.scope.account_id.clone()))
+            })
+            .unwrap()
+            .hash()
+            .unwrap();
+        let source = confirmed_source(
+            &ClientAuthorizationBundle {
+                journal: retained.journal().to_vec(),
+                grant_leaf,
+            },
+            retained.pins(),
+            &fixture.client,
+            &fixture.project_node,
+            &project,
+            now,
+        )
+        .unwrap();
+        let source_policy = require_confirmed_client_policy(&source).unwrap();
+        let leaf = fixture
+            .state
+            .grant(&fixture.actual.handoff.invocation.payload.grant_leaf)
+            .unwrap();
+        let ResourceScope::Exact(resource) = &leaf.payload.scope else {
+            panic!("fixture grant is not exact")
+        };
+        let selection = RemoteExecutionPolicySelection {
+            execution_resource: resource.clone(),
+            target_public_key: PublicKey::of(&fixture.executor),
+            execution_grant: leaf.hash().unwrap(),
+        };
+        let mut context = leaf.payload.constraints.context.clone();
+        context.workspace_resource = Some(project.resource.clone());
+        let context = prepare::PrepareContext {
+            context,
+            binding_generation: Some(1),
+            canonical_cwd: Some("/tmp".into()),
+            execution_target_public_key: Some(PublicKey::of(&fixture.executor)),
+        };
+        let stream = remote_policy_stream(
+            &source,
+            &fixture.client,
+            &fixture.project_node,
+            &fixture.execution_bundle,
+            &fixture.pins,
+            &fixture.executor,
+            &selection,
+            &context,
+            Action::ExecutionOpen,
+            RemoteExecutionPolicyPurpose::Execution,
+            now,
+        )
+        .unwrap();
+        let current = verify_remote_execution_policy_delegation_source(
+            source_policy.state(),
+            &stream.request.intent,
+            &PublicKey::of(&fixture.project_node),
+            &PublicKey::of(&fixture.client),
+            now,
+        )
+        .unwrap();
+        let trust =
+            approve_task_execution_policy(&current, None, &fixture.project_node, now).unwrap();
+        let source = task_policy_source_from_current(&current, source_policy.pins(), now).unwrap();
+        let mut import = begin_task_policy_import(
+            &trust,
+            &source,
+            &stream.request,
+            &stream.header,
+            &[],
+            PolicyCarrierOrigin::SignedTranscript,
+            now,
+        )
+        .unwrap();
+        for page in &stream.pages {
+            import.append_page(page, now).unwrap();
+        }
+        import.finish_current(&stream.witness, now).unwrap()
+    }
+
+    fn noise_peer(source: &Identity, target: &Identity) -> ActualPolicyNoisePeer {
+        let mut source_handshake = crate::Handshake::new(
+            true,
+            &source.secret_hex(),
+            Some(target.node_id()),
+            b"task-business-policy-test",
+        )
+        .unwrap();
+        let mut target_handshake = crate::Handshake::new(
+            false,
+            &target.secret_hex(),
+            Some(source.node_id()),
+            b"task-business-policy-test",
+        )
+        .unwrap();
+        target_handshake
+            .read(&source_handshake.write(&[]).unwrap())
+            .unwrap();
+        source_handshake
+            .read(&target_handshake.write(&[]).unwrap())
+            .unwrap();
+        target_handshake
+            .read(&source_handshake.write(&[]).unwrap())
+            .unwrap();
+        ActualPolicyNoisePeer::from_finished_handshake(&target_handshake).unwrap()
+    }
+
+    fn original_authorization(
+        state: &VerifiedPolicySet,
+        wire: &SignedExecutionHandoff,
+        now: u64,
+    ) -> VerifiedAuthorization {
+        let event: Event =
+            serde_json::from_str(&wire.handoff.project_dispatch.canonical_body).unwrap();
+        let EventCause::Invocation { admission } = event.cause else {
+            panic!("fixture lacks original admission")
+        };
+        let facts = request_facts(&admission.invocation.payload);
+        let historical =
+            remote_resolution_history::at_heads(state, &admission.challenge.policies).unwrap();
+        let admitted =
+            remote_resolution_history::admitted(&historical, &admission, &facts).unwrap();
+        state
+            .verify_operation_authorization(
+                &admitted,
+                &facts,
+                &admission.transport.into_evidence(),
+                now,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn task_business_source_uses_local_grant_roots_real_noise_and_exact_wire() {
+        let fixture = retained_history_fixture_with_execution_source();
+        let now = fixture.invocation.payload.not_before_ms;
+        let current = current_policy(&fixture);
+        let wire = TaskBusinessWire::Submit(fixture.actual.handoff.clone());
+        let original = original_authorization(current.state(), &fixture.actual.handoff, now);
+        let transport = TransportEvidence::VerifiedPeer {
+            origin: DeviceId::from_key(&PublicKey::of(&fixture.project_node)),
+        };
+        let verified = current
+            .state()
+            .verify_execution_handoff(&fixture.actual.handoff, &original, &transport, None, now)
+            .unwrap();
+        let mut export = build_task_business_policy_export(
+            &current,
+            TaskBusinessAuthorization::Submit(&verified),
+            &wire,
+            &fixture.project_node,
+            now,
+        )
+        .unwrap();
+        let source = require_confirmed_client_policy(&fixture.source).unwrap();
+        let mut pages = Vec::new();
+        for entry in source.journal() {
+            if export.allows_entry(entry).unwrap() {
+                pages.push(
+                    export
+                        .append_entry_page(&fixture.project_node, entry.clone(), now)
+                        .unwrap(),
+                );
+            }
+        }
+        let (last, witness) = export.finish_pages(&fixture.project_node, now).unwrap();
+        pages.push(last);
+        let c_primary = &fixture.state;
+        assert!(
+            c_primary
+                .resource(
+                    &export.scope().source_project.space,
+                    &export.scope().source_project.resource
+                )
+                .is_none()
+        );
+        assert!(
+            c_primary
+                .find_device(&DeviceId::from_key(&PublicKey::of(&fixture.project_node)))
+                .is_err()
+        );
+        let peer = noise_peer(&fixture.project_node, &fixture.executor);
+        let c_key = PublicKey::of(&fixture.executor);
+        let mut import =
+            begin_task_business_policy_import(c_primary, &peer, export.header(), &c_key, &[], now)
+                .unwrap();
+        let wrong_peer = noise_peer(&fixture.client, &fixture.executor);
+        assert!(
+            begin_task_business_policy_import(
+                c_primary,
+                &wrong_peer,
+                export.header(),
+                &c_key,
+                &[],
+                now
+            )
+            .is_err()
+        );
+        let mut wrong_header = export.header().payload.clone();
+        wrong_header.scope.binding_generation += 1;
+        wrong_header.scope.task_ref = EventRef::parse(&"fe".repeat(32)).unwrap();
+        let wrong_header = Signed::sign(wrong_header, &fixture.project_node).unwrap();
+        assert!(
+            begin_task_business_policy_import(c_primary, &peer, &wrong_header, &c_key, &[], now)
+                .is_err()
+        );
+        let mut wrong_roots = export.pins().to_vec();
+        wrong_roots[0].genesis_root = PublicKey::of(&fixture.client);
+        assert!(
+            begin_task_business_policy_import(
+                c_primary,
+                &peer,
+                export.header(),
+                &c_key,
+                &wrong_roots,
+                now
+            )
+            .is_err()
+        );
+        if pages.len() > 1 {
+            assert!(import.append_page(&pages[1], now).is_err());
+        }
+        assert!(import.clone().finish(&witness, now).is_err());
+        for page in &pages {
+            import.append_page(page, now).unwrap();
+            import.append_page(page, now).unwrap();
+            assert!(import.proof_usage().counts().authorization_bytes <= MAX_PROOF_BYTES);
+            assert!(import.proof_usage().counts().unique_signatures <= MAX_PROOF_SIGNATURES);
+        }
+        let source = import.finish(&witness, now).unwrap();
+        assert_eq!(
+            source.original_page_envelope_hashes(),
+            pages
+                .iter()
+                .map(ObjectHash::body)
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+        );
+        source.verify_wire(&wire, now).unwrap();
+        let mut changed = fixture.actual.handoff.clone();
+        changed.invocation.payload.operation_id.push_str("-changed");
+        assert!(
+            source
+                .verify_wire(&TaskBusinessWire::Submit(changed), now)
+                .is_err()
+        );
+        assert!(
+            source
+                .verify_wire(&wire, export.header().payload.expires_at_ms)
+                .is_err()
+        );
+        let view = source.scoped_view(c_primary, &c_key, &wire, now).unwrap();
+        assert!(
+            view.state()
+                .resource(
+                    &source.scope().source_project.space,
+                    &source.scope().source_project.resource
+                )
+                .is_some()
+        );
+        let original = original_authorization(view.state(), &fixture.actual.handoff, now);
+        assert!(
+            c_primary
+                .verify_execution_handoff(&fixture.actual.handoff, &original, &transport, None, now)
+                .is_err()
+        );
+        let accepted = view
+            .state()
+            .verify_execution_handoff(&fixture.actual.handoff, &original, &transport, None, now)
+            .unwrap();
+        let mut usage = view.proof_usage().clone();
+        usage.merge(accepted.proof_usage());
+        usage.enforce_limits().unwrap();
+        let mut floor = source.pins().to_vec();
+        floor[0].minimum_head.as_mut().unwrap().sequence += 1;
+        assert!(source.check_saved_floors(&floor).is_err());
+        let mut revoked = c_primary.clone();
+        let domain = PolicyDomain::Space(source.scope().execution_resource.space.clone());
+        let mut space = revoked
+            .space(&source.scope().execution_resource.space)
+            .unwrap()
+            .clone();
+        space.previous = revoked.head(&domain).cloned();
+        space.sequence += 1;
+        space
+            .grants
+            .retain(|hash| hash != &source.scope().execution_grant);
+        revoked
+            .install_space(Signed::sign(space, &fixture.root).unwrap())
+            .unwrap();
+        assert!(source.scoped_view(&revoked, &c_key, &wire, now).is_err());
     }
 }
