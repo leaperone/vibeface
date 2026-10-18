@@ -514,6 +514,10 @@ pub fn verify_remote_execution_history_acceptance(
         "historical policy proof changed its exact heads or decision time",
     )?;
     validate_window(issued, expires, decision_at_ms)?;
+    require(
+        expires - issued <= EXECUTION_LEASE_MS,
+        "historical freshness proof exceeds its original window limit",
+    )?;
     validate_window(
         reference.old_submission.payload.not_before_ms,
         reference.old_submission.payload.expires_at_ms,
@@ -702,4 +706,177 @@ pub fn verify_remote_execution_history_policy(
         decision_at_ms: accepted.decision_at_ms,
         usage,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authorization::execution_observation::tests::retained_history_fixture;
+
+    const NOW: u64 = 10_000;
+
+    fn wire<T: Serialize>(value: &T) -> String {
+        serde_json::to_string(value).unwrap()
+    }
+
+    #[test]
+    fn retained_result_uses_its_original_acceptance_after_the_execution_grant_is_revoked() {
+        let mut fixture = retained_history_fixture();
+        let actual = wire(&fixture.actual);
+        let body = wire(&fixture.body);
+        let invocation = wire(&fixture.invocation);
+        let binding = wire(&fixture.binding);
+        let reference = derive_reference(&actual, &body, &invocation, &binding).unwrap();
+        assert_eq!(
+            reference.actual_hash,
+            ObjectHash::body(&fixture.actual).unwrap()
+        );
+        assert_eq!(
+            reference.expected_body_hash,
+            ObjectHash::body(&fixture.body).unwrap()
+        );
+        assert_eq!(
+            reference.expected_invocation_hash,
+            ObjectHash::body(&fixture.invocation).unwrap()
+        );
+        assert_eq!(
+            reference.expected_binding_hash,
+            Some(ObjectHash::body(&fixture.binding).unwrap())
+        );
+        assert_eq!(
+            reference.dispatch_envelope_hash,
+            ObjectHash::body(&fixture.actual.handoff.handoff.project_dispatch).unwrap()
+        );
+        let target = PublicKey::of(&fixture.executor);
+        let checked = verify_remote_execution_history_policy(
+            &fixture.state,
+            &reference,
+            &fixture.acceptance,
+            &fixture.pins,
+            &target,
+            NOW + 20,
+        )
+        .unwrap();
+        assert_eq!(checked.decision_at_ms(), NOW);
+        assert_ne!(
+            checked.decision_at_ms(),
+            fixture.actual.receipt.payload.issued_at_ms
+        );
+        let mut document = fixture
+            .state
+            .space(&reference.execution_resource().space)
+            .unwrap()
+            .clone();
+        document.previous = fixture
+            .state
+            .head(&PolicyDomain::Space(document.space.clone()))
+            .cloned();
+        document.sequence += 1;
+        document
+            .grants
+            .retain(|hash| hash != reference.grant_leaf());
+        fixture
+            .state
+            .install_space(Signed::sign(document, &fixture.root).unwrap())
+            .unwrap();
+        for pin in &mut fixture.pins {
+            pin.minimum_head = fixture.state.head(&pin.domain).cloned();
+        }
+        let rejected_now = fixture
+            .state
+            .grant_chain(Some(reference.grant_leaf()))
+            .unwrap();
+        assert!(
+            fixture
+                .state
+                .verify_grant_path(
+                    &rejected_now,
+                    NOW + 20,
+                    &mut Budget::default(),
+                    &mut BTreeMap::new(),
+                    true
+                )
+                .is_err()
+        );
+        let history = verify_remote_execution_history_policy(
+            &fixture.state,
+            &reference,
+            &fixture.acceptance,
+            &fixture.pins,
+            &target,
+            NOW + 20,
+        )
+        .unwrap();
+        assert_eq!(history.decision_at_ms(), NOW);
+        assert!(
+            history
+                .target_heads()
+                .iter()
+                .all(|head| fixture.state.head(&head.domain) == Some(head))
+        );
+        let mut wrong_pins = fixture.pins.clone();
+        wrong_pins[0].genesis_root = reference.source.issuer.clone();
+        assert!(
+            verify_remote_execution_history_policy(
+                &fixture.state,
+                &reference,
+                &fixture.acceptance,
+                &wrong_pins,
+                &target,
+                NOW + 20
+            )
+            .is_err()
+        );
+        let mut wrong_body = fixture.body.clone();
+        wrong_body["authorization_id"] = Value::String("another-operation".into());
+        assert!(derive_reference(&actual, &wire(&wrong_body), &invocation, &binding).is_err());
+        assert!(derive_reference(&actual, &body, &invocation, "null").is_err());
+        let mut wrong_binding = fixture.binding.clone();
+        wrong_binding.binding.generation += 1;
+        assert!(derive_reference(&actual, &body, &invocation, &wire(&wrong_binding)).is_err());
+    }
+
+    #[test]
+    fn terminal_proof_time_requires_an_existing_nonempty_window_intersection() {
+        let fixture = retained_history_fixture();
+        let reference = derive_reference(
+            &wire(&fixture.actual),
+            &wire(&fixture.body),
+            &wire(&fixture.invocation),
+            &wire(&fixture.binding),
+        )
+        .unwrap();
+        let RemoteExecutionHistoryAcceptance::ExecutionResult {
+            freshness: original,
+            ..
+        } = fixture.acceptance
+        else {
+            panic!("fixture must retain an original executor admission")
+        };
+        let challenge = ExecutionHandoffResolutionChallenge {
+            version: AUTH_VERSION,
+            resolution_hash: ObjectHash::body(&"resolution").unwrap(),
+            resolver_invocation_hash: reference.account_invocation_hash.clone(),
+            submission_invocation_hash: reference.old_submission.hash().unwrap(),
+            policies: original.challenge.policies,
+            nonce: Nonce::random().unwrap(),
+            issued_at_ms: NOW + 5,
+            expires_at_ms: NOW + 80,
+        };
+        let mut freshness = ExecutionHandoffResolutionFreshness {
+            challenge,
+            receipts: original.receipts,
+        };
+        for receipt in &mut freshness.receipts {
+            receipt.payload.issued_at_ms = NOW + 20;
+            receipt.payload.expires_at_ms = NOW + 70;
+        }
+        assert_eq!(
+            proof_time(&reference, &freshness, &fixture.actual.receipt, NOW + 20).unwrap(),
+            NOW + 20
+        );
+        assert!(proof_time(&reference, &freshness, &fixture.actual.receipt, NOW + 19).is_err());
+        freshness.receipts[0].payload.expires_at_ms = NOW + 20;
+        assert!(proof_time(&reference, &freshness, &fixture.actual.receipt, NOW + 40).is_err());
+    }
 }

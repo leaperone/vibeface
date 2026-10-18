@@ -944,7 +944,7 @@ impl VerifiedPolicySet {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::Signer;
     use serde_json::{Value, json};
@@ -1140,6 +1140,186 @@ mod tests {
         execution_grant: ObjectHash,
         old_execution_grant: ObjectHash,
         original_usage: ExecutionProofUsage,
+    }
+
+    pub(crate) struct RetainedHistoryFixture {
+        pub(crate) state: VerifiedPolicySet,
+        pub(crate) actual: ExecutionHandoffResult,
+        pub(crate) acceptance: remote_execution_history::RemoteExecutionHistoryAcceptance,
+        pub(crate) body: Value,
+        pub(crate) invocation: Signed<Invocation>,
+        pub(crate) binding: SignedBinding,
+        pub(crate) pins: Vec<PolicyPin>,
+        pub(crate) executor: Identity,
+        pub(crate) root: Identity,
+    }
+
+    pub(crate) fn retained_history_fixture() -> RetainedHistoryFixture {
+        let fixture = Fixture::new();
+        let event: Event =
+            serde_json::from_str(&fixture.original.handoff.project_dispatch.canonical_body)
+                .unwrap();
+        let EventCause::Invocation { admission: proof } = event.cause else {
+            panic!("fixture has no admission")
+        };
+        let mut heads: BTreeMap<_, _> = proof
+            .challenge
+            .policies
+            .iter()
+            .cloned()
+            .map(|head| (head.domain.clone(), head))
+            .collect();
+        for head in &fixture.original.invocation.payload.expected_policies {
+            heads.insert(head.domain.clone(), head.clone());
+        }
+        let historical = remote_resolution_history::at_heads(
+            &fixture.state,
+            &heads.into_values().collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let facts = RequestFacts {
+            resource: proof.invocation.payload.resource.clone(),
+            action: proof.invocation.payload.action,
+            audience: proof.invocation.payload.audience.clone(),
+            operation_id: proof.invocation.payload.operation_id.clone(),
+            body_hash: ObjectHash::body(&proof.source_body).unwrap(),
+            context: proof.invocation.payload.context.clone(),
+        };
+        let original = historical
+            .verify_invocation(
+                &proof.invocation,
+                &facts,
+                &proof.transport.clone().into_evidence(),
+                NOW,
+            )
+            .unwrap();
+        let fresh = historical
+            .verify_freshness(&original, &proof.challenge, &proof.receipts, NOW)
+            .unwrap();
+        let admitted = historical.admit_operation(&original, &fresh, NOW).unwrap();
+        let original = historical
+            .verify_operation_authorization(
+                &admitted,
+                &facts,
+                &proof.transport.clone().into_evidence(),
+                NOW,
+            )
+            .unwrap();
+        let transport = StoredTransport::VerifiedPeer {
+            origin: fixture.original.invocation.payload.presenter.clone(),
+        };
+        let handoff = historical
+            .verify_execution_handoff(
+                &fixture.original,
+                &original,
+                &transport.clone().into_evidence(),
+                None,
+                NOW,
+            )
+            .unwrap();
+        let challenge = ExecutionHandoffChallenge::new(
+            &handoff,
+            CheckStage::Admit,
+            Nonce::random().unwrap(),
+            NOW,
+            NOW + 1_000,
+        )
+        .unwrap();
+        let freshness = ExecutionHandoffFreshness {
+            receipts: receipts(
+                &historical,
+                handoff.dependencies(),
+                &challenge.hash().unwrap(),
+                NOW,
+                &[&fixture.project.node, &fixture.executor.node],
+            ),
+            challenge,
+        };
+        let fresh = historical
+            .verify_execution_handoff_freshness(&handoff, &freshness, NOW)
+            .unwrap();
+        historical
+            .admit_execution_handoff(&handoff, &fresh, NOW)
+            .unwrap();
+        let checkpoint = Signed::sign(
+            ExecutionHandoffAdmissionReceipt::new(&fixture.original, &freshness, &transport, NOW)
+                .unwrap(),
+            &fixture.executor.node,
+        )
+        .unwrap();
+        let accepted = verify_execution_handoff_admission_checkpoint(
+            &fixture.original,
+            &checkpoint,
+            &freshness,
+            &transport,
+            NOW,
+        )
+        .unwrap();
+        historical
+            .verify_execution_handoff(
+                &fixture.original,
+                &original,
+                &transport.clone().into_evidence(),
+                Some(&accepted),
+                NOW,
+            )
+            .unwrap();
+        let result = json!({"state":"completed"});
+        let source = fixture
+            .original
+            .handoff
+            .source_attestation
+            .as_ref()
+            .unwrap();
+        let receipt = Signed::sign(
+            ExecutionHandoffReceipt {
+                version: AUTH_VERSION,
+                operation_id: source.payload.operation_id.clone(),
+                original_space_id: source.payload.project.space.clone(),
+                execution_space_id: fixture.original.handoff.execution_resource.space.clone(),
+                handoff_hash: fixture.original.hash().unwrap(),
+                target: fixture.executor.audience().device,
+                session_id: source.payload.execution_session.session_id.clone(),
+                binding_generation: source.payload.binding_generation,
+                state: ExecutionHandoffState::Succeeded,
+                result_hash: ObjectHash::body(&result).unwrap(),
+                session: None,
+                issued_at_ms: NOW + 10,
+            },
+            &fixture.executor.node,
+        )
+        .unwrap();
+        let actual = ExecutionHandoffResult {
+            handoff: fixture.original,
+            receipt,
+            result,
+        };
+        verify_execution_handoff_receipt_signature(
+            &actual.handoff,
+            &actual.receipt,
+            &actual.result,
+        )
+        .unwrap();
+        let binding =
+            serde_json::from_value(proof.source_body["request"]["binding"].clone()).unwrap();
+        let state =
+            replay_policies(&fixture.executor.pins, &fixture.executor.bundle.journal).unwrap();
+        RetainedHistoryFixture {
+            state,
+            actual,
+            acceptance:
+                remote_execution_history::RemoteExecutionHistoryAcceptance::ExecutionResult {
+                    receipt: checkpoint,
+                    freshness,
+                    transport,
+                },
+            body: proof.source_body,
+            invocation: proof.invocation,
+            binding,
+            pins: fixture.executor.pins,
+            executor: fixture.executor.node,
+            root: fixture.executor.root,
+        }
     }
 
     fn receipts(
