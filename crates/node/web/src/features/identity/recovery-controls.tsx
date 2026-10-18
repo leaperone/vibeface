@@ -35,7 +35,7 @@ export function RecoveryReview() {
     <h2 id="recovery-review-title" className="font-semibold">{review.kind === 'bootstrap' ? '先保存加密恢复包' : '确认恢复后的设备授权'}</h2>
     <p className="break-all font-mono text-xs">个人网络 {review.networkId}</p>
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-    <p role="status" className="text-sm text-muted-foreground">{busy ? '正在提交授权，请等待设备确认。' : '恢复根私钥只在此可信客户端使用。未加密私钥不会发送给节点。'}</p>
+    <p role="status" className="text-sm text-muted-foreground">{busy ? '正在提交授权，请等待设备确认。' : review.kind === 'bootstrap' ? '创建网络的根私钥只在此浏览器里使用，不会发给节点。' : '恢复根私钥只在此可信客户端使用。未加密私钥不会发送给节点。'}</p>
     {review.kind === 'bootstrap' ? <form className="space-y-4" onSubmit={event => {
       event.preventDefault(); const checkbox = event.currentTarget.elements.namedItem('saved')
       void run(() => device.confirmBootstrap(checkbox instanceof HTMLInputElement && checkbox.checked))
@@ -54,7 +54,7 @@ export function RecoveryReview() {
         await device.confirmRecovery(selected)
       })
     }}>
-      <p className="text-sm text-muted-foreground">明确选择保留的设备。旧管理客户端默认不保留。离线节点需要收到恢复记录后才会拒绝旧授权。业务正文与工程文件仍依赖现存副本。</p>
+      <p className="text-sm text-muted-foreground">非管理成员默认留下，旧管理端默认不选。当前节点必须留下。</p>
       <fieldset disabled={busy} className="space-y-4">{review.members.map(member => <div key={member.subject_id} className="space-y-2 rounded-lg border border-border p-3"><label className="flex min-h-11 items-center gap-2 break-all text-sm"><input type="checkbox" name={`keep-${member.subject_id}`} defaultChecked={!member.manage || member.subject_id === review.requiredNode} disabled={member.subject_id === review.requiredNode} />保留 {member.name}{member.subject_id === review.requiredNode ? '（当前目标，必须保留）' : ''}</label><p className="break-all font-mono text-xs text-muted-foreground">{member.subject_id}</p>{member.kind === 'client' ? <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" name={`manage-${member.subject_id}`} />允许此客户端管理设备</label> : <p className="text-xs text-muted-foreground">节点角色 {member.node_roles.join('、')}</p>}</div>)}</fieldset>
       <p className="break-all text-sm">此浏览器「{review.newManager.name}」将成为管理客户端。</p><p className="break-all font-mono text-xs text-muted-foreground">{review.newManager.subject_id}</p>
       <Button className={button} type="submit" disabled={busy}>签名确认并恢复管理权限</Button>
@@ -65,7 +65,7 @@ export function RecoveryReview() {
   </Card>
 }
 
-export function RecoveryControls() {
+export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) {
   const device = useDevice()
   const [busy, setBusy] = useState(false)
   const pending = useRef(false)
@@ -81,8 +81,8 @@ export function RecoveryControls() {
     {device.ready && device.review && <RecoveryReview />}
     {error && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error}</p>}
     {(busy || status) && <p role="status" className="text-sm text-muted-foreground">{busy ? '正在验证恢复包及目标设备…' : status}</p>}
-    <Card className="gap-0 py-0">
-      <Collapsible>
+    {only !== 'passphrase' && <Card className="gap-0 py-0">
+      <Collapsible defaultOpen={only === 'restore'}>
         <CollapsibleTrigger asChild><Button variant="ghost" className={disclosure} type="button"><span className="font-semibold">恢复管理权限</span><ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform" /></Button></CollapsibleTrigger>
         <CollapsibleContent forceMount className="space-y-4 px-5 pb-5 data-[state=closed]:hidden">
           <p className="text-sm text-muted-foreground">恢复根私钥不会上传节点。恢复只重建授权，聊天正文和工程文件仍需可用副本。</p>
@@ -106,9 +106,9 @@ export function RecoveryControls() {
           </fieldset></form>
         </CollapsibleContent>
       </Collapsible>
-    </Card>
-    <Card className="gap-0 py-0">
-      <Collapsible>
+    </Card>}
+    {only !== 'restore' && <Card className="gap-0 py-0">
+      <Collapsible defaultOpen={only === 'passphrase'}>
         <CollapsibleTrigger asChild><Button variant="ghost" className={disclosure} type="button"><span className="font-semibold">更换恢复包口令</span><ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform" /></Button></CollapsibleTrigger>
         <CollapsibleContent forceMount className="space-y-4 px-5 pb-5 data-[state=closed]:hidden">
           <p className="text-sm text-muted-foreground">生成使用新口令的文件。原文件仍可用原口令解锁，请分别保管。</p>
@@ -127,6 +127,6 @@ export function RecoveryControls() {
           </fieldset></form>
         </CollapsibleContent>
       </Collapsible>
-    </Card>
+    </Card>}
   </div>
 }

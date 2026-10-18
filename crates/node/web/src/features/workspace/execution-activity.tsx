@@ -16,7 +16,7 @@ import { ActionButton, DetailList, StatusBadge, SubmitButton } from "./present"
 import { reconcileDecision } from "./reconcile"
 import type { ExecutionActivityRecord, HumanRequest, OperationRecord, PendingOperation } from "./types"
 
-export function ExecutionActivity({ execution, conversationId }: { execution: ExecutionActivityRecord; conversationId: string }) {
+export function ExecutionActivity({ execution, conversationId, compact = false }: { execution: ExecutionActivityRecord; conversationId: string; compact?: boolean }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const id = useId()
@@ -26,9 +26,15 @@ export function ExecutionActivity({ execution, conversationId }: { execution: Ex
   const pending = workspace.pending.filter((item) => item.conversation_id === conversationId && (item.execution_control?.expected_operation_id === execution.operation_id || item.target_node === execution.target_node && execution.session_id !== null && item.session_id === execution.session_id))
   const canControl = workspace.writable && Boolean(workspace.selectedBot) && targetOnline && execution.state !== "unknown" && execution.session_state !== "unknown" && execution.freshness !== "unknown" && pending.length === 0
   const followupMode = execution.goal?.followup_mode
+  if (compact) {
+    if (!execution.pending_requests.length) return null
+    return <div className="grid gap-3">
+      {execution.pending_requests.map((request) => <ExecutionApproval key={`${typeof request.request_id}:${request.request_id}`} execution={execution} request={request} canRespond={execution.capabilities.includes("respond_request")} disabled={!canControl} />)}
+    </div>
+  }
   return <Card>
     <CardHeader className="flex flex-wrap items-start justify-between gap-3">
-      <CardTitle className="min-w-0 flex-1 break-words">{execution.title || "后台工作"}</CardTitle>
+      <CardTitle className="min-w-0 flex-1 break-words">{execution.title || "执行"}</CardTitle>
       <StatusBadge value={execution.state} />
     </CardHeader>
     <CardContent className="space-y-3">
@@ -41,10 +47,11 @@ export function ExecutionActivity({ execution, conversationId }: { execution: Ex
         <ActionButton disabled={!workspace.connectionOnline} action={() => workspace.run(() => workspace.refreshExecution(execution.operation_id))}>核对进展</ActionButton>
         {execution.capabilities.includes("interrupt") ? <ActionButton disabled={!canControl} variant="destructive" action={() => workspace.run(() => workspace.executionControl(execution.operation_id, { type: "interrupt" }))}>停止当前执行</ActionButton> : null}
       </div>
-      {followupMode === "continue" || followupMode === "report" ? <section className="space-y-2 rounded-lg bg-muted p-3" aria-label="后续处理">
-        <p className="text-sm">{followupMode === "continue" ? "已授权继续处理这项工作。" : "已授权自动汇报这项工作的结果。"}</p>
-        <ActionButton disabled={!workspace.writable} action={() => workspace.run(() => workspace.stopFollowup(execution.operation_id))}>停止后续处理</ActionButton>
-        <p className="text-xs text-muted-foreground">停止后续处理不会中断已经开始的执行。</p>
+      {execution.capabilities.includes("interrupt") ? <p className="text-xs text-muted-foreground">只停这一次执行。</p> : null}
+      {followupMode === "continue" || followupMode === "report" ? <section className="space-y-2 rounded-lg bg-muted p-3" aria-label="后续任务">
+        <p className="text-sm">{followupMode === "continue" ? "已授权这项工作完成后继续。" : "已授权这项工作完成后自动汇报。"}</p>
+        <ActionButton disabled={!workspace.writable} action={() => workspace.run(() => workspace.stopFollowup(execution.operation_id))}>取消后续任务</ActionButton>
+        <p className="text-xs text-muted-foreground">只取消还没开始的后续。不改已经发出的消息。</p>
       </section> : null}
       {execution.capabilities.includes("steer") ? <Collapsible>
         <CollapsibleTrigger asChild><Button type="button" variant="ghost" disabled={!canControl} className="min-h-9 px-0">补充说明<ChevronDownIcon aria-hidden="true" /></Button></CollapsibleTrigger>

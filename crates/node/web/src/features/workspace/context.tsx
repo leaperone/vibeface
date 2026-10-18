@@ -5,7 +5,7 @@ import type { ReadyConnection } from "@/lib/node"
 import { mergeProgress, type LiveProgress } from "@/lib/progress"
 import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import { conversationHref } from "./entry-url"
-import { isIncomplete, mergeBasis, missingCount } from "./labels"
+import { isIncomplete, mergeBasis } from "./labels"
 import {
   frontierMap, inputText, parseConversation, parseNodes, parseNotifications, parseOperation,
   parsePending, parsePendingMessages, parseBot, parseBots, parseCreateBot, parsePendingBot, record,
@@ -154,7 +154,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (seen.has(item.notification_id)) continue
       seen.add(item.notification_id)
       try {
-        const popup = new Notification("Vibeface · 任务进展", { body: item.text, tag: item.notification_id })
+        const popup = new Notification("Vibeface · 进展", { body: item.text, tag: item.notification_id })
         popup.onclick = () => {
           if (!current()) { popup.close(); return }
           window.focus(); selectConversation(item.conversation_id); setView("chat")
@@ -294,10 +294,10 @@ function useWorkspaceState(connection: ReadyConnection) {
     setNoticeText(interrupt ? "停止请求已接收，是否结束以执行设备的最终结果为准。" : "本人操作已接收，请查看最新进展。")
     if (activeId.current === request.conversation_id) await refreshRef.current()
   }
-  const submitMessage = async (text: string) => {
+  const submitMessage = async (text: string, reportResults: boolean) => {
     const context = requireContext(), id = activeId.current
     const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
-    const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: null, entryNode: connection.entry.node_id, pending: prior, heads: context.heads, reportResults: true })
+    const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: null, entryNode: connection.entry.node_id, pending: prior, heads: context.heads, reportResults })
     if (!prepared.ok) throw new Error(prepared.error)
     replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])
     try {
@@ -346,11 +346,11 @@ function useWorkspaceState(connection: ReadyConnection) {
     setView("chat")
     await refreshRef.current()
   }
-  const sendMessage = (input: string) => withMutation(`message:${activeId.current}`, async () => {
+  const sendMessage = (input: string, reportResults = false) => withMutation(`message:${activeId.current}`, async () => {
     if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选择机器人。")
     const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)
-    try { await submitMessage(text) } finally { if (current()) setMessageBusy(false) }
+    try { await submitMessage(text, reportResults) } finally { if (current()) setMessageBusy(false) }
   })
   const incomplete = !data || isIncomplete(data.missing)
   const messagePending = pendingMessages.find((item) => item.conversation_id === conversationId) ?? null
@@ -365,7 +365,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       : writeState === "unsupported" ? "浏览器未能提供跨页面写锁，此页只读。请使用支持 Web Locks 的安全浏览器入口。"
       : writeState === "checking" ? "正在核对浏览器设备的写入权限。" : "",
     syncText: !data ? "发一条消息开始对话。" : incomplete
-      ? `上下文尚未完整，已暂停派发。缺少事件 ${missingCount(data.missing.events)}，附件 ${missingCount(data.missing.blobs)}，冲突 ${missingCount(data.missing.conflicts)}。`
+      ? "对话还在同步。"
       : `此入口已取得已知上下文，共 ${data.heads.length} 个历史位置。其他离线设备可能仍有未同步记录。`,
     refresh, run, announce: setNoticeText, notificationButton,
     selectBot,
@@ -411,8 +411,8 @@ function useWorkspaceState(connection: ReadyConnection) {
       requireCurrent()
       const job = record(receipt.job)
       if (receipt.publication_pending === true) setNoticeText("本轮已有结果，正在补齐发布；未提交停止请求。")
-      else if (receipt.cancel_requested === true && job.state === "cancelled") setNoticeText("本轮回复已停止。已派出的后台任务会单独继续。")
-      else if (receipt.cancel_requested === true) setNoticeText("已提交停止回复请求。已派出的后台任务会单独继续，最终状态以核对结果为准。")
+      else if (receipt.cancel_requested === true && job.state === "cancelled") setNoticeText("本轮回复已停止。已经派出的执行会单独继续。")
+      else if (receipt.cancel_requested === true) setNoticeText("已提交停止本轮回复。已经派出的执行会单独继续，最终状态以核对结果为准。")
       else setNoticeText("本轮当前状态未接受停止请求，请核对最新状态。")
       if (activeId.current === id) await refreshRef.current()
     }),
@@ -451,7 +451,7 @@ function useWorkspaceState(connection: ReadyConnection) {
         throw caught
       }
       requireCurrent()
-      setNoticeText("已停止后续处理。正在运行的执行可单独停止。")
+      setNoticeText("已取消后续任务。正在跑的执行不会因此停止。")
       if (activeId.current === id) await refreshRef.current()
     }),
     resolveManagerUnknown: (trigger: string, evidence: string) => withMutation(`resolve-manager:${trigger}`, async () => {

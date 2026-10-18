@@ -1,5 +1,5 @@
 import { useRef, type ChangeEvent, type KeyboardEvent } from 'react'
-import { ArrowUpIcon } from 'lucide-react'
+import { ArrowUpIcon, SquareIcon } from 'lucide-react'
 import { Spinner } from '@/components/ui/spinner'
 import { isSubmitKey } from '../protocol'
 
@@ -15,15 +15,21 @@ export function PromptInput({
   hint,
   disabled,
   busy,
+  reportResults,
+  onReportResults,
   onChange,
   onSubmit,
+  onStop,
 }: {
   value: string
   hint: string
   disabled: boolean
   busy: boolean
+  reportResults: boolean
+  onReportResults: (value: boolean) => void
   onChange: (value: string) => void
   onSubmit: () => void
+  onStop?: () => void
 }) {
   const formRef = useRef<HTMLFormElement>(null)
   return (
@@ -31,6 +37,7 @@ export function PromptInput({
       ref={formRef}
       onSubmit={(event) => {
         event.preventDefault()
+        if (onStop) return
         if (disabled || busy || !value.trim()) return
         onSubmit()
       }}
@@ -42,7 +49,8 @@ export function PromptInput({
           required
           maxLength={100000}
           value={value}
-          placeholder="描述目标，或询问某个任务的进展…"
+          placeholder="发消息"
+          disabled={disabled || busy}
           aria-label="给机器人发消息"
           aria-describedby={hint ? 'manager-hint' : undefined}
           title="Enter 发送，Shift+Enter 换行"
@@ -57,19 +65,31 @@ export function PromptInput({
         />
         <InputGroupAddon align="block-end" className="pt-1">
           <InputGroupButton
-            type="submit"
+            type={onStop ? 'button' : 'submit'}
             variant="default"
             size="icon-sm"
-            disabled={disabled || busy || !value.trim()}
+            disabled={!onStop && (disabled || busy || !value.trim())}
             aria-busy={busy || undefined}
-            aria-label="发送消息"
-            className="ms-auto size-10 rounded-full"
+            aria-label={onStop ? '停止回复' : '发送消息'}
+            className="ms-auto size-11 rounded-full"
+            onClick={onStop}
           >
-            {busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
+            {onStop ? <SquareIcon aria-hidden="true" /> : busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
           </InputGroupButton>
         </InputGroupAddon>
       </InputGroup>
       {hint ? <p id="manager-hint">{hint}</p> : null}
+      <label className="mt-3 flex min-h-11 items-start gap-2 text-sm">
+        <input
+          type="checkbox"
+          className="mt-1 size-4 accent-primary focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-50"
+          checked={reportResults}
+          disabled={disabled || busy}
+          onChange={(event) => onReportResults(event.target.checked)}
+        />
+        <span>完成后告诉我</span>
+      </label>
+      <p className="text-xs text-muted-foreground">只影响这条消息，不改后续授权。</p>
     </form>
   )
 }

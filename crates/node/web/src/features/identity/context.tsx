@@ -7,6 +7,7 @@ import {
   parseMember, parsePairReceipt, parseReview, parseSigning, parseView, record, same, signingPayload, text,
 } from '@/lib/node'
 import type { ConnectionEntry, EntryInfo, Member, MembershipView, NodeRole, PairReceipt, PublicIdentity, ReadyConnection, WaitingPair } from '@/lib/node'
+import { shouldAutoConnect } from './connection-lane'
 import { parseChanged } from '@/lib/progress'
 import type { ChangedEvent } from '@/lib/progress'
 import type { AuthenticationTrust } from '@/lib/secure'
@@ -282,7 +283,6 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }
   async function pair(invitationText: string, nameValue: string, password?: string) {
     const invitation = parseInvitation(readInvitation(invitationText))
-    setInitialInvitation('')
     const name = deviceName(nameValue)
     const active = await open(invitation.entry)
     const request = scoped(active)
@@ -454,14 +454,9 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         await open(pending.entry)
         if (!mounted) return
         waitingRef.current = pending; setWaiting(pending)
-      } else if (!invitation && !pending) {
-        const previous = loadAuthenticated()
-        if (previous) {
-          setEntry(previous.entry); setPhase('reconnecting')
-          setError('正在恢复已授权的设备连接。')
-          reconnect.current = { ...previous, attempt: 0 }
-          scheduleReconnect(true)
-        }
+      } else if (shouldAutoConnect({ hasInvitation: Boolean(invitation), savedCount: savedEntries().length })) {
+        const [only] = savedEntries()
+        if (only) void connect(only).catch(cause => { if (mounted) setError(messageOf(cause)) })
       }
     }).catch(cause => { if (mounted) { setPhase(cause instanceof Error && 'code' in cause && cause.code === 'key_lost' ? 'key_lost' : 'blocked'); setError(messageOf(cause)) } })
     return () => { mounted = false; generation.current += 1; reconnect.current = null; if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current); reconnectTimer.current = null; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
