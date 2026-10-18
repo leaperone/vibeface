@@ -711,6 +711,13 @@ pub fn verify_remote_execution_history_policy(
         }),
         "historical grant changed its signed exact heads",
     )?;
+    for head in accepted.heads() {
+        if state.head(&head.domain).is_some() {
+            dependencies
+                .entry(head.domain.clone())
+                .or_insert_with(|| head.clone());
+        }
+    }
     let required: Vec<_> = dependencies.into_values().collect();
     let (heads, allowed_hashes) =
         remote_execution_policy::reference_closure(state, &required, independent_pins)?;
