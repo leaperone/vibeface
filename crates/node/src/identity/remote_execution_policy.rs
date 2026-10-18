@@ -1110,6 +1110,7 @@ mod tests {
         body["task_ref"] = json!(fixture.task.hash);
         body["target_node"] = json!(fixture.executor.node.node_id()?);
         body["session_id"] = json!("remote-session");
+        body["binding_generation"] = json!(1);
         body["executor"] = json!("codex");
         body["cwd"] = json!(fixture.project.project);
         let signed_prepare = checked("native_signed_prepare", || {
