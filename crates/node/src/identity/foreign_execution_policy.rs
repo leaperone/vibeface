@@ -1147,7 +1147,7 @@ pub(crate) mod tests {
             body = json!({
                 "method":"operate", "space_id":fixture.project.space,
                 "resource_id":fixture.project.resource,
-                "authorization_id":operation.operation_id, "binding_generation":1,
+                "authorization_id":operation.operation_id,
                 "execution_resource":selection.execution_resource,
                 "target_public_key":selection.target_public_key,
                 "execution_grant":selection.execution_grant,
