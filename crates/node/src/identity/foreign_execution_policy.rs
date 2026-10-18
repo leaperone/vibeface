@@ -26,11 +26,205 @@ use vibeface_secure::{
 
 const PREFIX: &str = "task-execution-policy-v2";
 
+mod ingress;
+pub(crate) use ingress::ForeignExecutionPolicyCache;
+mod provenance;
+pub(crate) use provenance::{
+    TaskExecutionPolicyProvenance, bind_task_execution_policy_in, check_task_policy_heads_in,
+    current_task_execution_policy_in, original_task_execution_policy_in,
+    rehydrate_task_execution_policy_in, validate_task_execution_policy_links_in,
+};
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApprovalNonce {
     intent_envelope_hash: ObjectHash,
     approval_ref: ObjectHash,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionAssociation {
+    policy_ref: ObjectHash,
+    approval_ref: ObjectHash,
+    invocation_hash: ObjectHash,
+    authorization_id: String,
+    body_hash: ObjectHash,
+    binding_hash: String,
+    admitted_at_ms: u64,
+}
+
+fn binding_association_key(binding: &SignedBinding) -> Result<String> {
+    Ok(format!(
+        "{PREFIX}:binding-admission:{}",
+        crate::binding::binding_hash(&binding.binding)?
+    ))
+}
+
+fn retained_binding_in(
+    connection: &Connection,
+    space: &str,
+    hash: &str,
+    local: &PublicKey,
+) -> Result<SignedBinding> {
+    let value: String = connection.query_row(
+        "SELECT value FROM local_values WHERE space_id=? AND key=? AND length(CAST(value AS BLOB))<=?",
+        params![space,format!("task-binding-record:{hash}"),MAX_PROOF_BYTES], |row| row.get(0),
+    )?;
+    let binding: SignedBinding = serde_json::from_str(&value)?;
+    crate::binding::verify_binding(&binding, local.as_str())?;
+    ensure!(
+        crate::binding::binding_hash(&binding.binding)? == hash
+            && binding.binding.network_id == space,
+        "foreign policy retained binding changed its original hash or space"
+    );
+    Ok(binding)
+}
+
+fn binding_association_in(
+    connection: &Connection,
+    binding: &SignedBinding,
+) -> Result<AdmissionAssociation> {
+    let reference: ObjectHash = read_in(connection, &binding_association_key(binding)?)?
+        .context("NeedPolicySync: current binding has no immutable foreign policy association")?;
+    let association: AdmissionAssociation = read_in(connection, &key("admission", &reference))?
+        .context("NeedPolicySync: foreign policy binding admission is missing")?;
+    ensure!(
+        association.invocation_hash == reference
+            && association.binding_hash == crate::binding::binding_hash(&binding.binding)?,
+        "foreign policy binding association changed its original admission"
+    );
+    let proof = super::admission::load_admission_in(
+        connection,
+        &binding.binding.network_id,
+        &association.authorization_id,
+    )?;
+    ensure!(
+        proof.invocation.hash()? == association.invocation_hash
+            && ObjectHash::body(&proof.source_body)? == association.body_hash
+            && proof.admitted_at_ms == association.admitted_at_ms
+            && matches!(
+                proof.source_body["method"].as_str(),
+                Some("bind_execution" | "rebind_execution")
+            ),
+        "foreign policy association differs from its original accepted binding admission"
+    );
+    Ok(association)
+}
+
+fn read_binding_in(
+    connection: &Connection,
+    identity: &LocalIdentity,
+    intent: &Signed<RemoteExecutionPolicyReadIntent>,
+    usage: &mut ExecutionProofUsage,
+) -> Result<Option<SignedBinding>> {
+    let local = PublicKey::parse(&identity.public_key_hex()?)?;
+    if intent.payload.purpose == RemoteExecutionPolicyPurpose::History {
+        let reference = intent
+            .payload
+            .history
+            .as_ref()
+            .context("History has no original artifact")?;
+        let source = &reference.source.payload;
+        let binding = retained_binding_in(
+            connection,
+            source.project.space.as_str(),
+            &source.binding_hash,
+            &local,
+        )?;
+        ensure!(
+            binding.binding.task_ref == source.task.as_str()
+                && binding.binding.generation == source.binding_generation
+                && binding.binding.session_id == source.execution_session.session_id
+                && binding.binding.target_node
+                    == crate::crypto::fingerprint(reference.target_public_key().as_str())?,
+            "foreign History binding changed its original Task, generation, target or session"
+        );
+        usage.record_binding(&binding)?;
+        Ok(Some(binding))
+    } else {
+        checked_source_task_binding_in(connection, intent, &local, usage)
+    }
+}
+
+fn check_read_trust(
+    intent: &Signed<RemoteExecutionPolicyReadIntent>,
+    trust: &VerifiedTaskExecutionTrust,
+) -> Result<()> {
+    let current = &intent.payload;
+    let old = &trust.original_intent().payload;
+    ensure!(
+        current.source_selection.resource == old.source_selection.resource
+            && current.source_selection.audience == old.source_selection.audience
+            && current.context.context.task == old.context.context.task
+            && current.context.context.conversation == old.context.context.conversation
+            && current.context.context.workspace_resource == old.context.context.workspace_resource
+            && current.context.context.execution_session == old.context.context.execution_session
+            && current.context.context.executor_kind == old.context.context.executor_kind
+            && current.context.binding_generation == old.context.binding_generation
+            && current.selection.execution_resource == old.selection.execution_resource
+            && current.selection.target_public_key == old.selection.target_public_key,
+        "foreign policy read escaped its immutable Task selection"
+    );
+    for approved in trust.pins() {
+        ensure!(
+            current
+                .execution_pins
+                .iter()
+                .any(|pin| pin.domain == approved.domain
+                    && pin.genesis_root == approved.genesis_root),
+            "foreign policy read changed its independently approved genesis"
+        );
+    }
+    if current.purpose == RemoteExecutionPolicyPurpose::Execution {
+        ensure!(
+            current.selection == old.selection
+                && current.context.canonical_cwd == old.context.canonical_cwd,
+            "foreign policy writer changed its grant or cwd without rebind"
+        );
+    }
+    Ok(())
+}
+
+fn trust_for_read_in(
+    connection: &Connection,
+    identity: &LocalIdentity,
+    intent: &Signed<RemoteExecutionPolicyReadIntent>,
+    supplied: Option<&ObjectHash>,
+    usage: &mut ExecutionProofUsage,
+) -> Result<VerifiedTaskExecutionTrust> {
+    let local = PublicKey::parse(&identity.public_key_hex()?)?;
+    let binding = read_binding_in(connection, identity, intent, usage)?;
+    let candidate = intent.payload.purpose == RemoteExecutionPolicyPurpose::Execution
+        && ((binding.is_none() && intent.payload.expected_action == Action::ExecutionOpen)
+            || (binding.is_some() && intent.payload.expected_action == Action::ExecutionRebind));
+    let reference = if candidate {
+        let choice = task_execution_policy_choice_key(intent)?;
+        let reference: ObjectHash = read_in(connection, &key("choice", &choice))?
+            .context("NeedPolicySync: foreign Task choice has not been approved")?;
+        reference
+    } else {
+        binding_association_in(
+            connection,
+            binding
+                .as_ref()
+                .context("foreign read has no original binding")?,
+        )?
+        .approval_ref
+    };
+    ensure!(
+        supplied.is_none_or(|supplied| *supplied == reference),
+        "foreign policy read supplied another Task approval"
+    );
+    let trust = load_task_execution_trust_in(connection, &local, &reference)?;
+    if candidate {
+        check_candidate_anchor(&trust, intent, binding.as_ref())?;
+    } else {
+        check_read_trust(intent, &trust)?;
+    }
+    usage.record_signed(trust.original_intent())?;
+    usage.record_signed(trust.approval())?;
+    Ok(trust)
 }
 
 fn key(kind: &str, reference: &ObjectHash) -> String {
@@ -134,6 +328,74 @@ fn check_candidate_anchor(
 }
 
 impl Store {
+    pub(crate) fn foreign_execution_policy_selection(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        now: u64,
+    ) -> Result<Value> {
+        let _signatures = ScopedSignatureVerification::new();
+        let intent: Signed<RemoteExecutionPolicyReadIntent> =
+            serde_json::from_value(params.clone())?;
+        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let source = verify_remote_execution_policy_delegation_source(
+            self.policy.verified(),
+            &intent,
+            &local,
+            &PublicKey::parse(principal)?,
+            now,
+        )?;
+        check_heads_in(&tx, &self.policy, source.source_heads())?;
+        self.policy.accepted_journal_snapshot(&tx)?;
+        let mut usage = source.proof_usage().clone();
+        if intent.payload.purpose == RemoteExecutionPolicyPurpose::History {
+            usage.merge(
+                &super::execution_dispatch::retained_execution_history_reference_in(
+                    &tx,
+                    identity,
+                    intent
+                        .payload
+                        .history
+                        .as_ref()
+                        .context("History has no original artifact")?,
+                )?,
+            );
+        }
+        let binding = read_binding_in(&tx, identity, &intent, &mut usage)?;
+        let output = if let Some(binding) = &binding {
+            let association = binding_association_in(&tx, binding)?;
+            let proof = super::admission::load_admission_in(
+                &tx,
+                &binding.binding.network_id,
+                &association.authorization_id,
+            )?;
+            let original =
+                provenance::original_task_execution_policy_in(&tx, &self.policy, &local, &proof)?
+                    .context("NeedPolicySync: bound Task has no original verified foreign policy")?;
+            usage.merge(original.proof_usage());
+            let trust = load_task_execution_trust_in(&tx, &local, &association.approval_ref)?;
+            usage.record_signed(trust.original_intent())?;
+            usage.record_signed(trust.approval())?;
+            json!({"binding":binding,"approval_ref":association.approval_ref,"policy_ref":association.policy_ref,
+                "selection":trust.selection(),"approved_pins":trust.pins()})
+        } else {
+            ensure!(
+                intent.payload.purpose == RemoteExecutionPolicyPurpose::Execution
+                    && intent.payload.expected_action == Action::ExecutionOpen
+                    && intent.payload.context.binding_generation == Some(1),
+                "only first execution open may select an unbound Task"
+            );
+            json!({"binding":null,"approval_ref":null,"policy_ref":null,"selection":null,"approved_pins":[]})
+        };
+        let output = ingress::response(params, output, usage)?;
+        tx.commit()?;
+        Ok(output)
+    }
+
     pub(crate) fn foreign_execution_policy_approve(
         &mut self,
         identity: &LocalIdentity,

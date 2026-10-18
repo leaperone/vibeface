@@ -22,6 +22,8 @@ pub struct Store {
         Option<crate::identity::cross_node_recovery::TargetRecoveryImport>,
     pub(crate) account_node_enrollment_import:
         Option<vibeface_secure::authorization::bootstrap::recovery::node_enrollment::AccountNodeEnrollmentImport>,
+    pub(crate) foreign_execution_policy:
+        crate::identity::foreign_execution_policy::ForeignExecutionPolicyCache,
 }
 fn verify_schema(connection: &Connection) -> Result<()> {
     let metadata: (String, u32, u32, String, String) = connection.query_row(
@@ -368,6 +370,7 @@ impl Store {
             policy,
             target_recovery_import: None,
             account_node_enrollment_import: None,
+            foreign_execution_policy: Default::default(),
         })
     }
 
@@ -426,6 +429,7 @@ impl Store {
             policy,
             target_recovery_import: None,
             account_node_enrollment_import: None,
+            foreign_execution_policy: Default::default(),
         };
         store
             .connection
