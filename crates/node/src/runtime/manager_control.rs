@@ -373,7 +373,7 @@ impl Runtime {
                 && original.conversation_id == scope
                 && reference["operation_id"] == original.operation_id
                 && reference["target_node"] == original.target_node
-                && reference["session_id"] == original.session_id
+                && reference["session_id"] == serde_json::to_value(&original.session_id)?
                 && reference["task_id"] == serde_json::to_value(&original.task_id)?,
             "management operation reference does not match its original dispatch"
         );

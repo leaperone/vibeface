@@ -13,8 +13,11 @@ use std::{
     path::{Component, Path},
 };
 
+pub(crate) mod bots;
 pub(crate) mod followup;
 
+const SESSIONLESS_SCHEMA: &str =
+    include_str!("../migrations/202610180001_sessionless_operations.sql");
 const INITIAL_SCHEMA: &str = include_str!("../migrations/202610160001_initial.sql");
 
 pub struct Store {
@@ -55,8 +58,11 @@ impl Store {
                 ensure!(tables == 0, "unversioned database is not supported");
                 connection.execute_batch(&format!("BEGIN IMMEDIATE;{INITIAL_SCHEMA}COMMIT;"))?;
             }
-            2 => {}
+            2 | 3 => {}
             _ => bail!("unsupported database schema version {version}"),
+        }
+        if version < 3 {
+            connection.execute_batch(&format!("BEGIN IMMEDIATE;{SESSIONLESS_SCHEMA}COMMIT;"))?;
         }
         let mut store = Self { connection };
         // Reject incompatible membership before recovery changes operations or rebuilds projections.
@@ -1727,7 +1733,7 @@ impl Store {
                 ensure!(events.values().any(|stored|stored.status == "ready" && stored.event.author == binding.target_node
                     && stored.event.scope_id == binding.conversation_id
                     && matches!(&stored.event.body,EventBody::ExecutionObserved{operation_id,target_node,session_id,status,..}
-                        if operation_id == &operation && target_node == &binding.target_node && session_id == &binding.session_id && status == &expected)),
+                        if operation_id == &operation && target_node == &binding.target_node && session_id.as_deref() == Some(binding.session_id.as_str()) && status == &expected)),
                     "execution completion must be durable before sealing");
             }
         }
@@ -1763,11 +1769,9 @@ impl Store {
     }
 
     pub fn validate_operation_binding(&self, request: &OperationRequest) -> Result<()> {
-        let proof = request
-            .binding
-            .as_ref()
-            .context("execution requires a confirmed task binding")?;
-        self.verify_binding_creation(proof)?;
+        if let Some(proof) = &request.binding {
+            self.verify_binding_creation(proof)?;
+        }
         validate_operation_binding_from(&self.connection, request)
     }
 
@@ -1808,7 +1812,10 @@ impl Store {
             } else if let Some(session) = self.session(
                 &request.network_id,
                 &request.target_node,
-                &request.session_id,
+                request
+                    .session_id
+                    .as_deref()
+                    .context("execution session is required")?,
             )? {
                 serde_json::json!({"type":"open","executor":session.executor,"cwd":session.cwd})
             } else {
@@ -1822,7 +1829,10 @@ impl Store {
             authority_node: identity.node_id()?,
             generation: 1,
             target_node: request.target_node.clone(),
-            session_id: request.session_id.clone(),
+            session_id: request
+                .session_id
+                .clone()
+                .context("execution session is required")?,
             open_spec,
             previous_binding_hash: None,
             previous_seal: None,
@@ -1866,9 +1876,17 @@ impl Store {
             request.network_id == network_id,
             "operation network mismatch"
         );
+        ensure!(!request.operation_id.is_empty(), "operation ID is required");
         ensure!(
-            !request.operation_id.is_empty() && !request.session_id.is_empty(),
-            "operation and session IDs are required"
+            if request.action["type"] == "command" {
+                request.session_id.is_none() && request.expected_revision == 0 && !control
+            } else {
+                request
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+            },
+            "SDK operations require a session and commands must be sessionless"
         );
         ensure!(
             request.expected_revision < i64::MAX as u64,
@@ -1972,6 +1990,7 @@ impl Store {
         )?;
         let request: OperationRequest = serde_json::from_str(&encoded)?;
         validate_operation_binding_from(&tx, &request)?;
+        followup::validate_manager_dispatch_from(&tx, network_id, &request)?;
         authorize_node_from(
             &tx,
             network_id,
@@ -2955,6 +2974,7 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
             events.get_mut(hash).unwrap().status = "ready".into();
         }
     }
+    bots::validate_bot_projections_from(connection, network_id, &mut events, &ordered);
     for (hash, e) in &events {
         connection.execute(
             "UPDATE events SET status=? WHERE network_id=? AND hash=?",
@@ -3056,10 +3076,12 @@ fn validate_operation_binding_from(
     connection: &Connection,
     request: &OperationRequest,
 ) -> Result<()> {
-    let proof = request
-        .binding
-        .as_ref()
-        .context("execution requires a confirmed task binding")?;
+    match (&request.task_id, &request.binding) {
+        (None, None) => return validate_unbound_operation_from(connection, request),
+        (Some(_), Some(_)) => {}
+        _ => bail!("task and confirmed binding must be supplied together"),
+    }
+    let proof = request.binding.as_ref().expect("checked binding");
     let binding = &proof.binding;
     ensure!(
         binding.network_id == request.network_id
@@ -3068,7 +3090,8 @@ fn validate_operation_binding_from(
         "operation does not match its bound task"
     );
     ensure!(
-        binding.target_node == request.target_node && binding.session_id == request.session_id,
+        binding.target_node == request.target_node
+            && Some(binding.session_id.as_str()) == request.session_id.as_deref(),
         "operation target or session differs from confirmed task binding"
     );
     if request.action["type"] == "open" {
@@ -3112,6 +3135,74 @@ fn validate_operation_binding_from(
         !sealed,
         "execution binding is sealed; old commands cannot resume it"
     );
+    Ok(())
+}
+
+fn validate_unbound_operation_from(
+    connection: &Connection,
+    request: &OperationRequest,
+) -> Result<()> {
+    let Some(session) = request.session_id.as_deref() else {
+        ensure!(
+            request.action["type"] == "command",
+            "sessionless operation must be a command"
+        );
+        return Ok(());
+    };
+    let mut query = connection.prepare(
+        "SELECT request FROM operations WHERE network_id=? AND target_node=? AND session_id=?",
+    )?;
+    for encoded in query.query_map(
+        params![request.network_id, request.target_node, session],
+        |r| r.get::<_, String>(0),
+    )? {
+        let previous: OperationRequest = serde_json::from_str(&encoded?)?;
+        ensure!(
+            previous.conversation_id == request.conversation_id,
+            "execution session belongs to another conversation"
+        );
+        ensure!(
+            previous.task_id.is_none() && previous.binding.is_none(),
+            "task-bound session cannot be used without its binding"
+        );
+    }
+    let mut query = connection.prepare(
+        "SELECT value FROM local_values WHERE network_id=? AND key LIKE 'task-binding-record:%'",
+    )?;
+    for value in query.query_map([&request.network_id], |r| r.get::<_, String>(0))? {
+        let value: Value = serde_json::from_str(&value?)?;
+        let binding: crate::binding::TaskBinding =
+            serde_json::from_value(value["binding"].clone())?;
+        ensure!(
+            binding.target_node != request.target_node || binding.session_id != session,
+            "task-bound session cannot be downgraded to ordinary execution"
+        );
+    }
+    for stored in load_events_from(connection, &request.network_id)?
+        .values()
+        .filter(|event| event.status == "ready")
+    {
+        if let EventBody::DispatchRecorded {
+            target_node,
+            session_id,
+            task_id,
+            action,
+            ..
+        } = &stored.event.body
+            && target_node == &request.target_node
+            && session_id.as_deref() == Some(session)
+        {
+            ensure!(
+                stored.event.scope_id == request.conversation_id,
+                "execution session belongs to another conversation"
+            );
+            let previous: OperationRequest = serde_json::from_value(action.clone())?;
+            ensure!(
+                task_id.is_none() && previous.binding.is_none(),
+                "task-bound dispatch cannot be downgraded"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3917,7 +4008,7 @@ mod tests {
                 operation_id: "op".into(),
                 task_id: None,
                 target_node: target.clone(),
-                session_id: "session".into(),
+                session_id: Some("session".into()),
                 status: "completed".into(),
                 detail: json!({}),
             },
@@ -4462,7 +4553,7 @@ mod tests {
             conversation_id: "conversation".into(),
             task_id: None,
             target_node: owner.node_id()?,
-            session_id: "session".into(),
+            session_id: Some("session".into()),
             expected_revision: 0,
             basis_heads: heads,
             action: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
@@ -4998,7 +5089,7 @@ mod tests {
         assert!(store.accept_operation(&network, &changed).is_err());
         let mut overlap = first.clone();
         overlap.operation_id = "other".into();
-        overlap.session_id = "second".into();
+        overlap.session_id = Some("second".into());
         overlap.resources = vec!["/tmp/vibeface-lock/repo/child".into()];
         overlap.task_id = None;
         overlap.binding = None;
@@ -5318,7 +5409,7 @@ mod tests {
                 operation_id: "operation".into(),
                 task_id: None,
                 target_node: a.node_id()?,
-                session_id: "session".into(),
+                session_id: Some("session".into()),
                 status: "completed".into(),
                 detail: json!({"turn":"finished"}),
             },
@@ -5478,12 +5569,138 @@ mod tests {
             assert_eq!(store.conversations(&network)?.len(), 1);
         }
         let connection = Connection::open(&db)?;
-        connection.execute_batch("PRAGMA user_version=3;")?;
+        connection.execute_batch("PRAGMA user_version=4;")?;
         drop(connection);
         assert!(Store::open(&db).is_err());
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
+    #[test]
+    fn ordinary_operations_keep_session_ownership_without_creating_tasks() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut store = memory(&owner, None)?;
+        let creation = conversation(&mut store, &owner)?;
+        let open = OperationRequest {
+            operation_id: "ordinary-open".into(),
+            network_id: network.clone(),
+            conversation_id: "conversation".into(),
+            task_id: None,
+            target_node: owner.node_id()?,
+            session_id: Some("ordinary-session".into()),
+            expected_revision: 0,
+            basis_heads: vec![creation.hash],
+            action: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
+            resources: vec![],
+            binding: None,
+            manager_authority: None,
+        };
+        store.accept_operation(&network, &open)?;
+        store.upsert_session(&network, &session(&owner, "ordinary-session")?)?;
+        store.claim_operation(&network, &open.operation_id)?;
+        store.finish_operation(
+            &network,
+            &open.operation_id,
+            OperationState::Succeeded,
+            json!({"opened":true}),
+        )?;
+        assert!(store.tasks(&network, "conversation")?.is_empty());
+        assert!(
+            !store
+                .context(&network, "conversation", &[])?
+                .events
+                .iter()
+                .any(|event| matches!(event.body, EventBody::TaskCreated { .. }))
+        );
+        let mut send = open.clone();
+        send.operation_id = "ordinary-send".into();
+        send.expected_revision = 1;
+        send.action = json!({"type":"send","text":"continue"});
+        store.accept_operation(&network, &send)?;
+        let mut foreign = send.clone();
+        foreign.operation_id = "foreign".into();
+        foreign.conversation_id = "other".into();
+        assert!(
+            store
+                .accept_operation(&network, &foreign)
+                .unwrap_err()
+                .to_string()
+                .contains("another conversation")
+        );
+        let mut bound = send.clone();
+        bound.operation_id = "legacy-task".into();
+        store.bind_test_operation(&owner, &mut bound)?;
+        assert!(
+            store
+                .claim_operation(&network, &send.operation_id)
+                .unwrap_err()
+                .to_string()
+                .contains("task-bound session")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sessionless_commands_share_reservations_without_creating_native_sessions() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut store = memory(&owner, None)?;
+        let event = conversation(&mut store, &owner)?;
+        let command = OperationRequest {
+            operation_id: "command".into(),
+            network_id: network.clone(),
+            conversation_id: "conversation".into(),
+            task_id: None,
+            target_node: owner.node_id()?,
+            session_id: None,
+            expected_revision: 0,
+            basis_heads: vec![event.hash],
+            action: json!({"type":"command","command":"pwd","cwd":"/tmp","timeout_secs":10}),
+            resources: vec!["/tmp".into()],
+            binding: None,
+            manager_authority: None,
+        };
+        store.accept_operation(&network, &command)?;
+        assert_eq!(
+            store
+                .accept_operation(&network, &command)?
+                .request
+                .session_id,
+            None
+        );
+        store.claim_operation(&network, &command.operation_id)?;
+        assert!(store.sessions(&network)?.is_empty());
+        assert!(store.tasks(&network, "conversation")?.is_empty());
+        let mut competitor = command.clone();
+        competitor.operation_id = "competitor".into();
+        assert!(
+            store
+                .accept_operation(&network, &competitor)
+                .unwrap_err()
+                .to_string()
+                .contains("resource overlaps")
+        );
+        store.recover_running()?;
+        assert_eq!(
+            store.operation(&network, "command")?.unwrap().state,
+            OperationState::Unknown
+        );
+        assert!(store.claim_operation(&network, "command").is_err());
+        assert!(store.accept_operation(&network, &competitor).is_err());
+        store.finish_operation(
+            &network,
+            "command",
+            OperationState::Succeeded,
+            json!({"exit_code":0,"stdout":"/tmp\n","stderr":"","truncated":false}),
+        )?;
+        assert_eq!(
+            store.accept_operation(&network, &competitor)?.state,
+            OperationState::Accepted
+        );
+        assert!(store.sessions(&network)?.is_empty());
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn resource_normalization_follows_symlinks_before_parent_components() -> Result<()> {

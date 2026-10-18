@@ -386,6 +386,7 @@ pub(crate) fn context_bot(context: &Context) -> Result<Option<Bot>> {
             name,
             instructions,
             project,
+            ..
         } = &event.body
         {
             ensure!(
@@ -661,6 +662,9 @@ mod tests {
 
     #[test]
     fn bot_prompt_uses_only_the_pinned_conversation_definition() -> Result<()> {
+        let identity = crate::crypto::LocalIdentity::generate();
+        let role_proof = identity
+            .sign_network_fixture(1, vec![identity.certificate(vec![NodeRole::Gateway])?])?;
         let make = |scope: &str, name: &str, instructions: &str| Event {
             version: WIRE_VERSION,
             network_id: "network".into(),
@@ -678,6 +682,7 @@ mod tests {
                     target_node: "executor".into(),
                     cwd: "/project".into(),
                 }),
+                membership_role_proof: role_proof.clone(),
             },
             blobs: vec![],
         };

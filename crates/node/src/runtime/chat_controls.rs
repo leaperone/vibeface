@@ -954,7 +954,7 @@ impl Runtime {
             .map(|job| job["manager"].clone());
         let metadata = remote_manager.unwrap_or_else(||json!({"provider":manager.map(|manager|&manager.provider),"model":manager.map(|manager|&manager.model),"capabilities":capabilities}));
         Ok(
-            json!({"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),"messages":messages,"tasks":tasks,"executions":executions,"heads":context.heads,"missing":context.missing,"sessions":sessions,"operations":operations,"facts_freshness":"local_known_history","scheduler":{"jobs":jobs,"provider":metadata["provider"],"model":metadata["model"],"capabilities":metadata["capabilities"],"write_frozen":frozen},"observation_targets":targets}),
+            json!({"bot":store.bot_for_conversation(network,scope)?,"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),"messages":messages,"tasks":tasks,"executions":executions,"heads":context.heads,"missing":context.missing,"sessions":sessions,"operations":operations,"facts_freshness":"local_known_history","scheduler":{"jobs":jobs,"provider":metadata["provider"],"model":metadata["model"],"capabilities":metadata["capabilities"],"write_frozen":frozen},"observation_targets":targets}),
         )
     }
 
