@@ -76,3 +76,5 @@ export function buildClientRemoteExecutionPolicyReadIntent(source: VerifiedClien
 export function buildClientRemoteExecutionHistoryPolicyReadIntent(source: VerifiedClientAuthorization, inputJson: string, independentPinsJson: string, expiresAt: number): string
 
 export function prepareClientGatewayReply(authorization: VerifiedClientAuthorization, originalJson: string, routeHash: string, gatewayPublicKey: string): GatewayClientReplyHandle
+
+export function prepareClientGatewayOwnerRoute(materialJson: string, ownerAuthorization: VerifiedClientAuthorization, payloadJson: string): string

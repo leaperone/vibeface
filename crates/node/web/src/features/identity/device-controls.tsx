@@ -15,6 +15,7 @@ import { EnrollmentRequestsControls } from './enrollment-status'
 import { AccountPasskeyControls } from './account-passkey-controls'
 import { NodeControls } from './node-controls'
 import { TeamWorkspaceControls } from './team-workspace-controls'
+import { GatewayControls } from './gateway-controls'
 
 const button = 'min-h-10'
 const input = 'min-h-10'
@@ -63,6 +64,8 @@ export function DeviceControls() {
     {error && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error}</p>}
 
     <EnrollmentRequestsControls />
+
+    <GatewayControls />
 
     {canManageDevices && <Card className={panel} aria-labelledby="account-devices-title">
       <div className="flex flex-wrap items-center justify-between gap-3">
