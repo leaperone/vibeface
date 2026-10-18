@@ -173,6 +173,7 @@ export function DeviceControls() {
               <legend className="mb-2 text-sm font-medium">设备类型</legend>
               <label className="flex min-h-11 items-center gap-2 text-sm"><input type="radio" name="invite-kind" value="client" checked={inviteKind === 'client'} onChange={() => { setInviteKind('client'); setInvitation('') }} />浏览器或其他客户端</label>
               <label className="flex min-h-11 items-center gap-2 text-sm"><input type="radio" name="invite-kind" value="node" checked={inviteKind === 'node'} onChange={() => { setInviteKind('node'); setInvitation('') }} />运行 Vibeface 的节点</label>
+              {inviteKind === 'node' && <p className="text-sm text-muted-foreground">对方要在那台机器运行 <code>vibeface pair</code>，不能用这张网页接受。</p>}
             </fieldset>
             {inviteKind === 'node' && <fieldset disabled={busy} className="space-y-1">
               <legend className="mb-2 text-sm font-medium">节点角色</legend>
@@ -183,7 +184,7 @@ export function DeviceControls() {
           </form>
           {invitation && <div className="space-y-3 rounded-lg bg-muted/50 p-3">
             <label className="grid gap-2 text-sm">邀请内容<Textarea className="min-h-28 font-mono text-xs" readOnly value={invitation} onFocus={(event) => event.target.select()} /></label>
-            <p className="text-xs text-muted-foreground">邀请含配对凭证，仅发送给你信任的设备。</p>
+            <p className="text-xs text-muted-foreground">{inviteKind === 'node' ? '对方要在那台机器运行 vibeface pair，不能用这张网页接受。邀请含配对凭证，仅发送给你信任的设备。' : '邀请含配对凭证，仅发送给你信任的设备。浏览器邀请可以贴到对方的连接页。'}</p>
             <div className="flex flex-wrap gap-2"><Button type="button" className={button} disabled={busy} onClick={() => void run(async () => { await navigator.clipboard.writeText(invitation) }, '邀请已复制。')}>复制邀请</Button><Button type="button" variant="outline" className={button} disabled={busy} onClick={() => setInvitation('')}>清除</Button></div>
           </div>}
         </CollapsibleContent>

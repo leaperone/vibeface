@@ -1,7 +1,9 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
-import { PlusIcon, RefreshCwIcon, Settings2Icon } from "lucide-react"
+import { PlusIcon, RefreshCwIcon, Settings2Icon, UnplugIcon } from "lucide-react"
+import { Badge } from "@/components/ui/badge"
+import { useDevice } from "@/features/identity/context"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -32,6 +34,7 @@ export function WorkspaceShell() {
 
 function WorkspaceLayout() {
   const workspace = useWorkspace()
+  const device = useDevice()
   const { setOpenMobile } = useSidebar()
   const [creatingBot, setCreatingBot] = useState(false)
   const creatorTrigger = useRef<HTMLElement | null>(null)
@@ -73,7 +76,8 @@ function WorkspaceLayout() {
               <nav aria-label="机器人列表">
                 <SidebarMenu>
                   {workspace.bots.length ? workspace.bots.map((bot) => {
-                    const unread = workspace.notifications.some((item) => item.conversation_id === bot.conversation_id)
+                    const marks = workspace.notifications.filter((item) => item.conversation_id === bot.conversation_id)
+                    const mark = marks.some((item) => item.kind === "approval" || item.kind === "attention") ? "待决定" : marks.length ? "有进展" : ""
                     const active = workspace.view === "chat" && bot.bot_id === workspace.selectedBot?.bot_id
                     return (
                       <SidebarMenuItem key={bot.bot_id}>
@@ -90,11 +94,11 @@ function WorkspaceLayout() {
                           }}
                         >
                           <span className="min-w-0 flex-1 truncate">{bot.name}</span>
-                          {unread ? <><span className="size-1.5 shrink-0 rounded-full bg-primary" aria-hidden="true" /><span className="sr-only">有未读进展</span></> : null}
+                          {mark ? <Badge variant="outline" className="shrink-0">{mark}</Badge> : null}
                         </SidebarMenuButton>
                       </SidebarMenuItem>
                     )
-                  }) : <SidebarMenuItem className="px-2 py-3 text-xs text-muted-foreground">创建一个机器人，开始聊天。</SidebarMenuItem>}
+                  }) : <SidebarMenuItem className="px-2 py-3 text-xs text-muted-foreground">还没有机器人。</SidebarMenuItem>}
                 </SidebarMenu>
               </nav>
             </SidebarGroupContent>
@@ -111,6 +115,11 @@ function WorkspaceLayout() {
                 <Settings2Icon aria-hidden="true" /><span>设置</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
+            <SidebarMenuItem>
+              <SidebarMenuButton type="button" className="min-h-11" title="断开当前连接，回到连接页。已保存的入口还在。" onClick={() => device.disconnect()}>
+                <UnplugIcon aria-hidden="true" /><span>断开</span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
           </SidebarMenu>
         </SidebarFooter>
       </Sidebar>
@@ -125,7 +134,7 @@ function WorkspaceLayout() {
         </header>
         {!workspace.connectionOnline || workspace.writeNotice || workspace.noticeText || workspace.error || workspace.data && workspace.incomplete ? (
           <div className="workspace-notices space-y-2">
-            {!workspace.connectionOnline ? <Alert role="status"><AlertDescription>{workspace.connectionText}后台任务不会因网页断线而自动停止，当前显示最后核对的进展。</AlertDescription></Alert> : null}
+            {!workspace.connectionOnline ? <Alert role="status"><AlertDescription>连接中断，正在重连。</AlertDescription></Alert> : null}
             {workspace.writeNotice ? <Alert role="status"><AlertDescription>{workspace.writeNotice}</AlertDescription></Alert> : null}
             {workspace.noticeText ? <Alert role="status"><AlertDescription>{workspace.noticeText}</AlertDescription></Alert> : null}
             {workspace.error ? <Alert variant="destructive" role="alert"><AlertDescription>{workspace.error}</AlertDescription></Alert> : null}

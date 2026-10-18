@@ -31,7 +31,7 @@ export function ManagerStatus({ job, progress, hasLiveProgress }: { job: Manager
       {job.state === 'running' && !hasLiveProgress ? <p className="text-sm text-muted-foreground">当前只取得持久状态，尚未取得这轮实时片段；最终结果会在此显示。</p> : null}
       {canStop ? <>
         <ActionButton disabled={!workspace.writable || !workspace.selectedBot} action={() => workspace.run(() => workspace.cancelManager(job.trigger))}>停止本轮回复</ActionButton>
-        <p className="text-xs text-muted-foreground">只停止这次回复及尚未派出的安排，已派出的后台任务会继续单独跟踪。</p>
+        <p className="text-xs text-muted-foreground">只停这次回复。</p>
       </> : null}
       {job.state === 'unknown' ? <>
         <p className="text-sm">可继续只读聊天。原调用与外部结果仍需核对，不能直接重派。</p>

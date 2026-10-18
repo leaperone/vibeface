@@ -14,6 +14,7 @@ import './chat.css'
 export function ConversationScreen() {
   const workspace = useWorkspace()
   const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
+  const [reportResults, setReportResults] = useState(false)
   const sentDrafts = useRef(new Map<string, { message_id: string; text: string }>())
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
   const text = drafts.get(conversationId) ?? ''
@@ -21,11 +22,19 @@ export function ConversationScreen() {
   const jobs = data?.scheduler?.jobs ?? []
   const activeJobs = jobs.filter((job) => ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling', 'unknown'].includes(job.state))
   const visibleJobs = activeJobs.length ? activeJobs : jobs.slice(-1)
-  const liveMessages = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (['completed', 'failed', 'cancelled', 'unknown', 'rejected'].includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id)))).map((progress) => ({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.needsRefresh ? `实时片段不完整，等待最终结果。\n\n${progress.text}` : progress.text, created_at_ms: 0 }))
+  const liveMessages = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (['completed', 'failed', 'cancelled', 'unknown', 'rejected'].includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id)))).map((progress) => ({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0 }))
   const messages = [...(data?.messages ?? []), ...liveMessages]
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const sendDisabled = !workspace.writable || !workspace.selectedBot || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
-  const hint = !workspace.connectionOnline ? '正在恢复只读连接。未确认操作保留原请求，不会自动重发。' : messagePending ? originalEntry ? '先核对原消息，再发送新内容。' : '原消息尚未确认，请回原入口核对或重试；当前入口可只读查看进展。' : workspace.writeNotice || (!workspace.selectedBot ? '创建或选择一个机器人，开始聊天。' : composerHint(gate)) || (data?.scheduler?.write_frozen ? '旧调用结果待核对，新的消息只允许只读交谈。' : activeJobs.some((job) => ['queued', 'claimed', 'running'].includes(job.state)) ? '可继续发送；新消息会可靠排队，后台任务继续运行。' : '')
+  const assistantBusy = activeJobs.some((job) => ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling'].includes(job.state))
+  const stopJob = jobs.find((job) => workspace.data?.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
+  const pendingShown = messagePending && !messages.some((message) => message.message_id === messagePending.message_id)
+    ? [{ message_id: messagePending.message_id, event_hash: messagePending.message_id, role: 'user', text: messagePending.text, created_at_ms: 0 }]
+    : []
+  const shown = [...messages, ...pendingShown]
+  const needsCheck = Boolean(messagePending && !messageBusy && !assistantBusy) || Boolean(data?.scheduler?.write_frozen) || data?.operations.some((item) => item.state === 'unknown') || workspace.pending.some((item) => item.conversation_id === conversationId)
+  const hint = !workspace.connectionOnline ? '连接中断，稍等。' : needsCheck && messagePending ? (originalEntry ? '上一条还没发出。' : '请回到原来的入口。') : workspace.writeNotice || (!workspace.selectedBot ? '' : composerHint(gate)) || (data?.scheduler?.write_frozen ? '先核对上一条。' : '')
+  const hasDetails = Boolean(data && (visibleJobs.length > 0 || data.executions.length > 0 || workspace.pending.some((item) => item.conversation_id === conversationId) || data.operations.some((item) => item.state === 'unknown') || messagePending))
 
   useEffect(() => {
     if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)
@@ -53,57 +62,53 @@ export function ConversationScreen() {
     <section className="conversation-screen" aria-label="对话">
       <Chat
         key={conversationId}
-        messages={messages}
-        emptyTitle={workspace.selectedBot ? `你好，我是${workspace.selectedBot.name}` : '选择一个机器人'}
-        emptyDetail={workspace.selectedBot?.instructions || '创建机器人，告诉它需要帮你做什么。'}
+        messages={shown}
+        emptyTitle={workspace.selectedBot ? workspace.selectedBot.name : '选择一个机器人'}
+        emptyDetail={workspace.selectedBot?.instructions || '发一条消息开始聊。'}
       >
-        {data && (visibleJobs.length > 0 || data.executions.length > 0 || workspace.pending.some((item) => item.conversation_id === conversationId) || data.operations.some((item) => item.state === 'unknown')) ? <div className="grid gap-4" aria-label="工作进展">
-          {workspace.liveProgress.some((item) => item.needsRefresh) ? <p role="status" className="text-sm text-muted-foreground">正在核对完整进展，最终结果会在此显示。</p> : null}
+        {data?.executions.map((execution) => {
+          const progress = workspace.liveProgress.find((item) => item.kind === 'execution' && item.session_id === execution.session_id && item.target_node === execution.target_node && item.operation_id === execution.operation_id)
+          const projected = progress ? { ...execution, latest_progress: progress.text || progress.status || execution.latest_progress } : execution
+          return <ExecutionActivity key={execution.operation_id} execution={projected} conversationId={conversationId} compact />
+        })}
+        {(messageBusy || assistantBusy) && liveMessages.length === 0 ? <p role="status" className="replying" aria-label={messageBusy && !assistantBusy ? '稍等' : '正在回复'}><span className="dot" /><span className="dot" /><span className="dot" /><span>{messageBusy && !assistantBusy ? '稍等' : '正在回复'}</span></p> : null}
+      </Chat>
+      {hasDetails ? <Collapsible className="chat-details">
+        <CollapsibleTrigger asChild>
+          <Button variant="ghost" size="sm" className="group">{needsCheck ? '需要核对' : '详情'}<ChevronDownIcon aria-hidden="true" className="group-data-[state=open]:rotate-180" /></Button>
+        </CollapsibleTrigger>
+        <CollapsibleContent className="grid gap-4">
           {visibleJobs.map((job) => <ManagerStatus key={job.trigger} job={job} progress={workspace.liveProgress.find((item) => item.kind === 'manager' && item.trigger === job.trigger)?.status} hasLiveProgress={workspace.liveProgress.some((item) => item.kind === 'manager' && item.trigger === job.trigger)} />)}
-          {data.executions.map((execution) => {
+          {data?.executions.map((execution) => {
             const progress = workspace.liveProgress.find((item) => item.kind === 'execution' && item.session_id === execution.session_id && item.target_node === execution.target_node && item.operation_id === execution.operation_id)
             const projected = progress ? { ...execution, latest_progress: progress.text || progress.status || execution.latest_progress } : execution
-            return <ExecutionActivity key={execution.operation_id} execution={projected} conversationId={conversationId} />
+            return <ExecutionActivity key={`detail-${execution.operation_id}`} execution={projected} conversationId={conversationId} />
           })}
-          {workspace.pending.filter((item) => item.conversation_id === conversationId && !data.executions.some((execution) => item.execution_control?.expected_operation_id === execution.operation_id || execution.session_id !== null && item.target_node === execution.target_node && item.session_id === execution.session_id)).map((operation) => <PendingExecutionControl key={operation.operation_id} operation={operation} />)}
-          {data.operations.filter((operation) => operation.state === 'unknown' && !data.executions.some((execution) => execution.operation_id === operation.request.operation_id)).map((operation) => <UnknownOperationActivity key={operation.request.operation_id} operation={operation} />)}
-        </div> : null}
-      </Chat>
-      {messagePending ? (
-        <section className="pending-message" aria-label="待核对消息">
-          <h3 role="status">{messageBusy ? '正在提交消息…' : jobs.some((job) => job.message_id === messagePending.message_id && job.target_node === messagePending.scheduler_node && job.state === 'pending_delivery') ? '消息已提交，等待助手接收' : '消息发送结果待核对'}</h3>
-          <Collapsible className="pending-message-details">
-            <CollapsibleTrigger asChild>
-              <Button variant="ghost" size="sm" className="group -ms-2">
-                查看原消息
-                <ChevronDownIcon aria-hidden="true" className="group-data-[state=open]:rotate-180" />
-              </Button>
-            </CollapsibleTrigger>
-            <CollapsibleContent>
-              <p className="whitespace-pre-wrap break-words text-sm">{messagePending.text}</p>
-              <p className="text-sm text-muted-foreground">重试会保留原消息。{originalEntry ? '' : '请回原入口重试。'}</p>
-            </CollapsibleContent>
-          </Collapsible>
-          <div className="pending-message-actions">
-            <ActionButton variant="default" disabled={messageBusy} action={() => workspace.run(() => workspace.refresh())}>核对原消息</ActionButton>
+          {data ? workspace.pending.filter((item) => item.conversation_id === conversationId && !data.executions.some((execution) => item.execution_control?.expected_operation_id === execution.operation_id || execution.session_id !== null && item.target_node === execution.target_node && item.session_id === execution.session_id)).map((operation) => <PendingExecutionControl key={operation.operation_id} operation={operation} />) : null}
+          {data?.operations.filter((operation) => operation.state === 'unknown' && !data.executions.some((execution) => execution.operation_id === operation.request.operation_id)).map((operation) => <UnknownOperationActivity key={operation.request.operation_id} operation={operation} />)}
+          {messagePending ? <div className="pending-message-actions">
+            <ActionButton variant="default" disabled={messageBusy} action={() => workspace.run(() => workspace.refresh())}>核对</ActionButton>
             <ActionButton disabled={!workspace.writable || !originalEntry || messageBusy || workspace.incomplete} action={() => workspace.run(async () => {
-              await workspace.sendMessage(messagePending.text)
+              await workspace.sendMessage(messagePending.text, messagePending.report_results ?? false)
               clearSentDraft(messagePending.conversation_id, messagePending.text)
-            })}>重试原消息</ActionButton>
-            <ActionButton variant="ghost" disabled={!workspace.writable || messageBusy} action={() => workspace.run(() => workspace.releaseMessagePending())}>核对未提交并解除</ActionButton>
-          </div>
-        </section>
-      ) : null}
+            })}>重试</ActionButton>
+            <ActionButton variant="ghost" disabled={!workspace.writable || messageBusy} action={() => workspace.run(() => workspace.releaseMessagePending())}>解除</ActionButton>
+          </div> : null}
+        </CollapsibleContent>
+      </Collapsible> : null}
       <PromptInput
         value={text}
         hint={hint}
         disabled={sendDisabled}
         busy={messageBusy}
+        onStop={stopJob && workspace.writable && workspace.selectedBot ? () => { void workspace.run(() => workspace.cancelManager(stopJob.trigger)) } : undefined}
+        reportResults={reportResults}
+        onReportResults={setReportResults}
         onChange={(value) => setDrafts((current) => new Map(current).set(conversationId, value))}
         onSubmit={() => {
           if (sendDisabled || !text.trim()) return
           void workspace.run(async () => {
-            await workspace.sendMessage(text)
+            await workspace.sendMessage(text, reportResults)
             clearSentDraft(conversationId, text)
           })
         }}

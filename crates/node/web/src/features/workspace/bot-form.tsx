@@ -81,7 +81,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-lg" onCloseAutoFocus={(event) => { event.preventDefault(); restoreFocus() }}>
         <SheetHeader className="pr-14">
           <SheetTitle>{pending ? "核对机器人创建" : "创建机器人"}</SheetTitle>
-          <SheetDescription>{pending ? "原配置已保存。重试会继续核对同一个机器人。" : "为机器人起个名字，告诉它需要帮你做什么。"}</SheetDescription>
+          <SheetDescription>{pending ? "沿用这次的名称，再试一次。" : "起个名字。"}</SheetDescription>
         </SheetHeader>
         <form className="space-y-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]" onSubmit={(event) => { void submit(event) }}>
           {pending && !busy ? <p role="status" className="rounded-lg bg-muted p-3 text-sm">{rejected ? "原创建请求已被拒绝，核对没有创建后可以修改配置。" : "创建结果尚未确认，以下配置保持不变。恢复连接后可重试创建。"}</p> : null}
