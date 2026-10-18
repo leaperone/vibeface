@@ -1,7 +1,7 @@
 use super::{
-    admission::{check_policy_heads_in, consume_execution_dispatch_in, validate_basis_in},
+    admission::{check_policy_heads_in, consume_execution_request_dispatch_in, validate_basis_in},
     journal::PolicyState,
-    policy::{FreshnessProof, request_execution_dispatch_facts_from},
+    policy::{FreshnessProof, RequestTransport, request_execution_dispatch_facts_from},
     task_execution_context::TaskScopedAuthorization,
 };
 use crate::{
@@ -166,6 +166,28 @@ impl Store {
         body: &Value,
         now_ms: u64,
     ) -> Result<Value> {
+        self.execution_share_request_in_transport(identity, auth, None, body, now_ms)
+    }
+
+    pub(crate) fn execution_share_request_for_transport(
+        &self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        transport: &RequestTransport,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<Value> {
+        self.execution_share_request_in_transport(identity, auth, Some(transport), body, now_ms)
+    }
+
+    fn execution_share_request_in_transport(
+        &self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        transport: Option<&RequestTransport>,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<Value> {
         use vibeface_secure::authorization::{
             AUTH_VERSION, Actor, DeviceId, EventRef, INVOCATION_MAX_AGE_MS, MAX_PROOF_BYTES, Nonce,
             ServiceId, Signed,
@@ -188,6 +210,16 @@ impl Store {
         );
         let tx = self.connection.unchecked_transaction()?;
         let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        if let Some(transport) = transport {
+            let facts = RequestFacts {
+                resource: auth.resource().clone(), action: auth.action(), audience: auth.audience().clone(),
+                operation_id: auth.operation_id().into(), body_hash: ObjectHash::body(body)?,
+                context: auth.signed_invocation().payload.context.clone(),
+            };
+            super::policy::authorize_request_invocation_for_body(
+                current.verified(), auth.signed_invocation(), &facts, transport, body, now_ms,
+            )?;
+        }
         current.verified().check_current(auth, now_ms)?;
         check_policy_heads_in(&tx, current.verified(), auth, now_ms)?;
         let encoded: String = tx
@@ -662,7 +694,25 @@ impl Store {
         body: &Value,
         now_ms: u64,
     ) -> Result<SignedBinding> {
+        self.bind_execution_request_dispatch(
+            identity, dispatch, scoped, proof, &RequestTransport::Existing(transport.clone()), body, now_ms,
+        )
+    }
+
+    pub(crate) fn bind_execution_request_dispatch(
+        &mut self,
+        identity: &LocalIdentity,
+        dispatch: &VerifiedDispatchFacts,
+        scoped: &TaskScopedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<SignedBinding> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let auth = scoped.authorization();
+        transport.check_current(auth, now_ms)?;
         ensure!(
             auth.action() == Action::ExecutionOpen && body["method"] == "bind_execution",
             "remote binding requires execution-open authorization"
@@ -700,7 +750,10 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = PolicyState::reload_verified(&tx, &self.policy)?;
-        dispatch.revalidate(&tx, &current, scoped, body, auth.audience(), now_ms)?;
+        let facts = dispatch.revalidate(&tx, &current, scoped, body, auth.audience(), now_ms)?;
+        super::policy::authorize_request_invocation_for_body(
+            scoped.state(current.verified()), auth.signed_invocation(), &facts, transport, body, now_ms,
+        )?;
         let current_key = format!("task-binding-current:{}", binding.task_ref);
         let current_binding: Option<String> = tx
             .query_row(
@@ -733,7 +786,7 @@ impl Store {
             self.policy = current;
             return Ok(signed);
         }
-        let admitted = consume_execution_dispatch_in(
+        let admitted = consume_execution_request_dispatch_in(
             &tx,
             &current,
             scoped,
@@ -816,7 +869,26 @@ impl Store {
         request: &OperationRequest,
         now_ms: u64,
     ) -> Result<OperationRecord> {
+        self.accept_execution_request_dispatch(
+            identity, dispatch, scoped, proof, &RequestTransport::Existing(transport.clone()), body, request, now_ms,
+        )
+    }
+
+    pub(crate) fn accept_execution_request_dispatch(
+        &mut self,
+        identity: &LocalIdentity,
+        dispatch: &VerifiedDispatchFacts,
+        scoped: &TaskScopedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        body: &Value,
+        request: &OperationRequest,
+        now_ms: u64,
+    ) -> Result<OperationRecord> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let auth = scoped.authorization();
+        transport.check_current(auth, now_ms)?;
         ensure!(
             body["method"] == "operate"
                 && body["request"] == serde_json::to_value(request)?
@@ -886,7 +958,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = PolicyState::reload_verified(&tx, &self.policy)?;
         let facts = dispatch.revalidate(&tx, &current, scoped, body, auth.audience(), now_ms)?;
-        super::policy::authorize_invocation_for_body(scoped.state(current.verified()),
+        super::policy::authorize_request_invocation_for_body(scoped.state(current.verified()),
             auth.signed_invocation(),
             &facts,
             transport,
@@ -939,7 +1011,7 @@ impl Store {
             control,
         )?;
         crate::store::check_execution_resources_in(&tx, &request.target_node, &resources)?;
-        let admission = consume_execution_dispatch_in(
+        let admission = consume_execution_request_dispatch_in(
             &tx,
             &current,
             scoped,
@@ -1671,9 +1743,8 @@ impl Store {
                 body_hash: ObjectHash::body(&retained.admission.source_body)?, context: invocation.context.clone(),
             };
             super::admission::validate_persisted_admission(&tx, &retained.admission)?;
-            super::admission::reconstruct_admission(
+            super::admission::reconstruct_stored_admission(
                 &tx, &current, &retained.admission, &facts,
-                &retained.admission.transport.clone().into_evidence(),
             )?;
             if old_state.terminal() {
                 crate::store::validate_released_operation_reservations_from(&tx,space,operation)?;

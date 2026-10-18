@@ -1,12 +1,12 @@
 use super::{
     admission::{
         admission_for_operation_from, check_operation_reservations_in,
-        consume_execution_dispatch_in,
+        consume_execution_request_dispatch_in,
         validate_persisted_admission,
     },
     execution_dispatch::{VerifiedDispatchFacts, check_destination_heads_in},
     journal::PolicyState,
-    policy::FreshnessProof,
+    policy::{FreshnessProof, RequestTransport},
     task_execution_context::TaskScopedAuthorization,
 };
 use crate::{
@@ -319,9 +319,25 @@ impl Store {
         body: &Value,
         now_ms: u64,
     ) -> Result<(SignedExecutionHandoffResolution, bool)> {
+        self.prepare_execution_request_dispatch_resolution(
+            identity, dispatch, scoped, proof, &RequestTransport::Existing(transport.clone()), body, now_ms,
+        )
+    }
+
+    pub(crate) fn prepare_execution_request_dispatch_resolution(
+        &mut self,
+        identity: &LocalIdentity,
+        dispatch: &VerifiedDispatchFacts,
+        scoped: &TaskScopedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<(SignedExecutionHandoffResolution, bool)> {
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let auth = scoped.authorization();
+        transport.check_current(auth, now_ms)?;
         ensure!(
             auth.action() == Action::OperationResolve
                 && matches!(auth.actor(), Actor::Account(_))
@@ -393,7 +409,7 @@ impl Store {
         validate_operation_binding_from(&tx, &stored.request)?;
         check_operation_reservations_in(&tx, &stored)?;
         dispatch.revalidate(&tx, &current, scoped, body, auth.audience(), now_ms)?;
-        let admitted = consume_execution_dispatch_in(
+        let admitted = consume_execution_request_dispatch_in(
             &tx, &current, scoped, proof, transport, body, None, now_ms, dispatch,
         )?;
         let resolution = ExecutionHandoffResolution {
@@ -523,8 +539,8 @@ impl Store {
             );
             validate_persisted_admission(&tx, account)?;
             let facts = execution_resolution_account_facts(&wire.resolution)?;
-            super::admission::reconstruct_admission(
-                &tx, &current, account, &facts, &account.transport.clone().into_evidence(),
+            super::admission::reconstruct_stored_admission(
+                &tx, &current, account, &facts,
             )?;
             validate_released_operation_reservations_from(&tx, space, operation)?;
             tx.commit()?;

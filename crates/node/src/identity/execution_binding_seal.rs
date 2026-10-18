@@ -1,7 +1,7 @@
 use super::{
-    admission::{check_policy_heads_in, consume_authorization_in, validate_persisted_admission},
+    admission::{check_policy_heads_in, consume_request_authorization_in, validate_persisted_admission},
     journal::PolicyState,
-    policy::FreshnessProof,
+    policy::{FreshnessProof, RequestTransport},
 };
 use crate::{
     binding::{self, BindingSeal, SignedSeal},
@@ -77,7 +77,7 @@ fn authorize_in(
     identity: &LocalIdentity,
     auth: &VerifiedAuthorization,
     proof: &FreshnessProof,
-    transport: &TransportEvidence,
+    transport: &RequestTransport,
     body: &Value,
     now: u64,
 ) -> Result<ExecutionBindingSealTarget> {
@@ -94,10 +94,9 @@ fn authorize_in(
                 .is_none(),
         "executor seal requires its current Account authority"
     );
-    let verified =
-        policy
-            .verified()
-            .verify_invocation(auth.signed_invocation(), &facts, transport, now)?;
+    let verified = super::policy::authorize_request_invocation_for_body(
+        policy.verified(), auth.signed_invocation(), &facts, transport, body, now,
+    )?;
     policy
         .verified()
         .verify_freshness(&verified, &proof.challenge, &proof.receipts, now)?;
@@ -275,8 +274,24 @@ impl Store {
         body: &Value,
         now: u64,
     ) -> Result<crate::binding::SignedBinding> {
+        self.rebind_execution_dispatch_request_authorized(
+            identity, dispatch, scoped, proof, &RequestTransport::Existing(transport.clone()), body, now,
+        )
+    }
+
+    pub(crate) fn rebind_execution_dispatch_request_authorized(
+        &mut self,
+        identity: &LocalIdentity,
+        dispatch: &super::execution_dispatch::VerifiedDispatchFacts,
+        scoped: &super::task_execution_context::TaskScopedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        body: &Value,
+        now: u64,
+    ) -> Result<crate::binding::SignedBinding> {
         let _scope = vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let auth = scoped.authorization();
+        transport.check_current(auth, now)?;
         ensure!(
             body["method"] == "rebind_execution"
                 && auth.action() == Action::ExecutionRebind
@@ -355,7 +370,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = PolicyState::reload_verified(&tx, &self.policy)?;
         let facts = dispatch.revalidate(&tx, &current, scoped, body, auth.audience(), now)?;
-        super::policy::authorize_invocation_for_body(
+        super::policy::authorize_request_invocation_for_body(
             scoped.state(current.verified()), auth.signed_invocation(), &facts, transport, body, now,
         )?;
         let saved: String = tx.query_row(
@@ -389,7 +404,7 @@ impl Store {
             "rebind task differs from its exact ready Project source"
         );
         project_binding_quiescent_in(&tx, &old)?;
-        if super::operation_control::accepted_before(&tx, auth, proof, transport, body)? {
+        if super::operation_control::accepted_request_before(&tx, &current, auth, proof, transport, body, now)? {
             let stored: String = tx.query_row(
                 "SELECT value FROM local_values WHERE space_id=? AND key=?",
                 params![next.network_id, format!("task-binding-record:{hash}")],
@@ -413,7 +428,7 @@ impl Store {
             serde_json::from_str::<String>(&pointer)? == old_hash,
             "task binding changed before rebind"
         );
-        let admitted = super::admission::consume_execution_dispatch_in(
+        let admitted = super::admission::consume_execution_request_dispatch_in(
             &tx, &current, scoped, proof, transport, body, None, now, dispatch,
         )?;
         tx.execute(
@@ -467,6 +482,20 @@ impl Store {
         body: &Value,
         now: u64,
     ) -> Result<RemoteExecutionSealPreflight> {
+        self.authorize_remote_execution_seal_request_fence(
+            identity, auth, proof, &RequestTransport::Existing(transport.clone()), body, now,
+        )
+    }
+
+    pub(crate) fn authorize_remote_execution_seal_request_fence(
+        &self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        body: &Value,
+        now: u64,
+    ) -> Result<RemoteExecutionSealPreflight> {
         let _scope = vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let tx = self.connection.unchecked_transaction()?;
         let current = PolicyState::reload_verified(&tx, &self.policy)?;
@@ -487,7 +516,7 @@ impl Store {
         tx.commit()?;
         Ok(RemoteExecutionSealPreflight::Fence(context(
             &target,
-            auth.expires_at_ms(),
+            auth.expires_at_ms().min(transport.expires_at_ms()),
         )))
     }
 
@@ -501,6 +530,21 @@ impl Store {
         stopped: &StoppedExecution,
         now: u64,
     ) -> Result<SignedSeal> {
+        self.seal_remote_execution_request_authorized(
+            identity, auth, proof, &RequestTransport::Existing(transport.clone()), body, stopped, now,
+        )
+    }
+
+    pub(crate) fn seal_remote_execution_request_authorized(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        body: &Value,
+        stopped: &StoppedExecution,
+        now: u64,
+    ) -> Result<SignedSeal> {
         let _scope = vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let tx = self
             .connection
@@ -509,7 +553,7 @@ impl Store {
         let target = authorize_in(&tx, &current, identity, auth, proof, transport, body, now)?;
         ensure!(
             auth.action() == Action::ExecutionRebind
-                && stopped.matches_context(&context(&target, auth.expires_at_ms())),
+                && stopped.matches_context(&context(&target, auth.expires_at_ms().min(transport.expires_at_ms()))),
             "remote seal has no matching real executor fence"
         );
         if let Some((admission, seal)) = stored_seal_from(&tx, &target)? {
@@ -534,7 +578,7 @@ impl Store {
             },
         )?;
         let admission =
-            consume_authorization_in(&tx, &current, auth, proof, transport, body, None, now)?;
+            consume_request_authorization_in(&tx, &current, auth, proof, transport, body, None, now)?;
         session.state = "closed".into();
         session.native_session_id = None;
         ensure!(tx.execute(
@@ -554,6 +598,20 @@ impl Store {
         auth: &VerifiedAuthorization,
         proof: &FreshnessProof,
         transport: &TransportEvidence,
+        body: &Value,
+        now: u64,
+    ) -> Result<Option<SignedSeal>> {
+        self.remote_execution_seal_status_request_authorized(
+            identity, auth, proof, &RequestTransport::Existing(transport.clone()), body, now,
+        )
+    }
+
+    pub(crate) fn remote_execution_seal_status_request_authorized(
+        &self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
         body: &Value,
         now: u64,
     ) -> Result<Option<SignedSeal>> {
