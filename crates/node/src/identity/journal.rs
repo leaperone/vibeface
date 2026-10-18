@@ -1627,22 +1627,19 @@ mod tests {
                 &self.authority,
             )
             .unwrap();
-            let receipts = dependencies
-                .into_iter()
-                .map(|current| {
-                    Signed::sign(
-                        FreshnessReceipt {
-                            version: AUTH_VERSION,
-                            current,
-                            challenge_hash: commit.challenge_hash().unwrap(),
-                            issued_at_ms: NOW,
-                            expires_at_ms: NOW + 10_000,
-                        },
-                        &self.authority,
-                    )
-                    .unwrap()
-                })
-                .collect();
+            let receipts = vec![
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        currents: dependencies,
+                        challenge_hash: commit.challenge_hash().unwrap(),
+                        issued_at_ms: NOW,
+                        expires_at_ms: NOW + 10_000,
+                    },
+                    &self.authority,
+                )
+                .unwrap(),
+            ];
             JournalEntry::SpaceCommit(Committed {
                 proposal,
                 commit,

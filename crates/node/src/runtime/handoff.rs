@@ -616,13 +616,17 @@ impl Runtime {
         kind: &str,
         challenge: Value,
     ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        for receipt in &receipts {
+            receipt.payload.validate_currents()?;
+        }
         let targets = {
             let store = self.store.lock().await;
             let mut targets = BTreeSet::new();
             for stamp in policies {
                 if receipts
                     .iter()
-                    .any(|receipt| receipt.payload.current.domain == stamp.domain)
+                    .flat_map(|receipt| &receipt.payload.currents)
+                    .any(|current| current.domain == stamp.domain)
                 {
                     continue;
                 }
@@ -656,16 +660,20 @@ impl Runtime {
                 .await?;
             let signed: Vec<Signed<FreshnessReceipt>> =
                 serde_json::from_value(reply["receipts"].clone())?;
+            for receipt in &signed {
+                receipt.payload.validate_currents()?;
+            }
             receipts.extend(signed);
         }
-        receipts.sort_by(|left, right| {
-            left.payload
-                .current
-                .domain
-                .cmp(&right.payload.current.domain)
-        });
+        receipts.sort_by(|left, right| left.payload.currents.cmp(&right.payload.currents));
+        receipts.dedup();
+        let mut currents: Vec<_> = receipts
+            .iter()
+            .flat_map(|receipt| &receipt.payload.currents)
+            .collect();
+        currents.sort();
         ensure!(
-            receipts.len() == policies.len(),
+            currents == policies.iter().collect::<Vec<_>>(),
             "handoff policy authority is unavailable"
         );
         Ok(receipts)

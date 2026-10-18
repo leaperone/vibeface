@@ -2416,7 +2416,7 @@ impl Store {
         let key = PublicKey::parse(&identity.public_key_hex()?)?;
         let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
             .map_err(anyhow::Error::msg)?;
-        let mut receipts = Vec::new();
+        let mut currents = Vec::new();
         for stamp in &challenge.policies {
             ensure!(
                 current.state(&self.policy).head(&stamp.domain) == Some(stamp),
@@ -2456,19 +2456,22 @@ impl Store {
                         && authority.service == ServiceId::from_key(&key),
                     "handoff freshness authority mismatch"
                 );
-                receipts.push(Signed::sign(
-                    FreshnessReceipt {
-                        version: AUTH_VERSION,
-                        current: stamp.clone(),
-                        challenge_hash: challenge.hash()?,
-                        issued_at_ms: now_ms,
-                        expires_at_ms: challenge.expires_at_ms,
-                    },
-                    &signer,
-                )?);
+                currents.push(stamp.clone());
             }
         }
-        Ok(receipts)
+        if currents.is_empty() {
+            return Ok(Vec::new());
+        }
+        currents.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let receipt = FreshnessReceipt {
+            version: AUTH_VERSION,
+            currents,
+            challenge_hash: challenge.hash()?,
+            issued_at_ms: now_ms,
+            expires_at_ms: challenge.expires_at_ms,
+        };
+        receipt.validate_currents()?;
+        Ok(vec![Signed::sign(receipt, &signer)?])
     }
 
     pub fn accept_execution_handoff(
@@ -4167,7 +4170,7 @@ impl Store {
         let key = PublicKey::parse(&identity.public_key_hex()?)?;
         let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
             .map_err(anyhow::Error::msg)?;
-        let mut receipts = Vec::new();
+        let mut currents = Vec::new();
         for stamp in &challenge.policies {
             ensure!(
                 current.state(&self.policy).head(&stamp.domain) == Some(stamp),
@@ -4207,19 +4210,22 @@ impl Store {
                         && authority.service == ServiceId::from_key(&key),
                     "resolution authority mismatch"
                 );
-                receipts.push(Signed::sign(
-                    FreshnessReceipt {
-                        version: AUTH_VERSION,
-                        current: stamp.clone(),
-                        challenge_hash: challenge.hash()?,
-                        issued_at_ms: now_ms,
-                        expires_at_ms: challenge.expires_at_ms,
-                    },
-                    &signer,
-                )?);
+                currents.push(stamp.clone());
             }
         }
-        Ok(receipts)
+        if currents.is_empty() {
+            return Ok(Vec::new());
+        }
+        currents.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let receipt = FreshnessReceipt {
+            version: AUTH_VERSION,
+            currents,
+            challenge_hash: challenge.hash()?,
+            issued_at_ms: now_ms,
+            expires_at_ms: challenge.expires_at_ms,
+        };
+        receipt.validate_currents()?;
+        Ok(vec![Signed::sign(receipt, &signer)?])
     }
 
     pub fn authorize_execution_handoff_resolution_fence(
@@ -8325,7 +8331,9 @@ pub(crate) mod tests {
         let admission = fixture.freshness(CheckStage::Admit, now() + 1)?;
         let mut missing = admission.clone();
         missing.receipts.retain(|receipt| {
-            receipt.payload.current.domain != PolicyDomain::Space(fixture.executor.space.clone())
+            !receipt.payload.currents.iter().any(|current| {
+                current.domain == PolicyDomain::Space(fixture.executor.space.clone())
+            })
         });
         assert!(
             fixture

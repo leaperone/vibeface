@@ -3686,6 +3686,9 @@ impl Runtime {
             let store = self.store.lock().await;
             let receipts = verification
                 .run(|| store.sign_current_receipts(challenge, &self.identity, now_ms() as u64))?;
+            for receipt in &receipts {
+                receipt.payload.validate_currents()?;
+            }
             let policies = authorization.map_or(store.authorization_state(), |(scope, _)| {
                 scope.state(store.authorization_state())
             });
@@ -3693,7 +3696,8 @@ impl Runtime {
             for stamp in &challenge.policies {
                 if receipts
                     .iter()
-                    .any(|receipt| receipt.payload.current.domain == stamp.domain)
+                    .flat_map(|receipt| &receipt.payload.currents)
+                    .any(|current| current.domain == stamp.domain)
                 {
                     continue;
                 }
@@ -3752,6 +3756,9 @@ impl Runtime {
                 else {
                     bail!("Node freshness returned another policy read stage");
                 };
+                for receipt in &current {
+                    receipt.payload.validate_currents()?;
+                }
                 receipts.extend(current);
                 continue;
             }
@@ -3764,16 +3771,20 @@ impl Runtime {
                 .await?;
             let current: Vec<Signed<FreshnessReceipt>> =
                 serde_json::from_value(reply["receipts"].clone())?;
+            for receipt in &current {
+                receipt.payload.validate_currents()?;
+            }
             receipts.extend(current);
         }
-        receipts.sort_by(|left, right| {
-            left.payload
-                .current
-                .domain
-                .cmp(&right.payload.current.domain)
-        });
+        receipts.sort_by(|left, right| left.payload.currents.cmp(&right.payload.currents));
+        receipts.dedup();
+        let mut currents: Vec<_> = receipts
+            .iter()
+            .flat_map(|receipt| &receipt.payload.currents)
+            .collect();
+        currents.sort();
         ensure!(
-            receipts.len() == challenge.policies.len(),
+            currents == challenge.policies.iter().collect::<Vec<_>>(),
             "current policy authority is unavailable"
         );
         Ok(FreshnessProof {

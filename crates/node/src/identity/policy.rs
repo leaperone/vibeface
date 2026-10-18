@@ -1305,7 +1305,7 @@ impl Store {
         let key = PublicKey::parse(&identity.public_key_hex()?)?;
         let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
             .map_err(anyhow::Error::msg)?;
-        let mut receipts = Vec::new();
+        let mut currents = Vec::new();
         for expected in &challenge.policies {
             let state = self.policy.verified();
             let authority = match &expected.domain {
@@ -1345,18 +1345,21 @@ impl Store {
                     && authority.service == ServiceId::from_key(&key),
                 "authority identity mismatch"
             );
-            receipts.push(Signed::sign(
-                FreshnessReceipt {
-                    version: vibeface_secure::authorization::AUTH_VERSION,
-                    current: current.clone(),
-                    challenge_hash: challenge.hash()?,
-                    issued_at_ms: now_ms,
-                    expires_at_ms: challenge.expires_at_ms,
-                },
-                &signer,
-            )?);
+            currents.push(current.clone());
         }
-        Ok(receipts)
+        if currents.is_empty() {
+            return Ok(Vec::new());
+        }
+        currents.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let receipt = FreshnessReceipt {
+            version: vibeface_secure::authorization::AUTH_VERSION,
+            currents,
+            challenge_hash: challenge.hash()?,
+            issued_at_ms: now_ms,
+            expires_at_ms: challenge.expires_at_ms,
+        };
+        receipt.validate_currents()?;
+        Ok(vec![Signed::sign(receipt, &signer)?])
     }
 }
 
@@ -1853,12 +1856,9 @@ mod tests {
         let body = network.body("create_conversation", "freshness-scope");
         let (authorization, _) = network.authorization(&stale, &body, now())?;
         let challenge = stale.issue_freshness(&authorization, CheckStage::Admit, now())?;
-        assert_eq!(
-            stale
-                .sign_current_receipts(&challenge, &network.node, now())?
-                .len(),
-            challenge.policies.len()
-        );
+        let receipts = stale.sign_current_receipts(&challenge, &network.node, now())?;
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].payload.currents, challenge.policies);
         let mut writer = Store::open(&path)?;
         network.revoke_node(&mut writer)?;
         let error = stale

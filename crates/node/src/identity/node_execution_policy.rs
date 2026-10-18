@@ -71,23 +71,26 @@ impl Store {
         self.policy.accepted_journal_snapshot(&tx)?;
         let challenge = verified.challenge();
         let challenge_hash = challenge.hash()?;
-        let receipts = challenge
+        let mut currents: Vec<_> = challenge
             .policies
             .iter()
             .filter(|stamp| verified.allows_head(stamp))
-            .map(|stamp| {
-                Signed::sign(
-                    FreshnessReceipt {
-                        version: AUTH_VERSION,
-                        current: stamp.clone(),
-                        challenge_hash: challenge_hash.clone(),
-                        issued_at_ms: now_ms,
-                        expires_at_ms: verified.expires_at_ms(),
-                    },
-                    &signer,
-                )
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .cloned()
+            .collect();
+        currents.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let receipts = if currents.is_empty() {
+            Vec::new()
+        } else {
+            let receipt = FreshnessReceipt {
+                version: AUTH_VERSION,
+                currents,
+                challenge_hash,
+                issued_at_ms: now_ms,
+                expires_at_ms: verified.expires_at_ms(),
+            };
+            receipt.validate_currents()?;
+            vec![Signed::sign(receipt, &signer)?]
+        };
         let mut usage = record_node_freshness_receipts(&verified, &receipts, now_ms)?;
         let envelopes = receipts
             .iter()

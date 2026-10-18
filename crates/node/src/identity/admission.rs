@@ -3337,23 +3337,16 @@ pub(crate) mod tests {
             )?;
             self.connection.execute("INSERT INTO authorization_challenges(space_id,nonce,invocation_hash,stage,challenge,expires_at_ms) VALUES(?,?,?,'admit',?,?)",
                 params![self.auth.resource().space.as_str(), challenge.nonce.as_str(), self.auth.invocation_hash().as_str(), serde_json::to_string(&challenge)?, challenge.expires_at_ms])?;
-            let receipts = self
-                .auth
-                .dependencies()
-                .iter()
-                .map(|current| {
-                    Ok(Signed::sign(
-                        FreshnessReceipt {
-                            version: AUTH_VERSION,
-                            current: current.clone(),
-                            challenge_hash: challenge.hash()?,
-                            issued_at_ms: NOW,
-                            expires_at_ms: challenge.expires_at_ms,
-                        },
-                        &self.authority,
-                    )?)
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let receipts = vec![Signed::sign(
+                FreshnessReceipt {
+                    version: AUTH_VERSION,
+                    currents: self.auth.dependencies().to_vec(),
+                    challenge_hash: challenge.hash()?,
+                    issued_at_ms: NOW,
+                    expires_at_ms: challenge.expires_at_ms,
+                },
+                &self.authority,
+            )?];
             Ok(FreshnessProof {
                 challenge,
                 receipts,
@@ -4175,22 +4168,16 @@ pub(crate) mod tests {
             NOW,
             NOW + 60_000,
         )?;
-        let receipts = auth
-            .dependencies()
-            .iter()
-            .map(|current| {
-                Ok(Signed::sign(
-                    FreshnessReceipt {
-                        version: AUTH_VERSION,
-                        current: current.clone(),
-                        challenge_hash: challenge.hash()?,
-                        issued_at_ms: NOW,
-                        expires_at_ms: NOW + 60_000,
-                    },
-                    &fixture.authority,
-                )?)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let receipts = vec![Signed::sign(
+            FreshnessReceipt {
+                version: AUTH_VERSION,
+                currents: auth.dependencies().to_vec(),
+                challenge_hash: challenge.hash()?,
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + 60_000,
+            },
+            &fixture.authority,
+        )?];
         fixture.connection.execute("INSERT INTO authorization_challenges(space_id,nonce,invocation_hash,stage,challenge,expires_at_ms) VALUES(?,?,?,'remote_read',?,?)",
             params![auth.resource().space.as_str(), challenge.nonce.as_str(), auth.invocation_hash().as_str(), serde_json::to_string(&challenge)?, challenge.expires_at_ms])?;
         let proof = FreshnessProof {

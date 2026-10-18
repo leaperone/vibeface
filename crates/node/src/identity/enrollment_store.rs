@@ -712,7 +712,7 @@ impl Store {
             &self.policy,
             &challenge.payload.dependencies,
         )?;
-        let mut receipts = Vec::new();
+        let mut currents = Vec::new();
         for head in &challenge.payload.dependencies {
             let authority = match &head.domain {
                 PolicyDomain::Account(account) => {
@@ -736,17 +736,18 @@ impl Store {
                 authority.public_key.as_str() == identity.public_key_hex()?,
                 "device policy requires another current authority"
             );
-            receipts.push(Signed::sign(
-                FreshnessReceipt {
-                    version: AUTH_VERSION,
-                    current: head.clone(),
-                    challenge_hash: challenge.challenge_hash()?,
-                    issued_at_ms: now,
-                    expires_at_ms: challenge.payload.expires_at_ms,
-                },
-                &signer,
-            )?);
+            currents.push(head.clone());
         }
+        currents.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let receipt = FreshnessReceipt {
+            version: AUTH_VERSION,
+            currents,
+            challenge_hash: challenge.challenge_hash()?,
+            issued_at_ms: now,
+            expires_at_ms: challenge.payload.expires_at_ms,
+        };
+        receipt.validate_currents()?;
+        let receipts = vec![Signed::sign(receipt, &signer)?];
         let committed: Committed<AccountDocument> = serde_json::from_str(
             &enrollment::accept_account_device_policy_change(
                 &request_json,

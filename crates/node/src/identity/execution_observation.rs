@@ -381,8 +381,13 @@ impl Store {
             usage.merge(current.proof_usage());
             usage.record_metadata(challenge)?;
         }
-        let mut receipts = Vec::new();
+        let mut currents = Vec::new();
         for stamp in &challenge.policies {
+            if let HandoffPolicy::TaskBusiness(view) = policy {
+                if !view.primary_heads().contains(stamp) {
+                    continue;
+                }
+            }
             let authority = match &stamp.domain {
                 PolicyDomain::Account(id) => self
                     .policy
@@ -404,17 +409,22 @@ impl Store {
                     && authority.service == ServiceId::from_key(&key),
                 "observation freshness authority mismatch"
             );
-            receipts.push(Signed::sign(
-                FreshnessReceipt {
-                    version: AUTH_VERSION,
-                    current: stamp.clone(),
-                    challenge_hash: challenge.hash()?,
-                    issued_at_ms: now_ms,
-                    expires_at_ms: challenge.expires_at_ms,
-                },
-                &signer,
-            )?);
+            currents.push(stamp.clone());
         }
+        currents.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let receipts = if currents.is_empty() {
+            Vec::new()
+        } else {
+            let receipt = FreshnessReceipt {
+                version: AUTH_VERSION,
+                currents,
+                challenge_hash: challenge.hash()?,
+                issued_at_ms: now_ms,
+                expires_at_ms: challenge.expires_at_ms,
+            };
+            receipt.validate_currents()?;
+            vec![Signed::sign(receipt, &signer)?]
+        };
         for receipt in &receipts {
             usage.record_signed(receipt)?;
         }

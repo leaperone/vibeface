@@ -275,12 +275,11 @@ impl Runtime {
             })?
         };
         receipts.extend(local);
-        receipts.sort_by(|left, right| {
-            left.payload
-                .current
-                .domain
-                .cmp(&right.payload.current.domain)
-        });
+        for receipt in &receipts {
+            receipt.payload.validate_currents()?;
+        }
+        receipts.sort_by(|left, right| left.payload.currents.cmp(&right.payload.currents));
+        receipts.dedup();
         match (wire, challenge) {
             (TaskBusinessWire::Submit(wire), TaskBusinessChallenge::Submit(challenge)) => {
                 let proof = ExecutionHandoffFreshness {
@@ -517,12 +516,11 @@ impl Runtime {
                 &self.identity,
                 now,
             )?);
-            receipts.sort_by(|left, right| {
-                left.payload
-                    .current
-                    .domain
-                    .cmp(&right.payload.current.domain)
-            });
+            for receipt in &receipts {
+                receipt.payload.validate_currents()?;
+            }
+            receipts.sort_by(|left, right| left.payload.currents.cmp(&right.payload.currents));
+            receipts.dedup();
             Ok(ExecutionHandoffResolutionFreshness {
                 challenge,
                 receipts,

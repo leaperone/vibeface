@@ -266,20 +266,23 @@ fn check_space_receipt(
     let mut domains = BTreeSet::new();
     for receipt in &response.committed.receipts {
         receipt.verify_signature()?;
+        receipt.payload.validate_currents()?;
         ensure!(
             receipt.issuer == *node
                 && receipt.payload.version == AUTH_VERSION
                 && receipt.payload.challenge_hash == commit.challenge_hash()?
-                && commit
-                    .payload
-                    .dependencies
-                    .contains(&receipt.payload.current)
-                && domains.insert(receipt.payload.current.domain.clone())
                 && receipt.payload.issued_at_ms >= commit.payload.issued_at_ms
                 && receipt.payload.issued_at_ms <= commit.payload.accepted_at_ms
                 && receipt.payload.expires_at_ms <= commit.payload.expires_at_ms,
             "stored governance freshness receipt changed"
         );
+        for current in &receipt.payload.currents {
+            ensure!(
+                commit.payload.dependencies.contains(current)
+                    && domains.insert(current.domain.clone()),
+                "stored governance freshness receipt changed"
+            );
+        }
     }
     let mut expected = request.new_objects.clone();
     expected.push(JournalEntry::SpaceCommit(response.committed.clone()));
@@ -290,7 +293,7 @@ fn check_space_receipt(
             && request.proposal.payload.previous.as_ref() == Some(&commit.payload.previous)
             && commit.payload.proposal_hash == request.proposal.hash()?
             && commit.payload.nonce == request.nonce
-            && response.committed.receipts.len() == commit.payload.dependencies.len()
+            && domains.len() == commit.payload.dependencies.len()
             && response.journal_delta == expected,
         "stored governance receipt differs from its signed request"
     );
@@ -907,36 +910,35 @@ impl Store {
                     )?
                 };
                 let challenge_hash = challenge.challenge_hash()?;
-                let receipts = challenge
-                    .payload
-                    .dependencies
-                    .iter()
-                    .map(|current| {
-                        let authority = match &current.domain {
-                            PolicyDomain::Account(id) => {
-                                state.account(id).map(|value| &value.authority)
-                            }
-                            PolicyDomain::Space(id) => {
-                                state.space(id).map(|value| &value.authority)
-                            }
+                let mut currents = Vec::new();
+                for current in &challenge.payload.dependencies {
+                    let authority = match &current.domain {
+                        PolicyDomain::Account(id) => {
+                            state.account(id).map(|value| &value.authority)
                         }
-                        .context("dependency authority is unavailable")?;
-                        ensure!(
-                            authority.public_key == node,
-                            "governance requires freshness from a remote authority"
-                        );
-                        Ok(Signed::sign(
-                            FreshnessReceipt {
-                                version: AUTH_VERSION,
-                                current: current.clone(),
-                                challenge_hash: challenge_hash.clone(),
-                                issued_at_ms: now_ms,
-                                expires_at_ms,
-                            },
-                            &signer,
-                        )?)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                        PolicyDomain::Space(id) => state.space(id).map(|value| &value.authority),
+                    }
+                    .context("dependency authority is unavailable")?;
+                    ensure!(
+                        authority.public_key == node,
+                        "governance requires freshness from a remote authority"
+                    );
+                    currents.push(current.clone());
+                }
+                currents.sort_by(|left, right| left.domain.cmp(&right.domain));
+                let receipts = if currents.is_empty() {
+                    Vec::new()
+                } else {
+                    let receipt = FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        currents,
+                        challenge_hash,
+                        issued_at_ms: now_ms,
+                        expires_at_ms,
+                    };
+                    receipt.validate_currents()?;
+                    vec![Signed::sign(receipt, &signer)?]
+                };
                 let committed = if registration.is_none() {
                     governance::accept_space_governance_change_in_state(
                         state, &request, &challenge, &receipts, &signer, now_ms,
@@ -2340,10 +2342,11 @@ mod tests {
         )?;
         let own_receipts = local.sign_current_receipts(&challenge, &network.node, now())?;
         let remote_receipts = remote.sign_current_receipts(&challenge, &remote_identity, now())?;
-        assert_eq!(own_receipts.len(), 2);
+        assert_eq!(own_receipts.len(), 1);
+        assert_eq!(own_receipts[0].payload.currents.len(), 2);
         assert_eq!(remote_receipts.len(), 1);
         assert_eq!(
-            remote_receipts[0].payload.current.domain,
+            remote_receipts[0].payload.currents[0].domain,
             PolicyDomain::Space(source.space.clone())
         );
         let mut stale = challenge.clone();
