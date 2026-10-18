@@ -1624,6 +1624,214 @@ pub(crate) mod tests {
         serde_json::to_string(value).unwrap()
     }
 
+    #[test]
+    fn bounded_history_import_verifies_original_result_after_current_writer_revocation() {
+        let now = 10_020;
+        let mut fixture = execution_observation::tests::retained_history_fixture();
+        let mut document = fixture
+            .state
+            .space(&fixture.actual.handoff.handoff.execution_resource.space)
+            .unwrap()
+            .clone();
+        document.previous = fixture
+            .state
+            .head(&PolicyDomain::Space(document.space.clone()))
+            .cloned();
+        document.sequence += 1;
+        document
+            .grants
+            .retain(|hash| hash != &fixture.actual.handoff.invocation.payload.grant_leaf);
+        let revoked = Signed::sign(document, &fixture.root).unwrap();
+        fixture.state.install_space(revoked.clone()).unwrap();
+        fixture
+            .execution_bundle
+            .journal
+            .push(JournalEntry::Space(revoked));
+        for pin in &mut fixture.pins {
+            pin.minimum_head = fixture.state.head(&pin.domain).cloned();
+        }
+        let mut independent: BTreeMap<_, _> = require_confirmed_client_policy(&fixture.source)
+            .unwrap()
+            .pins()
+            .iter()
+            .cloned()
+            .map(|pin| (pin.domain.clone(), pin))
+            .collect();
+        for pin in &fixture.pins {
+            if let Some(saved) = independent.insert(pin.domain.clone(), pin.clone()) {
+                assert_eq!(saved.genesis_root, pin.genesis_root);
+            }
+        }
+        let independent: Vec<_> = independent.into_values().collect();
+        let input = json!({"actual_json":wire(&fixture.actual),"body_json":wire(&fixture.body),
+            "invocation_json":wire(&fixture.invocation),"binding_json":wire(&fixture.binding)});
+        let intent_json = build_remote_execution_history_policy_read_intent(
+            &fixture.source,
+            &wire(&input),
+            &wire(&independent),
+            &fixture.client,
+            now as f64,
+            (now + 1_000) as f64,
+        )
+        .unwrap();
+        let intent: Signed<RemoteExecutionPolicyReadIntent> =
+            serde_json::from_str(&intent_json).unwrap();
+        assert_eq!(
+            intent.payload.purpose,
+            RemoteExecutionPolicyPurpose::History
+        );
+        let gate = verify_remote_execution_policy_delegation_source(
+            require_confirmed_client_policy(&fixture.source)
+                .unwrap()
+                .state(),
+            &intent,
+            &PublicKey::of(&fixture.project_node),
+            &PublicKey::of(&fixture.client),
+            now,
+        )
+        .unwrap();
+        let delegation =
+            sign_remote_execution_policy_read_delegation(&gate, &fixture.project_node, now)
+                .unwrap();
+        let request = RemoteExecutionPolicyReadRequest { intent, delegation };
+        let verified = verify_remote_execution_history_policy_read(
+            &fixture.state,
+            &request,
+            &fixture.acceptance,
+            &PublicKey::of(&fixture.executor),
+            &PublicKey::of(&fixture.client),
+            now,
+        )
+        .unwrap();
+        assert!(
+            verify_remote_execution_policy_read(
+                &fixture.state,
+                &request,
+                &PublicKey::of(&fixture.executor),
+                &PublicKey::of(&fixture.client),
+                now
+            )
+            .is_err()
+        );
+        let header = Signed::sign(
+            RemoteExecutionPolicySnapshot {
+                version: AUTH_VERSION,
+                request_hash: ObjectHash::body(&request).unwrap(),
+                snapshot_id: Nonce::random().unwrap(),
+                saved_pins_hash: ObjectHash::body(&independent).unwrap(),
+                target_heads: verified.target_heads().to_vec(),
+                source_node_public_key: PublicKey::of(&fixture.executor),
+                issued_at_ms: now,
+                expires_at_ms: now + 1_000,
+                history: Some(fixture.acceptance.clone()),
+            },
+            &fixture.executor,
+        )
+        .unwrap();
+        assert!(
+            begin_remote_execution_policy_import(
+                &fixture.source,
+                &wire(&request),
+                &wire(&header),
+                &wire(&independent),
+                PublicKey::of(&fixture.executor).as_str(),
+                now as f64
+            )
+            .is_err()
+        );
+        let mut import = begin_remote_execution_history_policy_import(
+            &fixture.source,
+            &wire(&request),
+            &wire(&header),
+            &wire(&independent),
+            PublicKey::of(&fixture.executor).as_str(),
+            now as f64,
+        )
+        .unwrap();
+        let entries: Vec<_> = fixture
+            .execution_bundle
+            .journal
+            .iter()
+            .filter(|entry| verified.allows_entry(entry).unwrap())
+            .cloned()
+            .collect();
+        assert!(!entries.is_empty());
+        let mut previous = header.hash().unwrap();
+        for (index, entry) in entries.iter().enumerate() {
+            let page_request: RemoteExecutionPolicyPageRequest =
+                serde_json::from_str(&import.page_request_json().unwrap()).unwrap();
+            let next_cursor =
+                (index + 1 < entries.len()).then(|| policy_import::entry_hash(entry).unwrap());
+            let page = Signed::sign(
+                RemoteExecutionPolicyPage {
+                    version: AUTH_VERSION,
+                    request_hash: header.payload.request_hash.clone(),
+                    snapshot_id: header.payload.snapshot_id.clone(),
+                    target_heads_hash: ObjectHash::body(&header.payload.target_heads).unwrap(),
+                    page_index: index as u64,
+                    request_cursor: page_request.cursor,
+                    previous_page_hash: previous,
+                    entry: Some(entry.clone()),
+                    complete: next_cursor.is_none(),
+                    next_cursor,
+                },
+                &fixture.executor,
+            )
+            .unwrap();
+            import.append_page(&wire(&page), now as f64).unwrap();
+            previous = page.hash().unwrap();
+        }
+        let witness = Signed::sign(
+            RemoteExecutionPolicyWitness {
+                version: AUTH_VERSION,
+                request_hash: header.payload.request_hash.clone(),
+                snapshot_id: header.payload.snapshot_id.clone(),
+                target_heads: header.payload.target_heads.clone(),
+                final_page_hash: previous,
+                page_count: entries.len() as u64,
+                entry_count: entries.len() as u64,
+                snapshot_hash: header.hash().unwrap(),
+                source_node_public_key: PublicKey::of(&fixture.executor),
+                issued_at_ms: now,
+                expires_at_ms: now + 1_000,
+            },
+            &fixture.executor,
+        )
+        .unwrap();
+        let history = import.finish(&wire(&witness), now as f64).unwrap();
+        let result = remote_resolution_history::verify_remote_execution_result_history(
+            &fixture.source,
+            &history,
+            &wire(&fixture.actual),
+            &wire(&fixture.body),
+            &wire(&fixture.invocation),
+            &wire(&fixture.binding),
+            now as f64,
+        )
+        .unwrap();
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["historical"], true);
+        assert_eq!(result["state"], "succeeded");
+        assert_eq!(
+            result["actual"],
+            serde_json::to_value(&fixture.actual).unwrap()
+        );
+        let mut wrong = fixture.body.clone();
+        wrong["authorization_id"] = json!("another-history");
+        assert!(
+            remote_resolution_history::verify_remote_execution_result_history(
+                &fixture.source,
+                &history,
+                &wire(&fixture.actual),
+                &wire(&wrong),
+                &wire(&fixture.invocation),
+                &wire(&fixture.binding),
+                now as f64
+            )
+            .is_err()
+        );
+    }
+
     fn domain(entry: &JournalEntry) -> PolicyDomain {
         match entry {
             JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {

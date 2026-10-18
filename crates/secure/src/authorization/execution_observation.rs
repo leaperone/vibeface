@@ -1152,6 +1152,10 @@ pub(crate) mod tests {
         pub(crate) pins: Vec<PolicyPin>,
         pub(crate) executor: Identity,
         pub(crate) root: Identity,
+        pub(crate) source: VerifiedClientAuthorization,
+        pub(crate) client: Identity,
+        pub(crate) project_node: Identity,
+        pub(crate) execution_bundle: ClientAuthorizationBundle,
     }
 
     pub(crate) fn retained_history_fixture() -> RetainedHistoryFixture {
@@ -1304,6 +1308,12 @@ pub(crate) mod tests {
             serde_json::from_value(proof.source_body["request"]["binding"].clone()).unwrap();
         let state =
             replay_policies(&fixture.executor.pins, &fixture.executor.bundle.journal).unwrap();
+        let mut source_bundle = fixture.project.bundle.clone();
+        source_bundle.grant_leaf = fixture.resolver_grant.clone();
+        let source = remote_execution_policy::tests::confirmed_source(
+            &source_bundle, &fixture.project.pins, &fixture.project.client,
+            &fixture.project.node, &fixture.project.project, NOW,
+        ).unwrap();
         RetainedHistoryFixture {
             state,
             actual,
@@ -1319,6 +1329,10 @@ pub(crate) mod tests {
             pins: fixture.executor.pins,
             executor: fixture.executor.node,
             root: fixture.executor.root,
+            source,
+            client: fixture.project.client,
+            project_node: fixture.project.node,
+            execution_bundle: fixture.executor.bundle,
         }
     }
 
