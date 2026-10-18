@@ -1,40 +1,94 @@
-use super::{journal, policy::project_policy_in};
+use super::{
+    bounded_recovery_context::{completed_recovery_read_in, recovery_read_reference_in},
+    journal,
+    policy::project_policy_in,
+};
 use crate::{crypto::LocalIdentity, store::Store};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use vibeface_secure::authorization::{
-    Actor, ClientAuthorizationBundle, JournalEntry, Nonce, ObjectHash, PolicyDomain, PolicyPin,
-    PolicyStamp, PublicKey, Signed,
-    bootstrap::{
-        self, NodeClaim,
-        recovery::{self, context::RecoveryContextRequest},
+use vibeface_secure::{
+    Identity,
+    authorization::{
+        AUTH_VERSION, JournalEntry, Nonce, ObjectHash, PublicKey, Signature, Signed,
+        bootstrap::recovery::{
+            context::RecoveryContextRequest,
+            stream::{
+                self, RecoveryCompletionReceipt, RecoveryCompletionStatusRequest,
+                RecoveryProofUsage, RecoveryReadRequest, StreamedRecoveryCommitRequest,
+                StreamedRecoveryNodeRequest,
+            },
+        },
     },
+    signature_verification::ScopedSignatureVerification,
 };
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RecoveryContext {
-    request: Signed<RecoveryContextRequest>,
-    claim: Signed<NodeClaim>,
-    pins: Vec<PolicyPin>,
-    authorization: ClientAuthorizationBundle,
-    possession: Option<Value>,
+struct ApprovedRecoveryPossession {
+    request: StreamedRecoveryNodeRequest,
+    proof: Signature,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveryCommit {
-    expected_account_head: PolicyStamp,
-    expected_space_head: PolicyStamp,
-    journal_delta: Vec<JournalEntry>,
-    claim_nonce: Nonce,
-    request_hash: ObjectHash,
+fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
+    let encoded: Option<(usize, Option<String>)> = connection
+        .query_row(
+            "SELECT length(CAST(value AS BLOB)),CASE WHEN length(CAST(value AS BLOB))<=65536 THEN value END FROM identity_meta WHERE key=?",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((length, encoded)) = encoded else {
+        return Ok(None);
+    };
+    ensure!(length <= 65_536, "stored recovery record is too large");
+    Ok(Some(encoded.context("stored recovery record is missing")?))
 }
 
-fn context_key(nonce: &Nonce) -> String {
-    format!("recovery-context:{nonce}")
+fn possession_key(snapshot_id: &Nonce) -> String {
+    format!("recovery-possession:{snapshot_id}")
+}
+
+fn completion_key(snapshot_id: &Nonce) -> String {
+    format!("recovery-completed:{snapshot_id}")
+}
+
+fn bounded(value: Value) -> Result<Value> {
+    ensure!(
+        serde_json::to_vec(&value)?.len() <= 65_536,
+        "recovery carrier exceeds 64 KiB"
+    );
+    Ok(value)
+}
+
+fn carrier_bytes(request: &Value, response: &Value) -> Result<usize> {
+    Ok(serde_json::to_vec(request)?
+        .len()
+        .max(serde_json::to_vec(response)?.len()))
+}
+
+pub(crate) fn recovery_completion_in(
+    connection: &Connection,
+    local: &PublicKey,
+    principal: &str,
+    request: &RecoveryCompletionStatusRequest,
+) -> Result<Option<Signed<RecoveryCompletionReceipt>>> {
+    let Some(encoded) = metadata(connection, &completion_key(&request.context.snapshot_id))? else {
+        return Ok(None);
+    };
+    let receipt: Signed<RecoveryCompletionReceipt> = serde_json::from_str(&encoded)?;
+    ensure!(
+        receipt.issuer == *local
+            && receipt.payload.version == AUTH_VERSION
+            && receipt.payload.context == request.context
+            && receipt.payload.input_hash == request.input_hash
+            && receipt.payload.new_device_public_key.as_str() == principal
+            && receipt.payload.source_node_public_key == *local,
+        "recovery completion differs from the original request or Noise device"
+    );
+    receipt.verify_signature()?;
+    Ok(Some(receipt))
 }
 
 impl Store {
@@ -45,203 +99,119 @@ impl Store {
         params: &Value,
         now_ms: u64,
     ) -> Result<Value> {
-        let request: Signed<RecoveryContextRequest> =
-            serde_json::from_value(params["request"].clone())?;
-        let key = PublicKey::parse(&identity.public_key_hex()?)?;
-        let verified = self
-            .policy
-            .verified()
-            .verify_recovery_context_request(&request, &key, now_ms)?;
-        ensure!(
-            verified.new_device_public_key().as_str() == principal,
-            "recovery request belongs to another Noise device"
-        );
-        let account_domain = PolicyDomain::Account(verified.account().clone());
-        let space_domain = PolicyDomain::Space(verified.space().clone());
-        let pins: Vec<_> = self
-            .policy
-            .pins()
-            .iter()
-            .filter(|pin| pin.domain == account_domain || pin.domain == space_domain)
-            .cloned()
-            .collect();
-        ensure!(pins.len() == 2, "recovery policy roots are not installed");
-        let mut statement = self
-            .connection
-            .prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut entries = Vec::new();
-        for row in rows {
-            let entry: JournalEntry = serde_json::from_str(&row?)?;
-            let belongs = match &entry {
-                JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
-                    value.payload.account == *verified.account()
-                }
-                JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => {
-                    value.payload.space == *verified.space()
-                }
-                JournalEntry::AccountCommit(value) => {
-                    value.proposal.payload.account == *verified.account()
-                }
-                JournalEntry::SpaceCommit(value) => {
-                    value.proposal.payload.space == *verified.space()
-                }
-                JournalEntry::Device(value) => {
-                    value.payload.owner == account_domain || value.payload.owner == space_domain
-                }
-                JournalEntry::Authenticator(value) => value.payload.account == *verified.account(),
-                JournalEntry::Resource(value) => value.payload.space == *verified.space(),
-                JournalEntry::Membership(value) => value.payload.space == *verified.space(),
-                JournalEntry::Grant(value) => value.payload.owner_space == *verified.space(),
-            };
-            if belongs {
-                entries.push(entry);
-            }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BeginRequest {
+            request: Signed<RecoveryContextRequest>,
         }
-        drop(statement);
-        let leaf = entries
-            .iter()
-            .find_map(|entry| match entry {
-                JournalEntry::Grant(grant)
-                    if grant.payload.grantee
-                        == vibeface_secure::authorization::Grantee::Actor(Actor::Account(
-                            verified.account().clone(),
-                        )) =>
-                {
-                    grant.hash().ok()
-                }
-                _ => None,
-            })
-            .context("recovery history has no account grant anchor")?;
-        let authorization = ClientAuthorizationBundle {
-            journal: entries,
-            grant_leaf: leaf,
-        };
-        let replayed =
-            vibeface_secure::authorization::replay_policies(&pins, &authorization.journal)
-                .context("recovery history requires additional scoped proof")?;
-        for domain in [&account_domain, &space_domain] {
-            ensure!(
-                replayed.head(domain) == self.policy.verified().head(domain),
-                "recovery projection is incomplete"
-            );
-        }
-        let row_key = context_key(verified.nonce());
-        let previous: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT value FROM identity_meta WHERE key=?",
-                [&row_key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(previous) = previous {
-            let previous: RecoveryContext = serde_json::from_str(&previous)?;
-            ensure!(
-                previous.request == request,
-                "recovery nonce was reused with another request"
-            );
-            return Ok(
-                json!({"claim":previous.claim,"authorization":previous.authorization,"pins":previous.pins}),
-            );
-        }
-        let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
-            .map_err(anyhow::Error::msg)?;
-        let claim = bootstrap::create_node_claim(
-            &signer,
-            verified.nonce().as_str(),
-            now_ms as f64,
-            verified.expires_at_ms() as f64,
+        bounded(params.clone())?;
+        let request: BeginRequest = serde_json::from_value(params.clone())?;
+        self.begin_recovery_read(
+            identity,
+            principal,
+            RecoveryReadRequest::Account(request.request),
+            now_ms,
         )
-        .map_err(anyhow::Error::msg)?;
-        let claim: Signed<NodeClaim> = serde_json::from_str(&claim)?;
-        let context = RecoveryContext {
-            request,
-            claim: claim.clone(),
-            pins: pins.clone(),
-            authorization: authorization.clone(),
-            possession: None,
-        };
-        self.connection.execute(
-            "INSERT INTO identity_meta(key,value) VALUES(?,?)",
-            params![row_key, serde_json::to_string(&context)?],
-        )?;
-        Ok(json!({"claim":claim,"authorization":authorization,"pins":pins}))
+    }
+
+    pub(crate) fn recovery_status(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        _now_ms: u64,
+    ) -> Result<Value> {
+        let _verification = ScopedSignatureVerification::new();
+        bounded(params.clone())?;
+        let request: RecoveryCompletionStatusRequest = serde_json::from_value(params.clone())?;
+        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = recovery_completion_in(&tx, &local, principal, &request)? {
+            let response = bounded(json!({"state":"committed","receipt":receipt}))?;
+            let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+            usage.record_completion(&receipt)?;
+            usage.finish()?;
+            return Ok(response);
+        }
+        let context = recovery_read_reference_in(&tx, identity, principal, &request.context)?;
+        ensure!(
+            matches!(&context.request, RecoveryReadRequest::Account(_)),
+            "recovery status belongs to another purpose"
+        );
+        let response = json!({"state":"not_committed"});
+        let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+        context.record_reference_usage(&mut usage)?;
+        usage.finish()?;
+        Ok(response)
     }
 
     pub(crate) fn recovery_node_possession(
         &mut self,
         identity: &LocalIdentity,
         principal: &str,
-        request: &Value,
+        params: &Value,
         now_ms: u64,
     ) -> Result<Value> {
-        let claim: Signed<NodeClaim> = serde_json::from_value(request["claim"].clone())?;
-        let row_key = context_key(&claim.payload.claim_nonce);
-        let encoded: String = self.connection.query_row(
-            "SELECT value FROM identity_meta WHERE key=?",
-            [&row_key],
-            |row| row.get(0),
-        )?;
-        let mut context: RecoveryContext = serde_json::from_str(&encoded)?;
-        ensure!(
-            context.claim == claim
-                && context.request.payload.new_device_public_key.as_str() == principal,
-            "recovery claim or Noise device changed"
-        );
-        self.policy.verified().verify_recovery_context_request(
-            &context.request,
-            &PublicKey::parse(&identity.public_key_hex()?)?,
+        let _verification = ScopedSignatureVerification::new();
+        bounded(params.clone())?;
+        let request: StreamedRecoveryNodeRequest = serde_json::from_value(params.clone())?;
+        let signer =
+            Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let context = completed_recovery_read_in(
+            &tx,
+            &self.policy,
+            identity,
+            principal,
+            &request.context,
             now_ms,
         )?;
-        let request_hash = ObjectHash::body(request)?;
-        if let Some(possession) = &context.possession {
-            ensure!(
-                possession["request_hash"] == request_hash.as_str(),
-                "recovery claim was already bound to another proposal"
-            );
-            return Ok(json!({"proof":possession["proof"]}));
-        }
-        for (name, domain) in [
-            (
-                "expected_account_head",
-                PolicyDomain::Account(context.request.payload.account.clone()),
-            ),
-            (
-                "expected_space_head",
-                PolicyDomain::Space(context.request.payload.space.clone()),
-            ),
-        ] {
-            ensure!(
-                Some(serde_json::from_value::<PolicyStamp>(
-                    request[name].clone()
-                )?)
-                .as_ref()
-                    == self.policy.verified().head(&domain),
-                "recovery proposal has stale policy heads"
-            );
-        }
-        let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
-            .map_err(anyhow::Error::msg)?;
-        let proof = recovery::sign_recovery_node_possession(
-            &serde_json::to_string(request)?,
-            &signer,
-            &serde_json::to_string(&context.pins)?,
-            &serde_json::to_string(&context.authorization)?,
-            claim.payload.claim_nonce.as_str(),
-            now_ms as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        context.possession =
-            Some(json!({"request":request,"request_hash":request_hash,"proof":proof}));
         ensure!(
-            self.connection.execute(
-                "UPDATE identity_meta SET value=? WHERE key=? AND value=?",
-                params![serde_json::to_string(&context)?, row_key, encoded]
-            )? == 1,
-            "recovery proposal changed concurrently"
+            matches!(&context.request, RecoveryReadRequest::Account(_)),
+            "recovery possession belongs to another purpose"
         );
-        Ok(json!({"proof":proof}))
+        let proof = stream::sign_recovery_node_possession_in_state(
+            &request,
+            &context.request,
+            &context.snapshot,
+            &context.witness,
+            self.policy.verified(),
+            &signer,
+            &context.snapshot.payload.claim.payload.claim_nonce,
+            now_ms,
+        )?;
+        let key = possession_key(&request.context.snapshot_id);
+        let response = bounded(json!({"proof":proof}))?;
+        let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+        context.record_current_usage(self.policy.verified(), &mut usage)?;
+        usage.record_node_request(&request, self.policy.verified())?;
+        usage.finish()?;
+        if let Some(previous) = metadata(&tx, &key)? {
+            let previous: ApprovedRecoveryPossession = serde_json::from_str(&previous)?;
+            ensure!(
+                previous.request == request && previous.proof == proof,
+                "recovery snapshot was already bound to another proposal"
+            );
+        } else {
+            let encoded = serde_json::to_string(&ApprovedRecoveryPossession {
+                request,
+                proof: proof.clone(),
+            })?;
+            ensure!(
+                encoded.len() <= 65_536,
+                "stored recovery possession is too large"
+            );
+            tx.execute(
+                "INSERT INTO identity_meta(key,value) VALUES(?,?)",
+                params![key, encoded],
+            )?;
+        }
+        tx.commit()?;
+        Ok(response)
     }
 
     pub(crate) fn recover_account(
@@ -251,155 +221,122 @@ impl Store {
         params: &Value,
         now_ms: u64,
     ) -> Result<Value> {
-        let input: RecoveryCommit = serde_json::from_value(params.clone())?;
-        let completion_hash = ObjectHash::body(params)?;
-        let completion_key = format!("recovery-completed:{}", input.claim_nonce);
-        let previous: Option<String> = self
+        let _verification = ScopedSignatureVerification::new();
+        bounded(params.clone())?;
+        let input: StreamedRecoveryCommitRequest = serde_json::from_value(params.clone())?;
+        let input_hash = ObjectHash::body(&input)?;
+        let status = RecoveryCompletionStatusRequest {
+            context: input.context.clone(),
+            input_hash: input_hash.clone(),
+        };
+        let signer =
+            Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
+        let local = PublicKey::of(&signer);
+        let tx = self
             .connection
-            .query_row(
-                "SELECT value FROM identity_meta WHERE key=?",
-                [&completion_key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(previous) = previous {
-            let previous: Value = serde_json::from_str(&previous)?;
-            ensure!(
-                previous["completion_hash"] == completion_hash.as_str()
-                    && previous["principal"] == principal,
-                "recovery nonce was already consumed by another request"
-            );
-            return Ok(previous["response"].clone());
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = recovery_completion_in(&tx, &local, principal, &status)? {
+            let response = bounded(json!({"receipt":receipt}))?;
+            let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+            usage.record_completion(&receipt)?;
+            usage.finish()?;
+            return Ok(response);
         }
-        let row_key = context_key(&input.claim_nonce);
-        let encoded: String = self.connection.query_row(
-            "SELECT value FROM identity_meta WHERE key=?",
-            [&row_key],
-            |row| row.get(0),
-        )?;
-        let context: RecoveryContext = serde_json::from_str(&encoded)?;
-        let local_key = PublicKey::parse(&identity.public_key_hex()?)?;
-        self.policy.verified().verify_recovery_context_request(
-            &context.request,
-            &local_key,
+        let context = completed_recovery_read_in(
+            &tx,
+            &self.policy,
+            identity,
+            principal,
+            &input.context,
             now_ms,
         )?;
         ensure!(
-            context.request.payload.new_device_public_key.as_str() == principal,
-            "recovery belongs to another Noise device"
-        );
-        let possession = context
-            .possession
-            .as_ref()
-            .context("recovery Node possession is not approved")?;
-        ensure!(
-            possession["request_hash"] == input.request_hash.as_str(),
-            "recovery commit differs from approved proposal"
-        );
-        let request = &possession["request"];
-        ensure!(
-            serde_json::to_value(&input.expected_account_head)? == request["expected_account_head"]
-                && serde_json::to_value(&input.expected_space_head)?
-                    == request["expected_space_head"],
-            "recovery heads differ from approved proposal"
+            matches!(&context.request, RecoveryReadRequest::Account(_)),
+            "recovery commit belongs to another purpose"
         );
         ensure!(
-            self.policy
-                .verified()
-                .head(&input.expected_account_head.domain)
-                == Some(&input.expected_account_head)
-                && self
-                    .policy
-                    .verified()
-                    .head(&input.expected_space_head.domain)
-                    == Some(&input.expected_space_head),
-            "recovery policy changed before commit"
+            input.new_device_public_key.as_str() == principal
+                && input.new_device_public_key == *context.request.new_device_public_key()
+                && input.claim_nonce == context.snapshot.payload.claim.payload.claim_nonce,
+            "recovery commit changed its original client or claim"
         );
-        let mut account_proposal = false;
-        let mut node_certificate = false;
-        for entry in &input.journal_delta {
-            match entry {
-                JournalEntry::Account(account)
-                    if serde_json::to_value(account)? == request["account_recovery"] =>
-                {
-                    account_proposal = true
-                }
+        let approved: ApprovedRecoveryPossession = serde_json::from_str(
+            &metadata(&tx, &possession_key(&input.context.snapshot_id))?
+                .context("recovery Node possession is not approved")?,
+        )?;
+        ensure!(
+            approved.request.context == input.context,
+            "recovery commit changed its approved context"
+        );
+        ensure!(
+            input.journal_delta.iter().any(|entry| matches!(
+                entry,
                 JournalEntry::Device(certificate)
-                    if certificate.payload.public_key == local_key =>
-                {
-                    let mut unsigned = certificate.payload.clone();
-                    unsigned.possession = None;
-                    ensure!(
-                        serde_json::to_value(unsigned)? == request["node_certificate"]
-                            && certificate
-                                .payload
-                                .possession
-                                .as_ref()
-                                .map(|proof| proof.as_str())
-                                == possession["proof"].as_str(),
-                        "recovery Node certificate differs from approved possession"
-                    );
-                    node_certificate = true;
-                }
-                _ => {}
-            }
-        }
+                    if certificate.payload.public_key == local
+                        && certificate.payload.possession.as_ref() == Some(&approved.proof)
+            )),
+            "recovery commit changed its approved Node possession"
+        );
+        let verified = stream::verify_recovery_stream_commit_in_state(
+            &input,
+            &approved.request,
+            &context.request,
+            self.policy.verified(),
+            now_ms,
+        )?;
         ensure!(
-            account_proposal && node_certificate,
-            "recovery commit lacks approved account or Node certificate"
+            verified.input_hash() == &input_hash,
+            "recovery commit changed its exact input hash"
         );
         let update = self
             .policy
             .prepare_network_update(&input.journal_delta, now_ms)?;
-        let state = update.verified_after();
-        let mut pins = context.pins.clone();
-        for pin in &mut pins {
-            pin.minimum_head = state.head(&pin.domain).cloned();
-        }
-        let mut full_journal = context.authorization.journal.clone();
-        full_journal.extend(input.journal_delta.clone());
-        let grant_leaf = input
-            .journal_delta
-            .iter()
-            .find_map(|entry| match entry {
-                JournalEntry::Grant(grant)
-                    if grant.payload.grantee
-                        == vibeface_secure::authorization::Grantee::Actor(Actor::Account(
-                            context.request.payload.account.clone(),
-                        )) =>
-                {
-                    grant.hash().ok()
-                }
-                _ => None,
-            })
-            .context("recovery lacks a new account grant")?;
-        let bundle = ClientAuthorizationBundle {
-            journal: full_journal,
-            grant_leaf,
-        };
-        let verified = vibeface_secure::authorization::verify_client_authorization(
-            &serde_json::to_string(&bundle)?,
-            &serde_json::to_string(&pins)?,
-            context.request.payload.account.as_str(),
-            context.request.payload.space.as_str(),
-            principal,
-            now_ms as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let response = json!({"scope":verified.scope(),"authorization":bundle,"pins":pins,"resources":verified.resources()});
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let actual: String = tx.query_row(
-            "SELECT value FROM identity_meta WHERE key=?",
-            [&row_key],
-            |row| row.get(0),
+        let after = update.verified_after();
+        ensure!(
+            verified.committed_heads().len() == 2
+                && verified
+                    .committed_heads()
+                    .iter()
+                    .all(|head| after.head(&head.domain) == Some(head)),
+            "recovery commit differs from its verified policy delta"
+        );
+        let receipt = Signed::sign(
+            RecoveryCompletionReceipt {
+                version: AUTH_VERSION,
+                context: input.context.clone(),
+                request_hash: input.request_hash.clone(),
+                input_hash,
+                committed_account_head: after
+                    .head(&input.expected_account_head.domain)
+                    .cloned()
+                    .context("recovered account policy is missing")?,
+                committed_space_head: after
+                    .head(&input.expected_space_head.domain)
+                    .cloned()
+                    .context("recovered personal policy is missing")?,
+                grant_leaf: input.grant_leaf.clone(),
+                new_device_public_key: input.new_device_public_key.clone(),
+                source_node_public_key: local,
+                accepted_at_ms: now_ms,
+            },
+            &signer,
         )?;
-        ensure!(actual == encoded, "recovery request changed concurrently");
+        let response = bounded(json!({"receipt":receipt}))?;
+        let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+        context.record_current_usage(self.policy.verified(), &mut usage)?;
+        usage.record_node_request(&approved.request, self.policy.verified())?;
+        usage.record_commit(&input, self.policy.verified())?;
+        usage.record_completion(&receipt)?;
+        usage.finish()?;
         let state = journal::commit_in(&tx, &update)?;
         project_policy_in(&tx, &state)?;
-        tx.execute("INSERT INTO identity_meta(key,value) VALUES(?,?)", params![completion_key,
-            serde_json::to_string(&json!({"completion_hash":completion_hash,"principal":principal,"response":response}))?])?;
+        tx.execute(
+            "INSERT INTO identity_meta(key,value) VALUES(?,?)",
+            params![
+                completion_key(&input.context.snapshot_id),
+                serde_json::to_string(&receipt)?
+            ],
+        )?;
         tx.commit()?;
         self.policy = state;
         Ok(response)
