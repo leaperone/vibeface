@@ -157,93 +157,95 @@ impl Runtime {
         Ok(())
     }
 
-    pub(super) async fn agent_tool(
-        self: &Arc<Self>,
+    pub(super) fn agent_tool<'a>(
+        self: &'a Arc<Self>,
         access: Access,
-        name: &str,
+        name: &'a str,
         args: Value,
-        call_id: &str,
-    ) -> Result<Value> {
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_secs(self.config.timeout_secs.clamp(1, 20));
-        let scope = access
-            .conversation_id
-            .as_deref()
-            .context("missing tool scope")?;
-        let original = if matches!(name, "continue_execution" | "stop_execution") {
-            Some(
-                tokio::time::timeout_at(
+        call_id: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            let deadline = tokio::time::Instant::now()
+                + Duration::from_secs(self.config.timeout_secs.clamp(1, 20));
+            let scope = access
+                .conversation_id
+                .as_deref()
+                .context("missing tool scope")?;
+            let original = if matches!(name, "continue_execution" | "stop_execution") {
+                Some(
+                    tokio::time::timeout_at(
+                        deadline,
+                        self.agent_work(&access, field(&args, "work_ref")?),
+                    )
+                    .await
+                    .context(
+                        "tool preparation timed out before dispatch; keep the original call_ref",
+                    )??,
+                )
+            } else {
+                None
+            };
+            let write = !matches!(
+                name,
+                "context" | "nodes" | "execution_status" | "call_lookup"
+            );
+            let _lease = tokio::time::timeout_at(
+                deadline,
+                self.manager_tool_lease(
+                    &access,
+                    write,
+                    original
+                        .as_ref()
+                        .and_then(|request| request.task_id.as_deref()),
+                ),
+            )
+            .await
+            .context("tool admission timed out before dispatch; keep the original call_ref")??;
+            match name {
+                "nodes" => tokio::time::timeout_at(
                     deadline,
-                    self.agent_work(&access, field(&args, "work_ref")?),
+                    self.agent_rpc(&access, json!({"method":"nodes"})),
                 )
                 .await
-                .context(
-                    "tool preparation timed out before dispatch; keep the original call_ref",
-                )??,
-            )
-        } else {
-            None
-        };
-        let write = !matches!(
-            name,
-            "context" | "nodes" | "execution_status" | "call_lookup"
-        );
-        let _lease = tokio::time::timeout_at(
-            deadline,
-            self.manager_tool_lease(
-                &access,
-                write,
-                original
-                    .as_ref()
-                    .and_then(|request| request.task_id.as_deref()),
-            ),
-        )
-        .await
-        .context("tool admission timed out before dispatch; keep the original call_ref")??;
-        match name {
-            "nodes" => tokio::time::timeout_at(
-                deadline,
-                self.agent_rpc(&access, json!({"method":"nodes"})),
-            )
-            .await
-            .context("tool node lookup timed out")?,
-            "context" => tokio::time::timeout_at(deadline, self.agent_context(&access, &args))
-                .await
-                .context("tool context lookup timed out")?,
-            "execution_status" => tokio::time::timeout_at(
-                deadline,
-                self.agent_status(&access, args["work_ref"].as_str()),
-            )
-            .await
-            .context("tool status lookup timed out; keep the original work_ref")?,
-            "call_lookup" => {
-                let reference = field(&args, "call_ref")?;
-                let prepared =
-                    tokio::time::timeout_at(deadline, self.load_agent_call(&access, reference))
-                        .await
-                        .with_context(|| {
-                            format!("tool lookup timed out; keep call_ref {reference}")
-                        })??;
-                let prepared = prepared.context("call reference not found in this invocation")?;
-                self.run_agent_call(&access, reference, &prepared, false, deadline)
+                .context("tool node lookup timed out")?,
+                "context" => tokio::time::timeout_at(deadline, self.agent_context(&access, &args))
                     .await
-            }
-            "command" | "delegate" | "continue_execution" | "stop_execution" => {
-                let sdk_reference = if call_id.len() > 256 || call_id.chars().any(char::is_control)
-                {
-                    format!("sdk:{}", crate::crypto::digest(call_id.as_bytes()))
-                } else {
-                    call_id.to_owned()
-                };
-                let reference = args["call_ref"].as_str().unwrap_or(&sdk_reference);
-                ensure!(
-                    !reference.is_empty()
-                        && reference.len() <= 256
-                        && !reference.chars().any(char::is_control),
-                    "a bounded stable call reference is required"
-                );
-                let intent = call_intent(&args)?;
-                let prepared = tokio::time::timeout_at(deadline, async {
+                    .context("tool context lookup timed out")?,
+                "execution_status" => tokio::time::timeout_at(
+                    deadline,
+                    self.agent_status(&access, args["work_ref"].as_str()),
+                )
+                .await
+                .context("tool status lookup timed out; keep the original work_ref")?,
+                "call_lookup" => {
+                    let reference = field(&args, "call_ref")?;
+                    let prepared =
+                        tokio::time::timeout_at(deadline, self.load_agent_call(&access, reference))
+                            .await
+                            .with_context(|| {
+                                format!("tool lookup timed out; keep call_ref {reference}")
+                            })??;
+                    let prepared =
+                        prepared.context("call reference not found in this invocation")?;
+                    self.run_agent_call(&access, reference, &prepared, false, deadline)
+                        .await
+                }
+                "command" | "delegate" | "continue_execution" | "stop_execution" => {
+                    let sdk_reference =
+                        if call_id.len() > 256 || call_id.chars().any(char::is_control) {
+                            format!("sdk:{}", crate::crypto::digest(call_id.as_bytes()))
+                        } else {
+                            call_id.to_owned()
+                        };
+                    let reference = args["call_ref"].as_str().unwrap_or(&sdk_reference);
+                    ensure!(
+                        !reference.is_empty()
+                            && reference.len() <= 256
+                            && !reference.chars().any(char::is_control),
+                        "a bounded stable call reference is required"
+                    );
+                    let intent = call_intent(&args)?;
+                    let prepared = tokio::time::timeout_at(deadline, async {
                     let prepared = if let Some(prepared) = self.load_agent_call(&access, reference).await? {
                         ensure!(prepared.name == name && prepared.intent == intent, "call reference reused with different tool arguments");
                         prepared
@@ -266,29 +268,37 @@ impl Runtime {
                     };
                     Ok::<PreparedCall, anyhow::Error>(prepared)
                 }).await.with_context(|| format!("tool preparation timed out before dispatch; keep call_ref {reference} and query call_lookup before retrying"))??;
-                self.run_agent_call(&access, reference, &prepared, true, deadline)
-                    .await
+                    self.run_agent_call(&access, reference, &prepared, true, deadline)
+                        .await
+                }
+                _ => bail!("unknown or unavailable tool"),
             }
-            _ => bail!("unknown or unavailable tool"),
-        }
+        })
     }
 
-    async fn agent_rpc(self: &Arc<Self>, access: &Access, body: Value) -> Result<Value> {
-        let child = self.agent_child_access(access, body).await?;
-        let body = child.body.clone();
-        self.rpc(child, body).await
+    fn agent_rpc<'a>(
+        self: &'a Arc<Self>,
+        access: &'a Access,
+        body: Value,
+    ) -> futures_util::future::BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            let child = self.agent_child_access(access, body).await?;
+            let body = child.body.clone();
+            self.rpc(child, body).await
+        })
     }
 
-    async fn dispatch_agent_request(
-        self: &Arc<Self>,
-        access: &Access,
-        request: &OperationRequest,
-    ) -> Result<Value> {
-        let body =
-            json!({"method":"operate","authorization_id":request.operation_id,"request":request});
-        let child = self.agent_child_access(access, body).await?;
-        let prepared: OperationRequest = serde_json::from_value(child.body["request"].clone())?;
-        self.dispatch(child, prepared).await
+    fn dispatch_agent_request<'a>(
+        self: &'a Arc<Self>,
+        access: &'a Access,
+        request: &'a OperationRequest,
+    ) -> futures_util::future::BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            let body = json!({"method":"operate","authorization_id":request.operation_id,"request":request});
+            let child = self.agent_child_access(access, body).await?;
+            let prepared: OperationRequest = serde_json::from_value(child.body["request"].clone())?;
+            self.dispatch(child, prepared).await
+        })
     }
 
     async fn load_agent_call(
@@ -724,127 +734,130 @@ impl Runtime {
         Ok((original, operation))
     }
 
-    async fn run_agent_call(
-        self: &Arc<Self>,
-        access: &Access,
-        reference: &str,
-        prepared: &PreparedCall,
+    fn run_agent_call<'a>(
+        self: &'a Arc<Self>,
+        access: &'a Access,
+        reference: &'a str,
+        prepared: &'a PreparedCall,
         dispatch: bool,
         deadline: tokio::time::Instant,
-    ) -> Result<Value> {
-        ensure!(
-            access.conversation_id.as_deref() == Some(prepared.conversation_id.as_str()),
-            "prepared call belongs to another conversation"
-        );
-        let work_ref = &prepared
-            .requests
-            .first()
-            .context("prepared call has no request")?
-            .operation_id;
-        let mut operations = Vec::new();
-        let mut ready = true;
-        for request in &prepared.requests {
-            if tokio::time::Instant::now() >= deadline {
-                operations.push(
+    ) -> futures_util::future::BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            ensure!(
+                access.conversation_id.as_deref() == Some(prepared.conversation_id.as_str()),
+                "prepared call belongs to another conversation"
+            );
+            let work_ref = &prepared
+                .requests
+                .first()
+                .context("prepared call has no request")?
+                .operation_id;
+            let mut operations = Vec::new();
+            let mut ready = true;
+            for request in &prepared.requests {
+                if tokio::time::Instant::now() >= deadline {
+                    operations.push(
                     json!({"operation_id":request.operation_id,"state":"unknown","receipt":null}),
                 );
-                break;
-            }
-            let (original, mut record) = match tokio::time::timeout_at(
-                deadline,
-                self.agent_receipt(access, request),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => {
-                    operations.push(json!({"operation_id":request.operation_id,"state":"unknown","receipt":null}));
                     break;
                 }
-            };
-            if record.is_none() && original.is_none() && dispatch && ready {
-                if tokio::time::Instant::now() >= deadline {
-                    operations.push(json!({"operation_id":request.operation_id,"state":"unknown","receipt":null}));
-                    break;
-                }
-                match tokio::time::timeout_at(
-                    deadline,
-                    self.dispatch_agent_request(access, request),
-                )
-                .await
-                {
-                    Ok(result) => {
-                        result?;
-                    }
-                    Err(_) => {
-                        operations.push(json!({"operation_id":request.operation_id,"state":"unknown","receipt":null}));
-                        break;
-                    }
-                }
-                record = match tokio::time::timeout_at(
+                let (original, mut record) = match tokio::time::timeout_at(
                     deadline,
                     self.agent_receipt(access, request),
                 )
                 .await
                 {
-                    Ok(result) => result?.1,
+                    Ok(result) => result?,
                     Err(_) => {
                         operations.push(json!({"operation_id":request.operation_id,"state":"unknown","receipt":null}));
                         break;
                     }
                 };
-            }
-            if dispatch
-                && ((prepared.name == "delegate" && request.action["type"] == "open")
-                    || prepared.name == "command")
-            {
-                while record.as_ref().is_some_and(|record| {
-                    matches!(
-                        record.state,
-                        OperationState::Accepted | OperationState::Running
-                    )
-                }) && tokio::time::Instant::now() < deadline
-                {
-                    if tokio::time::timeout_at(
-                        deadline,
-                        tokio::time::sleep(Duration::from_millis(100)),
-                    )
-                    .await
-                    .is_err()
-                    {
+                if record.is_none() && original.is_none() && dispatch && ready {
+                    if tokio::time::Instant::now() >= deadline {
+                        operations.push(json!({"operation_id":request.operation_id,"state":"unknown","receipt":null}));
                         break;
                     }
-                    match tokio::time::timeout_at(deadline, self.agent_receipt(access, request))
-                        .await
+                    match tokio::time::timeout_at(
+                        deadline,
+                        self.dispatch_agent_request(access, request),
+                    )
+                    .await
                     {
-                        Ok(result) => record = result?.1,
-                        Err(_) => break,
+                        Ok(result) => {
+                            result?;
+                        }
+                        Err(_) => {
+                            operations.push(json!({"operation_id":request.operation_id,"state":"unknown","receipt":null}));
+                            break;
+                        }
+                    }
+                    record = match tokio::time::timeout_at(
+                        deadline,
+                        self.agent_receipt(access, request),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?.1,
+                        Err(_) => {
+                            operations.push(json!({"operation_id":request.operation_id,"state":"unknown","receipt":null}));
+                            break;
+                        }
+                    };
+                }
+                if dispatch
+                    && ((prepared.name == "delegate" && request.action["type"] == "open")
+                        || prepared.name == "command")
+                {
+                    while record.as_ref().is_some_and(|record| {
+                        matches!(
+                            record.state,
+                            OperationState::Accepted | OperationState::Running
+                        )
+                    }) && tokio::time::Instant::now() < deadline
+                    {
+                        if tokio::time::timeout_at(
+                            deadline,
+                            tokio::time::sleep(Duration::from_millis(100)),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                        match tokio::time::timeout_at(deadline, self.agent_receipt(access, request))
+                            .await
+                        {
+                            Ok(result) => record = result?.1,
+                            Err(_) => break,
+                        }
                     }
                 }
+                let state = record
+                    .as_ref()
+                    .map(|record| serde_json::to_value(&record.state))
+                    .transpose()?
+                    .unwrap_or_else(|| {
+                        json!(if original.is_some() {
+                            "unknown"
+                        } else {
+                            "prepared"
+                        })
+                    });
+                operations.push(
+                    json!({"operation_id":request.operation_id,"state":state,"receipt":record}),
+                );
+                ready = record
+                    .as_ref()
+                    .is_some_and(|record| record.state == OperationState::Succeeded);
+                if !ready {
+                    break;
+                }
             }
-            let state = record
-                .as_ref()
-                .map(|record| serde_json::to_value(&record.state))
-                .transpose()?
-                .unwrap_or_else(|| {
-                    json!(if original.is_some() {
-                        "unknown"
-                    } else {
-                        "prepared"
-                    })
-                });
-            operations
-                .push(json!({"operation_id":request.operation_id,"state":state,"receipt":record}));
-            ready = record
-                .as_ref()
-                .is_some_and(|record| record.state == OperationState::Succeeded);
-            if !ready {
-                break;
-            }
-        }
-        Ok(
-            json!({"call_ref":reference,"work_ref":work_ref,"tool":prepared.name,"operations":operations,"all_dispatched":operations.len()==prepared.requests.len() && operations.iter().all(|operation| operation["receipt"].is_object()),"retry":"Reuse this call_ref with identical arguments. If a dispatch is unknown, query call_lookup and reconcile; never allocate another call to resend it."}),
-        )
+            Ok(
+                json!({"call_ref":reference,"work_ref":work_ref,"tool":prepared.name,"operations":operations,"all_dispatched":operations.len()==prepared.requests.len() && operations.iter().all(|operation| operation["receipt"].is_object()),"retry":"Reuse this call_ref with identical arguments. If a dispatch is unknown, query call_lookup and reconcile; never allocate another call to resend it."}),
+            )
+        })
     }
 
     async fn agent_status(

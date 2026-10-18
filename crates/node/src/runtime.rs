@@ -4578,513 +4578,66 @@ impl Runtime {
     fn capabilities(&self) -> Value {
         json!({"executors":["codex","claude_code","cursor_agent"],"manager":self.config.manager.as_ref().map(|m|m.provider.clone())})
     }
-    pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
-        let write = !access.authorization.action().is_read()
-            && !matches!(
-                input["method"].as_str(),
-                Some("agent_result" | "agent_notification")
-            );
-        let task = input["task_id"]
-            .as_str()
-            .or_else(|| input["request"]["task_id"].as_str());
-        let _lease = self.manager_tool_lease(&access, write, task).await?;
-        self.rpc_inner(access, input).await
+    pub fn rpc<'a>(
+        self: &'a Arc<Self>,
+        access: Access,
+        input: Value,
+    ) -> futures_util::future::BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            let write = !access.authorization.action().is_read()
+                && !matches!(
+                    input["method"].as_str(),
+                    Some("agent_result" | "agent_notification")
+                );
+            let task = input["task_id"]
+                .as_str()
+                .or_else(|| input["request"]["task_id"].as_str());
+            let _lease = self.manager_tool_lease(&access, write, task).await?;
+            self.rpc_inner(access, input).await
+        })
     }
-    async fn rpc_inner(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
-        let _work = self.maintenance.enter()?;
-        access.require_body(&input)?;
-        self.check_execution_actor(&input, &access.authorization.signed_invocation().payload)?;
-        let network = &access.network_id;
-        {
-            let store = self.store.lock().await;
-            let _verification = access.verification.enter();
-            let facts = self.authorization_facts_in_scope(
-                &store,
-                &access.authorization,
-                &input,
-                &self.audience()?,
-                now_ms() as u64,
-            )?;
-            store.authorize_scoped_request_for_transport(
-                &self.identity,
-                access.authorization.signed_invocation(),
-                &facts,
-                &access.transport,
-                &input,
-                now_ms() as u64,
-            )?;
-        }
-        let method = field(&input, "method")?;
-        let scope = input["conversation_id"].as_str().map(String::from);
-        if let Some(scope) = &scope
-            && !matches!(method, "create_conversation" | "create_bot")
-        {
-            self.require_scope(&access, scope).await?;
-        }
-        match method {
-            "execution_share_request" => {
-                ensure!(
-                    access.account_actor(),
-                    "execution sharing requires the user"
-                );
+    fn rpc_inner<'a>(
+        self: &'a Arc<Self>,
+        access: Access,
+        input: Value,
+    ) -> futures_util::future::BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            let _work = self.maintenance.enter()?;
+            access.require_body(&input)?;
+            self.check_execution_actor(&input, &access.authorization.signed_invocation().payload)?;
+            let network = &access.network_id;
+            {
                 let store = self.store.lock().await;
-                access.verification.run(|| {
-                    store.authorize_request_read(
-                        &access.authorization,
-                        &access.freshness,
-                        &access.transport,
-                        now_ms() as u64,
-                    )?;
-                    store.execution_share_request_for_transport(
-                        &self.identity,
-                        &access.authorization,
-                        &access.transport,
-                        &input,
-                        now_ms() as u64,
-                    )
-                })
-            }
-            "nodes" => {
-                let mut store = self.store.lock().await;
                 let _verification = access.verification.enter();
-                store.authorize_request_read(
+                let facts = self.authorization_facts_in_scope(
+                    &store,
                     &access.authorization,
-                    &access.freshness,
-                    &access.transport,
+                    &input,
+                    &self.audience()?,
                     now_ms() as u64,
                 )?;
-                ensure!(
-                    *access.authorization.audience() == self.audience()?,
-                    "grant targets another service"
-                );
-                Ok(
-                    json!({"nodes":[{"node_id":self.identity.node_id()?,"audience":self.audience()?,"roles":self.config.roles,"local":true,"online":true,"capabilities":self.capabilities()}]}),
-                )
-            }
-            "conversations" => {
-                let mut store = self.store.lock().await;
-                let _verification = access.verification.enter();
-                store.authorize_request_read(
-                    &access.authorization,
-                    &access.freshness,
+                store.authorize_scoped_request_for_transport(
+                    &self.identity,
+                    access.authorization.signed_invocation(),
+                    &facts,
                     &access.transport,
+                    &input,
                     now_ms() as u64,
                 )?;
-                let allowed = store.authorized_conversation_ids(&access.authorization)?;
-                let conversations = store
-                    .conversations(network)?
-                    .into_iter()
-                    .filter(|conversation| allowed.contains(&conversation.conversation_id))
-                    .collect::<Vec<_>>();
-                Ok(json!({"conversations":conversations}))
             }
-            "create_conversation" => {
-                ensure!(
-                    access.account_actor(),
-                    "only the user creates conversations"
-                );
-                let scope = id(&input, "conversation_id")?;
-                let title = field(&input, "title")?;
-                ensure!(title.len() <= 512, "title too long");
-                {
-                    let store = self.store.lock().await;
-                    let _verification = access.verification.enter();
-                    if let Some(old) = store
-                        .conversations(network)?
-                        .into_iter()
-                        .find(|c| c.conversation_id == scope)
-                    {
-                        ensure!(old.title == title, "conversation ID already exists");
-                        return Ok(json!(old));
-                    }
-                }
-                self.append_authorized(
-                    &access,
-                    &scope,
-                    EventBody::ConversationCreated {
-                        title: title.into(),
-                    },
-                )
-                .await?;
-                Ok(
-                    json!({"conversation_id":scope,"title":title,"heads":self.store.lock().await.heads(network,&scope)?}),
-                )
+            let method = field(&input, "method")?;
+            let scope = input["conversation_id"].as_str().map(String::from);
+            if let Some(scope) = &scope
+                && !matches!(method, "create_conversation" | "create_bot")
+            {
+                self.require_scope(&access, scope).await?;
             }
-            "conversation" => self.conversation_snapshot(&access, &input).await,
-            "message" => self.accept_chat_message(&access, &input).await,
-            "set_followup" => {
-                let scope = scope.context("conversation_id is required")?;
-                self.set_followup(&access, &scope, &input).await
-            }
-            "progress_read" => self.read_progress(&access, &input).await,
-            "schedule" => self.receive_schedule(&access, &input).await,
-            "manager_status" => {
-                self.validate_subscription(&access).await?;
-                let scope = scope.context("conversation_id is required")?;
-                self.manager_status(network, &scope, field(&input, "trigger")?)
-                    .await
-            }
-            "context" => {
-                let scope = scope.context("conversation_id is required")?;
-                let mut store = self.store.lock().await;
-                let _verification = access.verification.enter();
-                store.authorize_request_read(
-                    &access.authorization,
-                    &access.freshness,
-                    &access.transport,
-                    now_ms() as u64,
-                )?;
-                let context = store.context(network, &scope, &[])?;
-                let offset = input["offset"].as_u64().unwrap_or(0).min(usize::MAX as u64) as usize;
-                let limit = input["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
-                if let Some(hash) = input["blob_hash"].as_str() {
+            match method {
+                "execution_share_request" => {
                     ensure!(
-                        context
-                            .events
-                            .iter()
-                            .filter(|event| event.scope_id == scope)
-                            .flat_map(|event| &event.blobs)
-                            .any(|blob| blob.hash == hash),
-                        "attachment is outside the authorized resource"
+                        access.account_actor(),
+                        "execution sharing requires the user"
                     );
-                    let bytes = store
-                        .get_blob(network, hash)?
-                        .context("attachment unavailable")?;
-                    let end = offset.saturating_add(limit * 1024).min(bytes.len());
-                    ensure!(offset <= end, "invalid attachment offset");
-                    return Ok(
-                        json!({"hash":hash,"offset":offset,"data_hex":hex::encode(&bytes[offset..end]),"next_offset":(end<bytes.len()).then_some(end),"size":bytes.len()}),
-                    );
-                }
-                let events = context
-                    .events
-                    .into_iter()
-                    .filter(|event| event.scope_id == scope)
-                    .collect::<Vec<_>>();
-                let end = offset.saturating_add(limit).min(events.len());
-                ensure!(offset <= end, "invalid event offset");
-                Ok(
-                    json!({"heads":context.heads,"missing":context.missing,"events":&events[offset..end],"next_offset":(end<events.len()).then_some(end)}),
-                )
-            }
-            "read_artifact" => self.read_artifact(&access, &input).await,
-            "task_control" => self.task_control(&access, &input).await,
-            "execution_control" => self.execution_control(&access, &input).await,
-            "execution_status" => self.execution_status(&access, &input).await,
-            "bots" => self.bots(&access).await,
-            "create_bot" => self.create_bot(&access, &input).await,
-            "cancel_manager" => self.cancel_manager(&access, &input).await,
-            "resolve_manager_unknown" => self.resolve_manager_invocation(&access, &input).await,
-            "create_task" => {
-                ensure!(
-                    input["auto_followup"].as_bool() != Some(true),
-                    "use set_followup for explicit versioned permission"
-                );
-                let scope = scope.context("conversation_id is required")?;
-                let envelope = {
-                    let mut store = self.store.lock().await;
-                    let _verification = access.verification.enter();
-                    store.create_task_with_origin(
-                        &self.identity,
-                        &access.authorization,
-                        &access.freshness,
-                        &access.transport,
-                        &access.body,
-                        now_ms(),
-                    )?
-                };
-                self.publish_changed(network, &scope, &envelope.hash);
-                Ok(json!({"event":envelope}))
-            }
-            "update_task" => {
-                let scope = scope.context("conversation_id is required")?;
-                let task_id = id(&input, "task_id")?;
-                let status = field(&input, "status")?;
-                ensure!(
-                    matches!(
-                        status,
-                        "open" | "working" | "blocked" | "needs_review" | "accepted" | "cancelled"
-                    ),
-                    "invalid task status"
-                );
-                ensure!(
-                    access.account_actor() || !matches!(status, "accepted" | "cancelled"),
-                    "only the user accepts or cancels tasks"
-                );
-                let event = {
-                    let mut store = self.store.lock().await;
-                    let _verification = access.verification.enter();
-                    require_task_write(&store, network, &scope, &task_id, access.account_actor())?;
-                    store.append_request_authorized_event(
-                        &self.identity,
-                        &access.authorization,
-                        &access.freshness,
-                        &access.transport,
-                        &access.body,
-                        &scope,
-                        EventBody::TaskChanged {
-                            task_id,
-                            status: status.into(),
-                            detail: input["detail"]
-                                .as_str()
-                                .context("task detail is required")?
-                                .to_owned(),
-                        },
-                        vec![],
-                        now_ms(),
-                    )?
-                };
-                self.publish_changed(network, &scope, &event.hash);
-                Ok(json!(event))
-            }
-            "agent_notification" => {
-                ensure!(
-                    matches!(access.authorization.actor(), Actor::Service(_)),
-                    "manager notifications require service authority"
-                );
-                let scope = scope.context("conversation_id is required")?;
-                let event = self
-                    .append_authorized(
-                        &access,
-                        &scope,
-                        EventBody::NotificationRaised {
-                            notification_id: id(&input, "notification_id")?,
-                            kind: id(&input, "kind")?,
-                            text: field(&input, "text")?.to_owned(),
-                        },
-                    )
-                    .await?;
-                Ok(json!({"event":event}))
-            }
-            "agent_result" => {
-                ensure!(
-                    matches!(access.authorization.actor(), Actor::Service(_)),
-                    "manager results require service authority"
-                );
-                let scope = scope.context("conversation_id is required")?;
-                let blobs: Vec<BlobRef> = serde_json::from_value(input["blobs"].clone())?;
-                let events = vec![
-                    (
-                        scope.clone(),
-                        EventBody::DecisionRecorded {
-                            decision_id: id(&input, "decision_id")?,
-                            text: field(&input, "text")?.to_owned(),
-                            effective_constraints: serde_json::from_value(
-                                input["effective_constraints"].clone(),
-                            )?,
-                            tool_configuration: input["tool_configuration"].clone(),
-                        },
-                        vec![],
-                    ),
-                    (
-                        scope.clone(),
-                        EventBody::MessagePosted {
-                            message_id: id(&input, "message_id")?,
-                            role: "assistant".into(),
-                            text: field(&input, "output")?.to_owned(),
-                            scheduler_node: None,
-                        },
-                        blobs,
-                    ),
-                ];
-                let appended = {
-                    let mut store = self.store.lock().await;
-                    access.verification.run(|| {
-                        store.append_request_authorized_events(
-                            &self.identity,
-                            &access.authorization,
-                            &access.freshness,
-                            &access.transport,
-                            &access.body,
-                            events,
-                            now_ms(),
-                        )
-                    })?
-                };
-                for event in &appended {
-                    self.publish_changed(network, &scope, &event.hash);
-                }
-                Ok(json!({"events":appended}))
-            }
-            "bind_execution" => {
-                let mut store = self.store.lock().await;
-                let _verification = access.verification.enter();
-                let binding = if self.is_execution_dispatch(&input)? {
-                    let dispatch = store.execution_dispatch_facts_in_scope(
-                        &access.authorization,
-                        &input,
-                        access.authorization.audience(),
-                        now_ms() as u64,
-                    )?;
-                    store.bind_execution_request_dispatch(
-                        &self.identity,
-                        &dispatch,
-                        &access.authorization,
-                        &access.freshness,
-                        &access.transport,
-                        &access.body,
-                        now_ms() as u64,
-                    )?
-                } else {
-                    store.bind_task_request_authorized(
-                        &self.identity,
-                        &access.authorization,
-                        &access.freshness,
-                        &access.transport,
-                        &access.body,
-                        now_ms() as u64,
-                    )?
-                };
-                Ok(json!({"binding":binding}))
-            }
-            "seal_execution" => {
-                let seal = {
-                    let mut store = self.store.lock().await;
-                    access.verification.run(|| {
-                        store.seal_task_request_authorized(
-                            &self.identity,
-                            &access.authorization,
-                            &access.freshness,
-                            &access.transport,
-                            &input,
-                            now_ms() as u64,
-                        )
-                    })?
-                };
-                Ok(json!({"seal":seal}))
-            }
-            "seal_remote_execution" => self.seal_remote_execution(&access, &input).await,
-            "remote_execution_seal_status" => {
-                let store = self.store.lock().await;
-                let seal = access.verification.run(|| {
-                    store.remote_execution_seal_status_request_authorized(
-                        &self.identity,
-                        &access.authorization,
-                        &access.freshness,
-                        &access.transport,
-                        &input,
-                        now_ms() as u64,
-                    )
-                })?;
-                Ok(json!({"seal":seal}))
-            }
-            "rebind_execution" => self.rebind_execution(&access, &input).await,
-            "operate" => {
-                let request: OperationRequest = serde_json::from_value(input["request"].clone())?;
-                self.require_scope(&access, &request.conversation_id)
-                    .await?;
-                self.dispatch(access, request).await
-            }
-            "session" => {
-                let target = field(&input, "target_node")?;
-                if target != self.identity.node_id()? {
-                    return self
-                        .remote_session_status(&access, target, field(&input, "session_id")?)
-                        .await;
-                }
-                ensure!(
-                    target == self.identity.node_id()?,
-                    "query the target service directly"
-                );
-                let mut store = self.store.lock().await;
-                let _verification = access.verification.enter();
-                store.authorize_request_read(
-                    &access.authorization,
-                    &access.freshness,
-                    &access.transport,
-                    now_ms() as u64,
-                )?;
-                Ok(json!({"session":store.session(network,target,field(&input,"session_id")?)?}))
-            }
-            "operation" => {
-                let target = field(&input, "target_node")?;
-                if target != self.identity.node_id()? {
-                    return self
-                        .remote_operation_status(&access, target, field(&input, "operation_id")?)
-                        .await;
-                }
-                ensure!(
-                    target == self.identity.node_id()?,
-                    "query the target service directly"
-                );
-                let mut store = self.store.lock().await;
-                let _verification = access.verification.enter();
-                store.authorize_request_read(
-                    &access.authorization,
-                    &access.freshness,
-                    &access.transport,
-                    now_ms() as u64,
-                )?;
-                Ok(json!({"operation":store.operation(network,field(&input,"operation_id")?)?}))
-            }
-            "notifications" => {
-                ensure!(
-                    input["client_id"].as_str() == Some(access.authorization.device().as_str()),
-                    "notification client differs from authenticated device"
-                );
-                let mut store = self.store.lock().await;
-                let _verification = access.verification.enter();
-                store.authorize_request_read(
-                    &access.authorization,
-                    &access.freshness,
-                    &access.transport,
-                    now_ms() as u64,
-                )?;
-                let allowed = store.authorized_conversation_ids(&access.authorization)?;
-                let notifications = store
-                    .pending_notifications(network, access.authorization.device().as_str())?
-                    .into_iter()
-                    .filter(|notification| allowed.contains(&notification.conversation_id))
-                    .collect::<Vec<_>>();
-                Ok(json!({"notifications":notifications}))
-            }
-            "ack" => {
-                ensure!(
-                    access.account_actor(),
-                    "only clients acknowledge notifications"
-                );
-                let notification = id(&input, "notification_id")?;
-                let client = id(&input, "client_id")?;
-                ensure!(
-                    client == access.authorization.device().as_str(),
-                    "notification client differs from authenticated device"
-                );
-                let pending = self
-                    .store
-                    .lock()
-                    .await
-                    .pending_notifications(network, &client)?;
-                if let Some(n) = pending
-                    .into_iter()
-                    .find(|n| n.notification_id == notification)
-                {
-                    self.append_authorized(
-                        &access,
-                        &n.conversation_id,
-                        EventBody::NotificationAcknowledged {
-                            notification_id: notification,
-                            client_id: client,
-                        },
-                    )
-                    .await?;
-                }
-                Ok(json!({"acknowledged":true}))
-            }
-            "export" => {
-                let scope = scope.context("conversation_id is required")?;
-                let mut store = self.store.lock().await;
-                let _verification = access.verification.enter();
-                store.authorize_request_read(
-                    &access.authorization,
-                    &access.freshness,
-                    &access.transport,
-                    now_ms() as u64,
-                )?;
-                Ok(json!(store.export_snapshot(network, &scope)?))
-            }
-            "reconcile" => {
-                ensure!(access.account_actor(), "reconciliation requires the user");
-                {
                     let store = self.store.lock().await;
                     access.verification.run(|| {
                         store.authorize_request_read(
@@ -5092,28 +4645,510 @@ impl Runtime {
                             &access.freshness,
                             &access.transport,
                             now_ms() as u64,
+                        )?;
+                        store.execution_share_request_for_transport(
+                            &self.identity,
+                            &access.authorization,
+                            &access.transport,
+                            &input,
+                            now_ms() as u64,
+                        )
+                    })
+                }
+                "nodes" => {
+                    let mut store = self.store.lock().await;
+                    let _verification = access.verification.enter();
+                    store.authorize_request_read(
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        now_ms() as u64,
+                    )?;
+                    ensure!(
+                        *access.authorization.audience() == self.audience()?,
+                        "grant targets another service"
+                    );
+                    Ok(
+                        json!({"nodes":[{"node_id":self.identity.node_id()?,"audience":self.audience()?,"roles":self.config.roles,"local":true,"online":true,"capabilities":self.capabilities()}]}),
+                    )
+                }
+                "conversations" => {
+                    let mut store = self.store.lock().await;
+                    let _verification = access.verification.enter();
+                    store.authorize_request_read(
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        now_ms() as u64,
+                    )?;
+                    let allowed = store.authorized_conversation_ids(&access.authorization)?;
+                    let conversations = store
+                        .conversations(network)?
+                        .into_iter()
+                        .filter(|conversation| allowed.contains(&conversation.conversation_id))
+                        .collect::<Vec<_>>();
+                    Ok(json!({"conversations":conversations}))
+                }
+                "create_conversation" => {
+                    ensure!(
+                        access.account_actor(),
+                        "only the user creates conversations"
+                    );
+                    let scope = id(&input, "conversation_id")?;
+                    let title = field(&input, "title")?;
+                    ensure!(title.len() <= 512, "title too long");
+                    {
+                        let store = self.store.lock().await;
+                        let _verification = access.verification.enter();
+                        if let Some(old) = store
+                            .conversations(network)?
+                            .into_iter()
+                            .find(|c| c.conversation_id == scope)
+                        {
+                            ensure!(old.title == title, "conversation ID already exists");
+                            return Ok(json!(old));
+                        }
+                    }
+                    self.append_authorized(
+                        &access,
+                        &scope,
+                        EventBody::ConversationCreated {
+                            title: title.into(),
+                        },
+                    )
+                    .await?;
+                    Ok(
+                        json!({"conversation_id":scope,"title":title,"heads":self.store.lock().await.heads(network,&scope)?}),
+                    )
+                }
+                "conversation" => self.conversation_snapshot(&access, &input).await,
+                "message" => self.accept_chat_message(&access, &input).await,
+                "set_followup" => {
+                    let scope = scope.context("conversation_id is required")?;
+                    self.set_followup(&access, &scope, &input).await
+                }
+                "progress_read" => self.read_progress(&access, &input).await,
+                "schedule" => self.receive_schedule(&access, &input).await,
+                "manager_status" => {
+                    self.validate_subscription(&access).await?;
+                    let scope = scope.context("conversation_id is required")?;
+                    self.manager_status(network, &scope, field(&input, "trigger")?)
+                        .await
+                }
+                "context" => {
+                    let scope = scope.context("conversation_id is required")?;
+                    let mut store = self.store.lock().await;
+                    let _verification = access.verification.enter();
+                    store.authorize_request_read(
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        now_ms() as u64,
+                    )?;
+                    let context = store.context(network, &scope, &[])?;
+                    let offset =
+                        input["offset"].as_u64().unwrap_or(0).min(usize::MAX as u64) as usize;
+                    let limit = input["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+                    if let Some(hash) = input["blob_hash"].as_str() {
+                        ensure!(
+                            context
+                                .events
+                                .iter()
+                                .filter(|event| event.scope_id == scope)
+                                .flat_map(|event| &event.blobs)
+                                .any(|blob| blob.hash == hash),
+                            "attachment is outside the authorized resource"
+                        );
+                        let bytes = store
+                            .get_blob(network, hash)?
+                            .context("attachment unavailable")?;
+                        let end = offset.saturating_add(limit * 1024).min(bytes.len());
+                        ensure!(offset <= end, "invalid attachment offset");
+                        return Ok(
+                            json!({"hash":hash,"offset":offset,"data_hex":hex::encode(&bytes[offset..end]),"next_offset":(end<bytes.len()).then_some(end),"size":bytes.len()}),
+                        );
+                    }
+                    let events = context
+                        .events
+                        .into_iter()
+                        .filter(|event| event.scope_id == scope)
+                        .collect::<Vec<_>>();
+                    let end = offset.saturating_add(limit).min(events.len());
+                    ensure!(offset <= end, "invalid event offset");
+                    Ok(
+                        json!({"heads":context.heads,"missing":context.missing,"events":&events[offset..end],"next_offset":(end<events.len()).then_some(end)}),
+                    )
+                }
+                "read_artifact" => self.read_artifact(&access, &input).await,
+                "task_control" => self.task_control(&access, &input).await,
+                "execution_control" => self.execution_control(&access, &input).await,
+                "execution_status" => self.execution_status(&access, &input).await,
+                "bots" => self.bots(&access).await,
+                "create_bot" => self.create_bot(&access, &input).await,
+                "cancel_manager" => self.cancel_manager(&access, &input).await,
+                "resolve_manager_unknown" => self.resolve_manager_invocation(&access, &input).await,
+                "create_task" => {
+                    ensure!(
+                        input["auto_followup"].as_bool() != Some(true),
+                        "use set_followup for explicit versioned permission"
+                    );
+                    let scope = scope.context("conversation_id is required")?;
+                    let envelope = {
+                        let mut store = self.store.lock().await;
+                        let _verification = access.verification.enter();
+                        store.create_task_with_origin(
+                            &self.identity,
+                            &access.authorization,
+                            &access.freshness,
+                            &access.transport,
+                            &access.body,
+                            now_ms(),
+                        )?
+                    };
+                    self.publish_changed(network, &scope, &envelope.hash);
+                    Ok(json!({"event":envelope}))
+                }
+                "update_task" => {
+                    let scope = scope.context("conversation_id is required")?;
+                    let task_id = id(&input, "task_id")?;
+                    let status = field(&input, "status")?;
+                    ensure!(
+                        matches!(
+                            status,
+                            "open"
+                                | "working"
+                                | "blocked"
+                                | "needs_review"
+                                | "accepted"
+                                | "cancelled"
+                        ),
+                        "invalid task status"
+                    );
+                    ensure!(
+                        access.account_actor() || !matches!(status, "accepted" | "cancelled"),
+                        "only the user accepts or cancels tasks"
+                    );
+                    let event = {
+                        let mut store = self.store.lock().await;
+                        let _verification = access.verification.enter();
+                        require_task_write(
+                            &store,
+                            network,
+                            &scope,
+                            &task_id,
+                            access.account_actor(),
+                        )?;
+                        store.append_request_authorized_event(
+                            &self.identity,
+                            &access.authorization,
+                            &access.freshness,
+                            &access.transport,
+                            &access.body,
+                            &scope,
+                            EventBody::TaskChanged {
+                                task_id,
+                                status: status.into(),
+                                detail: input["detail"]
+                                    .as_str()
+                                    .context("task detail is required")?
+                                    .to_owned(),
+                            },
+                            vec![],
+                            now_ms(),
+                        )?
+                    };
+                    self.publish_changed(network, &scope, &event.hash);
+                    Ok(json!(event))
+                }
+                "agent_notification" => {
+                    ensure!(
+                        matches!(access.authorization.actor(), Actor::Service(_)),
+                        "manager notifications require service authority"
+                    );
+                    let scope = scope.context("conversation_id is required")?;
+                    let event = self
+                        .append_authorized(
+                            &access,
+                            &scope,
+                            EventBody::NotificationRaised {
+                                notification_id: id(&input, "notification_id")?,
+                                kind: id(&input, "kind")?,
+                                text: field(&input, "text")?.to_owned(),
+                            },
+                        )
+                        .await?;
+                    Ok(json!({"event":event}))
+                }
+                "agent_result" => {
+                    ensure!(
+                        matches!(access.authorization.actor(), Actor::Service(_)),
+                        "manager results require service authority"
+                    );
+                    let scope = scope.context("conversation_id is required")?;
+                    let blobs: Vec<BlobRef> = serde_json::from_value(input["blobs"].clone())?;
+                    let events = vec![
+                        (
+                            scope.clone(),
+                            EventBody::DecisionRecorded {
+                                decision_id: id(&input, "decision_id")?,
+                                text: field(&input, "text")?.to_owned(),
+                                effective_constraints: serde_json::from_value(
+                                    input["effective_constraints"].clone(),
+                                )?,
+                                tool_configuration: input["tool_configuration"].clone(),
+                            },
+                            vec![],
+                        ),
+                        (
+                            scope.clone(),
+                            EventBody::MessagePosted {
+                                message_id: id(&input, "message_id")?,
+                                role: "assistant".into(),
+                                text: field(&input, "output")?.to_owned(),
+                                scheduler_node: None,
+                            },
+                            blobs,
+                        ),
+                    ];
+                    let appended = {
+                        let mut store = self.store.lock().await;
+                        access.verification.run(|| {
+                            store.append_request_authorized_events(
+                                &self.identity,
+                                &access.authorization,
+                                &access.freshness,
+                                &access.transport,
+                                &access.body,
+                                events,
+                                now_ms(),
+                            )
+                        })?
+                    };
+                    for event in &appended {
+                        self.publish_changed(network, &scope, &event.hash);
+                    }
+                    Ok(json!({"events":appended}))
+                }
+                "bind_execution" => {
+                    let mut store = self.store.lock().await;
+                    let _verification = access.verification.enter();
+                    let binding = if self.is_execution_dispatch(&input)? {
+                        let dispatch = store.execution_dispatch_facts_in_scope(
+                            &access.authorization,
+                            &input,
+                            access.authorization.audience(),
+                            now_ms() as u64,
+                        )?;
+                        store.bind_execution_request_dispatch(
+                            &self.identity,
+                            &dispatch,
+                            &access.authorization,
+                            &access.freshness,
+                            &access.transport,
+                            &access.body,
+                            now_ms() as u64,
+                        )?
+                    } else {
+                        store.bind_task_request_authorized(
+                            &self.identity,
+                            &access.authorization,
+                            &access.freshness,
+                            &access.transport,
+                            &access.body,
+                            now_ms() as u64,
+                        )?
+                    };
+                    Ok(json!({"binding":binding}))
+                }
+                "seal_execution" => {
+                    let seal = {
+                        let mut store = self.store.lock().await;
+                        access.verification.run(|| {
+                            store.seal_task_request_authorized(
+                                &self.identity,
+                                &access.authorization,
+                                &access.freshness,
+                                &access.transport,
+                                &input,
+                                now_ms() as u64,
+                            )
+                        })?
+                    };
+                    Ok(json!({"seal":seal}))
+                }
+                "seal_remote_execution" => self.seal_remote_execution(&access, &input).await,
+                "remote_execution_seal_status" => {
+                    let store = self.store.lock().await;
+                    let seal = access.verification.run(|| {
+                        store.remote_execution_seal_status_request_authorized(
+                            &self.identity,
+                            &access.authorization,
+                            &access.freshness,
+                            &access.transport,
+                            &input,
+                            now_ms() as u64,
                         )
                     })?;
+                    Ok(json!({"seal":seal}))
                 }
-                let target = field(&input, "target_node")?;
-                if target != self.identity.node_id()? {
-                    self.remote_operation_status(&access, target, field(&input, "operation_id")?)
+                "rebind_execution" => self.rebind_execution(&access, &input).await,
+                "operate" => {
+                    let request: OperationRequest =
+                        serde_json::from_value(input["request"].clone())?;
+                    self.require_scope(&access, &request.conversation_id)
+                        .await?;
+                    self.dispatch(access, request).await
+                }
+                "session" => {
+                    let target = field(&input, "target_node")?;
+                    if target != self.identity.node_id()? {
+                        return self
+                            .remote_session_status(&access, target, field(&input, "session_id")?)
+                            .await;
+                    }
+                    ensure!(
+                        target == self.identity.node_id()?,
+                        "query the target service directly"
+                    );
+                    let mut store = self.store.lock().await;
+                    let _verification = access.verification.enter();
+                    store.authorize_request_read(
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        now_ms() as u64,
+                    )?;
+                    Ok(
+                        json!({"session":store.session(network,target,field(&input,"session_id")?)?}),
+                    )
+                }
+                "operation" => {
+                    let target = field(&input, "target_node")?;
+                    if target != self.identity.node_id()? {
+                        return self
+                            .remote_operation_status(
+                                &access,
+                                target,
+                                field(&input, "operation_id")?,
+                            )
+                            .await;
+                    }
+                    ensure!(
+                        target == self.identity.node_id()?,
+                        "query the target service directly"
+                    );
+                    let mut store = self.store.lock().await;
+                    let _verification = access.verification.enter();
+                    store.authorize_request_read(
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        now_ms() as u64,
+                    )?;
+                    Ok(json!({"operation":store.operation(network,field(&input,"operation_id")?)?}))
+                }
+                "notifications" => {
+                    ensure!(
+                        input["client_id"].as_str() == Some(access.authorization.device().as_str()),
+                        "notification client differs from authenticated device"
+                    );
+                    let mut store = self.store.lock().await;
+                    let _verification = access.verification.enter();
+                    store.authorize_request_read(
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        now_ms() as u64,
+                    )?;
+                    let allowed = store.authorized_conversation_ids(&access.authorization)?;
+                    let notifications = store
+                        .pending_notifications(network, access.authorization.device().as_str())?
+                        .into_iter()
+                        .filter(|notification| allowed.contains(&notification.conversation_id))
+                        .collect::<Vec<_>>();
+                    Ok(json!({"notifications":notifications}))
+                }
+                "ack" => {
+                    ensure!(
+                        access.account_actor(),
+                        "only clients acknowledge notifications"
+                    );
+                    let notification = id(&input, "notification_id")?;
+                    let client = id(&input, "client_id")?;
+                    ensure!(
+                        client == access.authorization.device().as_str(),
+                        "notification client differs from authenticated device"
+                    );
+                    let pending = self
+                        .store
+                        .lock()
                         .await
-                } else {
-                    self.reconcile(network, target, field(&input, "operation_id")?)
+                        .pending_notifications(network, &client)?;
+                    if let Some(n) = pending
+                        .into_iter()
+                        .find(|n| n.notification_id == notification)
+                    {
+                        self.append_authorized(
+                            &access,
+                            &n.conversation_id,
+                            EventBody::NotificationAcknowledged {
+                                notification_id: notification,
+                                client_id: client,
+                            },
+                        )
+                        .await?;
+                    }
+                    Ok(json!({"acknowledged":true}))
+                }
+                "export" => {
+                    let scope = scope.context("conversation_id is required")?;
+                    let mut store = self.store.lock().await;
+                    let _verification = access.verification.enter();
+                    store.authorize_request_read(
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        now_ms() as u64,
+                    )?;
+                    Ok(json!(store.export_snapshot(network, &scope)?))
+                }
+                "reconcile" => {
+                    ensure!(access.account_actor(), "reconciliation requires the user");
+                    {
+                        let store = self.store.lock().await;
+                        access.verification.run(|| {
+                            store.authorize_request_read(
+                                &access.authorization,
+                                &access.freshness,
+                                &access.transport,
+                                now_ms() as u64,
+                            )
+                        })?;
+                    }
+                    let target = field(&input, "target_node")?;
+                    if target != self.identity.node_id()? {
+                        self.remote_operation_status(
+                            &access,
+                            target,
+                            field(&input, "operation_id")?,
+                        )
                         .await
+                    } else {
+                        self.reconcile(network, target, field(&input, "operation_id")?)
+                            .await
+                    }
                 }
-            }
-            "resolve_unknown" => {
-                ensure!(access.account_actor(), "resolution requires the user");
-                if self.is_execution_resolution(&input)? {
-                    self.resolve_execution_dispatch(&access).await
-                } else {
-                    self.resolve_unknown(&access, &input).await
+                "resolve_unknown" => {
+                    ensure!(access.account_actor(), "resolution requires the user");
+                    if self.is_execution_resolution(&input)? {
+                        self.resolve_execution_dispatch(&access).await
+                    } else {
+                        self.resolve_unknown(&access, &input).await
+                    }
                 }
+                _ => bail!("unknown method"),
             }
-            _ => bail!("unknown method"),
-        }
+        })
     }
     pub async fn tool(
         self: &Arc<Self>,
@@ -5262,21 +5297,28 @@ impl Runtime {
         Ok(result)
     }
 
-    async fn authorize_agent(&self, session: &AgentSession, body: Value) -> Result<Access> {
-        self.authorize_agent_with_verification(session, body, SignatureVerification::new())
-            .await
+    fn authorize_agent<'a>(
+        &'a self,
+        session: &'a AgentSession,
+        body: Value,
+    ) -> futures_util::future::BoxFuture<'a, Result<Access>> {
+        Box::pin(async move {
+            self.authorize_agent_with_verification(session, body, SignatureVerification::new())
+                .await
+        })
     }
 
-    async fn authorize_agent_with_verification(
-        &self,
-        session: &AgentSession,
+    fn authorize_agent_with_verification<'a>(
+        &'a self,
+        session: &'a AgentSession,
         mut body: Value,
         verification: SignatureVerification,
-    ) -> Result<Access> {
-        let now = now_ms() as u64;
-        let mut session = {
-            let mut store = self.store.lock().await;
-            verification.run(|| -> Result<_> {
+    ) -> futures_util::future::BoxFuture<'a, Result<Access>> {
+        Box::pin(async move {
+            let now = now_ms() as u64;
+            let mut session = {
+                let mut store = self.store.lock().await;
+                verification.run(|| -> Result<_> {
             let session = store.refresh_agent_session(session, now)
                 .context("SDK authorize session refresh")?;
             let origin = store.agent_origin(&session, now)
@@ -5329,141 +5371,145 @@ impl Runtime {
             }
             Ok(session)
             }).with_context(|| format!("SDK authorize source refresh; actual={:?}", verification.counts()))?
-        };
-        let task_policy = self
-            .ensure_sdk_execution_task_policy(&session, &body)
-            .await
-            .context("SDK execution Task policy refresh")?;
-        let now = now_ms() as u64;
-        let facts = {
-            let store = self.store.lock().await;
-            verification
-                .run(|| -> Result<_> {
-                    let origin = store
-                        .agent_origin(&session, now)
-                        .context("SDK authorize current origin")?;
-                    let facts = if let Some(task) = &task_policy {
-                        store
-                            .execution_dispatch_facts_with_task_policy(
-                                task,
-                                &body,
-                                &self.audience()?,
+            };
+            let task_policy = self
+                .ensure_sdk_execution_task_policy(&session, &body)
+                .await
+                .context("SDK execution Task policy refresh")?;
+            let now = now_ms() as u64;
+            let facts = {
+                let store = self.store.lock().await;
+                verification
+                    .run(|| -> Result<_> {
+                        let origin = store
+                            .agent_origin(&session, now)
+                            .context("SDK authorize current origin")?;
+                        let facts = if let Some(task) = &task_policy {
+                            store
+                                .execution_dispatch_facts_with_task_policy(
+                                    task,
+                                    &body,
+                                    &self.audience()?,
+                                    now,
+                                )
+                                .context("SDK authorize current execution facts")?
+                                .facts()
+                                .clone()
+                        } else {
+                            self.authorization_facts(&store, &body, &self.audience()?, now)
+                                .context("SDK authorize primary facts")?
+                        };
+                        let policies = task_policy
+                            .as_ref()
+                            .map_or(store.authorization_state(), |task| task.state());
+                        let delegated = policies
+                            .verify_service_delegation(
+                                &origin.parent,
+                                &session.service,
+                                &session.grant_leaf,
+                                &facts,
                                 now,
                             )
-                            .context("SDK authorize current execution facts")?
-                            .facts()
-                            .clone()
-                    } else {
-                        self.authorization_facts(&store, &body, &self.audience()?, now)
-                            .context("SDK authorize primary facts")?
-                    };
-                    let policies = task_policy
-                        .as_ref()
-                        .map_or(store.authorization_state(), |task| task.state());
-                    let delegated = policies
-                        .verify_service_delegation(
-                            &origin.parent,
-                            &session.service,
-                            &session.grant_leaf,
-                            &facts,
-                            now,
-                        )
-                        .context("SDK authorize current service delegation")?;
-                    ensure!(
-                        delegated.device() == &session.device
-                            && delegated.initiator() == &session.initiator
-                            && delegated.initiating_grant() == session.initiating_grant.as_ref(),
-                        "SDK request differs from its current admitted delegation"
-                    );
-                    let mut expected: BTreeMap<_, _> = delegated
-                        .heads()
-                        .iter()
-                        .cloned()
-                        .map(|head| (head.domain.clone(), head))
-                        .collect();
-                    if let Some(destination) =
-                        crate::identity::policy::execution_destination_for_body(
-                            policies, &facts, &body, now,
-                        )
-                        .context("SDK authorize current execution destination")?
-                    {
-                        for head in destination.heads() {
-                            ensure!(
-                                expected
-                                    .insert(head.domain.clone(), head.clone())
-                                    .is_none_or(|previous| previous == *head),
-                                "SDK execution destination has conflicting policy heads"
-                            );
+                            .context("SDK authorize current service delegation")?;
+                        ensure!(
+                            delegated.device() == &session.device
+                                && delegated.initiator() == &session.initiator
+                                && delegated.initiating_grant()
+                                    == session.initiating_grant.as_ref(),
+                            "SDK request differs from its current admitted delegation"
+                        );
+                        let mut expected: BTreeMap<_, _> = delegated
+                            .heads()
+                            .iter()
+                            .cloned()
+                            .map(|head| (head.domain.clone(), head))
+                            .collect();
+                        if let Some(destination) =
+                            crate::identity::policy::execution_destination_for_body(
+                                policies, &facts, &body, now,
+                            )
+                            .context("SDK authorize current execution destination")?
+                        {
+                            for head in destination.heads() {
+                                ensure!(
+                                    expected
+                                        .insert(head.domain.clone(), head.clone())
+                                        .is_none_or(|previous| previous == *head),
+                                    "SDK execution destination has conflicting policy heads"
+                                );
+                            }
                         }
-                    }
-                    session.expected_policies = expected.into_values().collect();
-                    session.expires_at_ms = session.expires_at_ms.min(delegated.expires_at_ms());
-                    if let Some(task) = &task_policy {
-                        session.expires_at_ms = session.expires_at_ms.min(task.expires_at_ms());
-                    }
-                    Ok(facts)
-                })
-                .with_context(|| {
-                    format!(
-                        "SDK authorize current source and facts; actual={:?}",
-                        verification.counts()
-                    )
-                })?
-        };
-        let identity = vibeface_secure::Identity::from_secret_hex(&self.identity.secret_key_hex)
-            .map_err(anyhow::Error::msg)?;
-        let key = PublicKey::of(&identity);
-        ensure!(
-            ServiceId::from_key(&key) == session.service
-                && DeviceId::from_key(&key) == session.device,
-            "Agent session is owned by another service"
-        );
-        ensure!(now < session.expires_at_ms, "Agent delegation expired");
-        let descriptor = session.clone();
-        let needs_manager = !matches!(
-            body["method"].as_str(),
-            Some("agent_start" | "agent_result" | "agent_notification")
-        );
-        let invocation = Signed::sign(
-            Invocation {
-                version: AUTH_VERSION,
-                actor: Actor::Service(session.service.clone()),
-                device: session.device.clone(),
-                initiator: session.initiator,
-                initiating_grant: session.initiating_grant,
-                resource: facts.resource,
-                action: facts.action,
-                audience: facts.audience,
-                presenter: session.device,
-                operation_id: facts.operation_id,
-                body_hash: facts.body_hash,
-                grant_leaf: session.grant_leaf,
-                expected_policies: session.expected_policies,
-                context: facts.context,
-                nonce: Nonce::random()?,
-                not_before_ms: now,
-                expires_at_ms: now
-                    .saturating_add(INVOCATION_MAX_AGE_MS)
-                    .min(session.expires_at_ms),
-            },
-            &identity,
-        )?;
-        let mut access = self
-            .authorize_rpc_with_verification(
-                body,
-                invocation,
-                TransportEvidence::LocalAgentAdapter {
-                    service: session.service,
-                    session: session.sdk_session,
+                        session.expected_policies = expected.into_values().collect();
+                        session.expires_at_ms =
+                            session.expires_at_ms.min(delegated.expires_at_ms());
+                        if let Some(task) = &task_policy {
+                            session.expires_at_ms = session.expires_at_ms.min(task.expires_at_ms());
+                        }
+                        Ok(facts)
+                    })
+                    .with_context(|| {
+                        format!(
+                            "SDK authorize current source and facts; actual={:?}",
+                            verification.counts()
+                        )
+                    })?
+            };
+            let identity =
+                vibeface_secure::Identity::from_secret_hex(&self.identity.secret_key_hex)
+                    .map_err(anyhow::Error::msg)?;
+            let key = PublicKey::of(&identity);
+            ensure!(
+                ServiceId::from_key(&key) == session.service
+                    && DeviceId::from_key(&key) == session.device,
+                "Agent session is owned by another service"
+            );
+            ensure!(now < session.expires_at_ms, "Agent delegation expired");
+            let descriptor = session.clone();
+            let needs_manager = !matches!(
+                body["method"].as_str(),
+                Some("agent_start" | "agent_result" | "agent_notification")
+            );
+            let invocation = Signed::sign(
+                Invocation {
+                    version: AUTH_VERSION,
+                    actor: Actor::Service(session.service.clone()),
+                    device: session.device.clone(),
+                    initiator: session.initiator,
+                    initiating_grant: session.initiating_grant,
+                    resource: facts.resource,
+                    action: facts.action,
+                    audience: facts.audience,
+                    presenter: session.device,
+                    operation_id: facts.operation_id,
+                    body_hash: facts.body_hash,
+                    grant_leaf: session.grant_leaf,
+                    expected_policies: session.expected_policies,
+                    context: facts.context,
+                    nonce: Nonce::random()?,
+                    not_before_ms: now,
+                    expires_at_ms: now
+                        .saturating_add(INVOCATION_MAX_AGE_MS)
+                        .min(session.expires_at_ms),
                 },
-                verification,
-            )
-            .await
-            .context("SDK authorize final RPC access")?;
-        if needs_manager {
-            access.manager = Some(self.manager_access(&descriptor).await?);
-        }
-        Ok(access)
+                &identity,
+            )?;
+            let mut access = self
+                .authorize_rpc_with_verification(
+                    body,
+                    invocation,
+                    TransportEvidence::LocalAgentAdapter {
+                        service: session.service,
+                        session: session.sdk_session,
+                    },
+                    verification,
+                )
+                .await
+                .context("SDK authorize final RPC access")?;
+            if needs_manager {
+                access.manager = Some(self.manager_access(&descriptor).await?);
+            }
+            Ok(access)
+        })
     }
 
     pub(crate) async fn claim_manager(
