@@ -1199,9 +1199,15 @@ mod tests {
             assert_eq!(late.reference_json().unwrap(), "null");
             assert_eq!(late.pins_json().unwrap(), finished.pins_json().unwrap());
             let mut future = source_pins.clone();
-            let minimum = future[0].minimum_head.as_mut().unwrap();
+            let mut minimum = source
+                .snapshot()
+                .state()
+                .head(&future[0].domain)
+                .unwrap()
+                .clone();
             minimum.sequence += 1;
             minimum.head = ObjectHash::body(&"unknown higher source head").unwrap();
+            future[0].minimum_head = Some(minimum);
             assert!(
                 source
                     .revalidate_request(&encode(&future).unwrap(), NOW as f64)
