@@ -1511,6 +1511,7 @@ struct ObservationCausalFact {
 struct ObservationScopeCheckpoint {
     heads: Vec<String>,
     previous: Option<(u64, String)>,
+    validated_events: usize,
 }
 
 pub(super) fn validate_retained_execution_scope_in(
@@ -1530,6 +1531,14 @@ pub(crate) fn validate_retained_event_scope_in(
     Ok(())
 }
 
+pub(crate) fn validate_retained_event_dependencies_in(
+    connection: &Connection,
+    source: &SignedEvent,
+) -> Result<()> {
+    ready_observation_dependencies_in(connection, source, "", "", vec![source.hash.clone()])?;
+    Ok(())
+}
+
 fn ready_observation_scope_in(
     connection: &Connection,
     source: &SignedEvent,
@@ -1537,7 +1546,6 @@ fn ready_observation_scope_in(
     observation_slot: &str,
 ) -> Result<ObservationScopeCheckpoint> {
     let expected: Event = serde_json::from_str(&source.canonical_body)?;
-    let invocation_hash = admission(&expected).invocation.hash()?;
     let changed_resource_index: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND scope_id=? AND resource_id IS NOT json_extract(json_extract(envelope,'$.canonical_body'),'$.resource_id'))",
         params![expected.network_id, expected.scope_id],
@@ -1560,6 +1568,29 @@ fn ready_observation_scope_in(
         "WITH scoped AS (SELECT hash,json_extract(envelope,'$.canonical_body') AS body FROM events WHERE space_id=?1 AND resource_id=?2 AND scope_id=?3), dependencies AS (SELECT value AS hash FROM scoped,json_each(scoped.body,'$.parents') UNION SELECT json_extract(body,'$.previous') FROM scoped WHERE json_extract(body,'$.previous') IS NOT NULL) SELECT hash FROM scoped WHERE hash NOT IN (SELECT hash FROM dependencies) ORDER BY hash",
     )?.query_map(params![expected.network_id, expected.resource_id.as_str(), expected.scope_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let checkpoint = ready_observation_dependencies_in(
+        connection,
+        source,
+        local_author,
+        observation_slot,
+        heads,
+    )?;
+    ensure!(
+        checkpoint.validated_events as u64 == row_count,
+        "execution observation scope has unreachable causal history"
+    );
+    Ok(checkpoint)
+}
+
+fn ready_observation_dependencies_in(
+    connection: &Connection,
+    source: &SignedEvent,
+    local_author: &str,
+    observation_slot: &str,
+    heads: Vec<String>,
+) -> Result<ObservationScopeCheckpoint> {
+    let expected: Event = serde_json::from_str(&source.canonical_body)?;
+    let invocation_hash = admission(&expected).invocation.hash()?;
     let mut lookup = connection.prepare(
         "SELECT envelope,status,scope_id,author,sequence,resource_id FROM events WHERE space_id=? AND hash=?",
     )?;
@@ -1661,10 +1692,6 @@ fn ready_observation_scope_in(
             },
         );
     }
-    ensure!(
-        facts.len() as u64 == row_count,
-        "execution observation scope has unreachable causal history"
-    );
     for fact in facts.values() {
         if let Some(previous) = &fact.previous {
             let prior = facts
@@ -1676,7 +1703,11 @@ fn ready_observation_scope_in(
             );
         }
     }
-    Ok(ObservationScopeCheckpoint { heads, previous })
+    Ok(ObservationScopeCheckpoint {
+        heads,
+        previous,
+        validated_events: facts.len(),
+    })
 }
 
 fn append_checkpointed_execution_observation_in(

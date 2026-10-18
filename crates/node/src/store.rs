@@ -900,6 +900,11 @@ impl Store {
         require_current_executor: bool,
     ) -> Result<()> {
         crate::binding::validate_binding(binding)?;
+        let snapshot = if self.connection.is_autocommit() {
+            Some(self.connection.unchecked_transaction()?)
+        } else {
+            None
+        };
         let envelope = self
             .event(&binding.network_id, &binding.task_ref)?
             .context("task creation is missing")?;
@@ -913,14 +918,10 @@ impl Store {
             matches!(&creation.body, EventBody::TaskCreated { task_id, .. } if task_id == &binding.task_id),
             "binding references a different task"
         );
-        ensure!(
-            self.missing_dependencies(
-                &binding.network_id,
-                std::slice::from_ref(&binding.task_ref)
-            )?
-            .is_complete(),
-            "binding task history is incomplete or conflicting"
-        );
+        crate::identity::event_authorization::validate_retained_event_dependencies_in(
+            &self.connection,
+            &envelope,
+        )?;
         if require_current_executor {
             self.authorize_node(
                 &binding.network_id,
@@ -955,6 +956,9 @@ impl Store {
                     && seal.seal.target_node == prior.target_node,
                 "seal does not close previous binding"
             );
+        }
+        if let Some(snapshot) = snapshot {
+            snapshot.commit()?;
         }
         Ok(())
     }
@@ -2352,6 +2356,61 @@ mod tests {
         network.revoke_node(&mut store)?;
         store.policy = known;
         assert!(store.authorize_node(space, &node_id, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn binding_task_uses_its_retained_creation_ancestors() -> Result<()> {
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        let root = network.conversation(&mut store, "conversation")?;
+        let creation = network.task(&mut store, "conversation", "bound-task")?;
+        let binding = network.bind(
+            &mut store,
+            &creation,
+            "bound-task",
+            "binding-session",
+            &network.project,
+        )?;
+        let mut latest = creation.clone();
+        for _ in 0..40 {
+            latest = network.message(&mut store, "conversation", "later history")?;
+        }
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        verification.run(|| store.verify_historical_binding(&binding))?;
+        assert!(verification.counts().actual_verifications > 0);
+        assert!(verification.counts().actual_verifications <= 32);
+        store.connection.execute_batch("BEGIN IMMEDIATE")?;
+        store.verify_historical_binding(&binding)?;
+        assert!(!store.connection.is_autocommit());
+        store.connection.execute_batch("ROLLBACK")?;
+        store.connection.execute(
+            "UPDATE events SET status='pending' WHERE space_id=? AND hash=?",
+            params![space, latest.hash],
+        )?;
+        store.verify_historical_binding(&binding)?;
+        assert!(
+            crate::identity::event_authorization::validate_retained_event_scope_in(
+                &store.connection,
+                &creation,
+            )
+            .is_err()
+        );
+        store.connection.execute(
+            "UPDATE events SET sequence=999 WHERE space_id=? AND hash=?",
+            params![space, root.hash],
+        )?;
+        assert!(store.verify_historical_binding(&binding).is_err());
+        store.connection.execute(
+            "UPDATE events SET sequence=1 WHERE space_id=? AND hash=?",
+            params![space, root.hash],
+        )?;
+        store.verify_historical_binding(&binding)?;
+        store.connection.execute(
+            "UPDATE events SET status='pending' WHERE space_id=? AND hash=?",
+            params![space, creation.hash],
+        )?;
+        assert!(store.verify_historical_binding(&binding).is_err());
         Ok(())
     }
 
