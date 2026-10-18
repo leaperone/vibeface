@@ -958,6 +958,67 @@ table "passkey_receipts" {
   }
 }
 
+table "execution_binding_seals" {
+  schema = schema.main
+  column "original_space_id" {
+    type = text
+  }
+  column "original_resource_id" {
+    type = text
+  }
+  column "task_ref" {
+    type = text
+  }
+  column "target_node" {
+    type = text
+  }
+  column "generation" {
+    type = integer
+  }
+  column "execution_space_id" {
+    type = text
+  }
+  column "execution_resource_id" {
+    type = text
+  }
+  column "binding_hash" {
+    type = text
+  }
+  column "seal_invocation_hash" {
+    type = text
+  }
+  column "admission" {
+    type = text
+  }
+  column "seal" {
+    type = text
+  }
+  primary_key {
+    columns = [column.original_space_id, column.original_resource_id, column.task_ref, column.target_node, column.generation]
+  }
+  foreign_key "binding_seals_node" {
+    columns     = [column.execution_space_id, column.target_node]
+    ref_columns = [table.node_certificates.column.space_id, table.node_certificates.column.node_id]
+  }
+  foreign_key "binding_seals_space" {
+    columns     = [column.execution_space_id]
+    ref_columns = [table.spaces.column.space_id]
+  }
+  index "binding_seals_invocation_once" {
+    unique  = true
+    columns = [column.execution_space_id, column.seal_invocation_hash]
+  }
+  check "binding_seals_generation" {
+    expr = "generation >= 1"
+  }
+  check "binding_seals_admission_json" {
+    expr = "json_valid(admission)"
+  }
+  check "binding_seals_seal_json" {
+    expr = "json_valid(seal)"
+  }
+}
+
 table "execution_handoffs" {
   schema = schema.main
   column "execution_space_id" {
