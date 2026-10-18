@@ -26,6 +26,15 @@ pub(crate) fn now() -> u64 {
 }
 const CERT_END: u64 = 10_000_000;
 
+fn test_directory() -> PathBuf {
+    std::env::var_os("VIBEFACE_TEST_ARTIFACT_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.artifacts/store-tests")
+        })
+        .join(uuid::Uuid::new_v4().to_string())
+}
+
 pub(crate) struct TestNetwork {
     pub created: bootstrap::CreatedAccount,
     pub root: Identity,
@@ -105,9 +114,7 @@ impl TestNetwork {
                 _ => None,
             })
             .context("bootstrap project missing")?;
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.artifacts/store-tests")
-            .join(uuid::Uuid::new_v4().to_string());
+        let directory = test_directory();
         crate::config::private_dir(&directory)?;
         let directory = directory.canonicalize()?;
         crate::config::private_dir(&directory.join("project"))?;
@@ -129,9 +136,7 @@ impl TestNetwork {
     }
 
     pub fn same_account_node(&self) -> Result<Self> {
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.artifacts/store-tests")
-            .join(uuid::Uuid::new_v4().to_string());
+        let directory = test_directory();
         crate::config::private_dir(&directory)?;
         let directory = directory.canonicalize()?;
         crate::config::private_dir(&directory.join("project"))?;
