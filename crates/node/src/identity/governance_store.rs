@@ -1288,7 +1288,7 @@ mod tests {
             let other = Signed::sign(other, &network.root)?;
             let mut project_grant = other.payload.clone();
             project_grant.scope = ResourceScope::Exact(source.clone());
-            project_grant.actions = vec![Action::MessageRead];
+            project_grant.actions = vec![Action::ConversationRead];
             project_grant.nonce = Nonce::random()?;
             let project_grant = Signed::sign(project_grant, &network.root)?;
             let mut document = store
