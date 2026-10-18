@@ -1250,6 +1250,35 @@ mod tests {
                 now(),
             )
         })?;
+        assert!(
+            fixture
+                .store
+                .authorize_request(&invocation, facts.facts(), &peer, now(),)
+                .is_err()
+        );
+        for wrong_transport in [
+            TransportEvidence::GatewayNoise {
+                device: DeviceId::from_key(&PublicKey::of(&fixture.executor.client)),
+                gateway: gateway_device.clone(),
+            },
+            TransportEvidence::GatewayNoise {
+                device: DeviceId::from_key(&PublicKey::of(&fixture.project.client)),
+                gateway: DeviceId::from_key(&target_key),
+            },
+        ] {
+            assert!(
+                fixture
+                    .store
+                    .authorize_request_for_body(
+                        &invocation,
+                        facts.facts(),
+                        &wrong_transport,
+                        &body,
+                        now(),
+                    )
+                    .is_err()
+            );
+        }
         let wrong_peer = TransportEvidence::VerifiedPeer {
             origin: DeviceId::from_key(&target_key),
         };
@@ -1278,6 +1307,20 @@ mod tests {
                     now(),
                 ),
                 Err(AuthorizationError::NeedPolicySync(_))
+            ));
+            let mut missing = invocation.payload.clone();
+            missing
+                .expected_policies
+                .retain(|head| head.domain != missing_domain);
+            let missing = Signed::sign(missing, &fixture.project.client)?;
+            let error = fixture
+                .store
+                .authorize_request_for_body(&missing, facts.facts(), &peer, &body, now())
+                .err()
+                .context("missing signed invocation policy head was accepted")?;
+            assert!(matches!(
+                error.downcast_ref::<AuthorizationError>(),
+                Some(AuthorizationError::NeedPolicySync(_))
             ));
         }
         let missing_gateway_pin = verified_client_policy_for_test(
