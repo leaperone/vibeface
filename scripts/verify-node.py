@@ -638,7 +638,7 @@ class Client:
             "authority_node": authority.node_id, "authority_public_key": authority.node_public_key}
         return response
 
-    def bind_execution(self, conversation, task_id, target, session_id, open_spec, *, remote=None):
+    def bind_execution(self, conversation, task_id, target, session_id, open_spec, *, remote=None, connection="main"):
         task = self.tasks[(self.scope["space_id"], self.resource_id, conversation, task_id)]
         self.target_public_keys[target.node_id] = target.node_public_key
         require(open_spec["type"] == "open" and Path(open_spec["cwd"]).resolve() == Path(open_spec["cwd"]),
@@ -646,7 +646,8 @@ class Client:
         response = self.rpc("bind_execution", conversation_id=conversation, task_id=task_id,
                             task_ref=task["task_ref"],
                             target_node=target.node_id, session_id=session_id,
-                            executor=open_spec["executor"], cwd=open_spec["cwd"], binding_generation=1, remote=remote)
+                            executor=open_spec["executor"], cwd=open_spec["cwd"], binding_generation=1,
+                            remote=remote, connection=connection)
         expected = {"space_id": self.scope["space_id"], "conversation_id": conversation,
                     "task_ref": task["task_ref"], "task_id": task_id,
                     "authority_node": task["authority_node"], "generation": 1,
