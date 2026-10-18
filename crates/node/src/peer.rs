@@ -115,6 +115,27 @@ struct Packet {
 type PacketId = (NetworkId, NodeId, String, Kind);
 
 impl PeerHub {
+    #[cfg(test)]
+    pub(crate) async fn reserve_replay_entries(
+        &self,
+        network: &str,
+        remaining: usize,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        for index in state.seen.len()..MAX_SEEN.saturating_sub(remaining) {
+            state.seen.insert(
+                (
+                    network.to_owned(),
+                    self.identity.node_id()?,
+                    Uuid::from_u128(index as u128).to_string(),
+                    Kind::Presence,
+                ),
+                (String::new(), Instant::now()),
+            );
+        }
+        Ok(())
+    }
+
     pub fn new(
         identity: LocalIdentity,
         store: Arc<Mutex<Store>>,
@@ -1101,6 +1122,16 @@ mod tests {
             )
             .is_err()
         );
+        let payload = json!("x".repeat(MAX_PACKET_BYTES - 1024 - 2));
+        assert_eq!(serde_json::to_vec(&payload)?.len(), MAX_PACKET_BYTES - 1024);
+        let response = hub.packet(
+            &a.fixture_network_id()?,
+            Some(b.node_id()?),
+            Kind::Response,
+            payload,
+            None,
+        )?;
+        assert!(serde_json::to_vec(&response)?.len() <= MAX_PACKET_BYTES);
         Ok(())
     }
 

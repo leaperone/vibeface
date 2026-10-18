@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { open, readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { resolve, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -22,12 +22,36 @@ function endpoint() {
     try {
       let result = null;
       switch (input.op) {
-        case 'fixture_event': {
+        case 'fixture_event':
+        case 'fixture_chain': {
           const secret = JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex;
           const key = createPrivateKey({key:Buffer.concat([Buffer.from('302e020100300506032b657004220420','hex'),Buffer.from(secret,'hex')]),format:'der',type:'pkcs8'});
-          const canonical_body = JSON.stringify(input.event);
-          const hash = createHash('sha256').update(canonical_body).digest('hex');
-          result = {hash,canonical_body,signature:sign(null,Buffer.from(`vibeface:event:v1:${hash}`),key).toString('hex')};
+          const signed = event => {
+            const canonical_body = JSON.stringify(event);
+            const hash = createHash('sha256').update(canonical_body).digest('hex');
+            return {hash,canonical_body,signature:sign(null,Buffer.from(`vibeface:event:v1:${hash}`),key).toString('hex')};
+          };
+          if (input.op === 'fixture_event') { result = signed(input.event); break; }
+          assert(Number.isInteger(input.count) && input.count >= 2 && input.count <= 100001, 'fixture chain count must be between 2 and 100001');
+          const output = await open(input.output_file, 'wx', 0o600);
+          const digest = createHash('sha256');
+          let first_hash, previous = null, page = '';
+          try {
+            for (let index = 0; index < input.count; index++) {
+              const event = {...input.event,sequence:index+1,previous,parents:previous ? [previous] : [],
+                body:index ? {type:'context_checkpoint',summary:'fixture',covered_heads:[]} : {type:'conversation_created',title:'NET-1 continuation fixture'},
+                blobs:index === input.count-1 ? [input.blob] : []};
+              const envelope = signed(event);
+              first_hash ??= envelope.hash;
+              previous = envelope.hash;
+              const line = `${JSON.stringify(envelope)}\n`;
+              digest.update(line); page += line;
+              if ((index+1) % 1024 === 0) { await output.writeFile(page); page = ''; }
+            }
+            if (page) await output.writeFile(page);
+            await output.sync();
+          } finally { await output.close(); }
+          result = {count:input.count,first_hash,head:previous,envelopes_sha256:digest.digest('hex')};
           break;
         }
         case 'identity':

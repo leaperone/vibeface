@@ -10,6 +10,8 @@ using a controlled sidecar. It does not verify real provider model behavior.
 --chat-agent checks taskless tools, sandboxed commands and startup event recovery
 with real Node processes and controlled provider protocol fixtures.
 --network-reliability records the NET-1 process baseline without Codex or models.
+Add --net1-lane 1 to check completed no-op syncs against the saved M0 baseline.
+Add --net1-lane 3 to verify a 100001-event closure across three authorized replicas.
 """
 
 import argparse
@@ -674,13 +676,13 @@ class Node:
         configuration.update(values)
         private_json(path, configuration)
 
-    def start(self):
+    def start(self, *, env=None):
         require(self.process is None, f"{self.name}: process is stopped before start")
         self.log = (self.directory / "process.log").open("ab")
         self.process = subprocess.Popen(
             [str(self.binary), "serve", "--data-dir", str(self.directory)],
             stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log,
-            start_new_session=True)
+            start_new_session=True, env=env)
         info = wait_for(f"{self.name} HTTP listener", lambda: self.client.request("/api/info"))
         self.node_id = info["node_id"]
         require(self.process.poll() is None, f"{self.name}: independent process remains running")
@@ -2517,6 +2519,225 @@ def acceptance(options):
         private_json(run / "report.json", report)
 
 
+def history_sync_fields(line):
+    fields = re.findall(r'\b(network|target|scope|state|processed|changed|missing_events|missing_blobs|conflicts|hash|size)=("[^"]*"|[^\s]+)', line)
+    return {key: value[1:-1] if value.startswith('"') else value for key, value in fields}
+
+
+def network_reliability_closure_progress(run, binary, workspace, fixture, helper, module, report, nodes,
+                                         event_count=100001):
+    repository = Path(__file__).resolve().parents[1]
+    case = {"status": "running", "history_events": event_count, "batch_budget": 1024,
+            "observations": [], "batches": [], "complete": False,
+            "source_isolation": "maintenance leases block background sync and allow authenticated peer reads"}
+    report["cases"]["closure_progress"] = case
+    leases = []
+    try:
+        for name in ("R", "A", "B", "C", "D"):
+            node = Node(run, name, binary, workspace, fixture, helper, module)
+            node.configure(manager=None, codex_socket=str(run / "unused-codex.sock"))
+            nodes.append(node)
+        relay, head_source, parent_source, blob_source, receiver = nodes
+        relay.configure(roles=["relay"], network={"bootstrap_urls": [], "advertise_urls": [],
+                                               "mdns": False, "relay_enabled": True})
+        relay.start()
+        for node in nodes[1:]:
+            node.configure(network={"bootstrap_urls": [relay.url.replace("http:", "ws:") + "/api/network/ws"],
+                                    "advertise_urls": [node.url.replace("http:", "ws:") + "/api/network/ws"],
+                                    "mdns": False, "relay_enabled": False})
+        head_source.start()
+        network = head_source.bootstrap()
+        for node in (parent_source, blob_source, receiver):
+            node.pair(head_source, network)
+            node.configure(roles=["gateway", "replica"] + (["executor"] if node is receiver else []))
+            node.start(env={**os.environ, "RUST_LOG": "vibeface::runtime=trace", "NO_COLOR": "1"}
+                       if node is receiver else None)
+            node.client.connect(node.node_id)
+            wait_for(f"{node.name} client authorization", lambda node=node: node.client.authenticate())
+        expected_membership = head_source.client.call("directory")["state"]
+        wait_for("all source and receiver memberships converge before maintenance", lambda: all(
+            node.client.call("directory")["state"] == expected_membership for node in nodes[1:]), timeout=90)
+        for node in nodes[1:]:
+            def acquire(node=node):
+                stream, response = maintenance(node, "acquire")
+                if response["status"] == "ready":
+                    return stream
+                stream.close()
+                require(response["status"] == "busy", f"{node.name} maintenance can be retried safely")
+                return None
+            leases.append(wait_for(f"{node.name} fixture isolation lease", acquire))
+        scope = "net1-continuation-history"
+        payload = b"NET-1 closure attachment supplied by replica C\n"
+        blob = {"hash": hashlib.sha256(payload).hexdigest(), "size": len(payload)}
+        event = {"version": 1, "network_id": network, "scope_id": scope, "author": head_source.node_id,
+                 "sequence": 1, "previous": None, "parents": [], "created_at_ms": 1,
+                 "body": {}, "blobs": []}
+        chain_path = run / "signed-history.ndjson"
+        signed = subprocess.run(["node", str(repository / "scripts/crypto-client.mjs"), "--module", str(module)],
+                                input=json.dumps({"op": "fixture_chain", "identity_file": str(head_source.directory / "identity.json"),
+                                                  "event": event, "blob": blob, "count": event_count,
+                                                  "output_file": str(chain_path)}) + "\n",
+                                capture_output=True, text=True, timeout=180)
+        require(signed.returncode == 0, "one temporary signer generates the bounded history without exposing its key")
+        result = json.loads(signed.stdout)
+        require(result.get("ok"), "streamed history signing succeeds")
+        chain = result["result"]
+        require(chain["count"] == event_count and file_sha256(chain_path) == chain["envelopes_sha256"],
+                "private streamed history has the exact requested count and digest")
+        case.update({"network_id": network, "scope_id": scope, "head": chain["head"], "blob": blob,
+                     "expected_envelopes_sha256": chain["envelopes_sha256"], "fixture_artifact": str(chain_path),
+                     "sources": {node.name: node.node_id for node in nodes[1:-1]},
+                     "receiver_log": str(receiver.directory / "process.log")})
+        sequences = {}
+        with sqlite3.connect(head_source.directory / "node.sqlite3", timeout=10) as heads, \
+                sqlite3.connect(parent_source.directory / "node.sqlite3", timeout=10) as parents:
+            with chain_path.open() as source:
+                for line in source:
+                    envelope = json.loads(line)
+                    body = json.loads(envelope["canonical_body"])
+                    sequence = body["sequence"]
+                    sequences[envelope["hash"]] = sequence
+                    connection = heads if sequence == event_count else parents
+                    connection.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?)",
+                                       (network, envelope["hash"], scope, head_source.node_id, sequence,
+                                        json.dumps(envelope, separators=(",", ":")), "pending" if sequence == event_count else "ready"))
+        require(len(sequences) == event_count and sequences[chain["head"]] == event_count,
+                "seeded history contains every unique signed event exactly once")
+        database = receiver.directory / "node.sqlite3"
+        source_events = {head_source.node_id: set(), parent_source.node_id: set(), blob_source.node_id: set()}
+        source_blobs = {node.node_id: set() for node in nodes[1:-1]}
+        log_path = receiver.directory / "process.log"
+        log_offset = log_path.stat().st_size
+        log_tail = b""
+
+        def read_progress():
+            nonlocal log_offset, log_tail
+            with log_path.open("rb") as log:
+                log.seek(log_offset)
+                chunk = log.read()
+                log_offset = log.tell()
+            lines = (log_tail + chunk).split(b"\n")
+            log_tail = lines.pop()
+            for raw in lines:
+                line = re.sub(r"\x1b\[[0-9;]*m", "", raw.decode(errors="replace"))
+                fields = history_sync_fields(line)
+                if fields.get("network") != network:
+                    continue
+                if "history event fetched" in line:
+                    target, digest = fields["target"], fields["hash"]
+                    require(target in source_events and digest in sequences, "events come from a known authorized fixture source")
+                    require((target == head_source.node_id and digest == chain["head"])
+                            or (target == parent_source.node_id and digest != chain["head"]),
+                            "each event is fetched from its actual fixed source distribution")
+                    source_events[target].add(digest)
+                elif "history blob fetched" in line:
+                    require(fields["target"] == blob_source.node_id and fields["hash"] == blob["hash"],
+                            "the complete attachment is fetched from replica C")
+                    source_blobs[fields["target"]].add(fields["hash"])
+                elif "history scope sync finished" in line and fields.get("scope") == scope:
+                    case["batches"].append(fields)
+            with sqlite3.connect(database, timeout=10) as connection:
+                count, ready, pending, invalid = connection.execute(
+                    "SELECT COUNT(*),COALESCE(SUM(status='ready'),0),COALESCE(SUM(status='pending'),0),COALESCE(SUM(status IN ('invalid','conflict')),0) FROM events WHERE network_id=? AND scope_id=?",
+                    (network, scope)).fetchone()
+                has_head = bool(connection.execute("SELECT 1 FROM events WHERE network_id=? AND hash=?", (network, chain["head"])).fetchone())
+                has_blob = bool(connection.execute("SELECT 1 FROM blobs WHERE network_id=? AND hash=?", (network, blob["hash"])).fetchone())
+                has_conversation = bool(connection.execute("SELECT 1 FROM conversations WHERE network_id=? AND conversation_id=?", (network, scope)).fetchone())
+                continuations = []
+                for key, value in connection.execute("SELECT key,value FROM local_values WHERE network_id=? AND key LIKE 'net1:v1:closure:%'", (network,)):
+                    progress = json.loads(value)
+                    if progress["scope"] == scope:
+                        continuations.append({"key": key, "heads": progress["heads"], "next_events": progress["events"],
+                                              "next_sequences": [sequences.get(digest) for digest in progress["events"]],
+                                              "missing_blobs": len(progress["blobs"]),
+                                              "frontier_generation": progress["frontier_generation"]})
+            observation = {"elapsed_seconds": time.monotonic() - started, "persisted_events": count,
+                           "remaining_history": event_count - count, "ready_events": ready,
+                           "pending_events": pending, "invalid_events": invalid, "has_head": has_head,
+                           "has_conversation": has_conversation, "complete_blob": has_blob, "continuations": continuations}
+            previous = case["observations"][-1] if case["observations"] else None
+            require(previous is None or count >= previous["persisted_events"], "remaining history decreases monotonically")
+            require(count <= event_count and invalid == 0, "receiver stores only valid fixture history")
+            if previous is None or any(observation[key] != previous[key] for key in observation if key != "elapsed_seconds"):
+                case["observations"].append(observation)
+                private_json(run / "report.json", report)
+                print(f"PROGRESS NET-1 Lane 3 persisted={count} remaining={event_count-count} pending={pending}", flush=True)
+            return observation
+
+        started = time.monotonic()
+        read_progress()
+        leases.pop().close()
+        blocked_operation = None
+        while time.monotonic() - started < 3600:
+            observation = read_progress()
+            if blocked_operation is None and observation["has_head"] and observation["has_conversation"] and observation["pending_events"]:
+                operation_id = "net1-incomplete-history-must-not-execute"
+                operation_request = request(network, scope, receiver, operation_id, "net1-pending-fixture",
+                                            {"type": "open", "executor": "claude_code", "cwd": str(workspace)})
+                operation_request["basis_heads"] = [chain["head"]]
+                rejection = dispatch(receiver.client, operation_request, status=400)
+                require("operation basis is incomplete or conflicting" in str(rejection.get("error")),
+                        "pending signed history is rejected at the operation basis check")
+                with sqlite3.connect(database, timeout=10) as connection:
+                    accepted = connection.execute("SELECT COUNT(*) FROM operations WHERE network_id=? AND operation_id=?",
+                                                  (network, operation_id)).fetchone()[0]
+                require(accepted == 0 and not invocations(run), "incomplete history never admits an operation or invokes the fixture")
+                blocked_operation = {"operation_id": operation_id, "target_node": receiver.node_id,
+                                     "basis_heads": [chain["head"]], "rejection": rejection["error"],
+                                     "accepted_operations": accepted, "fixture_invocations": 0}
+                case["pending_operation"] = blocked_operation
+                with sqlite3.connect(blob_source.directory / "node.sqlite3", timeout=10) as connection:
+                    connection.execute("INSERT INTO blobs(network_id,hash,size,content) VALUES(?,?,?,?)",
+                                       (network, blob["hash"], blob["size"], payload))
+                case["blob_supply"] = "replica C supplies the missing attachment after the incomplete-operation rejection"
+            complete = any(batch.get("target") == head_source.node_id and batch.get("state") == "Complete"
+                           and batch.get("missing_events") == "0" and batch.get("missing_blobs") == "0"
+                           and batch.get("conflicts") == "0" for batch in case["batches"])
+            if complete and observation["persisted_events"] == event_count and observation["ready_events"] == event_count and observation["complete_blob"]:
+                case["complete"] = True
+                break
+            require(all(node.process.poll() is None for node in nodes), "all isolated Node processes stay alive")
+            time.sleep(0.5)
+        require(case["complete"], "the full history reaches a complete signed frontier within the observation bound")
+        require(blocked_operation is not None, "pending history has an actual rejected operation attempt")
+        require(any(int(batch.get("processed", "0")) == 1024 for batch in case["batches"]) or event_count <= 1024,
+                "large history advances through the actual 1024-event runtime batch budget")
+        digest = hashlib.sha256()
+        with sqlite3.connect(database, timeout=10) as connection:
+            for envelope, in connection.execute("SELECT envelope FROM events WHERE network_id=? AND scope_id=? ORDER BY sequence", (network, scope)):
+                parsed = json.loads(envelope)
+                require(hashlib.sha256(parsed["canonical_body"].encode()).hexdigest() == parsed["hash"],
+                        "every persisted event matches its signed content hash")
+                digest.update((json.dumps(parsed, separators=(",", ":")) + "\n").encode())
+            stored_blob = connection.execute("SELECT size,content FROM blobs WHERE network_id=? AND hash=?", (network, blob["hash"])).fetchone()
+        require(digest.hexdigest() == chain["envelopes_sha256"], "receiver preserves the entire exact signed event history")
+        require(stored_blob and stored_blob[0] == len(stored_blob[1]) == blob["size"]
+                and hashlib.sha256(stored_blob[1]).hexdigest() == blob["hash"], "receiver attachment size and final hash match")
+        for node, expected_count in ((head_source, 1), (parent_source, event_count - 1), (blob_source, 0)):
+            with sqlite3.connect(node.directory / "node.sqlite3", timeout=10) as connection:
+                count = connection.execute("SELECT COUNT(*) FROM events WHERE network_id=? AND scope_id=?", (network, scope)).fetchone()[0]
+                blobs = connection.execute("SELECT COUNT(*) FROM blobs WHERE network_id=?", (network,)).fetchone()[0]
+            require(count == expected_count and blobs == int(node is blob_source), "source distribution remains fixed throughout transfer")
+        require(source_events[head_source.node_id] == {chain["head"]}
+                and len(source_events[parent_source.node_id]) == event_count - 1
+                and source_blobs[blob_source.node_id] == {blob["hash"]}, "real object-source logs cover every supplied event and attachment")
+        require(not invocations(run), "closure continuation and rejected pending operation never invoke an executor")
+        verify_no_model_budget(nodes)
+        require(file_sha256(binary) == report["binary_sha256"], "Lane 3 binary remains unchanged")
+        case.update({"status": "passed", "actual_envelopes_sha256": digest.hexdigest(), "attachment_hash_verified": True,
+                     "source_events_fetched": {node.name: len(source_events[node.node_id]) for node in nodes[1:-1]},
+                     "source_blobs_fetched": {node.name: len(source_blobs[node.node_id]) for node in nodes[1:-1]},
+                     "source_distribution_preserved": True})
+        report["fixture_invocations"] = 0
+        report["status"] = "passed"
+        print(f"PASS NET-1 Lane 3 report: {run / 'report.json'}", flush=True)
+    finally:
+        for node in reversed(nodes):
+            node.stop()
+        for lease in leases:
+            lease.close()
+
+
 def network_reliability_acceptance(options):
     binary = options.binary.resolve(strict=True)
     repository = Path(__file__).resolve().parents[1]
@@ -2527,7 +2748,9 @@ def network_reliability_acceptance(options):
                              cwd=repository, capture_output=True)
     require(ignored.returncode == 0, "NET-1 artifacts are ignored before fixture creation")
     artifacts.mkdir(parents=True, exist_ok=True)
-    run = artifacts / ("m0-baseline-" + uuid.uuid4().hex[:10])
+    lane = options.net1_lane
+    baseline_report = None
+    run = artifacts / ({1: "lane-1-noop-", 3: "lane-3-closure-"}.get(lane, "m0-baseline-") + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir(mode=0o700)
@@ -2538,7 +2761,7 @@ def network_reliability_acceptance(options):
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     helper.chmod(0o600)
-    report = {"status": "running", "mode": "network-reliability-m0",
+    report = {"status": "running", "mode": f"network-reliability-lane-{lane}" if lane else "network-reliability-m0",
               "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip(),
               "binary_sha256": file_sha256(binary), "artifacts": str(run),
               "command": [sys.executable, *sys.argv], "provider_calls": 0, "cases": {},
@@ -2546,6 +2769,25 @@ def network_reliability_acceptance(options):
                               "attachment crash recovery and 64 MiB completion", "rendered browser UI", "production networks"]}
     nodes, capture = [], None
     try:
+        if lane == 3:
+            report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
+            report["not_checked"] = ["other NET-1 lanes", "rendered browser UI", "production networks"]
+            network_reliability_closure_progress(run, binary, workspace, fixture, helper, module, report, nodes)
+            return
+        if lane == 1:
+            require(options.evidence_dir is not None, "Lane 1 requires --evidence-dir with the saved M0 baseline")
+            baseline_path = options.evidence_dir / "m0-baseline.json"
+            baseline_report = json.loads(baseline_path.read_text())
+            require(baseline_report["status"] == "observed" and baseline_report["mode"] == "network-reliability-m0",
+                    "Lane 1 compares against an observed M0 process baseline")
+            ancestry = subprocess.run(["git", "merge-base", "--is-ancestor", baseline_report["source_commit"], "HEAD"],
+                                      cwd=repository, capture_output=True)
+            require(ancestry.returncode == 0, "saved baseline is an ancestor of the current head")
+            report["base_commit"] = baseline_report["source_commit"]
+            report["baseline"] = {"evidence": str(baseline_path), "binary_sha256": baseline_report["binary_sha256"],
+                                  "noop_sync": baseline_report["cases"]["noop_sync"]}
+            report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
+            report["not_checked"] = ["base/head interleaved perf probes", "other NET-1 lanes", "rendered browser UI", "production networks"]
         for name in ("R", "A", "B"):
             nodes.append(Node(run, name, binary, workspace, fixture, helper, module))
         relay, source, receiver = nodes
@@ -2554,22 +2796,23 @@ def network_reliability_acceptance(options):
         capture = RelayCapture(relay.port, retain_payloads=False)
         relay.configure(allowed_origins=[capture.url])
         relay.start()
-        probe = relay.client
-        directory = probe.command("network_probe", kind="directory", url=relay.url)
-        require(all(directory.values()), "short directory lease expires without losing the healthy record")
-        report["cases"]["directory_expiry"] = {"status": "observed", **directory,
-                                                 "full_resolver_cache": "not_exercised"}
-        print("OBSERVED NET-1 signed directory expiry", flush=True)
-        reservations = probe.command("network_probe", kind="reservations", url=relay.url)
-        require(reservations["accepted"] == 64 and reservations["rejected"] == 1,
-                "isolated baseline admits exactly 64 unique reservations and rejects the 65th")
-        require(reservations["timeouts"] == 0 and reservations["first_reservation_published_after_capacity"],
-                "reservation capacity has no probe timeouts and retains the first control connection")
-        require(not reservations["duplicate_identity_accepted"], "baseline rejects a duplicate identity reservation")
-        report["cases"]["reservation_capacity"] = {"status": "observed", **reservations}
-        print("OBSERVED NET-1 reservation capacity", flush=True)
-        relay.stop()
-        relay.start()
+        if not lane:
+            probe = relay.client
+            directory = probe.command("network_probe", kind="directory", url=relay.url)
+            require(all(directory.values()), "short directory lease expires without losing the healthy record")
+            report["cases"]["directory_expiry"] = {"status": "observed", **directory,
+                                                     "full_resolver_cache": "not_exercised"}
+            print("OBSERVED NET-1 signed directory expiry", flush=True)
+            reservations = probe.command("network_probe", kind="reservations", url=relay.url)
+            require(reservations["accepted"] == 64 and reservations["rejected"] == 1,
+                    "isolated baseline admits exactly 64 unique reservations and rejects the 65th")
+            require(reservations["timeouts"] == 0 and reservations["first_reservation_published_after_capacity"],
+                    "reservation capacity has no probe timeouts and retains the first control connection")
+            require(not reservations["duplicate_identity_accepted"], "baseline rejects a duplicate identity reservation")
+            report["cases"]["reservation_capacity"] = {"status": "observed", **reservations}
+            print("OBSERVED NET-1 reservation capacity", flush=True)
+            relay.stop()
+            relay.start()
         for node in (source, receiver):
             node.configure(manager=None, network={"bootstrap_urls": [capture.url.replace("http:", "ws:") + "/api/network/ws"],
                                                   "advertise_urls": [], "mdns": False, "relay_enabled": False})
@@ -2577,7 +2820,7 @@ def network_reliability_acceptance(options):
         network = source.bootstrap()
         wait_for("source reservation through the sole relay", lambda: b'{"type":"reserved"}' in capture.payloads)
         receiver.pair(source, network, relay_url=capture.url)
-        receiver.start()
+        receiver.start(env={**os.environ, "RUST_LOG": "vibeface::runtime=debug", "NO_COLOR": "1"} if lane == 1 else None)
         receiver.client.connect(receiver.node_id)
         wait_for("receiver client authorization", lambda: receiver.client.authenticate())
         conversation = "net1-baseline-history"
@@ -2599,18 +2842,55 @@ def network_reliability_acceptance(options):
                             if (value := receiver.client.rpc("export", conversation_id=conversation)) else None)
         require(any(item["node_id"] == source.node_id and item["online"]
                     for item in receiver.client.rpc("nodes")["nodes"]), "receiver has a real authenticated source peer")
+        if lane == 1:
+            log_path = receiver.directory / "process.log"
+
+            def complete_syncs(offset, *, unchanged=False):
+                with log_path.open("rb") as log:
+                    log.seek(offset)
+                    lines = log.read().decode(errors="replace").splitlines()
+                expected = {"network": network, "target": source.node_id, "scope": conversation,
+                            "state": "Complete", "missing_events": "0", "missing_blobs": "0", "conflicts": "0"}
+                if unchanged:
+                    expected["changed"] = "false"
+                completed = []
+                for line in lines:
+                    line = re.sub(r"\x1b\[[0-9;]*m", "", line)
+                    if "history scope sync finished" not in line:
+                        continue
+                    fields = history_sync_fields(line)
+                    if all(fields.get(key) == value for key, value in expected.items()):
+                        completed.append(line)
+                return completed
+
+            converged = wait_for("complete sync after the full fixture has arrived",
+                                 lambda offset=log_path.stat().st_size: complete_syncs(offset))
+            require(source.client.rpc("export", conversation_id=conversation) == baseline,
+                    "receiver has the source's exact complete signed history")
         with sqlite3.connect(database, timeout=10) as connection:
             positive_writes = connection.execute("SELECT COUNT(*) FROM net1_projection_audit WHERE table_name!='events'").fetchone()[0]
             require(positive_writes > 0, "database audit observes actual projection writes before the no-op check")
+            if lane == 1:
+                projection = {table: connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+                              for table in ("conversations", "messages", "tasks")}
             connection.execute("DELETE FROM net1_projection_audit")
         started = time.monotonic()
-        time.sleep(7)
+        if lane == 1:
+            log_offset = log_path.stat().st_size
+            starting_bytes, starting_frames = capture.payload_bytes, capture.frame_count
+            completed = wait_for("a new complete unchanged scope sync inside the audit window",
+                                 lambda: complete_syncs(log_offset, unchanged=True))
+        else:
+            time.sleep(7)
         after = receiver.client.rpc("export", conversation_id=conversation)
         require(after == baseline, "unchanged sync preserves the exact complete signed snapshot")
         with sqlite3.connect(database, timeout=10) as connection:
             writes = [{"table": table, "operation": operation, "rows": count}
                       for table, operation, count in connection.execute(
                           "SELECT table_name,operation,COUNT(*) FROM net1_projection_audit GROUP BY table_name,operation ORDER BY table_name,operation")]
+            if lane == 1:
+                require(all(connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() == rows
+                            for table, rows in projection.items()), "no-op sync preserves the exact business projection")
         business_writes = sum(value["rows"] for value in writes if value["table"] != "events")
         rebuilds = sum(value["rows"] for value in writes if value["table"] == "conversations" and value["operation"] == "DELETE")
         report["cases"]["noop_sync"] = {"status": "observed", "history_events": 2,
@@ -2621,6 +2901,21 @@ def network_reliability_acceptance(options):
                                            "rebuild_counter": "one conversation DELETE row per rebuild in this fixture",
                                            "writes": writes, "snapshot_identical": True}
         print(f"OBSERVED NET-1 no-op sync business writes={business_writes}", flush=True)
+        if lane == 1:
+            report["cases"]["noop_sync"].update({"status": "passed" if business_writes == 0 else "failed",
+                "projection_identical": True, "convergence_completions": converged,
+                "window_completions": completed, "receiver_log": str(log_path), "log_window_offset": log_offset,
+                "wire_payload_bytes": capture.payload_bytes - starting_bytes, "wire_frames": capture.frame_count - starting_frames,
+                "wire_counter": "all captured directions and both relay legs, including control and protocol overhead"})
+            require(business_writes == 0, "completed no-op scope sync performs zero business projection writes")
+            require(not capture.errors, "relay capture parses all observed frames")
+            require(not invocations(run), "Lane 1 synchronization never invokes an executor")
+            verify_no_model_budget(nodes)
+            require(file_sha256(binary) == report["binary_sha256"], "Lane 1 binary remains unchanged")
+            report["status"] = "passed"
+            report["fixture_invocations"] = 0
+            print(f"PASS NET-1 Lane 1 report: {run / 'report.json'}", flush=True)
+            return
         receiver.stop()
         source.stop()
         def seed_attachment(size):
@@ -2727,7 +3022,9 @@ def network_reliability_acceptance(options):
         private_json(run / "report.json", report)
         if options.evidence_dir:
             options.evidence_dir.mkdir(parents=True, exist_ok=True)
-            private_json(options.evidence_dir / "m0-baseline.json", report)
+            evidence_path = options.evidence_dir / {1: "live/01-noop-sync.json", 3: "live/03-closure-progress.json"}.get(lane, "m0-baseline.json")
+            evidence_path.parent.mkdir(parents=True, exist_ok=True)
+            private_json(evidence_path, report)
 
 
 def shared_history(client, conversation, task, dispatched=None):
@@ -2779,12 +3076,15 @@ if __name__ == "__main__":
         parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "crates/node/web/generated/vibeface_secure.js")
         parser.add_argument("--codex-bin", default="codex")
         parser.add_argument("--skip-codex", action="store_true", help="omit real Codex transport checks and report that omission")
-        parser.add_argument("--evidence-dir", type=Path, help="save a compact NET-1 baseline report in the task evidence directory")
+        parser.add_argument("--evidence-dir", type=Path, help="save compact NET-1 reports in the task evidence directory")
+        parser.add_argument("--net1-lane", type=int, choices=[1, 3], help="run one focused NET-1 process lane")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run taskless tools, command isolation and startup subscription process checks")
         modes.add_argument("--network-reliability", action="store_true", help="record NET-1 isolated process baselines without provider calls")
         arguments = parser.parse_args()
+        if arguments.net1_lane and not arguments.network_reliability:
+            parser.error("--net1-lane requires --network-reliability")
         try:
             if arguments.network_reliability:
                 network_reliability_acceptance(arguments)

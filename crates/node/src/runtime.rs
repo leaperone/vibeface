@@ -13,10 +13,10 @@ use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
 
@@ -53,8 +53,12 @@ mod tests {
         })
     }
     pub(super) fn fixture() -> Result<PathBuf> {
+        fixture_under("")
+    }
+    fn fixture_under(subdir: &str) -> Result<PathBuf> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
+            .join(subdir)
             .join(format!("runtime-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":3}"#)?;
@@ -84,6 +88,1714 @@ mod tests {
         .await?;
         Ok(view.network_id)
     }
+    #[tokio::test]
+    async fn net1_pending_basis_rejects_before_scanning_history_and_ready_rechecks_content()
+    -> Result<()> {
+        let dir = fixture_under("network-reliability")?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let network = conversation(&node).await?;
+        let content = b"basis content must be verified";
+        let blob = BlobRef {
+            hash: crypto::digest(content),
+            size: content.len() as u64,
+        };
+        let root = node.store.lock().await.heads(&network, "chat")?[0].clone();
+        let pending = node.identity.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "chat".into(),
+            author: node.identity.node_id()?,
+            sequence: 2,
+            previous: Some(root.clone()),
+            parents: vec![root],
+            created_at_ms: 2,
+            body: EventBody::MessagePosted {
+                message_id: "pending-basis".into(),
+                role: "user".into(),
+                text: "needs the attachment".into(),
+                scheduler_node: None,
+            },
+            blobs: vec![blob.clone()],
+        })?;
+        let sentinel = node.identity.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "chat".into(),
+            author: node.identity.node_id()?,
+            sequence: 3,
+            previous: Some(pending.hash.clone()),
+            parents: vec![pending.hash.clone()],
+            created_at_ms: 3,
+            body: EventBody::MessagePosted {
+                message_id: "later-sentinel".into(),
+                role: "user".into(),
+                text: "outside the requested basis ancestry".into(),
+                scheduler_node: None,
+            },
+            blobs: vec![],
+        })?;
+        node.store
+            .lock()
+            .await
+            .ingest_events(&network, &[pending.clone(), sentinel.clone()])?;
+        let mut corrupt = sentinel.clone();
+        corrupt.signature = "00".repeat(64);
+        let connection = rusqlite::Connection::open(dir.join("node.sqlite3"))?;
+        connection.execute(
+            "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
+            rusqlite::params![serde_json::to_string(&corrupt)?, network, sentinel.hash],
+        )?;
+        assert!(
+            node.store
+                .lock()
+                .await
+                .context(&network, "chat", std::slice::from_ref(&pending.hash))
+                .is_err()
+        );
+        let human = Access {
+            network_id: network.clone(),
+            human: true,
+            conversation_id: Some("chat".into()),
+            manager: None,
+        };
+        let request = OperationRequest {
+            operation_id: "pending-open".into(),
+            network_id: network.clone(),
+            conversation_id: "chat".into(),
+            task_id: None,
+            target_node: node.identity.node_id()?,
+            session_id: Some("pending-session".into()),
+            expected_revision: 0,
+            basis_heads: vec![pending.hash.clone()],
+            action: json!({"type":"open","executor":"claude_code","cwd":dir}),
+            resources: vec![],
+            binding: None,
+            manager_authority: None,
+        };
+        assert_eq!(
+            node.rpc(human.clone(), json!({"method":"operate","request":request}))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "operation basis is incomplete or conflicting"
+        );
+        let mut agent_request = request.clone();
+        agent_request.operation_id = "pending-agent-open".into();
+        let agent = Access {
+            human: false,
+            ..human.clone()
+        };
+        assert_eq!(
+            node.dispatch(agent, agent_request)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "operation basis is incomplete or conflicting"
+        );
+        let mut command = request.clone();
+        command.operation_id = "pending-command".into();
+        command.session_id = None;
+        command.action = json!({"type":"command","command":"printf net1 >> pending-effect","cwd":dir,"timeout_secs":1});
+        assert_eq!(
+            node.dispatch(human.clone(), command.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "operation basis is incomplete or conflicting"
+        );
+        assert_eq!(
+            node.admit_operation(request.clone(), true)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "required context is incomplete or conflicting"
+        );
+        assert_eq!(
+            node.admit_operation(command.clone(), true)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "required context is incomplete or conflicting"
+        );
+        let mut missing = command.clone();
+        missing.operation_id = "missing-root-command".into();
+        missing.basis_heads = vec![crypto::digest(b"missing basis")];
+        assert_eq!(
+            node.dispatch(human.clone(), missing)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "operation basis is incomplete or conflicting"
+        );
+        let scoped_elsewhere = Access {
+            conversation_id: Some("elsewhere".into()),
+            ..human.clone()
+        };
+        assert_eq!(
+            node.dispatch(scoped_elsewhere, command.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "outside this tool's conversation"
+        );
+        assert!(node.store.lock().await.operations(&network)?.is_empty());
+        assert!(
+            node.store
+                .lock()
+                .await
+                .session(&network, &node.identity.node_id()?, "pending-session")?
+                .is_none()
+        );
+        let dispatches: usize = connection.query_row("SELECT count(*) FROM events WHERE network_id=? AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.type')='dispatch_recorded'", [&network], |row| row.get(0))?;
+        assert_eq!(dispatches, 0);
+        assert!(!dir.join("pending-effect").exists());
+        connection.execute(
+            "UPDATE events SET envelope=? WHERE network_id=? AND hash=?",
+            rusqlite::params![serde_json::to_string(&sentinel)?, network, sentinel.hash],
+        )?;
+        node.store.lock().await.put_blob(&network, &blob, content)?;
+        let status: String = connection.query_row(
+            "SELECT status FROM events WHERE network_id=? AND hash=?",
+            rusqlite::params![network, pending.hash],
+            |row| row.get(0),
+        )?;
+        assert_eq!(status, "ready");
+        connection.execute(
+            "UPDATE blobs SET content=? WHERE network_id=? AND hash=?",
+            rusqlite::params![vec![b'x'; content.len()], network, blob.hash],
+        )?;
+        assert!(
+            !node
+                .store
+                .lock()
+                .await
+                .has_known_basis_gap(&network, std::slice::from_ref(&pending.hash))?
+        );
+        assert_eq!(
+            node.dispatch(human.clone(), command.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "operation basis is incomplete or conflicting"
+        );
+        assert_eq!(
+            node.admit_operation(command.clone(), true)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "required context is incomplete or conflicting"
+        );
+        assert!(node.store.lock().await.operations(&network)?.is_empty());
+        assert!(!dir.join("pending-effect").exists());
+        node.store.lock().await.put_blob(&network, &blob, content)?;
+        node.dispatch(human, command.clone()).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if node
+                    .store
+                    .lock()
+                    .await
+                    .operation(&network, &command.operation_id)?
+                    .is_some_and(|record| record.state == OperationState::Succeeded)
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        assert_eq!(std::fs::read(dir.join("pending-effect"))?, b"net1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn net1_existing_unknown_operation_keeps_normalization_and_never_redispatches()
+    -> Result<()> {
+        let dir = fixture_under("network-reliability")?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let network = conversation(&node).await?;
+        let request = OperationRequest {
+            operation_id: "unknown-original".into(),
+            network_id: network.clone(),
+            conversation_id: "chat".into(),
+            task_id: None,
+            target_node: node.identity.node_id()?,
+            session_id: None,
+            expected_revision: 0,
+            basis_heads: node.store.lock().await.heads(&network, "chat")?,
+            action: json!({"type":"command","command":"printf net1 >> unknown-effect; sleep 30","cwd":dir,"timeout_secs":1}),
+            resources: vec![],
+            binding: None,
+            manager_authority: None,
+        };
+        node.admit_operation(request.clone(), true).await?;
+        let old = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(record) = node
+                    .store
+                    .lock()
+                    .await
+                    .operation(&network, &request.operation_id)?
+                {
+                    if record.state == OperationState::Unknown {
+                        return Ok::<_, anyhow::Error>(record);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        assert_eq!(std::fs::read(dir.join("unknown-effect"))?, b"net1");
+        let connection = rusqlite::Connection::open(dir.join("node.sqlite3"))?;
+        connection.execute(
+            "UPDATE events SET status='pending' WHERE network_id=? AND hash=?",
+            rusqlite::params![network, request.basis_heads[0]],
+        )?;
+        let mut retry = request.clone();
+        retry.resources = vec![
+            format!("{}/.", node.config.roots[0].display()),
+            node.config.roots[0].to_string_lossy().into(),
+        ];
+        let repeated = node.admit_operation(retry.clone(), true).await?;
+        assert_eq!(repeated["operation"], serde_json::to_value(&old)?);
+        let mut changed = retry.clone();
+        changed.action["command"] = json!("printf changed >> unknown-effect");
+        assert_eq!(
+            node.admit_operation(changed, true)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "operation ID reused with different body"
+        );
+        let mut outside = retry;
+        outside.resources = vec!["/".into()];
+        assert_eq!(
+            node.admit_operation(outside, true)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "execution path is outside configured roots"
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .operation(&network, &request.operation_id)?,
+            Some(old)
+        );
+        assert_eq!(std::fs::read(dir.join("unknown-effect"))?, b"net1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn net1_history_batch_checks_exact_closure_and_wire_bytes() -> Result<()> {
+        let dir = fixture_under("network-reliability")?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let network = conversation(&node).await?;
+        let root = node.store.lock().await.heads(&network, "chat")?[0].clone();
+        let root = node.store.lock().await.event(&network, &root)?.unwrap();
+        let mut event: Event = serde_json::from_str(&root.canonical_body)?;
+        event.sequence = 2;
+        event.previous = Some(root.hash.clone());
+        event.parents.clear();
+        event.body = EventBody::MessagePosted {
+            message_id: "previous-only".into(),
+            role: "user".into(),
+            text: "previous is an ancestry edge".into(),
+            scheduler_node: None,
+        };
+        let parent = node.identity.sign_event(event.clone())?;
+        event.sequence = 3;
+        event.previous = Some(parent.hash.clone());
+        let child = node.identity.sign_event(event.clone())?;
+        let batch = json!({"version":1,"hash":child.hash,"events":[root,parent,child]});
+        let store = node.store.lock().await;
+        let verified = verify_history_batch(
+            &store,
+            &network,
+            &child.hash,
+            &batch,
+            3,
+            HISTORY_BATCH_BYTES,
+        )?;
+        assert_eq!(
+            verified.iter().map(|event| &event.hash).collect::<Vec<_>>(),
+            vec![&child.hash, &parent.hash, &root.hash]
+        );
+        let mut bad = batch.clone();
+        bad["hash"] = json!(root.hash);
+        assert!(
+            verify_history_batch(&store, &network, &child.hash, &bad, 3, HISTORY_BATCH_BYTES)
+                .is_err()
+        );
+        bad = batch.clone();
+        bad["events"] = json!([root, parent]);
+        assert_eq!(
+            verify_history_batch(&store, &network, &child.hash, &bad, 3, HISTORY_BATCH_BYTES)
+                .unwrap_err()
+                .to_string(),
+            "history batch root missing"
+        );
+        bad["events"] = json!([root, child]);
+        assert_eq!(
+            verify_history_batch(&store, &network, &child.hash, &bad, 3, HISTORY_BATCH_BYTES)
+                .unwrap_err()
+                .to_string(),
+            "unrelated event in history batch"
+        );
+        bad["events"] = json!([child, child]);
+        assert_eq!(
+            verify_history_batch(&store, &network, &child.hash, &bad, 3, HISTORY_BATCH_BYTES)
+                .unwrap_err()
+                .to_string(),
+            "duplicate event in history batch"
+        );
+        bad = batch.clone();
+        bad["events"][0]["signature"] = json!("00".repeat(64));
+        assert!(
+            verify_history_batch(&store, &network, &child.hash, &bad, 3, HISTORY_BATCH_BYTES)
+                .is_err()
+        );
+        event.network_id = "ab".repeat(32);
+        let foreign = node.identity.sign_event(event.clone())?;
+        bad["events"] = json!([child, foreign]);
+        assert!(
+            verify_history_batch(&store, &network, &child.hash, &bad, 3, HISTORY_BATCH_BYTES)
+                .is_err()
+        );
+        assert!(
+            verify_history_batch(
+                &store,
+                &network,
+                &child.hash,
+                &batch,
+                2,
+                HISTORY_BATCH_BYTES
+            )
+            .is_err()
+        );
+        let wire_bytes = serde_json::to_vec(&batch)?.len();
+        assert!(
+            verify_history_batch(&store, &network, &child.hash, &batch, 3, wire_bytes - 1).is_err()
+        );
+        drop(store);
+
+        event.network_id = network.clone();
+        event.scope_id = "other-scope".into();
+        event.sequence = 1;
+        event.previous = None;
+        event.parents = vec![root.hash.clone()];
+        let branch = node.identity.sign_event(event.clone())?;
+        event.scope_id = "chat".into();
+        event.sequence = 3;
+        event.previous = Some(parent.hash.clone());
+        event.parents = vec![root.hash.clone(), branch.hash.clone()];
+        let diamond = node.identity.sign_event(event.clone())?;
+        let batch = json!({"version":1,"hash":diamond.hash,"events":[root,parent,branch,diamond]});
+        let store = node.store.lock().await;
+        assert_eq!(
+            verify_history_batch(
+                &store,
+                &network,
+                &diamond.hash,
+                &batch,
+                4,
+                HISTORY_BATCH_BYTES
+            )?
+            .len(),
+            4
+        );
+        drop(store);
+
+        event.scope_id = "large-event".into();
+        event.sequence = 1;
+        event.previous = None;
+        event.parents.clear();
+        event.body = EventBody::MessagePosted {
+            message_id: "escaped".into(),
+            role: "user".into(),
+            text: "\"\\界".repeat(145_000),
+            scheduler_node: None,
+        };
+        let large = node.identity.sign_event(event)?;
+        assert!(large.canonical_body.len() > 1_000_000);
+        node.store
+            .lock()
+            .await
+            .ingest_events(&network, std::slice::from_ref(&large))?;
+        let mut message = Inbound {
+            network_id: network.clone(),
+            origin: node.identity.node_id()?,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            broadcast: false,
+            payload: json!({"type":"history_batch","hash":large.hash,"limit":128,"max_bytes":HISTORY_BATCH_BYTES}),
+        };
+        let response = node.handle_peer(&message).await?;
+        let actual_bytes = serde_json::to_vec(&response)?.len();
+        assert!(actual_bytes <= HISTORY_BATCH_BYTES);
+        assert_eq!(response["events"].as_array().unwrap().len(), 1);
+        assert!(actual_bytes > large.canonical_body.len());
+        message.payload["max_bytes"] = json!(512);
+        let response = node.handle_peer(&message).await?;
+        assert_eq!(
+            response,
+            json!({"version":1,"hash":large.hash,"single_event":true})
+        );
+        message.payload["max_bytes"] =
+            json!(serde_json::to_vec(&json!({"version":1,"hash":large.hash,"events":[]}))?.len());
+        assert_eq!(
+            node.handle_peer(&message).await.unwrap_err().to_string(),
+            "history batch byte budget too small"
+        );
+        message.payload = json!({"type":"event","hash":large.hash});
+        assert_eq!(node.handle_peer(&message).await?["event"], json!(large));
+
+        let mut event: Event = serde_json::from_str(&root.canonical_body)?;
+        event.scope_id = "wide".into();
+        event.parents = (0..1024)
+            .map(|index| crypto::digest(format!("missing-{index}").as_bytes()))
+            .collect();
+        let wide = node.identity.sign_event(event)?;
+        node.store
+            .lock()
+            .await
+            .ingest_events(&network, std::slice::from_ref(&wide))?;
+        message.payload = json!({"type":"history_batch","hash":wide.hash,"limit":128,"max_bytes":HISTORY_BATCH_BYTES});
+        let response = node.handle_peer(&message).await?;
+        assert_eq!(response["events"].as_array().unwrap().len(), 1);
+        assert_eq!(response["events"][0]["hash"], wide.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn net1_history_batch_advances_with_only_64_replay_slots() -> Result<()> {
+        use axum::{
+            Router,
+            extract::{State, WebSocketUpgrade},
+            routing::get,
+        };
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        async fn upgrade(
+            State(hub): State<Arc<PeerHub>>,
+            ws: WebSocketUpgrade,
+        ) -> impl axum::response::IntoResponse {
+            ws.max_message_size(crate::peer::MAX_PACKET_BYTES)
+                .max_frame_size(crate::peer::MAX_PACKET_BYTES)
+                .on_upgrade(|socket| async move {
+                    let _ = hub.accept(socket).await;
+                })
+        }
+        let receiver_dir = fixture_under("network-reliability")?;
+        let source_dir = fixture_under("network-reliability")?;
+        let backup_dir = fixture_under("network-reliability")?;
+        let receiver = Arc::new(Runtime::open(&receiver_dir).await?);
+        let source = Arc::new(Runtime::open(&source_dir).await?);
+        let backup = Arc::new(Runtime::open(&backup_dir).await?);
+        let owner = test_owner(&receiver)?;
+        let state = owner.sign_network_fixture(
+            1,
+            vec![
+                receiver
+                    .identity
+                    .certificate(receiver.config.roles.clone())?,
+                source.identity.certificate(source.config.roles.clone())?,
+                backup.identity.certificate(backup.config.roles.clone())?,
+            ],
+        )?;
+        let network = state.genesis.network_id.clone();
+        receiver.install_membership(state.clone()).await?;
+        source.install_membership(state.clone()).await?;
+        backup.install_membership(state).await?;
+        let mut envelopes = Vec::<SignedEvent>::new();
+        for index in 0..1025 {
+            let previous = envelopes.last().map(|event| event.hash.clone());
+            envelopes.push(source.identity.sign_event(Event {
+                version: 1,
+                network_id: network.clone(),
+                scope_id: "chat".into(),
+                author: source.identity.node_id()?,
+                sequence: index + 1,
+                previous,
+                parents: vec![],
+                created_at_ms: index as i64,
+                body: if index == 0 {
+                    EventBody::ConversationCreated {
+                        title: "bounded history".into(),
+                    }
+                } else {
+                    EventBody::MessagePosted {
+                        message_id: format!("m{index}"),
+                        role: "user".into(),
+                        text: format!("message {index}"),
+                        scheduler_node: None,
+                    }
+                },
+                blobs: vec![],
+            })?);
+        }
+        let mut unrelated: Event = serde_json::from_str(&envelopes[0].canonical_body)?;
+        unrelated.scope_id = "unrelated".into();
+        let unrelated = source.identity.sign_event(unrelated)?;
+        for batch in envelopes.chunks(1024) {
+            source.store.lock().await.ingest_events(&network, batch)?;
+            backup.store.lock().await.ingest_events(&network, batch)?;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("ws://{}/peer", listener.local_addr()?);
+        let mut tasks = tokio::task::JoinSet::new();
+        let router = Router::new()
+            .route("/peer", get(upgrade))
+            .with_state(source.hub.clone());
+        tasks.spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let hub = receiver.hub.clone();
+        let scope = network.clone();
+        tasks.spawn(async move {
+            let _ = hub.connect(scope, url).await;
+        });
+        let malformed = Arc::new(AtomicUsize::new(1));
+        let legacy = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let batch_requests = Arc::new(AtomicUsize::new(0));
+        let single_requests = Arc::new(AtomicUsize::new(0));
+        let mut inbound = source
+            .peer_rx
+            .lock()
+            .await
+            .take()
+            .context("missing test receiver")?;
+        let serving = source.clone();
+        let extra = unrelated.clone();
+        let (bad, old, count, batches, singles) = (
+            malformed.clone(),
+            legacy.clone(),
+            requests.clone(),
+            batch_requests.clone(),
+            single_requests.clone(),
+        );
+        tasks.spawn(async move {
+            while let Some(message) = inbound.recv().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let mut value = serving
+                    .handle_peer(&message)
+                    .await
+                    .unwrap_or_else(|error| json!({"error":error.to_string()}));
+                if message.payload["type"] == "capabilities" && old.load(Ordering::SeqCst) {
+                    value.as_object_mut().unwrap().remove("history_batch");
+                }
+                if message.payload["type"] == "event" {
+                    singles.fetch_add(1, Ordering::SeqCst);
+                }
+                if message.payload["type"] == "history_batch" {
+                    batches.fetch_add(1, Ordering::SeqCst);
+                    if bad.load(Ordering::SeqCst) == 1 {
+                        let events = value["events"].as_array_mut().unwrap();
+                        events.pop();
+                        events.push(json!(extra));
+                    } else if bad.load(Ordering::SeqCst) == 2 {
+                        value = json!({"error":"x".repeat(8192)});
+                    } else if bad.load(Ordering::SeqCst) == 3 {
+                        value["events"] = json!(vec![json!({}); 1024]);
+                    } else if bad.load(Ordering::SeqCst) == 4 {
+                        let mut small = message.clone();
+                        small.payload["max_bytes"] = json!(120);
+                        value = serving.handle_peer(&small).await.unwrap();
+                    }
+                }
+                let _ = serving.hub.respond(&message, value).await;
+            }
+        });
+        let source_id = source.identity.node_id()?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !receiver.hub.online(&network).await.contains(&source_id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        receiver.hub.reserve_replay_entries(&network, 64).await?;
+        source.hub.reserve_replay_entries(&network, 64).await?;
+        let head = &envelopes.last().unwrap().hash;
+        let bad = receiver
+            .fetch_scope(&network, "chat", &source_id, std::slice::from_ref(head))
+            .await?;
+        assert_ne!(bad.state, SyncState::Complete);
+        assert_eq!(bad.processed, 128);
+        assert!(receiver.store.lock().await.event(&network, head)?.is_none());
+        assert!(
+            receiver
+                .store
+                .lock()
+                .await
+                .event(&network, &unrelated.hash)?
+                .is_none()
+        );
+        assert_eq!(single_requests.load(Ordering::SeqCst), 0);
+        malformed.store(2, Ordering::SeqCst);
+        let mut sources = receiver.history_sources(&network, &source_id).await?;
+        let mut budget = HistoryBudget {
+            events: 5,
+            bytes: 8192,
+        };
+        assert!(
+            receiver
+                .history_events(&network, &mut sources, head, &mut budget)
+                .await
+                .is_err()
+        );
+        assert_eq!(budget.bytes, 0);
+        assert_eq!(budget.events, 4);
+        malformed.store(0, Ordering::SeqCst);
+        let first = receiver
+            .fetch_closure_batch(&network, "chat", &source_id, std::slice::from_ref(head), 1)
+            .await?;
+        assert_eq!(first.processed, 1);
+        assert_eq!(first.state, SyncState::Partial);
+        assert_eq!(first.missing.events, vec![envelopes[1023].hash.clone()]);
+        let final_page = receiver
+            .fetch_scope(&network, "chat", &source_id, std::slice::from_ref(head))
+            .await?;
+        assert_eq!(final_page.state, SyncState::Complete);
+        assert_eq!(final_page.processed, 1024);
+        assert_eq!(
+            receiver
+                .store
+                .lock()
+                .await
+                .messages(&network, "chat")?
+                .len(),
+            1024
+        );
+        assert!(requests.load(Ordering::SeqCst) < 24);
+        assert_eq!(batch_requests.load(Ordering::SeqCst), 11);
+        assert_eq!(single_requests.load(Ordering::SeqCst), 0);
+        legacy.store(true, Ordering::SeqCst);
+        let before = batch_requests.load(Ordering::SeqCst);
+        let mut sources = receiver.history_sources(&network, &source_id).await?;
+        let mut budget = HistoryBudget {
+            events: 128,
+            bytes: 8 * MAX_EVENT_BYTES,
+        };
+        let old = receiver
+            .history_events(&network, &mut sources, head, &mut budget)
+            .await?;
+        assert_eq!(old, vec![envelopes.last().unwrap().clone()]);
+        assert_eq!(batch_requests.load(Ordering::SeqCst), before);
+        assert_eq!(single_requests.load(Ordering::SeqCst), 1);
+        assert!(requests.load(Ordering::SeqCst) < 24);
+
+        legacy.store(false, Ordering::SeqCst);
+        malformed.store(4, Ordering::SeqCst);
+        let mut sources = receiver.history_sources(&network, &source_id).await?;
+        let mut budget = HistoryBudget {
+            events: 128,
+            bytes: 8 * MAX_EVENT_BYTES,
+        };
+        let single = receiver
+            .history_events(&network, &mut sources, head, &mut budget)
+            .await?;
+        assert_eq!(single, vec![envelopes.last().unwrap().clone()]);
+        assert_eq!(single_requests.load(Ordering::SeqCst), 2);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("ws://{}/peer", listener.local_addr()?);
+        let router = Router::new()
+            .route("/peer", get(upgrade))
+            .with_state(backup.hub.clone());
+        tasks.spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let hub = receiver.hub.clone();
+        let scope = network.clone();
+        tasks.spawn(async move {
+            let _ = hub.connect(scope, url).await;
+        });
+        let mut inbound = backup
+            .peer_rx
+            .lock()
+            .await
+            .take()
+            .context("missing test backup receiver")?;
+        let serving = backup.clone();
+        tasks.spawn(async move {
+            while let Some(message) = inbound.recv().await {
+                let value = serving
+                    .handle_peer(&message)
+                    .await
+                    .unwrap_or_else(|error| json!({"error":error.to_string()}));
+                let _ = serving.hub.respond(&message, value).await;
+            }
+        });
+        let backup_id = backup.identity.node_id()?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !receiver.hub.online(&network).await.contains(&backup_id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        malformed.store(3, Ordering::SeqCst);
+        let mut sources = receiver.history_sources(&network, &source_id).await?;
+        let mut budget = HistoryBudget {
+            events: 1024,
+            bytes: 8 * MAX_EVENT_BYTES,
+        };
+        let recovered = receiver
+            .history_events(&network, &mut sources, head, &mut budget)
+            .await?;
+        assert_eq!(recovered.len(), 128);
+        assert_eq!(recovered[0].hash, *head);
+        assert_eq!(budget.events, 768);
+        tasks.abort_all();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn net1_continuation_survives_restart_and_frontier_rechecks_corruption() -> Result<()> {
+        let dir = fixture_under("network-reliability")?;
+        let node = Runtime::open(&dir).await?;
+        let network = conversation(&node).await?;
+        let root = node.store.lock().await.heads(&network, "chat")?[0].clone();
+        let content = b"verified network evidence";
+        let blob = BlobRef {
+            hash: crypto::digest(content),
+            size: content.len() as u64,
+        };
+        let parent = node.identity.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "chat".into(),
+            author: node.identity.node_id()?,
+            sequence: 2,
+            previous: Some(root.clone()),
+            parents: vec![root],
+            created_at_ms: 2,
+            body: EventBody::MessagePosted {
+                message_id: "parent".into(),
+                role: "user".into(),
+                text: "parent".into(),
+                scheduler_node: None,
+            },
+            blobs: vec![blob.clone()],
+        })?;
+        let child = node.identity.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "chat".into(),
+            author: node.identity.node_id()?,
+            sequence: 3,
+            previous: Some(parent.hash.clone()),
+            parents: vec![parent.hash.clone()],
+            created_at_ms: 3,
+            body: EventBody::MessagePosted {
+                message_id: "child".into(),
+                role: "user".into(),
+                text: "child".into(),
+                scheduler_node: None,
+            },
+            blobs: vec![],
+        })?;
+        node.store.lock().await.ingest_event(&network, &child)?;
+        let local = node.identity.node_id()?;
+        let first = node
+            .fetch_scope(&network, "chat", &local, std::slice::from_ref(&child.hash))
+            .await?;
+        assert_eq!(first.state, SyncState::Unreachable);
+        assert_eq!(first.missing.events, vec![parent.hash.clone()]);
+        assert!(
+            node.store
+                .lock()
+                .await
+                .messages(&network, "chat")?
+                .is_empty()
+        );
+        node._process_lock.unlock()?;
+        drop(node);
+        let node = Runtime::open(&dir).await?;
+        let resumed = node
+            .fetch_closure_batch(
+                &network,
+                "chat",
+                &local,
+                std::slice::from_ref(&child.hash),
+                0,
+            )
+            .await?;
+        assert_eq!(resumed.missing.events, vec![parent.hash.clone()]);
+        node.install_membership(test_owner(&node)?.sign_network_fixture(
+            2,
+            vec![node.identity.certificate(node.config.roles.clone())?],
+        )?)
+        .await?;
+        let after_membership = node
+            .fetch_closure_batch(
+                &network,
+                "chat",
+                &local,
+                std::slice::from_ref(&child.hash),
+                0,
+            )
+            .await?;
+        assert_eq!(after_membership.missing.events, vec![parent.hash.clone()]);
+        node.store.lock().await.ingest_event(&network, &parent)?;
+        node.store.lock().await.put_blob(&network, &blob, content)?;
+        let complete = node
+            .fetch_scope(&network, "chat", &local, std::slice::from_ref(&child.hash))
+            .await?;
+        assert_eq!(complete.state, SyncState::Complete);
+        assert_eq!(node.store.lock().await.messages(&network, "chat")?.len(), 2);
+        let generation = node.store.lock().await.projection_generation(&network)?;
+        let noop = node
+            .fetch_scope(&network, "chat", &local, std::slice::from_ref(&child.hash))
+            .await?;
+        assert_eq!(noop.state, SyncState::Complete);
+        assert!(!noop.changed);
+        assert_eq!(
+            node.store.lock().await.projection_generation(&network)?,
+            generation
+        );
+        node.append(
+            &network,
+            "unrelated",
+            EventBody::ConversationCreated {
+                title: "another scope".into(),
+            },
+        )
+        .await?;
+        let unrelated = node
+            .fetch_scope(&network, "chat", &local, std::slice::from_ref(&child.hash))
+            .await?;
+        assert_eq!(unrelated.state, SyncState::Complete);
+        assert!(!unrelated.changed);
+        let external = rusqlite::Connection::open(dir.join("node.sqlite3"))?;
+        external.execute(
+            "UPDATE blobs SET content=? WHERE network_id=? AND hash=?",
+            rusqlite::params![vec![b'x'; content.len()], network, blob.hash],
+        )?;
+        let corrupt = node
+            .fetch_scope(&network, "chat", &local, std::slice::from_ref(&child.hash))
+            .await?;
+        assert_ne!(corrupt.state, SyncState::Complete);
+        assert_eq!(corrupt.missing.blobs, vec![blob.clone()]);
+        assert!(corrupt.changed);
+        node.store.lock().await.put_blob(&network, &blob, content)?;
+        assert_eq!(
+            node.fetch_scope(&network, "chat", &local, std::slice::from_ref(&child.hash))
+                .await?
+                .state,
+            SyncState::Complete
+        );
+        let mut fork: Event = serde_json::from_str(&parent.canonical_body)?;
+        fork.body = EventBody::MessagePosted {
+            message_id: "fork".into(),
+            role: "user".into(),
+            text: "fork".into(),
+            scheduler_node: None,
+        };
+        node.store
+            .lock()
+            .await
+            .ingest_event(&network, &node.identity.sign_event(fork)?)?;
+        let conflicted = node
+            .fetch_scope(&network, "chat", &local, std::slice::from_ref(&child.hash))
+            .await?;
+        assert_eq!(conflicted.state, SyncState::Partial);
+        assert!(conflicted.missing.conflicts.contains(&parent.hash));
+        assert!(
+            node.store
+                .lock()
+                .await
+                .messages(&network, "chat")?
+                .is_empty()
+        );
+        assert!(node.store.lock().await.operations(&network)?.is_empty());
+        drop(external);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn net1_changing_heads_keep_one_scope_checkpoint_and_ignore_unverified_heads()
+    -> Result<()> {
+        let dir = fixture_under("network-reliability")?;
+        let node = Runtime::open(&dir).await?;
+        let network = conversation(&node).await?;
+        let local = node.identity.node_id()?;
+        let content = b"one missing blob across advancing heads";
+        let blob = BlobRef {
+            hash: crypto::digest(content),
+            size: content.len() as u64,
+        };
+        let mut head = node.store.lock().await.heads(&network, "chat")?[0].clone();
+        for sequence in 2..=130 {
+            let event = node.identity.sign_event(Event {
+                version: 1,
+                network_id: network.clone(),
+                scope_id: "chat".into(),
+                author: local.clone(),
+                sequence,
+                previous: Some(head.clone()),
+                parents: vec![head],
+                created_at_ms: sequence as i64,
+                body: EventBody::MessagePosted {
+                    message_id: format!("message-{sequence}"),
+                    role: "user".into(),
+                    text: "waiting for one blob".into(),
+                    scheduler_node: None,
+                },
+                blobs: vec![blob.clone()],
+            })?;
+            head = event.hash.clone();
+            node.store.lock().await.ingest_event(&network, &event)?;
+            let result = node
+                .fetch_scope(&network, "chat", &local, std::slice::from_ref(&head))
+                .await?;
+            assert_eq!(result.missing.blobs, vec![blob.clone()]);
+        }
+        let other = LocalIdentity::generate();
+        node.install_membership(test_owner(&node)?.sign_network_fixture(
+            2,
+            vec![
+                node.identity.certificate(node.config.roles.clone())?,
+                other.certificate(node.config.roles.clone())?,
+            ],
+        )?)
+        .await?;
+        let branch = other.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "chat".into(),
+            author: other.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 1,
+            body: EventBody::ConversationCreated {
+                title: "local branch".into(),
+            },
+            blobs: vec![],
+        })?;
+        node.store.lock().await.ingest_event(&network, &branch)?;
+        node.fetch_scope(&network, "chat", &local, std::slice::from_ref(&head))
+            .await?;
+        let key = format!("net1:v1:closure:{}", crypto::digest(b"chat"));
+        let cursor = crypto::digest(b"retained actual-attempt cursor");
+        let mut checkpoint = node
+            .store
+            .lock()
+            .await
+            .local_value(&network, &key)?
+            .unwrap();
+        checkpoint["event_cursor"] = json!(cursor);
+        node.store
+            .lock()
+            .await
+            .local_set(&network, &key, &checkpoint)?;
+        node.fetch_closure_batch(&network, "chat", &local, std::slice::from_ref(&head), 0)
+            .await?;
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .local_value(&network, &key)?
+                .unwrap()["event_cursor"],
+            json!(cursor)
+        );
+        let ancestor = node
+            .store
+            .lock()
+            .await
+            .event(&network, &head)?
+            .map(|envelope| serde_json::from_str::<Event>(&envelope.canonical_body))
+            .transpose()?
+            .unwrap()
+            .previous
+            .unwrap();
+        node.fetch_closure_batch(&network, "chat", &local, &[ancestor], 0)
+            .await?;
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .local_value(&network, &key)?
+                .unwrap()["event_cursor"],
+            json!(cursor)
+        );
+        for index in 0..129 {
+            let unknown = crypto::digest(format!("unverified-{index}").as_bytes());
+            assert_eq!(
+                node.fetch_scope(&network, "unverified", &local, &[unknown])
+                    .await?
+                    .state,
+                SyncState::Unreachable
+            );
+        }
+        let connection = rusqlite::Connection::open(dir.join("node.sqlite3"))?;
+        let count: usize = connection.query_row(
+            "SELECT count(*) FROM local_values WHERE key LIKE 'net1:v1:closure:%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
+        node.store.lock().await.put_blob(&network, &blob, content)?;
+        assert_eq!(
+            node.fetch_scope(&network, "chat", &local, std::slice::from_ref(&head))
+                .await?
+                .state,
+            SyncState::Complete
+        );
+        assert_eq!(
+            node.store.lock().await.messages(&network, "chat")?.len(),
+            129
+        );
+        assert!(
+            !node
+                .fetch_closure(&network, "chat", &local, std::slice::from_ref(&head))
+                .await?
+                .changed
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM local_values WHERE key LIKE 'net1:v1:closure:%'",
+                [],
+                |row| row.get::<_, usize>(0)
+            )?,
+            1
+        );
+        drop(connection);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn net1_checkpoints_require_matching_signed_scopes_and_allow_129_scopes() -> Result<()> {
+        let dir = fixture_under("network-reliability")?;
+        let node = Runtime::open(&dir).await?;
+        let network = conversation(&node).await?;
+        let local = node.identity.node_id()?;
+        let content = b"one object for many real scopes";
+        let blob = BlobRef {
+            hash: crypto::digest(content),
+            size: content.len() as u64,
+        };
+        let envelopes = (0..129)
+            .map(|index| {
+                node.identity.sign_event(Event {
+                    version: 1,
+                    network_id: network.clone(),
+                    scope_id: format!("scope-{index:03}"),
+                    author: local.clone(),
+                    sequence: 1,
+                    previous: None,
+                    parents: vec![],
+                    created_at_ms: 1,
+                    body: EventBody::ConversationCreated {
+                        title: "a real scope".into(),
+                    },
+                    blobs: vec![blob.clone()],
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        {
+            let mut store = node.store.lock().await;
+            store.ingest_events(&network, &envelopes)?;
+            for (index, envelope) in envelopes.iter().enumerate() {
+                let scope = format!("scope-{index:03}");
+                let progress = SyncProgress::new(
+                    &scope,
+                    vec![envelope.hash.clone()],
+                    &MissingDependencies {
+                        events: vec![],
+                        blobs: vec![blob.clone()],
+                        conflicts: vec![],
+                    },
+                );
+                save_sync_progress(
+                    &mut store,
+                    &network,
+                    &format!("net1:v1:closure:{}", crypto::digest(scope.as_bytes())),
+                    &progress,
+                    true,
+                )?;
+                let forged = SyncProgress::new(
+                    &format!("forged-{index}"),
+                    vec![envelope.hash.clone()],
+                    &MissingDependencies::default(),
+                );
+                let error = save_sync_progress(
+                    &mut store,
+                    &network,
+                    &format!(
+                        "net1:v1:closure:{}",
+                        crypto::digest(forged.scope.as_bytes())
+                    ),
+                    &forged,
+                    true,
+                )
+                .unwrap_err();
+                assert_eq!(error.to_string(), "history head scope mismatch");
+            }
+        }
+        let connection = rusqlite::Connection::open(dir.join("node.sqlite3"))?;
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM local_values WHERE key LIKE 'net1:v1:closure:%'",
+                [],
+                |row| row.get::<_, usize>(0)
+            )?,
+            129
+        );
+        let heads = vec![envelopes[128].hash.clone(); 1025];
+        assert_eq!(
+            node.fetch_scope(&network, "scope-128", &local, &heads)
+                .await?
+                .missing
+                .blobs,
+            vec![blob.clone()]
+        );
+        node.store.lock().await.put_blob(&network, &blob, content)?;
+        assert_eq!(
+            node.fetch_scope(&network, "scope-128", &local, &heads)
+                .await?
+                .state,
+            SyncState::Complete
+        );
+        assert_eq!(node.store.lock().await.conversations(&network)?.len(), 130);
+        drop(connection);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn net1_closure_switches_authorized_replicas_and_isolates_bad_scopes() -> Result<()> {
+        use axum::{
+            Router,
+            extract::{State, WebSocketUpgrade},
+            routing::get,
+        };
+        async fn upgrade(
+            State(hub): State<Arc<PeerHub>>,
+            ws: WebSocketUpgrade,
+        ) -> impl axum::response::IntoResponse {
+            ws.max_message_size(crate::peer::MAX_PACKET_BYTES)
+                .max_frame_size(crate::peer::MAX_PACKET_BYTES)
+                .on_upgrade(|socket| async move {
+                    let _ = hub.accept(socket).await;
+                })
+        }
+        let mut dirs = Vec::new();
+        let mut nodes = Vec::new();
+        for index in 0..4 {
+            let dir = fixture_under("network-reliability")?;
+            if index == 0 {
+                configure_manager(&dir)?;
+            }
+            nodes.push(Arc::new(Runtime::open(&dir).await?));
+            dirs.push(dir);
+        }
+        let owner = test_owner(&nodes[0])?;
+        let state = owner.sign_network_fixture(
+            1,
+            nodes
+                .iter()
+                .map(|node| node.identity.certificate(node.config.roles.clone()))
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        let network = state.genesis.network_id.clone();
+        for node in &nodes {
+            node.install_membership(state.clone()).await?;
+        }
+        let author = &nodes[1].identity;
+        let root = author.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "chat".into(),
+            author: author.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 1,
+            body: EventBody::ConversationCreated {
+                title: "distributed".into(),
+            },
+            blobs: vec![],
+        })?;
+        let bytes = b"from a third authorized replica";
+        let blob = BlobRef {
+            hash: crypto::digest(bytes),
+            size: bytes.len() as u64,
+        };
+        let head = author.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "chat".into(),
+            author: author.node_id()?,
+            sequence: 2,
+            previous: Some(root.hash.clone()),
+            parents: vec![root.hash.clone()],
+            created_at_ms: 2,
+            body: EventBody::MessagePosted {
+                message_id: "distributed".into(),
+                role: "user".into(),
+                text: "complete once".into(),
+                scheduler_node: None,
+            },
+            blobs: vec![blob.clone()],
+        })?;
+        nodes[1].store.lock().await.ingest_event(&network, &head)?;
+        nodes[2].store.lock().await.ingest_event(&network, &root)?;
+        nodes[3]
+            .store
+            .lock()
+            .await
+            .put_blob(&network, &blob, bytes)?;
+        let membership_during_fetch = Arc::new(Mutex::new(None::<NetworkState>));
+        let mut tasks = tokio::task::JoinSet::new();
+        for (index, source) in nodes.iter().enumerate().skip(1).rev() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("ws://{}/peer", listener.local_addr()?);
+            let router = Router::new()
+                .route("/peer", get(upgrade))
+                .with_state(source.hub.clone());
+            tasks.spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+            let hub = nodes[0].hub.clone();
+            let scope = network.clone();
+            tasks.spawn(async move {
+                let _ = hub.connect(scope, url).await;
+            });
+            let source = source.clone();
+            let mut inbound = source
+                .peer_rx
+                .lock()
+                .await
+                .take()
+                .context("missing test receiver")?;
+            let wrong = head.clone();
+            let root_hash = root.hash.clone();
+            let scope = network.clone();
+            let membership_during_fetch = membership_during_fetch.clone();
+            let receiver = nodes[0].clone();
+            tasks.spawn(async move {
+                while let Some(message) = inbound.recv().await {
+                    if message.payload["type"] == "event" {
+                        let update = membership_during_fetch.lock().await.take();
+                        if let Some(update) = update { receiver.install_membership(update).await.unwrap(); }
+                    }
+                    let value = if message.payload["type"] == "capabilities" {
+                        let mut capabilities = source.capabilities();
+                        capabilities.as_object_mut().unwrap().remove("history_batch");
+                        capabilities
+                    } else if index == 1 && message.payload["type"] == "event" && message.payload["hash"] == root_hash {
+                        json!({"event":wrong})
+                    } else if index == 1 && message.payload["type"] == "inventory" {
+                        json!({"membership":source.store.lock().await.trust_bundle(&scope).unwrap(),"scopes":[
+                            {"scope_id":"broken","heads":[crypto::digest(b"unavailable event")]},
+                            {"heads":[]}, {"scope_id":"chat","heads":[wrong.hash]}]})
+                    } else {
+                        source.handle_peer(&message).await.unwrap_or_else(|error| json!({"error":error.to_string()}))
+                    };
+                    let _ = source.hub.respond(&message, value).await;
+                }
+            });
+            if index == 3 {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !nodes[0]
+                        .hub
+                        .online(&network)
+                        .await
+                        .contains(&nodes[3].identity.node_id().unwrap())
+                    {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await?;
+                let empty = nodes[0].sync_all(&network).await?;
+                assert_eq!(empty.state, SyncState::Complete);
+                assert!(empty.scopes.is_empty());
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while nodes[0].hub.online(&network).await.len() < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        let preferred = nodes[1].identity.node_id()?;
+        let partial = nodes[0]
+            .fetch_closure_batch(
+                &network,
+                "chat",
+                &preferred,
+                std::slice::from_ref(&head.hash),
+                1,
+            )
+            .await?;
+        assert_eq!(partial.state, SyncState::Partial);
+        assert_eq!(partial.missing.events, vec![root.hash.clone()]);
+        assert!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .messages(&network, "chat")?
+                .is_empty()
+        );
+        assert!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .event(&network, &head.hash)?
+                .is_some()
+        );
+        let reports = nodes[0].sync_from(&network, &preferred).await?;
+        assert_eq!(reports.len(), 3);
+        assert_eq!(reports[0].state, SyncState::Unreachable);
+        assert_eq!(reports[1].state, SyncState::Partial);
+        assert_eq!(reports[2].state, SyncState::Complete);
+        assert_eq!(
+            nodes[0].store.lock().await.get_blob(&network, &blob.hash)?,
+            Some(bytes.to_vec())
+        );
+        assert_eq!(
+            nodes[0].store.lock().await.messages(&network, "chat")?[0].text,
+            "complete once"
+        );
+        let noop = nodes[0]
+            .fetch_scope(
+                &network,
+                "chat",
+                &preferred,
+                std::slice::from_ref(&head.hash),
+            )
+            .await?;
+        assert_eq!(noop.state, SyncState::Complete);
+        assert!(!noop.changed);
+        assert!(nodes[0].store.lock().await.operations(&network)?.is_empty());
+        let fifth_bytes = b"fifth blob makes progress after four unavailable objects";
+        let fifth = BlobRef {
+            hash: crypto::digest(fifth_bytes),
+            size: fifth_bytes.len() as u64,
+        };
+        let mut refs = (1..=4)
+            .map(|index| BlobRef {
+                hash: format!("{:064x}", index),
+                size: 1,
+            })
+            .collect::<Vec<_>>();
+        refs.push(fifth.clone());
+        refs.sort();
+        assert_eq!(refs[4], fifth);
+        nodes[3]
+            .store
+            .lock()
+            .await
+            .put_blob(&network, &fifth, fifth_bytes)?;
+        let starvation = author.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "starvation".into(),
+            author: author.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 1,
+            body: EventBody::ConversationCreated {
+                title: "rotation".into(),
+            },
+            blobs: refs,
+        })?;
+        nodes[1]
+            .store
+            .lock()
+            .await
+            .ingest_event(&network, &starvation)?;
+        let first_page = nodes[0]
+            .fetch_scope(
+                &network,
+                "starvation",
+                &preferred,
+                std::slice::from_ref(&starvation.hash),
+            )
+            .await?;
+        assert_eq!(first_page.state, SyncState::Partial);
+        assert_eq!(first_page.missing.blobs.len(), 5);
+        assert!(!nodes[0].store.lock().await.has_blob(&network, &fifth)?);
+        let next_page = nodes[0]
+            .fetch_scope(
+                &network,
+                "starvation",
+                &preferred,
+                std::slice::from_ref(&starvation.hash),
+            )
+            .await?;
+        assert_eq!(next_page.state, SyncState::Partial);
+        assert_eq!(next_page.missing.blobs.len(), 4);
+        assert_eq!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .get_blob(&network, &fifth.hash)?,
+            Some(fifth_bytes.to_vec())
+        );
+        let wrong_scope = author.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "proper-root".into(),
+            author: author.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 1,
+            body: EventBody::ConversationCreated {
+                title: "proper scope".into(),
+            },
+            blobs: vec![],
+        })?;
+        nodes[1]
+            .store
+            .lock()
+            .await
+            .ingest_event(&network, &wrong_scope)?;
+        assert_eq!(
+            nodes[0]
+                .fetch_scope(
+                    &network,
+                    "forged-root",
+                    &preferred,
+                    std::slice::from_ref(&wrong_scope.hash)
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+            "history head scope mismatch"
+        );
+        assert!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .event(&network, &wrong_scope.hash)?
+                .is_none()
+        );
+        assert!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .local_value(
+                    &network,
+                    &format!("net1:v1:closure:{}", crypto::digest(b"forged-root"))
+                )?
+                .is_none()
+        );
+        let request = OperationRequest {
+            operation_id: "revoked-sessionless-command".into(),
+            network_id: network.clone(),
+            conversation_id: "chat".into(),
+            task_id: None,
+            target_node: nodes[0].identity.node_id()?,
+            session_id: None,
+            expected_revision: 0,
+            basis_heads: vec![head.hash.clone()],
+            action: json!({"type":"command","command":"printf forbidden > revoked-effect","cwd":dirs[0],"timeout_secs":1}),
+            resources: vec![],
+            binding: None,
+            manager_authority: None,
+        };
+        let dispatch = author.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "chat".into(),
+            author: author.node_id()?,
+            sequence: 3,
+            previous: Some(head.hash.clone()),
+            parents: vec![head.hash.clone()],
+            created_at_ms: 3,
+            body: EventBody::DispatchRecorded {
+                operation_id: request.operation_id.clone(),
+                task_id: None,
+                target_node: request.target_node.clone(),
+                session_id: None,
+                action: json!(request),
+            },
+            blobs: vec![],
+        })?;
+        nodes[3]
+            .store
+            .lock()
+            .await
+            .ingest_event(&network, &dispatch)?;
+        let revoked_state = |epoch: u64, second: bool| -> Result<NetworkState> {
+            owner.sign_network_fixture(
+                epoch,
+                nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, node)| {
+                        let mut certificate =
+                            node.identity.certificate(node.config.roles.clone())?;
+                        certificate.revoked = index == 1 || (second && index == 2);
+                        Ok(certificate)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        };
+        *membership_during_fetch.lock().await = Some(revoked_state(2, false)?);
+        let execute = Inbound {
+            network_id: network.clone(),
+            origin: preferred.clone(),
+            request_id: "revoked-dispatch".into(),
+            broadcast: false,
+            payload: json!({"type":"execute","human":true,"request":request,"dispatch_head":dispatch.hash}),
+        };
+        let error = nodes[0].handle_peer(&execute).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "identity is not authorized in this personal network"
+        );
+        assert!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .context(&network, "chat", std::slice::from_ref(&dispatch.hash))?
+                .missing
+                .is_complete()
+        );
+        assert_eq!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .operation(&network, &request.operation_id)?,
+            None
+        );
+        assert!(!dirs[0].join("revoked-effect").exists());
+        let schedule_author = &nodes[3].identity;
+        let (trigger, schedule_basis) = {
+            let mut store = nodes[3].store.lock().await;
+            store.append_event(
+                schedule_author,
+                &network,
+                "schedule-revocation",
+                EventBody::ConversationCreated {
+                    title: "schedule revocation".into(),
+                },
+                vec![],
+                1,
+            )?;
+            let (trigger, _) = store.accept_message(
+                schedule_author,
+                &network,
+                "schedule-revocation",
+                EventBody::MessagePosted {
+                    message_id: "revoked-schedule".into(),
+                    role: "user".into(),
+                    text: "do not run".into(),
+                    scheduler_node: Some(nodes[0].identity.node_id()?),
+                },
+                vec![],
+                2,
+                &schedule_author.node_id()?,
+                &nodes[0].identity.node_id()?,
+                false,
+            )?;
+            (trigger, store.heads(&network, "schedule-revocation")?)
+        };
+        *membership_during_fetch.lock().await = Some(revoked_state(3, true)?);
+        let schedule = Inbound {
+            network_id: network.clone(),
+            origin: nodes[2].identity.node_id()?,
+            request_id: "revoked-schedule".into(),
+            broadcast: false,
+            payload: json!({"type":"schedule","version":1,"target_node":nodes[0].identity.node_id()?,"conversation_id":"schedule-revocation","trigger":trigger.hash,"basis_heads":schedule_basis}),
+        };
+        let error = nodes[0].handle_peer(&schedule).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "identity is not authorized in this personal network"
+        );
+        assert!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .context(
+                    &network,
+                    "schedule-revocation",
+                    std::slice::from_ref(&trigger.hash)
+                )?
+                .missing
+                .is_complete()
+        );
+        assert_eq!(
+            nodes[0].store.lock().await.scheduler_job(
+                &network,
+                "schedule-revocation",
+                &trigger.hash,
+                &nodes[0].identity.node_id()?
+            )?,
+            None
+        );
+        let (snapshot, membership) = {
+            let store = nodes[0].store.lock().await;
+            store.authorize_node(
+                &network,
+                &schedule_author.node_id()?,
+                Some(NodeRole::Gateway),
+            )?;
+            assert!(
+                store
+                    .report_intent_head(&network, "schedule-revocation", &trigger.hash)?
+                    .is_some()
+            );
+            (
+                store.export_snapshot(&network, "schedule-revocation")?,
+                store.trust_bundle(&network)?.unwrap(),
+            )
+        };
+        let mut admission_control = Store::open(":memory:")?;
+        admission_control.install_trust_bundle(&network, &membership)?;
+        assert!(
+            admission_control
+                .import_snapshot(&network, &snapshot)?
+                .is_complete()
+        );
+        admission_control.enqueue_trigger(
+            &network,
+            "schedule-revocation",
+            &trigger.hash,
+            &nodes[0].identity.node_id()?,
+        )?;
+        assert_eq!(
+            admission_control
+                .scheduler_job(
+                    &network,
+                    "schedule-revocation",
+                    &trigger.hash,
+                    &nodes[0].identity.node_id()?
+                )?
+                .unwrap()
+                .state
+                .name(),
+            "queued"
+        );
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        drop(nodes);
+        for dir in dirs {
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
     async fn queued(
         node: &Runtime,
         network: &str,
@@ -850,8 +2562,16 @@ mod tests {
         }
         for (origin, human, expected) in [
             (&scheduler, true, "origin cannot assert human authority"),
-            (&scheduler, false, "no peer route available"),
-            (&owner, true, "no peer route available"),
+            (
+                &scheduler,
+                false,
+                "history is Unreachable: 1 events, 0 blobs, 0 conflicts",
+            ),
+            (
+                &owner,
+                true,
+                "history is Unreachable: 1 events, 0 blobs, 0 conflicts",
+            ),
         ] {
             let message = Inbound {
                 network_id: network.clone(),
@@ -909,7 +2629,7 @@ mod tests {
             };
             assert_eq!(
                 node.handle_peer(&message).await.unwrap_err().to_string(),
-                "no peer route available"
+                "history is Unreachable: 1 events, 0 blobs, 0 conflicts"
             );
         }
         let message = Inbound {
@@ -1618,6 +3338,156 @@ pub struct Update {
     pub network_id: String,
     pub payload: Value,
 }
+const HISTORY_BATCH_EVENTS: usize = 128;
+const HISTORY_BATCH_BYTES: usize = crate::peer::MAX_PACKET_BYTES - 1024;
+
+struct HistorySource {
+    node_id: String,
+    batch: Option<bool>,
+}
+
+struct HistoryBudget {
+    events: usize,
+    bytes: usize,
+}
+impl HistoryBudget {
+    fn response(&mut self, value: &Value) -> Result<()> {
+        let bytes = serde_json::to_vec(value)?.len();
+        let fits = bytes <= self.bytes;
+        self.bytes = self.bytes.saturating_sub(bytes);
+        ensure!(fits, "history response byte budget exceeded");
+        Ok(())
+    }
+}
+
+fn history_batch_capability() -> Value {
+    json!({"version":1,"max_events":HISTORY_BATCH_EVENTS,"max_bytes":HISTORY_BATCH_BYTES})
+}
+
+fn verify_history_batch(
+    store: &Store,
+    network: &str,
+    hash: &str,
+    value: &Value,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<Vec<SignedEvent>> {
+    ensure!(
+        value["version"] == 1 && value["hash"] == hash,
+        "history batch root/version mismatch"
+    );
+    ensure!(
+        serde_json::to_vec(value)?.len() <= max_bytes,
+        "history batch byte limit exceeded"
+    );
+    let values = value["events"]
+        .as_array()
+        .context("invalid history batch")?;
+    ensure!(
+        !values.is_empty() && values.len() <= limit,
+        "history batch count limit exceeded"
+    );
+    let mut events = HashMap::new();
+    for value in values {
+        let envelope: SignedEvent = serde_json::from_value(value.clone())?;
+        let event = store.verify_event(network, &envelope)?;
+        ensure!(
+            events
+                .insert(envelope.hash.clone(), (envelope, event))
+                .is_none(),
+            "duplicate event in history batch"
+        );
+    }
+    ensure!(events.contains_key(hash), "history batch root missing");
+    let mut pending = VecDeque::from([hash.to_owned()]);
+    let mut visited = BTreeSet::new();
+    let mut envelopes = Vec::new();
+    while let Some(hash) = pending.pop_front() {
+        if !visited.insert(hash.clone()) {
+            continue;
+        }
+        if let Some((envelope, event)) = events.remove(&hash) {
+            pending.extend(event.parents.into_iter().chain(event.previous));
+            envelopes.push(envelope);
+        }
+    }
+    ensure!(events.is_empty(), "unrelated event in history batch");
+    Ok(envelopes)
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct SyncProgress {
+    version: u32,
+    scope: String,
+    heads: Vec<String>,
+    events: Vec<String>,
+    blobs: Vec<BlobRef>,
+    event_cursor: Option<String>,
+    blob_cursor: Option<BlobRef>,
+    frontier_generation: Option<u64>,
+}
+impl SyncProgress {
+    fn new(scope: &str, heads: Vec<String>, missing: &MissingDependencies) -> Self {
+        let mut progress = Self {
+            version: 1,
+            scope: scope.into(),
+            heads,
+            events: Vec::new(),
+            blobs: Vec::new(),
+            event_cursor: None,
+            blob_cursor: None,
+            frontier_generation: None,
+        };
+        progress.advance(missing);
+        progress
+    }
+    fn advance(&mut self, missing: &MissingDependencies) {
+        self.events = rotated_page(&missing.events, self.event_cursor.as_ref(), 1024);
+        self.blobs = rotated_page(&missing.blobs, self.blob_cursor.as_ref(), 128);
+        if !missing.is_complete() {
+            self.frontier_generation = None;
+        }
+    }
+}
+fn rotated_page<T: Ord + Clone>(items: &[T], cursor: Option<&T>, limit: usize) -> Vec<T> {
+    let start = cursor.map_or(0, |cursor| items.partition_point(|item| item <= cursor));
+    items[start..]
+        .iter()
+        .chain(items[..start].iter())
+        .take(limit)
+        .cloned()
+        .collect()
+}
+fn save_sync_progress(
+    store: &mut Store,
+    network: &str,
+    key: &str,
+    progress: &SyncProgress,
+    persist: bool,
+) -> Result<()> {
+    if !persist {
+        return Ok(());
+    }
+    let mut verified_head = false;
+    for hash in &progress.heads {
+        if let Some(envelope) = store.event(network, hash)? {
+            ensure!(
+                store.verify_event(network, &envelope)?.scope_id == progress.scope,
+                "history head scope mismatch"
+            );
+            verified_head = true;
+        }
+    }
+    if !verified_head && store.local_value(network, key)?.is_none() {
+        return Ok(());
+    }
+    let value = serde_json::to_value(progress)?;
+    if store.local_value(network, key)?.as_ref() != Some(&value) {
+        store.local_set(network, key, &value)?;
+    }
+    Ok(())
+}
+
 pub struct Runtime {
     pub config: Config,
     pub identity: LocalIdentity,
@@ -2162,15 +4032,17 @@ impl Runtime {
         if let Some(allowed) = &access.conversation_id {
             ensure!(allowed == scope, "outside this tool's conversation");
         }
+        let waiting = Instant::now();
         let store = self.store.lock().await;
+        let waited = waiting.elapsed();
+        let held = Instant::now();
         store.authorize_node(&access.network_id, &self.identity.node_id()?, None)?;
         ensure!(
-            store
-                .conversations(&access.network_id)?
-                .iter()
-                .any(|c| c.conversation_id == scope),
+            store.has_conversation(&access.network_id, scope)?,
             "conversation not found"
         );
+        tracing::trace!(network=%access.network_id, scope, stage="scope_access", wait_ms=waited.as_millis() as u64,
+            hold_ms=held.elapsed().as_millis() as u64, "history store phase finished");
         Ok(())
     }
     async fn require_role(&self, network: &str, role: NodeRole) -> Result<()> {
@@ -2196,18 +4068,61 @@ impl Runtime {
         }
         Ok(reply)
     }
-    pub async fn sync_all(&self, network: &str) -> Result<()> {
+    pub async fn sync_all(&self, network: &str) -> Result<SyncReport> {
         let _work = self.maintenance.enter()?;
-        let peers = self.hub.online(network).await;
+        self.require_role(network, NodeRole::Replica).await?;
         let local = self.identity.node_id()?;
-        futures_util::stream::iter(peers.into_iter().filter(|p| p != &local))
-            .for_each_concurrent(4, |target| async move {
-                if let Err(error) = self.sync_from(network, &target).await {
-                    tracing::debug!(error=%error,"history sync pending");
-                }
+        let mut peers = self
+            .hub
+            .online(network)
+            .await
+            .into_iter()
+            .filter(|peer| peer != &local)
+            .collect::<Vec<_>>();
+        {
+            let store = self.store.lock().await;
+            peers.retain(|peer| {
+                store
+                    .authorize_node(network, peer, Some(NodeRole::Replica))
+                    .is_ok()
+            });
+        }
+        let source_count = peers.len();
+        let reports = futures_util::stream::iter(peers)
+            .map(|target| async move {
+                let result = self.sync_from(network, &target).await;
+                (target, result)
             })
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
             .await;
-        Ok(())
+        let mut scopes = Vec::new();
+        let mut unreachable_sources = Vec::new();
+        for (target, result) in reports {
+            match result {
+                Ok(report) => scopes.extend(report),
+                Err(error) => {
+                    tracing::debug!(network, target, error=%error, "history inventory unreachable");
+                    unreachable_sources.push(target);
+                }
+            }
+        }
+        let state = if source_count == 0 || unreachable_sources.len() == source_count {
+            SyncState::Unreachable
+        } else if !unreachable_sources.is_empty()
+            || scopes
+                .iter()
+                .any(|scope| scope.state != SyncState::Complete)
+        {
+            SyncState::Partial
+        } else {
+            SyncState::Complete
+        };
+        Ok(SyncReport {
+            state,
+            scopes,
+            unreachable_sources,
+        })
     }
     async fn read_peer(&self, network: &str, target: &str, payload: Value) -> Result<Value> {
         tokio::time::timeout(
@@ -2217,8 +4132,164 @@ impl Runtime {
         .await
         .context("history peer is currently unreachable")?
     }
-    async fn sync_from(&self, network: &str, target: &str) -> Result<()> {
-        self.require_role(network, NodeRole::Replica).await?;
+    async fn history_response(
+        &self,
+        network: &str,
+        target: &str,
+        payload: Value,
+        budget: &mut HistoryBudget,
+    ) -> Result<Value> {
+        self.store
+            .lock()
+            .await
+            .authorize_node(network, target, Some(NodeRole::Replica))?;
+        let value = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.hub.request(network, target, payload),
+        )
+        .await
+        .context("history peer is currently unreachable")??;
+        budget.response(&value)?;
+        self.store
+            .lock()
+            .await
+            .authorize_node(network, target, Some(NodeRole::Replica))?;
+        if let Some(error) = value["error"].as_str() {
+            bail!("{error}");
+        }
+        Ok(value)
+    }
+    async fn history_sources(&self, network: &str, preferred: &str) -> Result<Vec<HistorySource>> {
+        let local = self.identity.node_id()?;
+        let mut sources = vec![preferred.to_owned()];
+        sources.extend(self.hub.online(network).await);
+        let mut seen = BTreeSet::new();
+        let store = self.store.lock().await;
+        sources.retain(|source| {
+            source != &local
+                && seen.insert(source.clone())
+                && store
+                    .authorize_node(network, source, Some(NodeRole::Replica))
+                    .is_ok()
+        });
+        Ok(sources
+            .into_iter()
+            .map(|node_id| HistorySource {
+                node_id,
+                batch: None,
+            })
+            .collect())
+    }
+    async fn history_events(
+        &self,
+        network: &str,
+        sources: &mut [HistorySource],
+        hash: &str,
+        budget: &mut HistoryBudget,
+    ) -> Result<Vec<SignedEvent>> {
+        let initial_events = budget.events;
+        for source in sources {
+            if budget.events == 0 || budget.bytes == 0 {
+                break;
+            }
+            let target = &source.node_id;
+            let before = budget.events;
+            let result = async {
+                let batch = match source.batch {
+                    Some(batch) => batch,
+                    None => {
+                        let capabilities = self.history_response(network, target, json!({"type":"capabilities"}), budget).await?;
+                        let batch = capabilities["history_batch"]["version"] == 1;
+                        source.batch = Some(batch);
+                        batch
+                    }
+                };
+                let limit = budget.events.min(HISTORY_BATCH_EVENTS);
+                let max_bytes = budget.bytes.min(HISTORY_BATCH_BYTES);
+                let value = if batch {
+                    self.history_response(network, target, json!({"type":"history_batch","hash":hash,"limit":limit,"max_bytes":max_bytes}), budget).await?
+                } else {
+                    Value::Null
+                };
+                let single = !batch || (value["version"] == 1 && value["hash"] == hash && value["single_event"] == true && value.get("events").is_none() && serde_json::to_vec(&value)?.len() <= max_bytes);
+                let value = if single {
+                    let value = self.history_response(network, target, json!({"type":"event","hash":hash}), budget).await?;
+                    budget.events = budget.events.saturating_sub(1);
+                    value
+                } else {
+                    budget.events = budget.events.saturating_sub(value["events"].as_array().map_or(1, Vec::len).clamp(1, limit));
+                    value
+                };
+                let store = self.store.lock().await;
+                store.authorize_node(network, target, Some(NodeRole::Replica))?;
+                let envelopes = if single {
+                    let envelope: SignedEvent = serde_json::from_value(value["event"].clone())?;
+                    ensure!(envelope.hash == hash, "event response hash mismatch");
+                    store.verify_event(network, &envelope)?;
+                    vec![envelope]
+                } else {
+                    verify_history_batch(&store, network, hash, &value, limit, max_bytes)?
+                };
+                if !single {
+                    tracing::trace!(network, target, hash, count=envelopes.len(), "history batch fetched");
+                }
+                for envelope in &envelopes {
+                    tracing::trace!(network, target, hash=%envelope.hash, mode=if single {"single"} else {"batch"}, "history event fetched");
+                }
+                Ok(envelopes)
+            }
+            .await;
+            match result {
+                Ok(envelopes) => return Ok(envelopes),
+                Err(error) => {
+                    if budget.events == before {
+                        budget.events -= 1;
+                    }
+                    tracing::debug!(network, target, error=%error, "history object source unavailable")
+                }
+            }
+        }
+        if budget.events == initial_events && budget.events != 0 {
+            budget.events -= 1;
+        }
+        bail!("event unavailable from authorized replicas")
+    }
+    async fn history_blob(
+        &self,
+        network: &str,
+        sources: &[HistorySource],
+        blob: &BlobRef,
+    ) -> Result<()> {
+        for source in sources {
+            let target = &source.node_id;
+            let result: Result<()> = async {
+                self.store.lock().await.authorize_node(network, target, Some(NodeRole::Replica))?;
+                let mut bytes = Vec::with_capacity(blob.size as usize);
+                while bytes.len() < blob.size as usize {
+                    self.store.lock().await.authorize_node(network, target, Some(NodeRole::Replica))?;
+                    let value = self.read_peer(network, target, json!({"type":"blob","hash":blob.hash,"offset":bytes.len(),"limit":65536})).await?;
+                    let encoded = value["data"].as_str().context("blob data is required")?;
+                    ensure!(encoded.len() <= 131072, "blob chunk too large");
+                    let chunk = hex::decode(encoded)?;
+                    ensure!(!chunk.is_empty() && chunk.len() <= 65536 && bytes.len() + chunk.len() <= blob.size as usize, "invalid blob chunk");
+                    bytes.extend(chunk);
+                }
+                let mut store = self.store.lock().await;
+                store.authorize_node(network, target, Some(NodeRole::Replica))?;
+                store.put_blob(network, blob, &bytes)?;
+                tracing::debug!(network, target, hash=%blob.hash, size=blob.size, "history blob fetched");
+                Ok(())
+            }.await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    tracing::debug!(network, target, error=%error, "blob source unavailable")
+                }
+            }
+        }
+        bail!("blob unavailable from authorized replicas")
+    }
+    async fn sync_from(&self, network: &str, target: &str) -> Result<Vec<ClosureSync>> {
         self.store
             .lock()
             .await
@@ -2235,74 +4306,358 @@ impl Runtime {
         let scopes = inventory["scopes"]
             .as_array()
             .context("invalid inventory")?;
+        let mut report = Vec::new();
         for scope in scopes {
-            let scope_id = field(scope, "scope_id")?;
-            let wanted: Vec<String> = serde_json::from_value(scope["heads"].clone())?;
-            self.fetch_closure(network, target, &wanted).await?;
-            let missing = self
-                .store
-                .lock()
-                .await
-                .context(network, scope_id, &wanted)?
-                .missing;
-            if missing.is_complete() {
-                let _ = self.events.send(Update {
-                    network_id: network.into(),
-                    payload: json!({"type":"changed","conversation_id":scope_id}),
-                });
-            }
-        }
-        Ok(())
-    }
-    async fn fetch_closure(&self, network: &str, target: &str, wanted: &[String]) -> Result<()> {
-        self.membership_state().await?;
-        self.store
-            .lock()
-            .await
-            .authorize_node(network, target, Some(NodeRole::Replica))?;
-        let mut pending: Vec<String> = wanted.to_vec();
-        let mut seen = BTreeSet::new();
-        while let Some(hash) = pending.pop() {
-            ensure!(seen.len() < 100_000, "history fetch exceeds bounded batch");
-            if !seen.insert(hash.clone()) {
-                continue;
-            }
-            let local = self.store.lock().await.event(network, &hash)?;
-            let envelope = match local {
-                Some(e) => e,
-                None => serde_json::from_value(
-                    self.read_peer(network, target, json!({"type":"event","hash":hash}))
-                        .await?["event"]
-                        .clone(),
-                )?,
+            let scope_id = match field(scope, "scope_id") {
+                Ok(scope) => scope,
+                Err(error) => {
+                    report.push(ClosureSync {
+                        scope_id: "<invalid>".into(),
+                        target: target.into(),
+                        state: SyncState::Partial,
+                        missing: MissingDependencies::default(),
+                        processed: 0,
+                        changed: false,
+                        errors: vec![error.to_string()],
+                    });
+                    continue;
+                }
             };
-            let event = self.store.lock().await.verify_event(network, &envelope)?;
-            pending.extend(event.parents.clone());
-            pending.extend(event.previous.clone());
-            for blob in &event.blobs {
-                if !self.store.lock().await.has_blob(network, blob)? {
-                    let mut bytes = Vec::with_capacity(blob.size as usize);
-                    while bytes.len() < (blob.size as usize) {
-                        let value=self.read_peer(network,target,json!({"type":"blob","hash":blob.hash,"offset":bytes.len(),"limit":65536})).await?;
-                        let encoded = value["data"].as_str().context("blob data is required")?;
-                        ensure!(encoded.len() <= 131072, "blob chunk too large");
-                        let chunk = hex::decode(encoded)?;
+            let wanted: Result<Vec<String>> =
+                serde_json::from_value(scope["heads"].clone()).map_err(Into::into);
+            let result = match wanted {
+                Ok(wanted) => self.fetch_scope(network, scope_id, target, &wanted).await,
+                Err(error) => Err(error),
+            };
+            let outcome = result.unwrap_or_else(|error| ClosureSync {
+                scope_id: scope_id.into(),
+                target: target.into(),
+                state: SyncState::Partial,
+                missing: MissingDependencies::default(),
+                processed: 0,
+                changed: false,
+                errors: vec![error.to_string()],
+            });
+            tracing::debug!(network, target, scope=scope_id, state=?outcome.state, processed=outcome.processed,
+                changed=outcome.changed, missing_events=outcome.missing.events.len(), missing_blobs=outcome.missing.blobs.len(),
+                conflicts=outcome.missing.conflicts.len(), "history scope sync finished");
+            report.push(outcome);
+        }
+        Ok(report)
+    }
+    async fn fetch_closure(
+        &self,
+        network: &str,
+        scope: &str,
+        target: &str,
+        wanted: &[String],
+    ) -> Result<ClosureSync> {
+        self.fetch_closure_batch_mode(network, scope, target, wanted, 1024, false)
+            .await
+    }
+    async fn fetch_scope(
+        &self,
+        network: &str,
+        scope: &str,
+        target: &str,
+        wanted: &[String],
+    ) -> Result<ClosureSync> {
+        self.fetch_closure_batch_mode(network, scope, target, wanted, 1024, true)
+            .await
+    }
+    #[cfg(test)]
+    async fn fetch_closure_batch(
+        &self,
+        network: &str,
+        scope: &str,
+        target: &str,
+        wanted: &[String],
+        budget: usize,
+    ) -> Result<ClosureSync> {
+        self.fetch_closure_batch_mode(network, scope, target, wanted, budget, true)
+            .await
+    }
+    async fn fetch_closure_batch_mode(
+        &self,
+        network: &str,
+        scope: &str,
+        target: &str,
+        wanted: &[String],
+        budget: usize,
+        persist: bool,
+    ) -> Result<ClosureSync> {
+        self.membership_state().await?;
+        ensure!(
+            !scope.is_empty() && scope.len() <= 512,
+            "invalid history scope"
+        );
+        let mut roots = wanted.to_vec();
+        roots.sort();
+        roots.dedup();
+        for hash in &roots {
+            ensure!(hex::decode(hash)?.len() == 32, "invalid history hash");
+        }
+        let key = format!("net1:v1:closure:{}", crypto::digest(scope.as_bytes()));
+        let mut sources = self.history_sources(network, target).await?;
+        let waiting = Instant::now();
+        let (mut progress, generation) = {
+            let store = self.store.lock().await;
+            let waited = waiting.elapsed();
+            let held = Instant::now();
+            let generation = store.projection_generation(network)?;
+            if persist {
+                let mut combined = store.heads(network, scope)?;
+                for hash in &roots {
+                    if let Some(envelope) = store.event(network, hash)? {
                         ensure!(
-                            !chunk.is_empty()
-                                && chunk.len() <= 65536
-                                && bytes.len() + chunk.len() <= blob.size as usize,
-                            "invalid blob chunk"
+                            store.verify_event(network, &envelope)?.scope_id == scope,
+                            "history head scope mismatch"
                         );
-                        bytes.extend(chunk);
+                    } else {
+                        combined.push(hash.clone());
                     }
-                    self.store.lock().await.put_blob(network, blob, &bytes)?;
+                }
+                combined.sort();
+                combined.dedup();
+                roots = combined;
+            }
+            let previous = if persist {
+                store.local_value(network, &key)?
+            } else {
+                None
+            };
+            let previous = previous
+                .map(serde_json::from_value::<SyncProgress>)
+                .transpose()?;
+            let progress =
+                if let Some(progress) = previous.filter(|progress| progress.heads == roots) {
+                    progress
+                } else {
+                    SyncProgress::new(
+                        scope,
+                        roots.clone(),
+                        &store.missing_dependencies(network, &roots)?,
+                    )
+                };
+            ensure!(
+                progress.version == 1
+                    && progress.scope == scope
+                    && progress.heads == roots
+                    && progress.events.len() <= 1024
+                    && progress.blobs.len() <= 128,
+                "invalid history continuation"
+            );
+            tracing::trace!(
+                network,
+                scope,
+                stage = "scope_roots",
+                wait_ms = waited.as_millis() as u64,
+                hold_ms = held.elapsed().as_millis() as u64,
+                "history store phase finished"
+            );
+            (progress, generation)
+        };
+        let before = progress.clone();
+        let invalidated = progress
+            .frontier_generation
+            .is_some_and(|frontier| frontier != generation);
+        if invalidated {
+            progress.frontier_generation = None;
+        }
+        save_sync_progress(
+            &mut *self.store.lock().await,
+            network,
+            &key,
+            &progress,
+            persist,
+        )?;
+        let mut pending: VecDeque<String> = progress.events.iter().cloned().collect();
+        let mut queued: BTreeSet<String> = progress.events.iter().cloned().collect();
+        if invalidated {
+            for root in &roots {
+                if queued.insert(root.clone()) {
+                    pending.push_back(root.clone());
                 }
             }
-            let mut store = self.store.lock().await;
-            store.authorize_node(network, target, Some(NodeRole::Replica))?;
-            store.ingest_event(network, &envelope)?;
         }
-        Ok(())
+        let mut attempted = BTreeSet::new();
+        let mut unavailable = BTreeSet::new();
+        let mut envelopes = Vec::new();
+        let mut blobs: BTreeSet<BlobRef> = progress.blobs.iter().cloned().collect();
+        let mut errors = Vec::new();
+        let mut work = HistoryBudget {
+            events: budget,
+            bytes: 8 * MAX_EVENT_BYTES,
+        };
+        while work.events > 0 && work.bytes >= MAX_EVENT_BYTES {
+            let Some(hash) = pending.pop_front() else {
+                break;
+            };
+            if !attempted.insert(hash.clone()) {
+                continue;
+            }
+            queued.remove(&hash);
+            progress.event_cursor = Some(hash.clone());
+            let local = self.store.lock().await.event(network, &hash)?;
+            let page = match local {
+                Some(envelope) => {
+                    work.events -= 1;
+                    work.bytes = work.bytes.saturating_sub(envelope.canonical_body.len());
+                    vec![envelope]
+                }
+                None => match self
+                    .history_events(network, &mut sources, &hash, &mut work)
+                    .await
+                {
+                    Ok(envelopes) => envelopes,
+                    Err(error) => {
+                        errors.push(error.to_string());
+                        unavailable.insert(hash);
+                        continue;
+                    }
+                },
+            };
+            ensure!(
+                page.first().is_some_and(|envelope| envelope.hash == hash),
+                "stored event hash mismatch"
+            );
+            for envelope in page {
+                let hash = &envelope.hash;
+                attempted.insert(hash.clone());
+                queued.remove(hash);
+                progress.event_cursor = Some(hash.clone());
+                let event = self.store.lock().await.verify_event(network, &envelope)?;
+                ensure!(
+                    roots.binary_search(hash).is_err() || event.scope_id == scope,
+                    "history head scope mismatch"
+                );
+                {
+                    let store = self.store.lock().await;
+                    for parent in event.parents.iter().chain(event.previous.iter()) {
+                        if !attempted.contains(parent)
+                            && store.event(network, parent)?.is_none()
+                            && queued.insert(parent.clone())
+                        {
+                            pending.push_back(parent.clone());
+                        }
+                    }
+                    for blob in &event.blobs {
+                        if !store.has_blob(network, blob)? {
+                            blobs.insert(blob.clone());
+                        }
+                    }
+                }
+                envelopes.push(envelope);
+            }
+        }
+        queued.extend(unavailable);
+        let mut missing = MissingDependencies {
+            events: queued.into_iter().collect(),
+            blobs: blobs.iter().cloned().collect(),
+            conflicts: Vec::new(),
+        };
+        let inserted = {
+            let mut store = self.store.lock().await;
+            store.authorize_node(network, &self.identity.node_id()?, Some(NodeRole::Replica))?;
+            let inserted = store.ingest_events(network, &envelopes)?;
+            progress.advance(&missing);
+            save_sync_progress(&mut store, network, &key, &progress, persist)?;
+            inserted
+        };
+        let blob_page = rotated_page(
+            &blobs.into_iter().collect::<Vec<_>>(),
+            progress.blob_cursor.as_ref(),
+            4,
+        );
+        let mut blobs_completed = 0;
+        for blob in blob_page {
+            progress.blob_cursor = Some(blob.clone());
+            if self.store.lock().await.has_blob(network, &blob)? {
+                missing.blobs.retain(|wanted| wanted != &blob);
+                continue;
+            }
+            match self.history_blob(network, &sources, &blob).await {
+                Ok(()) => {
+                    missing.blobs.retain(|wanted| wanted != &blob);
+                    blobs_completed += 1;
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        let waiting = Instant::now();
+        let changed = {
+            let mut store = self.store.lock().await;
+            let waited = waiting.elapsed();
+            let held = Instant::now();
+            for hash in &roots {
+                let verified = store.event(network, hash).and_then(|envelope| {
+                    if let Some(envelope) = envelope {
+                        ensure!(
+                            store.verify_event(network, &envelope)?.scope_id == scope,
+                            "history head scope mismatch"
+                        );
+                    }
+                    Ok(())
+                });
+                if let Err(error) = verified {
+                    progress.frontier_generation = None;
+                    save_sync_progress(&mut store, network, &key, &progress, persist)?;
+                    return Err(error);
+                }
+            }
+            if missing.is_complete() || (envelopes.is_empty() && blobs_completed == 0) {
+                missing = match store.missing_dependencies(network, &roots) {
+                    Ok(missing) => missing,
+                    Err(error) => {
+                        progress.frontier_generation = None;
+                        save_sync_progress(&mut store, network, &key, &progress, persist)?;
+                        return Err(error);
+                    }
+                };
+            }
+            let after_generation = store.projection_generation(network)?;
+            progress.advance(&missing);
+            progress.frontier_generation = missing.is_complete().then_some(after_generation);
+            save_sync_progress(&mut store, network, &key, &progress, persist)?;
+            let completeness_changed = persist
+                && (before.frontier_generation.is_some() != progress.frontier_generation.is_some());
+            tracing::trace!(
+                network,
+                scope,
+                stage = "scope_frontier",
+                wait_ms = waited.as_millis() as u64,
+                hold_ms = held.elapsed().as_millis() as u64,
+                "history store phase finished"
+            );
+            inserted != 0 || blobs_completed != 0 || completeness_changed
+        };
+        let processed = budget - work.events;
+        let state = if missing.is_complete() {
+            SyncState::Complete
+        } else if !missing.conflicts.is_empty() {
+            SyncState::Partial
+        } else if sources.is_empty()
+            || (processed > 0 && !errors.is_empty() && envelopes.is_empty())
+        {
+            SyncState::Unreachable
+        } else {
+            SyncState::Partial
+        };
+        if changed {
+            let _ = self.events.send(Update {
+                network_id: network.into(),
+                payload: json!({"type":"changed","conversation_id":scope}),
+            });
+        }
+        Ok(ClosureSync {
+            scope_id: scope.into(),
+            target: target.into(),
+            state,
+            missing,
+            processed,
+            changed,
+            errors,
+        })
     }
     fn capabilities(&self) -> Value {
         let manager =
@@ -2320,7 +4675,8 @@ impl Runtime {
                 "claude_code":{"actions":ExecutorKind::ClaudeCode.capabilities(),"verified":false},
                 "cursor_agent":{"actions":ExecutorKind::CursorAgent.capabilities(),"verified":false}},
             "manager":self.config.manager.as_ref().map(|m|m.provider.clone()),
-            "manager_capabilities":manager.map(|kind|kind.capabilities()),"reliable_schedule":{"version":1}})
+            "manager_capabilities":manager.map(|kind|kind.capabilities()),"reliable_schedule":{"version":1},
+            "history_batch":history_batch_capability()})
     }
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
         let write = !matches!(
@@ -2799,6 +5155,15 @@ impl Runtime {
         let scope = field(input, "conversation_id")?;
         self.require_scope(access, scope).await?;
         self.sync_all(&access.network_id).await?;
+        ensure!(
+            self.store
+                .lock()
+                .await
+                .context(&access.network_id, scope, &[])?
+                .missing
+                .is_complete(),
+            "task history is incomplete"
+        );
         self.cache_context_bindings(&access.network_id, scope)
             .await?;
         let creation = self.store.lock().await.task_creation(
@@ -2884,11 +5249,25 @@ impl Runtime {
             )
             .await?;
         }
-        self.store.lock().await.authorize_node(
-            &access.network_id,
-            &request.target_node,
-            Some(NodeRole::Executor),
-        )?;
+        {
+            let waiting = Instant::now();
+            let store = self.store.lock().await;
+            let waited = waiting.elapsed();
+            let held = Instant::now();
+            store.authorize_node(
+                &access.network_id,
+                &request.target_node,
+                Some(NodeRole::Executor),
+            )?;
+            let known_gap = !request.basis_heads.is_empty()
+                && store
+                    .operation(&request.network_id, &request.operation_id)?
+                    .is_none()
+                && store.has_known_basis_gap(&request.network_id, &request.basis_heads)?;
+            tracing::trace!(network=%request.network_id, scope=%request.conversation_id, stage="dispatch_basis", wait_ms=waited.as_millis() as u64,
+                hold_ms=held.elapsed().as_millis() as u64, known_gap, "history store phase finished");
+            ensure!(!known_gap, "operation basis is incomplete or conflicting");
+        }
         if !access.human
             && matches!(
                 request.action["type"].as_str(),
@@ -2980,7 +5359,7 @@ impl Runtime {
             event.hash
         };
         if request.target_node == self.identity.node_id()? {
-            self.admit_operation_checked(request, access.human, Some(&access))
+            self.admit_operation_checked(request, access.human, Some(&access), None)
                 .await
         } else {
             Self::check_manager_permission(
@@ -2992,18 +5371,21 @@ impl Runtime {
             self.peer_request(&access.network_id,&request.target_node,json!({"type":"execute","request":request,"dispatch_head":head,"human":access.human})).await
         }
     }
+    #[cfg(test)]
     async fn admit_operation(
         self: &Arc<Self>,
         request: OperationRequest,
         human: bool,
     ) -> Result<Value> {
-        self.admit_operation_checked(request, human, None).await
+        self.admit_operation_checked(request, human, None, None)
+            .await
     }
     async fn admit_operation_checked(
         self: &Arc<Self>,
         mut request: OperationRequest,
         human: bool,
         manager_access: Option<&Access>,
+        peer_origin: Option<&str>,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         self.require_role(&request.network_id, NodeRole::Executor)
@@ -3018,8 +5400,27 @@ impl Runtime {
             "only the user may answer approvals"
         );
         let mut store = self.store.lock().await;
+        if let Some(origin) = peer_origin {
+            let sender = store.authorize_node(&request.network_id, origin, None)?;
+            ensure!(
+                sender.roles.contains(&NodeRole::Scheduler)
+                    || sender.roles.contains(&NodeRole::Gateway),
+                "origin cannot dispatch"
+            );
+            ensure!(
+                !human || sender.roles.contains(&NodeRole::Gateway),
+                "origin cannot assert human authority"
+            );
+        }
         if let Some(access) = manager_access {
             Self::check_manager_permission(&store, access, true, request.task_id.as_deref())?;
+        }
+        let existing_operation = store.operation(&request.network_id, &request.operation_id)?;
+        if existing_operation.is_none() && !request.basis_heads.is_empty() {
+            ensure!(
+                !store.has_known_basis_gap(&request.network_id, &request.basis_heads)?,
+                "required context is incomplete or conflicting"
+            );
         }
         if kind == "command" {
             ensure!(
@@ -3050,7 +5451,7 @@ impl Runtime {
             resources.sort();
             resources.dedup();
             request.resources = resources;
-            if let Some(old) = store.operation(&request.network_id, &request.operation_id)? {
+            if let Some(old) = existing_operation {
                 ensure!(
                     old.request == request,
                     "operation ID reused with different body"
@@ -3075,7 +5476,6 @@ impl Runtime {
                 .as_deref()
                 .context("execution session is required")?,
         )?;
-        let existing_operation = store.operation(&request.network_id, &request.operation_id)?;
         if !human && existing_operation.is_none() && matches!(kind, "open" | "send" | "steer") {
             if let Some(task) = &request.task_id {
                 require_task_write(
@@ -3658,6 +6058,7 @@ impl Runtime {
             "capabilities"
                 | "inventory"
                 | "event"
+                | "history_batch"
                 | "blob"
                 | "operation"
                 | "task_binding"
@@ -3682,7 +6083,9 @@ impl Runtime {
                     .into_iter()
                     .map(|s| Ok(json!({"scope_id":s,"heads":store.heads(network,&s)?})))
                     .collect::<Result<Vec<_>>>()?;
-                Ok(json!({"membership":store.trust_bundle(network)?,"scopes":scopes}))
+                Ok(
+                    json!({"membership":store.trust_bundle(network)?,"scopes":scopes,"history_batch":history_batch_capability()}),
+                )
             }
             "event" => {
                 self.require_role(network, NodeRole::Replica).await?;
@@ -3692,6 +6095,68 @@ impl Runtime {
                     Some(NodeRole::Replica),
                 )?;
                 Ok(json!({"event":self.store.lock().await.event(network,field(input,"hash")?)?}))
+            }
+            "history_batch" => {
+                self.require_role(network, NodeRole::Replica).await?;
+                let store = self.store.lock().await;
+                store.authorize_node(network, &message.origin, Some(NodeRole::Replica))?;
+                let hash = field(input, "hash")?;
+                ensure!(hex::decode(hash)?.len() == 32, "invalid history hash");
+                let limit = input["limit"]
+                    .as_u64()
+                    .unwrap_or(HISTORY_BATCH_EVENTS as u64)
+                    .clamp(1, HISTORY_BATCH_EVENTS as u64) as usize;
+                let max_bytes = input["max_bytes"]
+                    .as_u64()
+                    .unwrap_or(HISTORY_BATCH_BYTES as u64)
+                    .min(HISTORY_BATCH_BYTES as u64) as usize;
+                let mut value = json!({"version":1,"hash":hash,"events":[]});
+                let mut bytes = serde_json::to_vec(&value)?.len();
+                ensure!(max_bytes >= bytes, "history batch byte budget too small");
+                let mut pending = VecDeque::from([hash.to_owned()]);
+                let mut queued = BTreeSet::from([hash.to_owned()]);
+                let mut examined = 0;
+                while let Some(next) = pending.pop_front() {
+                    examined += 1;
+                    let Some(envelope) = store.event(network, &next)? else {
+                        ensure!(next != hash, "history event unavailable");
+                        continue;
+                    };
+                    let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+                    let encoded = serde_json::to_value(&envelope)?;
+                    let events = value["events"].as_array_mut().unwrap();
+                    let added =
+                        serde_json::to_vec(&encoded)?.len() + usize::from(!events.is_empty());
+                    if bytes + added > max_bytes {
+                        if events.is_empty() {
+                            let marker = json!({"version":1,"hash":hash,"single_event":true});
+                            ensure!(
+                                serde_json::to_vec(&marker)?.len() <= max_bytes,
+                                "history batch byte budget too small"
+                            );
+                            return Ok(marker);
+                        }
+                        break;
+                    }
+                    bytes += added;
+                    events.push(encoded);
+                    for parent in event.parents.into_iter().chain(event.previous) {
+                        if queued.len() == limit {
+                            break;
+                        }
+                        if queued.insert(parent.clone()) {
+                            pending.push_back(parent);
+                        }
+                    }
+                    if examined == limit {
+                        break;
+                    }
+                }
+                ensure!(
+                    serde_json::to_vec(&value)?.len() <= max_bytes,
+                    "history batch byte limit exceeded"
+                );
+                Ok(value)
             }
             "blob" => {
                 self.require_role(network, NodeRole::Replica).await?;
@@ -3783,8 +6248,9 @@ impl Runtime {
                 // Admission holds the complete dispatched history before any external call.
                 let mut wanted = request.basis_heads.clone();
                 wanted.push(field(input, "dispatch_head")?.into());
-                self.fetch_closure(network, &message.origin, &wanted)
-                    .await?;
+                self.fetch_closure(network, &request.conversation_id, &message.origin, &wanted)
+                    .await?
+                    .require_complete()?;
                 ensure!(
                     self.store
                         .lock()
@@ -3818,7 +6284,8 @@ impl Runtime {
                 if let Some(proof) = &request.binding {
                     self.store.lock().await.install_binding(proof)?;
                 }
-                self.admit_operation(request, human).await
+                self.admit_operation_checked(request, human, None, Some(&message.origin))
+                    .await
             }
             "session" => {
                 self.session_fact(

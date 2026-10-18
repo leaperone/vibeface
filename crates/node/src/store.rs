@@ -118,6 +118,7 @@ impl Store {
             );
             tx.execute("INSERT OR IGNORE INTO node_certificates(network_id,node_id,public_key) VALUES(?,?,?)",params![network_id,member.subject_id,member.public_key])?;
         }
+        rebuild_projections_from(&tx, network_id)?;
         tx.commit()?;
         Ok(true)
     }
@@ -176,40 +177,73 @@ impl Store {
         let key = self.public_key(network_id, &event.author)?;
         verify_signed_event(network_id, envelope, &key)
     }
+    pub fn ingest_events(&mut self, network_id: &str, envelopes: &[SignedEvent]) -> Result<usize> {
+        ensure!(envelopes.len() <= 1024, "event batch is too large");
+        ensure!(
+            envelopes
+                .iter()
+                .map(|event| event.canonical_body.len())
+                .sum::<usize>()
+                <= 8 * MAX_EVENT_BYTES,
+            "event batch byte limit exceeded"
+        );
+        let verified = envelopes
+            .iter()
+            .map(|envelope| {
+                Ok((
+                    envelope,
+                    self.verify_event(network_id, envelope)?,
+                    serde_json::to_string(envelope)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut inserted = 0;
+        for (envelope, event, encoded) in verified {
+            let old: Option<String> = tx
+                .query_row(
+                    "SELECT envelope FROM events WHERE network_id=? AND hash=?",
+                    params![network_id, envelope.hash],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(old) = old {
+                ensure!(old == encoded, "conflicting envelope for event hash");
+                continue;
+            }
+            tx.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'pending')",params![network_id,envelope.hash,event.scope_id,event.author,event.sequence,encoded])?;
+            inserted += 1;
+        }
+        if inserted != 0 {
+            rebuild_projections_from(&tx, network_id)?;
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
     pub fn ingest_event(
         &mut self,
         network_id: &str,
         envelope: &SignedEvent,
     ) -> Result<IngestOutcome> {
-        let event = self.verify_event(network_id, envelope)?;
-        let encoded = serde_json::to_string(envelope)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let old: Option<String> = tx
-            .query_row(
-                "SELECT envelope FROM events WHERE network_id=? AND hash=?",
-                params![network_id, envelope.hash],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(old) = old {
-            ensure!(old == encoded, "conflicting envelope for event hash");
-        } else {
-            tx.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'pending')",params![network_id,envelope.hash,event.scope_id,event.author,event.sequence,encoded])?;
-        }
-        rebuild_projections_from(&tx, network_id)?;
-        tx.commit()?;
+        self.ingest_events(network_id, std::slice::from_ref(envelope))?;
         let status: String = self.connection.query_row(
             "SELECT status FROM events WHERE network_id=? AND hash=?",
             params![network_id, envelope.hash],
-            |r| r.get(0),
+            |row| row.get(0),
         )?;
         Ok(IngestOutcome {
             hash: envelope.hash.clone(),
             status,
             missing: self.missing_dependencies(network_id, std::slice::from_ref(&envelope.hash))?,
         })
+    }
+    pub fn projection_generation(&self, network_id: &str) -> Result<u64> {
+        Ok(self
+            .local_value(network_id, "net1:v1:projection-generation")?
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0))
     }
     pub fn append_event(
         &mut self,
@@ -1109,6 +1143,24 @@ impl Store {
     pub fn heads(&self, network_id: &str, scope_id: &str) -> Result<Vec<EventHash>> {
         Ok(heads_from_events(&self.load_events(network_id)?, scope_id))
     }
+    pub(crate) fn has_known_basis_gap(
+        &self,
+        network_id: &str,
+        heads: &[EventHash],
+    ) -> Result<bool> {
+        let mut query = self
+            .connection
+            .prepare("SELECT status FROM events WHERE network_id=? AND hash=?")?;
+        for hash in heads {
+            let status: Option<String> = query
+                .query_row(params![network_id, hash], |row| row.get(0))
+                .optional()?;
+            if status.as_deref() != Some("ready") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     pub fn missing_dependencies(
         &self,
         network_id: &str,
@@ -1216,17 +1268,35 @@ impl Store {
         for event in &snapshot.events {
             self.verify_event(network_id, event)?;
         }
-        for event in &snapshot.events {
-            self.ingest_event(network_id, event)?;
-        }
         for hash in &snapshot.heads {
-            if let Some(event) = self.event(network_id, hash)? {
-                let body: Event = serde_json::from_str(&event.canonical_body)?;
+            let envelope = snapshot
+                .events
+                .iter()
+                .find(|event| &event.hash == hash)
+                .cloned()
+                .or(self.event(network_id, hash)?);
+            if let Some(envelope) = envelope {
+                let body: Event = serde_json::from_str(&envelope.canonical_body)?;
                 ensure!(
                     body.scope_id == snapshot.scope_id,
                     "snapshot head scope mismatch"
                 );
             }
+        }
+        let mut start = 0;
+        while start < snapshot.events.len() {
+            let mut end = start;
+            let mut bytes = 0;
+            while end < snapshot.events.len() && end - start < 1024 {
+                let size = snapshot.events[end].canonical_body.len();
+                if bytes + size > 8 * MAX_EVENT_BYTES {
+                    break;
+                }
+                bytes += size;
+                end += 1;
+            }
+            self.ingest_events(network_id, &snapshot.events[start..end])?;
+            start = end;
         }
         self.missing_dependencies(network_id, &snapshot.heads)
     }
@@ -1236,6 +1306,9 @@ impl Store {
             "blob size mismatch or limit exceeded"
         );
         ensure!(digest(content) == expected.hash, "blob hash mismatch");
+        if self.has_blob(network_id, expected)? {
+            return Ok(());
+        }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1291,6 +1364,13 @@ impl Store {
             });
         }
         Ok(result)
+    }
+    pub(crate) fn has_conversation(&self, network_id: &str, scope_id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE network_id=? AND conversation_id=?)",
+            params![network_id, scope_id],
+            |row| row.get(0),
+        )?)
     }
     pub fn messages(&self, network_id: &str, scope_id: &str) -> Result<Vec<Message>> {
         let mut statement=self.connection.prepare("SELECT message_id,role,text,event_hash,created_at_ms FROM messages WHERE network_id=? AND conversation_id=? ORDER BY ordinal")?;
@@ -3089,6 +3169,14 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
             _ => {}
         }
     }
+    let generation: u64 = connection.query_row(
+        "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM local_values WHERE network_id=? AND key='net1:v1:projection-generation'),0)",
+        [network_id], |row| row.get(0),
+    )?;
+    connection.execute(
+        "INSERT INTO local_values(network_id,key,value) VALUES(?,'net1:v1:projection-generation',?) ON CONFLICT(network_id,key) DO UPDATE SET value=excluded.value",
+        params![network_id, generation.checked_add(1).context("projection generation exhausted")?.to_string()],
+    )?;
     Ok(())
 }
 fn authorize_node_from(
@@ -4830,7 +4918,7 @@ mod tests {
         })
     }
     #[test]
-    fn net1_duplicate_import_projection_write_baseline() -> Result<()> {
+    fn net1_duplicate_import_does_not_write_projections() -> Result<()> {
         let owner = LocalIdentity::generate();
         let network = owner.fixture_network_id()?;
         let mut store = memory(&owner, None)?;
@@ -4848,9 +4936,68 @@ mod tests {
             store
                 .connection
                 .query_row("SELECT count FROM projection_writes", [], |row| row.get(0))?;
-        assert_eq!(writes, 2);
+        assert_eq!(writes, 0);
         assert_eq!(store.conversations(&network)?.len(), 1);
         assert!(store.operations(&network)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn net1_batch_and_snapshot_rebuild_once_and_duplicates_keep_generation() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut source = memory(&owner, None)?;
+        let root = conversation(&mut source, &owner)?;
+        let first = message(
+            &owner,
+            &network,
+            2,
+            Some(root.hash.clone()),
+            vec![root.hash.clone()],
+            "one",
+            vec![],
+        )?;
+        let second = message(
+            &owner,
+            &network,
+            3,
+            Some(first.hash.clone()),
+            vec![first.hash.clone()],
+            "two",
+            vec![],
+        )?;
+        let mut replica = memory(&owner, None)?;
+        let generation = replica.projection_generation(&network)?;
+        assert_eq!(
+            replica.ingest_events(&network, &[second.clone(), root.clone(), first.clone()])?,
+            3
+        );
+        assert_eq!(replica.projection_generation(&network)?, generation + 1);
+        assert_eq!(
+            replica
+                .messages(&network, "conversation")?
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+        assert_eq!(
+            replica.ingest_events(&network, &[root.clone(), first, second.clone()])?,
+            0
+        );
+        assert_eq!(replica.projection_generation(&network)?, generation + 1);
+        let snapshot = replica.export_snapshot(&network, "conversation")?;
+        let mut target = memory(&owner, None)?;
+        let before = target.projection_generation(&network)?;
+        assert!(target.import_snapshot(&network, &snapshot)?.is_complete());
+        assert_eq!(target.projection_generation(&network)?, before + 1);
+        assert!(target.import_snapshot(&network, &snapshot)?.is_complete());
+        assert_eq!(target.projection_generation(&network)?, before + 1);
+        let mut conflicting = second;
+        conflicting.signature = root.signature;
+        assert!(target.ingest_event(&network, &conflicting).is_err());
+        assert_eq!(target.projection_generation(&network)?, before + 1);
+        assert_eq!(target.messages(&network, "conversation")?.len(), 2);
         Ok(())
     }
 

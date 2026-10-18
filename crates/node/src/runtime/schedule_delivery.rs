@@ -850,10 +850,19 @@ impl Runtime {
         let scope = id(input, "conversation_id")?;
         let trigger = field(input, "trigger")?;
         let wanted = proof_heads(input, trigger)?;
-        self.fetch_closure(network, &message.origin, &wanted)
-            .await?;
+        self.fetch_closure(network, &scope, &message.origin, &wanted)
+            .await?
+            .require_complete()?;
         {
             let mut store = self.store.lock().await;
+            let sender = store.authorize_node(network, &message.origin, None)?;
+            ensure!(
+                sender.roles.iter().any(|role| matches!(
+                    role,
+                    NodeRole::Gateway | NodeRole::Scheduler | NodeRole::Executor
+                )),
+                "origin cannot schedule"
+            );
             let envelope = store
                 .event(network, trigger)?
                 .context("scheduling trigger is missing")?;
@@ -1061,8 +1070,14 @@ impl Runtime {
                 .missing_dependencies(&entry.network_id, &wanted)?
                 .is_complete()
             {
-                self.fetch_closure(&entry.network_id, &entry.target_node, &wanted)
-                    .await?;
+                self.fetch_closure(
+                    &entry.network_id,
+                    &entry.conversation_id,
+                    &entry.target_node,
+                    &wanted,
+                )
+                .await?
+                .require_complete()?;
             }
             ensure!(
                 self.store
