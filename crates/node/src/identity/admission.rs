@@ -27,6 +27,243 @@ use vibeface_secure::authorization::{
     VerifiedAuthorization, VerifiedPolicySet,
 };
 
+#[derive(Clone, Default)]
+pub(crate) struct AdmissionCheckpoints {
+    entries: BTreeMap<(String, String), LocalAdmissionCheckpoint>,
+}
+
+#[derive(Clone)]
+pub(super) struct LocalAdmissionCheckpoint {
+    proof: AdmissionProof,
+    facts: RequestFacts,
+    facts_hash: ObjectHash,
+    operation_id: Option<String>,
+    anchors: Vec<crate::model::SignedEvent>,
+    admitted: VerifiedAdmission,
+    proof_usage: vibeface_secure::authorization::execution_handoff::ExecutionProofUsage,
+}
+
+fn admission_facts_hash(facts: &RequestFacts) -> Result<ObjectHash> {
+    Ok(ObjectHash::body(&(
+        &facts.resource,
+        facts.action,
+        &facts.audience,
+        &facts.operation_id,
+        &facts.body_hash,
+        &facts.context,
+    ))?)
+}
+
+fn admission_operation_index_in(
+    connection: &Connection,
+    proof: &AdmissionProof,
+) -> Result<Option<String>> {
+    let invocation = &proof.invocation.payload;
+    let operation: Option<String> = connection.query_row(
+        "SELECT operation_id FROM accepted_authorizations WHERE space_id=? AND authorization_id=?",
+        params![invocation.resource.space.as_str(), invocation.operation_id],
+        |row| row.get(0),
+    )?;
+    if let Some(operation) = &operation {
+        let encoded: String = connection.query_row(
+            "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
+            params![invocation.resource.space.as_str(), operation],
+            |row| row.get(0),
+        )?;
+        let request: OperationRequest = serde_json::from_str(&encoded)?;
+        ensure!(
+            proof.source_body["method"] == "operate"
+                && request.operation_id == *operation
+                && request.network_id == invocation.resource.space.as_str()
+                && serde_json::from_value::<OperationRequest>(
+                    proof.source_body["request"].clone()
+                )? == request,
+            "cached admission operation differs from its original request"
+        );
+    } else {
+        ensure!(
+            proof.source_body["method"] != "operate",
+            "cached operation has no admission index"
+        );
+    }
+    Ok(operation)
+}
+
+fn admission_anchors_in(
+    connection: &Connection,
+    proof: &AdmissionProof,
+) -> Result<Vec<crate::model::SignedEvent>> {
+    let invocation = &proof.invocation.payload;
+    let method = manager_field(&proof.source_body, "method")?;
+    if matches!(
+        method,
+        "bind_execution" | "seal_execution" | "rebind_execution"
+    ) {
+        return Ok(Vec::new());
+    }
+    let encoded = if method == "agent_start" {
+        vec![connection.query_row(
+            "SELECT envelope FROM events WHERE space_id=? AND hash=? AND status='ready'",
+            params![
+                invocation.resource.space.as_str(),
+                manager_field(&proof.source_body, "trigger")?
+            ],
+            |row| row.get::<_, String>(0),
+        )?]
+    } else {
+        let scope = if method == "operate" {
+            manager_field(&proof.source_body["request"], "conversation_id")?
+        } else {
+            manager_field(&proof.source_body, "conversation_id")?
+        };
+        connection.prepare(
+            "SELECT envelope FROM events WHERE space_id=? AND resource_id=? AND scope_id=? AND json_extract(json_extract(envelope,'$.canonical_body'),'$.cause.kind')='invocation' AND json_extract(json_extract(envelope,'$.canonical_body'),'$.cause.admission.invocation.payload.operation_id')=? ORDER BY hash",
+        )?.query_map(params![invocation.resource.space.as_str(), invocation.resource.resource.as_str(), scope, invocation.operation_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    ensure!(
+        !encoded.is_empty(),
+        "accepted admission has no retained ready checkpoint"
+    );
+    encoded.into_iter().map(|encoded| {
+        let envelope: crate::model::SignedEvent = serde_json::from_str(&encoded)?;
+        let event: crate::model::Event = serde_json::from_str(&envelope.canonical_body)?;
+        ensure!(event.network_id == invocation.resource.space.as_str()
+            && event.resource_id == invocation.resource.resource,
+            "admission checkpoint belongs to another resource");
+        if method != "agent_start" {
+            ensure!(matches!(&event.cause, crate::model::EventCause::Invocation { admission } if admission == proof),
+                "admission checkpoint changed its original proof");
+        }
+        super::event_authorization::validate_retained_event_dependencies_in(connection, &envelope)?;
+        Ok(envelope)
+    }).collect()
+}
+
+impl AdmissionCheckpoints {
+    pub(super) fn insert(&mut self, checkpoint: LocalAdmissionCheckpoint) {
+        let invocation = &checkpoint.proof.invocation.payload;
+        self.entries.insert(
+            (
+                invocation.resource.space.to_string(),
+                invocation.operation_id.clone(),
+            ),
+            checkpoint,
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn admitted_in(
+        &self,
+        connection: &Connection,
+        proof: &AdmissionProof,
+        facts: &RequestFacts,
+        transport: &TransportEvidence,
+    ) -> Result<Option<VerifiedAdmission>> {
+        let invocation = &proof.invocation.payload;
+        let Some(checkpoint) = self.entries.get(&(
+            invocation.resource.space.to_string(),
+            invocation.operation_id.clone(),
+        )) else {
+            return Ok(None);
+        };
+        let snapshot = if connection.is_autocommit() {
+            Some(connection.unchecked_transaction()?)
+        } else {
+            None
+        };
+        validate_persisted_admission(connection, proof)?;
+        ensure!(
+            checkpoint.proof == *proof
+                && checkpoint.facts == *facts
+                && checkpoint.facts_hash == admission_facts_hash(facts)?
+                && checkpoint.proof.transport.clone().into_evidence() == *transport
+                && checkpoint.operation_id == admission_operation_index_in(connection, proof)?
+                && checkpoint.admitted.signed_invocation() == &proof.invocation
+                && checkpoint.admitted.admitted_at_ms() == proof.admitted_at_ms,
+            "retained admission differs from its verified local checkpoint"
+        );
+        let anchors = admission_anchors_in(connection, proof)?;
+        ensure!(
+            anchors == checkpoint.anchors,
+            "retained admission changed its ready canonical checkpoint"
+        );
+        checkpoint.proof_usage.enforce_limits()?;
+        if let Some(snapshot) = snapshot {
+            snapshot.commit()?;
+        }
+        Ok(Some(checkpoint.admitted.clone()))
+    }
+}
+
+fn checkpoint_from_verified_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    proof: &AdmissionProof,
+    facts: RequestFacts,
+    admitted: VerifiedAdmission,
+) -> Result<Option<LocalAdmissionCheckpoint>> {
+    validate_persisted_admission(connection, proof)?;
+    let operation_id = admission_operation_index_in(connection, proof)?;
+    let anchors = admission_anchors_in(connection, proof)?;
+    if anchors.is_empty() {
+        return Ok(None);
+    }
+    for envelope in &anchors {
+        let event: crate::model::Event = serde_json::from_str(&envelope.canonical_body)?;
+        ensure!(
+            super::event_authorization::verify_event_envelope(policy, &event.network_id, envelope)?
+                == event,
+            "local admission checkpoint has an invalid event signature"
+        );
+    }
+    let retained = if policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)? {
+        None
+    } else {
+        Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
+    };
+    let state = retained.as_ref().unwrap_or(policy.verified());
+    let authorization = state.verify_invocation(
+        &proof.invocation,
+        &facts,
+        &proof.transport.clone().into_evidence(),
+        proof.admitted_at_ms,
+    )?;
+    let mut proof_usage =
+        vibeface_secure::authorization::execution_handoff::ExecutionProofUsage::default();
+    proof_usage.record_cached_admission(&authorization, proof)?;
+    proof_usage.enforce_limits()?;
+    Ok(Some(LocalAdmissionCheckpoint {
+        proof: proof.clone(),
+        facts_hash: admission_facts_hash(&facts)?,
+        facts,
+        operation_id,
+        anchors,
+        admitted,
+        proof_usage,
+    }))
+}
+
+pub(super) fn prepare_local_admission_checkpoint_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    proof: &AdmissionProof,
+) -> Result<LocalAdmissionCheckpoint> {
+    let facts = persisted_admission_facts(connection, policy, proof)?;
+    let admitted = reconstruct_admission_uncached(
+        policy,
+        proof,
+        &facts,
+        &proof.transport.clone().into_evidence(),
+    )?;
+    checkpoint_from_verified_in(connection, policy, proof, facts, admitted)?
+        .context("local admission has no retained event checkpoint")
+}
+
 pub(crate) fn check_policy_heads_in(
     connection: &Connection,
     state: &VerifiedPolicySet,
@@ -230,6 +467,22 @@ fn consume_authorization_with_facts_in(
 }
 
 pub(crate) fn reconstruct_admission(
+    connection: &Connection,
+    policy: &PolicyState,
+    proof: &AdmissionProof,
+    facts: &RequestFacts,
+    transport: &TransportEvidence,
+) -> Result<VerifiedAdmission> {
+    if let Some(admitted) = policy
+        .local_admissions
+        .admitted_in(connection, proof, facts, transport)?
+    {
+        return Ok(admitted);
+    }
+    reconstruct_admission_uncached(policy, proof, facts, transport)
+}
+
+pub(crate) fn reconstruct_admission_uncached(
     policy: &PolicyState,
     proof: &AdmissionProof,
     facts: &RequestFacts,
@@ -688,6 +941,17 @@ pub(crate) fn validate_persisted_authorizations(
     connection: &Connection,
     policy: &PolicyState,
 ) -> Result<()> {
+    verified_admission_checkpoints_from(connection, policy).map(|_| ())
+}
+
+pub(crate) fn verified_admission_checkpoints_from(
+    connection: &Connection,
+    policy: &PolicyState,
+) -> Result<AdmissionCheckpoints> {
+    let mut uncached = policy.clone();
+    uncached.local_admissions = AdmissionCheckpoints::default();
+    let policy = &uncached;
+    let mut checkpoints = AdmissionCheckpoints::default();
     let rows = connection.prepare("SELECT space_id,authorization_id,operation_id FROM accepted_authorizations ORDER BY space_id,authorization_id")?
         .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?)))?
         .collect::<std::result::Result<Vec<_>,_>>()?;
@@ -695,7 +959,13 @@ pub(crate) fn validate_persisted_authorizations(
     for (space, id, operation_id) in rows {
         let stored = load_authorization_from(connection, &space, &id)?;
         let facts = persisted_admission_facts(connection, policy, &stored.proof)?;
-        reconstruct_admission(policy, &stored.proof, &facts, &stored.transport)?;
+        let admitted =
+            reconstruct_admission_uncached(policy, &stored.proof, &facts, &stored.transport)?;
+        if let Some(checkpoint) =
+            checkpoint_from_verified_in(connection, policy, &stored.proof, facts, admitted)?
+        {
+            checkpoints.insert(checkpoint);
+        }
         match operation_id {
             Some(operation_id) => {
                 ensure!(
@@ -849,7 +1119,7 @@ pub(crate) fn validate_persisted_authorizations(
             }
         }
     }
-    Ok(())
+    Ok(checkpoints)
 }
 
 fn operation_from(
@@ -1084,7 +1354,8 @@ fn verify_lease_record(
             lease.checked_at_ms,
         )?
     } else {
-        let admission = reconstruct_admission(policy, &stored.proof, &facts, &stored.transport)?;
+        let admission =
+            reconstruct_admission(connection, policy, &stored.proof, &facts, &stored.transport)?;
         historical.verify_operation_authorization(
             &admission,
             &facts,
@@ -1310,7 +1581,8 @@ fn manager_authorization_from(
         &stored.proof.source_body,
         &stored.proof.invocation.payload.audience,
     )?;
-    let admitted = reconstruct_admission(policy, &stored.proof, &facts, &stored.transport)?;
+    let admitted =
+        reconstruct_admission(connection, policy, &stored.proof, &facts, &stored.transport)?;
     let auth = policy.verified().verify_operation_authorization(
         &admitted,
         &facts,
@@ -1528,7 +1800,7 @@ impl Store {
             session.native_id = None;
             session.sdk_config = Some(sdk_config.into());
         }
-        consume_authorization_in(
+        let admission = consume_authorization_in(
             &tx,
             &self.policy,
             auth,
@@ -1587,7 +1859,9 @@ impl Store {
                 params![space, trigger, "v2", serde_json::to_string(&continuation)?])? == 1,
                 "continuation already has an admitted attempt; reconcile it");
         }
+        let checkpoint = prepare_local_admission_checkpoint_in(&tx, &self.policy, &admission)?;
         tx.commit()?;
+        self.policy.local_admissions.insert(checkpoint);
         Ok(ManagerAdmission {
             manager_id: auth.operation_id().into(),
             invocation,
@@ -1866,7 +2140,9 @@ impl Store {
                 params![request.network_id, request.target_node, request.session_id, session.revision, serde_json::to_string(&session)?])?;
         }
         append_admitted_dispatch_in(&tx, &self.policy, identity, &admission, request, now_ms)?;
+        let checkpoint = prepare_local_admission_checkpoint_in(&tx, &self.policy, &admission)?;
         tx.commit()?;
+        self.policy.local_admissions.insert(checkpoint);
         Ok(OperationRecord {
             request: request.clone(),
             state: OperationState::Accepted,
@@ -1893,8 +2169,13 @@ impl Store {
             &stored.proof.source_body,
             &stored.proof.invocation.payload.audience,
         )?;
-        let admission =
-            reconstruct_admission(&self.policy, &stored.proof, &facts, &stored.transport)?;
+        let admission = reconstruct_admission(
+            &self.connection,
+            &self.policy,
+            &stored.proof,
+            &facts,
+            &stored.transport,
+        )?;
         Ok(self.policy.verified().verify_operation_authorization(
             &admission,
             &facts,
@@ -2515,8 +2796,13 @@ pub(crate) mod tests {
             &fixture.body,
             fixture.auth.audience(),
         )?;
-        let historical =
-            reconstruct_admission(&fixture.policy, &admitted, &facts, &fixture.transport)?;
+        let historical = reconstruct_admission(
+            &fixture.connection,
+            &fixture.policy,
+            &admitted,
+            &facts,
+            &fixture.transport,
+        )?;
         validate_persisted_admission(&fixture.connection, &admitted)?;
         assert_eq!(
             historical.signed_invocation(),

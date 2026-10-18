@@ -2268,6 +2268,21 @@ impl ExecutionProofUsage {
         self.max_chain_depth = self.max_chain_depth.max(auth.grant_path().len());
         Ok(())
     }
+    pub fn record_cached_admission(
+        &mut self,
+        auth: &VerifiedAuthorization,
+        proof: &AdmissionProof,
+    ) -> Result<()> {
+        require(auth.signed_invocation() == &proof.invocation,
+            "cached admission differs from its verified invocation")?;
+        self.objects.extend(auth.budget.object_bytes.iter().map(|(hash, size)| (hash.clone(), *size)));
+        self.record_chain_depth(auth.grant_path().len());
+        let mut retained = Self::default();
+        retained.record_admission_kind(proof, false)?;
+        retained.signatures.clear();
+        self.merge(&retained);
+        Ok(())
+    }
     pub(super) fn record_budget(&mut self, budget: &Budget) -> Result<()> {
         for (hash, size) in &budget.object_bytes {
             self.objects.insert(hash.clone(), *size);

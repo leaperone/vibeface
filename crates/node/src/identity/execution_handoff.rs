@@ -443,7 +443,7 @@ fn verify_capsule_admission(
     origin: Option<&CompactSdkOrigin>,
 ) -> Result<vibeface_secure::authorization::VerifiedAdmission> {
     let historical = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
-    let admitted = super::admission::reconstruct_admission(
+    let admitted = super::admission::reconstruct_admission_uncached(
         policy,
         proof,
         facts,

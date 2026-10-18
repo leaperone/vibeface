@@ -62,8 +62,9 @@ fn schema_objects(connection: &Connection) -> Result<Vec<(String, String, String
         .collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-fn validate_persisted_state(connection: &Connection) -> Result<()> {
-    let policy = crate::identity::journal::PolicyState::load(connection)?;
+fn validate_persisted_state(connection: &Connection) -> Result<crate::identity::journal::PolicyState> {
+    let snapshot = if connection.is_autocommit() { Some(connection.unchecked_transaction()?) } else { None };
+    let mut policy = crate::identity::journal::PolicyState::load(connection)?;
     let mut statement = connection.prepare("SELECT space_id,revision,bundle FROM spaces")?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -98,10 +99,12 @@ fn validate_persisted_state(connection: &Connection) -> Result<()> {
         .collect();
     ensure!(seen == expected, "stored space projection is incomplete");
     crate::identity::policy::validate_resource_projections(connection)?;
-    crate::identity::admission::validate_persisted_authorizations(connection, &policy)?;
+    let checkpoints = crate::identity::admission::verified_admission_checkpoints_from(connection, &policy)?;
     crate::identity::enrollment_store::validate_enrollment_storage(connection, &policy)?;
     crate::identity::execution_handoff::validate_execution_handoff_storage(connection, &policy)?;
-    Ok(())
+    policy.local_admissions = checkpoints;
+    if let Some(snapshot) = snapshot { snapshot.commit()?; }
+    Ok(policy)
 }
 
 fn private_sidecars(path: &Path) -> Result<()> {
@@ -334,7 +337,7 @@ impl Store {
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", true)?;
         verify_schema(&connection)?;
-        validate_persisted_state(&connection)?;
+        let policy = validate_persisted_state(&connection)?;
         for suffix in ["-wal", "-shm", "-journal"] {
             let mut name = path.as_os_str().to_owned();
             name.push(suffix);
@@ -347,7 +350,6 @@ impl Store {
                 );
             }
         }
-        let policy = crate::identity::journal::PolicyState::load(&connection)?;
         Ok(Self {
             connection,
             policy,
@@ -401,12 +403,11 @@ impl Store {
             tx.commit()?;
         }
         verify_schema(&connection)?;
-        validate_persisted_state(&connection)?;
+        let policy = validate_persisted_state(&connection)?;
         if !memory {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
             private_sidecars(path)?;
         }
-        let policy = crate::identity::journal::PolicyState::load(&connection)?;
         let mut store = Self {
             connection,
             policy,

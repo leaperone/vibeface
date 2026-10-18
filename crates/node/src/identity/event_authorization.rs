@@ -1,8 +1,4 @@
-use super::{
-    admission::{reconstruct_admission, reconstruct_admission_at_current_heads},
-    journal::PolicyState,
-    policy::FreshnessProof,
-};
+use super::{admission::reconstruct_admission, journal::PolicyState, policy::FreshnessProof};
 use crate::{
     crypto::{self, LocalIdentity},
     model::{
@@ -846,12 +842,7 @@ fn validate_event_evidence_in_state(
         return Ok(EventEvidenceStatus::Pending);
     };
     let transport = proof.transport.clone().into_evidence();
-    if current_heads {
-        reconstruct_admission_at_current_heads(policy, proof, &facts, &transport)?
-            .context("local event admission policy changed")?;
-    } else {
-        reconstruct_admission(policy, proof, &facts, &transport)?;
-    }
+    reconstruct_admission(connection, policy, proof, &facts, &transport)?;
     validate_sdk_parent(policy, connection, state, event, events, &facts)?;
     match &event.cause {
         EventCause::Invocation { .. } => {
@@ -960,12 +951,7 @@ pub(crate) fn event_authorization_in_view(
     let facts = historical_facts(historical, event, events, &ancestors)?
         .context("event resource history is incomplete")?;
     let transport = proof.transport.clone().into_evidence();
-    let admitted = if current_heads {
-        reconstruct_admission_at_current_heads(policy, proof, &facts, &transport)?
-            .context("retained event admission policy changed")?
-    } else {
-        reconstruct_admission(policy, proof, &facts, &transport)?
-    };
+    let admitted = reconstruct_admission(connection, policy, proof, &facts, &transport)?;
     Ok(state.verify_operation_authorization(&admitted, &facts, &transport, now_ms)?)
 }
 
@@ -2026,7 +2012,10 @@ impl Store {
         )?;
         let signed =
             append_admitted_events_in(&tx, &self.policy, identity, &admitted, events, now_ms)?;
+        let checkpoint =
+            super::admission::prepare_local_admission_checkpoint_in(&tx, &self.policy, &admitted)?;
         tx.commit()?;
+        self.policy.local_admissions.insert(checkpoint);
         Ok(signed)
     }
 

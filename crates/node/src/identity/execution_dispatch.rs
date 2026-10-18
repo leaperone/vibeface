@@ -950,7 +950,11 @@ impl Store {
         super::event_authorization::append_admitted_dispatch_in(
             &tx, &self.policy, identity, &admission, request, now_ms,
         )?;
+        let checkpoint = super::admission::prepare_local_admission_checkpoint_in(
+            &tx, &self.policy, &admission,
+        )?;
         tx.commit()?;
+        self.policy.local_admissions.insert(checkpoint);
         Ok(OperationRecord {
             request: request.clone(),
             state: OperationState::Accepted,

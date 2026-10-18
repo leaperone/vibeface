@@ -16,6 +16,7 @@ pub(crate) struct PolicyState {
     pins: Vec<PolicyPin>,
     accepted: BTreeMap<ObjectHash, AcceptedEntry>,
     order: Vec<ObjectHash>,
+    pub(crate) local_admissions: super::admission::AdmissionCheckpoints,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1038,6 +1039,7 @@ impl PolicyState {
             pins,
             accepted: BTreeMap::new(),
             order: Vec::new(),
+            local_admissions: Default::default(),
         };
         let mut additions = Vec::with_capacity(journal.len());
         for entry in journal {
