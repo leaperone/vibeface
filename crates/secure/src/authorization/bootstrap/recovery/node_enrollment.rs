@@ -2,7 +2,19 @@
 
 use super::*;
 use crate::authorization::{
-    client_policy_import::require_confirmed_client_policy, policy_import::VerifiedPolicySnapshot,
+    client_policy_import::require_confirmed_client_policy,
+    enrollment_policy_import::{
+        EnrollmentPolicyDescriptor, EnrollmentPolicyPurpose, EnrollmentPolicyReadRequest,
+    },
+    execution_handoff::ExecutionProofUsage,
+    policy_import::VerifiedPolicySnapshot,
+};
+
+mod policy_import;
+pub use policy_import::{
+    AccountNodeEnrollmentImport, AccountNodeEnrollmentImportApproval,
+    VerifiedAccountNodeEnrollmentContext, begin_account_node_enrollment_import,
+    sign_account_node_enrollment_import_approval,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,22 +36,18 @@ impl SignedObject for AccountNodeEnrollmentIntent {
     const DOMAIN: &'static str = "account-node-enrollment-v2";
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct AccountNodePossessionRequest {
+pub struct AccountNodeEnrollmentCredential {
     pub intent: Signed<AccountNodeEnrollmentIntent>,
-    pub pins: Vec<PolicyPin>,
-    pub bundle: ClientAuthorizationBundle,
-}
-
-fn context_hash(pins: &[PolicyPin], bundle: &ClientAuthorizationBundle) -> Result<ObjectHash> {
-    ObjectHash::body(&serde_json::json!({"pins": pins, "bundle": bundle}))
+    pub descriptor: EnrollmentPolicyDescriptor,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AccountNodeEnrollmentCommitRequest {
     pub intent: Signed<AccountNodeEnrollmentIntent>,
+    pub descriptor: EnrollmentPolicyDescriptor,
     pub certificate: Signed<DeviceCertificate>,
     pub proposal: Signed<AccountDocument>,
 }
@@ -65,6 +73,8 @@ impl VerifiedAccountNodeEnrollmentProposal {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct PreparedAccountNodeEnrollment {
     intent: Signed<AccountNodeEnrollmentIntent>,
+    descriptor: EnrollmentPolicyDescriptor,
+    read_request: Signed<EnrollmentPolicyReadRequest>,
     snapshot: VerifiedPolicySnapshot,
     authorization: VerifiedClientAuthorization,
 }
@@ -79,19 +89,16 @@ pub struct PreparedAccountNodeEnrollmentCommit {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AccountNodeInstallation {
-    request: AccountNodeEnrollmentCommitRequest,
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
-    committed: Committed<AccountDocument>,
+pub struct AccountNodeInstallation {
+    pub request: AccountNodeEnrollmentCommitRequest,
+    pub committed: Committed<AccountDocument>,
 }
 
 #[derive(Clone, Debug)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct VerifiedAccountNodeEnrollment {
     installation: AccountNodeInstallation,
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
+    snapshot: VerifiedPolicySnapshot,
     authorization: Option<VerifiedClientAuthorization>,
 }
 
@@ -117,24 +124,12 @@ fn root_material_snapshot(
     Ok((material.scope.account_id.clone(), root, snapshot))
 }
 
-fn snapshot_bundle(
-    snapshot: &VerifiedPolicySnapshot,
-    authorization: &VerifiedClientAuthorization,
-) -> ClientAuthorizationBundle {
-    ClientAuthorizationBundle {
-        journal: snapshot.journal().to_vec(),
-        grant_leaf: authorization.grant_leaf.clone(),
-    }
-}
 impl VerifiedAccountNodeEnrollment {
     pub fn pins(&self) -> &[PolicyPin] {
-        &self.pins
-    }
-    pub fn bundle(&self) -> &ClientAuthorizationBundle {
-        &self.bundle
+        self.snapshot.pins()
     }
     pub fn journal(&self) -> &[JournalEntry] {
-        &self.bundle.journal
+        self.snapshot.journal()
     }
     pub fn account(&self) -> &AccountId {
         &self.installation.request.intent.payload.account
@@ -181,7 +176,7 @@ fn verify_intent(
     state: &VerifiedPolicySet,
     signed: &Signed<AccountNodeEnrollmentIntent>,
     now: u64,
-) -> Result<()> {
+) -> Result<ExecutionProofUsage> {
     let i = &signed.payload;
     signed.verify_signature()?;
     let account = state
@@ -195,7 +190,16 @@ fn verify_intent(
         "node enrollment changed the current account root, head or authority",
     )?;
     validate_window(i.issued_at_ms, i.expires_at_ms, now)?;
-    state.verify_account_client_device(&i.account, &i.requesting_device, now)?;
+    let manager = state.verify_account_client_device(&i.account, &i.requesting_device, now)?;
+    require(
+        manager.payload.uses.contains(&DeviceUse::EnrollDevice)
+            && account.enrollment.iter().any(|authority| {
+                authority.device == i.requesting_device
+                    && now < authority.expires_at_ms
+                    && authority.rights.contains(&AccountRight::EnrollDevice)
+            }),
+        "node enrollment requires a current account enrollment manager",
+    )?;
     require(
         i.expires_at_ms - i.issued_at_ms <= NODE_CLAIM_MAX_AGE_MS
             && i.expires_at_ms <= i.claim.payload.expires_at_ms,
@@ -216,7 +220,91 @@ fn verify_intent(
         "node enrollment changed the exact personal service certificate",
     )?;
     validate_window(c.not_before_ms, c.expires_at_ms, now)?;
-    fresh_node_key(state, &c.public_key)
+    fresh_node_key(state, &c.public_key)?;
+    let mut budget = Budget::default();
+    state.validate_certificate(
+        manager,
+        now,
+        &mut budget,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )?;
+    let mut usage = ExecutionProofUsage::default();
+    usage.record_budget(&budget)?;
+    usage.record_signed(signed)?;
+    usage.record_signed(&i.claim)?;
+    usage.enforce_limits()?;
+    Ok(usage)
+}
+
+pub fn verify_account_node_enrollment_read(
+    state: &VerifiedPolicySet,
+    intent: &Signed<AccountNodeEnrollmentIntent>,
+    descriptor: &EnrollmentPolicyDescriptor,
+    source: &PublicKey,
+    noise: &PublicKey,
+    now: u64,
+) -> Result<ExecutionProofUsage> {
+    let mut usage = verify_intent(state, intent, now)?;
+    let i = &intent.payload;
+    let account = state
+        .account(&i.account)
+        .ok_or(AuthorizationError::Revoked)?;
+    let domains = [
+        PolicyDomain::Account(i.account.clone()),
+        PolicyDomain::Space(SpaceId::personal(&i.account)),
+    ];
+    require(
+        descriptor.version == AUTH_VERSION
+            && descriptor.purpose == EnrollmentPolicyPurpose::AccountNode
+            && descriptor.account == i.account
+            && descriptor.requesting_device == i.requesting_device
+            && descriptor.source_node_public_key == *source
+            && account.authority.public_key == *source
+            && DeviceId::from_key(noise) == i.requesting_device
+            && descriptor.claim_hash.as_ref() == Some(&i.claim.hash()?)
+            && descriptor.nonce == i.claim.payload.claim_nonce
+            && descriptor.issued_at_ms == i.issued_at_ms
+            && descriptor.expires_at_ms == i.expires_at_ms
+            && descriptor.pins.len() == domains.len()
+            && descriptor.target_heads.len() == domains.len()
+            && descriptor
+                .required_heads
+                .windows(2)
+                .all(|pair| pair[0].domain < pair[1].domain)
+            && descriptor.pins.iter().zip(&domains).all(|(pin, domain)| {
+                pin.domain == *domain
+                    && pin.genesis_root == account.genesis_root
+                    && pin
+                        .minimum_head
+                        .as_ref()
+                        .is_none_or(|head| state.roots.contains_key(head))
+            })
+            && descriptor
+                .target_heads
+                .iter()
+                .zip(&domains)
+                .all(|(head, domain)| head.domain == *domain && state.head(domain) == Some(head))
+            && descriptor
+                .required_heads
+                .iter()
+                .all(|head| domains.contains(&head.domain) && state.roots.contains_key(head))
+            && ObjectHash::body(descriptor)? == i.context_hash,
+        "node enrollment changed its independent roots, exact heads, source, claim or Noise client",
+    )?;
+    let source_device = state.verify_transport_device(&DeviceId::from_key(source), now)?;
+    let mut budget = Budget::default();
+    state.validate_certificate(
+        source_device,
+        now,
+        &mut budget,
+        &mut BTreeMap::new(),
+        &mut BTreeSet::new(),
+    )?;
+    usage.record_budget(&budget)?;
+    usage.record_metadata(descriptor)?;
+    usage.enforce_limits()?;
+    Ok(usage)
 }
 
 fn proposed_account(
@@ -251,7 +339,25 @@ pub fn verify_account_node_enrollment_proposal(
         canonical(request)?.len() <= MAX_PROOF_BYTES,
         "node enrollment proposal too large",
     )?;
-    verify_intent(state, &request.intent, now_ms)?;
+    let source = state
+        .account(&request.intent.payload.account)
+        .ok_or(AuthorizationError::Revoked)?
+        .authority
+        .public_key
+        .clone();
+    let requester = state
+        .find_device(&request.intent.payload.requesting_device)?
+        .payload
+        .public_key
+        .clone();
+    verify_account_node_enrollment_read(
+        state,
+        &request.intent,
+        &request.descriptor,
+        &source,
+        &requester,
+        now_ms,
+    )?;
     let mut certificate = request.intent.payload.certificate.clone();
     certificate.possession = request.certificate.payload.possession.clone();
     require(
@@ -298,7 +404,6 @@ pub fn prepare_account_node_enrollment(
             "node enrollment requires this account's confirmed requesting client",
         )?;
         let state = snapshot.state();
-        let bundle = snapshot_bundle(&snapshot, authorization);
         let head = state
             .head(&PolicyDomain::Account(account.clone()))
             .ok_or(AuthorizationError::Revoked)?
@@ -309,12 +414,30 @@ pub fn prepare_account_node_enrollment(
             .payload
             .expires_at_ms
             .min(now.saturating_add(NODE_CLAIM_MAX_AGE_MS));
+        let descriptor = EnrollmentPolicyDescriptor {
+            version: AUTH_VERSION,
+            purpose: EnrollmentPolicyPurpose::AccountNode,
+            account: account.clone(),
+            requesting_device: authorization.scope.device_id.clone(),
+            source_node_public_key: authorization.audience_public_key.clone(),
+            pins: snapshot.pins().to_vec(),
+            required_heads: snapshot
+                .pins()
+                .iter()
+                .filter_map(|pin| pin.minimum_head.clone())
+                .collect(),
+            target_heads: snapshot.heads().to_vec(),
+            claim_hash: Some(claim.claim.hash()?),
+            nonce: claim.claim.payload.claim_nonce.clone(),
+            issued_at_ms: now,
+            expires_at_ms: expires,
+        };
         let intent = Signed::sign(
             AccountNodeEnrollmentIntent {
                 version: AUTH_VERSION,
                 account: account.clone(),
                 requesting_device: DeviceId::from_key(&PublicKey::of(requesting_client)),
-                context_hash: context_hash(snapshot.pins(), &bundle)?,
+                context_hash: ObjectHash::body(&descriptor)?,
                 expected_head: head.clone(),
                 authority: state
                     .account(&account)
@@ -342,9 +465,37 @@ pub fn prepare_account_node_enrollment(
             },
             &root,
         )?;
-        verify_intent(&state, &intent, now)?;
+        verify_account_node_enrollment_read(
+            state,
+            &intent,
+            &descriptor,
+            &authorization.audience_public_key,
+            &PublicKey::of(requesting_client),
+            now,
+        )?;
+        let credential = AccountNodeEnrollmentCredential {
+            intent: intent.clone(),
+            descriptor: descriptor.clone(),
+        };
+        let read_request = Signed::sign(
+            EnrollmentPolicyReadRequest {
+                version: AUTH_VERSION,
+                purpose: EnrollmentPolicyPurpose::AccountNode,
+                credential_hash: ObjectHash::body(&credential)?,
+                descriptor_hash: ObjectHash::body(&descriptor)?,
+                reader_public_key: PublicKey::of(requesting_client),
+                target_public_key: claim.claim.payload.node_public_key.clone(),
+                node_public_key: descriptor.source_node_public_key.clone(),
+                nonce: Nonce::random()?,
+                issued_at_ms: now,
+                expires_at_ms: expires,
+            },
+            requesting_client,
+        )?;
         Ok(PreparedAccountNodeEnrollment {
             intent,
+            descriptor,
+            read_request,
             snapshot,
             authorization: authorization.clone(),
         })
@@ -356,44 +507,40 @@ pub fn prepare_account_node_enrollment(
 impl PreparedAccountNodeEnrollment {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = requestJson))]
     pub fn request_json(&self) -> crate::Result<String> {
-        encode(&AccountNodePossessionRequest {
-            intent: self.intent.clone(),
-            pins: self.snapshot.pins().to_vec(),
-            bundle: snapshot_bundle(&self.snapshot, &self.authorization),
-        })
+        encode(&serde_json::json!({
+            "credential":{"purpose":"account_node","credential":AccountNodeEnrollmentCredential {
+                intent:self.intent.clone(),descriptor:self.descriptor.clone()
+            }},
+            "request":self.read_request,
+        }))
     }
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = signAccountNodeEnrollmentPossession))]
 pub fn sign_account_node_enrollment_possession(
-    request_json: &str,
+    context: &VerifiedAccountNodeEnrollmentContext,
     node: &Identity,
     expected_claim_nonce: &str,
     now_ms: f64,
 ) -> crate::Result<String> {
     let sign = || -> Result<String> {
-        let request: AccountNodePossessionRequest =
-            decode_bounded(request_json, MAX_RECOVERY_JOURNAL_BYTES)?;
-        require(
-            request.bundle.journal.len() <= 126
-                && canonical(&request.pins)?.len() <= MAX_PROOF_BYTES,
-            "node possession history requires checkpoint",
-        )?;
-        require(
-            request.intent.payload.context_hash == context_hash(&request.pins, &request.bundle)?,
-            "node possession changed the root approved public trust context",
-        )?;
-        let state = replay_policies(&request.pins, &request.bundle.journal)?;
-        let request = request.intent;
+        let request = &context.credential.intent;
         let now = timestamp(now_ms)?;
-        verify_intent(&state, &request, now)?;
+        verify_account_node_enrollment_read(
+            context.policy.state(),
+            request,
+            &context.credential.descriptor,
+            &context.credential.descriptor.source_node_public_key,
+            &context.reader,
+            now,
+        )?;
         validate_claim(
             &request.payload.claim,
             &PublicKey::of(node),
             &Nonce::parse(expected_claim_nonce)?,
             now,
         )?;
-        let mut certificate = request.payload.certificate;
+        let mut certificate = request.payload.certificate.clone();
         certificate.prove_possession(node)?;
         Ok(certificate
             .possession
@@ -437,6 +584,7 @@ pub fn prepare_account_node_enrollment_commit(
         )?;
         let request = AccountNodeEnrollmentCommitRequest {
             intent: prepared.intent.clone(),
+            descriptor: prepared.descriptor.clone(),
             certificate,
             proposal,
         };
@@ -568,7 +716,6 @@ fn finish(
         space: resource.payload.space.clone(),
         resource: resource.payload.resource.clone(),
     };
-    let bundle = snapshot_bundle(&snapshot, original);
     let authorization = match verify_client_policy_state_selected(
         snapshot.state().clone(),
         &ClientAuthorizationBundle {
@@ -589,7 +736,7 @@ fn finish(
     ) {
         Ok(mut authorization) => {
             authorization.policy_journal = snapshot.journal().to_vec();
-            authorization.imported_snapshot = Some(snapshot);
+            authorization.imported_snapshot = Some(snapshot.clone());
             authorization.client_policy_context = original.client_policy_context.clone();
             Some(authorization)
         }
@@ -599,12 +746,9 @@ fn finish(
     Ok(VerifiedAccountNodeEnrollment {
         installation: AccountNodeInstallation {
             request: prepared.request.clone(),
-            pins: prepared.snapshot.pins().to_vec(),
-            bundle: snapshot_bundle(&prepared.snapshot, original),
             committed: committed.clone(),
         },
-        pins,
-        bundle,
+        snapshot,
         authorization,
     })
 }
@@ -626,19 +770,65 @@ pub fn finish_account_node_enrollment(
     verify().map_err(|e| e.to_string())
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyAccountNodeInstallation))]
+pub struct VerifiedAccountNodeInstallation {
+    policy: VerifiedPolicySnapshot,
+    accepted_prefix_len: usize,
+    account: AccountId,
+    requesting_device: DeviceId,
+    node_public_key: PublicKey,
+    claim_nonce: Nonce,
+    request_hash: ObjectHash,
+    input_hash: ObjectHash,
+    proof_usage: ExecutionProofUsage,
+}
+impl VerifiedAccountNodeInstallation {
+    pub fn accepted_prefix_len(&self) -> usize {
+        self.accepted_prefix_len
+    }
+    pub fn account(&self) -> &AccountId {
+        &self.account
+    }
+    pub fn requesting_device(&self) -> &DeviceId {
+        &self.requesting_device
+    }
+    pub fn node_public_key(&self) -> &PublicKey {
+        &self.node_public_key
+    }
+    pub fn claim_nonce(&self) -> &Nonce {
+        &self.claim_nonce
+    }
+    pub fn request_hash(&self) -> &ObjectHash {
+        &self.request_hash
+    }
+    pub fn input_hash(&self) -> &ObjectHash {
+        &self.input_hash
+    }
+    pub fn pins(&self) -> &[PolicyPin] {
+        self.policy.pins()
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.proof_usage
+    }
+    pub fn into_store_parts(self) -> (VerifiedPolicySet, Vec<PolicyPin>, Vec<JournalEntry>) {
+        self.policy.into_parts()
+    }
+}
+
 pub fn verify_account_node_installation(
+    context: &VerifiedAccountNodeEnrollmentContext,
     installation_json: &str,
     node: &Identity,
     expected_claim_nonce: &str,
     now_ms: f64,
-) -> crate::Result<VerifiedAccountNodeEnrollment> {
-    let verify = || -> Result<VerifiedAccountNodeEnrollment> {
-        let installation: AccountNodeInstallation = decode_bounded(installation_json, 2_097_152)?;
+) -> crate::Result<VerifiedAccountNodeInstallation> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
+    let verify = || -> Result<VerifiedAccountNodeInstallation> {
+        let installation: AccountNodeInstallation =
+            decode_bounded(installation_json, MAX_PROOF_BYTES)?;
         require(
-            installation.request.intent.payload.context_hash
-                == context_hash(&installation.pins, &installation.bundle)?,
-            "node installation changed the root approved public trust context",
+            installation.request.intent == context.credential.intent
+                && installation.request.descriptor == context.credential.descriptor,
+            "node installation changed its completed purpose-bound context",
         )?;
         let accepted = installation.committed.commit.payload.accepted_at_ms;
         validate_claim(
@@ -653,27 +843,68 @@ pub fn verify_account_node_installation(
         ];
         let now = timestamp(now_ms)?;
         require(
-            installation.committed.proposal == installation.request.proposal && accepted <= now,
+            installation.committed.proposal == installation.request.proposal
+                && context.approved_at_ms <= accepted
+                && accepted <= now,
             "node installation changed the approved account proposal or acceptance clock",
         )?;
-        let mut current = replay_policies(&installation.pins, &installation.bundle.journal)?;
-        verify_account_node_enrollment_proposal(&current, &installation.request, accepted)?;
-        current.install_device(installation.request.certificate.clone(), accepted)?;
-        let head = current.replay_account_committed(installation.committed.clone())?;
-        current.verify_transport_device(&DeviceId::from_key(&PublicKey::of(node)), now)?;
-        let mut pins = installation.pins.clone();
-        let pin = pins
-            .iter_mut()
-            .find(|pin| pin.domain == head.domain)
-            .ok_or(AuthorizationError::Revoked)?;
-        pin.minimum_head = Some(head);
-        let mut bundle = installation.bundle.clone();
-        bundle.journal.extend(delta);
-        Ok(VerifiedAccountNodeEnrollment {
-            installation,
-            pins,
-            bundle,
-            authorization: None,
+        verify_account_node_enrollment_proposal(
+            context.policy.state(),
+            &installation.request,
+            accepted,
+        )?;
+        let policy = context.policy.apply_delta(&delta)?;
+        policy
+            .state()
+            .verify_transport_device(&DeviceId::from_key(&PublicKey::of(node)), now)?;
+        policy.state().verify_account_client_device(
+            &installation.request.intent.payload.account,
+            &installation.request.intent.payload.requesting_device,
+            now,
+        )?;
+        let mut pins = policy.pins().to_vec();
+        for pin in &mut pins {
+            pin.minimum_head = policy.state().head(&pin.domain).cloned();
+        }
+        let policy = policy.with_independent_pins(&pins)?;
+        let mut proof_usage = verify_account_node_enrollment_read(
+            context.policy.state(),
+            &installation.request.intent,
+            &installation.request.descriptor,
+            &installation.request.descriptor.source_node_public_key,
+            &context.reader,
+            accepted,
+        )?;
+        proof_usage.record_metadata(&installation)?;
+        proof_usage.record_signed(&installation.request.certificate)?;
+        proof_usage.record_signed(&installation.committed.proposal)?;
+        proof_usage.record_signed(&installation.committed.commit)?;
+        for receipt in &installation.committed.receipts {
+            proof_usage.record_signed(receipt)?;
+        }
+        proof_usage.enforce_limits()?;
+        Ok(VerifiedAccountNodeInstallation {
+            accepted_prefix_len: context.policy.journal().len(),
+            account: installation.request.intent.payload.account.clone(),
+            requesting_device: installation
+                .request
+                .intent
+                .payload
+                .requesting_device
+                .clone(),
+            node_public_key: PublicKey::of(node),
+            claim_nonce: installation
+                .request
+                .intent
+                .payload
+                .claim
+                .payload
+                .claim_nonce
+                .clone(),
+            request_hash: ObjectHash::body(&installation.request.intent)?,
+            input_hash: ObjectHash::body(&installation)?,
+            proof_usage,
+            policy,
         })
     };
     verify().map_err(|e| e.to_string())
@@ -686,11 +917,7 @@ impl VerifiedAccountNodeEnrollment {
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = pinsJson))]
     pub fn pins_json(&self) -> crate::Result<String> {
-        encode(&self.pins)
-    }
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = bundleJson))]
-    pub fn bundle_json(&self) -> crate::Result<String> {
-        encode(&self.bundle)
+        encode(self.snapshot.pins())
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = installationJson))]
     pub fn installation_json(&self) -> crate::Result<String> {
