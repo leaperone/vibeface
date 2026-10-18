@@ -1,15 +1,23 @@
 //! A finite policy read over a dedicated Noise channel; it creates no business session.
 
+use super::client_policy_read::{check_heads_in, signer};
 use crate::{crypto::LocalIdentity, runtime::Runtime, store::Store};
 use anyhow::{Result, ensure};
+use rusqlite::{Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use vibeface_secure::authorization::{
-    MAX_PROOF_BYTES, PublicKey, Signed,
-    node_execution_policy::NodeExecutionPolicyReadRequest,
-    remote_execution_policy::{
-        RemoteExecutionPolicyPage, RemoteExecutionPolicyPageRequest, RemoteExecutionPolicySnapshot,
-        RemoteExecutionPolicyWitness,
+use vibeface_secure::{
+    authorization::{
+        AUTH_VERSION, FreshnessReceipt, MAX_PROOF_BYTES, ObjectHash, PublicKey, Signed,
+        node_execution_policy::{
+            NodeExecutionFreshnessRead, NodeExecutionPolicyReadRequest,
+            record_node_freshness_receipts, verify_node_execution_freshness_read,
+        },
+        remote_execution_policy::{
+            RemoteExecutionPolicyPage, RemoteExecutionPolicyPageRequest,
+            RemoteExecutionPolicySnapshot, RemoteExecutionPolicyWitness,
+        },
     },
+    signature_verification::ScopedSignatureVerification,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -23,6 +31,7 @@ pub(crate) enum NodeReadRequest {
     Prepare(NodeExecutionPolicyReadRequest),
     Page(RemoteExecutionPolicyPageRequest),
     Finish(RemoteExecutionPolicyPageRequest),
+    Freshness(Signed<NodeExecutionFreshnessRead>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -36,9 +45,61 @@ pub(crate) enum NodeReadResponse {
     Snapshot(Signed<RemoteExecutionPolicySnapshot>),
     Page(Signed<RemoteExecutionPolicyPage>),
     Witness(Signed<RemoteExecutionPolicyWitness>),
+    Receipts(Vec<Signed<FreshnessReceipt>>),
 }
 
 impl Store {
+    fn node_execution_freshness_receipts(
+        &self,
+        identity: &LocalIdentity,
+        actual_noise_public_key: &str,
+        request: &Signed<NodeExecutionFreshnessRead>,
+        now_ms: u64,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        let signatures = ScopedSignatureVerification::new();
+        let signer = signer(identity)?;
+        let local = PublicKey::of(&signer);
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let verified = verify_node_execution_freshness_read(
+            self.policy.verified(),
+            request,
+            &local,
+            &PublicKey::parse(actual_noise_public_key)?,
+            now_ms,
+        )?;
+        check_heads_in(&tx, &self.policy, verified.target_heads())?;
+        self.policy.accepted_journal_snapshot(&tx)?;
+        let challenge = verified.challenge();
+        let challenge_hash = challenge.hash()?;
+        let receipts = challenge
+            .policies
+            .iter()
+            .filter(|stamp| verified.allows_head(stamp))
+            .map(|stamp| {
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: stamp.clone(),
+                        challenge_hash: challenge_hash.clone(),
+                        issued_at_ms: now_ms,
+                        expires_at_ms: verified.expires_at_ms(),
+                    },
+                    &signer,
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut usage = record_node_freshness_receipts(&verified, &receipts, now_ms)?;
+        let envelopes = receipts
+            .iter()
+            .map(ObjectHash::body)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        usage.record_metadata(&("node-execution-freshness-receipts-v2", envelopes))?;
+        usage.record_actual_signature_counts(signatures.counts());
+        usage.enforce_limits()?;
+        tx.commit()?;
+        Ok(receipts)
+    }
+
     fn read_node_execution_policy(
         &mut self,
         identity: &LocalIdentity,
@@ -81,6 +142,14 @@ impl Store {
                     now_ms,
                 )?;
                 NodeReadResponse::Witness(serde_json::from_value(value["witness"].clone())?)
+            }
+            NodeReadRequest::Freshness(request) => {
+                NodeReadResponse::Receipts(self.node_execution_freshness_receipts(
+                    identity,
+                    actual_noise_public_key,
+                    &request,
+                    now_ms,
+                )?)
             }
         };
         ensure!(
