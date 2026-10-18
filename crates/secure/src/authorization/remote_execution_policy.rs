@@ -752,14 +752,13 @@ pub(super) fn reference_closure(
             .find(|domain| !visited.contains(*domain))
             .cloned();
         if let Some(domain) = next {
-            let pin = independent.iter().find(|pin| pin.domain == domain).ok_or(
-                AuthorizationError::InvalidProof(
-                    "policy dependency needs an independently saved pin",
-                ),
-            )?;
             let head = state
                 .head(&domain)
                 .ok_or(AuthorizationError::PolicyConflict)?;
+            let pin = independent
+                .iter()
+                .find(|pin| pin.domain == domain)
+                .ok_or_else(|| AuthorizationError::NeedPolicySync(vec![head.clone()]))?;
             let genesis = match &domain {
                 PolicyDomain::Account(account) => state
                     .account(account)
