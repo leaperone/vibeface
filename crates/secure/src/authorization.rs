@@ -2475,13 +2475,7 @@ impl VerifiedPolicySet {
             now_ms >= admission.admitted_at_ms,
             "operation clock moved backwards",
         )?;
-        self.verify_invocation_inner(
-            &admission.invocation,
-            facts,
-            transport,
-            now_ms,
-            AuthorizationPhase::Operation,
-        )
+        self.verify_admitted_operation_authorization(admission, facts, now_ms)
     }
     fn verify_invocation_inner(
         &self,

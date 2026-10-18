@@ -677,6 +677,7 @@ impl VerifiedGatewayForward {
         gateway: &Identity,
         now: u64,
     ) -> Result<Signed<GatewayForwardHeader>> {
+        let _scope = ScopedSignatureVerification::new();
         require(
             PublicKey::of(gateway) == self.header.gateway_key,
             "gateway signer differs from route",
@@ -686,8 +687,9 @@ impl VerifiedGatewayForward {
             original.hash()? == self.header.original_hash,
             "gateway signer changed the original",
         )?;
-        let signed = Signed::sign(self.header.clone(), gateway)?;
         let mut usage = self.usage.clone();
+        original.verify(&mut usage, now)?;
+        let signed = Signed::sign(self.header.clone(), gateway)?;
         usage.record_signed(&signed)?;
         usage.enforce_limits()?;
         require(
@@ -777,10 +779,14 @@ impl VerifiedDirectedGateway {
         local_target: &PublicKey,
         now: u64,
     ) -> Result<()> {
+        let _scope = ScopedSignatureVerification::new();
         require(
             original.hash()? == self.original_hash,
             "directed gateway proof belongs to another original",
         )?;
+        let mut usage = self.usage.clone();
+        original.verify(&mut usage, now)?;
+        finish_usage(&mut usage)?;
         validate_window(
             self.header.payload.issued_at_ms,
             self.header.payload.expires_at_ms,
@@ -2391,6 +2397,24 @@ mod tests {
         };
         assert_eq!(hash, changed.hash().unwrap());
         let header = header(&original, &gateway, &target);
+        let verified = verify_directed_gateway(
+            &PublicKey::of(&gateway),
+            &header,
+            &original,
+            &PublicKey::of(&target),
+            NOW,
+        )
+        .unwrap();
+        assert!(
+            verified
+                .check_original(&changed, &PublicKey::of(&target), NOW)
+                .is_err()
+        );
+        let forward = VerifiedGatewayForward {
+            header: header.payload.clone(),
+            usage: ExecutionProofUsage::default(),
+        };
+        assert!(forward.sign_header(&changed, &gateway, NOW).is_err());
         assert!(
             verify_directed_gateway(
                 &PublicKey::of(&gateway),
