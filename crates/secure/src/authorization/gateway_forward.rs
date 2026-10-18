@@ -2334,6 +2334,9 @@ mod tests {
             .head(&PolicyDomain::Account(account.clone()))
             .cloned();
         document.sequence += 1;
+        document.devices.retain(|hash| {
+            revoked.device(hash).unwrap().payload.device != invocation.payload.device
+        });
         document
             .revoked_devices
             .push(invocation.payload.device.clone());
