@@ -1,0 +1,63 @@
+//! A completed source import is scoped to one immutable Task business wire.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use vibeface_secure::authorization::{
+    ObjectHash, Signed,
+    task_business_policy::{
+        TaskBusinessPolicyHeader, TaskBusinessPolicyPage, TaskBusinessPolicyWitness,
+        TaskBusinessWire, VerifiedTaskBusinessSource,
+    },
+};
+
+#[derive(Serialize, Deserialize)]
+#[serde(
+    tag = "stage",
+    content = "request",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub(crate) enum TaskBusinessRequest {
+    SourceBegin {
+        header: Signed<TaskBusinessPolicyHeader>,
+    },
+    SourcePage {
+        page: Signed<TaskBusinessPolicyPage>,
+    },
+    SourceFinish {
+        witness: Signed<TaskBusinessPolicyWitness>,
+    },
+    Business(TaskBusinessWire),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(
+    tag = "stage",
+    content = "response",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub(crate) enum TaskBusinessResponse {
+    SourceBegun {
+        context_hash: ObjectHash,
+    },
+    SourcePageAccepted {
+        context_hash: ObjectHash,
+        next_page_index: u64,
+        complete: bool,
+    },
+    SourceFinished {
+        context_hash: ObjectHash,
+    },
+    Business(Value),
+}
+
+pub(crate) struct TaskBusinessPolicySession {
+    source: VerifiedTaskBusinessSource,
+}
+
+impl TaskBusinessPolicySession {
+    pub(crate) fn source(&self) -> &VerifiedTaskBusinessSource {
+        &self.source
+    }
+}

@@ -28,6 +28,7 @@ pub(crate) mod remote_execution_policy;
 pub mod services;
 pub(crate) mod task_execution_context;
 pub(crate) mod task_freshness;
+pub(crate) mod task_business_policy;
 pub mod webauthn;
 
 #[cfg(test)]
