@@ -9,7 +9,9 @@ pub mod stream;
 
 use super::*;
 pub use checkpoint::RecoveryPolicyCheckpoint;
-pub(crate) use checkpoint::{compact_recovery_material, material_state};
+pub(crate) use checkpoint::{
+    compact_recovery_material, compact_recovery_material_in_state, material_state,
+};
 use zeroize::Zeroize;
 
 const MAX_RECOVERY_MATERIAL_BYTES: usize = 65_536;
@@ -214,25 +216,31 @@ pub fn build_account_recovery_material(
     endpoint: &str,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
     let build = || -> Result<RecoveryMaterial> {
-        timestamp(now_ms)?;
-        let auth = verify_client_authorization(
-            &created
-                .bundle_json()
-                .map_err(|_| AuthorizationError::InvalidProof("invalid created bundle"))?,
-            &created
-                .pins_json()
-                .map_err(|_| AuthorizationError::InvalidProof("invalid created pins"))?,
-            created.authorization.scope.account_id.as_str(),
-            created.authorization.scope.space_id.as_str(),
-            &replay_policies(&created.pins, &created.bundle.journal)?
+        let now = timestamp(now_ms)?;
+        let state = &created.authorization.policy_snapshot;
+        require(
+            created.authorization.policy_journal == created.bundle.journal
+                && created
+                    .pins
+                    .iter()
+                    .all(|pin| state.head(&pin.domain) == pin.minimum_head.as_ref()),
+            "created recovery material differs from its verified policy state",
+        )?;
+        let auth = verify_client_policy_state(
+            state.clone(),
+            &created.bundle,
+            &created.pins,
+            created.authorization.scope.account_id.clone(),
+            created.authorization.scope.space_id.clone(),
+            state
                 .find_device(&created.authorization.scope.device_id)?
                 .payload
                 .public_key
-                .to_string(),
-            now_ms,
-        )
-        .map_err(|_| AuthorizationError::InvalidProof("created account authorization expired"))?;
+                .clone(),
+            now,
+        )?;
         let mut material = RecoveryMaterial {
             format: "vibeface-account-recovery".to_owned(),
             version: 2,
@@ -247,8 +255,7 @@ pub fn build_account_recovery_material(
             },
             policy_checkpoint: None,
         };
-        validate_material(&material)?;
-        compact_recovery_material(&mut material, timestamp(now_ms)?)?;
+        compact_recovery_material_in_state(&mut material, state, now)?;
         validate_material(&material)?;
         Ok(material)
     };
@@ -889,13 +896,34 @@ mod tests {
             created.pins = installed.pins().to_vec();
             created.bundle = installed.bundle().clone();
         }
-        created.authorization = verify_client_authorization(
-            &created.bundle_json().unwrap(),
-            &created.pins_json().unwrap(),
-            created.authorization.scope.account_id.as_str(),
-            created.authorization.scope.space_id.as_str(),
-            &key(3).public_key_hex(),
-            NOW,
+        let required = created
+            .pins
+            .iter()
+            .filter_map(|pin| pin.minimum_head.clone())
+            .collect();
+        let mut import = crate::authorization::policy_import::BoundedPolicyImport::new(
+            created.pins.clone(),
+            required,
+        )
+        .unwrap();
+        for entry in &created.bundle.journal {
+            let _scope = crate::signature_verification::ScopedSignatureVerification::new();
+            import.apply_entry(entry.clone()).unwrap();
+        }
+        let heads = created
+            .pins
+            .iter()
+            .filter_map(|pin| pin.minimum_head.clone())
+            .collect::<Vec<_>>();
+        let snapshot = import.finish(&heads).unwrap();
+        created.authorization = verify_client_policy_state(
+            snapshot.state().clone(),
+            &created.bundle,
+            &created.pins,
+            created.authorization.scope.account_id.clone(),
+            created.authorization.scope.space_id.clone(),
+            PublicKey::of(&key(3)),
+            NOW as u64,
         )
         .unwrap();
         created
@@ -1511,7 +1539,16 @@ mod tests {
             CreatedAccount {
                 pins: updated_pins.clone(),
                 bundle: updated_bundle.clone(),
-                authorization: created.authorization.clone(),
+                authorization: verify_client_policy_state(
+                    state.clone(),
+                    &updated_bundle,
+                    &updated_pins,
+                    created.authorization.scope.account_id.clone(),
+                    created.authorization.scope.space_id.clone(),
+                    PublicKey::of(&key(3)),
+                    NOW as u64,
+                )
+                .unwrap(),
             },
             12,
         );
@@ -1545,6 +1582,16 @@ mod tests {
             .find(|pin| pin.domain == head.domain)
             .unwrap()
             .minimum_head = Some(head.clone());
+        removed.authorization = verify_client_policy_state(
+            removed_state,
+            &removed.bundle,
+            &removed.pins,
+            removed.authorization.scope.account_id.clone(),
+            removed.authorization.scope.space_id.clone(),
+            PublicKey::of(&key(3)),
+            NOW as u64,
+        )
+        .unwrap();
         let removed_material = material(&removed);
         let private = material_state(&read_material(&removed_material).unwrap()).unwrap();
         assert!(

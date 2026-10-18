@@ -4,6 +4,19 @@ use super::*;
 use context::RecoveryContextRequest;
 use cross_node::CrossNodeRecoveryRequest;
 
+mod import;
+mod node;
+mod proof;
+pub use import::{
+    RecoveryContextImport, VerifiedRecoveryPolicyContext, begin_cross_node_recovery_policy_import,
+    begin_recovery_context_import,
+};
+pub use node::{
+    VerifiedStreamedRecoveryCommit, sign_recovery_node_possession_in_state,
+    verify_recovery_stream_commit_in_state,
+};
+pub use proof::{RecoveryProofCounts, RecoveryProofUsage, validate_recovery_context_page_carrier};
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryContextKind {

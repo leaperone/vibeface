@@ -146,11 +146,41 @@ pub(crate) fn compact_recovery_material(material: &mut RecoveryMaterial, now: u6
     if zeroize::Zeroizing::new(canonical(material)?).len() <= MAX_RECOVERY_MATERIAL_BYTES {
         return Ok(());
     }
+    let state = replay_policies(&material.pins, &material.bundle.journal)?;
+    compact_recovery_material_in_state(material, &state, now)
+}
+
+pub(crate) fn compact_recovery_material_in_state(
+    material: &mut RecoveryMaterial,
+    state: &VerifiedPolicySet,
+    now: u64,
+) -> Result<()> {
+    if material.policy_checkpoint.is_some() {
+        material_state(material)?;
+        return require(
+            zeroize::Zeroizing::new(canonical(material)?).len() <= MAX_RECOVERY_MATERIAL_BYTES,
+            "private recovery checkpoint exceeds 64 KiB",
+        );
+    }
+    let mut history_usage = crate::authorization::execution_handoff::ExecutionProofUsage::default();
+    let history_bounded = material.bundle.journal.iter().all(|entry| {
+        match crate::authorization::policy_proof::policy_entry_payload_usage(entry) {
+            Ok(usage) => {
+                history_usage.merge(&usage);
+                history_usage.enforce_limits().is_ok()
+            }
+            Err(_) => false,
+        }
+    });
+    if history_bounded
+        && zeroize::Zeroizing::new(canonical(material)?).len() <= MAX_RECOVERY_MATERIAL_BYTES
+    {
+        return Ok(());
+    }
     require(
         material.policy_checkpoint.is_none(),
         "private recovery checkpoint exceeds its proof budget",
     )?;
-    let state = replay_policies(&material.pins, &material.bundle.journal)?;
     let root = Identity::from_secret_hex(&material.root_secret_hex)
         .map_err(|_| AuthorizationError::InvalidProof("invalid checkpoint root"))?;
     let recovery = Identity::from_secret_hex(&material.recovery_secret_hex)
@@ -316,6 +346,27 @@ pub(crate) fn material_state(material: &RecoveryMaterial) -> Result<VerifiedPoli
     }
     let _verification = crate::signature_verification::ScopedSignatureVerification::new();
     material_state_with_budget(material, &mut Budget::default())
+}
+
+pub(super) fn material_proof_usage(
+    material: &RecoveryMaterial,
+) -> Result<crate::authorization::execution_handoff::ExecutionProofUsage> {
+    let mut usage = crate::authorization::execution_handoff::ExecutionProofUsage::default();
+    let mut budget = Budget::default();
+    let state = material_state_with_budget(material, &mut budget)?;
+    if material.policy_checkpoint.is_none() {
+        for entry in &material.bundle.journal {
+            usage.merge(&crate::authorization::policy_proof::policy_entry_payload_usage(entry)?);
+        }
+        let at = state
+            .find_device(&material.scope.device_id)?
+            .payload
+            .not_before_ms;
+        scope_budget(&state, material, at, &mut budget)?;
+    }
+    usage.record_budget(&budget)?;
+    usage.enforce_limits()?;
+    Ok(usage)
 }
 
 fn material_state_with_budget(

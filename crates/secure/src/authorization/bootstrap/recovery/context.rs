@@ -130,6 +130,7 @@ pub fn build_recovery_context_request(
     now_ms: f64,
     expires_at_ms: f64,
 ) -> crate::Result<String> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
     let build = || -> Result<Signed<RecoveryContextRequest>> {
         let material = read_material(material_json)?;
         let recovery = validate_material(&material)?;
