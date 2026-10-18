@@ -324,7 +324,7 @@ request 与 response 指向特定 Node，响应必须来自原请求的预期 No
 
 后续权限使用 `DecisionRecorded.tool_configuration` 中带类型的签名记录，类型为 `followup_intent_v1`、`task_origin_v1` 和 `task_followup_grant_v1`。自然语言或模型传入的参数不构成授权。
 
-`message.report_results=true` 产生的意图固定原消息 hash、网络、会话和目标 Scheduler，只允许由该消息可信创建的任务做 `report`。`false` 也保存明确的 `off` 意图，重试不能改变。Rust 从已领取的本人 invocation 推导任务来源，将 `TaskCreated` 和不可改写的来源记录一次提交；模型不能指定来源或把旧任务重新挂到新授权。
+`message.report_results` 默认 `true`。汇报意图固定原消息 hash、网络、会话和目标 Scheduler，普通执行通过签名请求中的 `manager_authority.trigger` 关联原消息，终态只触发只读总结，不创建隐藏 Task。`false` 保存明确的 `off` 意图，重试不能改变。原始结果与通知始终保留，模型不能借回调获得新的写权限。
 
 `set_followup` 仅本人可用，固定到现有任务的 `task_ref`。`off` 禁止自主后续，`report` 只允许读取结果并保存最终 assistant 回答，`continue` 允许在本任务范围内继续业务工作。稳定 grant ID 配合单调版本，`expected_version` 必须使用会话快照返回的当前 `followup_version`。并发或旧版本修改被拒绝，既有授权不能用重试改变目标。
 
