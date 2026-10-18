@@ -147,29 +147,7 @@ pub(super) fn admitted(
     proof: &events::AdmissionProof,
     facts: &RequestFacts,
 ) -> Result<VerifiedAdmission> {
-    let historical = at_heads(current, &proof.challenge.policies)?;
-    let transport = proof.transport.clone().into_evidence();
-    let request = match prepare::remote_selection(&proof.source_body)? {
-        Some((resource, key, grant)) => {
-            let destination = historical.verify_execution_destination(
-                &facts.resource, &facts.audience, &resource, &key, &grant,
-                &facts.context, facts.action, proof.admitted_at_ms,
-            )?;
-            historical.verify_invocation_with_execution_destination(
-                &proof.invocation, facts, &transport, &destination, proof.admitted_at_ms,
-            )?
-        }
-        None => historical.verify_invocation(
-            &proof.invocation, facts, &transport, proof.admitted_at_ms,
-        )?,
-    };
-    let fresh = historical.verify_freshness(
-        &request,
-        &proof.challenge,
-        &proof.receipts,
-        proof.admitted_at_ms,
-    )?;
-    historical.admit_operation(&request, &fresh, proof.admitted_at_ms)
+    current.verify_original_admission(proof, facts)
 }
 
 fn reader_scope(reader: &VerifiedClientAuthorization, resource: &ResourceRef) -> Result<()> {
@@ -238,12 +216,8 @@ pub fn verify_remote_resolution_history(
         )?;
         let accepted = admitted(&state, proof, &facts)?;
         let decision = at_heads(&state, &freshness.challenge.policies)?;
-        let resolver = decision.verify_operation_authorization(
-            &accepted,
-            &facts,
-            &proof.transport.clone().into_evidence(),
-            decision_time,
-        )?;
+        let resolver =
+            decision.verify_admitted_operation_authorization(&accepted, &facts, decision_time)?;
         usage.record_admission(proof)?;
         usage.record_authorization(&resolver)?;
         if unknown {
@@ -316,8 +290,7 @@ pub fn verify_remote_execution_result_history(
         let accepted = admitted(&state,&proof,&facts)?;
         let historical = at_heads(&state,historical_proof.heads())?;
         let time = historical_proof.decision_at_ms();
-        let original = historical.verify_operation_authorization(&accepted,&facts,
-            &proof.transport.clone().into_evidence(),time)?;
+        let original = historical.verify_admitted_operation_authorization(&accepted,&facts,time)?;
         let remote_execution_history::RemoteExecutionHistoryAcceptance::ExecutionResult {
             receipt, freshness, transport,
         } = policy.acceptance()? else {

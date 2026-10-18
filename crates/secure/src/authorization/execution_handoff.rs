@@ -9,6 +9,7 @@ pub struct CompactSdkOrigin {
     pub message_event: EventRef,
     pub sdk_trigger: EventRef,
     pub invocation: Signed<Invocation>,
+    pub source_body: Value,
     pub challenge: FreshnessChallenge,
     pub receipts: Vec<Signed<FreshnessReceipt>>,
     pub admitted_at_ms: u64,
@@ -39,6 +40,8 @@ impl SignedObject for ProjectExecutionSource {
 pub struct VerifiedProjectExecutionSource {
     capsule_hash: ObjectHash,
     usage: ExecutionProofUsage,
+    original: VerifiedAdmission,
+    sdk_parent: Option<VerifiedAdmission>,
 }
 impl VerifiedProjectExecutionSource {
     pub fn capsule_hash(&self) -> &ObjectHash {
@@ -53,13 +56,11 @@ impl VerifiedProjectExecutionSource {
         now_ms: u64,
     ) -> Result<VerifiedAdmission> {
         self.check_capsule(handoff)?;
-        let (_, proof, _, _) = original_dispatch(handoff)?;
-        attested_admission(
-            &proof.invocation,
-            &proof.challenge,
-            proof.admitted_at_ms,
-            now_ms,
-        )
+        require(
+            self.original.admitted_at_ms() <= now_ms,
+            "Project source admission is from the future",
+        )?;
+        Ok(self.original.clone())
     }
     pub fn sdk_parent_admission(
         &self,
@@ -87,12 +88,22 @@ impl VerifiedProjectExecutionSource {
                 && origin.admitted_at_ms <= proof.admitted_at_ms,
             "invalid attested Account message origin",
         )?;
-        Ok(Some(attested_admission(
-            &origin.invocation,
-            &origin.challenge,
-            origin.admitted_at_ms,
-            now_ms,
-        )?))
+        require(
+            origin.admitted_at_ms <= now_ms,
+            "SDK parent admission is from the future",
+        )?;
+        let parent = self
+            .sdk_parent
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "Project source has no verified SDK parent admission",
+            ))?;
+        require(
+            parent.signed_invocation() == &origin.invocation
+                && parent.admitted_at_ms() == origin.admitted_at_ms,
+            "Project source changed its verified SDK parent",
+        )?;
+        Ok(Some(parent.clone()))
     }
     fn check_capsule(&self, handoff: &ExecutionHandoff) -> Result<()> {
         require(
@@ -102,33 +113,15 @@ impl VerifiedProjectExecutionSource {
     }
 }
 
-fn attested_admission(
-    invocation: &Signed<Invocation>,
-    challenge: &FreshnessChallenge,
-    admitted_at_ms: u64,
-    now_ms: u64,
-) -> Result<VerifiedAdmission> {
-    let value = &invocation.payload;
-    require(
-        admitted_at_ms <= now_ms
-            && value.not_before_ms <= admitted_at_ms
-            && admitted_at_ms < value.expires_at_ms
-            && challenge.version == AUTH_VERSION
-            && challenge.stage == CheckStage::Admit
-            && challenge.invocation_hash == invocation.hash()?
-            && challenge.operation_id == value.operation_id
-            && challenge.body_hash == value.body_hash
-            && challenge.audience == value.audience
-            && challenge.presenter == value.presenter
-            && challenge.issued_at_ms <= admitted_at_ms
-            && admitted_at_ms < challenge.expires_at_ms
-            && challenge.policies.len() <= MAX_POLICY_DOMAINS,
-        "invalid Project-attested admission checkpoint",
-    )?;
-    Ok(VerifiedAdmission {
-        invocation: invocation.clone(),
-        admitted_at_ms,
-    })
+fn admission_facts(invocation: &Invocation) -> RequestFacts {
+    RequestFacts {
+        resource: invocation.resource.clone(),
+        action: invocation.action,
+        audience: invocation.audience.clone(),
+        operation_id: invocation.operation_id.clone(),
+        body_hash: invocation.body_hash.clone(),
+        context: invocation.context.clone(),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -501,6 +494,10 @@ pub fn verify_execution_handoff_admission_checkpoint(
                     admitted_at_ms,
                 )?
             && admission.challenge.stage == CheckStage::Admit
+            && transport.existing_evidence()?
+                == TransportEvidence::VerifiedPeer {
+                    origin: wire.invocation.payload.presenter.clone(),
+                }
             && admission.challenge.issued_at_ms <= admitted_at_ms
             && admitted_at_ms < admission.challenge.expires_at_ms
             && wire.invocation.payload.not_before_ms <= admitted_at_ms
@@ -514,10 +511,23 @@ pub fn verify_execution_handoff_admission_checkpoint(
     usage.enforce_limits()?;
     Ok(VerifiedExecutionAdmission {
         handoff_hash: wire.hash()?,
-        submission: VerifiedAdmission {
-            invocation: wire.invocation.clone(),
+        submission: VerifiedAdmission::from_execution_checkpoint(
+            wire.invocation.clone(),
             admitted_at_ms,
-        },
+            transport.existing_evidence()?,
+            usage.clone(),
+            admission
+                .receipts
+                .iter()
+                .map(|value| value.payload.expires_at_ms)
+                .fold(
+                    admission
+                        .challenge
+                        .expires_at_ms
+                        .min(wire.invocation.payload.expires_at_ms),
+                    u64::min,
+                ),
+        )?,
         usage,
     })
 }
@@ -763,7 +773,7 @@ impl VerifiedPolicySet {
                         == Some(origin.invocation.hash()?.as_str())
                     && proof.source_body["sdk_session"]
                         == serde_json::to_value(session).map_err(invalid_shape)?
-                    && proof.transport.clone().into_evidence()
+                    && proof.transport.existing_evidence()?
                         == TransportEvidence::LocalAgentAdapter {
                             service: service.clone(),
                             session: session.clone(),
@@ -779,12 +789,8 @@ impl VerifiedPolicySet {
                 body_hash: parent_value.body_hash.clone(),
                 context: parent_value.context.clone(),
             };
-            let parent = self.verify_operation_authorization(
-                &parent,
-                &parent_facts,
-                &origin.transport.clone().into_evidence(),
-                now_ms,
-            )?;
+            let parent =
+                self.verify_admitted_operation_authorization(&parent, &parent_facts, now_ms)?;
             let child_facts = RequestFacts {
                 resource: invocation.resource.clone(),
                 action: invocation.action,
@@ -901,11 +907,37 @@ impl VerifiedPolicySet {
         usage.record_event_signature(&handoff.task_creation, task.event(), task_admission)?;
         usage.record_event_signature(&handoff.project_dispatch, &dispatch, &proof)?;
         usage.record_binding(&binding)?;
+        let original =
+            self.verify_original_admission(&proof, &admission_facts(&proof.invocation.payload))?;
+        usage.merge(original.proof_usage());
+        let sdk_parent = handoff
+            .sdk_origin
+            .as_ref()
+            .map(|origin| -> Result<VerifiedAdmission> {
+                let parent = self.verify_original_admission(
+                    &AdmissionProof {
+                        invocation: origin.invocation.clone(),
+                        source_body: origin.source_body.clone(),
+                        challenge: origin.challenge.clone(),
+                        receipts: origin.receipts.clone(),
+                        admitted_at_ms: origin.admitted_at_ms,
+                        transport: origin.transport.clone(),
+                    },
+                    &admission_facts(&origin.invocation.payload),
+                )?;
+                usage.merge(parent.proof_usage());
+                Ok(parent)
+            })
+            .transpose()?;
+        usage.enforce_limits()?;
         let verified = VerifiedProjectExecutionSource {
             capsule_hash: statement.capsule_hash,
             usage,
+            original,
+            sdk_parent,
         };
         verified.original_admission(handoff, now_ms)?;
+        verified.sdk_parent_admission(handoff, now_ms)?;
         Ok(verified)
     }
 
@@ -1167,10 +1199,15 @@ impl VerifiedPolicySet {
         )?;
         Ok(VerifiedExecutionAdmission {
             handoff_hash: handoff.hash.clone(),
-            submission: VerifiedAdmission {
-                invocation: handoff.submission.invocation.clone(),
-                admitted_at_ms: now_ms,
-            },
+            submission: VerifiedAdmission::from_execution_checkpoint(
+                handoff.submission.invocation.clone(),
+                now_ms,
+                TransportEvidence::VerifiedPeer {
+                    origin: handoff.submission.device().clone(),
+                },
+                freshness.usage.clone(),
+                freshness.expires_at_ms,
+            )?,
             usage: ExecutionProofUsage::default(),
         })
     }
@@ -1312,10 +1349,15 @@ impl VerifiedPolicySet {
         usage.record_signed(receipt)?;
         let admitted = VerifiedExecutionAdmission {
             handoff_hash: wire.hash()?,
-            submission: VerifiedAdmission {
-                invocation: wire.invocation.clone(),
-                admitted_at_ms: receipt.payload.issued_at_ms,
-            },
+            submission: VerifiedAdmission::from_execution_checkpoint(
+                wire.invocation.clone(),
+                receipt.payload.issued_at_ms,
+                TransportEvidence::VerifiedPeer {
+                    origin: wire.invocation.payload.presenter.clone(),
+                },
+                usage.clone(),
+                0,
+            )?,
             usage,
         };
         let project_receipt_origin = TransportEvidence::VerifiedPeer {
@@ -1687,7 +1729,7 @@ pub fn verify_execution_resolution_admission_checkpoint(
             && result.receipt.payload.issued_at_ms == resolved_at_ms
             && invocation.not_before_ms <= resolved_at_ms
             && resolved_at_ms < invocation.expires_at_ms
-            && transport.clone().into_evidence()
+            && transport.existing_evidence()?
                 == TransportEvidence::VerifiedPeer {
                     origin: invocation.device.clone(),
                 },
@@ -1700,10 +1742,23 @@ pub fn verify_execution_resolution_admission_checkpoint(
     usage.record_metadata(transport)?;
     Ok(VerifiedExecutionResolutionAdmission {
         resolution_hash: result.resolution.hash()?,
-        submission: VerifiedAdmission {
-            invocation: result.resolution.invocation.clone(),
-            admitted_at_ms: resolved_at_ms,
-        },
+        submission: VerifiedAdmission::from_execution_checkpoint(
+            result.resolution.invocation.clone(),
+            resolved_at_ms,
+            transport.existing_evidence()?,
+            usage.clone(),
+            freshness
+                .receipts
+                .iter()
+                .map(|value| value.payload.expires_at_ms)
+                .fold(
+                    freshness
+                        .challenge
+                        .expires_at_ms
+                        .min(invocation.expires_at_ms),
+                    u64::min,
+                ),
+        )?,
         usage,
     })
 }
@@ -1878,18 +1933,8 @@ impl VerifiedPolicySet {
         budget.verify(project)?;
         budget.verify(&wire.invocation)?;
         let facts = execution_resolution_account_facts(&wire.resolution)?;
-        let admitted = attested_admission(
-            &proof.invocation,
-            &proof.challenge,
-            proof.admitted_at_ms,
-            now_ms,
-        )?;
-        self.verify_operation_authorization(
-            &admitted,
-            &facts,
-            &proof.transport.clone().into_evidence(),
-            now_ms,
-        )
+        let admitted = self.verify_original_admission(proof, &facts)?;
+        self.verify_admitted_operation_authorization(&admitted, &facts, now_ms)
     }
 
     pub fn verify_execution_resolution(
@@ -2092,17 +2137,22 @@ impl VerifiedPolicySet {
         proof: &ExecutionHandoffResolutionFreshness,
         now_ms: u64,
     ) -> Result<VerifiedExecutionResolutionAdmission> {
-        self.verify_execution_resolution_freshness(value, proof, now_ms)?;
+        let deadline = self.verify_execution_resolution_freshness(value, proof, now_ms)?;
         require(
             value.submission.phase == AuthorizationPhase::Admission,
             "resolution was already admitted",
         )?;
         Ok(VerifiedExecutionResolutionAdmission {
             resolution_hash: value.hash.clone(),
-            submission: VerifiedAdmission {
-                invocation: value.wire.invocation.clone(),
-                admitted_at_ms: now_ms,
-            },
+            submission: VerifiedAdmission::from_execution_checkpoint(
+                value.wire.invocation.clone(),
+                now_ms,
+                TransportEvidence::VerifiedPeer {
+                    origin: value.wire.invocation.payload.presenter.clone(),
+                },
+                value.usage.clone(),
+                deadline,
+            )?,
             usage: ExecutionProofUsage::default(),
         })
     }
@@ -2125,10 +2175,15 @@ impl VerifiedPolicySet {
         usage.record_signed(&result.handoff_receipt)?;
         let admission = VerifiedExecutionResolutionAdmission {
             resolution_hash: result.resolution.hash()?,
-            submission: VerifiedAdmission {
-                invocation: result.resolution.invocation.clone(),
-                admitted_at_ms: result.receipt.payload.issued_at_ms,
-            },
+            submission: VerifiedAdmission::from_execution_checkpoint(
+                result.resolution.invocation.clone(),
+                result.receipt.payload.issued_at_ms,
+                TransportEvidence::VerifiedPeer {
+                    origin: result.resolution.invocation.payload.presenter.clone(),
+                },
+                usage.clone(),
+                0,
+            )?,
             usage,
         };
         self.verify_execution_resolution(
@@ -2273,10 +2328,22 @@ impl ExecutionProofUsage {
         auth: &VerifiedAuthorization,
         proof: &AdmissionProof,
     ) -> Result<()> {
-        require(auth.signed_invocation() == &proof.invocation,
-            "cached admission differs from its verified invocation")?;
-        self.objects.extend(auth.budget.object_bytes.iter().map(|(hash, size)| (hash.clone(), *size)));
-        self.metadata.extend(auth.budget.metadata.iter().map(|(hash, size)| (hash.clone(), *size)));
+        require(
+            auth.signed_invocation() == &proof.invocation,
+            "cached admission differs from its verified invocation",
+        )?;
+        self.objects.extend(
+            auth.budget
+                .object_bytes
+                .iter()
+                .map(|(hash, size)| (hash.clone(), *size)),
+        );
+        self.metadata.extend(
+            auth.budget
+                .metadata
+                .iter()
+                .map(|(hash, size)| (hash.clone(), *size)),
+        );
         self.record_chain_depth(auth.grant_path().len());
         let mut retained = Self::default();
         retained.record_admission_kind(proof, false)?;
@@ -2288,7 +2355,12 @@ impl ExecutionProofUsage {
         for (hash, size) in &budget.object_bytes {
             self.objects.insert(hash.clone(), *size);
         }
-        self.metadata.extend(budget.metadata.iter().map(|(hash, size)| (hash.clone(), *size)));
+        self.metadata.extend(
+            budget
+                .metadata
+                .iter()
+                .map(|(hash, size)| (hash.clone(), *size)),
+        );
         for signature in &budget.signatures {
             self.signatures.insert(ObjectHash::body(signature)?);
         }
@@ -2346,6 +2418,15 @@ impl ExecutionProofUsage {
     pub fn record_admission(&mut self, proof: &AdmissionProof) -> Result<()> {
         self.record_admission_kind(proof, false)
     }
+    fn transport_metadata(&mut self, transport: &StoredTransport) -> Result<Value> {
+        match transport {
+            StoredTransport::DirectedGateway { header } => {
+                self.record_signed(header)?;
+                Ok(serde_json::json!({"kind":"directed_gateway","header_hash":header.hash()?}))
+            }
+            _ => serde_json::to_value(transport).map_err(invalid_shape),
+        }
+    }
     fn record_admission_kind(&mut self, proof: &AdmissionProof, checkpointed: bool) -> Result<()> {
         require(
             proof.receipts.len() <= MAX_POLICY_DOMAINS
@@ -2353,6 +2434,13 @@ impl ExecutionProofUsage {
             "too many historical admission items",
         )?;
         let mut source = proof.source_body.clone();
+        if source["method"] == "message" {
+            if let Some(text) = source["text"].as_str() {
+                source["text"] = serde_json::json!({
+                    "payload_hash":ObjectHash::body(&text)?,"utf8_bytes":text.len(),
+                });
+            }
+        }
         if source["method"] == "create_task" {
             for field in ["title", "goal", "acceptance"] {
                 let value = source[field]
@@ -2410,8 +2498,9 @@ impl ExecutionProofUsage {
                 self.record_signed(receipt)?;
             }
         }
+        let transport = self.transport_metadata(&proof.transport)?;
         self.record_metadata(&serde_json::json!({"source_body_hash":ObjectHash::body(&proof.source_body)?,"source_metadata":source,
-            "challenge":proof.challenge,"admitted_at_ms":proof.admitted_at_ms,"transport":proof.transport}))
+            "challenge":proof.challenge,"admitted_at_ms":proof.admitted_at_ms,"transport":transport}))
     }
     pub fn record_binding(&mut self, binding: &SignedBinding) -> Result<()> {
         let hash = ObjectHash::body(binding)?;
@@ -2501,8 +2590,10 @@ impl ExecutionProofUsage {
             for receipt in &origin.receipts {
                 self.record_historical_wrapper(receipt)?;
             }
+            let transport = self.transport_metadata(&origin.transport)?;
             self.record_metadata(&serde_json::json!({"message_event":origin.message_event,"sdk_trigger":origin.sdk_trigger,
-                "challenge":origin.challenge,"admitted_at_ms":origin.admitted_at_ms,"transport":origin.transport}))?;
+                "source_body_hash":ObjectHash::body(&origin.source_body)?,
+                "challenge":origin.challenge,"admitted_at_ms":origin.admitted_at_ms,"transport":transport}))?;
         }
         self.record_metadata(&serde_json::json!({"version":handoff.version,"execution_resource":handoff.execution_resource,
             "execution_audience":handoff.execution_audience,"target_public_key":handoff.target_public_key}))

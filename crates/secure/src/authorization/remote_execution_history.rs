@@ -373,13 +373,20 @@ pub(crate) fn record_history_reference_metadata(
         .map_err(|_| AuthorizationError::InvalidProof("invalid historical reference metadata"))?;
     for (field, hash) in [
         ("source", ObjectHash::body(&reference.source)?),
-        ("old_submission", ObjectHash::body(&reference.old_submission)?),
-        ("observation_receipt", ObjectHash::body(&reference.observation_receipt)?),
+        (
+            "old_submission",
+            ObjectHash::body(&reference.old_submission)?,
+        ),
+        (
+            "observation_receipt",
+            ObjectHash::body(&reference.observation_receipt)?,
+        ),
     ] {
         metadata[field] = serde_json::json!({"signed_object_hash": hash});
     }
     if let Some(proof) = &reference.terminal_freshness {
-        metadata["terminal_freshness"] = serde_json::json!({"proof_hash": ObjectHash::body(proof)?});
+        metadata["terminal_freshness"] =
+            serde_json::json!({"proof_hash": ObjectHash::body(proof)?});
     }
     usage.record_metadata(&serde_json::json!({
         "reference_hash": ObjectHash::body(reference)?, "reference": metadata,
@@ -489,7 +496,7 @@ pub fn verify_remote_execution_history_acceptance(
                     && value.original_request_hash == challenge.original_request_hash
                     && value.admission_hash == ObjectHash::body(freshness)?
                     && value.transport_hash == ObjectHash::body(transport)?
-                    && transport.clone().into_evidence()
+                    && transport.existing_evidence()?
                         == TransportEvidence::VerifiedPeer {
                             origin: reference.old_submission.payload.presenter.clone(),
                         }

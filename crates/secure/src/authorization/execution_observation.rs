@@ -1211,12 +1211,7 @@ pub(crate) mod tests {
         };
         let admitted = remote_resolution_history::admitted(&historical, &proof, &facts).unwrap();
         let original = historical
-            .verify_operation_authorization(
-                &admitted,
-                &facts,
-                &proof.transport.clone().into_evidence(),
-                NOW,
-            )
+            .verify_admitted_operation_authorization(&admitted, &facts, NOW)
             .unwrap();
         let transport = StoredTransport::VerifiedPeer {
             origin: fixture.original.invocation.payload.presenter.clone(),
@@ -1225,7 +1220,7 @@ pub(crate) mod tests {
             .verify_execution_handoff(
                 &fixture.original,
                 &original,
-                &transport.clone().into_evidence(),
+                &transport.existing_evidence().unwrap(),
                 None,
                 NOW,
             )
@@ -1272,7 +1267,7 @@ pub(crate) mod tests {
             .verify_execution_handoff(
                 &fixture.original,
                 &original,
-                &transport.clone().into_evidence(),
+                &transport.existing_evidence().unwrap(),
                 Some(&accepted),
                 NOW,
             )
@@ -1320,9 +1315,14 @@ pub(crate) mod tests {
         let mut source_bundle = fixture.project.bundle.clone();
         source_bundle.grant_leaf = fixture.resolver_grant.clone();
         let source = remote_execution_policy::tests::confirmed_source(
-            &source_bundle, &fixture.project.pins, &fixture.project.client,
-            &fixture.project.node, &fixture.project.project, NOW,
-        ).unwrap();
+            &source_bundle,
+            &fixture.project.pins,
+            &fixture.project.client,
+            &fixture.project.node,
+            &fixture.project.project,
+            NOW,
+        )
+        .unwrap();
         RetainedHistoryFixture {
             state,
             actual,
@@ -1415,13 +1415,30 @@ pub(crate) mod tests {
             expires_at_ms: NOW + 100_000,
         };
         let transport = TransportEvidence::DirectNoise { device };
-        let destination = prepare::remote_selection(&body).unwrap().map(|(resource, key, grant)| {
-            state.verify_execution_destination(&facts.resource, &facts.audience,
-                &resource, &key, &grant, &facts.context, facts.action, NOW).unwrap()
-        });
+        let destination =
+            prepare::remote_selection(&body)
+                .unwrap()
+                .map(|(resource, key, grant)| {
+                    state
+                        .verify_execution_destination(
+                            &facts.resource,
+                            &facts.audience,
+                            &resource,
+                            &key,
+                            &grant,
+                            &facts.context,
+                            facts.action,
+                            NOW,
+                        )
+                        .unwrap()
+                });
         let authorize = |signed: &Signed<Invocation>| match &destination {
             Some(destination) => state.verify_invocation_with_execution_destination(
-                signed, &facts, &transport, destination, NOW,
+                signed,
+                &facts,
+                &transport,
+                destination,
+                NOW,
             ),
             None => state.verify_invocation(signed, &facts, &transport, NOW),
         };
