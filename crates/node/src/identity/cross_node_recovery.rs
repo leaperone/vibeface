@@ -7,8 +7,7 @@ use serde_json::{Value, json};
 use vibeface_secure::{
     Identity,
     authorization::{
-        Actor, ClientAuthorizationBundle, DeviceId, Grantee, JournalEntry, ObjectHash,
-        PolicyDomain, PublicKey, Signature, Signed,
+        DeviceId, JournalEntry, ObjectHash, PolicyDomain, PublicKey, Signature, Signed,
         bootstrap::{
             NodeClaim,
             recovery::cross_node::{
@@ -97,58 +96,6 @@ fn check_claim_in(
     Ok(())
 }
 
-fn recovery_history(
-    connection: &Connection,
-    request: &CrossNodeRecoveryRequest,
-) -> Result<ClientAuthorizationBundle> {
-    let account = PolicyDomain::Account(request.account.clone());
-    let space = PolicyDomain::Space(request.space.clone());
-    let mut statement = connection.prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-    let mut journal = Vec::new();
-    for row in rows {
-        let entry: JournalEntry = serde_json::from_str(&row?)?;
-        let belongs = match &entry {
-            JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
-                value.payload.account == request.account
-            }
-            JournalEntry::AccountCommit(value) => value.proposal.payload.account == request.account,
-            JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => {
-                value.payload.space == request.space
-            }
-            JournalEntry::SpaceCommit(value) => value.proposal.payload.space == request.space,
-            JournalEntry::Device(value) => {
-                value.payload.owner == account || value.payload.owner == space
-            }
-            JournalEntry::Authenticator(value) => value.payload.account == request.account,
-            JournalEntry::Resource(value) => value.payload.space == request.space,
-            JournalEntry::Membership(value) => value.payload.space == request.space,
-            JournalEntry::Grant(value) => value.payload.owner_space == request.space,
-        };
-        if belongs {
-            journal.push(entry);
-            ensure!(journal.len() <= 128, "recovery history requires checkpoint");
-        }
-    }
-    let grant_leaf = journal
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            JournalEntry::Grant(value)
-                if value.payload.grantee
-                    == Grantee::Actor(Actor::Account(request.account.clone())) =>
-            {
-                Some(value.hash())
-            }
-            _ => None,
-        })
-        .context("recovery history has no existing account grant anchor")??;
-    Ok(ClientAuthorizationBundle {
-        journal,
-        grant_leaf,
-    })
-}
-
 impl Store {
     pub(crate) fn cross_node_recovery_command(
         &mut self,
@@ -166,6 +113,12 @@ impl Store {
         match method {
             "cross_node_recovery_context" => {
                 self.cross_node_recovery_context(identity, principal, params, now)
+            }
+            "cross_node_recovery_context_page" => {
+                self.recovery_context_page(identity, principal, params, now)
+            }
+            "cross_node_recovery_context_witness" => {
+                self.recovery_context_witness(identity, principal, params, now)
             }
             "cross_node_recovery_source_possession" => {
                 self.cross_node_recovery_source_possession(identity, principal, params, now)
@@ -190,63 +143,18 @@ impl Store {
         params: &Value,
         now: u64,
     ) -> Result<Value> {
-        let request: Signed<CrossNodeRecoveryRequest> =
-            serde_json::from_value(params["request"].clone())?;
-        require_principal(&request, principal)?;
-        let signer =
-            Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = journal::PolicyState::load(&tx)?;
-        cross_node::verify_cross_node_recovery_request(
-            current.verified(),
-            &request,
-            &PublicKey::of(&signer),
-            now,
-        )?;
-        let bundle = recovery_history(&tx, &request.payload)?;
-        let context = cross_node::create_cross_node_recovery_witness(
-            current.verified(),
-            &request,
-            &bundle,
-            &signer,
-            now,
-        )?;
-        let key = context_key(&request);
-        if let Some(previous) = metadata(&tx, &key)? {
-            let previous: SourceContext = serde_json::from_str(&previous)?;
-            ensure!(
-                ObjectHash::body(&previous.context.request)? == ObjectHash::body(&request)?
-                    && previous.context.witness.payload.request_hash == ObjectHash::body(&request)?
-                    && previous.context.witness.payload.expected_account_head
-                        == context.witness.payload.expected_account_head
-                    && previous.context.witness.payload.expected_space_head
-                        == context.witness.payload.expected_space_head
-                    && previous.context.witness.payload.context_hash
-                        == context.witness.payload.context_hash,
-                "recovery context or policy heads changed"
-            );
-            previous.context.witness.verify_signature()?;
-            ensure!(
-                previous.context.witness.issuer == PublicKey::of(&signer),
-                "recovery witness belongs to another source Node"
-            );
-            tx.commit()?;
-            self.policy = current;
-            return Ok(json!({"context":previous.context}));
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct BeginRequest {
+            request: Signed<CrossNodeRecoveryRequest>,
         }
-        let record = SourceContext {
-            context,
-            source_possession: None,
-        };
-        tx.execute(
-            "INSERT INTO identity_meta(key,value) VALUES(?,?)",
-            params![key, serde_json::to_string(&record)?],
-        )?;
-        tx.commit()?;
-        self.policy = current;
-        Ok(json!({"context":record.context}))
+        let request: BeginRequest = serde_json::from_value(params.clone())?;
+        self.begin_recovery_read(
+            identity,
+            principal,
+            vibeface_secure::authorization::bootstrap::recovery::stream::RecoveryReadRequest::CrossNode(request.request),
+            now,
+        )
     }
 
     fn cross_node_recovery_source_possession(
@@ -506,8 +414,8 @@ mod tests {
         test_support::{TestNetwork, now},
     };
     use vibeface_secure::authorization::{
-        AUTH_VERSION, Audience, CheckStage, Invocation, Nonce, ResourceRef, ServiceId,
-        TransportEvidence,
+        AUTH_VERSION, Actor, Audience, CheckStage, ClientAuthorizationBundle, Invocation, Nonce,
+        ResourceRef, ServiceId, TransportEvidence,
         bootstrap::{self, VerifiedNodeClaim, recovery},
     };
 

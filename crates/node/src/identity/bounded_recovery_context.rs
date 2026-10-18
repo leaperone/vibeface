@@ -1,3 +1,5 @@
+pub(crate) mod target_cache;
+
 use super::journal::{AcceptedJournalCursor, AcceptedJournalSnapshot, PolicyState};
 use crate::{crypto::LocalIdentity, store::Store};
 use anyhow::{Context, Result, ensure};
@@ -61,7 +63,7 @@ impl CompletedRecoveryRead {
         self.record_reference_usage(usage)?;
         usage.record_current_source(&self.request, state)?;
         if let Some(page) = &self.last_page {
-            usage.record_page(page, state)?;
+            usage.record_page_binding(page)?;
         }
         Ok(())
     }
@@ -93,6 +95,10 @@ fn reference_record_in(
         record.request.new_device_public_key().as_str() == principal
             && record.snapshot.issuer == local
             && witness.issuer == local
+            && record.snapshot.payload.version == AUTH_VERSION
+            && witness.payload.version == AUTH_VERSION
+            && record.snapshot.payload.kind == record.request.kind()
+            && witness.payload.kind == record.request.kind()
             && record.snapshot.payload.snapshot_id == reference.snapshot_id
             && record.snapshot.payload.request_hash == reference.request_hash
             && record.request.request_hash()? == reference.request_hash
@@ -101,6 +107,13 @@ fn reference_record_in(
             && witness.payload.snapshot_id == reference.snapshot_id
             && witness.payload.request_hash == reference.request_hash
             && witness.payload.target_heads == record.snapshot.payload.target_heads
+            && witness.payload.claim_hash == record.snapshot.payload.claim.hash()?
+            && record.snapshot.payload.saved_pins_hash == record.request.saved_pins_hash()?
+            && record.snapshot.payload.expires_at_ms == record.request.expires_at_ms()
+            && witness.payload.expires_at_ms == record.request.expires_at_ms()
+            && record.request.issued_at_ms() <= record.snapshot.payload.issued_at_ms
+            && record.snapshot.payload.issued_at_ms <= witness.payload.issued_at_ms
+            && witness.payload.issued_at_ms < witness.payload.expires_at_ms
             && witness.payload.source_node_public_key == local
             && record.snapshot.payload.source_node_public_key == local,
         "recovery completion reference or Noise device changed"
@@ -414,15 +427,20 @@ fn check_read_usage(
     usage.record_snapshot(&record.snapshot)?;
     usage.record_current_source(&record.request, policy.verified())?;
     if let Some(previous) = previous {
-        usage.record_page(&previous.page, policy.verified())?;
+        usage.record_page_binding(&previous.page)?;
     }
     if let Some(outgoing) = outgoing {
-        usage.record_page(outgoing, policy.verified())?;
+        usage.record_outgoing_page(outgoing)?;
     }
     if let Some(witness) = &record.witness {
         usage.record_witness(witness)?;
     }
-    usage.finish()?;
+    let _counts = usage.finish()?;
+    #[cfg(test)]
+    eprintln!(
+        "bounded_recovery_source_proof {}",
+        serde_json::to_string(&_counts)?
+    );
     Ok(())
 }
 
@@ -696,9 +714,7 @@ impl Store {
             "recovery witness does not accept a cursor"
         );
         let local = PublicKey::parse(&identity.public_key_hex()?)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self.connection.transaction()?;
         let record: RecoveryReadRecord = serde_json::from_str(
             &metadata(&tx, &context_key(&request.snapshot_id))?
                 .context("recovery snapshot is missing")?,
@@ -915,6 +931,21 @@ mod tests {
         let client = Identity::generate().map_err(anyhow::Error::msg)?;
         let request = read_request(&network, &client)?;
         let snapshot = begin(&mut store, &network, &client, request.clone())?;
+        let RecoveryReadRequest::Account(mut invalid) = request.clone() else {
+            unreachable!()
+        };
+        invalid.payload.nonce = Nonce::random()?;
+        invalid.signature = vibeface_secure::authorization::Signature::parse(&"00".repeat(64))?;
+        assert!(
+            store
+                .begin_recovery_read(
+                    &network.node,
+                    &client.public_key_hex(),
+                    RecoveryReadRequest::Account(invalid),
+                    now(),
+                )
+                .is_err()
+        );
         let RecoveryReadRequest::Account(mut changed) = request else {
             unreachable!()
         };

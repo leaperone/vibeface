@@ -3,6 +3,7 @@
 pub use vibeface_secure::membership::{NodeCertificate, NodeRole};
 
 pub(crate) mod admission;
+pub(crate) mod bounded_recovery_context;
 pub(crate) mod client_policy_read;
 pub(crate) mod cross_node_recovery;
 pub(crate) mod enrollment_store;

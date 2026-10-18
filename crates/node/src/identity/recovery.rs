@@ -125,9 +125,7 @@ impl Store {
         bounded(params.clone())?;
         let request: RecoveryCompletionStatusRequest = serde_json::from_value(params.clone())?;
         let local = PublicKey::parse(&identity.public_key_hex()?)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = self.connection.transaction()?;
         if let Some(receipt) = recovery_completion_in(&tx, &local, principal, &request)? {
             let response = bounded(json!({"state":"committed","receipt":receipt}))?;
             let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
