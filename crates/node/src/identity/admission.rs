@@ -480,12 +480,24 @@ fn persisted_admission_facts(
         record.payload.host == proof.invocation.payload.audience.service,
         "historical request targets another resource host"
     );
-    let events = load_events_from(connection, space.as_str())?;
     let reference = if method == "agent_start" {
         manager_field(body, "trigger")?
     } else {
         manager_field(body, "task_ref")?
     };
+    let mut roots = vec![reference.to_owned()];
+    if method == "agent_start" && !body["basis_heads"].is_null() {
+        roots.extend(serde_json::from_value::<Vec<String>>(
+            body["basis_heads"].clone(),
+        )?);
+    }
+    let events = super::event_authorization::retained_event_dependencies_in(
+        connection,
+        space.as_str(),
+        &resource,
+        scope,
+        &roots,
+    )?;
     let source = events
         .get(reference)
         .context("historical command source is missing")?;

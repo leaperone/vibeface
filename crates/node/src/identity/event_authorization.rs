@@ -948,7 +948,27 @@ pub(crate) fn persisted_admission_facts(
     policy: &PolicyState,
     proof: &AdmissionProof,
 ) -> Result<Option<RequestFacts>> {
-    let events = load_events_from(connection, proof.invocation.payload.resource.space.as_str())?;
+    let resource = &proof.invocation.payload.resource;
+    let scope = source_scope(&proof.source_body)?;
+    let candidates = retained_scope_event_rows_in(
+        connection,
+        resource.space.as_str(),
+        &resource.resource,
+        scope,
+    )?;
+    let roots = candidates.values().filter(|stored| {
+        matches!(&stored.event.cause, EventCause::Invocation { admission } if admission == proof)
+    }).map(|stored| stored.envelope.hash.clone()).collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let events = retained_event_dependencies_in(
+        connection,
+        resource.space.as_str(),
+        &resource.resource,
+        scope,
+        &roots,
+    )?;
     let mut facts = None;
     for stored in events.values() {
         if !matches!(&stored.event.cause,EventCause::Invocation { admission } if admission == proof)
@@ -986,7 +1006,7 @@ pub(crate) fn persisted_admission_facts(
     Ok(facts)
 }
 
-pub(super) fn retained_scope_events_in(
+fn retained_scope_event_rows_in(
     connection: &Connection,
     space: &str,
     resource: &ResourceId,
@@ -1010,9 +1030,44 @@ pub(super) fn retained_scope_events_in(
             },
         );
     }
+    Ok(events)
+}
+
+pub(super) fn retained_scope_events_in(
+    connection: &Connection,
+    space: &str,
+    resource: &ResourceId,
+    scope: &str,
+) -> Result<BTreeMap<String, StoredEvent>> {
+    let events = retained_scope_event_rows_in(connection, space, resource, scope)?;
     if let Some(source) = events.values().next() {
         validate_retained_event_scope_in(connection, &source.envelope)?;
     }
+    Ok(events)
+}
+
+pub(super) fn retained_event_dependencies_in(
+    connection: &Connection,
+    space: &str,
+    resource: &ResourceId,
+    scope: &str,
+    roots: &[String],
+) -> Result<BTreeMap<String, StoredEvent>> {
+    let mut events = retained_scope_event_rows_in(connection, space, resource, scope)?;
+    for hash in roots {
+        let source = events
+            .get(hash)
+            .context("retained request has missing causal history")?;
+        ensure!(
+            source.event.network_id == space
+                && source.event.resource_id == *resource
+                && source.event.scope_id == scope,
+            "retained request history belongs to another resource or scope"
+        );
+        validate_retained_event_dependencies_in(connection, &source.envelope)?;
+    }
+    let selected = closure_hashes(&events, roots);
+    events.retain(|hash, _| selected.contains(hash));
     Ok(events)
 }
 
