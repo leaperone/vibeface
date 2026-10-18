@@ -21,7 +21,10 @@ use vibeface_secure::authorization::{
     execution_handoff::*,
     remote_execution_history::RemoteExecutionHistoryAcceptance,
     task_binding::SignedBinding,
-    task_business_policy::{TaskBusinessScopedView, TaskBusinessWire},
+    task_business_policy::{
+        TaskBusinessScopedView, TaskBusinessWire, original::VerifiedTaskBusinessOriginalSource,
+        original_operation::VerifiedTaskBusinessOperationCurrent,
+    },
 };
 
 #[path = "execution_observation.rs"]
@@ -273,6 +276,218 @@ impl HandoffPolicy<'_> {
         }
         Ok(usage)
     }
+}
+
+#[derive(Clone, Copy)]
+enum HandoffRunningAuthorization<'a> {
+    Primary(&'a VerifiedExecutionHandoff),
+    OperationCurrent(&'a VerifiedTaskBusinessOperationCurrent),
+}
+
+impl HandoffRunningAuthorization<'_> {
+    fn authorization(&self) -> &VerifiedExecutionHandoff {
+        match self {
+            Self::Primary(value) => value,
+            Self::OperationCurrent(value) => value.handoff_authorization(),
+        }
+    }
+
+    fn check_accepted(&self, stored: &StoredHandoff) -> Result<()> {
+        ensure!(
+            stored.wire == *self.authorization().wire(),
+            "running authorization changed its accepted wire"
+        );
+        if let Self::OperationCurrent(cap) = self {
+            let acceptance = RemoteExecutionHistoryAcceptance::ExecutionResult {
+                receipt: stored.admission_receipt.clone(),
+                freshness: stored.admission.clone(),
+                transport: StoredTransport::from(&stored.transport),
+            };
+            ensure!(
+                cap.admission_receipt()? == &stored.admission_receipt
+                    && cap.accepted_at_ms() == stored.admitted_at_ms
+                    && cap.acceptance_envelope_hash()? == ObjectHash::body(&acceptance)?,
+                "operation capability changed its original executor acceptance"
+            );
+        }
+        Ok(())
+    }
+
+    fn check_current_in(
+        &self,
+        connection: &Connection,
+        primary: &PolicyState,
+        now_ms: u64,
+    ) -> Result<ExecutionProofUsage> {
+        match self {
+            Self::Primary(auth) => {
+                check_policy_heads_in(connection, primary.verified(), auth.original(), now_ms)?;
+                check_policy_heads_in(connection, primary.verified(), auth.submission(), now_ms)?;
+                Ok(auth.proof_usage().clone())
+            }
+            Self::OperationCurrent(cap) => {
+                super::task_business_policy::check_task_business_operation_current_in(
+                    connection, primary, cap, now_ms,
+                )
+            }
+        }
+    }
+
+    fn check_unconsumed_in(
+        &self,
+        connection: &Connection,
+        primary: &PolicyState,
+        proof: &ExecutionHandoffFreshness,
+        stage: CheckStage,
+        now_ms: u64,
+    ) -> Result<ExecutionProofUsage> {
+        if let Self::OperationCurrent(cap) = self {
+            ensure!(
+                proof == cap.freshness() && proof.challenge.stage == stage,
+                "operation capability changed its freshness purpose"
+            );
+            let usage = self.check_current_in(connection, primary, now_ms)?;
+            check_execution_handoff_operation_challenge_in(connection, cap.wire(), proof, false)?;
+            Ok(usage)
+        } else {
+            Ok(self.authorization().proof_usage().clone())
+        }
+    }
+
+    fn consume_in(
+        &self,
+        tx: &Transaction<'_>,
+        primary: &PolicyState,
+        proof: &ExecutionHandoffFreshness,
+        stage: CheckStage,
+        now_ms: u64,
+    ) -> Result<u64> {
+        match self {
+            Self::Primary(auth) => consume_freshness_in(tx, primary, auth, proof, stage, now_ms),
+            Self::OperationCurrent(cap) => {
+                ensure!(
+                    proof == cap.freshness() && proof.challenge.stage == stage,
+                    "operation capability changed its freshness purpose"
+                );
+                consume_execution_handoff_operation_challenge_in(tx, cap.wire(), proof)?;
+                Ok(cap.deadline_ms())
+            }
+        }
+    }
+
+    fn check_latest_lease_in(&self, connection: &Connection, stored: &StoredHandoff) -> Result<()> {
+        if let Self::OperationCurrent(cap) = self {
+            self.check_accepted(stored)?;
+            let (proof, verified_at, deadline) = stored
+                .lease
+                .as_ref()
+                .context("operation capability has no consumed execution lease")?;
+            ensure!(
+                proof == cap.freshness()
+                    && *deadline == cap.deadline_ms()
+                    && *verified_at >= cap.checked_at_ms(),
+                "operation capability differs from the latest executor lease"
+            );
+            check_execution_handoff_operation_challenge_in(connection, cap.wire(), proof, true)?;
+        }
+        Ok(())
+    }
+
+    fn check_usage_in(
+        &self,
+        connection: &Connection,
+        stored: &StoredHandoff,
+        mut usage: ExecutionProofUsage,
+        result: Option<&AdmittedExecutionHandoff>,
+    ) -> Result<()> {
+        if let Self::OperationCurrent(cap) = self {
+            usage.merge(cap.proof_usage());
+            check_handoff_checkpoint_usage_in(connection, stored, usage, result)?;
+        }
+        Ok(())
+    }
+}
+
+fn check_handoff_checkpoint_usage_in(
+    connection: &Connection,
+    stored: &StoredHandoff,
+    mut usage: ExecutionProofUsage,
+    result: Option<&AdmittedExecutionHandoff>,
+) -> Result<ExecutionProofUsage> {
+    verify_local_handoff_checkpoint(connection, stored)?;
+    usage.merge(
+        verify_execution_handoff_admission_checkpoint(
+            &stored.wire,
+            &stored.admission_receipt,
+            &stored.admission,
+            &StoredTransport::from(&stored.transport),
+            stored.admitted_at_ms,
+        )?
+        .proof_usage(),
+    );
+    if let Some((proof, verified_at, deadline)) = &stored.lease {
+        let encoded: String = connection
+            .query_row(
+                "SELECT value FROM local_values WHERE space_id=? AND key=?",
+                params![
+                    stored.wire.handoff.execution_resource.space.as_str(),
+                    lease_checkpoint_key(&stored.wire, proof)?
+                ],
+                |row| row.get(0),
+            )
+            .context("operation lease lost its immutable checkpoint")?;
+        let receipt: Signed<ExecutionHandoffLeaseReceipt> = serde_json::from_str(&encoded)?;
+        usage.merge(&verify_execution_handoff_lease_checkpoint(
+            &stored.wire,
+            &stored.admission_receipt,
+            proof,
+            *verified_at,
+            *deadline,
+            &receipt,
+        )?);
+    }
+    if let Some(receipt) = &stored.receipt {
+        usage.record_signed(receipt)?;
+    }
+    if let Some(receipt) = result.and_then(|value| value.receipt.as_ref()) {
+        usage.record_signed(receipt)?;
+    }
+    if let Some(counts) =
+        vibeface_secure::signature_verification::SignatureVerification::current_counts()
+    {
+        ensure!(
+            counts.actual_verifications <= 32,
+            "Task running operation exceeded its crypto budget"
+        );
+        usage.record_actual_signature_counts(counts);
+    }
+    usage.enforce_limits()?;
+    Ok(usage)
+}
+
+fn clear_unknown_native_session_in(connection: &Connection, stored: &StoredHandoff) -> Result<()> {
+    let (execution, original, _) = scope(&stored.wire)?;
+    let dispatch: Event =
+        serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
+    let (mut session, binding) = session_from(
+        connection,
+        &execution,
+        &original,
+        dispatch.resource_id.as_str(),
+        &stored.request.target_node,
+        &stored.request.session_id,
+    )?
+    .context("Unknown execution session disappeared")?;
+    ensure!(
+        stored.request.binding.as_ref() == Some(&binding),
+        "Unknown execution session changed its accepted binding"
+    );
+    session.state = "unknown".into();
+    session.native_session_id = None;
+    ensure!(connection.execute("UPDATE execution_handoff_sessions SET record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=? AND revision=?",
+        params![serde_json::to_string(&session)?,execution,original,dispatch.resource_id.as_str(),session.target_node,session.session_id,session.revision])? == 1,
+        "Unknown execution session changed before commit");
+    Ok(())
 }
 
 fn scope(wire: &SignedExecutionHandoff) -> Result<(String, String, String)> {
@@ -922,7 +1137,8 @@ fn stored_from(
         !matches!(
             stored.state,
             OperationState::Running | OperationState::Unknown
-        ) || stored.lease.is_some(),
+        ) || stored.lease.is_some()
+            || (stored.state == OperationState::Unknown && stored.receipt.is_some()),
         "started handoff has no execution lease"
     );
     if let Some(receipt) = &stored.receipt {
@@ -2368,6 +2584,36 @@ impl Store {
         proof: &ExecutionHandoffFreshness,
         now_ms: u64,
     ) -> Result<(AdmittedExecutionHandoff, bool, u64)> {
+        self.claim_execution_handoff_with_authority(
+            HandoffRunningAuthorization::Primary(auth),
+            identity,
+            proof,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn claim_execution_handoff_operation_current(
+        &mut self,
+        identity: &LocalIdentity,
+        cap: &VerifiedTaskBusinessOperationCurrent,
+        now_ms: u64,
+    ) -> Result<(AdmittedExecutionHandoff, bool, u64)> {
+        self.claim_execution_handoff_with_authority(
+            HandoffRunningAuthorization::OperationCurrent(cap),
+            identity,
+            cap.freshness(),
+            now_ms,
+        )
+    }
+
+    fn claim_execution_handoff_with_authority(
+        &mut self,
+        authority: HandoffRunningAuthorization<'_>,
+        identity: &LocalIdentity,
+        proof: &ExecutionHandoffFreshness,
+        now_ms: u64,
+    ) -> Result<(AdmittedExecutionHandoff, bool, u64)> {
+        let auth = authority.authorization();
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let (execution, original, operation) = scope(auth.wire())?;
@@ -2376,6 +2622,9 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stored = stored_from(&tx, &execution, &original, &operation)?
             .context("unknown execution handoff")?;
+        authority.check_accepted(&stored)?;
+        let usage =
+            authority.check_unconsumed_in(&tx, &self.policy, proof, CheckStage::Start, now_ms)?;
         ensure!(
             stored.wire == *auth.wire(),
             "handoff differs from its accepted request"
@@ -2383,18 +2632,20 @@ impl Store {
         if stored.state != OperationState::Accepted {
             let result = dto(&tx, identity, &stored, now_ms)?;
             let deadline = stored.lease.as_ref().map(|lease| lease.2).unwrap_or(0);
+            authority.check_usage_in(&tx, &stored, usage, Some(&result))?;
             tx.commit()?;
             return Ok((result, false, deadline));
         }
-        super::execution_binding_seal::ensure_handoff_generation_open_in(&tx,auth.wire())?;
-        let deadline =
-            consume_freshness_in(&tx, &self.policy, auth, proof, CheckStage::Start, now_ms)?;
+        super::execution_binding_seal::ensure_handoff_generation_open_in(&tx, auth.wire())?;
+        let deadline = authority.consume_in(&tx, &self.policy, proof, CheckStage::Start, now_ms)?;
         save_lease_in(&tx, identity, auth, proof, now_ms, deadline)?;
         ensure!(tx.execute("UPDATE execution_handoffs SET state='running' WHERE execution_space_id=? AND original_space_id=? AND operation_id=? AND state='accepted'",
             params![execution, original, operation])? == 1, "execution handoff was already claimed");
         let stored = stored_from(&tx, &execution, &original, &operation)?
             .context("claimed handoff disappeared")?;
         let result = dto(&tx, identity, &stored, now_ms)?;
+        authority.check_latest_lease_in(&tx, &stored)?;
+        authority.check_usage_in(&tx, &stored, usage, Some(&result))?;
         tx.commit()?;
         Ok((result, true, deadline))
     }
@@ -2406,6 +2657,36 @@ impl Store {
         proof: &ExecutionHandoffFreshness,
         now_ms: u64,
     ) -> Result<u64> {
+        self.renew_execution_handoff_with_authority(
+            HandoffRunningAuthorization::Primary(auth),
+            identity,
+            proof,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn renew_execution_handoff_operation_current(
+        &mut self,
+        identity: &LocalIdentity,
+        cap: &VerifiedTaskBusinessOperationCurrent,
+        now_ms: u64,
+    ) -> Result<u64> {
+        self.renew_execution_handoff_with_authority(
+            HandoffRunningAuthorization::OperationCurrent(cap),
+            identity,
+            cap.freshness(),
+            now_ms,
+        )
+    }
+
+    fn renew_execution_handoff_with_authority(
+        &mut self,
+        authority: HandoffRunningAuthorization<'_>,
+        identity: &LocalIdentity,
+        proof: &ExecutionHandoffFreshness,
+        now_ms: u64,
+    ) -> Result<u64> {
+        let auth = authority.authorization();
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let (execution, original, operation) = scope(auth.wire())?;
@@ -2414,7 +2695,14 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stored = stored_from(&tx, &execution, &original, &operation)?
             .context("unknown execution handoff")?;
-        super::execution_binding_seal::ensure_handoff_generation_open_in(&tx,auth.wire())?;
+        authority.check_accepted(&stored)?;
+        let mut usage =
+            authority.check_unconsumed_in(&tx, &self.policy, proof, CheckStage::Renew, now_ms)?;
+        if let HandoffRunningAuthorization::OperationCurrent(cap) = authority {
+            usage.merge(cap.proof_usage());
+            usage = check_handoff_checkpoint_usage_in(&tx, &stored, usage, None)?;
+        }
+        super::execution_binding_seal::ensure_handoff_generation_open_in(&tx, auth.wire())?;
         ensure!(
             stored.wire == *auth.wire()
                 && stored.state == OperationState::Running
@@ -2422,9 +2710,14 @@ impl Store {
                     < verified_lease_deadline(&tx, &self.policy, &stored, Some(auth), Some(proof))?,
             "only a running handoff with a live lease may renew"
         );
-        let deadline =
-            consume_freshness_in(&tx, &self.policy, auth, proof, CheckStage::Renew, now_ms)?;
+        let deadline = authority.consume_in(&tx, &self.policy, proof, CheckStage::Renew, now_ms)?;
         save_lease_in(&tx, identity, auth, proof, now_ms, deadline)?;
+        if matches!(authority, HandoffRunningAuthorization::OperationCurrent(_)) {
+            let updated = stored_from(&tx, &execution, &original, &operation)?
+                .context("renewed handoff disappeared")?;
+            authority.check_latest_lease_in(&tx, &updated)?;
+            authority.check_usage_in(&tx, &updated, usage, None)?;
+        }
         tx.commit()?;
         Ok(deadline)
     }
@@ -2471,6 +2764,43 @@ impl Store {
             auth.original().resource() == original_project,
             "native execution belongs to another Project"
         );
+        self.persist_execution_handoff_native_with_authority(
+            HandoffRunningAuthorization::Primary(&auth),
+            native_session_id,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn persist_execution_handoff_native_operation_current(
+        &mut self,
+        cap: &VerifiedTaskBusinessOperationCurrent,
+        native_session_id: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.persist_execution_handoff_native_with_authority(
+            HandoffRunningAuthorization::OperationCurrent(cap),
+            native_session_id,
+            now_ms,
+        )
+    }
+
+    fn persist_execution_handoff_native_with_authority(
+        &mut self,
+        authority: HandoffRunningAuthorization<'_>,
+        native_session_id: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        ensure!(
+            !native_session_id.is_empty() && native_session_id.len() <= 512,
+            "invalid native execution session ID"
+        );
+        let auth = authority.authorization();
+        let (execution, _, operation) = scope(auth.wire())?;
+        let execution_space = execution.as_str();
+        let operation_id = operation.as_str();
+        let original_project = auth.original().resource();
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2486,8 +2816,12 @@ impl Store {
                 && now_ms < verified_lease_deadline(&tx, &self.policy, &stored, Some(&auth), None)?,
             "native session update requires a running handoff and live lease"
         );
-        check_policy_heads_in(&tx, self.policy.verified(), auth.original(), now_ms)?;
-        check_policy_heads_in(&tx, self.policy.verified(), auth.submission(), now_ms)?;
+        authority.check_accepted(&stored)?;
+        authority.check_latest_lease_in(&tx, &stored)?;
+        let usage = authority.check_current_in(&tx, &self.policy, now_ms)?;
+        if matches!(authority, HandoffRunningAuthorization::OperationCurrent(_)) {
+            super::execution_binding_seal::ensure_handoff_generation_open_in(&tx, auth.wire())?;
+        }
         let (mut session, binding) = session_from(
             &tx,
             execution_space,
@@ -2511,6 +2845,7 @@ impl Store {
         session.native_session_id = Some(native_session_id.to_owned());
         tx.execute("UPDATE execution_handoff_sessions SET record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=? AND revision=?",
             params![serde_json::to_string(&session)?,execution_space,original_project.space.as_str(),original_project.resource.as_str(),stored.request.target_node,stored.request.session_id,session.revision])?;
+        authority.check_usage_in(&tx, &stored, usage, None)?;
         tx.commit()?;
         Ok(())
     }
@@ -2637,8 +2972,162 @@ impl Store {
         Ok(result)
     }
 
+    pub(crate) fn mark_task_business_handoff_unknown(
+        &mut self,
+        identity: &LocalIdentity,
+        source: &VerifiedTaskBusinessOriginalSource,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<AdmittedExecutionHandoff> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let TaskBusinessWire::Submit(wire) = source.wire() else {
+            anyhow::bail!("Unknown state requires an original accepted Submit")
+        };
+        let (execution, original, operation) = scope(wire)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::task_business_policy::check_task_business_original_source_in(
+            &tx,
+            &self.policy,
+            source,
+            source.wire(),
+            source.acceptance(),
+        )?;
+        let mut stored = stored_from(&tx, &execution, &original, &operation)?
+            .context("Unknown state has no original executor acceptance")?;
+        let acceptance = RemoteExecutionHistoryAcceptance::ExecutionResult {
+            receipt: stored.admission_receipt.clone(),
+            freshness: stored.admission.clone(),
+            transport: StoredTransport::from(&stored.transport),
+        };
+        ensure!(
+            stored.wire == *wire
+                && source.acceptance() == &acceptance
+                && identity.public_key_hex()? == stored.wire.handoff.target_public_key.as_str(),
+            "Unknown state changed its original executor acceptance or signer"
+        );
+        verify_local_handoff_checkpoint(&tx, &stored)?;
+        ensure!(
+            now_ms >= stored.admitted_at_ms,
+            "Unknown state clock predates its acceptance"
+        );
+        ensure!(
+            matches!(
+                stored.state,
+                OperationState::Accepted | OperationState::Running | OperationState::Unknown
+            ),
+            "terminal handoff cannot become Unknown"
+        );
+        if stored.state == OperationState::Unknown {
+            clear_unknown_native_session_in(&tx, &stored)?;
+            let value = dto(&tx, identity, &stored, now_ms)?;
+            check_handoff_checkpoint_usage_in(
+                &tx,
+                &stored,
+                source.proof_usage().clone(),
+                Some(&value),
+            )?;
+            tx.commit()?;
+            return Ok(value);
+        }
+        let dispatch: Event = serde_json::from_str(&wire.handoff.project_dispatch.canonical_body)?;
+        let (mut session, binding) = session_from(
+            &tx,
+            &execution,
+            &original,
+            dispatch.resource_id.as_str(),
+            &stored.request.target_node,
+            &stored.request.session_id,
+        )?
+        .context("Unknown execution session disappeared")?;
+        ensure!(
+            stored.request.binding.as_ref() == Some(&binding),
+            "Unknown execution session changed its accepted binding"
+        );
+        stored.state = OperationState::Unknown;
+        stored.result = public_execution_result(
+            json!({"reason":reason}),
+            session.native_session_id.as_deref(),
+        );
+        session.state = "unknown".into();
+        session.native_session_id = None;
+        ensure!(tx.execute("UPDATE execution_handoff_sessions SET record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=? AND revision=?",
+            params![serde_json::to_string(&session)?,execution,original,dispatch.resource_id.as_str(),session.target_node,session.session_id,session.revision])? == 1,
+            "Unknown execution session changed before commit");
+        let receipt = signed_receipt(&tx, identity, &stored, now_ms)?;
+        ensure!(tx.execute("UPDATE execution_handoffs SET state='unknown',result=?,result_receipt=? WHERE execution_space_id=? AND original_space_id=? AND operation_id=? AND state IN ('accepted','running') AND handoff_hash=?",
+            params![serde_json::to_string(&stored.result)?,serde_json::to_string(&receipt)?,execution,original,operation,wire.hash()?.as_str()])? == 1,
+            "handoff changed before its protective Unknown state");
+        let value = dto(&tx, identity, &stored, now_ms)?;
+        check_handoff_checkpoint_usage_in(
+            &tx,
+            &stored,
+            source.proof_usage().clone(),
+            Some(&value),
+        )?;
+        tx.commit()?;
+        Ok(value)
+    }
+
     pub fn finish_execution_handoff(
         &mut self,
+        identity: &LocalIdentity,
+        execution: &str,
+        original: &str,
+        operation: &str,
+        state: OperationState,
+        result: Value,
+        session: Option<&ExecutionSession>,
+        now_ms: u64,
+    ) -> Result<AdmittedExecutionHandoff> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        ensure!(
+            state.terminal() || state == OperationState::Unknown,
+            "invalid execution handoff completion state"
+        );
+        let auth = self.execution_handoff_authorization(execution, original, operation, now_ms);
+        self.finish_execution_handoff_with_authority(
+            auth.as_ref().ok().map(HandoffRunningAuthorization::Primary),
+            identity,
+            execution,
+            original,
+            operation,
+            state,
+            result,
+            session,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn finish_execution_handoff_operation_current(
+        &mut self,
+        identity: &LocalIdentity,
+        cap: &VerifiedTaskBusinessOperationCurrent,
+        state: OperationState,
+        result: Value,
+        session: Option<&ExecutionSession>,
+        now_ms: u64,
+    ) -> Result<AdmittedExecutionHandoff> {
+        let (execution, original, operation) = scope(cap.wire())?;
+        self.finish_execution_handoff_with_authority(
+            Some(HandoffRunningAuthorization::OperationCurrent(cap)),
+            identity,
+            &execution,
+            &original,
+            &operation,
+            state,
+            result,
+            session,
+            now_ms,
+        )
+    }
+
+    fn finish_execution_handoff_with_authority(
+        &mut self,
+        authority: Option<HandoffRunningAuthorization<'_>>,
         identity: &LocalIdentity,
         execution: &str,
         original: &str,
@@ -2654,7 +3143,6 @@ impl Store {
             state.terminal() || state == OperationState::Unknown,
             "invalid execution handoff completion state"
         );
-        let auth = self.execution_handoff_authorization(execution, original, operation, now_ms);
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2664,6 +3152,26 @@ impl Store {
             identity.public_key_hex()? == stored.wire.handoff.target_public_key.as_str(),
             "completion signer is not this executor"
         );
+        let mut usage = ExecutionProofUsage::default();
+        if let Some(value @ HandoffRunningAuthorization::OperationCurrent(cap)) = authority {
+            value.check_accepted(&stored)?;
+            ensure!(
+                now_ms >= stored.admitted_at_ms,
+                "operation completion clock predates its acceptance"
+            );
+            let original_source = cap.original_source();
+            super::task_business_policy::check_task_business_original_source_in(
+                &tx,
+                &self.policy,
+                original_source,
+                original_source.wire(),
+                original_source.acceptance(),
+            )?;
+            verify_local_handoff_checkpoint(&tx, &stored)?;
+            value.check_latest_lease_in(&tx, &stored)?;
+            usage.merge(cap.proof_usage());
+            usage.merge(original_source.proof_usage());
+        }
         let dispatch: Event =
             serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
         let local_session = session_from(
@@ -2688,6 +3196,9 @@ impl Store {
                 "terminal handoff result cannot change"
             );
             let value = dto(&tx, identity, &stored, now_ms)?;
+            if let Some(authority) = authority {
+                authority.check_usage_in(&tx, &stored, usage, Some(&value))?;
+            }
             tx.commit()?;
             return Ok(value);
         }
@@ -2700,13 +3211,30 @@ impl Store {
             "handoff was not running or requires an explicit reconciliation decision"
         );
         if stored.state == OperationState::Running && state.terminal() {
-            let lease_valid = now_ms
-                < verified_lease_deadline(&tx, &self.policy, &stored, auth.as_ref().ok(), None)?;
-            if let Ok(auth) = &auth {
-                check_policy_heads_in(&tx, self.policy.verified(), auth.original(), now_ms)?;
-                check_policy_heads_in(&tx, self.policy.verified(), auth.submission(), now_ms)?;
-            }
-            if auth.is_err() || !lease_valid {
+            let current_auth = authority.as_ref().map(|value| value.authorization());
+            let lease_valid =
+                now_ms < verified_lease_deadline(&tx, &self.policy, &stored, current_auth, None)?;
+            let authorized = match authority {
+                Some(value @ HandoffRunningAuthorization::Primary(_)) => {
+                    value.check_current_in(&tx, &self.policy, now_ms)?;
+                    true
+                }
+                Some(value @ HandoffRunningAuthorization::OperationCurrent(_)) => {
+                    match value.check_current_in(&tx, &self.policy, now_ms) {
+                        Ok(current_usage) => {
+                            usage.merge(&current_usage);
+                            super::execution_binding_seal::ensure_handoff_generation_open_in(
+                                &tx,
+                                value.authorization().wire(),
+                            )
+                            .is_ok()
+                        }
+                        Err(_) => false,
+                    }
+                }
+                None => false,
+            };
+            if !authorized || !lease_valid {
                 state = OperationState::Unknown;
                 result = json!({"reason":"execution authorization lease is unavailable","observed_result":result});
             }
@@ -2767,6 +3295,15 @@ impl Store {
                     params![previous.revision, serde_json::to_string(&previous)?, execution, original, dispatch.resource_id.as_str(), stored.request.target_node, stored.request.session_id])?;
             }
         }
+        if state == OperationState::Unknown
+            && session.is_none()
+            && matches!(
+                authority,
+                Some(HandoffRunningAuthorization::OperationCurrent(_))
+            )
+        {
+            clear_unknown_native_session_in(&tx, &stored)?;
+        }
         stored.state = state;
         stored.result = result;
         let receipt = signed_receipt(&tx, identity, &stored, now_ms)?;
@@ -2776,6 +3313,9 @@ impl Store {
             tx.execute("DELETE FROM execution_handoff_reservations WHERE execution_space_id=? AND original_space_id=? AND operation_id=?", params![execution, original, operation])?;
         }
         let value = dto(&tx, identity, &stored, now_ms)?;
+        if let Some(authority) = authority {
+            authority.check_usage_in(&tx, &stored, usage, Some(&value))?;
+        }
         tx.commit()?;
         Ok(value)
     }
@@ -3916,7 +4456,8 @@ pub(crate) fn validate_execution_handoff_storage(
             !matches!(
                 stored.state,
                 OperationState::Running | OperationState::Unknown
-            ) || stored.lease.is_some(),
+            ) || stored.lease.is_some()
+                || (stored.state == OperationState::Unknown && stored.receipt.is_some()),
             "started handoff has no verified lease"
         );
         if let Some(receipt) = &stored.receipt {
@@ -6488,6 +7029,108 @@ pub(crate) mod tests {
                 .is_err()
         );
         assert_eq!(before, fixture.store.connection.total_changes());
+        Ok(())
+    }
+
+    #[test]
+    fn protective_unknown_requires_a_signed_executor_receipt_without_fabricating_a_lease()
+    -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        fixture.accept()?;
+        let (execution, original, operation) = scope(&fixture.wire)?;
+        let mut accepted =
+            stored_from(&fixture.store.connection, &execution, &original, &operation)?
+                .context("fixture has no original acceptance")?;
+        assert_eq!(accepted.state, OperationState::Accepted);
+        assert!(accepted.lease.is_none());
+        let reservations: u64 = fixture.store.connection.query_row(
+            "SELECT count(*) FROM execution_handoff_reservations",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(reservations > 0);
+        accepted.state = OperationState::Unknown;
+        accepted.result = json!({"reason":"stopped before Start"});
+        fixture.store.connection.execute(
+            "UPDATE execution_handoffs SET state='unknown',result=?,result_receipt=NULL",
+            [serde_json::to_string(&accepted.result)?],
+        )?;
+        assert!(
+            fixture
+                .store
+                .execution_handoff_status(
+                    &fixture.executor.node,
+                    &execution,
+                    &original,
+                    &operation,
+                    now() + 2
+                )
+                .is_err()
+        );
+        let receipt = signed_receipt(
+            &fixture.store.connection,
+            &fixture.executor.node,
+            &accepted,
+            now() + 2,
+        )?;
+        fixture.store.connection.execute(
+            "UPDATE execution_handoffs SET result_receipt=?",
+            [serde_json::to_string(&receipt)?],
+        )?;
+        let status = fixture.store.execution_handoff_status(
+            &fixture.executor.node,
+            &execution,
+            &original,
+            &operation,
+            now() + 2,
+        )?;
+        assert_eq!(status.state, OperationState::Unknown);
+        assert_eq!(status.execution_context.lease_expires_at_ms, None);
+        let lease_rows: u64 = fixture.store.connection.query_row(
+            "SELECT count(*) FROM execution_handoffs WHERE lease_challenge IS NOT NULL OR lease_deadline_ms IS NOT NULL",
+            [], |row| row.get(0))?;
+        assert_eq!(lease_rows, 0);
+        let held: u64 = fixture.store.connection.query_row(
+            "SELECT count(*) FROM execution_handoff_reservations",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(held, reservations);
+        validate_execution_handoff_storage(&fixture.store.connection, &fixture.store.policy)?;
+        let mut changed = receipt.clone();
+        changed.payload.handoff_hash = ObjectHash::body(&"another accepted operation")?;
+        fixture.store.connection.execute(
+            "UPDATE execution_handoffs SET result_receipt=?",
+            [serde_json::to_string(&changed)?],
+        )?;
+        assert!(
+            fixture
+                .store
+                .execution_handoff_status(
+                    &fixture.executor.node,
+                    &execution,
+                    &original,
+                    &operation,
+                    now() + 2
+                )
+                .is_err()
+        );
+        fixture.store.connection.execute(
+            "UPDATE execution_handoffs SET state='running',result_receipt=?",
+            [serde_json::to_string(&receipt)?],
+        )?;
+        assert!(
+            fixture
+                .store
+                .execution_handoff_status(
+                    &fixture.executor.node,
+                    &execution,
+                    &original,
+                    &operation,
+                    now() + 2
+                )
+                .is_err()
+        );
         Ok(())
     }
 
