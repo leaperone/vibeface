@@ -336,6 +336,82 @@ impl TaskBusinessOperationCheck {
         )
     }
 
+    pub fn sign_receipts(
+        &self,
+        identity: &Identity,
+        challenge: &ExecutionHandoffChallenge,
+        now: u64,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        let _signatures = ScopedSignatureVerification::new();
+        carrier(challenge)?;
+        let local_c = PublicKey::of(identity);
+        require(
+            local_c == self.original.scope().target_public_key
+                && now == self.checked_at_ms
+                && matches!(challenge.stage, CheckStage::Start | CheckStage::Renew),
+            "Task operation receipts require their freshly checked executor authority",
+        )?;
+        let expected = ExecutionHandoffChallenge::bound_to(
+            &self.authorization,
+            challenge.stage,
+            challenge.nonce.clone(),
+            challenge.issued_at_ms,
+            challenge.expires_at_ms,
+        )?;
+        require(
+            challenge == &expected,
+            "Task operation receipt changed its complete execution challenge",
+        )?;
+        validate_window(challenge.issued_at_ms, challenge.expires_at_ms, now)?;
+        self.combined
+            .state()
+            .check_execution_handoff_current(&self.authorization, now)?;
+        let expires = challenge
+            .expires_at_ms
+            .min(self.authorization.expires_at_ms());
+        require(now < expires, "Task operation receipt authority expired")?;
+        let mut receipts = Vec::new();
+        let hash = challenge.hash()?;
+        for head in &self.primary_heads {
+            require(
+                challenge.policies.contains(head),
+                "Task operation receipt omitted an executor policy head",
+            )?;
+            let authority = match &head.domain {
+                PolicyDomain::Account(id) => {
+                    self.combined.state().account(id).map(|v| &v.authority)
+                }
+                PolicyDomain::Space(id) => self.combined.state().space(id).map(|v| &v.authority),
+            }
+            .ok_or(AuthorizationError::PolicyConflict)?;
+            if authority.public_key == local_c {
+                require(
+                    authority.device == DeviceId::from_key(&local_c)
+                        && authority.service == ServiceId::from_key(&local_c),
+                    "Task operation executor authority changed its service or device",
+                )?;
+                receipts.push(Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: head.clone(),
+                        challenge_hash: hash.clone(),
+                        issued_at_ms: now,
+                        expires_at_ms: expires,
+                    },
+                    identity,
+                )?);
+            }
+        }
+        carrier(&receipts)?;
+        let mut usage = self.usage.clone();
+        usage.record_metadata(challenge)?;
+        for receipt in &receipts {
+            usage.record_signed(receipt)?;
+        }
+        finish_usage(&mut usage)?;
+        Ok(receipts)
+    }
+
     pub fn finish(
         self,
         proof: &ExecutionHandoffFreshness,
