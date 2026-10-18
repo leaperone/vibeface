@@ -1177,8 +1177,14 @@ impl VerifiedRemoteExecution {
                 body_hash: ObjectHash::body(&body)?,
                 context: self.context.context.clone(),
             };
-            self.state
-                .verify_invocation(&invocation, &facts, &transport, now)?;
+            let destination = self.state.verify_execution_destination(
+                &facts.resource, &facts.audience, &self.selection.execution_resource,
+                &self.selection.target_public_key, &self.selection.execution_grant,
+                &facts.context, facts.action, now,
+            )?;
+            self.state.verify_invocation_with_execution_destination(
+                &invocation, &facts, &transport, &destination, now,
+            )?;
             Ok(())
         })()
         .map_err(|error| error.to_string())
