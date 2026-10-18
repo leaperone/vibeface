@@ -6,6 +6,7 @@ pub use authenticator_management::{
     AuthenticatorManagementIntent, AuthenticatorPolicyApproval, VerifiedAuthenticatorManagement,
 };
 pub mod bootstrap;
+pub mod client_policy_import;
 pub mod directory;
 pub mod enrollment;
 pub mod execution_handoff;
@@ -5691,6 +5692,8 @@ pub struct VerifiedClientAuthorization {
     policy_snapshot: VerifiedPolicySet,
     policy_journal: Vec<JournalEntry>,
     policy_pins: Vec<PolicyPin>,
+    imported_snapshot: Option<policy_import::VerifiedPolicySnapshot>,
+    client_policy_context: Option<client_policy_import::ClientPolicyProvenance>,
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedClientAuthorization {
@@ -5726,6 +5729,19 @@ fn verify_client_policy_state(
     account: AccountId,
     space: SpaceId,
     key: PublicKey,
+    now_ms: u64,
+) -> Result<VerifiedClientAuthorization> {
+    verify_client_policy_state_selected(state, bundle, pins, account, space, key, None, now_ms)
+}
+
+fn verify_client_policy_state_selected(
+    state: VerifiedPolicySet,
+    bundle: &ClientAuthorizationBundle,
+    pins: &[PolicyPin],
+    account: AccountId,
+    space: SpaceId,
+    key: PublicKey,
+    selected: Option<&ResourceRef>,
     now_ms: u64,
 ) -> Result<VerifiedClientAuthorization> {
     let certificate = state.find_device(&DeviceId::from_key(&key))?;
@@ -5785,7 +5801,23 @@ fn verify_client_policy_state(
     )?;
     state.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
     let mut resources = Vec::new();
-    if let Some(document) = state.space(&space) {
+    if let Some(selected) = selected {
+        let record = state.resource(&selected.space, &selected.resource).ok_or(
+            AuthorizationError::InvalidProof("missing selected client resource"),
+        )?;
+        require(
+            selected.space == space
+                && matches!(
+                    record.payload.kind,
+                    ResourceKind::Project | ResourceKind::ExecutionService
+                )
+                && record.payload.host == leaf.audience.service
+                && scope_covers(&leaf.scope, selected),
+            "client selection is outside the current authorized resource",
+        )?;
+        budget.verify(record)?;
+        resources.push(record.clone());
+    } else if let Some(document) = state.space(&space) {
         for hash in &document.resources {
             let Some(record) = state.resources.get(hash) else {
                 continue;
@@ -5873,6 +5905,8 @@ fn verify_client_policy_state(
         policy_snapshot: state,
         policy_journal: bundle.journal.clone(),
         policy_pins: pins.to_vec(),
+        imported_snapshot: None,
+        client_policy_context: None,
     })
 }
 
