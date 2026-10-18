@@ -1919,7 +1919,7 @@ def enroll_account_node(authority, candidate):
         require(progress["context"] == import_context, "additional-Node import preserves its original purpose context")
         if page["page"]["payload"]["complete"]:
             break
-    witness = client.identity_call("enrollment_policy_read_witness", progress["page_request"])
+    witness = client.identity_call("enrollment_policy_read_witness", {**progress["page_request"], "cursor": None})
     finish = {"context": import_context, "witness": witness["witness"]}
     possession = client.identity_call("account_node_import_finish", finish, connection=connection)
     require(client.identity_call("account_node_import_finish", finish, connection=connection) == possession,
