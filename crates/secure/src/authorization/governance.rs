@@ -225,15 +225,14 @@ fn install_objects(
                         && request.proposal.payload.resources.contains(&hash),
                     "resource does not belong to proposed change",
                 )?;
-                let host = previous
+                let host = state
                     .devices
-                    .iter()
-                    .filter_map(|hash| state.device(hash))
+                    .values()
                     .find(|certificate| {
                         certificate.payload.subject == Actor::Service(value.payload.host.clone())
                     })
                     .ok_or(AuthorizationError::InvalidProof(
-                        "resource host is not an explicit space node reference",
+                        "resource host has no service certificate",
                     ))?;
                 state.verify_service_device(space, &host.payload.device, now)?;
                 state.install_resource(value.clone())?;
@@ -2671,6 +2670,106 @@ pub(crate) mod tests {
         assert!(
             crate::recovery_open(&sealed, "team fixture recovery password").unwrap()
                 == material.as_bytes()
+        );
+    }
+
+    #[test]
+    fn personal_resource_registration_uses_current_account_nodes_and_rejects_foreign_hosts() {
+        let personal = Fixture::personal();
+        let space = SpaceId::personal(&personal.account);
+        let state = personal.state();
+        let node = state
+            .find_device(&DeviceId::from_key(&PublicKey::of(&key(4))))
+            .unwrap();
+        let node_hash = node.hash().unwrap();
+        assert!(
+            state
+                .account(&personal.account)
+                .unwrap()
+                .devices
+                .contains(&node_hash)
+        );
+        assert!(!state.space(&space).unwrap().devices.contains(&node_hash));
+        let intent = SpaceResourceIntent {
+            space: space.clone(),
+            resource: ResourceId::from_bytes([31; 32]),
+            kind: ResourceKind::Project,
+            host_node_public_key: PublicKey::of(&key(4)),
+        };
+        let prepared = prepare_space_resource_registration(
+            &json(&intent).unwrap(),
+            &key(3),
+            &personal.authorization(),
+            NOW as f64,
+        )
+        .unwrap();
+        let committed = personal.commit(&prepared);
+        let committed_state = committed.state();
+        assert_eq!(
+            committed_state
+                .resource(&space, &intent.resource)
+                .unwrap()
+                .payload
+                .host,
+            ServiceId::from_key(&PublicKey::of(&key(4)))
+        );
+        assert!(
+            !committed_state
+                .space(&space)
+                .unwrap()
+                .devices
+                .contains(&node_hash)
+        );
+
+        let nonce = Nonce::from_bytes([32; 32]).to_string();
+        let claim_json = create_node_claim(&key(24), &nonce, 10_000.0, 100_000.0).unwrap();
+        let claim =
+            verify_node_claim(&claim_json, &key(24).public_key_hex(), &nonce, 10_000.0).unwrap();
+        let foreign =
+            prepare_account_creation(&key(21), &key(22), &key(23), &claim, 1_000_000.0, 10_000.0)
+                .unwrap();
+        let possession = sign_node_possession(
+            &foreign.node_request_json().unwrap(),
+            &key(24),
+            &nonce,
+            10_000.0,
+        )
+        .unwrap();
+        let foreign = finish_account_creation(&foreign, &key(21), &possession, 10_000.0).unwrap();
+        let foreign_bundle: ClientAuthorizationBundle =
+            parse(&foreign.bundle_json().unwrap()).unwrap();
+        let mut pins = personal.pins.clone();
+        pins.extend(parse::<Vec<PolicyPin>>(&foreign.pins_json().unwrap()).unwrap());
+        pins.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let mut journal = personal.bundle.journal.clone();
+        journal.extend(foreign_bundle.journal);
+        let combined = replay_policies(&pins, &journal).unwrap();
+        assert!(
+            combined
+                .verify_service_device(
+                    &SpaceId::personal(&AccountId::from_root(&PublicKey::of(&key(21)))),
+                    &DeviceId::from_key(&PublicKey::of(&key(24))),
+                    NOW,
+                )
+                .is_ok()
+        );
+        let mut request = prepared.request.clone();
+        let JournalEntry::Resource(record) = &request.new_objects[0] else {
+            panic!("fixture requires a resource change");
+        };
+        let old_hash = record.hash().unwrap();
+        let mut record = record.payload.clone();
+        record.host = ServiceId::from_key(&PublicKey::of(&key(24)));
+        let record = Signed::sign(record, &key(3)).unwrap();
+        let mut proposal = request.proposal.payload.clone();
+        proposal.resources.retain(|hash| hash != &old_hash);
+        proposal.resources.push(record.hash().unwrap());
+        proposal.resources.sort();
+        request.proposal = Signed::sign(proposal, &key(3)).unwrap();
+        request.new_objects = vec![JournalEntry::Resource(record)];
+        assert_eq!(
+            verify_space_governance_request(&combined, &request, NOW).unwrap_err(),
+            AuthorizationError::InvalidProof("service belongs to another personal account")
         );
     }
 
