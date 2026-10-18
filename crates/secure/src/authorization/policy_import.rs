@@ -472,6 +472,40 @@ impl VerifiedPolicySnapshot {
     pub(crate) fn journal(&self) -> &[JournalEntry] {
         &self.journal
     }
+    pub(crate) fn with_independent_pins(&self, incoming: &[PolicyPin]) -> Result<Self> {
+        require(
+            incoming.len() == self.pins.len()
+                && incoming.iter().zip(&self.pins).all(|(pin, saved)| {
+                    pin.domain == saved.domain && pin.genesis_root == saved.genesis_root
+                }),
+            "policy refresh changed independently trusted domains or genesis roots",
+        )?;
+        let mut pins = self.pins.clone();
+        for (pin, saved) in incoming.iter().zip(&mut pins) {
+            if let Some(minimum) = &pin.minimum_head {
+                require(
+                    minimum.domain == pin.domain,
+                    "policy minimum belongs to another domain",
+                )?;
+                if !self.state.roots.contains_key(minimum) {
+                    return Err(AuthorizationError::NeedPolicySync(vec![minimum.clone()]));
+                }
+                let position = minimum_position(&self.state, minimum)?;
+                if saved
+                    .minimum_head
+                    .as_ref()
+                    .map(|old| minimum_position(&self.state, old))
+                    .transpose()?
+                    .is_none_or(|old| old < position)
+                {
+                    saved.minimum_head = Some(minimum.clone());
+                }
+            }
+        }
+        let mut refreshed = self.clone();
+        refreshed.pins = pins;
+        Ok(refreshed)
+    }
     pub(crate) fn into_parts(self) -> (VerifiedPolicySet, Vec<PolicyPin>, Vec<JournalEntry>) {
         (self.state, self.pins, self.journal)
     }
@@ -832,5 +866,42 @@ mod tests {
             .payload
             .expires_at_ms += 1;
         assert!(merge_same_head_snapshots(&snapshot, &conflicting).is_err());
+    }
+
+    #[test]
+    fn independent_minima_only_advance_to_an_exact_verified_historical_head() {
+        let (_, pins, entries, heads) = account_history();
+        let JournalEntry::AccountGenesis(genesis) = &entries[0] else {
+            unreachable!()
+        };
+        let mut earlier = pins.clone();
+        earlier[0].minimum_head = Some(account_stamp(genesis).unwrap());
+        let snapshot = complete(&earlier, &entries, &heads);
+        let refreshed = snapshot.with_independent_pins(&pins).unwrap();
+        assert_eq!(refreshed.pins(), pins);
+        assert_eq!(refreshed.heads(), snapshot.heads());
+        assert_eq!(refreshed.journal(), snapshot.journal());
+        assert_eq!(
+            refreshed.with_independent_pins(&earlier).unwrap().pins(),
+            pins
+        );
+        earlier[0].minimum_head = None;
+        assert_eq!(
+            refreshed.with_independent_pins(&earlier).unwrap().pins(),
+            pins
+        );
+        let mut unverified = pins.clone();
+        let head = unverified[0].minimum_head.as_mut().unwrap();
+        head.sequence += 1;
+        head.head = ObjectHash::body(&"unimported successor").unwrap();
+        assert!(matches!(
+            refreshed.with_independent_pins(&unverified),
+            Err(AuthorizationError::NeedPolicySync(_))
+        ));
+        assert_eq!(refreshed.pins(), pins);
+        let mut changed_genesis = pins;
+        changed_genesis[0].genesis_root = PublicKey::parse(&"bc".repeat(32)).unwrap();
+        assert!(refreshed.with_independent_pins(&changed_genesis).is_err());
+        assert!(refreshed.with_independent_pins(&[]).is_err());
     }
 }
