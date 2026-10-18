@@ -57,7 +57,7 @@ mod tests {
             .join("../../.artifacts")
             .join(format!("runtime-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
-        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":2}"#)?;
+        config::private_write(&dir.join("data-epoch.json"), br#"{"data_epoch":3}"#)?;
         let mut cfg = Config::local("127.0.0.1:4790".parse()?, vec![dir.canonicalize()?], false);
         cfg.codex_socket = Some(dir.join("unavailable.sock"));
         cfg.save(&dir)?;
@@ -168,12 +168,23 @@ mod tests {
     #[tokio::test]
     async fn unsupported_epoch_does_not_open_databases_or_modify_the_directory() -> Result<()> {
         let dir = fixture()?;
-        std::fs::remove_file(dir.join("data-epoch.json"))?;
         let config = std::fs::read(dir.join("config.json"))?;
-        assert!(Runtime::open(&dir).await.is_err());
-        assert!(!dir.join("node.sqlite3").exists());
-        assert!(!dir.join("identity.sqlite3").exists());
-        assert_eq!(std::fs::read(dir.join("config.json"))?, config);
+        for epoch in [None, Some(1), Some(2), Some(4)] {
+            if let Some(epoch) = epoch {
+                config::private_write(
+                    &dir.join("data-epoch.json"),
+                    &serde_json::to_vec(&json!({"data_epoch":epoch}))?,
+                )?;
+            } else {
+                std::fs::remove_file(dir.join("data-epoch.json"))?;
+            }
+            let marker = std::fs::read(dir.join("data-epoch.json")).ok();
+            assert!(Runtime::open(&dir).await.is_err());
+            assert!(!dir.join("node.sqlite3").exists());
+            assert!(!dir.join("identity.sqlite3").exists());
+            assert_eq!(std::fs::read(dir.join("config.json"))?, config);
+            assert_eq!(std::fs::read(dir.join("data-epoch.json")).ok(), marker);
+        }
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -1683,8 +1694,8 @@ impl Runtime {
     pub async fn open(dir: &Path) -> Result<Self> {
         let epoch: Value = serde_json::from_slice(&std::fs::read(dir.join("data-epoch.json"))?)?;
         ensure!(
-            epoch == json!({"data_epoch":2}),
-            "this Node requires an initialized data epoch 2 directory"
+            epoch == json!({"data_epoch":3}),
+            "this Node requires an initialized data epoch 3 directory"
         );
         let mut config = Config::load(dir)?;
         let process_lock = config::lock_data_dir(dir)?;

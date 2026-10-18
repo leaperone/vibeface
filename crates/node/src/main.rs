@@ -387,7 +387,7 @@ fn initialize(dir: &Path, configuration: Config) -> Result<()> {
         &dir.join("bootstrap.json"),
         &serde_json::to_vec(&capability)?,
     )?;
-    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":2}"#)?;
+    create_private(&dir.join("data-epoch.json"), br#"{"data_epoch":3}"#)?;
     println!("Initialized node {}", identity.node_id()?);
     println!("Configuration: {}", dir.join("config.json").display());
     Ok(())
@@ -462,7 +462,7 @@ fn access(options: Access) -> Result<()> {
     let dir = &options.data.data_dir;
     let epoch: Value = serde_json::from_slice(&read_bounded(&dir.join("data-epoch.json"), 4096)?)?;
     ensure!(
-        epoch == json!({"data_epoch":2}),
+        epoch == json!({"data_epoch":3}),
         "data directory uses another format; existing data was preserved"
     );
     let configuration = Config::load(dir)?;
