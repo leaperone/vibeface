@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::{BTreeMap, BTreeSet};
 use vibeface_secure::authorization::{
     AccountId, Committed, JournalEntry, ObjectHash, PolicyCommit, PolicyDomain, PolicyPin,
@@ -344,6 +344,23 @@ impl PolicyState {
             ensure!(!nonempty, "unverified recovery journal entries exist");
             None
         };
+        let durable_tail: Option<(String, i64)> = connection
+            .query_row(
+                "SELECT entry_hash,ordinal FROM policy_journal ORDER BY ordinal DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        ensure!(
+            durable_tail
+                .as_ref()
+                .map(|(hash, ordinal)| (hash.as_str(), *ordinal))
+                == last_hash
+                    .as_ref()
+                    .zip(last_ordinal)
+                    .map(|(hash, ordinal)| (hash.as_str(), ordinal)),
+            "unverified policy journal tail changed the current frontier"
+        );
         Ok(AcceptedJournalSnapshot {
             accepted_len: self.order.len(),
             last_hash,
