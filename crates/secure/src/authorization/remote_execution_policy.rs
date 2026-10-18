@@ -276,15 +276,7 @@ pub(crate) fn revalidate_source(
         Some(&resource),
         now,
     )?;
-    let source_node = &source
-        .client_policy_context
-        .as_ref()
-        .ok_or(AuthorizationError::InvalidProof(
-            "source provenance is missing",
-        ))?
-        .request
-        .payload
-        .node_public_key;
+    let source_node = client_policy_import::confirmed_client_policy_source_node(source)?;
     client_policy_import::bind_client_policy_source_node(&mut current, source_node, now)?;
     require(
         current.scope == source.scope

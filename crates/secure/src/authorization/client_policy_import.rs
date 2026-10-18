@@ -1120,6 +1120,21 @@ pub(crate) fn require_confirmed_client_policy(
         ))
 }
 
+pub(crate) fn confirmed_client_policy_source_node(
+    authorization: &VerifiedClientAuthorization,
+) -> Result<&PublicKey> {
+    require_confirmed_client_policy(authorization)?;
+    Ok(&authorization
+        .client_policy_context
+        .as_ref()
+        .ok_or(AuthorizationError::InvalidProof(
+            "bounded client provenance is missing",
+        ))?
+        .request
+        .payload
+        .node_public_key)
+}
+
 pub(crate) fn record_confirmed_client_policy_metadata(
     authorization: &VerifiedClientAuthorization,
     usage: &mut ExecutionProofUsage,
