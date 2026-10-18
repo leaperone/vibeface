@@ -1434,6 +1434,15 @@ struct ObservationScopeCheckpoint {
     previous: Option<(u64, String)>,
 }
 
+pub(super) fn validate_retained_execution_scope_in(
+    connection: &Connection,
+    identity: &LocalIdentity,
+    source: &SignedEvent,
+) -> Result<()> {
+    ready_observation_scope_in(connection, source, &identity.node_id()?, "")?;
+    Ok(())
+}
+
 fn ready_observation_scope_in(
     connection: &Connection,
     source: &SignedEvent,
