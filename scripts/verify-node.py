@@ -2331,8 +2331,16 @@ def portable_access_acceptance(options):
 
         target.client.close()
         phone_invite = run / "phone-invitation.vibeface.json"
+        unpublished_path = run / "missing" / "phone-invitation.vibeface.json"
+        failed_output = cli(["invite", "create", "--via", relay.url, "--out", unpublished_path], "owner")
+        failed_output.finish(expected=1)
+        with sqlite3.connect(f"file:{target.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+            offers_before_retry = database.execute("SELECT count(*) FROM local_values WHERE key GLOB 'enrollment-offer:*'").fetchone()[0]
         created = cli(["invite", "create", "--data-dir", target.directory, "--via", relay.url, "--out", phone_invite], "owner")
         created.finish()
+        with sqlite3.connect(f"file:{target.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+            require(database.execute("SELECT count(*) FROM local_values WHERE key GLOB 'enrollment-offer:*'").fetchone()[0] == offers_before_retry,
+                    "retry after output failure reuses the published invitation")
         phone_reference = json.loads(phone_invite.read_text())
         require(phone_reference["relay"] is True and phone_reference["node_public_key"] == target.node_public_key, "CLI invitation binds the same relay target")
         passed("enrolled CLI creates invitations after original manager closes")

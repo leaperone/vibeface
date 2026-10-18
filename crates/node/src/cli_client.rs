@@ -113,7 +113,15 @@ enum ProfileState {
 struct ManagedOffer {
     reference: EnrollmentReference,
     offer: String,
-    published: bool,
+    status: PublicationStatus,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PublicationStatus {
+    Prepared,
+    Published,
+    Delivered,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -592,6 +600,8 @@ async fn enroll(options: ProfileOptions, invitation_path: PathBuf) -> Result<()>
     let input: EnrollmentReference = serde_json::from_slice(&bytes).context(
         "use a device invitation from an authorized manager, not a public connection card",
     )?;
+    ensure!(input.version == 2, "unsupported device invitation version");
+    secure(input.route())?;
     let mut store = ProfileStore::open(&options, true)?;
     let identity = store.identity()?;
     if let ProfileState::Ready(trust) = &store.profile.state {
@@ -808,11 +818,9 @@ async fn create_invitation(
                 .iter()
                 .any(|approval| approval.offer_hash == offer.reference.offer_hash)
     });
-    let reusable = store
-        .profile
-        .offers
-        .iter()
-        .position(|offer| !offer.published && offer.reference.expires_at_ms > now());
+    let reusable = store.profile.offers.iter().position(|offer| {
+        offer.status != PublicationStatus::Delivered && offer.reference.expires_at_ms > now()
+    });
     let index = if let Some(index) = reusable {
         ensure!(
             secure(store.profile.offers[index].reference.route())? == route
@@ -855,7 +863,7 @@ async fn create_invitation(
         store.profile.offers.push(ManagedOffer {
             reference,
             offer: encoded,
-            published: false,
+            status: PublicationStatus::Prepared,
         });
         store.save()?;
         store.profile.offers.len() - 1
@@ -881,7 +889,7 @@ async fn create_invitation(
             "existing invitation differs from the original signed request"
         );
     }
-    store.profile.offers[index].published = true;
+    store.profile.offers[index].status = PublicationStatus::Published;
     store.save()?;
     let encoded = serde_json::to_vec(&saved.reference)?;
     if let Some(path) = out {
@@ -915,13 +923,15 @@ async fn create_invitation(
         if route.relay { "relay" } else { "direct" }
     );
     eprintln!("The new device still requires your explicit approval.");
+    store.profile.offers[index].status = PublicationStatus::Delivered;
+    store.save()?;
     Ok(())
 }
 
 async fn pending_invitations(options: ProfileOptions) -> Result<()> {
     let (store, mut client, _, _) = manager(&options).await?;
     for offer in &store.profile.offers {
-        if !offer.published || offer.reference.expires_at_ms <= now() {
+        if offer.status == PublicationStatus::Prepared || offer.reference.expires_at_ms <= now() {
             continue;
         }
         let response = call(&mut client, "enrollment_pending", json!({"account_id":offer.reference.account_id,"offer_hash":offer.reference.offer_hash})).await?;
@@ -972,7 +982,7 @@ async fn approve_invitation(options: ProfileOptions, request_id: &str) -> Result
     let (mut store, mut client, identity, mut auth) = manager(&options).await?;
     let mut found = None;
     for saved in &store.profile.offers {
-        if !saved.published {
+        if saved.status == PublicationStatus::Prepared {
             continue;
         }
         let request = call(&mut client, "enrollment_status", json!({"account_id":saved.reference.account_id,"offer_hash":saved.reference.offer_hash,"request_id":id})).await?;

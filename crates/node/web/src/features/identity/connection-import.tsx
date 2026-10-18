@@ -79,7 +79,7 @@ export function ConnectionImport({ disabled }: { disabled: boolean }) {
         <label className="grid gap-2 text-sm">恢复包口令<Input className="min-h-11" name="password" type="password" minLength={12} autoComplete="new-password" required /></label>
         <label className="grid gap-2 text-sm">再次填写口令<Input className="min-h-11" name="confirmation" type="password" minLength={12} autoComplete="new-password" required /></label>
       </fieldset>}
-      <p className="text-xs text-muted-foreground">{preview.kind === 'enrollment' ? '确认后，此设备将生成自己的持钥证明，并等待管理设备批准。' : preview.kind === 'connection' ? '连接卡不授予新权限，将使用此设备已有的授权。' : '仅用于尚未认领的节点。'}</p>
+      <p className="text-xs text-muted-foreground">{preview.kind === 'enrollment' ? '确认后将提交入网申请，等待管理设备核对。批准后还需由此设备提供持钥证明。' : preview.kind === 'connection' ? '连接卡不授予新权限，将使用此设备已有的授权。' : '仅用于尚未认领的节点。'}</p>
       <div className="flex flex-wrap gap-2"><Button className="min-h-11" type="submit" disabled={busy || disabled}>确认{preview.kind === 'enrollment' ? '申请加入' : preview.kind === 'claim' ? '认领' : '连接'}</Button><Button className="min-h-11" type="button" variant="outline" disabled={busy} onClick={() => setPreview(null)}>取消</Button></div>
     </form>}
   </div>

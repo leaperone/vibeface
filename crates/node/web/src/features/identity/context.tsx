@@ -191,6 +191,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }
   const profileKey = (key: string) => `profile.${storageProfile()}.${key}`
   const savedSpaces = () => array(load(profileKey('policy-trusts'), true) ?? []).map(parseAuthorizationTrust)
+  const enrollmentRequestKey = (reference: EnrollmentReference) => profileKey(`enrollment-request.${reference.account_id}.${reference.node_public_key}.${reference.offer_hash}`)
+  function clearEnrollmentRequest(key: string) {
+    store(key, null)
+    if (load(profileKey('active-enrollment-request')) === key) store(profileKey('active-enrollment-request'), null)
+  }
   const managerEnrollmentKey = (active: Session) => profileKey(`enrollment-offer.${active.entry.node_id}.${active.authorization?.scope.account_id}`)
   function savedManagerEnrollment(active: Session): ManagerEnrollment | null {
     if (!active.authorization?.enrollmentRights.includes('enroll_device')) return null
@@ -951,7 +956,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const selectedSpace = spaceId ?? load(profileKey('last-space'), true)
     if (selectedSpace !== null && typeof selectedSpace !== 'string') throw new Error('已保存的空间选择无效。请保留浏览器数据并核查。')
     const trust = selectedSpace ? known.find(trust => trust.spaceId === selectedSpace) : known[0]
-    if (!trust) throw new Error('请先使用新格式连接卡为此设备配置取得账户授权。')
+    if (!trust) throw new Error('此设备尚无账户授权。请导入已授权设备生成的入网邀请，并完成批准。')
     const savedTarget = load(targetKey(trust.spaceId, candidate), true)
     const selection = savedTarget ? parseAuthorizationSelection(savedTarget) : undefined
     if (selection && projectId && selection.resourceId !== projectId) { selection.resourceId = projectId; delete selection.grantLeaf }
@@ -1801,7 +1806,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (!own) throw new Error('请先创建或解锁新设备配置。')
     cancelSensitive()
     let active = await open({ address: reference.endpoint, node_id: nodeFingerprint(reference.node_public_key), relay: reference.relay }, reference.node_public_key)
-    const requestKey = profileKey('enrollment-request')
+    const requestKey = enrollmentRequestKey(reference)
     const controller = new AbortController()
     let pending: Awaited<ReturnType<typeof requestDeviceEnrollment>> | null = null
     let passkey: {
@@ -1875,7 +1880,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         controller.signal.throwIfAborted()
         await authenticate(auth, active, trust, undefined, undefined, controller.signal)
         if (protectLocal) await saveLocalPasskeyProtection(attempt.assertion, controller.signal)
-        store(requestKey, null)
+        clearEnrollmentRequest(requestKey)
         if (sensitive.current === flow) cancelSensitive()
       },
       async refreshEnrollment() {
@@ -1891,7 +1896,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           const auth = await readAuthentication(active, original.trust, undefined, controller.signal)
           controller.signal.throwIfAborted()
           await authenticate(auth, active, original.trust, undefined, undefined, controller.signal)
-          store(requestKey, null)
+          clearEnrollmentRequest(requestKey)
           if (sensitive.current === flow) cancelSensitive()
           return
         }
@@ -1920,6 +1925,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           controller.signal.throwIfAborted()
           if (identityRef.current !== own || session.current !== active) throw changed()
           store(requestKey, request)
+          store(profileKey('active-enrollment-request'), requestKey)
         },
       }))
       controller.signal.throwIfAborted()
@@ -2218,8 +2224,13 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     if (version !== generation.current) throw changed()
     identityRef.current = own; setIdentity(own); setPhase('disconnected'); setError('')
     setEntries(savedEntries(storageProfile(own), load)); setSpaces(savedSpaces()); setRecoveryReadProjects(readRecoveryReadProjects(load(profileKey('recovery-read-projects'))))
-    const pendingEnrollment = load(profileKey('enrollment-request'), true)
-    if (pendingEnrollment) { await beginEnrollment(parseSavedEnrollmentRequest(pendingEnrollment).reference); return }
+    const pendingKey = load(profileKey('active-enrollment-request'), true)
+    if (pendingKey) {
+      const key = text(pendingKey), pending = parseSavedEnrollmentRequest(load(key, true))
+      if (key !== enrollmentRequestKey(pending.reference)) throw new Error('已保存的申请索引不属于当前设备配置。')
+      await beginEnrollment(pending.reference)
+      return
+    }
     if (!initialInvitation) {
       const lastEntry = load(profileKey('last-entry'), true)
       if (lastEntry) await connect(parseEntry(lastEntry))
