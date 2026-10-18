@@ -2,7 +2,7 @@ use super::{
     admission::reconstruct_stored_admission,
     journal::PolicyState,
     policy::{FreshnessProof, RequestTransport},
-    task_execution_context::OriginalAdmissionView,
+    task_execution_context::{OriginalAdmissionView, TaskScopedAuthorization},
 };
 use crate::{
     crypto::{self, LocalIdentity},
@@ -1819,6 +1819,7 @@ pub(crate) fn append_execution_handoff_observation_in(
     connection: &Connection,
     policy: &PolicyState,
     identity: &LocalIdentity,
+    scoped: &TaskScopedAuthorization,
     source: &SignedEvent,
     result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffResult,
     verified: &vibeface_secure::authorization::execution_handoff::VerifiedExecutionHandoffResult,
@@ -1828,14 +1829,46 @@ pub(crate) fn append_execution_handoff_observation_in(
         verified.result() == result && result.handoff.handoff.project_dispatch == *source,
         "handoff acknowledgement belongs to another dispatch"
     );
-    check_execution_observation_authorizations_in(
-        connection,
-        policy,
-        identity,
-        verified.original(),
-        verified.submission(),
-        now_ms,
-    )?;
+    ensure!(
+        scoped.authorization().signed_invocation() == verified.original().signed_invocation(),
+        "execution observation changed its verified dispatch scope"
+    );
+    if scoped.task_policy().is_some() {
+        let invocation = &verified.original().signed_invocation().payload;
+        let facts = RequestFacts {
+            resource: invocation.resource.clone(),
+            action: invocation.action,
+            audience: invocation.audience.clone(),
+            operation_id: invocation.operation_id.clone(),
+            body_hash: invocation.body_hash.clone(),
+            context: invocation.context.clone(),
+        };
+        scoped
+            .check_current_in(connection, policy.verified(), &facts, now_ms)
+            .context("check current Task execution observation scope")?;
+        let state = scoped.state(policy.verified());
+        state
+            .check_current(verified.original(), now_ms)
+            .context("check current Task execution observation original")?;
+        state
+            .check_current(verified.submission(), now_ms)
+            .context("check current Task execution observation submission")?;
+        ensure!(
+            verified.original().audience().device
+                == DeviceId::from_key(&PublicKey::parse(&identity.public_key_hex()?)?),
+            "execution observation must be appended by its current Project host"
+        );
+    } else {
+        check_execution_observation_authorizations_in(
+            connection,
+            policy,
+            identity,
+            verified.original(),
+            verified.submission(),
+            now_ms,
+        )
+        .context("check current primary execution observation authorizations")?;
+    }
     verified.proof_usage().enforce_limits()?;
     append_checkpointed_execution_observation_in(
         connection,

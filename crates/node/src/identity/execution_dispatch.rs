@@ -2598,8 +2598,9 @@ impl Store {
         )?;
         if state != OperationState::Accepted {
             super::event_authorization::append_execution_handoff_observation_in(
-                &tx, &current, identity, source, result, &verified, now_ms,
-            )?;
+                &tx, &current, identity, &scoped, source, result, &verified, now_ms,
+            )
+            .context("append execution result observation in its verified dispatch scope")?;
         }
         if state.terminal() {
             tx.execute(
@@ -3478,6 +3479,39 @@ pub(crate) mod tests {
             f.store
                 .connection
                 .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        {
+            let retained = retained_dispatch_from(&f.store.connection, &f.project.node, &wire)?;
+            let (scoped, _) = retained_dispatch_authorization(
+                &f.store.connection,
+                &f.store.policy,
+                &f.project.node,
+                &retained,
+                now() + 2,
+            )?;
+            let verified = scoped
+                .state(f.store.policy.verified())
+                .verify_execution_handoff_result(&result, scoped.authorization(), now() + 2)?;
+            let wrong_scope = TaskScopedAuthorization::from_primary(verified.submission().clone());
+            let before = f.store.connection.total_changes();
+            let error = super::super::event_authorization::append_execution_handoff_observation_in(
+                &f.store.connection,
+                &f.store.policy,
+                &f.project.node,
+                &wrong_scope,
+                &retained.source,
+                &result,
+                &verified,
+                now() + 2,
+            )
+            .expect_err("execution observation accepted another dispatch scope");
+            assert!(
+                error
+                    .to_string()
+                    .contains("changed its verified dispatch scope"),
+                "{error:#}"
+            );
+            assert_eq!(f.store.connection.total_changes(), before);
+        }
         let mut wrong = result.clone();
         wrong.result = json!({"opened":false});
         assert!(
