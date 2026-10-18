@@ -475,7 +475,7 @@ impl Store {
         let facts = execution_resolution_account_facts(&wire.resolution)?;
         let transport = account.transport.clone().into_evidence();
         let resolver = if let Some(admitted) =
-            reconstruct_admission_at_current_heads(current.verified(), account, &facts, &transport)?
+            reconstruct_admission_at_current_heads(&current, account, &facts, &transport)?
         {
             current
                 .verified()

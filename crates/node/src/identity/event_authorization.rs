@@ -120,12 +120,7 @@ pub(crate) fn verify_event_envelope(
     let event: Event = serde_json::from_str(&envelope.canonical_body)?;
     let proof = admission(&event);
     let current = policy.verified();
-    let historical = if proof
-        .challenge
-        .policies
-        .iter()
-        .all(|head| current.head(&head.domain) == Some(head))
-    {
+    let historical = if policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)? {
         None
     } else {
         Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
@@ -819,12 +814,10 @@ fn validate_local_event_evidence(
     events: &BTreeMap<String, StoredEvent>,
 ) -> Result<EventEvidenceStatus> {
     let state = policy.verified();
-    if admission(event)
-        .challenge
-        .policies
-        .iter()
-        .all(|head| state.head(&head.domain) == Some(head))
-    {
+    if policy.current_heads_at(
+        &admission(event).challenge.policies,
+        admission(event).admitted_at_ms,
+    )? {
         validate_event_evidence_in_state(policy, connection, state, event, events, true)
     } else {
         validate_event_evidence(policy, connection, event, events)
@@ -854,7 +847,7 @@ fn validate_event_evidence_in_state(
     };
     let transport = proof.transport.clone().into_evidence();
     if current_heads {
-        reconstruct_admission_at_current_heads(state, proof, &facts, &transport)?
+        reconstruct_admission_at_current_heads(policy, proof, &facts, &transport)?
             .context("local event admission policy changed")?;
     } else {
         reconstruct_admission(policy, proof, &facts, &transport)?;
@@ -945,11 +938,7 @@ pub(crate) fn event_authorization_in_view(
 ) -> Result<VerifiedAuthorization> {
     let proof = admission(event);
     let current = policy.verified();
-    let current_heads = proof
-        .challenge
-        .policies
-        .iter()
-        .all(|head| current.head(&head.domain) == Some(head));
+    let current_heads = policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)?;
     let retained = if current_heads {
         None
     } else {
@@ -972,7 +961,7 @@ pub(crate) fn event_authorization_in_view(
         .context("event resource history is incomplete")?;
     let transport = proof.transport.clone().into_evidence();
     let admitted = if current_heads {
-        reconstruct_admission_at_current_heads(current, proof, &facts, &transport)?
+        reconstruct_admission_at_current_heads(policy, proof, &facts, &transport)?
             .context("retained event admission policy changed")?
     } else {
         reconstruct_admission(policy, proof, &facts, &transport)?
@@ -1089,16 +1078,12 @@ pub(crate) fn persisted_admission_facts(
             "accepted event business content differs from signed request"
         );
         let current = policy.verified();
-        let retained = if proof
-            .challenge
-            .policies
-            .iter()
-            .all(|head| current.head(&head.domain) == Some(head))
-        {
-            None
-        } else {
-            Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
-        };
+        let retained =
+            if policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)? {
+                None
+            } else {
+                Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
+            };
         let state = retained.as_ref().unwrap_or(current);
         let ancestors = dependency_closure(&stored.event, &events)?
             .context("accepted event causal history is missing")?;
@@ -1991,6 +1976,25 @@ fn append_checkpointed_execution_observation_in(
 }
 
 impl Store {
+    pub(crate) fn retained_resource_heads(
+        &self,
+        space: &str,
+        resource: &ResourceId,
+        scope: &str,
+    ) -> Result<Vec<String>> {
+        let snapshot = if self.connection.is_autocommit() {
+            Some(self.connection.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let events = retained_scope_events_in(&self.connection, space, resource, scope)?;
+        let heads = heads_from_events(&events, scope);
+        if let Some(snapshot) = snapshot {
+            snapshot.commit()?;
+        }
+        Ok(heads)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn append_authorized_events(
         &mut self,

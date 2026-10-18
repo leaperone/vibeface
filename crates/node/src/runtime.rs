@@ -4446,7 +4446,7 @@ impl Runtime {
                 body["basis_heads"] = match saved {
                     Some(saved) => serde_json::from_str::<Value>(&saved)?["basis_heads"].clone(),
                     None => {
-                        json!(store.heads(session.space_id.as_str(), &session.conversation_id)?)
+                        json!(store.retained_resource_heads(session.space_id.as_str(), &session.resource_id, &session.conversation_id)?)
                     }
                 };
             }

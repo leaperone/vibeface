@@ -745,11 +745,26 @@ impl PolicyState {
         self.prepare(&[], journal, now_ms, false)
     }
 
-    pub(crate) fn historical(
+    pub(crate) fn current_heads_at(
         &self,
         expected: &[PolicyStamp],
         admitted_at_ms: u64,
-    ) -> Result<VerifiedPolicySet> {
+    ) -> Result<bool> {
+        if expected
+            .iter()
+            .any(|head| self.state.head(&head.domain) != Some(head))
+        {
+            return Ok(false);
+        }
+        self.historical_dependencies(expected, admitted_at_ms)?;
+        Ok(true)
+    }
+
+    fn historical_dependencies(
+        &self,
+        expected: &[PolicyStamp],
+        admitted_at_ms: u64,
+    ) -> Result<(BTreeSet<ObjectHash>, Vec<ObjectHash>)> {
         ensure!(!expected.is_empty(), "historical policy heads are missing");
         let domains: BTreeSet<_> = expected.iter().map(|head| &head.domain).collect();
         ensure!(
@@ -829,6 +844,16 @@ impl PolicyState {
                 );
             }
         }
+        Ok((policy_hashes, objects))
+    }
+
+    pub(crate) fn historical(
+        &self,
+        expected: &[PolicyStamp],
+        admitted_at_ms: u64,
+    ) -> Result<VerifiedPolicySet> {
+        let (policy_hashes, mut objects) =
+            self.historical_dependencies(expected, admitted_at_ms)?;
         let mut selected = policy_hashes.clone();
         while let Some(hash) = objects.pop() {
             if selected.contains(&hash) {
@@ -2016,6 +2041,14 @@ mod tests {
             }
         }
         assert!(fixture.state.historical(&first, NOW - 1).is_err());
+        let current: Vec<_> = fixture.state.heads().into_values().collect();
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        verification.run(|| {
+            assert!(fixture.state.current_heads_at(&current, NOW).unwrap());
+            assert!(fixture.state.current_heads_at(&current, NOW - 1).is_err());
+            assert!(!fixture.state.current_heads_at(&first, NOW).unwrap());
+        });
+        assert_eq!(verification.counts().actual_verifications, 0);
         assert!(
             fixture
                 .state
@@ -2042,6 +2075,7 @@ mod tests {
             .unwrap()
             .after;
         let historical = imported.historical(&expected, NOW - 1).unwrap();
+        assert!(imported.current_heads_at(&expected, NOW - 1).unwrap());
         for head in &expected {
             assert_eq!(historical.head(&head.domain), Some(head));
         }

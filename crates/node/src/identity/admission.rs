@@ -235,8 +235,7 @@ pub(crate) fn reconstruct_admission(
     facts: &RequestFacts,
     transport: &TransportEvidence,
 ) -> Result<VerifiedAdmission> {
-    if let Some(admitted) =
-        reconstruct_admission_at_current_heads(policy.verified(), proof, facts, transport)?
+    if let Some(admitted) = reconstruct_admission_at_current_heads(policy, proof, facts, transport)?
     {
         return Ok(admitted);
     }
@@ -245,22 +244,20 @@ pub(crate) fn reconstruct_admission(
 }
 
 pub(super) fn reconstruct_admission_at_current_heads(
-    state: &VerifiedPolicySet,
+    policy: &PolicyState,
     proof: &AdmissionProof,
     facts: &RequestFacts,
     transport: &TransportEvidence,
 ) -> Result<Option<VerifiedAdmission>> {
     validate_admission_evidence(proof, transport)?;
-    if proof
-        .challenge
-        .policies
-        .iter()
-        .any(|head| state.head(&head.domain) != Some(head))
-    {
+    if !policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)? {
         return Ok(None);
     }
     Ok(Some(reconstruct_admission_in_state(
-        state, proof, facts, transport,
+        policy.verified(),
+        proof,
+        facts,
+        transport,
     )?))
 }
 
@@ -477,12 +474,7 @@ fn persisted_admission_facts(
     let resource = ResourceId::parse(manager_field(body, "resource_id")?)?;
     let scope = manager_field(body, "conversation_id")?;
     let current = policy.verified();
-    let retained = if proof
-        .challenge
-        .policies
-        .iter()
-        .all(|head| current.head(&head.domain) == Some(head))
-    {
+    let retained = if policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)? {
         None
     } else {
         Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
@@ -1070,17 +1062,12 @@ fn verify_lease_record(
     lease: &LeaseRecord,
 ) -> Result<u64> {
     let current = policy.verified();
-    let retained = if lease
-        .proof
-        .challenge
-        .policies
-        .iter()
-        .all(|head| current.head(&head.domain) == Some(head))
-    {
-        None
-    } else {
-        Some(policy.historical(&lease.proof.challenge.policies, lease.checked_at_ms)?)
-    };
+    let retained =
+        if policy.current_heads_at(&lease.proof.challenge.policies, lease.checked_at_ms)? {
+            None
+        } else {
+            Some(policy.historical(&lease.proof.challenge.policies, lease.checked_at_ms)?)
+        };
     let historical = retained.as_ref().unwrap_or(current);
     let facts = persisted_admission_facts(connection, policy, &stored.proof)?;
     let auth = if lease.proof.challenge.stage == CheckStage::Admit {
