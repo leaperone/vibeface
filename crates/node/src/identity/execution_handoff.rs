@@ -5006,15 +5006,6 @@ pub(crate) mod tests {
                 facts.action,
                 now(),
             )?;
-            payload
-                .expected_policies
-                .extend_from_slice(destination.heads());
-            payload
-                .expected_policies
-                .sort_by(|left, right| left.domain.cmp(&right.domain));
-            payload
-                .expected_policies
-                .dedup_by(|left, right| left.domain == right.domain);
             proof.invocation = Signed::sign(payload, &project.client)?;
             let mut final_facts = facts.clone();
             final_facts.body_hash = ObjectHash::body(&proof.source_body)?;
@@ -5467,7 +5458,7 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        fn verify_builder_and_isolate_executor(&mut self) -> Result<()> {
+        fn verify_builder_and_isolate_executor(&mut self) -> Result<Store> {
             self.retain_source_dispatch()?;
             let outcome = self.store.ingest_event(
                 self.project.space.as_str(),
@@ -5517,13 +5508,13 @@ pub(crate) mod tests {
                     &json!(self.executor.project),
                 )?;
             }
-            self.store = executor;
+            let project = std::mem::replace(&mut self.store, executor);
             let events: u64 =
                 self.store
                     .connection
                     .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
             assert_eq!(events, 0);
-            Ok(())
+            Ok(project)
         }
 
         fn grant(
@@ -7134,6 +7125,39 @@ pub(crate) mod tests {
                 original_usage.counts().max_chain_depth,
                 MAX_DELEGATION_DEPTH
             );
+            let destination = super::super::policy::execution_destination_for_body(
+                policy,
+                &facts,
+                &admission.source_body,
+                now(),
+            )?
+            .context("deep grant fixture destination")?;
+            admission
+                .challenge
+                .policies
+                .extend_from_slice(destination.heads());
+            admission
+                .challenge
+                .policies
+                .sort_by(|left, right| left.domain.cmp(&right.domain));
+            admission
+                .challenge
+                .policies
+                .dedup_by(|left, right| left.domain == right.domain);
+            admission.receipts = fixture.store.sign_current_receipts(
+                &admission.challenge,
+                &fixture.project.node,
+                now(),
+            )?;
+            for authority in std::iter::once(&fixture.executor).chain(&intermediaries) {
+                admission
+                    .receipts
+                    .extend(fixture.store.sign_current_receipts(
+                        &admission.challenge,
+                        &authority.node,
+                        now(),
+                    )?);
+            }
             fixture.wire.handoff.project_dispatch = fixture.project.node.sign_event(event)?;
             let signer = Identity::from_secret_hex(&fixture.project.node.secret_key_hex)
                 .map_err(anyhow::Error::msg)?;
@@ -8225,6 +8249,66 @@ pub(crate) mod tests {
             wire.invocation = Signed::sign(carrier, &signer)?;
             Ok(())
         };
+        let resign_dispatch =
+            |fixture: &Fixture, wire: &mut SignedExecutionHandoff| -> Result<()> {
+                let mut event: Event =
+                    serde_json::from_str(&wire.handoff.project_dispatch.canonical_body)?;
+                let EventCause::Invocation { admission } = &mut event.cause else {
+                    unreachable!()
+                };
+                let mut invocation = admission.invocation.payload.clone();
+                invocation.body_hash = ObjectHash::body(&admission.source_body)?;
+                invocation.nonce = Nonce::random()?;
+                admission.invocation = Signed::sign(invocation.clone(), &signer)?;
+                let facts = RequestFacts {
+                    resource: invocation.resource,
+                    action: invocation.action,
+                    audience: invocation.audience,
+                    operation_id: invocation.operation_id,
+                    body_hash: invocation.body_hash,
+                    context: invocation.context,
+                };
+                let auth = super::super::policy::authorize_invocation_for_body(
+                    fixture.store.policy.verified(),
+                    &admission.invocation,
+                    &facts,
+                    &admission.transport.existing_evidence()?,
+                    &admission.source_body,
+                    now(),
+                )?;
+                admission.challenge = FreshnessChallenge::new(
+                    &auth,
+                    CheckStage::Admit,
+                    Nonce::random()?,
+                    now(),
+                    now() + 10_000,
+                )?;
+                admission.receipts = fixture.store.sign_current_receipts(
+                    &admission.challenge,
+                    &fixture.project.node,
+                    now(),
+                )?;
+                admission
+                    .receipts
+                    .extend(fixture.store.sign_current_receipts(
+                        &admission.challenge,
+                        &fixture.executor.node,
+                        now(),
+                    )?);
+                fixture.store.policy.verified().verify_freshness(
+                    &auth,
+                    &admission.challenge,
+                    &admission.receipts,
+                    now(),
+                )?;
+                let EventBody::DispatchRecorded { action, .. } = &mut event.body else {
+                    unreachable!()
+                };
+                *action = admission.source_body["request"].clone();
+                wire.handoff.project_dispatch = fixture.project.node.sign_event(event)?;
+                wire.handoff.attest_source(&signer)?;
+                resign_carrier(wire)
+            };
         let mut altered = fixture.wire.clone();
         altered.handoff.origin = ExecutionOrigin::TaskSession {
             task_creation: fixture.store.task_creation(
@@ -8352,13 +8436,8 @@ pub(crate) mod tests {
             unreachable!()
         };
         admission.source_body["request"]["resources"] = json!([]);
-        let EventBody::DispatchRecorded { action, .. } = &mut event.body else {
-            unreachable!()
-        };
-        *action = admission.source_body["request"].clone();
         altered.handoff.project_dispatch = fixture.project.node.sign_event(event)?;
-        altered.handoff.attest_source(&signer)?;
-        resign_carrier(&mut altered)?;
+        resign_dispatch(&fixture, &mut altered)?;
         altered.invocation.verify_signature()?;
         altered
             .handoff
@@ -8384,54 +8463,8 @@ pub(crate) mod tests {
             unreachable!()
         };
         admission.source_body["conversation_id"] = json!("another-conversation");
-        let mut invocation = admission.invocation.payload.clone();
-        invocation.body_hash = ObjectHash::body(&admission.source_body)?;
-        invocation.nonce = Nonce::random()?;
-        admission.invocation = Signed::sign(invocation.clone(), &signer)?;
-        let facts = RequestFacts {
-            resource: invocation.resource,
-            action: invocation.action,
-            audience: invocation.audience,
-            operation_id: invocation.operation_id,
-            body_hash: invocation.body_hash,
-            context: invocation.context,
-        };
-        let auth = super::super::policy::authorize_invocation_for_body(
-            fixture.store.policy.verified(),
-            &admission.invocation,
-            &facts,
-            &admission.transport.existing_evidence()?,
-            &admission.source_body,
-            now(),
-        )?;
-        admission.challenge = FreshnessChallenge::new(
-            &auth,
-            CheckStage::Admit,
-            Nonce::random()?,
-            now(),
-            now() + 10_000,
-        )?;
-        admission.receipts = fixture.store.sign_current_receipts(
-            &admission.challenge,
-            &fixture.project.node,
-            now(),
-        )?;
-        admission
-            .receipts
-            .extend(fixture.store.sign_current_receipts(
-                &admission.challenge,
-                &fixture.executor.node,
-                now(),
-            )?);
-        fixture.store.policy.verified().verify_freshness(
-            &auth,
-            &admission.challenge,
-            &admission.receipts,
-            now(),
-        )?;
         altered.handoff.project_dispatch = fixture.project.node.sign_event(event)?;
-        altered.handoff.attest_source(&signer)?;
-        resign_carrier(&mut altered)?;
+        resign_dispatch(&fixture, &mut altered)?;
         let error = fixture
             .store
             .issue_execution_handoff_challenge(
@@ -8452,7 +8485,7 @@ pub(crate) mod tests {
     #[test]
     fn direct_locks_block_handoff_and_signed_completion_releases_only_its_locks() -> Result<()> {
         let mut fixture = Fixture::new()?;
-        fixture.retain_source_dispatch()?;
+        let source = fixture.verify_builder_and_isolate_executor()?;
         fixture
             .executor
             .conversation(&mut fixture.store, "conversation")?;
@@ -8572,8 +8605,8 @@ pub(crate) mod tests {
         let source_event: Event =
             serde_json::from_str(&fixture.wire.handoff.project_dispatch.canonical_body)?;
         let mut events = load_events_from(
-            &fixture.store.connection,
-            &fixture.store.policy,
+            &source.connection,
+            &source.policy,
             fixture.project.space.as_str(),
         )?;
         events.insert(
@@ -8610,8 +8643,8 @@ pub(crate) mod tests {
         };
         assert_eq!(
             super::super::event_authorization::validate_event_evidence(
-                &fixture.store.policy,
-                &fixture.store.connection,
+                &source.policy,
+                &source.connection,
                 &observation,
                 &events
             )?,
@@ -8623,8 +8656,8 @@ pub(crate) mod tests {
         }
         assert!(
             super::super::event_authorization::validate_event_evidence(
-                &fixture.store.policy,
-                &fixture.store.connection,
+                &source.policy,
+                &source.connection,
                 &altered,
                 &events
             )
