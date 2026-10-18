@@ -1931,7 +1931,7 @@ impl Store {
             revision.unwrap_or(0) == request.expected_revision,
             "stale execution session revision"
         );
-        let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE network_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"') AND (?=0 OR control=1))",params![network_id,request.target_node,request.session_id,control],|r|r.get(0))?;
+        let busy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM operations WHERE network_id=? AND target_node=? AND session_id=? AND state IN ('\"accepted\"','\"running\"','\"unknown\"') AND (state='\"unknown\"' OR ?=0 OR control=1))",params![network_id,request.target_node,request.session_id,control],|r|r.get(0))?;
         ensure!(!busy, "execution session has an unresolved operation");
         {
             let mut statement =
@@ -5091,6 +5091,38 @@ mod tests {
         newer.revision = 2;
         store.upsert_session(&network, &newer)?;
         assert!(store.claim_operation(&network, "steer").is_err());
+        Ok(())
+    }
+    #[test]
+    fn unknown_send_blocks_controls_until_reconciliation() -> Result<()> {
+        let a = LocalIdentity::generate();
+        let network = a.fixture_network_id()?;
+        let mut store = memory(&a, None)?;
+        let root = conversation(&mut store, &a)?;
+        store.upsert_session(&network, &session(&a, "session")?)?;
+        let mut send = request(&mut store, &a, "send", vec![root.hash])?;
+        send.action = json!({"type":"send","text":"work"});
+        store.accept_operation(&network, &send)?;
+        store.claim_operation(&network, "send")?;
+        assert_eq!(store.recover_running()?, 1);
+        assert_eq!(
+            store.operation(&network, "send")?.unwrap().state,
+            OperationState::Unknown
+        );
+        for (operation_id, action) in [
+            ("interrupt", json!({"type":"interrupt"})),
+            ("steer", json!({"type":"steer","text":"more"})),
+            (
+                "respond",
+                json!({"type":"respond_request","request_id":"request","response":"no"}),
+            ),
+        ] {
+            let mut control = send.clone();
+            control.operation_id = operation_id.into();
+            control.action = action;
+            control.resources.clear();
+            assert!(store.accept_control_operation(&network, &control).is_err());
+        }
         Ok(())
     }
     #[test]

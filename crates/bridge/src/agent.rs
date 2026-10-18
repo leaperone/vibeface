@@ -90,6 +90,12 @@ pub async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
     }
 }
 
+/// A local process reap is not a provider terminal state. Cancellation stays
+/// `Unknown` until the provider reports `Cancelled`, `Failed`, or another finish.
+fn provider_cancel_failure(native_terminal: Option<AgentFailure>) -> AgentFailure {
+    native_terminal.unwrap_or(AgentFailure::Unknown)
+}
+
 /// Reaps the local process group only; already accepted external work is unaffected.
 pub async fn terminate_process_group(child: &mut Child, group: u32) -> bool {
     async fn signal(group: u32, signal: &str) -> Option<bool> {
@@ -337,11 +343,7 @@ where
     outcome.map_err(|error| {
         AgentRunError {
             kind: if cancellation_requested {
-                native_terminal.unwrap_or(if reaped {
-                    AgentFailure::Cancelled
-                } else {
-                    AgentFailure::Unknown
-                })
+                provider_cancel_failure(native_terminal)
             } else if send_started {
                 AgentFailure::Unknown
             } else {
@@ -1586,6 +1588,19 @@ mod tests {
                 json!({"type":"status","status":"finishing","run_id":"r","usage":{"inputTokens":"42","outputTokens":"7"}}),
                 json!({"type":"status","status":"completed"})
             ]
+        );
+    }
+
+    #[test]
+    fn local_reap_without_provider_terminal_stays_unknown() {
+        assert_eq!(provider_cancel_failure(None), AgentFailure::Unknown);
+        assert_eq!(
+            provider_cancel_failure(Some(AgentFailure::Cancelled)),
+            AgentFailure::Cancelled
+        );
+        assert_eq!(
+            provider_cancel_failure(Some(AgentFailure::Failed)),
+            AgentFailure::Failed
         );
     }
 
