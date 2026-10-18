@@ -330,6 +330,11 @@ pub fn verify_node_history_policy_source(
     let invocation = &current_reader.signed_invocation().payload;
     let verified_source = provenance
         .map(|record| {
+            require(
+                record.session.service == ServiceId::from_key(&local)
+                    && record.session.device == DeviceId::from_key(&local),
+                "native History SDK source is not this Node's service delegation",
+            )?;
             verify_sdk_source_provenance(
                 primary,
                 current_reader,
