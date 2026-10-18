@@ -23,6 +23,66 @@ pub(crate) struct VerifiedPolicySnapshot {
     authenticator_generations: BTreeSet<(AccountId, u64)>,
 }
 
+pub(super) fn native_execution_source_snapshot(
+    source: &remote_execution_policy::VerifiedRemoteExecutionPolicySourceIntent,
+    primary_pins: &[PolicyPin],
+) -> Result<VerifiedPolicySnapshot> {
+    require(
+        !primary_pins.is_empty()
+            && primary_pins.len() <= MAX_POLICY_DOMAINS
+            && primary_pins.windows(2).all(|pair| pair[0].domain < pair[1].domain),
+        "native source requires sorted independent primary pins",
+    )?;
+    let heads = source.source_heads().to_vec();
+    let domains: BTreeSet<_> = heads.iter().map(|head| head.domain.clone()).collect();
+    let mut state = source.authorization().policy_snapshot.clone();
+    let mut pins = Vec::with_capacity(heads.len());
+    for head in &heads {
+        require(state.head(&head.domain) == Some(head), "native source changed its exact current heads")?;
+        let pin = primary_pins.iter().find(|pin| pin.domain == head.domain)
+            .ok_or_else(|| AuthorizationError::NeedPolicySync(vec![head.clone()]))?;
+        let genesis = match &head.domain {
+            PolicyDomain::Account(account) => state.account(account).map(|value| value.genesis_root.clone()),
+            PolicyDomain::Space(space) => state.space(space).map(|value| match &value.root {
+                SpaceRoot::Personal { genesis_root, .. } | SpaceRoot::Team { genesis_root } => genesis_root.clone(),
+            }),
+        }.ok_or(AuthorizationError::PolicyConflict)?;
+        require(pin.genesis_root == genesis, "native source primary genesis changed")?;
+        if let Some(minimum) = &pin.minimum_head {
+            require(minimum.domain == pin.domain, "native source minimum belongs to another domain")?;
+            if !state.roots.contains_key(minimum) {
+                return Err(AuthorizationError::NeedPolicySync(vec![minimum.clone()]));
+            }
+        }
+        pins.push(pin.clone());
+    }
+    state.accounts.retain(|id, _| domains.contains(&PolicyDomain::Account(id.clone())));
+    state.spaces.retain(|id, _| domains.contains(&PolicyDomain::Space(id.clone())));
+    state.devices.retain(|_, value| domains.contains(&value.payload.owner));
+    state.resources.retain(|_, value| domains.contains(&PolicyDomain::Space(value.payload.space.clone())));
+    state.authenticators.retain(|_, value| domains.contains(&PolicyDomain::Account(value.payload.account.clone())));
+    state.authenticator_states.retain(|hash, _| state.authenticators.contains_key(hash));
+    state.memberships.retain(|_, value| domains.contains(&PolicyDomain::Space(value.payload.space.clone())));
+    state.grants.retain(|_, value| domains.contains(&PolicyDomain::Space(value.payload.owner_space.clone())));
+    state.roots.retain(|stamp, _| domains.contains(&stamp.domain));
+    state.commits.retain(|_, value| domains.contains(&value.payload.previous.domain));
+    let mut nonces = BTreeMap::new();
+    for (hash, commit) in &state.commits {
+        let key = (commit.payload.previous.domain.clone(), commit.payload.nonce.clone());
+        if let Some(previous) = nonces.insert(key, hash.clone()) {
+            require(previous == *hash, "native source has conflicting accepted nonces")?;
+        }
+    }
+    let authenticator_generations = state.accounts.values().flat_map(|account| {
+        account.history.iter().filter(|document| !document.payload.authenticators.is_empty())
+            .map(|document| (document.payload.account.clone(), document.payload.root_generation))
+    }).collect();
+    Ok(VerifiedPolicySnapshot {
+        state, pins, heads, journal: Vec::new(), entry_index: BTreeMap::new(),
+        nonces, authenticator_generations,
+    })
+}
+
 fn registered_generation(entry: &JournalEntry) -> Option<(AccountId, u64)> {
     let account = match entry {
         JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => &value.payload,

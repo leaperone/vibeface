@@ -168,6 +168,778 @@ pub struct VerifiedNodeExecutionPolicyRead {
     allowed_hashes: BTreeSet<ObjectHash>,
     usage: ExecutionProofUsage,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "request", rename_all = "snake_case")]
+pub enum TaskExecutionPolicyRequest {
+    Account(remote_execution_policy::RemoteExecutionPolicyReadRequest),
+    Node(NodeExecutionPolicyReadRequest),
+}
+impl TaskExecutionPolicyRequest {
+    pub fn account_request(
+        &self,
+    ) -> Option<&remote_execution_policy::RemoteExecutionPolicyReadRequest> {
+        match self {
+            Self::Account(value) => Some(value),
+            Self::Node(_) => None,
+        }
+    }
+    pub fn node_request(&self) -> Option<&NodeExecutionPolicyReadRequest> {
+        match self {
+            Self::Account(_) => None,
+            Self::Node(value) => Some(value),
+        }
+    }
+    pub fn source_project(&self) -> &ResourceRef {
+        match self {
+            Self::Account(value) => &value.intent.payload.source_selection.resource,
+            Self::Node(value) => value.source_project(),
+        }
+    }
+    pub fn source_node(&self) -> &PublicKey {
+        match self {
+            Self::Account(value) => &value.delegation.issuer,
+            Self::Node(value) => value.issuer(),
+        }
+    }
+    pub fn selection(&self) -> Result<RemoteExecutionPolicySelection> {
+        match self {
+            Self::Account(value) => Ok(value.intent.payload.selection.clone()),
+            Self::Node(value) => value.selection(),
+        }
+    }
+    pub fn context(&self) -> Result<prepare::PrepareContext> {
+        match self {
+            Self::Account(value) => Ok(value.intent.payload.context.clone()),
+            Self::Node(value) => value.context(),
+        }
+    }
+    pub fn purpose(&self) -> RemoteExecutionPolicyPurpose {
+        match self {
+            Self::Account(value) => value.intent.payload.purpose,
+            Self::Node(value) => value.purpose(),
+        }
+    }
+    pub fn expected_action(&self) -> Action {
+        match self {
+            Self::Account(value) => value.intent.payload.expected_action,
+            Self::Node(value) => value.expected_action(),
+        }
+    }
+    pub fn execution_pins(&self) -> &[PolicyPin] {
+        match self {
+            Self::Account(value) => &value.intent.payload.execution_pins,
+            Self::Node(value) => value.execution_pins(),
+        }
+    }
+    pub fn history(&self) -> Option<&remote_execution_history::RemoteExecutionHistoryReference> {
+        match self {
+            Self::Account(value) => value.intent.payload.history.as_ref(),
+            Self::Node(value) => value.history(),
+        }
+    }
+    pub fn request_hash(&self) -> Result<ObjectHash> {
+        match self {
+            Self::Account(value) => ObjectHash::body(value),
+            Self::Node(value) => ObjectHash::body(value),
+        }
+    }
+    pub fn expires_at_ms(&self) -> u64 {
+        match self {
+            Self::Account(value) => value
+                .intent
+                .payload
+                .expires_at_ms
+                .min(value.delegation.payload.expires_at_ms),
+            Self::Node(value) => value.expires_at_ms(),
+        }
+    }
+    fn check_window(&self, now: u64) -> Result<()> {
+        match self {
+            Self::Account(value) => {
+                read_window(
+                    value.intent.payload.issued_at_ms,
+                    value.intent.payload.expires_at_ms,
+                    now,
+                )?;
+                read_window(
+                    value.delegation.payload.issued_at_ms,
+                    value.delegation.payload.expires_at_ms,
+                    now,
+                )
+            }
+            Self::Node(value) => read_window(value.issued_at_ms(), value.expires_at_ms(), now),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct VerifiedTaskPolicySource {
+    snapshot: policy_import::VerifiedPolicySnapshot,
+    primary_pins: Vec<PolicyPin>,
+    intent: Signed<RemoteExecutionPolicyReadIntent>,
+    verified_at_ms: u64,
+    expires_at_ms: u64,
+    usage: ExecutionProofUsage,
+    retained: bool,
+}
+
+pub fn task_policy_source_from_current(
+    current: &VerifiedRemoteExecutionPolicySourceIntent,
+    primary_pins: &[PolicyPin],
+    now: u64,
+) -> Result<VerifiedTaskPolicySource> {
+    require(
+        current.verified_at_ms() == now,
+        "native policy source requires current local verification",
+    )?;
+    let snapshot = policy_import::native_execution_source_snapshot(current, primary_pins)?;
+    let state = &current.authorization().policy_snapshot;
+    for pin in primary_pins {
+        let genesis = match &pin.domain {
+            PolicyDomain::Account(id) => state.account(id).map(|value| value.genesis_root.clone()),
+            PolicyDomain::Space(id) => state.space(id).map(|value| match &value.root {
+                SpaceRoot::Personal { genesis_root, .. } | SpaceRoot::Team { genesis_root } => {
+                    genesis_root.clone()
+                }
+            }),
+        }
+        .ok_or(AuthorizationError::InvalidProof(
+            "native primary pin has no verified local policy",
+        ))?;
+        require(
+            genesis == pin.genesis_root,
+            "native primary pin changed its verified genesis",
+        )?;
+        if let Some(minimum) = &pin.minimum_head {
+            require(
+                minimum.domain == pin.domain,
+                "native primary minimum belongs to another domain",
+            )?;
+            if !state.roots.contains_key(minimum) {
+                return Err(AuthorizationError::NeedPolicySync(vec![minimum.clone()]));
+            }
+        }
+    }
+    Ok(VerifiedTaskPolicySource {
+        snapshot,
+        primary_pins: primary_pins.to_vec(),
+        intent: current.intent().clone(),
+        verified_at_ms: now,
+        expires_at_ms: current
+            .intent()
+            .payload
+            .expires_at_ms
+            .min(current.authorization().budget.expires_at_ms),
+        usage: current.proof_usage().clone(),
+        retained: false,
+    })
+}
+
+pub fn task_policy_source_from_retained(
+    trust: &VerifiedTaskExecutionTrust,
+    primary: &VerifiedPolicySet,
+    primary_pins: &[PolicyPin],
+    request: &remote_execution_policy::RemoteExecutionPolicyReadRequest,
+    original_clock: u64,
+) -> Result<VerifiedTaskPolicySource> {
+    let _signatures = ScopedSignatureVerification::new();
+    request.intent.verify_signature()?;
+    request.delegation.verify_signature()?;
+    let typed = TaskExecutionPolicyRequest::Account(request.clone());
+    check_task_read_scope(trust, &typed)?;
+    typed.check_window(original_clock)?;
+    require(
+        request.delegation.payload.intent_hash == request.intent.hash()?
+            && request.delegation.issuer == trust.approval.issuer
+            && request.delegation.payload.source_node_public_key == trust.approval.issuer,
+        "retained policy source changed its original local delegation",
+    )?;
+    let known: Vec<_> = request
+        .intent
+        .payload
+        .source_heads
+        .iter()
+        .filter(|head| primary.head(&head.domain).is_some())
+        .cloned()
+        .collect();
+    let historical = remote_resolution_history::at_heads(primary, &known)?;
+    let current = remote_execution_policy::verify_native_execution_policy_source_claims(
+        &historical,
+        &request.intent,
+        &trust.approval.issuer,
+        original_clock,
+    )?;
+    let original_pins: Vec<_> = primary_pins
+        .iter()
+        .cloned()
+        .map(|mut pin| {
+            pin.minimum_head = known.iter().find(|head| head.domain == pin.domain).cloned();
+            pin
+        })
+        .collect();
+    let mut source = task_policy_source_from_current(&current, &original_pins, original_clock)?;
+    source.retained = true;
+    Ok(source)
+}
+
+fn stronger_minimum(
+    left: Option<PolicyStamp>,
+    right: Option<&PolicyStamp>,
+) -> Result<Option<PolicyStamp>> {
+    let Some(right) = right else { return Ok(left) };
+    let Some(left) = left else {
+        return Ok(Some(right.clone()));
+    };
+    if (left.authority_epoch, left.sequence) == (right.authority_epoch, right.sequence) {
+        require(
+            left == *right,
+            "task policy minimum conflicts at the same version",
+        )?;
+        return Ok(Some(left));
+    }
+    Ok(Some(
+        if (left.authority_epoch, left.sequence) > (right.authority_epoch, right.sequence) {
+            left
+        } else {
+            right.clone()
+        },
+    ))
+}
+
+fn effective_task_pins(
+    trust: &VerifiedTaskExecutionTrust,
+    source: &VerifiedTaskPolicySource,
+    request: &TaskExecutionPolicyRequest,
+    floors: &[PolicyPin],
+) -> Result<Vec<PolicyPin>> {
+    validate_pins(request.execution_pins())?;
+    let mut result = Vec::new();
+    for requested in request.execution_pins() {
+        let approved = trust
+            .pins()
+            .iter()
+            .find(|pin| pin.domain == requested.domain);
+        let primary = source
+            .primary_pins
+            .iter()
+            .find(|pin| pin.domain == requested.domain);
+        require(
+            approved.is_some() || primary.is_some(),
+            "task policy introduced an independently unapproved root",
+        )?;
+        let mut pin = requested.clone();
+        for saved in approved
+            .into_iter()
+            .chain(primary)
+            .chain(floors.iter().filter(|pin| pin.domain == requested.domain))
+        {
+            require(
+                saved.genesis_root == requested.genesis_root,
+                "task policy changed an approved genesis",
+            )?;
+            if let Some(minimum) = &saved.minimum_head {
+                require(
+                    minimum.domain == saved.domain,
+                    "task policy floor belongs to another domain",
+                )?;
+            }
+            pin.minimum_head = stronger_minimum(pin.minimum_head, saved.minimum_head.as_ref())?;
+        }
+        result.push(pin);
+    }
+    Ok(result)
+}
+
+fn check_task_read_scope(
+    trust: &VerifiedTaskExecutionTrust,
+    request: &TaskExecutionPolicyRequest,
+) -> Result<()> {
+    let original = &trust.original_intent.payload;
+    let context = request.context()?;
+    let selection = request.selection()?;
+    let original_context = &original.context.context;
+    let actual = &context.context;
+    require(
+        request.source_node() == &trust.approval.issuer
+            && request.source_project() == &original.source_selection.resource
+            && selection.execution_resource == original.selection.execution_resource
+            && selection.target_public_key == original.selection.target_public_key
+            && actual.task == original_context.task
+            && actual.conversation == original_context.conversation
+            && actual.workspace_resource == original_context.workspace_resource
+            && actual.execution_session == original_context.execution_session
+            && actual.executor_kind == original_context.executor_kind
+            && actual.sdk_session.is_none()
+            && context.binding_generation == original.context.binding_generation
+            && context.execution_target_public_key == original.context.execution_target_public_key,
+        "task policy read escaped its approved Task, binding or target",
+    )?;
+    if request.purpose() == RemoteExecutionPolicyPurpose::Execution {
+        require(
+            selection.execution_grant == original.selection.execution_grant
+                && context.canonical_cwd == original.context.canonical_cwd,
+            "current execution policy changed its approved writer grant or cwd",
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct TaskExecutionPolicyImport {
+    inner: remote_execution_policy::RemoteExecutionPolicyImport,
+    trust: VerifiedTaskExecutionTrust,
+    source: VerifiedTaskPolicySource,
+    origin: PolicyCarrierOrigin,
+    page_envelope_hashes: Vec<ObjectHash>,
+}
+
+pub fn begin_task_policy_import(
+    trust: &VerifiedTaskExecutionTrust,
+    source: &VerifiedTaskPolicySource,
+    request: &remote_execution_policy::RemoteExecutionPolicyReadRequest,
+    snapshot: &Signed<remote_execution_policy::RemoteExecutionPolicySnapshot>,
+    verified_floors: &[PolicyPin],
+    origin: PolicyCarrierOrigin,
+    now: u64,
+) -> Result<TaskExecutionPolicyImport> {
+    require(
+        source.verified_at_ms <= now
+            && now < source.expires_at_ms
+            && source.intent == request.intent,
+        "task policy import changed its current native source",
+    )?;
+    let typed = TaskExecutionPolicyRequest::Account(request.clone());
+    check_task_read_scope(trust, &typed)?;
+    if let PolicyCarrierOrigin::DirectNoise(peer) = &origin {
+        require(
+            peer.public_key() == &trust.selection().target_public_key,
+            "task policy import reached another actual Noise peer",
+        )?;
+    }
+    let effective = effective_task_pins(trust, source, &typed, verified_floors)?;
+    let inner = remote_execution_policy::begin_native_execution_policy_import(
+        request,
+        snapshot,
+        &effective,
+        &trust.selection().target_public_key,
+        &source.usage,
+        now,
+        typed.purpose() == RemoteExecutionPolicyPurpose::History,
+    )?;
+    Ok(TaskExecutionPolicyImport {
+        inner,
+        trust: trust.clone(),
+        source: source.clone(),
+        origin,
+        page_envelope_hashes: Vec::new(),
+    })
+}
+
+impl TaskExecutionPolicyImport {
+    pub fn page_request(
+        &self,
+    ) -> Result<remote_execution_policy::RemoteExecutionPolicyPageRequest> {
+        let encoded = self
+            .inner
+            .page_request_json()
+            .map_err(|_| AuthorizationError::InvalidProof("invalid native policy page request"))?;
+        serde_json::from_str(&encoded)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid native policy page request"))
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        self.inner.native_proof_usage()
+    }
+    pub fn append_page(
+        &mut self,
+        page: &Signed<remote_execution_policy::RemoteExecutionPolicyPage>,
+        now: u64,
+    ) -> Result<()> {
+        self.inner.append_native_page(page, now)?;
+        let index = usize::try_from(page.payload.page_index)
+            .map_err(|_| AuthorizationError::InvalidProof("native policy page index overflow"))?;
+        let hash = ObjectHash::body(page)?;
+        if index == self.page_envelope_hashes.len() {
+            self.page_envelope_hashes.push(hash);
+        } else {
+            require(
+                self.page_envelope_hashes.get(index) == Some(&hash),
+                "native policy page envelope changed",
+            )?;
+        }
+        Ok(())
+    }
+    pub fn finish_current(
+        self,
+        witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+        now: u64,
+    ) -> Result<VerifiedTaskCurrentPolicy> {
+        require(
+            self.inner.native_request().intent.payload.purpose
+                != RemoteExecutionPolicyPurpose::History,
+            "history policy cannot become current execution policy",
+        )?;
+        let remote = self.inner.finish_native(witness, now, false)?;
+        VerifiedTaskCurrentPolicy::from_remote(
+            self.trust,
+            self.source,
+            self.origin,
+            self.page_envelope_hashes,
+            remote,
+            now,
+        )
+    }
+    pub fn finish_history(
+        self,
+        witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+        now: u64,
+    ) -> Result<VerifiedTaskHistoryPolicy> {
+        require(
+            self.inner.native_request().intent.payload.purpose
+                == RemoteExecutionPolicyPurpose::History,
+            "current policy cannot become history policy",
+        )?;
+        require(
+            self.source.verified_at_ms <= now && now < self.source.expires_at_ms,
+            "task history policy source permission expired",
+        )?;
+        let remote = self.inner.finish_native(witness, now, true)?;
+        let request = TaskExecutionPolicyRequest::Account(remote.native_request().clone());
+        let mut usage = remote.native_proof_usage().clone();
+        usage.merge(&self.source.usage);
+        usage.enforce_limits()?;
+        Ok(VerifiedTaskHistoryPolicy {
+            source: self.source,
+            trust: self.trust,
+            request,
+            snapshot: remote.native_header().clone(),
+            witness: remote.native_witness().clone(),
+            foreign: remote.snapshot().clone(),
+            usage,
+            page_envelope_hashes: self.page_envelope_hashes,
+            origin: self.origin,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct VerifiedTaskCurrentPolicy {
+    source: VerifiedTaskPolicySource,
+    trust: VerifiedTaskExecutionTrust,
+    request: TaskExecutionPolicyRequest,
+    snapshot: Signed<remote_execution_policy::RemoteExecutionPolicySnapshot>,
+    witness: Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+    combined: policy_import::VerifiedPolicySnapshot,
+    primary_heads: Vec<PolicyStamp>,
+    foreign_heads: Vec<PolicyStamp>,
+    selection: RemoteExecutionPolicySelection,
+    context: prepare::PrepareContext,
+    usage: ExecutionProofUsage,
+    page_envelope_hashes: Vec<ObjectHash>,
+    origin: PolicyCarrierOrigin,
+}
+impl VerifiedTaskCurrentPolicy {
+    fn from_remote(
+        trust: VerifiedTaskExecutionTrust,
+        source: VerifiedTaskPolicySource,
+        origin: PolicyCarrierOrigin,
+        page_envelope_hashes: Vec<ObjectHash>,
+        remote: remote_execution_policy::VerifiedRemoteExecutionPolicy,
+        now: u64,
+    ) -> Result<Self> {
+        let request = TaskExecutionPolicyRequest::Account(remote.native_request().clone());
+        check_task_read_scope(&trust, &request)?;
+        let combined =
+            policy_import::merge_same_head_snapshots(&source.snapshot, remote.snapshot())?;
+        let (primary_heads, foreign_heads) = combined.heads().iter().cloned().partition(|head| {
+            source
+                .primary_pins
+                .iter()
+                .any(|pin| pin.domain == head.domain)
+        });
+        let mut usage = remote.native_proof_usage().clone();
+        usage.merge(&source.usage);
+        usage.record_signed(trust.approval())?;
+        usage.enforce_limits()?;
+        let policy = Self {
+            source,
+            trust,
+            selection: request.selection()?,
+            context: request.context()?,
+            request,
+            snapshot: remote.native_header().clone(),
+            witness: remote.native_witness().clone(),
+            combined,
+            primary_heads,
+            foreign_heads,
+            usage,
+            page_envelope_hashes,
+            origin,
+        };
+        policy.check_window(now)?;
+        Ok(policy)
+    }
+    fn check_window(&self, now: u64) -> Result<()> {
+        self.request.check_window(now)?;
+        read_window(
+            self.snapshot.payload.issued_at_ms,
+            self.snapshot.payload.expires_at_ms,
+            now,
+        )?;
+        read_window(
+            self.witness.payload.issued_at_ms,
+            self.witness.payload.expires_at_ms,
+            now,
+        )?;
+        require(
+            now >= self.source.verified_at_ms && now < self.source.expires_at_ms,
+            "task policy source permission expired",
+        )
+    }
+    pub fn check_scope(
+        &self,
+        facts: &RequestFacts,
+        selection: &RemoteExecutionPolicySelection,
+        context: &prepare::PrepareContext,
+        now: u64,
+    ) -> Result<()> {
+        self.check_window(now)?;
+        require(
+            facts.resource == *self.request.source_project()
+                && facts.audience.service == ServiceId::from_key(self.request.source_node())
+                && facts.audience.device == DeviceId::from_key(self.request.source_node())
+                && facts.action == self.request.expected_action()
+                && facts.context == context.context
+                && *context == self.context
+                && *selection == self.selection,
+            "task policy does not match this exact request scope, purpose or selection",
+        )
+    }
+    pub fn check_body_scope(
+        &self,
+        invocation: &Signed<Invocation>,
+        facts: &RequestFacts,
+        body: &serde_json::Value,
+        now: u64,
+    ) -> Result<()> {
+        invocation.verify_signature()?;
+        let signed = &invocation.payload;
+        require(
+            signed.resource == facts.resource
+                && signed.audience == facts.audience
+                && signed.action == facts.action
+                && signed.context == facts.context
+                && signed.operation_id == facts.operation_id
+                && signed.body_hash == facts.body_hash
+                && ObjectHash::body(body)? == facts.body_hash,
+            "task policy body differs from the actual signed invocation",
+        )?;
+        let (execution_resource, target_public_key, execution_grant) =
+            prepare::remote_selection(body)?.ok_or(AuthorizationError::InvalidProof(
+                "task policy body has no remote selection",
+            ))?;
+        let selection = RemoteExecutionPolicySelection {
+            execution_resource,
+            target_public_key,
+            execution_grant,
+        };
+        self.check_scope(facts, &selection, &self.context, now)?;
+        let raw = prepare::PrepareIntent {
+            request: signed.clone(),
+            binding_generation: self.context.binding_generation,
+            canonical_cwd: self.context.canonical_cwd.clone(),
+            execution_target_public_key: self.context.execution_target_public_key.clone(),
+        };
+        prepare::check_raw_context(&raw, body, self.request.source_node())
+    }
+    pub fn state(&self) -> &VerifiedPolicySet {
+        self.combined.state()
+    }
+    pub fn primary_heads(&self) -> &[PolicyStamp] {
+        &self.primary_heads
+    }
+    pub fn foreign_heads(&self) -> &[PolicyStamp] {
+        &self.foreign_heads
+    }
+    pub fn pins(&self) -> &[PolicyPin] {
+        self.combined.pins()
+    }
+    pub fn request(&self) -> &TaskExecutionPolicyRequest {
+        &self.request
+    }
+    pub fn snapshot(&self) -> &Signed<remote_execution_policy::RemoteExecutionPolicySnapshot> {
+        &self.snapshot
+    }
+    pub fn witness(&self) -> &Signed<remote_execution_policy::RemoteExecutionPolicyWitness> {
+        &self.witness
+    }
+    pub fn selection(&self) -> &RemoteExecutionPolicySelection {
+        &self.selection
+    }
+    pub fn context(&self) -> &prepare::PrepareContext {
+        &self.context
+    }
+    pub fn trust(&self) -> &VerifiedTaskExecutionTrust {
+        &self.trust
+    }
+    pub fn expires_at_ms(&self) -> u64 {
+        self.request
+            .expires_at_ms()
+            .min(self.snapshot.payload.expires_at_ms)
+            .min(self.witness.payload.expires_at_ms)
+            .min(self.source.expires_at_ms)
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
+    pub fn original_page_envelope_hashes(&self) -> &[ObjectHash] {
+        &self.page_envelope_hashes
+    }
+    pub fn carrier_origin(&self) -> &PolicyCarrierOrigin {
+        &self.origin
+    }
+}
+
+#[derive(Clone)]
+pub struct VerifiedTaskHistoryPolicy {
+    source: VerifiedTaskPolicySource,
+    trust: VerifiedTaskExecutionTrust,
+    request: TaskExecutionPolicyRequest,
+    snapshot: Signed<remote_execution_policy::RemoteExecutionPolicySnapshot>,
+    witness: Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+    foreign: policy_import::VerifiedPolicySnapshot,
+    usage: ExecutionProofUsage,
+    page_envelope_hashes: Vec<ObjectHash>,
+    origin: PolicyCarrierOrigin,
+}
+impl VerifiedTaskHistoryPolicy {
+    pub fn state(&self) -> &VerifiedPolicySet {
+        self.foreign.state()
+    }
+    pub fn primary_heads(&self) -> &[PolicyStamp] {
+        self.source.snapshot.heads()
+    }
+    pub fn foreign_heads(&self) -> &[PolicyStamp] {
+        self.foreign.heads()
+    }
+    pub fn pins(&self) -> &[PolicyPin] {
+        self.foreign.pins()
+    }
+    pub fn request(&self) -> &TaskExecutionPolicyRequest {
+        &self.request
+    }
+    pub fn snapshot(&self) -> &Signed<remote_execution_policy::RemoteExecutionPolicySnapshot> {
+        &self.snapshot
+    }
+    pub fn witness(&self) -> &Signed<remote_execution_policy::RemoteExecutionPolicyWitness> {
+        &self.witness
+    }
+    pub fn trust(&self) -> &VerifiedTaskExecutionTrust {
+        &self.trust
+    }
+    pub fn reference(&self) -> &remote_execution_history::RemoteExecutionHistoryReference {
+        self.request.history().expect("verified History request")
+    }
+    pub fn expires_at_ms(&self) -> u64 {
+        self.request
+            .expires_at_ms()
+            .min(self.snapshot.payload.expires_at_ms)
+            .min(self.witness.payload.expires_at_ms)
+            .min(self.source.expires_at_ms)
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
+    pub fn original_page_envelope_hashes(&self) -> &[ObjectHash] {
+        &self.page_envelope_hashes
+    }
+    pub fn carrier_origin(&self) -> &PolicyCarrierOrigin {
+        &self.origin
+    }
+}
+
+pub struct VerifiedTaskOriginalAdmissionPolicy {
+    policy: VerifiedTaskCurrentPolicy,
+    admission: VerifiedAdmission,
+    invocation_hash: ObjectHash,
+}
+pub fn from_task_original_admission(
+    policy: VerifiedTaskCurrentPolicy,
+    proof: &events::AdmissionProof,
+) -> Result<VerifiedTaskOriginalAdmissionPolicy> {
+    let value = &proof.invocation.payload;
+    require(
+        value.body_hash == ObjectHash::body(&proof.source_body)?,
+        "original task policy admission body changed",
+    )?;
+    let facts = RequestFacts {
+        resource: value.resource.clone(),
+        action: value.action,
+        audience: value.audience.clone(),
+        operation_id: value.operation_id.clone(),
+        body_hash: value.body_hash.clone(),
+        context: value.context.clone(),
+    };
+    let selection = prepare::remote_selection(&proof.source_body)?.ok_or(
+        AuthorizationError::InvalidProof("original task policy has no execution selection"),
+    )?;
+    let selection = RemoteExecutionPolicySelection {
+        execution_resource: selection.0,
+        target_public_key: selection.1,
+        execution_grant: selection.2,
+    };
+    let admission = remote_resolution_history::admitted(policy.state(), proof, &facts)?;
+    policy.check_scope(&facts, &selection, &policy.context, proof.admitted_at_ms)?;
+    policy.check_body_scope(
+        &proof.invocation,
+        &facts,
+        &proof.source_body,
+        proof.admitted_at_ms,
+    )?;
+    Ok(VerifiedTaskOriginalAdmissionPolicy {
+        invocation_hash: proof.invocation.hash()?,
+        policy,
+        admission,
+    })
+}
+impl VerifiedTaskOriginalAdmissionPolicy {
+    pub fn state(&self) -> &VerifiedPolicySet {
+        self.policy.state()
+    }
+    pub fn primary_heads(&self) -> &[PolicyStamp] {
+        self.policy.primary_heads()
+    }
+    pub fn foreign_heads(&self) -> &[PolicyStamp] {
+        self.policy.foreign_heads()
+    }
+    pub fn pins(&self) -> &[PolicyPin] {
+        self.policy.pins()
+    }
+    pub fn request(&self) -> &TaskExecutionPolicyRequest {
+        self.policy.request()
+    }
+    pub fn snapshot(&self) -> &Signed<remote_execution_policy::RemoteExecutionPolicySnapshot> {
+        self.policy.snapshot()
+    }
+    pub fn witness(&self) -> &Signed<remote_execution_policy::RemoteExecutionPolicyWitness> {
+        self.policy.witness()
+    }
+    pub fn admitted_at_ms(&self) -> u64 {
+        self.admission.admitted_at_ms()
+    }
+    pub fn signed_invocation_hash(&self) -> &ObjectHash {
+        &self.invocation_hash
+    }
+    pub fn admission(&self) -> &VerifiedAdmission {
+        &self.admission
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        self.policy.proof_usage()
+    }
+    pub fn original_page_envelope_hashes(&self) -> &[ObjectHash] {
+        self.policy.original_page_envelope_hashes()
+    }
+}
 impl VerifiedNodeExecutionPolicyRead {
     pub fn request(&self) -> &NodeExecutionPolicyReadRequest {
         &self.request
@@ -539,6 +1311,275 @@ mod tests {
     };
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_task_import_keeps_foreign_policy_isolated_and_reverifies_retained_carriers() {
+        let fixture = retained_history_fixture();
+        let now = 10_020;
+        let retained = require_confirmed_client_policy(&fixture.source).unwrap();
+        let project = fixture
+            .actual
+            .handoff
+            .handoff
+            .source_statement()
+            .unwrap()
+            .project;
+        let grant_leaf = retained
+            .state()
+            .grants
+            .values()
+            .find(|grant| {
+                grant.payload.actions.contains(&Action::ExecutionOpen)
+                    && grant.payload.grantee
+                        == Grantee::Actor(Actor::Account(fixture.source.scope.account_id.clone()))
+            })
+            .unwrap()
+            .hash()
+            .unwrap();
+        let source_auth = super::super::remote_execution_policy::tests::confirmed_source(
+            &ClientAuthorizationBundle {
+                journal: retained.journal().to_vec(),
+                grant_leaf,
+            },
+            retained.pins(),
+            &fixture.client,
+            &fixture.project_node,
+            &project,
+            now,
+        )
+        .unwrap();
+        let source_policy = require_confirmed_client_policy(&source_auth).unwrap();
+        let source_key = PublicKey::of(&fixture.project_node);
+        let target = PublicKey::of(&fixture.executor);
+        let leaf = fixture
+            .state
+            .grants
+            .values()
+            .find(|grant| {
+                grant.payload.grantee
+                    == Grantee::Actor(Actor::Service(ServiceId::from_key(&source_key)))
+                    && grant.payload.actions.contains(&Action::ExecutionOpen)
+                    && fixture
+                        .state
+                        .space(&grant.payload.owner_space)
+                        .is_some_and(|space| space.grants.contains(&grant.hash().unwrap()))
+            })
+            .unwrap();
+        let ResourceScope::Exact(resource) = &leaf.payload.scope else {
+            panic!("fixture execution grant is not exact")
+        };
+        let selection = RemoteExecutionPolicySelection {
+            execution_resource: resource.clone(),
+            target_public_key: target.clone(),
+            execution_grant: leaf.hash().unwrap(),
+        };
+        let mut source_context = leaf.payload.constraints.context.clone();
+        source_context.workspace_resource = Some(project.resource.clone());
+        let context = prepare::PrepareContext {
+            context: source_context,
+            binding_generation: Some(1),
+            canonical_cwd: None,
+            execution_target_public_key: Some(target.clone()),
+        };
+        let stream = super::super::remote_execution_policy::tests::remote_policy_stream(
+            &source_auth,
+            &fixture.client,
+            &fixture.project_node,
+            &fixture.execution_bundle,
+            &fixture.pins,
+            &fixture.executor,
+            &selection,
+            &context,
+            Action::ExecutionOpen,
+            RemoteExecutionPolicyPurpose::Execution,
+            now,
+        )
+        .unwrap();
+        let current = verify_remote_execution_policy_delegation_source(
+            source_policy.state(),
+            &stream.request.intent,
+            &source_key,
+            &PublicKey::of(&fixture.client),
+            now,
+        )
+        .unwrap();
+        let trust =
+            approve_task_execution_policy(&current, None, &fixture.project_node, now).unwrap();
+        let source = task_policy_source_from_current(&current, source_policy.pins(), now).unwrap();
+        assert!(
+            source
+                .snapshot
+                .state()
+                .resource(
+                    &selection.execution_resource.space,
+                    &selection.execution_resource.resource
+                )
+                .is_none()
+        );
+        let mut import = begin_task_policy_import(
+            &trust,
+            &source,
+            &stream.request,
+            &stream.header,
+            &[],
+            PolicyCarrierOrigin::SignedTranscript,
+            now,
+        )
+        .unwrap();
+        for page in &stream.pages {
+            import.append_page(page, now).unwrap();
+        }
+        assert!(import.clone().finish_history(&stream.witness, now).is_err());
+        assert!(
+            import
+                .clone()
+                .finish_current(&stream.witness, now + 1_000)
+                .is_err()
+        );
+        let completed = import.finish_current(&stream.witness, now).unwrap();
+        assert!(
+            completed
+                .state()
+                .resource(
+                    &selection.execution_resource.space,
+                    &selection.execution_resource.resource
+                )
+                .is_some()
+        );
+        assert!(
+            source
+                .snapshot
+                .state()
+                .resource(
+                    &selection.execution_resource.space,
+                    &selection.execution_resource.resource
+                )
+                .is_none()
+        );
+        assert_eq!(completed.selection(), &selection);
+        assert_eq!(
+            completed.original_page_envelope_hashes(),
+            stream
+                .pages
+                .iter()
+                .map(ObjectHash::body)
+                .collect::<Result<Vec<_>>>()
+                .unwrap()
+        );
+        assert!(matches!(
+            completed.carrier_origin(),
+            PolicyCarrierOrigin::SignedTranscript
+        ));
+        let facts = RequestFacts {
+            resource: project,
+            audience: stream
+                .request
+                .intent
+                .payload
+                .source_selection
+                .audience
+                .clone(),
+            action: Action::ExecutionOpen,
+            context: context.context.clone(),
+            operation_id: fixture
+                .actual
+                .handoff
+                .invocation
+                .payload
+                .operation_id
+                .clone(),
+            body_hash: ObjectHash::body(&"scope").unwrap(),
+        };
+        completed
+            .check_scope(&facts, &selection, &context, now)
+            .unwrap();
+        let mut wrong = context.clone();
+        wrong.binding_generation = Some(2);
+        assert!(
+            completed
+                .check_scope(&facts, &selection, &wrong, now)
+                .is_err()
+        );
+        let mut changed_genesis = fixture.pins.clone();
+        changed_genesis[0].genesis_root = PublicKey::of(&fixture.client);
+        assert!(
+            begin_task_policy_import(
+                &trust,
+                &source,
+                &stream.request,
+                &stream.header,
+                &changed_genesis,
+                PolicyCarrierOrigin::SignedTranscript,
+                now
+            )
+            .is_err()
+        );
+        let mut future_floor = fixture.pins.clone();
+        let mut missing = stream
+            .header
+            .payload
+            .target_heads
+            .iter()
+            .find(|head| head.domain == future_floor[0].domain)
+            .unwrap()
+            .clone();
+        missing.sequence += 1;
+        future_floor[0].minimum_head = Some(missing);
+        let mut too_old = begin_task_policy_import(
+            &trust,
+            &source,
+            &stream.request,
+            &stream.header,
+            &future_floor,
+            PolicyCarrierOrigin::SignedTranscript,
+            now,
+        )
+        .unwrap();
+        for page in &stream.pages {
+            too_old.append_page(page, now).unwrap();
+        }
+        assert!(too_old.finish_current(&stream.witness, now).is_err());
+
+        let retained_source = task_policy_source_from_retained(
+            &trust,
+            source_policy.state(),
+            source_policy.pins(),
+            &stream.request,
+            now,
+        )
+        .unwrap();
+        let mut restored = begin_task_policy_import(
+            &trust,
+            &retained_source,
+            &stream.request,
+            &stream.header,
+            &[],
+            PolicyCarrierOrigin::SignedTranscript,
+            now,
+        )
+        .unwrap();
+        for page in &stream.pages {
+            restored.append_page(page, now).unwrap();
+        }
+        let restored = restored.finish_current(&stream.witness, now).unwrap();
+        assert_eq!(restored.foreign_heads(), completed.foreign_heads());
+        assert_eq!(
+            restored.original_page_envelope_hashes(),
+            completed.original_page_envelope_hashes()
+        );
+        let mut stolen = stream.request.clone();
+        stolen.delegation = Signed::sign(stolen.delegation.payload, &fixture.client).unwrap();
+        assert!(
+            task_policy_source_from_retained(
+                &trust,
+                source_policy.state(),
+                source_policy.pins(),
+                &stolen,
+                now
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn node_policy_read_uses_c_grant_and_real_noise_without_business_peer() {

@@ -593,6 +593,15 @@ pub fn verify_remote_execution_policy_delegation_source(
         &intent.issuer == noise_client,
         "source policy reader differs from its actual Noise client",
     )?;
+    verify_native_execution_policy_source_claims(state, intent, local_node, now)
+}
+
+pub(super) fn verify_native_execution_policy_source_claims(
+    state: &VerifiedPolicySet,
+    intent: &Signed<RemoteExecutionPolicyReadIntent>,
+    local_node: &PublicKey,
+    now: u64,
+) -> Result<VerifiedRemoteExecutionPolicySourceIntent> {
     let claim = &intent.payload;
     let bundle = ClientAuthorizationBundle {
         journal: Vec::new(),
@@ -618,7 +627,7 @@ pub fn verify_remote_execution_policy_delegation_source(
     require(
         client.payload.owner == PolicyDomain::Account(current.scope.account_id.clone())
             && client.payload.subject == Actor::Account(current.scope.account_id.clone())
-            && client.payload.public_key == *noise_client
+            && client.payload.public_key == intent.issuer
             && client.payload.uses.contains(&DeviceUse::Noise)
             && client.payload.uses.contains(&DeviceUse::AccountInvocation),
         "policy delegation requires this account's current Noise client",
@@ -1136,6 +1145,7 @@ pub fn verify_remote_execution_history_policy_read(
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+#[derive(Clone)]
 pub struct RemoteExecutionPolicyImport {
     request: RemoteExecutionPolicyReadRequest,
     header: Signed<RemoteExecutionPolicySnapshot>,
@@ -1160,6 +1170,9 @@ pub struct VerifiedRemoteExecutionPolicy {
 }
 
 impl VerifiedRemoteExecutionPolicy {
+    pub(super) fn native_proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
     pub(super) fn native_request(&self) -> &RemoteExecutionPolicyReadRequest {
         &self.request
     }
@@ -1409,6 +1422,12 @@ impl RemoteExecutionPolicyImport {
 }
 
 impl RemoteExecutionPolicyImport {
+    pub(super) fn native_request(&self) -> &RemoteExecutionPolicyReadRequest {
+        &self.request
+    }
+    pub(super) fn native_proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
     pub(super) fn append_native_page(
         &mut self,
         page: &Signed<RemoteExecutionPolicyPage>,
