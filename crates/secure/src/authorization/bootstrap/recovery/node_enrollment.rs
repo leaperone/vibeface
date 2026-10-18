@@ -1,6 +1,9 @@
 //! Add one personal service Node without granting it business or account management rights.
 
 use super::*;
+use crate::authorization::{
+    client_policy_import::require_confirmed_client_policy, policy_import::VerifiedPolicySnapshot,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -62,16 +65,16 @@ impl VerifiedAccountNodeEnrollmentProposal {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct PreparedAccountNodeEnrollment {
     intent: Signed<AccountNodeEnrollmentIntent>,
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
+    snapshot: VerifiedPolicySnapshot,
+    authorization: VerifiedClientAuthorization,
 }
 
 #[derive(Clone, Debug)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct PreparedAccountNodeEnrollmentCommit {
     request: AccountNodeEnrollmentCommitRequest,
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
+    snapshot: VerifiedPolicySnapshot,
+    authorization: VerifiedClientAuthorization,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,6 +92,39 @@ pub struct VerifiedAccountNodeEnrollment {
     installation: AccountNodeInstallation,
     pins: Vec<PolicyPin>,
     bundle: ClientAuthorizationBundle,
+    authorization: Option<VerifiedClientAuthorization>,
+}
+
+fn root_material_snapshot(
+    material_json: &str,
+    snapshot: &VerifiedPolicySnapshot,
+) -> Result<(AccountId, Identity, VerifiedPolicySnapshot)> {
+    let material = read_material(material_json)?;
+    validate_material(&material)?;
+    let root = Identity::from_secret_hex(&material.root_secret_hex)
+        .map_err(|_| AuthorizationError::InvalidProof("invalid node enrollment root"))?;
+    let snapshot = snapshot.with_independent_pins(&material.pins)?;
+    let account = snapshot
+        .state()
+        .account(&material.scope.account_id)
+        .ok_or(AuthorizationError::Revoked)?;
+    require(
+        material.scope.space_id == SpaceId::personal(&material.scope.account_id)
+            && account.current_root == PublicKey::of(&root)
+            && account.authority.public_key == material.entry.node_public_key,
+        "node enrollment changed current root or saved account authority",
+    )?;
+    Ok((material.scope.account_id.clone(), root, snapshot))
+}
+
+fn snapshot_bundle(
+    snapshot: &VerifiedPolicySnapshot,
+    authorization: &VerifiedClientAuthorization,
+) -> ClientAuthorizationBundle {
+    ClientAuthorizationBundle {
+        journal: snapshot.journal().to_vec(),
+        grant_leaf: authorization.grant_leaf.clone(),
+    }
 }
 impl VerifiedAccountNodeEnrollment {
     pub fn pins(&self) -> &[PolicyPin] {
@@ -241,21 +277,28 @@ pub fn verify_account_node_enrollment_proposal(
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = prepareAccountNodeEnrollment))]
 pub fn prepare_account_node_enrollment(
     material_json: &str,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     requesting_client: &Identity,
     claim: &VerifiedNodeClaim,
     certificate_expires_at_ms: f64,
     now_ms: f64,
 ) -> crate::Result<PreparedAccountNodeEnrollment> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let prepare = || -> Result<PreparedAccountNodeEnrollment> {
         let now = timestamp(now_ms)?;
-        let (account, root, state, pins, bundle) =
-            current_root_material_context(material_json, pins_json, bundle_json)?;
-        require(
-            bundle.journal.len() <= 126,
-            "node enrollment journal requires checkpoint",
+        let (account, root, snapshot) = root_material_snapshot(
+            material_json,
+            require_confirmed_client_policy(authorization)?,
         )?;
+        require(
+            authorization.scope.account_id == account
+                && authorization.scope.space_id == SpaceId::personal(&account)
+                && authorization.scope.device_id
+                    == DeviceId::from_key(&PublicKey::of(requesting_client)),
+            "node enrollment requires this account's confirmed requesting client",
+        )?;
+        let state = snapshot.state();
+        let bundle = snapshot_bundle(&snapshot, authorization);
         let head = state
             .head(&PolicyDomain::Account(account.clone()))
             .ok_or(AuthorizationError::Revoked)?
@@ -271,7 +314,7 @@ pub fn prepare_account_node_enrollment(
                 version: AUTH_VERSION,
                 account: account.clone(),
                 requesting_device: DeviceId::from_key(&PublicKey::of(requesting_client)),
-                context_hash: context_hash(&pins, &bundle)?,
+                context_hash: context_hash(snapshot.pins(), &bundle)?,
                 expected_head: head.clone(),
                 authority: state
                     .account(&account)
@@ -302,8 +345,8 @@ pub fn prepare_account_node_enrollment(
         verify_intent(&state, &intent, now)?;
         Ok(PreparedAccountNodeEnrollment {
             intent,
-            pins,
-            bundle,
+            snapshot,
+            authorization: authorization.clone(),
         })
     };
     prepare().map_err(|e| e.to_string())
@@ -315,8 +358,8 @@ impl PreparedAccountNodeEnrollment {
     pub fn request_json(&self) -> crate::Result<String> {
         encode(&AccountNodePossessionRequest {
             intent: self.intent.clone(),
-            pins: self.pins.clone(),
-            bundle: self.bundle.clone(),
+            pins: self.snapshot.pins().to_vec(),
+            bundle: snapshot_bundle(&self.snapshot, &self.authorization),
         })
     }
 }
@@ -373,15 +416,11 @@ pub fn prepare_account_node_enrollment_commit(
     node_possession_signature: &str,
     now_ms: f64,
 ) -> crate::Result<PreparedAccountNodeEnrollmentCommit> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let prepare = || -> Result<PreparedAccountNodeEnrollmentCommit> {
         let now = timestamp(now_ms)?;
-        let (account, root, mut state, _, _) = current_root_material_context(
-            material_json,
-            &encode(&prepared.pins)
-                .map_err(|_| AuthorizationError::InvalidProof("invalid enrollment pins"))?,
-            &encode(&prepared.bundle)
-                .map_err(|_| AuthorizationError::InvalidProof("invalid enrollment bundle"))?,
-        )?;
+        let (account, root, snapshot) = root_material_snapshot(material_json, &prepared.snapshot)?;
+        let mut state = snapshot.state().clone();
         require(
             account == prepared.intent.payload.account
                 && PublicKey::of(&root) == prepared.intent.issuer,
@@ -401,12 +440,11 @@ pub fn prepare_account_node_enrollment_commit(
             certificate,
             proposal,
         };
-        let state = replay_policies(&prepared.pins, &prepared.bundle.journal)?;
-        verify_account_node_enrollment_proposal(&state, &request, now)?;
+        verify_account_node_enrollment_proposal(snapshot.state(), &request, now)?;
         Ok(PreparedAccountNodeEnrollmentCommit {
             request,
-            pins: prepared.pins.clone(),
-            bundle: prepared.bundle.clone(),
+            snapshot,
+            authorization: prepared.authorization.clone(),
         })
     };
     prepare().map_err(|e| e.to_string())
@@ -427,71 +465,62 @@ impl PreparedAccountNodeEnrollmentCommit {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = commitAccountNodeEnrollment))]
-pub fn commit_account_node_enrollment(
-    request_json: &str,
+pub fn commit_account_node_enrollment_in_state(
+    request: &AccountNodeEnrollmentCommitRequest,
+    state: &VerifiedPolicySet,
     authority: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
-    now_ms: f64,
-) -> crate::Result<String> {
-    let commit = || -> Result<Vec<JournalEntry>> {
-        let request: AccountNodeEnrollmentCommitRequest =
-            decode_bounded(request_json, MAX_PROOF_BYTES)?;
-        let pins: Vec<PolicyPin> = decode_bounded(pins_json, MAX_PROOF_BYTES)?;
-        let bundle = read_bundle(bundle_json)?;
-        let mut state = replay_policies(&pins, &bundle.journal)?;
-        let now = timestamp(now_ms)?;
-        let verified = verify_account_node_enrollment_proposal(&state, &request, now)?;
-        let account = state
-            .account(&request.intent.payload.account)
-            .ok_or(AuthorizationError::Revoked)?;
-        require(
-            PublicKey::of(authority) == account.authority.public_key,
-            "node enrollment commit requires the current local account authority",
-        )?;
-        let expires = request
-            .intent
-            .payload
-            .expires_at_ms
-            .min(now.saturating_add(EXECUTION_LEASE_MS));
-        let previous = verified.expected_head.clone();
-        let commit = Signed::sign(
-            PolicyCommit {
-                version: AUTH_VERSION,
-                previous: previous.clone(),
-                proposal_hash: request.proposal.hash()?,
-                accepted_at_ms: now,
-                issued_at_ms: now,
-                expires_at_ms: expires,
-                nonce: Nonce::random()?,
-                dependencies: vec![previous.clone()],
-            },
-            authority,
-        )?;
-        let receipt = Signed::sign(
-            FreshnessReceipt {
-                version: AUTH_VERSION,
-                current: previous,
-                challenge_hash: commit.challenge_hash()?,
-                issued_at_ms: now,
-                expires_at_ms: expires,
-            },
-            authority,
-        )?;
-        let committed = Committed {
-            proposal: request.proposal,
-            commit,
-            receipts: vec![receipt],
-        };
-        state.install_device(request.certificate.clone(), now)?;
-        state.install_account_committed(committed.clone(), now)?;
-        Ok(vec![
-            JournalEntry::Device(request.certificate),
-            JournalEntry::AccountCommit(committed),
-        ])
+    now: u64,
+) -> Result<Vec<JournalEntry>> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
+    let mut state = state.clone();
+    let verified = verify_account_node_enrollment_proposal(&state, request, now)?;
+    let account = state
+        .account(&request.intent.payload.account)
+        .ok_or(AuthorizationError::Revoked)?;
+    require(
+        PublicKey::of(authority) == account.authority.public_key,
+        "node enrollment commit requires the current local account authority",
+    )?;
+    let expires = request
+        .intent
+        .payload
+        .expires_at_ms
+        .min(now.saturating_add(EXECUTION_LEASE_MS));
+    let previous = verified.expected_head.clone();
+    let commit = Signed::sign(
+        PolicyCommit {
+            version: AUTH_VERSION,
+            previous: previous.clone(),
+            proposal_hash: request.proposal.hash()?,
+            accepted_at_ms: now,
+            issued_at_ms: now,
+            expires_at_ms: expires,
+            nonce: Nonce::random()?,
+            dependencies: vec![previous.clone()],
+        },
+        authority,
+    )?;
+    let receipt = Signed::sign(
+        FreshnessReceipt {
+            version: AUTH_VERSION,
+            current: previous,
+            challenge_hash: commit.challenge_hash()?,
+            issued_at_ms: now,
+            expires_at_ms: expires,
+        },
+        authority,
+    )?;
+    let committed = Committed {
+        proposal: request.proposal.clone(),
+        commit,
+        receipts: vec![receipt],
     };
-    encode(&commit().map_err(|e| e.to_string())?)
+    state.install_device(request.certificate.clone(), now)?;
+    state.install_account_committed(committed.clone(), now)?;
+    Ok(vec![
+        JournalEntry::Device(request.certificate.clone()),
+        JournalEntry::AccountCommit(committed),
+    ])
 }
 
 fn finish(
@@ -514,36 +543,69 @@ fn finish(
             && committed.commit.payload.accepted_at_ms <= now,
         "node enrollment receipt changed the approved service or account proposal",
     )?;
-    let mut state = replay_policies(&prepared.pins, &prepared.bundle.journal)?;
+    let accepted = committed.commit.payload.accepted_at_ms;
     verify_account_node_enrollment_proposal(
-        &state,
+        prepared.snapshot.state(),
         &prepared.request,
-        committed.commit.payload.accepted_at_ms,
+        accepted,
     )?;
-    state.install_device(certificate.clone(), committed.commit.payload.accepted_at_ms)?;
-    let head = state.replay_account_committed(committed.clone())?;
-    state.verify_transport_device(
-        &certificate.payload.device,
-        committed.commit.payload.accepted_at_ms,
-    )?;
-    let mut pins = prepared.pins.clone();
-    let pin = pins
-        .iter_mut()
-        .find(|pin| pin.domain == head.domain)
-        .ok_or(AuthorizationError::Revoked)?;
-    pin.minimum_head = Some(head);
-    let mut bundle = prepared.bundle.clone();
-    bundle.journal.extend(delta.clone());
-    replay_policies(&pins, &bundle.journal)?;
+    let snapshot = prepared.snapshot.apply_delta(&delta)?;
+    snapshot
+        .state()
+        .verify_transport_device(&certificate.payload.device, accepted)?;
+    let mut pins = snapshot.pins().to_vec();
+    for pin in &mut pins {
+        pin.minimum_head = snapshot.state().head(&pin.domain).cloned();
+    }
+    let snapshot = snapshot.with_independent_pins(&pins)?;
+    let original = &prepared.authorization;
+    let [resource] = original.resources.as_slice() else {
+        return Err(AuthorizationError::InvalidProof(
+            "node enrollment requires one confirmed selected resource",
+        ));
+    };
+    let selected = ResourceRef {
+        space: resource.payload.space.clone(),
+        resource: resource.payload.resource.clone(),
+    };
+    let bundle = snapshot_bundle(&snapshot, original);
+    let authorization = match verify_client_policy_state_selected(
+        snapshot.state().clone(),
+        &ClientAuthorizationBundle {
+            journal: Vec::new(),
+            grant_leaf: original.grant_leaf.clone(),
+        },
+        &pins,
+        original.scope.account_id.clone(),
+        original.scope.space_id.clone(),
+        snapshot
+            .state()
+            .find_device(&original.scope.device_id)?
+            .payload
+            .public_key
+            .clone(),
+        Some(&selected),
+        now,
+    ) {
+        Ok(mut authorization) => {
+            authorization.policy_journal = snapshot.journal().to_vec();
+            authorization.imported_snapshot = Some(snapshot);
+            authorization.client_policy_context = original.client_policy_context.clone();
+            Some(authorization)
+        }
+        Err(AuthorizationError::Revoked | AuthorizationError::Expired) => None,
+        Err(error) => return Err(error),
+    };
     Ok(VerifiedAccountNodeEnrollment {
         installation: AccountNodeInstallation {
             request: prepared.request.clone(),
-            pins: prepared.pins.clone(),
-            bundle: prepared.bundle.clone(),
+            pins: prepared.snapshot.pins().to_vec(),
+            bundle: snapshot_bundle(&prepared.snapshot, original),
             committed: committed.clone(),
         },
         pins,
         bundle,
+        authorization,
     })
 }
 
@@ -553,10 +615,11 @@ pub fn finish_account_node_enrollment(
     committed_journal_json: &str,
     now_ms: f64,
 ) -> crate::Result<VerifiedAccountNodeEnrollment> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
     let verify = || -> Result<VerifiedAccountNodeEnrollment> {
         finish(
             prepared,
-            decode_bounded(committed_journal_json, MAX_RECOVERY_JOURNAL_BYTES)?,
+            decode_bounded(committed_journal_json, MAX_PROOF_BYTES)?,
             timestamp(now_ms)?,
         )
     };
@@ -586,24 +649,41 @@ pub fn verify_account_node_installation(
         )?;
         let delta = vec![
             JournalEntry::Device(installation.request.certificate.clone()),
-            JournalEntry::AccountCommit(installation.committed),
+            JournalEntry::AccountCommit(installation.committed.clone()),
         ];
-        let prepared = PreparedAccountNodeEnrollmentCommit {
-            request: installation.request,
-            pins: installation.pins,
-            bundle: installation.bundle,
-        };
         let now = timestamp(now_ms)?;
-        let completed = finish(&prepared, delta, now)?;
-        let current = replay_policies(completed.pins(), completed.journal())?;
+        require(
+            installation.committed.proposal == installation.request.proposal && accepted <= now,
+            "node installation changed the approved account proposal or acceptance clock",
+        )?;
+        let mut current = replay_policies(&installation.pins, &installation.bundle.journal)?;
+        verify_account_node_enrollment_proposal(&current, &installation.request, accepted)?;
+        current.install_device(installation.request.certificate.clone(), accepted)?;
+        let head = current.replay_account_committed(installation.committed.clone())?;
         current.verify_transport_device(&DeviceId::from_key(&PublicKey::of(node)), now)?;
-        Ok(completed)
+        let mut pins = installation.pins.clone();
+        let pin = pins
+            .iter_mut()
+            .find(|pin| pin.domain == head.domain)
+            .ok_or(AuthorizationError::Revoked)?;
+        pin.minimum_head = Some(head);
+        let mut bundle = installation.bundle.clone();
+        bundle.journal.extend(delta);
+        Ok(VerifiedAccountNodeEnrollment {
+            installation,
+            pins,
+            bundle,
+            authorization: None,
+        })
     };
     verify().map_err(|e| e.to_string())
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedAccountNodeEnrollment {
+    pub fn authorization(&self) -> Option<VerifiedClientAuthorization> {
+        self.authorization.clone()
+    }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = pinsJson))]
     pub fn pins_json(&self) -> crate::Result<String> {
         encode(&self.pins)

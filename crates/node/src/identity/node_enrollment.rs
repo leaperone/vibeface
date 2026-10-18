@@ -5,8 +5,8 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use vibeface_secure::authorization::{
-    AccountDocument, ClientAuthorizationBundle, Committed, DeviceId, JournalEntry, ObjectHash,
-    PolicyPin, PublicKey, Signed, SpaceId,
+    AccountDocument, ClientAuthorizationBundle, Committed, DeviceId, ObjectHash, PolicyPin,
+    PublicKey, Signed,
     bootstrap::{
         NodeClaim,
         recovery::node_enrollment::{
@@ -196,28 +196,11 @@ impl Store {
             self.policy = current;
             return Ok(response);
         }
-        node_enrollment::verify_account_node_enrollment_proposal(
-            current.verified(),
+        let delta = node_enrollment::commit_account_node_enrollment_in_state(
             &request,
+            current.verified(),
+            &signer,
             now,
-        )?;
-        let snapshot = super::policy::authenticate_account_from(
-            &tx,
-            &current,
-            principal,
-            &json!({"account_id":account,
-            "space_id":SpaceId::personal(account),"device_public_key":principal}),
-            now,
-        )?;
-        let delta: Vec<JournalEntry> = serde_json::from_str(
-            &node_enrollment::commit_account_node_enrollment(
-                &serde_json::to_string(&request)?,
-                &signer,
-                &serde_json::to_string(&snapshot["pins"])?,
-                &serde_json::to_string(&snapshot["authorization"])?,
-                now as f64,
-            )
-            .map_err(anyhow::Error::msg)?,
         )?;
         let update = current.prepare_network_update(&delta, now)?;
         let response = json!({"journal_delta":delta});
@@ -340,7 +323,10 @@ mod tests {
     };
     use vibeface_secure::{
         Identity,
-        authorization::bootstrap::{self, VerifiedNodeClaim, recovery},
+        authorization::{
+            Audience, AuthorizationSelection, ResourceRef, ServiceId,
+            bootstrap::{self, VerifiedNodeClaim, recovery},
+        },
     };
 
     struct Fixture {
@@ -405,10 +391,34 @@ mod tests {
             &self,
             network: &TestNetwork,
         ) -> Result<node_enrollment::PreparedAccountNodeEnrollment> {
+            let mut source = network.at(&network.directory.join(format!(
+                "node-enrollment-reader-{}.sqlite3",
+                uuid::Uuid::new_v4()
+            )))?;
+            let node = PublicKey::parse(&network.node.public_key_hex()?)?;
+            let authorization =
+                crate::identity::client_policy_read::verified_client_policy_for_test(
+                    &mut source,
+                    &network.node,
+                    &network.client,
+                    &network.account,
+                    AuthorizationSelection {
+                        resource: ResourceRef {
+                            space: network.space.clone(),
+                            resource: network.resource.clone(),
+                        },
+                        audience: Audience {
+                            service: ServiceId::from_key(&node),
+                            device: DeviceId::from_key(&node),
+                        },
+                        grant_leaf: network.bundle.grant_leaf.clone(),
+                    },
+                    &network.pins,
+                    now(),
+                )?;
             node_enrollment::prepare_account_node_enrollment(
                 &Self::material(network)?,
-                &serde_json::to_string(&network.pins)?,
-                &serde_json::to_string(&network.bundle)?,
+                &authorization,
                 &network.client,
                 &self.claim,
                 (now() + 1_000_000) as f64,
@@ -506,6 +516,25 @@ mod tests {
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
+        let successor = verified
+            .authorization()
+            .context("current client authorization missing")?;
+        assert_eq!(successor.scope().account_id, f.network.account);
+        assert_eq!(
+            successor.heads().first().map(|head| &head.domain),
+            Some(&vibeface_secure::authorization::PolicyDomain::Account(
+                f.network.account.clone()
+            ))
+        );
+        assert!(successor.client_policy_context_json().is_err());
+        let delayed = node_enrollment::finish_account_node_enrollment(
+            &prepared,
+            &serde_json::to_string(&response["journal_delta"])?,
+            (now() + 20_000_000) as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(delayed.authorization().is_none());
+        assert_eq!(delayed.pins(), verified.pins());
         let installation: Value =
             serde_json::from_str(&verified.installation_json().map_err(anyhow::Error::msg)?)?;
         assert!(
@@ -583,6 +612,33 @@ mod tests {
             )?,
             installed
         );
+        Ok(())
+    }
+
+    #[test]
+    fn node_enrollment_rejects_an_unconfirmed_client_handle() -> Result<()> {
+        let f = Fixture::new()?;
+        let unconfirmed = vibeface_secure::authorization::verify_client_authorization(
+            &serde_json::to_string(&f.network.bundle)?,
+            &serde_json::to_string(&f.network.pins)?,
+            f.network.account.as_str(),
+            f.network.space.as_str(),
+            &f.network.client.public_key_hex(),
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(
+            node_enrollment::prepare_account_node_enrollment(
+                &Fixture::material(&f.network)?,
+                &unconfirmed,
+                &f.network.client,
+                &f.claim,
+                (now() + 1_000_000) as f64,
+                now() as f64,
+            )
+            .is_err()
+        );
+        assert!(metadata(&f.fresh.connection, "node_possession")?.is_none());
         Ok(())
     }
 
