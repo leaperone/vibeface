@@ -288,7 +288,15 @@ pub(crate) mod tests {
                 "conversation",
                 name,
             )?;
-            if policy.version == 0 {
+            let finalized = node
+                .store
+                .lock()
+                .await
+                .tasks(network.space.as_str(), "conversation")?
+                .into_iter()
+                .find(|task| task.task_id == name)
+                .is_some_and(|task| matches!(task.status.as_str(), "accepted" | "cancelled"));
+            if policy.version == 0 && !finalized {
                 let mut grant = network.body("set_followup", "conversation");
                 grant["task_id"] = json!(name);
                 grant["task_ref"] = json!(policy.task_ref);
@@ -396,7 +404,7 @@ pub(crate) mod tests {
         open.expected_revision = session.revision;
         open.basis_heads = store.heads(network.space.as_str(), "conversation")?;
         open.action = json!({"type":"send","text":"test"});
-        let request = open;
+        let mut request = open;
         drop(store);
         if let Some(manager) = manager {
             let mut body = network.body("operate", "conversation");
@@ -405,6 +413,7 @@ pub(crate) mod tests {
             body["sdk_session"] = json!(manager.sdk_session);
             body["parent_invocation"] = json!(manager.parent_invocation);
             let access = node.authorize_agent(manager, body).await?;
+            request = serde_json::from_value(access.body["request"].clone())?;
             node.store
                 .lock()
                 .await
@@ -1048,6 +1057,7 @@ pub(crate) mod tests {
         let mut body = network.body("message", "conversation");
         body["message_id"] = json!("same-message");
         body["text"] = json!("same goal");
+        body["report_results"] = json!(false);
         body["scheduler_node"] = json!(node.identity.node_id()?);
         let access = access(&network, &node, &body).await?;
         let barrier = Arc::new(tokio::sync::Barrier::new(16));
@@ -1099,19 +1109,29 @@ pub(crate) mod tests {
         }
         drop(node);
         let node = Arc::new(Runtime::open(&network.directory).await?);
+        let policy = node.store.lock().await.historical_followup_policy(
+            network.space.as_str(),
+            "conversation",
+            "active",
+        )?;
+        let mut grant = network.body("set_followup", "conversation");
+        grant["task_id"] = json!("active");
+        grant["task_ref"] = json!(policy.task_ref);
+        grant["previous_head"] = json!(policy.proof_heads[0]);
+        grant["mode"] = json!("continue");
+        grant["expected_version"] = json!(0);
+        grant["scheduler_node"] = json!(node.identity.node_id()?);
+        let grant_access = access(&network, &node, &grant).await?;
+        let first = node.rpc(grant_access.clone(), grant.clone()).await?;
+        assert_eq!(first["policy"]["version"], 1);
+        assert_eq!(node.rpc(grant_access, grant.clone()).await?, first);
         for _ in 0..2 {
             for name in ["active", "accepted", "cancelled"] {
                 task(&network, &node, name, true).await?;
             }
         }
-        let grant = json!({"method":"set_followup","conversation_id":"chat","task_id":"active",
-            "mode":"report","expected_version":0,"scheduler_node":node.identity.node_id()?});
-        let grant_access = access(&network, &node, &grant).await?;
-        assert_eq!(
-            node.rpc(grant_access.clone(), grant.clone()).await?["policy"]["version"],
-            1
-        );
-        assert!(node.rpc(grant_access, grant).await.is_err());
+        grant["authorization_id"] = json!("stale-followup-grant");
+        assert!(rpc(&network, &node, grant).await.is_err());
         let store = node.store.lock().await;
         assert!(followup_authorized(
             &store,
@@ -1131,7 +1151,18 @@ pub(crate) mod tests {
             "conversation",
             "cancelled"
         )?);
-        assert_eq!(store.context(network.space.as_str(),"conversation",&[])?.events.iter().filter(|event|matches!(&event.body,EventBody::DecisionRecorded{decision_id,..} if decision_id.starts_with("auto:"))).count(),1);
+        assert_eq!(
+            store
+                .context(network.space.as_str(), "conversation", &[])?
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(&event.body, EventBody::DecisionRecorded { tool_configuration, .. }
+                    if tool_configuration["type"] == "task_followup_grant_v1")
+                })
+                .count(),
+            1
+        );
         assert_eq!(
             store
                 .tasks(network.space.as_str(), "conversation")?
@@ -1245,7 +1276,11 @@ pub(crate) mod tests {
             .context(network.space.as_str(), "conversation", &[])?
             .events;
         assert_eq!(events.iter().filter(|event|matches!(&event.body,EventBody::TaskCreated{task_id,..} if task_id=="spoofed")).count(),1);
-        assert_eq!(events.iter().filter(|event|matches!(&event.body,EventBody::DecisionRecorded{decision_id,..} if decision_id=="auto:spoofed")
+        assert_eq!(events.iter().filter(|event|matches!(&event.body,
+            EventBody::DecisionRecorded { tool_configuration, .. }
+                if tool_configuration["type"] == "task_followup_grant_v1"
+                    && tool_configuration["task_id"] == "spoofed"
+                    && tool_configuration["mode"] == "continue")
             && matches!(&event.cause,EventCause::Invocation{admission} if matches!(admission.invocation.payload.actor,Actor::Account(_)))).count(),1);
         network.revoke_client(&mut store)?;
         assert!(!followup_authorized(
@@ -1455,19 +1490,48 @@ pub(crate) mod tests {
             provider: "codex_sdk".into(),
             model: "unused".into(),
         });
-        let mut body = network.body("message", "conversation");
-        body["message_id"] = json!("retry-message");
-        body["text"] = json!("test");
-        body["scheduler_node"] = json!(node.identity.node_id()?);
+        let (mut body, event) = network.message_body("conversation", "test")?;
+        body["report_results"] = json!(false);
+        let original_event =
+            network.append(&mut *node.store.lock().await, &body, event, now_ms() as u64)?;
+        assert!(
+            node.store
+                .lock()
+                .await
+                .scheduler_job(
+                    network.space.as_str(),
+                    "conversation",
+                    &original_event.hash,
+                    &node.identity.node_id()?,
+                )?
+                .is_none()
+        );
         let original = access(&network, &node, &body).await?;
-        assert!(node.rpc(original.clone(), body.clone()).await.is_err());
+        let receipt = node.rpc(original.clone(), body.clone()).await?;
+        assert_eq!(receipt["state"], "queued");
+        assert_eq!(receipt["trigger"], original_event.hash);
         let first = node
             .store
             .lock()
             .await
             .messages(network.space.as_str(), "conversation")?;
         assert_eq!(first.len(), 1);
-        assert!(node.rpc(original, body.clone()).await.is_err());
+        assert_eq!(node.rpc(original, body.clone()).await?, receipt);
+        assert!(
+            node.store
+                .lock()
+                .await
+                .scheduler_job(
+                    network.space.as_str(),
+                    "conversation",
+                    &original_event.hash,
+                    &node.identity.node_id()?,
+                )?
+                .context("retry did not admit its scheduler trigger")?
+                .state
+                .attempt()
+                .is_none()
+        );
         let second = node
             .store
             .lock()
@@ -1639,12 +1703,12 @@ pub(crate) mod tests {
         )
         .await?;
         assert!(node.maintenance_idle().await.is_err());
-        node.finish(
+        network.complete(
+            &mut *node.store.lock().await,
             &request,
             OperationState::Succeeded,
             json!({"result":"verified"}),
-        )
-        .await?;
+        )?;
         node.maintenance_idle().await?;
         node.store.lock().await.local_set(
             network.space.as_str(),
