@@ -16,7 +16,7 @@ CREATE TABLE resource_reservations_v3 (
   target_node TEXT NOT NULL,
   resource TEXT NOT NULL,
   PRIMARY KEY(network_id,operation_id,resource),
-  FOREIGN KEY(network_id,operation_id) REFERENCES operations_v3(network_id,operation_id)
+  FOREIGN KEY(network_id,operation_id) REFERENCES operations(network_id,operation_id)
 );
 INSERT INTO resource_reservations_v3 SELECT * FROM resource_reservations;
 DROP TABLE resource_reservations;

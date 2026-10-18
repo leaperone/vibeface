@@ -2349,7 +2349,7 @@ impl Runtime {
         }
         let scope = input["conversation_id"].as_str().map(String::from);
         if let Some(scope) = &scope
-            && method != "create_conversation"
+            && !matches!(method, "create_conversation" | "create_bot")
         {
             self.require_scope(&access, scope).await?;
         }
