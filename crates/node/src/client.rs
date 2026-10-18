@@ -1,5 +1,9 @@
 //! Noise proves device possession. Every business request carries an independent Invocation.
 
+mod gateway_forward;
+
+pub(crate) use gateway_forward::{GatewayForwardClient, GatewayForwardReply, GatewaySourceClient};
+
 use crate::{
     crypto::LocalIdentity,
     identity::{
@@ -10,7 +14,7 @@ use crate::{
         },
     },
     network::{NetworkHub, NetworkSocket, Service},
-    runtime::{Access, Runtime},
+    runtime::{Access, GatewaySourceRequest, Runtime},
 };
 use anyhow::{Context, Result, bail, ensure};
 use axum::extract::ws::Message;
@@ -31,7 +35,8 @@ use vibeface_secure::authorization::{
     execution_observation::ExecutionObservationRequest,
     node_execution_policy::{ActualPolicyNoisePeer, VerifiedTaskExecutionTrust},
     task_business_policy::{
-        TaskBusinessPolicyExport, TaskBusinessWire,
+        TaskBusinessPolicyExport, TaskBusinessPolicyHeader, TaskBusinessWire,
+        VerifiedTaskBusinessOriginalSource,
         receipt::{TaskBusinessChallenge, TaskBusinessReceiptRead},
     },
 };
@@ -44,6 +49,8 @@ const HEARTBEAT: Duration = Duration::from_secs(20);
 const NODE_POLICY_READ_METHOD: &str = "node_policy_read";
 const TASK_BUSINESS_METHOD: &str = "task_business";
 const TASK_RECEIPT_READ_METHOD: &str = "task_business_receipt_read";
+const GATEWAY_SOURCE_METHOD: &str = "gateway_source";
+const GATEWAY_FORWARD_METHOD: &str = "gateway_forward";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +81,8 @@ enum SessionPurpose {
     Client,
     NodePolicyRead,
     TaskReceiptRead,
+    GatewaySource,
+    GatewayForward,
     TaskBusiness(TaskBusinessPhase),
 }
 enum TaskBusinessPhase {
@@ -191,7 +200,11 @@ impl SessionPurpose {
             Self::Client
                 if matches!(
                     method,
-                    NODE_POLICY_READ_METHOD | TASK_BUSINESS_METHOD | TASK_RECEIPT_READ_METHOD
+                    NODE_POLICY_READ_METHOD
+                        | TASK_BUSINESS_METHOD
+                        | TASK_RECEIPT_READ_METHOD
+                        | GATEWAY_SOURCE_METHOD
+                        | GATEWAY_FORWARD_METHOD
                 ) =>
             {
                 ensure!(
@@ -202,6 +215,10 @@ impl SessionPurpose {
                     Self::NodePolicyRead
                 } else if method == TASK_BUSINESS_METHOD {
                     Self::TaskBusiness(TaskBusinessPhase::AwaitingBegin)
+                } else if method == GATEWAY_SOURCE_METHOD {
+                    Self::GatewaySource
+                } else if method == GATEWAY_FORWARD_METHOD {
+                    Self::GatewayForward
                 } else {
                     Self::TaskReceiptRead
                 };
@@ -217,6 +234,14 @@ impl SessionPurpose {
             Self::TaskReceiptRead => ensure!(
                 method == TASK_RECEIPT_READ_METHOD,
                 "task receipt reader sessions cannot change purpose"
+            ),
+            Self::GatewaySource => ensure!(
+                method == GATEWAY_SOURCE_METHOD,
+                "gateway source sessions cannot change purpose"
+            ),
+            Self::GatewayForward => ensure!(
+                method == GATEWAY_FORWARD_METHOD,
+                "gateway forward sessions cannot change purpose"
             ),
             Self::Client => {}
         }
@@ -393,7 +418,22 @@ impl TaskBusinessReceiptClient {
         identity: &LocalIdentity,
         source: &TaskBusinessPolicySession,
     ) -> Result<Self> {
-        let header = source.source().header();
+        Self::connect_header(network, identity, source.source().header()).await
+    }
+
+    pub(crate) async fn connect_original(
+        network: &NetworkHub,
+        identity: &LocalIdentity,
+        original: &VerifiedTaskBusinessOriginalSource,
+    ) -> Result<Self> {
+        Self::connect_header(network, identity, original.header()).await
+    }
+
+    async fn connect_header(
+        network: &NetworkHub,
+        identity: &LocalIdentity,
+        header: &Signed<TaskBusinessPolicyHeader>,
+    ) -> Result<Self> {
         ensure!(
             identity.public_key_hex()? == header.payload.scope.target_public_key.as_str(),
             "task receipt reader is not the original execution Node"
@@ -848,9 +888,10 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                     Message::Binary(bytes) => {
                         if let Some(plaintext) = secure(channel.open_record(&bytes))? {
                             partial_started = None;
-                            let request = parse_request(&plaintext).context("invalid client request")?;
+                            let request = parse_session_request(&plaintext, &session.purpose)
+                                .context("invalid client request")?;
                             validate_request(&request)?;
-                            let policy_carrier = matches!(request.method.as_str(), NODE_POLICY_READ_METHOD | TASK_RECEIPT_READ_METHOD)
+                            let policy_carrier = matches!(request.method.as_str(), NODE_POLICY_READ_METHOD | TASK_RECEIPT_READ_METHOD | GATEWAY_SOURCE_METHOD | GATEWAY_FORWARD_METHOD)
                                 || (request.method == TASK_BUSINESS_METHOD && !matches!(request.params["stage"].as_str(), Some("business" | "status")));
                             if policy_carrier {
                                 require_node_policy_carrier(plaintext.len(), 0)?;
@@ -861,7 +902,7 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                                 Ok(result) => Response { id, result, error: None },
                                 Err(error) => Response { id, result: Value::Null, error: Some(error.to_string()) },
                             };
-                            if policy_carrier || matches!(session.purpose, SessionPurpose::NodePolicyRead | SessionPurpose::TaskReceiptRead) {
+                            if policy_carrier || matches!(session.purpose, SessionPurpose::NodePolicyRead | SessionPurpose::TaskReceiptRead | SessionPurpose::GatewaySource | SessionPurpose::GatewayForward) {
                                 require_node_policy_carrier(plaintext.len(), serde_json::to_vec(&response)?.len())?;
                             }
                             send_value(&mut socket, &mut channel, &response).await?;
@@ -948,6 +989,26 @@ async fn dispatch_request(
 ) -> Result<Value> {
     session.select_method(method)?;
     match method {
+        GATEWAY_SOURCE_METHOD => {
+            ensure!(
+                invocation.is_none(),
+                "gateway source transport does not accept an outer Invocation"
+            );
+            let request: GatewaySourceRequest = serde_json::from_value(params)?;
+            node.gateway_source_request(&session.noise_peer, request)
+                .await
+        }
+        GATEWAY_FORWARD_METHOD => {
+            ensure!(
+                invocation.is_none(),
+                "gateway forward transport does not accept an outer Invocation"
+            );
+            let request: gateway_forward::GatewayForwardRequest = serde_json::from_value(params)?;
+            let reply = node
+                .gateway_target_request(&session.noise_peer, request.header, request.original)
+                .await?;
+            Ok(serde_json::to_value(reply)?)
+        }
         TASK_RECEIPT_READ_METHOD => {
             ensure!(
                 invocation.is_none(),
@@ -1196,6 +1257,37 @@ fn parse_request(bytes: &[u8]) -> Result<Request> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
+#[derive(Deserialize)]
+struct RequestMethodProbe {
+    method: RequestMethodKind,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RequestMethodKind {
+    GatewaySource,
+    GatewayForward,
+    #[serde(other)]
+    Other,
+}
+
+fn parse_session_request(bytes: &[u8], purpose: &SessionPurpose) -> Result<Request> {
+    if bytes.len() > MAX_PROOF_BYTES {
+        // The probe skips params without constructing their JSON tree.
+        let gateway = matches!(
+            purpose,
+            SessionPurpose::GatewaySource | SessionPurpose::GatewayForward
+        ) || matches!(
+            serde_json::from_slice::<RequestMethodProbe>(bytes)?.method,
+            RequestMethodKind::GatewaySource | RequestMethodKind::GatewayForward
+        );
+        if gateway {
+            require_node_policy_carrier(bytes.len(), 0)?;
+        }
+    }
+    parse_request(bytes)
+}
+
 fn validate_request(request: &Request) -> Result<()> {
     ensure!(
         !request.id.is_empty()
@@ -1437,6 +1529,8 @@ mod tests {
             ("identity", json!({"method":"status","params":{}})),
             (TASK_BUSINESS_METHOD, json!({})),
             (TASK_RECEIPT_READ_METHOD, json!({})),
+            (GATEWAY_SOURCE_METHOD, json!({})),
+            (GATEWAY_FORWARD_METHOD, json!({})),
         ] {
             let error = reader
                 .client
@@ -1546,6 +1640,8 @@ mod tests {
             "identity",
             TASK_BUSINESS_METHOD,
             TASK_RECEIPT_READ_METHOD,
+            GATEWAY_SOURCE_METHOD,
+            GATEWAY_FORWARD_METHOD,
             "unknown",
         ] {
             assert!(purpose.select_method(method, false).is_err(), "{method}");
@@ -1560,6 +1656,8 @@ mod tests {
             NODE_POLICY_READ_METHOD,
             TASK_BUSINESS_METHOD,
             TASK_RECEIPT_READ_METHOD,
+            GATEWAY_SOURCE_METHOD,
+            GATEWAY_FORWARD_METHOD,
         ] {
             let mut authenticated = SessionPurpose::Client;
             assert!(authenticated.select_method(method, true).is_err());
@@ -1575,6 +1673,8 @@ mod tests {
             "subscribe",
             NODE_POLICY_READ_METHOD,
             TASK_RECEIPT_READ_METHOD,
+            GATEWAY_SOURCE_METHOD,
+            GATEWAY_FORWARD_METHOD,
         ] {
             assert!(purpose.select_method(method, false).is_err(), "{method}");
         }
@@ -1597,10 +1697,97 @@ mod tests {
             "subscribe",
             NODE_POLICY_READ_METHOD,
             TASK_BUSINESS_METHOD,
+            GATEWAY_SOURCE_METHOD,
+            GATEWAY_FORWARD_METHOD,
         ] {
             assert!(purpose.select_method(method, false).is_err(), "{method}");
         }
         assert!(matches!(purpose, SessionPurpose::TaskReceiptRead));
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_sessions_cannot_switch_between_source_target_or_other_purposes() -> Result<()> {
+        for selected in [GATEWAY_SOURCE_METHOD, GATEWAY_FORWARD_METHOD] {
+            let mut purpose = SessionPurpose::Client;
+            purpose.select_method(selected, false)?;
+            purpose.select_method(selected, false)?;
+            for method in [
+                "info",
+                "authenticate",
+                "prepare_invocation",
+                "rpc",
+                "subscribe",
+                "identity",
+                NODE_POLICY_READ_METHOD,
+                TASK_BUSINESS_METHOD,
+                TASK_RECEIPT_READ_METHOD,
+                GATEWAY_SOURCE_METHOD,
+                GATEWAY_FORWARD_METHOD,
+            ] {
+                if method != selected {
+                    assert!(
+                        purpose.select_method(method, false).is_err(),
+                        "{selected}: {method}"
+                    );
+                }
+            }
+            match selected {
+                GATEWAY_SOURCE_METHOD => assert!(matches!(purpose, SessionPurpose::GatewaySource)),
+                GATEWAY_FORWARD_METHOD => {
+                    assert!(matches!(purpose, SessionPurpose::GatewayForward))
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_carrier_limit_precedes_full_request_parsing() -> Result<()> {
+        let oversized_invalid_json = vec![b'!'; MAX_PROOF_BYTES + 1];
+        for purpose in [
+            SessionPurpose::GatewaySource,
+            SessionPurpose::GatewayForward,
+        ] {
+            assert!(
+                parse_session_request(&oversized_invalid_json, &purpose)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("exceed 64 KiB")
+            );
+        }
+        let padding = "x".repeat(MAX_PROOF_BYTES);
+        for method in [GATEWAY_SOURCE_METHOD, GATEWAY_FORWARD_METHOD] {
+            let bytes = serde_json::to_vec(&json!({
+                "id":"large", "params":{"padding":&padding}, "method":method,
+            }))?;
+            let error = parse_session_request(&bytes, &SessionPurpose::Client)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("exceed 64 KiB"));
+        }
+        let escaped = format!(
+            r#"{{"id":"escaped","params":{{"padding":"{padding}"}},"method":"gateway_\u0073ource"}}"#
+        );
+        assert!(
+            parse_session_request(escaped.as_bytes(), &SessionPurpose::Client)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("exceed 64 KiB")
+        );
+        let bytes = serde_json::to_vec(&json!({
+            "id":"ordinary", "method":"rpc", "params":{"padding":&padding},
+        }))?;
+        let ordinary = parse_session_request(&bytes, &SessionPurpose::Client)?;
+        assert_eq!(ordinary.params["padding"].as_str(), Some(padding.as_str()));
+        let gateway = parse_session_request(
+            br#"{"id":"small","method":"gateway_source","params":{}}"#,
+            &SessionPurpose::Client,
+        )?;
+        assert_eq!(gateway.method, GATEWAY_SOURCE_METHOD);
         Ok(())
     }
 
