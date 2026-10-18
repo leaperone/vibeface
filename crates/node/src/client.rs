@@ -19,9 +19,8 @@ use std::{
     time::{Duration, Instant},
 };
 use vibeface_secure::authorization::{
-    Actor, ClientAuthorizationBundle, ClientScope, DeviceId, Invocation, PolicyPin, PublicKey,
-    ResourceRecord, Signed, TransportEvidence, VerifiedClientAuthorization,
-    execution_observation::ExecutionObservationRequest, verify_client_authorization,
+    Actor, DeviceId, Invocation, PublicKey, Signed, TransportEvidence, VerifiedClientAuthorization,
+    execution_observation::ExecutionObservationRequest,
 };
 use vibeface_secure::{Channel, Handshake};
 
@@ -46,14 +45,6 @@ struct Response {
     result: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Authentication {
-    scope: ClientScope,
-    authorization: ClientAuthorizationBundle,
-    pins: Vec<PolicyPin>,
-    resources: Vec<Signed<ResourceRecord>>,
 }
 struct Session {
     public_key: String,
@@ -277,45 +268,19 @@ async fn dispatch_request(
     match method {
         "info" => Ok(node.info()),
         "authenticate" => {
-            let envelope = node
-                .identity_command(&session.public_key, "authenticate", &params)
-                .await?;
-            let input: Authentication = serde_json::from_value(envelope)?;
-            let pins = {
-                let store = node.store.lock().await;
-                serde_json::to_string(store.trusted_policy_pins())?
+            let (verified, response) = {
+                let mut store = node.store.lock().await;
+                store.authenticate_confirmed_client_policy(
+                    &node.identity,
+                    &session.public_key,
+                    &params,
+                    crate::runtime::now_ms() as u64,
+                )?
             };
-            let verified = secure(verify_client_authorization(
-                &serde_json::to_string(&input.authorization)?,
-                &pins,
-                input.scope.account_id.as_str(),
-                input.scope.space_id.as_str(),
-                &session.public_key,
-                crate::runtime::now_ms() as f64,
-            ))?;
-            ensure!(
-                verified.scope() == &input.scope,
-                "client scope differs from verified proof"
-            );
-            ensure!(
-                verified.resources() == input.resources,
-                "resource directory differs from verified policy"
-            );
-            {
-                let store = node.store.lock().await;
-                for stamp in verified.heads() {
-                    ensure!(
-                        store.authorization_state().head(&stamp.domain) == Some(stamp),
-                        "policy synchronization is required"
-                    );
-                }
-            }
             session.subscription = None;
             session.remote_subscription = None;
             session.authorization = Some(verified);
-            Ok(
-                json!({"scope":input.scope,"authorization":input.authorization,"pins":input.pins,"resources":input.resources}),
-            )
+            Ok(response)
         }
         "prepare_invocation" => {
             let client = session
@@ -617,7 +582,6 @@ mod tests {
             )
             .is_err()
         );
-        assert!(serde_json::from_value::<Authentication>(json!({"network_id":"legacy"})).is_err());
         let request = Request {
             id: "\n".into(),
             method: "rpc".into(),

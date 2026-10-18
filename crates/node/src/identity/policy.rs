@@ -1318,6 +1318,24 @@ impl crate::runtime::Runtime {
                 &self.config.roots,
                 now_ms,
             ),
+            "begin_client_policy_read" => store.begin_client_policy_read(
+                &self.identity,
+                noise_public_key,
+                serde_json::from_value(params.clone())?,
+                now_ms,
+            ),
+            "client_policy_page" => {
+                store.client_policy_page(&self.identity, noise_public_key, params, now_ms)
+            }
+            "client_policy_witness" => {
+                store.client_policy_witness(&self.identity, noise_public_key, params, now_ms)
+            }
+            "client_policy_selections" => {
+                store.client_policy_selections(&self.identity, noise_public_key, params, now_ms)
+            }
+            "confirm_client_policy_auth" => {
+                store.confirm_client_policy_auth(&self.identity, noise_public_key, params, now_ms)
+            }
             "recovery_context" => {
                 store.recovery_context(&self.identity, noise_public_key, params, now_ms)
             }
@@ -1336,7 +1354,14 @@ impl crate::runtime::Runtime {
                 params,
                 now_ms,
             ),
-            "authenticate" => store.authenticate_account(noise_public_key, params, now_ms),
+            "authenticate" => store
+                .authenticate_confirmed_client_policy(
+                    &self.identity,
+                    noise_public_key,
+                    params,
+                    now_ms,
+                )
+                .map(|(_, response)| response),
             "device_directory" => {
                 let authenticated = store.authenticate_account(noise_public_key, params, now_ms)?;
                 let account = AccountId::parse(
