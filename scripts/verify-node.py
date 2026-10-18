@@ -1607,7 +1607,43 @@ def revoke_execution_share(executor, registered, share):
                        grant_leaf=registered["grant_leaf"], activate=False)
 
 
-def verify_remote_readonly(run, project, executor, registered, *, connection="main"):
+def observation_protected_state(run, project, executor, space, operation_id, label):
+    state = {}
+    for node, tables in ((project, (("accepted_authorizations", "space_id", False),
+                                    ("operations", "space_id", True), ("resource_reservations", "space_id", True))),
+                         (executor, (("execution_handoffs", "original_space_id", True),
+                                     ("execution_handoff_reservations", "original_space_id", True)))):
+        with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+            for table, scope_column, scoped_operation in tables:
+                where = f"{scope_column}=?" + (" AND operation_id=?" if scoped_operation else "")
+                parameters = (space, operation_id) if scoped_operation else (space,)
+                state[(node.name, table)] = database.execute(
+                    f"SELECT * FROM {table} WHERE {where} ORDER BY rowid", parameters).fetchall()
+    state["provider_invocations"] = len(invocations(run, label))
+    return state
+
+
+def verify_observation_rejections(run, project, executor, outsider, label, operation_id, observation_body):
+    source = project.client
+    altered_target = copy.deepcopy(observation_body)
+    altered_target["observation_request"]["payload"]["intent"]["target"]["source"]["operation_id"] += "-tampered"
+    altered_signature = copy.deepcopy(observation_body)
+    signature = altered_signature["observation_request"]["signature"]
+    altered_signature["observation_request"]["signature"] = ("0" if signature[0] != "0" else "1") + signature[1:]
+    outsider.client.command("connect", connection="readonly-other-reader", url=project.url,
+                            node_id=project.node_id, node_public_key=project.node_public_key)
+    attempts = (("tampered_original_operation", source, "main", altered_target),
+                ("tampered_signature", source, "main", altered_signature),
+                ("independent_account_transport", outsider.client, "readonly-other-reader", observation_body))
+    for name, client, connection, body in attempts:
+        before = observation_protected_state(run, project, executor, source.scope["space_id"], operation_id, label)
+        client.call("rpc", body, connection=connection, status=400)
+        require(observation_protected_state(run, project, executor, source.scope["space_id"], operation_id, label) == before,
+                name + " rejects without changing admissions, operations, reservations or provider invocations")
+    return [name for name, _, _, _ in attempts]
+
+
+def verify_remote_readonly(run, project, executor, outsider, registered, *, connection="main"):
     source, owner = project.client, executor.client
     records = []
     for terminal in (False, True):
@@ -1693,6 +1729,8 @@ def verify_remote_readonly(run, project, executor, registered, *, connection="ma
             repeated_actual = source.command("verify_observation", handle=observer, actual=repeated["actual"], binding=binding)
             require(repeated_actual["handoff"] == original and repeated_actual["receipt"]["payload"]["state"] == expected_state,
                     "retrying the same signed observation only reads the original operation")
+            rejected = verify_observation_rejections(run, project, executor, outsider, label,
+                                                     sent["operation_id"], observation_body)
         finally:
             source.command("release_remote", handle=observer)
         require(persisted_operation_state(project, source.scope["space_id"], sent["operation_id"]) == "unknown",
@@ -1716,11 +1754,11 @@ def verify_remote_readonly(run, project, executor, registered, *, connection="ma
             require(duplicate == final, "the exact signed resolution retry returns the same terminal operation")
         finally:
             source.command("release_remote", handle=resolver)
-        source.call("rpc", original_request["body"], invocation=original_request["invocation"], connection=connection)
+        source.call("rpc", original_request["body"], invocation=original_request["invocation"], connection=connection, status=400)
         require(admitted_scope(project, source, sent["operation_id"]) == admission
                 and executor_original(executor, source.scope["space_id"], sent["operation_id"]) == accepted
                 and len(invocations(run, label)) == 1,
-                "Observation, resolution and both exact retries preserve the original admission and one execution")
+                "Observation, resolution and the rejected revoked-write retry preserve the original admission and one execution")
         for node, table, column in ((project, "resource_reservations", "space_id"),
                                     (executor, "execution_handoff_reservations", "original_space_id")):
             with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
@@ -1746,6 +1784,8 @@ def verify_remote_readonly(run, project, executor, registered, *, connection="ma
                         "writer_grant": share["selection"]["execution_grant"],
                         "reader_grant": reader_share["selection"]["execution_grant"],
                         "executor_state": verified["state"], "provider_invocations": len(invocations(run, label)),
+                        "rejections": rejected,
+                        "original_write_retry": "rejected_after_writer_revocation",
                         "evidence": label + "-resolution.json"})
     return records
 
@@ -1865,7 +1905,7 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
     wait_for("sealed Task opens only its next binding", lambda: source.rpc("operation", target_node=executor.node_id,
               operation_id="remote-rebound-open", remote=replacement, connection=connection)["operation"]["state"] == "succeeded")
 
-    readonly = verify_remote_readonly(run, project, executor, registered, connection=connection)
+    readonly = verify_remote_readonly(run, project, executor, outsider, registered, connection=connection)
 
     team_prepared = source.command("prepare_team", handle="remote-team", trust_ref="remote-team",
                                    source_project=source.resource_id)
