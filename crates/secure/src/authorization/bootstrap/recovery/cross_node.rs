@@ -76,19 +76,10 @@ pub(super) fn verify_request_identity(
         signed.issuer.clone(),
     ]);
     require(
-        keys.len() == 5
-            && r.new_root_public_key != account.current_root
-            && r.new_device_public_key != account.current_root
-            && !state.devices.values().any(|c| {
-                c.payload.public_key == r.new_root_public_key
-                    || c.payload.public_key == r.new_device_public_key
-            })
-            && !state.accounts.values().flat_map(|a| &a.history).any(|d| {
-                d.payload.current_root == r.new_root_public_key
-                    || d.payload.current_root == r.new_device_public_key
-            }),
+        keys.len() == 5,
         "cross-node recovery keys must be independent and new",
     )?;
+    require_independent_new_recovery_keys(state, &r.new_root_public_key, &r.new_device_public_key)?;
     require(
         !r.source_read_resources.is_empty()
             && r.source_read_resources.len() <= 32
@@ -568,6 +559,64 @@ pub(super) fn verify_delta_in_state(
     now: u64,
 ) -> Result<(VerifiedPolicySet, PolicyStamp, PolicyStamp)> {
     verify_possession_in_state(signed, node_request, source_certificate, before, now)?;
+    verify_delta_from_state(
+        signed,
+        node_request,
+        source_certificate,
+        pins,
+        delta,
+        grant_leaf,
+        before,
+        now,
+        before.clone(),
+        false,
+    )
+}
+
+pub(super) fn verify_delta_after_locally_approved_account(
+    signed: &Signed<CrossNodeRecoveryRequest>,
+    node_request: &RecoveryNodeRequest,
+    source_certificate: &DeviceCertificate,
+    pins: &[PolicyPin],
+    delta: &[JournalEntry],
+    grant_leaf: &ObjectHash,
+    before: &VerifiedPolicySet,
+    now: u64,
+    after_account: VerifiedPolicySet,
+) -> Result<(VerifiedPolicySet, PolicyStamp, PolicyStamp)> {
+    require(
+        after_account.head(&PolicyDomain::Account(signed.payload.account.clone()))
+            == Some(&account_stamp(&node_request.account_recovery)?)
+            && after_account.account(&signed.payload.account)
+                == Some(&node_request.account_recovery.payload),
+        "cross-node approved account differs from its exact proposal",
+    )?;
+    verify_delta_from_state(
+        signed,
+        node_request,
+        source_certificate,
+        pins,
+        delta,
+        grant_leaf,
+        before,
+        now,
+        after_account,
+        true,
+    )
+}
+
+fn verify_delta_from_state(
+    signed: &Signed<CrossNodeRecoveryRequest>,
+    node_request: &RecoveryNodeRequest,
+    source_certificate: &DeviceCertificate,
+    pins: &[PolicyPin],
+    delta: &[JournalEntry],
+    grant_leaf: &ObjectHash,
+    before: &VerifiedPolicySet,
+    now: u64,
+    mut after: VerifiedPolicySet,
+    approved_account: bool,
+) -> Result<(VerifiedPolicySet, PolicyStamp, PolicyStamp)> {
     bounded(&delta)?;
     let r = &signed.payload;
     require(
@@ -616,8 +665,7 @@ pub(super) fn verify_delta_in_state(
         matches!(delta.get(owner_index), Some(JournalEntry::Grant(owner)) if owner.hash().as_ref() == Ok(grant_leaf)),
         "recovery changed its exact account owner grant",
     )?;
-    let mut after = before.clone();
-    for entry in delta {
+    for entry in delta.iter().skip(usize::from(approved_account)) {
         apply_policy_entry(&mut after, pins, entry.clone())?;
     }
     let account = after
@@ -869,13 +917,11 @@ pub fn finish_cross_node_account_recovery(
                 })?;
             let now = timestamp(now_ms)?;
             let r = &prepared.possession.request.payload;
-            verify_possession_in_state(
-                &prepared.possession.request,
-                &prepared.possession.node_request,
-                &prepared.possession.source_certificate,
-                &prepared.prepared.before_state,
-                now,
-            )?;
+            #[cfg(test)]
+            eprintln!(
+                "cross client after ordinary: {:?}",
+                crate::signature_verification::SignatureVerification::current_counts()
+            );
             let mut state = created.authorization.policy_snapshot.clone();
             let mut source = prepared.possession.source_certificate.clone();
             source.possession = Some(Signature::parse(source_possession)?);
@@ -967,6 +1013,11 @@ pub fn finish_cross_node_account_recovery(
                     pin.minimum_head = Some(final_head.clone());
                 }
             }
+            #[cfg(test)]
+            eprintln!(
+                "cross client after extension: {:?}",
+                crate::signature_verification::SignatureVerification::current_counts()
+            );
             let genuine = created
                 .authorization
                 .imported_snapshot
@@ -998,8 +1049,11 @@ pub fn finish_cross_node_account_recovery(
             let context = prepared.prepared.verified_context.as_ref().ok_or(
                 AuthorizationError::InvalidProof("cross-node recovery lost its original read"),
             )?;
-            stream::cross::verify_cross_node_recovery_stream_commit_in_context(
-                &request, context, now,
+            stream::cross::verify_cross_node_recovery_stream_commit_locally_prepared(
+                &request,
+                &prepared.possession,
+                context,
+                now,
             )?;
             Ok(PreparedCrossNodeRecoveryCommit {
                 request,

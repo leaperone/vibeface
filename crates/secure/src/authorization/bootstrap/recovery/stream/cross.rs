@@ -30,7 +30,7 @@ fn exact_heads(read: &RecoveryReadRequest, state: &VerifiedPolicySet) -> Result<
     .collect()
 }
 
-fn verify_context_binding(
+fn verify_context_reference(
     possession: &StreamedCrossNodeRecoveryPossessionRequest,
     read: &RecoveryReadRequest,
     snapshot: &Signed<RecoveryContextSnapshot>,
@@ -79,8 +79,68 @@ fn verify_context_binding(
     validate_window(sealed.issued_at_ms, sealed.expires_at_ms, now)?;
     snapshot.verify_signature()?;
     witness.verify_signature()?;
+    require(
+        value.target_heads
+            == [
+                possession.node_request.expected_account_head.clone(),
+                possession.node_request.expected_space_head.clone(),
+            ]
+            && possession.node_request.account_recovery.payload.account == *read.account()
+            && possession
+                .node_request
+                .account_recovery
+                .payload
+                .current_root
+                == original.payload.new_root_public_key
+            && possession.node_request.account_recovery.issuer == original.issuer,
+        "cross-node proposal changed the exact approved account or keys",
+    )?;
+    read.validate_saved_pins()?;
+    let account = before
+        .account(read.account())
+        .ok_or(AuthorizationError::Revoked)?;
+    let space = before
+        .space(read.space())
+        .ok_or(AuthorizationError::Revoked)?;
+    require(
+        account.authority.public_key == *source
+            && space.authority.public_key == *source
+            && account.recovery.threshold == 1
+            && account.recovery.keys == [original.issuer.clone()]
+            && read.saved_pins().iter().all(|pin| {
+                pin.genesis_root == account.genesis_root
+                    && pin
+                        .minimum_head
+                        .as_ref()
+                        .is_some_and(|head| before.roots.contains_key(head))
+            }),
+        "cross-node approved read changed its current recovery or source authority",
+    )?;
+    before.ensure_personal_current(space)?;
+    validate_window(read.issued_at_ms(), read.expires_at_ms(), now)?;
+    validate_claim(
+        &original.payload.target_claim,
+        &original.payload.target_claim.payload.node_public_key,
+        &original.payload.target_claim.payload.claim_nonce,
+        now,
+    )?;
+    original.verify_signature()?;
+    before
+        .verify_service_device(read.space(), &DeviceId::from_key(source), now)
+        .map(|_| ())
+}
+
+fn verify_context_binding(
+    possession: &StreamedCrossNodeRecoveryPossessionRequest,
+    read: &RecoveryReadRequest,
+    snapshot: &Signed<RecoveryContextSnapshot>,
+    witness: &Signed<RecoveryContextWitness>,
+    before: &VerifiedPolicySet,
+    now: u64,
+) -> Result<()> {
+    verify_context_reference(possession, read, snapshot, witness, before, now)?;
     cross_node::verify_possession_in_state(
-        original,
+        cross_request(read)?,
         &possession.node_request,
         &possession.source_certificate,
         before,
@@ -347,6 +407,45 @@ fn sign_source_possession_cached(
     Ok(proof)
 }
 
+pub fn approve_cross_node_recovery_source_proposal(
+    possession: &StreamedCrossNodeRecoveryPossessionRequest,
+    read: &RecoveryReadRequest,
+    snapshot: &Signed<RecoveryContextSnapshot>,
+    witness: &Signed<RecoveryContextWitness>,
+    before: &VerifiedPolicySet,
+    source: &Identity,
+    accepted_prefix_commitment: &ObjectHash,
+    now: u64,
+) -> Result<(Signature, Signed<RecoverySourceProposalApproval>)> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
+    let proof = sign_cross_node_recovery_source_possession_in_state(
+        possession, read, snapshot, witness, before, source, now,
+    )?;
+    let approval = approval::sign_source_proposal_approval_after_verification(
+        read,
+        &possession.context,
+        &ObjectHash::body(possession)?,
+        &possession.node_request.account_recovery,
+        &proof,
+        before,
+        source,
+        accepted_prefix_commitment,
+        now,
+    )?;
+    let mut usage = possession_usage(
+        possession,
+        read,
+        snapshot,
+        witness,
+        before,
+        None,
+        canonical(&(possession, &proof, &approval))?.len(),
+    )?;
+    usage.record_source_proposal_approval(&approval)?;
+    usage.finish()?;
+    Ok((proof, approval))
+}
+
 pub fn approve_cross_node_recovery_import(
     context: &VerifiedRecoveryPolicyContext,
     possession: &StreamedCrossNodeRecoveryPossessionRequest,
@@ -419,6 +518,7 @@ pub struct VerifiedStreamedCrossNodeRecoveryCommit {
     verified_at_ms: u64,
     proof_usage: RecoveryProofCounts,
     proof: RecoveryProofUsage,
+    approved_account: Option<approval::LocallyApprovedRecoveryAccount>,
 }
 
 impl VerifiedStreamedCrossNodeRecoveryCommit {
@@ -477,6 +577,182 @@ impl VerifiedStreamedCrossNodeRecoveryCommit {
     }
 }
 
+fn approved_commit_usage(
+    input: &StreamedCrossNodeRecoveryCommitRequest,
+    read: &RecoveryReadRequest,
+    snapshot: &Signed<RecoveryContextSnapshot>,
+    witness: &Signed<RecoveryContextWitness>,
+    before: &VerifiedPolicySet,
+    cached: Option<&CachedPolicyProof>,
+    carrier_bytes: usize,
+) -> Result<RecoveryProofUsage> {
+    let mut usage = RecoveryProofUsage::new(carrier_bytes)?;
+    usage.record_request(read)?;
+    usage.record_snapshot(snapshot)?;
+    usage.record_witness(witness)?;
+    usage.record_current_source(read, before)?;
+    usage.record_cross_possession_carrier(&input.possession)?;
+    let mut metadata = ExecutionProofUsage::default();
+    metadata.record_metadata(&(&input.pins, &input.grant_leaf))?;
+    usage.merge_usage(&metadata);
+    #[cfg(test)]
+    eprintln!(
+        "cross approved proposal usage: {}",
+        serde_json::to_string(&usage.diagnostic_counts()).unwrap()
+    );
+    let mut staged = before.clone();
+    for (index, entry) in input.journal_delta.iter().enumerate() {
+        if index == 0 {
+            require(
+                entry
+                    == &JournalEntry::Account(
+                        input.possession.node_request.account_recovery.clone(),
+                    ),
+                "cross-node commit changed its locally approved account",
+            )?;
+            usage.merge_usage(&policy_entry_payload_usage(entry)?);
+            approval::apply_locally_approved_account_recovery(
+                &mut staged,
+                &input.possession.node_request.account_recovery,
+                &input.possession.node_request.expected_account_head,
+            )?;
+        } else {
+            let part = policy_entry_usage_with_cache(&staged, entry, cached);
+            #[cfg(test)]
+            if let Err(error) = &part {
+                eprintln!("cross approved delta {index} error: {error:?}");
+            }
+            usage.merge_usage(&part?);
+            apply_policy_entry(&mut staged, &input.pins, entry.clone())?;
+        }
+        #[cfg(test)]
+        eprintln!(
+            "cross approved delta {index} usage: {}",
+            serde_json::to_string(&usage.diagnostic_counts()).unwrap()
+        );
+    }
+    Ok(usage)
+}
+
+fn verify_stream_commit_after_local_approval(
+    input: &StreamedCrossNodeRecoveryCommitRequest,
+    read: &RecoveryReadRequest,
+    snapshot: &Signed<RecoveryContextSnapshot>,
+    witness: &Signed<RecoveryContextWitness>,
+    before: &VerifiedPolicySet,
+    now: u64,
+    cached: Option<&CachedPolicyProof>,
+) -> Result<VerifiedStreamedCrossNodeRecoveryCommit> {
+    verify_context_reference(&input.possession, read, snapshot, witness, before, now)?;
+    let mut after_account = before.clone();
+    let approved_account = approval::apply_locally_approved_account_recovery(
+        &mut after_account,
+        &input.possession.node_request.account_recovery,
+        &input.possession.node_request.expected_account_head,
+    )?;
+    let (state, account_head, space_head) =
+        cross_node::verify_delta_after_locally_approved_account(
+            &input.possession.request,
+            &input.possession.node_request,
+            &input.possession.source_certificate,
+            &input.pins,
+            &input.journal_delta,
+            &input.grant_leaf,
+            before,
+            now,
+            after_account,
+        )?;
+    let usage = approved_commit_usage(
+        input,
+        read,
+        snapshot,
+        witness,
+        before,
+        cached,
+        canonical(input)?.len(),
+    )?;
+    let proof_usage = usage.clone().finish()?;
+    Ok(VerifiedStreamedCrossNodeRecoveryCommit {
+        request: input.clone(),
+        state,
+        expected_heads: exact_heads(read, before)?,
+        committed_heads: vec![account_head, space_head],
+        input_hash: ObjectHash::body(input)?,
+        verified_at_ms: now,
+        proof_usage,
+        proof: usage,
+        approved_account: Some(approved_account),
+    })
+}
+
+pub fn verify_cross_node_recovery_stream_commit_with_source_approval(
+    input: &StreamedCrossNodeRecoveryCommitRequest,
+    read: &RecoveryReadRequest,
+    snapshot: &Signed<RecoveryContextSnapshot>,
+    witness: &Signed<RecoveryContextWitness>,
+    before: &VerifiedPolicySet,
+    source_approval: &VerifiedRecoverySourceProposalApproval,
+    local_source: &PublicKey,
+    now: u64,
+) -> Result<VerifiedStreamedCrossNodeRecoveryCommit> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
+    require(
+        read.source_node_public_key() == local_source
+            && source_approval.account() == &input.possession.node_request.account_recovery,
+        "cross-node approved commit reached another source or account",
+    )?;
+    source_approval.validate(
+        read,
+        &input.possession.context,
+        &ObjectHash::body(&input.possession)?,
+        before,
+        now,
+    )?;
+    let mut verified = verify_stream_commit_after_local_approval(
+        input,
+        read,
+        snapshot,
+        witness,
+        before,
+        now,
+        Some(source_approval.cache_for_current(before)?),
+    )?;
+    source_approval.record_proof_usage_into(&mut verified.proof)?;
+    #[cfg(test)]
+    eprintln!(
+        "cross source approval union usage: {}",
+        serde_json::to_string(&verified.proof.diagnostic_counts()).unwrap()
+    );
+    verified.proof_usage = verified.proof.clone().finish()?;
+    Ok(verified)
+}
+
+pub(crate) fn verify_cross_node_recovery_stream_commit_locally_prepared(
+    input: &StreamedCrossNodeRecoveryCommitRequest,
+    approved: &StreamedCrossNodeRecoveryPossessionRequest,
+    context: &VerifiedRecoveryPolicyContext,
+    now: u64,
+) -> Result<VerifiedStreamedCrossNodeRecoveryCommit> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
+    require(
+        &input.possession == approved && input.possession.context == context.reference()?,
+        "cross-node finish changed its genuine prepared proposal",
+    )?;
+    let cached = CachedPolicyProof::from_verified_prefix(
+        context.verified_state(),
+        context.policy().journal(),
+    )?;
+    verify_stream_commit_after_local_approval(
+        input,
+        context.request(),
+        context.snapshot(),
+        context.witness(),
+        context.verified_state(),
+        now,
+        Some(&cached),
+    )
+}
+
 pub fn verify_cross_node_recovery_stream_commit_in_state(
     input: &StreamedCrossNodeRecoveryCommitRequest,
     read: &RecoveryReadRequest,
@@ -518,27 +794,6 @@ pub fn verify_cross_node_recovery_stream_commit_with_source_proof(
         local_source,
         now,
         Some(source_proof.cache_for(read, before)?),
-    )
-}
-
-pub(crate) fn verify_cross_node_recovery_stream_commit_in_context(
-    input: &StreamedCrossNodeRecoveryCommitRequest,
-    context: &VerifiedRecoveryPolicyContext,
-    now: u64,
-) -> Result<VerifiedStreamedCrossNodeRecoveryCommit> {
-    let cached = CachedPolicyProof::from_verified_prefix(
-        context.verified_state(),
-        context.policy().journal(),
-    )?;
-    verify_stream_commit_cached(
-        input,
-        context.request(),
-        context.snapshot(),
-        context.witness(),
-        context.verified_state(),
-        context.request().source_node_public_key(),
-        now,
-        Some(&cached),
     )
 }
 
@@ -588,6 +843,7 @@ fn verify_stream_commit_cached(
         verified_at_ms: now,
         proof_usage,
         proof: usage,
+        approved_account: None,
     })
 }
 
@@ -761,7 +1017,7 @@ pub fn verify_cross_node_recovery_stream_installation(
     )?;
     approval.verify_signature()?;
     verify_receipt_binding(committed, now)?;
-    verify_context_binding(
+    verify_context_reference(
         &committed.request.possession,
         context.request(),
         context.snapshot(),
@@ -769,10 +1025,18 @@ pub fn verify_cross_node_recovery_stream_installation(
         context.verified_state(),
         approved.approved_at_ms,
     )?;
-    let verified = verify_cross_node_recovery_stream_commit_in_context(
+    let cached = CachedPolicyProof::from_verified_prefix(
+        context.verified_state(),
+        context.policy().journal(),
+    )?;
+    let verified = verify_stream_commit_after_local_approval(
         &committed.request,
-        &context,
+        context.request(),
+        context.snapshot(),
+        context.witness(),
+        context.verified_state(),
         value.accepted_at_ms,
+        Some(&cached),
     )?;
     require(
         verified.committed_heads()
@@ -784,30 +1048,21 @@ pub fn verify_cross_node_recovery_stream_installation(
     )?;
     let policy = context
         .policy()
-        .apply_delta(&committed.request.journal_delta)?
+        .apply_locally_approved_recovery_delta(
+            &committed.request.journal_delta,
+            verified
+                .approved_account
+                .as_ref()
+                .ok_or(AuthorizationError::InvalidProof(
+                    "cross-node installation lost its exact local account approval",
+                ))?,
+        )?
         .with_independent_pins(&committed.request.pins)?;
     policy
         .state()
         .verify_transport_device(&DeviceId::from_key(local_target), now)?;
-    let cached = CachedPolicyProof::from_verified_prefix(
-        context.verified_state(),
-        context.policy().journal(),
-    )?;
-    let mut usage = possession_usage(
-        &committed.request.possession,
-        context.request(),
-        context.snapshot(),
-        context.witness(),
-        context.verified_state(),
-        Some(&cached),
-        canonical(&(approval, committed))?.len(),
-    )?;
-    record_delta_usage(
-        &mut usage,
-        &committed.request,
-        context.verified_state(),
-        Some(&cached),
-    )?;
+    let mut usage = RecoveryProofUsage::new(canonical(&(approval, committed))?.len())?;
+    verified.record_proof_usage_into(&mut usage);
     let mut extra = ExecutionProofUsage::default();
     extra.record_signed(approval)?;
     extra.record_signed(&committed.receipt)?;
@@ -1049,16 +1304,8 @@ mod tests {
             })
         }
 
-        fn source_cache(&self) -> Result<VerifiedRecoverySourceProof> {
-            verify_recovery_source_proof_prefix(
-                &self.read,
-                &self.snapshot,
-                &self.witness,
-                &self.original.authorization.policy_snapshot,
-                &self.original.bundle.journal,
-                &PublicKey::of(&key(4)),
-                NOW,
-            )
+        fn prefix_commitment(&self) -> ObjectHash {
+            ObjectHash::body(&self.original.bundle.journal).unwrap()
         }
 
         fn commit(
@@ -1066,6 +1313,7 @@ mod tests {
         ) -> (
             StreamedCrossNodeRecoveryCommitRequest,
             Signed<CrossNodeRecoveryImportApproval>,
+            Signed<RecoverySourceProposalApproval>,
             cross_node::PreparedCrossNodeRecoveryCommit,
         ) {
             let client_context = self.import_client(NOW);
@@ -1082,16 +1330,15 @@ mod tests {
                     NOW,
                 )
             });
-            let source_proof = checked("source_possession", || {
-                let source_cache = self.source_cache()?;
-                sign_cross_node_recovery_source_possession_with_source_proof(
+            let (source_proof, source_approval) = checked("source_possession", || {
+                approve_cross_node_recovery_source_proposal(
                     &possession,
                     &self.read,
                     &self.snapshot,
                     &self.witness,
                     &self.original.authorization.policy_snapshot,
-                    &source_cache,
                     &key(4),
+                    &self.prefix_commitment(),
                     NOW,
                 )
             });
@@ -1105,24 +1352,49 @@ mod tests {
                 )
             });
             let commit = serde_json::from_str(&pending.request_json().unwrap()).unwrap();
-            (commit, approval, pending)
+            (commit, approval, source_approval, pending)
         }
 
         fn accept(
             &self,
             input: &StreamedCrossNodeRecoveryCommitRequest,
+            source_approval: &Signed<RecoverySourceProposalApproval>,
         ) -> StreamedCrossNodeRecoveryCommitted {
             let signatures = SignatureVerification::new();
             let committed = signatures
                 .run(|| {
-                    let source_cache = self.source_cache()?;
-                    let verified = verify_cross_node_recovery_stream_commit_with_source_proof(
+                    let source_proof = input
+                        .journal_delta
+                        .iter()
+                        .find_map(|entry| match entry {
+                            JournalEntry::Device(value)
+                                if value.payload.public_key
+                                    == *self.read.source_node_public_key() =>
+                            {
+                                value.payload.possession.as_ref()
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    let approved = verify_recovery_source_proposal_approval(
+                        source_approval,
+                        &self.read,
+                        &input.possession.context,
+                        &ObjectHash::body(&input.possession).unwrap(),
+                        &input.possession.node_request.account_recovery,
+                        source_proof,
+                        &self.original.authorization.policy_snapshot,
+                        &PublicKey::of(&key(4)),
+                        &self.prefix_commitment(),
+                        NOW,
+                    )?;
+                    let verified = verify_cross_node_recovery_stream_commit_with_source_approval(
                         input,
                         &self.read,
                         &self.snapshot,
                         &self.witness,
                         &self.original.authorization.policy_snapshot,
-                        &source_cache,
+                        &approved,
                         &PublicKey::of(&key(4)),
                         NOW,
                     )
@@ -1143,9 +1415,9 @@ mod tests {
     fn twelve_nodes_dual_possession_receipt_and_one_use_installation() {
         let fixture = Fixture::new(12);
         assert!(canonical(&fixture.original.bundle).unwrap().len() > MAX_PROOF_BYTES);
-        let (input, approval, mut pending) = fixture.commit();
+        let (input, approval, source_approval, mut pending) = fixture.commit();
         assert!(canonical(&input).unwrap().len() <= MAX_PROOF_BYTES);
-        let committed = fixture.accept(&input);
+        let committed = fixture.accept(&input, &source_approval);
         assert!(canonical(&committed).unwrap().len() <= MAX_PROOF_BYTES);
         let context = fixture.import(approval.payload.approved_at_ms);
         let token = checked("target_install", || {
@@ -1239,6 +1511,65 @@ mod tests {
             });
             assert_eq!(authorization.actions, cross_node::source_read_actions());
             assert_eq!(authorization.audience_public_key, PublicKey::of(&key(4)));
+            let mut invocation = Invocation {
+                version: AUTH_VERSION,
+                actor: Actor::Account(fixture.read.account().clone()),
+                device: authorization.scope.device_id.clone(),
+                initiator: Actor::Account(fixture.read.account().clone()),
+                initiating_grant: None,
+                resource: resource.clone(),
+                action: Action::ConversationRead,
+                audience: authorization.audience.clone(),
+                presenter: authorization.scope.device_id.clone(),
+                operation_id: "streamed-source-read".to_owned(),
+                body_hash: ObjectHash::body(&serde_json::json!({})).unwrap(),
+                grant_leaf: authorization.grant_leaf.clone(),
+                expected_policies: authorization.heads.clone(),
+                context: InvocationContext::default(),
+                nonce: Nonce::from_bytes([55; 32]),
+                not_before_ms: NOW,
+                expires_at_ms: NOW + 1000,
+            };
+            let transport = TransportEvidence::DirectNoise {
+                device: authorization.scope.device_id.clone(),
+            };
+            let facts = |value: &Invocation| RequestFacts {
+                resource: value.resource.clone(),
+                action: value.action,
+                audience: value.audience.clone(),
+                operation_id: value.operation_id.clone(),
+                body_hash: value.body_hash.clone(),
+                context: value.context.clone(),
+            };
+            checked("source_read_invocation", || {
+                after.verify_invocation(
+                    &Signed::sign(invocation.clone(), &key(50)).unwrap(),
+                    &facts(&invocation),
+                    &transport,
+                    NOW,
+                )
+            });
+            for action in [
+                Action::MessageAppend,
+                Action::TaskCreate,
+                Action::AgentStart,
+                Action::ExecutionOpen,
+                Action::MemberManage,
+                Action::AttachmentWrite,
+                Action::OperationResolve,
+            ] {
+                invocation.action = action;
+                assert!(
+                    after
+                        .verify_invocation(
+                            &Signed::sign(invocation.clone(), &key(50)).unwrap(),
+                            &facts(&invocation),
+                            &transport,
+                            NOW
+                        )
+                        .is_err()
+                );
+            }
         }
         let pending_material = checked("pending_material", || {
             pending.recovery_material_json(
@@ -1257,6 +1588,16 @@ mod tests {
         assert_eq!(
             restored.request_json().unwrap(),
             pending.request_json().unwrap()
+        );
+        let mut changed_pending: serde_json::Value =
+            serde_json::from_str(&pending_material).unwrap();
+        changed_pending["client_secret_hex"] = key(8).secret_hex().into();
+        assert!(
+            cross_node::restore_prepared_cross_node_recovery_commit(
+                &changed_pending.to_string(),
+                NOW as f64,
+            )
+            .is_err()
         );
         let result = checked("client_receipt", || {
             cross_node::finish_cross_node_recovery_commit(
@@ -1279,9 +1620,85 @@ mod tests {
     #[test]
     fn streamed_cross_rejects_changed_context_approvals_receipts_and_source_privileges() {
         let fixture = Fixture::new(0);
-        let (input, approval, _) = fixture.commit();
-        let committed = fixture.accept(&input);
+        let (input, approval, source_approval, _) = fixture.commit();
+        let committed = fixture.accept(&input, &source_approval);
         let context = fixture.import(NOW);
+        assert!(
+            approve_cross_node_recovery_import(
+                &context,
+                &input.possession,
+                &key(4),
+                &Nonce::from_bytes([44; 32]),
+                NOW
+            )
+            .is_err()
+        );
+        assert!(
+            approve_cross_node_recovery_import(
+                &context,
+                &input.possession,
+                &key(7),
+                &Nonce::from_bytes([45; 32]),
+                NOW
+            )
+            .is_err()
+        );
+        assert!(
+            sign_cross_node_recovery_source_possession_in_state(
+                &input.possession,
+                &fixture.read,
+                &fixture.snapshot,
+                &fixture.witness,
+                &fixture.original.authorization.policy_snapshot,
+                &key(7),
+                NOW
+            )
+            .is_err()
+        );
+        let mut missing_source = input.clone();
+        missing_source.journal_delta.retain(|entry| {
+            !matches!(entry,JournalEntry::Device(value)
+            if value.payload.public_key == *fixture.read.source_node_public_key())
+        });
+        assert!(
+            verify_cross_node_recovery_stream_commit_in_state(
+                &missing_source,
+                &fixture.read,
+                &fixture.snapshot,
+                &fixture.witness,
+                &fixture.original.authorization.policy_snapshot,
+                &PublicKey::of(&key(4)),
+                NOW
+            )
+            .is_err()
+        );
+        let mut oversized = input.clone();
+        oversized
+            .journal_delta
+            .extend(std::iter::repeat_n(input.journal_delta[0].clone(), 200));
+        assert!(
+            verify_cross_node_recovery_stream_commit_in_state(
+                &oversized,
+                &fixture.read,
+                &fixture.snapshot,
+                &fixture.witness,
+                &fixture.original.authorization.policy_snapshot,
+                &PublicKey::of(&key(4)),
+                NOW
+            )
+            .is_err()
+        );
+        assert!(
+            verify_cross_node_recovery_stream_installation(
+                context.clone(),
+                &approval,
+                &committed,
+                &PublicKey::of(&key(7)),
+                &Nonce::from_bytes([44; 32]),
+                END + 1
+            )
+            .is_err()
+        );
         let reject = |approval: &Signed<CrossNodeRecoveryImportApproval>,
                       committed: &StreamedCrossNodeRecoveryCommitted| {
             assert!(
@@ -1392,5 +1809,84 @@ mod tests {
             )
             .is_err()
         );
+        let mut advanced_space = fixture.original.authorization.policy_snapshot.clone();
+        let mut document = advanced_space.space(fixture.read.space()).unwrap().clone();
+        document.previous = advanced_space
+            .head(&PolicyDomain::Space(document.space.clone()))
+            .cloned();
+        document.sequence += 1;
+        advanced_space
+            .install_space(Signed::sign(document, &key(1)).unwrap())
+            .unwrap();
+        assert!(
+            verify_cross_node_recovery_stream_commit_in_state(
+                &input,
+                &fixture.read,
+                &fixture.snapshot,
+                &fixture.witness,
+                &advanced_space,
+                &PublicKey::of(&key(4)),
+                NOW
+            )
+            .is_err()
+        );
+        let old_recovery = PublicKey::of(&key(2));
+        let mut rotated = fixture.original.authorization.policy_snapshot.clone();
+        assert!(!rotated.roots.values().any(|root| root == &old_recovery));
+        assert!(
+            !rotated
+                .devices
+                .values()
+                .any(|device| device.payload.public_key == old_recovery)
+        );
+        let mut account = rotated.account(fixture.read.account()).unwrap().clone();
+        account.previous = rotated
+            .head(&PolicyDomain::Account(account.account.clone()))
+            .cloned();
+        account.sequence += 1;
+        account.recovery.keys = vec![PublicKey::of(&key(9))];
+        account.root_acceptance = None;
+        account.recovery_approvals.clear();
+        let recovery_policy = account.recovery.clone();
+        rotated
+            .install_account(Signed::sign(account, &key(1)).unwrap())
+            .unwrap();
+        let mut space = rotated.space(fixture.read.space()).unwrap().clone();
+        space.previous = rotated
+            .head(&PolicyDomain::Space(space.space.clone()))
+            .cloned();
+        space.sequence += 1;
+        space.recovery = recovery_policy;
+        space.root_acceptance = None;
+        space.recovery_approvals.clear();
+        rotated
+            .install_space(Signed::sign(space, &key(1)).unwrap())
+            .unwrap();
+        let fresh = Signed::sign(read.payload.clone(), &key(9)).unwrap();
+        cross_node::verify_cross_node_recovery_request(
+            &rotated,
+            &fresh,
+            &PublicKey::of(&key(4)),
+            NOW,
+        )
+        .unwrap();
+        for old_key_as_root in [true, false] {
+            let mut changed = fresh.payload.clone();
+            if old_key_as_root {
+                changed.new_root_public_key = old_recovery.clone();
+            } else {
+                changed.new_device_public_key = old_recovery.clone();
+            }
+            let changed = Signed::sign(changed, &key(9)).unwrap();
+            assert!(
+                cross_node::verify_cross_node_recovery_request(
+                    &rotated,
+                    &changed,
+                    &PublicKey::of(&key(4)),
+                    NOW,
+                )
+                .is_err()
+            );
+        }
     }
 }

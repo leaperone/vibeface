@@ -20,6 +20,13 @@ pub struct RecoveryProofUsage {
 }
 
 impl RecoveryProofUsage {
+    #[cfg(test)]
+    pub(crate) fn diagnostic_counts(&self) -> RecoveryProofCounts {
+        RecoveryProofCounts {
+            carrier_bytes: self.carrier_bytes,
+            proof: self.usage.counts(),
+        }
+    }
     pub fn new(carrier_bytes: usize) -> Result<Self> {
         require(
             carrier_bytes <= MAX_PROOF_BYTES,
@@ -75,6 +82,13 @@ impl RecoveryProofUsage {
         self.usage.enforce_limits()
     }
     pub fn record_completion(&mut self, value: &Signed<RecoveryCompletionReceipt>) -> Result<()> {
+        self.usage.record_signed(value)?;
+        self.usage.enforce_limits()
+    }
+    pub fn record_source_proposal_approval(
+        &mut self,
+        value: &Signed<RecoverySourceProposalApproval>,
+    ) -> Result<()> {
         self.usage.record_signed(value)?;
         self.usage.enforce_limits()
     }
@@ -136,6 +150,20 @@ impl RecoveryProofUsage {
     ) -> Result<()> {
         self.record_node_request_cached(value, state, None)
     }
+    pub(crate) fn record_approved_node_request(
+        &mut self,
+        value: &StreamedRecoveryNodeRequest,
+    ) -> Result<()> {
+        self.usage.record_metadata(&value.context)?;
+        self.usage
+            .record_metadata(&value.request.node_certificate)?;
+        self.usage.record_signed(&value.request.claim)?;
+        self.usage
+            .merge(&policy_entry_payload_usage(&JournalEntry::Account(
+                value.request.account_recovery.clone(),
+            ))?);
+        self.usage.enforce_limits()
+    }
     pub fn record_node_request_with_source_proof(
         &mut self,
         value: &StreamedRecoveryNodeRequest,
@@ -190,11 +218,46 @@ impl RecoveryProofUsage {
         state: &VerifiedPolicySet,
         cached: Option<&CachedPolicyProof>,
     ) -> Result<()> {
+        self.record_commit_with_account_approval(value, state, cached, None)
+    }
+    pub(crate) fn record_approved_commit(
+        &mut self,
+        value: &StreamedRecoveryCommitRequest,
+        state: &VerifiedPolicySet,
+        approval: &VerifiedRecoverySourceProposalApproval,
+    ) -> Result<()> {
+        self.record_commit_with_account_approval(
+            value,
+            state,
+            Some(approval.cache_for_current(state)?),
+            Some(approval),
+        )
+    }
+    fn record_commit_with_account_approval(
+        &mut self,
+        value: &StreamedRecoveryCommitRequest,
+        state: &VerifiedPolicySet,
+        cached: Option<&CachedPolicyProof>,
+        approval: Option<&VerifiedRecoverySourceProposalApproval>,
+    ) -> Result<()> {
         self.usage.record_metadata(&serde_json::json!({"context":value.context,"request_hash":value.request_hash,
             "expected_account_head":value.expected_account_head,"expected_space_head":value.expected_space_head,
             "grant_leaf":value.grant_leaf,"new_device_public_key":value.new_device_public_key,"claim_nonce":value.claim_nonce}))?;
         let mut staged = state.clone();
-        for entry in &value.journal_delta {
+        for (index, entry) in value.journal_delta.iter().enumerate() {
+            if let Some(approval) = approval.filter(|_| index == 0) {
+                require(
+                    entry == &JournalEntry::Account(approval.account().clone()),
+                    "approved recovery delta changed its exact account proposal",
+                )?;
+                self.usage.merge(&policy_entry_payload_usage(entry)?);
+                approval::apply_locally_approved_account_recovery(
+                    &mut staged,
+                    approval.account(),
+                    &value.expected_account_head,
+                )?;
+                continue;
+            }
             self.usage
                 .merge(&policy_entry_usage_with_cache(&staged, entry, cached)?);
             apply_policy_entry(&mut staged, &[], entry.clone())?;

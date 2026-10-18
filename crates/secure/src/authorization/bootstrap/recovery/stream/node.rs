@@ -1,12 +1,15 @@
 use super::*;
 use crate::authorization::execution_handoff::ExecutionProofUsage;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct VerifiedStreamedRecoveryCommit {
     authorization: VerifiedClientAuthorization,
     input_hash: ObjectHash,
     committed_heads: Vec<PolicyStamp>,
     proof_usage: RecoveryProofCounts,
+    proof: RecoveryProofUsage,
+    delta: Vec<JournalEntry>,
+    expected_heads: Vec<PolicyStamp>,
 }
 
 impl VerifiedStreamedRecoveryCommit {
@@ -21,6 +24,19 @@ impl VerifiedStreamedRecoveryCommit {
     }
     pub fn proof_usage(&self) -> &RecoveryProofCounts {
         &self.proof_usage
+    }
+    pub fn record_proof_usage_into(&self, usage: &mut RecoveryProofUsage) {
+        usage.merge(&self.proof);
+    }
+    pub fn expected_heads(&self) -> &[PolicyStamp] {
+        &self.expected_heads
+    }
+    pub fn into_store_parts(self) -> (VerifiedPolicySet, Vec<PolicyPin>, Vec<JournalEntry>) {
+        (
+            self.authorization.policy_snapshot,
+            self.authorization.policy_pins,
+            self.delta,
+        )
     }
 }
 
@@ -78,6 +94,7 @@ fn verify_proposal(
     let proposed = &request.account_recovery.payload;
     let root = &proposed.current_root;
     let client = read.new_device_public_key();
+    require_independent_new_recovery_keys(before, root, client)?;
     require(
         BTreeSet::from([
             root.clone(),
@@ -451,7 +468,7 @@ pub fn verify_recovery_stream_commit_in_state(
     before: &VerifiedPolicySet,
     now: u64,
 ) -> Result<VerifiedStreamedRecoveryCommit> {
-    verify_recovery_stream_commit(input, approved, read, before, None, now)
+    verify_recovery_stream_commit(input, approved, read, before, None, None, now)
 }
 
 pub fn verify_recovery_stream_commit_with_source_proof(
@@ -463,7 +480,25 @@ pub fn verify_recovery_stream_commit_with_source_proof(
     now: u64,
 ) -> Result<VerifiedStreamedRecoveryCommit> {
     source.cache_for(read, before)?;
-    verify_recovery_stream_commit(input, approved, read, before, Some(source), now)
+    verify_recovery_stream_commit(input, approved, read, before, Some(source), None, now)
+}
+
+pub fn verify_recovery_stream_commit_with_source_approval(
+    input: &StreamedRecoveryCommitRequest,
+    approved: &StreamedRecoveryNodeRequest,
+    read: &RecoveryReadRequest,
+    before: &VerifiedPolicySet,
+    approval: &VerifiedRecoverySourceProposalApproval,
+    now: u64,
+) -> Result<VerifiedStreamedRecoveryCommit> {
+    approval.validate(
+        read,
+        &approved.context,
+        &ObjectHash::body(approved)?,
+        before,
+        now,
+    )?;
+    verify_recovery_stream_commit(input, approved, read, before, None, Some(approval), now)
 }
 
 fn verify_recovery_stream_commit(
@@ -472,6 +507,7 @@ fn verify_recovery_stream_commit(
     read: &RecoveryReadRequest,
     before: &VerifiedPolicySet,
     source: Option<&VerifiedRecoverySourceProof>,
+    approval: Option<&VerifiedRecoverySourceProposalApproval>,
     now: u64,
 ) -> Result<VerifiedStreamedRecoveryCommit> {
     let _scope = crate::signature_verification::ScopedSignatureVerification::new();
@@ -491,11 +527,34 @@ fn verify_recovery_stream_commit(
             && input.journal_delta.len() <= MAX_PROOF_OBJECTS,
         "recovery commit differs from its exact approved request",
     )?;
-    verify_proposal(approved, read, before, now)?;
+    if let Some(approval) = approval {
+        require(
+            approval.account() == &approved.request.account_recovery,
+            "source approval changed its exact account proposal",
+        )?;
+        read.verify_approved_credentials(before, read.source_node_public_key(), now)?;
+        before.verify_service_device(
+            read.space(),
+            &DeviceId::from_key(read.source_node_public_key()),
+            now,
+        )?;
+        validate_claim(
+            &approved.request.claim,
+            read.source_node_public_key(),
+            read.nonce(),
+            now,
+        )?;
+    } else {
+        verify_proposal(approved, read, before, now)?;
+    }
     verify_delta_shape(input, approved, read, before)?;
     usage.record_request(read)?;
     usage.record_current_source(read, before)?;
-    if let Some(source) = source {
+    if let Some(approval) = approval {
+        approval.record_proof_usage_into(&mut usage)?;
+        usage.record_approved_node_request(approved)?;
+        usage.record_approved_commit(input, before, approval)?;
+    } else if let Some(source) = source {
         source.record_proof_usage_into(&mut usage);
         usage.record_node_request_with_source_proof(approved, before, source)?;
         usage.record_commit_with_source_proof(input, before, source)?;
@@ -504,8 +563,16 @@ fn verify_recovery_stream_commit(
         usage.record_commit(input, before)?;
     }
     let mut after = before.clone();
-    for entry in &input.journal_delta {
-        apply_policy_entry(&mut after, &[], entry.clone())?;
+    for (index, entry) in input.journal_delta.iter().enumerate() {
+        if let Some(approval) = approval.filter(|_| index == 0) {
+            approval::apply_locally_approved_account_recovery(
+                &mut after,
+                approval.account(),
+                &input.expected_account_head,
+            )?;
+        } else {
+            apply_policy_entry(&mut after, &[], entry.clone())?;
+        }
     }
     let root = &approved.request.account_recovery.payload.current_root;
     let account = after
@@ -553,11 +620,17 @@ fn verify_recovery_stream_commit(
     let mut client_usage = ExecutionProofUsage::default();
     client_usage.record_budget(&authorization.budget)?;
     usage.merge_usage(&client_usage);
-    let proof_usage = usage.finish()?;
+    let proof_usage = usage.clone().finish()?;
     Ok(VerifiedStreamedRecoveryCommit {
         authorization,
         input_hash: ObjectHash::body(input)?,
         committed_heads,
         proof_usage,
+        proof: usage,
+        delta: input.journal_delta.clone(),
+        expected_heads: vec![
+            input.expected_account_head.clone(),
+            input.expected_space_head.clone(),
+        ],
     })
 }

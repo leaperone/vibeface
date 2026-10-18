@@ -696,10 +696,16 @@ mod tests {
         stages.push(serde_json::json!({"stage":"prepare","actual":signatures.counts()}));
         let approved: StreamedRecoveryNodeRequest =
             serde_json::from_str(&prepared.node_request_json().unwrap()).unwrap();
+        let prefix_commitment = ObjectHash::body(&(
+            "fixed-native-accepted-prefix",
+            original.bundle.journal.len(),
+            ObjectHash::body(original.bundle.journal.last().unwrap()).unwrap(),
+        ))
+        .unwrap();
         let signatures = SignatureVerification::new();
-        let possession = signatures
+        let (possession, source_approval) = signatures
             .run(|| {
-                sign_recovery_node_possession_in_state(
+                approve_recovery_source_proposal(
                     &approved,
                     &read,
                     &snapshot,
@@ -707,6 +713,7 @@ mod tests {
                     &original.authorization.policy_snapshot,
                     &key(4),
                     read.nonce(),
+                    &prefix_commitment,
                     NOW as u64,
                 )
             })
@@ -736,16 +743,19 @@ mod tests {
         );
         let signatures = SignatureVerification::new();
         let committed = signatures.run(|| {
-            let source = verify_recovery_source_proof_prefix(
+            let source = verify_recovery_source_proposal_approval(
+                &source_approval,
                 &read,
-                &snapshot,
-                &witness,
+                &approved.context,
+                &ObjectHash::body(&approved)?,
+                &approved.request.account_recovery,
+                &possession,
                 &original.authorization.policy_snapshot,
-                &original.bundle.journal,
                 &PublicKey::of(&key(4)),
+                &prefix_commitment,
                 NOW as u64,
             )?;
-            verify_recovery_stream_commit_with_source_proof(
+            verify_recovery_stream_commit_with_source_approval(
                 &commit,
                 &approved,
                 &read,
@@ -779,6 +789,34 @@ mod tests {
             .unwrap();
         assert!(next_material.len() <= MAX_RECOVERY_MATERIAL_BYTES);
         stages.push(serde_json::json!({"stage":"backup","material_bytes":next_material.len(),"actual":signatures.counts()}));
+        let signatures = SignatureVerification::new();
+        let pending = signatures
+            .run(|| {
+                build_account_recovery_pending(
+                    &prepared,
+                    &recovered,
+                    &key(51),
+                    &key(50),
+                    &material,
+                    "https://node.example",
+                    NOW,
+                )
+            })
+            .unwrap();
+        let pending_json = zeroize::Zeroizing::new(pending.pending_material_json().unwrap());
+        let signatures_restore = SignatureVerification::new();
+        let restored = signatures_restore
+            .run(|| restore_account_recovery_pending(&pending_json, EXPIRY + 1.0))
+            .unwrap();
+        assert_eq!(restored.commit_request_json().unwrap(), commit_json);
+        assert_eq!(
+            restored.client_identity().unwrap().public_key_hex(),
+            key(50).public_key_hex()
+        );
+        stages.push(serde_json::json!({"stage":"pending","private_bytes":pending_json.len(),"actual":signatures.counts()}));
+        stages.push(
+            serde_json::json!({"stage":"pending_restore","actual":signatures_restore.counts()}),
+        );
         let max_actual = stages
             .iter()
             .filter_map(|stage| stage["actual"]["actual_verifications"].as_u64())
@@ -804,8 +842,8 @@ mod tests {
             let value = serde_json::json!({"now":NOW,"expiry":EXPIRY,"material":material,
                 "request":request,"snapshot":snapshot,"pages":pages,"witness":witness,
                 "expected":{"scope":original.authorization.scope,"heads":context.policy.heads()},
-                "node_request":approved,"node_possession":possession,"commit":commit,
-                "next_material":next_material,"stages":stages});
+                "node_request":approved,"node_possession":possession,"source_approval":source_approval,"prefix_commitment":prefix_commitment,"commit":commit,
+                "next_material":next_material,"pending":*pending_json,"stages":stages});
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create(true).truncate(true);
             #[cfg(unix)]

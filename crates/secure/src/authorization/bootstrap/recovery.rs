@@ -289,6 +289,29 @@ pub fn build_recovered_account_recovery_material(
     build_account_recovery_material(created, next_root, &recovery, endpoint, now_ms)
 }
 
+fn require_independent_new_recovery_keys(
+    state: &VerifiedPolicySet,
+    root: &PublicKey,
+    client: &PublicKey,
+) -> Result<()> {
+    require(
+        root != client
+            && !state.roots.values().any(|key| key == root || key == client)
+            && !state.devices.values().any(|value| {
+                &value.payload.public_key == root || &value.payload.public_key == client
+            })
+            && !state
+                .accounts
+                .values()
+                .flat_map(|account| &account.history)
+                .any(|value| {
+                    value.payload.recovery.keys.contains(root)
+                        || value.payload.recovery.keys.contains(client)
+                }),
+        "recovery requires independent root and client keys unused by historical policy",
+    )
+}
+
 fn revoke_devices(
     state: &VerifiedPolicySet,
     registered: &[ObjectHash],
@@ -471,6 +494,7 @@ fn prepare_account_recovery_in_state(
     )?;
     let root_key = PublicKey::of(next_root);
     let client_key = PublicKey::of(next_client);
+    require_independent_new_recovery_keys(&state, &root_key, &client_key)?;
     require(
         BTreeSet::from([
             root_key.clone(),
@@ -802,7 +826,12 @@ pub fn finish_account_recovery(
             now_ms,
         )?;
         let mut state = prepared.before_state.clone();
-        let account_head = state.install_account(prepared.request.account_recovery.clone())?;
+        let approved_account = stream::approval::apply_locally_approved_account_recovery(
+            &mut state,
+            &prepared.request.account_recovery,
+            &prepared.request.expected_account_head,
+        )?;
+        let account_head = account_stamp(&prepared.request.account_recovery)?;
         let client_hash = state.install_device(prepared.client_certificate.clone(), now_ms)?;
         let mut node_certificate = prepared.request.node_certificate.clone();
         node_certificate.possession = Some(Signature::parse(node_possession_signature)?);
@@ -917,7 +946,7 @@ pub fn finish_account_recovery(
             authorization.imported_snapshot = Some(
                 context
                     .policy()
-                    .apply_delta(&delta)?
+                    .apply_locally_approved_recovery_delta(&delta, &approved_account)?
                     .with_independent_pins(&pins)?,
             );
         }

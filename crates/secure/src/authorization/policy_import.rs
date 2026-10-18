@@ -545,6 +545,64 @@ impl VerifiedPolicySnapshot {
             .collect::<Result<Vec<_>>>()?;
         import.finish(&heads)
     }
+
+    pub(crate) fn apply_locally_approved_recovery_delta(
+        &self,
+        entries: &[JournalEntry],
+        approval: &crate::authorization::bootstrap::recovery::stream::approval::LocallyApprovedRecoveryAccount,
+    ) -> Result<Self> {
+        require(
+            !entries.is_empty()
+                && entries.len() <= MAX_PROOF_OBJECTS
+                && canonical(&entries)?.len() <= MAX_PROOF_BYTES,
+            "approved recovery delta exceeds proof bounds",
+        )?;
+        let first = &entries[0];
+        require(
+            first == &JournalEntry::Account(approval.account().clone())
+                && self.state.head(&approval.expected_head().domain)
+                    == Some(approval.expected_head()),
+            "approved recovery delta changed its exact account or prefix",
+        )?;
+        let mut import = self.clone().into_import();
+        let hash = entry_hash(first)?;
+        require(
+            !import.entry_index.contains_key(&hash)
+                && import.journal.len() < MAX_POLICY_HISTORY * MAX_POLICY_DOMAINS,
+            "approved recovery duplicated accepted history",
+        )?;
+        allowed(&import.pins, &approval.expected_head().domain)?;
+        witness(&import.state, &import.pins, approval.expected_head())?;
+        approval.apply(&mut import.state)?;
+        account_references(
+            &import.state,
+            &import.pins,
+            &approval.account().payload,
+            None,
+        )?;
+        if let Some(head) = import.state.head(&entry_domain(first)) {
+            if import.required_heads.contains(head) {
+                import.seen_heads.insert(head.clone());
+            }
+        }
+        import.entry_index.insert(hash, import.journal.len());
+        import.journal.push(first.clone());
+        for entry in &entries[1..] {
+            import.apply_entry(entry.clone())?;
+        }
+        let heads = import
+            .pins
+            .iter()
+            .map(|pin| {
+                import
+                    .state
+                    .head(&pin.domain)
+                    .cloned()
+                    .ok_or(AuthorizationError::PolicyConflict)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        import.finish(&heads)
+    }
 }
 
 fn merge_map<K: Ord + Clone, V: PartialEq + Clone>(

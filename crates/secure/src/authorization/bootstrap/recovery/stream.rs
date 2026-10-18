@@ -4,17 +4,25 @@ use super::*;
 use context::RecoveryContextRequest;
 use cross_node::CrossNodeRecoveryRequest;
 
+pub(crate) mod approval;
 pub(crate) mod cross;
 mod import;
 mod node;
+pub mod pending;
 mod proof;
 mod source;
+pub use approval::{
+    VerifiedRecoverySourceProposalApproval, approve_recovery_source_proposal,
+    verify_recovery_source_proposal_approval,
+};
 pub use cross::{
     VerifiedCrossNodeRecoveryInstallation, VerifiedStreamedCrossNodeRecoveryCommit,
     accept_cross_node_recovery_stream_commit, approve_cross_node_recovery_import,
+    approve_cross_node_recovery_source_proposal,
     sign_cross_node_recovery_source_possession_in_state,
     sign_cross_node_recovery_source_possession_with_source_proof,
     verify_cross_node_recovery_stream_commit_in_state,
+    verify_cross_node_recovery_stream_commit_with_source_approval,
     verify_cross_node_recovery_stream_commit_with_source_proof,
     verify_cross_node_recovery_stream_installation,
 };
@@ -24,7 +32,12 @@ pub use import::{
 };
 pub use node::{
     VerifiedStreamedRecoveryCommit, sign_recovery_node_possession_in_state,
-    verify_recovery_stream_commit_in_state, verify_recovery_stream_commit_with_source_proof,
+    verify_recovery_stream_commit_in_state, verify_recovery_stream_commit_with_source_approval,
+    verify_recovery_stream_commit_with_source_proof,
+};
+pub use pending::{
+    ConfirmedAccountRecovery, PendingAccountRecovery, build_account_recovery_pending,
+    restore_account_recovery_pending,
 };
 pub use proof::{RecoveryProofCounts, RecoveryProofUsage, validate_recovery_context_page_carrier};
 pub use source::{VerifiedRecoverySourceProof, verify_recovery_source_proof_prefix};
@@ -50,6 +63,101 @@ pub enum RecoveryReadRequest {
 }
 
 impl RecoveryReadRequest {
+    pub(crate) fn verify_approved_credentials(
+        &self,
+        state: &VerifiedPolicySet,
+        local_source: &PublicKey,
+        now: u64,
+    ) -> Result<()> {
+        self.validate_saved_pins()?;
+        let account = state
+            .account(self.account())
+            .ok_or(AuthorizationError::Revoked)?;
+        let space = state
+            .space(self.space())
+            .ok_or(AuthorizationError::Revoked)?;
+        require(
+            self.source_node_public_key() == local_source
+                && account.authority.public_key == *local_source
+                && space.authority.public_key == *local_source
+                && space.root
+                    == (SpaceRoot::Personal {
+                        owner: self.account().clone(),
+                        genesis_root: account.genesis_root.clone(),
+                    })
+                && account.recovery.threshold == 1
+                && self.saved_pins().iter().all(|pin| {
+                    pin.genesis_root == account.genesis_root
+                        && pin
+                            .minimum_head
+                            .as_ref()
+                            .is_some_and(|head| state.roots.contains_key(head))
+                }),
+            "approved recovery no longer has its original current source or saved trust",
+        )?;
+        state.ensure_personal_current(space)?;
+        validate_window(self.issued_at_ms(), self.expires_at_ms(), now)?;
+        require(
+            self.expires_at_ms() - self.issued_at_ms() <= NODE_CLAIM_MAX_AGE_MS,
+            "approved recovery validity is too long",
+        )?;
+        match self {
+            Self::Account(value) => {
+                require(
+                    value.payload.version == AUTH_VERSION
+                        && account.recovery.keys == [value.issuer.clone()]
+                        && value.payload.new_device_public_key != value.issuer
+                        && value.payload.new_device_public_key != *local_source
+                        && value.payload.new_device_public_key != account.current_root,
+                    "approved recovery credentials changed",
+                )?;
+                value.verify_signature()
+            }
+            Self::CrossNode(value) => {
+                let request = &value.payload;
+                require(
+                    request.version == AUTH_VERSION
+                        && account.recovery.keys == [value.issuer.clone()]
+                        && request.target_claim.payload.node_public_key != *local_source
+                        && request.expires_at_ms <= request.target_claim.payload.expires_at_ms
+                        && request.source_read_expires_at_ms > request.expires_at_ms
+                        && BTreeSet::from([
+                            request.new_root_public_key.clone(),
+                            request.new_device_public_key.clone(),
+                            request.target_claim.payload.node_public_key.clone(),
+                            local_source.clone(),
+                            value.issuer.clone(),
+                        ])
+                        .len()
+                            == 5
+                        && !request.source_read_resources.is_empty()
+                        && request.source_read_resources.len() <= MAX_PROOF_OBJECTS
+                        && request
+                            .source_read_resources
+                            .windows(2)
+                            .all(|pair| pair[0].resource < pair[1].resource)
+                        && request.source_read_resources.iter().all(|resource| {
+                            resource.space == request.space
+                                && state
+                                    .resource(&resource.space, &resource.resource)
+                                    .is_some_and(|record| {
+                                        record.payload.kind == ResourceKind::Project
+                                            && record.payload.host
+                                                == ServiceId::from_key(local_source)
+                                    })
+                        }),
+                    "approved cross-node recovery credentials or exact source selection changed",
+                )?;
+                validate_claim(
+                    &request.target_claim,
+                    &request.target_claim.payload.node_public_key,
+                    &request.target_claim.payload.claim_nonce,
+                    now,
+                )?;
+                value.verify_signature()
+            }
+        }
+    }
     pub fn kind(&self) -> RecoveryContextKind {
         match self {
             Self::Account(_) => RecoveryContextKind::Account,
@@ -289,6 +397,29 @@ impl SignedObject for RecoveryCompletionReceipt {
 pub struct RecoveryCompletionStatusRequest {
     pub context: RecoveryContextReference,
     pub input_hash: ObjectHash,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoverySourceProposalApproval {
+    pub version: u16,
+    pub kind: RecoveryContextKind,
+    pub context: RecoveryContextReference,
+    pub request_hash: ObjectHash,
+    pub proposal_hash: ObjectHash,
+    pub account_recovery_hash: ObjectHash,
+    pub source_node_possession_hash: ObjectHash,
+    pub source_node_public_key: PublicKey,
+    pub new_device_public_key: PublicKey,
+    pub expected_heads: Vec<PolicyStamp>,
+    pub saved_pins_hash: ObjectHash,
+    pub accepted_prefix_commitment: ObjectHash,
+    pub approved_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+impl sealed::Sealed for RecoverySourceProposalApproval {}
+impl SignedObject for RecoverySourceProposalApproval {
+    const DOMAIN: &'static str = "recovery-source-proposal-approval-v2";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

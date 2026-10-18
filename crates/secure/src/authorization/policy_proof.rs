@@ -4,9 +4,41 @@ use super::{execution_handoff::ExecutionProofUsage, *};
 pub(crate) struct CachedPolicyProof {
     known: BTreeMap<ObjectHash, Vec<u8>>,
     accepted: BTreeMap<ObjectHash, Vec<u8>>,
+    approved_state: Option<VerifiedPolicySet>,
 }
 
 impl CachedPolicyProof {
+    pub(crate) fn from_locally_approved_state(state: &VerifiedPolicySet) -> Self {
+        Self {
+            known: BTreeMap::new(),
+            accepted: BTreeMap::new(),
+            approved_state: Some(state.clone()),
+        }
+    }
+
+    fn approved_object<T: SignedObject>(&self, value: &Signed<T>) -> Result<Option<Vec<u8>>> {
+        let Some(state) = &self.approved_state else {
+            return Ok(None);
+        };
+        let hash = value.hash()?;
+        let candidate = match T::DOMAIN {
+            DeviceCertificate::DOMAIN => state.devices.get(&hash).map(canonical).transpose()?,
+            ResourceRecord::DOMAIN => state.resources.get(&hash).map(canonical).transpose()?,
+            AuthenticatorRecord::DOMAIN => {
+                state.authenticators.get(&hash).map(canonical).transpose()?
+            }
+            Membership::DOMAIN => state.memberships.get(&hash).map(canonical).transpose()?,
+            Grant::DOMAIN => state.grants.get(&hash).map(canonical).transpose()?,
+            _ => None,
+        };
+        if let Some(bytes) = &candidate {
+            require(
+                bytes == &canonical(value)?,
+                "source-approved metadata changed a same-hash verified object",
+            )?;
+        }
+        Ok(candidate)
+    }
     pub(crate) fn require_signed<T: SignedObject>(&self, value: &Signed<T>) -> Result<()> {
         let hash = value.hash()?;
         let bytes = canonical(value)?;
@@ -97,7 +129,11 @@ impl CachedPolicyProof {
                 _ => unreachable!(),
             }
         }
-        Ok(Self { known, accepted })
+        Ok(Self {
+            known,
+            accepted,
+            approved_state: None,
+        })
     }
 
     fn record<T: SignedObject>(
@@ -105,6 +141,9 @@ impl CachedPolicyProof {
         usage: &mut ExecutionProofUsage,
         value: &Signed<T>,
     ) -> Result<()> {
+        if self.approved_object(value)?.is_some() {
+            return usage.record_verified_object(value);
+        }
         let hash = value.hash()?;
         if let Some(known) = self.known.get(&hash) {
             let bytes = canonical(value)?;
