@@ -12,6 +12,308 @@ use crate::signature_verification::ScopedSignatureVerification;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct NodeExecutionPolicyReadIntent {
+    pub version: u16,
+    pub source_project: ResourceRef,
+    pub selection: RemoteExecutionPolicySelection,
+    pub context: prepare::PrepareContext,
+    pub expected_action: Action,
+    pub purpose: RemoteExecutionPolicyPurpose,
+    pub execution_pins: Vec<PolicyPin>,
+    pub nonce: Nonce,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+impl sealed::Sealed for NodeExecutionPolicyReadIntent {}
+impl SignedObject for NodeExecutionPolicyReadIntent {
+    const DOMAIN: &'static str = "node-execution-policy-read-v2";
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeExecutionHistoryPolicyReadIntent {
+    pub version: u16,
+    pub source_project: ResourceRef,
+    pub expected_action: Action,
+    pub reference: remote_execution_history::RemoteExecutionHistoryReference,
+    pub execution_pins: Vec<PolicyPin>,
+    pub nonce: Nonce,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+impl sealed::Sealed for NodeExecutionHistoryPolicyReadIntent {}
+impl SignedObject for NodeExecutionHistoryPolicyReadIntent {
+    const DOMAIN: &'static str = "node-execution-history-policy-read-v2";
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "intent", rename_all = "snake_case")]
+pub enum NodeExecutionPolicyReadRequest {
+    Current(Signed<NodeExecutionPolicyReadIntent>),
+    History(Signed<NodeExecutionHistoryPolicyReadIntent>),
+}
+
+impl NodeExecutionPolicyReadRequest {
+    pub fn issuer(&self) -> &PublicKey {
+        match self {
+            Self::Current(value) => &value.issuer,
+            Self::History(value) => &value.issuer,
+        }
+    }
+    pub fn source_project(&self) -> &ResourceRef {
+        match self {
+            Self::Current(value) => &value.payload.source_project,
+            Self::History(value) => &value.payload.source_project,
+        }
+    }
+    pub fn selection(&self) -> Result<RemoteExecutionPolicySelection> {
+        Ok(match self {
+            Self::Current(value) => value.payload.selection.clone(),
+            Self::History(value) => RemoteExecutionPolicySelection {
+                execution_resource: value
+                    .payload
+                    .reference
+                    .old_submission
+                    .payload
+                    .resource
+                    .clone(),
+                target_public_key: value.payload.reference.target_public_key.clone(),
+                execution_grant: value
+                    .payload
+                    .reference
+                    .old_submission
+                    .payload
+                    .grant_leaf
+                    .clone(),
+            },
+        })
+    }
+    pub fn context(&self) -> Result<prepare::PrepareContext> {
+        match self {
+            Self::Current(value) => Ok(value.payload.context.clone()),
+            Self::History(value) => value.payload.reference.context(),
+        }
+    }
+    pub fn purpose(&self) -> RemoteExecutionPolicyPurpose {
+        match self {
+            Self::Current(value) => value.payload.purpose,
+            Self::History(_) => RemoteExecutionPolicyPurpose::History,
+        }
+    }
+    pub fn expected_action(&self) -> Action {
+        match self {
+            Self::Current(value) => value.payload.expected_action,
+            Self::History(value) => value.payload.expected_action,
+        }
+    }
+    pub fn execution_pins(&self) -> &[PolicyPin] {
+        match self {
+            Self::Current(value) => &value.payload.execution_pins,
+            Self::History(value) => &value.payload.execution_pins,
+        }
+    }
+    pub fn issued_at_ms(&self) -> u64 {
+        match self {
+            Self::Current(value) => value.payload.issued_at_ms,
+            Self::History(value) => value.payload.issued_at_ms,
+        }
+    }
+    pub fn expires_at_ms(&self) -> u64 {
+        match self {
+            Self::Current(value) => value.payload.expires_at_ms,
+            Self::History(value) => value.payload.expires_at_ms,
+        }
+    }
+    pub fn history(&self) -> Option<&remote_execution_history::RemoteExecutionHistoryReference> {
+        match self {
+            Self::Current(_) => None,
+            Self::History(value) => Some(&value.payload.reference),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ActualPolicyNoisePeer {
+    public_key: PublicKey,
+}
+impl ActualPolicyNoisePeer {
+    pub fn from_finished_handshake(handshake: &crate::Handshake) -> Result<Self> {
+        require(
+            handshake.is_finished(),
+            "policy peer requires a completed Noise handshake",
+        )?;
+        let key = handshake
+            .remote_public_key()
+            .ok_or(AuthorizationError::InvalidProof(
+                "policy peer has no actual Noise identity",
+            ))?;
+        Ok(Self {
+            public_key: PublicKey::parse(&key)?,
+        })
+    }
+    pub fn public_key(&self) -> &PublicKey {
+        &self.public_key
+    }
+}
+
+#[derive(Clone)]
+pub enum PolicyCarrierOrigin {
+    SignedTranscript,
+    DirectNoise(ActualPolicyNoisePeer),
+}
+
+pub struct VerifiedNodeExecutionPolicyRead {
+    request: NodeExecutionPolicyReadRequest,
+    heads: Vec<PolicyStamp>,
+    allowed_hashes: BTreeSet<ObjectHash>,
+    usage: ExecutionProofUsage,
+}
+impl VerifiedNodeExecutionPolicyRead {
+    pub fn request(&self) -> &NodeExecutionPolicyReadRequest {
+        &self.request
+    }
+    pub fn target_heads(&self) -> &[PolicyStamp] {
+        &self.heads
+    }
+    pub fn domains(&self) -> Vec<PolicyDomain> {
+        self.heads.iter().map(|head| head.domain.clone()).collect()
+    }
+    pub fn allows_hash(&self, hash: &ObjectHash) -> bool {
+        self.allowed_hashes.contains(hash)
+    }
+    pub fn allows_entry(&self, entry: &JournalEntry) -> Result<bool> {
+        Ok(self.allows_hash(&policy_import::entry_hash(entry)?))
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
+    pub fn expires_at_ms(&self) -> u64 {
+        self.request.expires_at_ms()
+    }
+    pub fn request_hash(&self) -> Result<ObjectHash> {
+        ObjectHash::body(&self.request)
+    }
+}
+
+fn read_window(issued: u64, expires: u64, now: u64) -> Result<()> {
+    require(
+        issued <= now && now < expires,
+        "node policy read is outside its signed window",
+    )?;
+    require(
+        expires
+            .checked_sub(issued)
+            .is_some_and(|age| age <= INVOCATION_MAX_AGE_MS),
+        "node policy read exceeds its time limit",
+    )
+}
+
+/// The caller supplies the real Noise key, without creating a business Peer capability.
+pub fn verify_node_execution_policy_read(
+    state: &VerifiedPolicySet,
+    request: &NodeExecutionPolicyReadRequest,
+    local_c: &PublicKey,
+    actual_noise_b: &PublicKey,
+    history_acceptance: Option<&remote_execution_history::RemoteExecutionHistoryAcceptance>,
+    now: u64,
+) -> Result<VerifiedNodeExecutionPolicyRead> {
+    let signatures = ScopedSignatureVerification::new();
+    require(
+        canonical(request)?.len() <= MAX_PROOF_BYTES,
+        "node policy read carrier exceeds 64 KiB",
+    )?;
+    require(
+        request.issuer() == actual_noise_b,
+        "node policy reader differs from its actual Noise key",
+    )?;
+    read_window(request.issued_at_ms(), request.expires_at_ms(), now)?;
+    validate_pins(request.execution_pins())?;
+    let (heads, allowed_hashes, mut usage) = match request {
+        NodeExecutionPolicyReadRequest::Current(intent) => {
+            intent.verify_signature()?;
+            let value = &intent.payload;
+            require(
+                value.version == AUTH_VERSION
+                    && value.purpose != RemoteExecutionPolicyPurpose::History
+                    && history_acceptance.is_none()
+                    && value.context.context.workspace_resource.as_ref()
+                        == Some(&value.source_project.resource)
+                    && value.context.context.sdk_session.is_none()
+                    && value.context.context.task.is_some()
+                    && value.context.context.conversation.is_some()
+                    && value.context.context.executor_kind.is_some()
+                    && value
+                        .context
+                        .binding_generation
+                        .is_some_and(|generation| generation > 0),
+                "node policy read changed its Task, purpose or source Project",
+            )?;
+            let closure = remote_execution_policy::verify_execution_policy_closure(
+                state,
+                &value.selection,
+                actual_noise_b,
+                &value.context,
+                value.expected_action,
+                value.purpose,
+                &value.execution_pins,
+                local_c,
+                now,
+            )?;
+            let mut usage = closure.usage;
+            usage.record_signed(intent)?;
+            (closure.heads, closure.allowed_hashes, usage)
+        }
+        NodeExecutionPolicyReadRequest::History(intent) => {
+            intent.verify_signature()?;
+            let value = &intent.payload;
+            let reference = &value.reference;
+            require(
+                value.version == AUTH_VERSION
+                    && matches!(
+                        value.expected_action,
+                        Action::OperationStatusRead
+                            | Action::OperationResolve
+                            | Action::OperationReconcile
+                    )
+                    && reference.source.issuer == *actual_noise_b
+                    && reference.old_submission.issuer == *actual_noise_b
+                    && reference.source.payload.project == value.source_project
+                    && reference.target_public_key == *local_c,
+                "node history read changed its original source or accepted artifact",
+            )?;
+            let acceptance = history_acceptance.ok_or(AuthorizationError::InvalidProof(
+                "node history read has no original C acceptance",
+            ))?;
+            let checked = remote_execution_history::verify_remote_execution_history_policy(
+                state,
+                reference,
+                acceptance,
+                &value.execution_pins,
+                local_c,
+                now,
+            )?;
+            let mut usage = checked.proof_usage().clone();
+            usage.record_signed(intent)?;
+            (
+                checked.target_heads().to_vec(),
+                checked.allowed_hashes().clone(),
+                usage,
+            )
+        }
+    };
+    usage.record_metadata(request)?;
+    usage.record_actual_signature_counts(signatures.counts());
+    usage.enforce_limits()?;
+    Ok(VerifiedNodeExecutionPolicyRead {
+        request: request.clone(),
+        heads,
+        allowed_hashes,
+        usage,
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TaskExecutionTrustApproval {
     pub version: u16,
     pub original_intent_hash: ObjectHash,
@@ -237,6 +539,123 @@ mod tests {
     };
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn node_policy_read_uses_c_grant_and_real_noise_without_business_peer() {
+        let fixture = retained_history_fixture();
+        let now = 10_020;
+        let source = PublicKey::of(&fixture.project_node);
+        let target = PublicKey::of(&fixture.executor);
+        let project = fixture
+            .actual
+            .handoff
+            .handoff
+            .source_statement()
+            .unwrap()
+            .project;
+        let leaf = fixture
+            .state
+            .grants
+            .values()
+            .find(|grant| {
+                grant.payload.grantee
+                    == Grantee::Actor(Actor::Service(ServiceId::from_key(&source)))
+                    && grant.payload.actions.contains(&Action::ExecutionOpen)
+                    && fixture
+                        .state
+                        .space(&grant.payload.owner_space)
+                        .is_some_and(|space| space.grants.contains(&grant.hash().unwrap()))
+            })
+            .unwrap();
+        let ResourceScope::Exact(resource) = &leaf.payload.scope else {
+            panic!("fixture grant is not exact")
+        };
+        let mut context = leaf.payload.constraints.context.clone();
+        context.workspace_resource = Some(project.resource.clone());
+        let value = NodeExecutionPolicyReadIntent {
+            version: AUTH_VERSION,
+            source_project: project,
+            selection: RemoteExecutionPolicySelection {
+                execution_resource: resource.clone(),
+                target_public_key: target.clone(),
+                execution_grant: leaf.hash().unwrap(),
+            },
+            context: prepare::PrepareContext {
+                context,
+                binding_generation: Some(1),
+                canonical_cwd: None,
+                execution_target_public_key: Some(target.clone()),
+            },
+            expected_action: Action::ExecutionOpen,
+            purpose: RemoteExecutionPolicyPurpose::Execution,
+            execution_pins: fixture.pins.clone(),
+            nonce: Nonce::random().unwrap(),
+            issued_at_ms: now,
+            expires_at_ms: now + 1_000,
+        };
+        let request = NodeExecutionPolicyReadRequest::Current(
+            Signed::sign(value.clone(), &fixture.project_node).unwrap(),
+        );
+        let read = verify_node_execution_policy_read(
+            &fixture.state,
+            &request,
+            &target,
+            &source,
+            None,
+            now,
+        )
+        .unwrap();
+        assert!(!read.target_heads().is_empty());
+        assert!(
+            read.allows_entry(&JournalEntry::Grant(leaf.clone()))
+                .unwrap()
+        );
+        assert_eq!(
+            read.request_hash().unwrap(),
+            ObjectHash::body(&request).unwrap()
+        );
+        assert!(
+            verify_node_execution_policy_read(
+                &fixture.state,
+                &request,
+                &target,
+                &PublicKey::of(&fixture.client),
+                None,
+                now
+            )
+            .is_err()
+        );
+        let stolen = NodeExecutionPolicyReadRequest::Current(
+            Signed::sign(value.clone(), &fixture.client).unwrap(),
+        );
+        assert!(
+            verify_node_execution_policy_read(
+                &fixture.state,
+                &stolen,
+                &target,
+                &PublicKey::of(&fixture.client),
+                None,
+                now
+            )
+            .is_err()
+        );
+        let mut wrong_task = value;
+        wrong_task.context.context.task = Some(EventRef::parse(&"ad".repeat(32)).unwrap());
+        let changed = NodeExecutionPolicyReadRequest::Current(
+            Signed::sign(wrong_task, &fixture.project_node).unwrap(),
+        );
+        assert!(
+            verify_node_execution_policy_read(
+                &fixture.state,
+                &changed,
+                &target,
+                &source,
+                None,
+                now
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn task_trust_uses_real_source_and_retains_immutable_selection() {
