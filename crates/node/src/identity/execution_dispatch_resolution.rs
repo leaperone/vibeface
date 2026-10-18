@@ -8,6 +8,7 @@ use super::{
     execution_handoff::resolution_resolver_from,
     journal::PolicyState,
     policy::FreshnessProof,
+    task_execution_context::TaskScopedAuthorization,
 };
 use crate::{
     crypto::LocalIdentity,
@@ -24,7 +25,7 @@ use vibeface_secure::{
     Identity,
     authorization::{
         AUTH_VERSION, Action, Actor, DeviceId, Invocation, Nonce, ObjectHash, PublicKey, Signed,
-        TransportEvidence, VerifiedAuthorization,
+        TransportEvidence,
         execution_handoff::{
             ExecutionHandoffResolution, ExecutionHandoffResolutionResult, ExecutionHandoffResult,
             ExecutionHandoffTerminalReconciliationResult, ExecutionResolutionPurpose,
@@ -309,11 +310,11 @@ impl Store {
         Ok(pending_from(&self.connection, space, authorization)?.map(|saved| saved.wire))
     }
 
-    pub fn prepare_execution_dispatch_resolution(
+    pub(crate) fn prepare_execution_dispatch_resolution(
         &mut self,
         identity: &LocalIdentity,
         dispatch: &VerifiedDispatchFacts,
-        auth: &VerifiedAuthorization,
+        scoped: &TaskScopedAuthorization,
         proof: &FreshnessProof,
         transport: &TransportEvidence,
         body: &Value,
@@ -321,6 +322,7 @@ impl Store {
     ) -> Result<(SignedExecutionHandoffResolution, bool)> {
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let auth = scoped.authorization();
         ensure!(
             auth.action() == Action::OperationResolve
                 && matches!(auth.actor(), Actor::Account(_))
@@ -391,9 +393,9 @@ impl Store {
         );
         validate_operation_binding_from(&tx, &stored.request)?;
         check_operation_reservations_in(&tx, &stored)?;
-        dispatch.revalidate(&tx, &current, body, auth.audience(), now_ms)?;
+        dispatch.revalidate(&tx, &current, scoped, body, auth.audience(), now_ms)?;
         let admitted = consume_execution_dispatch_in(
-            &tx, &current, auth, proof, transport, body, None, now_ms, dispatch,
+            &tx, &current, scoped, proof, transport, body, None, now_ms, dispatch,
         )?;
         let resolution = ExecutionHandoffResolution {
             version: AUTH_VERSION,
@@ -403,14 +405,13 @@ impl Store {
         };
         let facts = execution_resolution_facts(&resolution, auth)?;
         let destination = dispatch.destination();
-        let grant = current
-            .verified()
+        let grant = scoped.state(current.verified())
             .grant(destination.grant_leaf())
             .context("executor resolution grant disappeared")?;
         let expires_at_ms = now_ms
             .checked_add(vibeface_secure::authorization::INVOCATION_MAX_AGE_MS)
             .context("resolution deadline overflow")?
-            .min(auth.expires_at_ms())
+            .min(scoped.expires_at_ms())
             .min(grant.payload.expires_at_ms);
         let invocation = Signed::sign(
             Invocation {
@@ -438,7 +439,7 @@ impl Store {
             resolution,
             invocation,
         };
-        current.verified().verify_execution_resolution(
+        scoped.state(current.verified()).verify_execution_resolution(
             &wire,
             auth,
             &TransportEvidence::VerifiedPeer {
@@ -458,6 +459,7 @@ impl Store {
                 })?
             ],
         )?;
+        scoped.bind_in(&tx, body, None, wire.resolution.account_admission.admitted_at_ms)?;
         tx.commit()?;
         self.policy = current;
         Ok((wire, true))
@@ -546,7 +548,7 @@ impl Store {
                 .verified()
                 .verify_operation_authorization(&admitted, &facts, &transport, now_ms)?
         } else {
-            resolution_resolver_from(&current, current.verified(), wire, now_ms)?
+            resolution_resolver_from(&tx, &current, current.verified(), wire, now_ms)?
         };
         let verified = match result {
             ResolutionResult::Unknown(result) => {

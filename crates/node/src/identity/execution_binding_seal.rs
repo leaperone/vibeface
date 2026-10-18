@@ -269,13 +269,14 @@ impl Store {
         &mut self,
         identity: &LocalIdentity,
         dispatch: &super::execution_dispatch::VerifiedDispatchFacts,
-        auth: &VerifiedAuthorization,
+        scoped: &super::task_execution_context::TaskScopedAuthorization,
         proof: &FreshnessProof,
         transport: &TransportEvidence,
         body: &Value,
         now: u64,
     ) -> Result<crate::binding::SignedBinding> {
         let _scope = vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let auth = scoped.authorization();
         ensure!(
             body["method"] == "rebind_execution"
                 && auth.action() == Action::ExecutionRebind
@@ -353,11 +354,10 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = PolicyState::reload_verified(&tx, &self.policy)?;
-        let facts = dispatch.revalidate(&tx, &current, body, auth.audience(), now)?;
-        current
-            .verified()
-            .verify_invocation(auth.signed_invocation(), &facts, transport, now)?;
-        check_policy_heads_in(&tx, current.verified(), auth, now)?;
+        let facts = dispatch.revalidate(&tx, &current, scoped, body, auth.audience(), now)?;
+        super::policy::authorize_invocation_for_body(
+            scoped.state(current.verified()), auth.signed_invocation(), &facts, transport, body, now,
+        )?;
         let saved: String = tx.query_row(
             "SELECT value FROM local_values WHERE space_id=? AND key=?",
             params![
@@ -413,8 +413,8 @@ impl Store {
             serde_json::from_str::<String>(&pointer)? == old_hash,
             "task binding changed before rebind"
         );
-        super::admission::consume_execution_dispatch_in(
-            &tx, &current, auth, proof, transport, body, None, now, dispatch,
+        let admitted = super::admission::consume_execution_dispatch_in(
+            &tx, &current, scoped, proof, transport, body, None, now, dispatch,
         )?;
         tx.execute(
             "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
@@ -436,6 +436,7 @@ impl Store {
             )? == 1,
             "task binding changed during rebind"
         );
+        scoped.bind_in(&tx, body, Some(&signed), admitted.admitted_at_ms)?;
         tx.commit()?;
         self.policy = current;
         Ok(signed)

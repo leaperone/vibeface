@@ -2,6 +2,7 @@ use super::{
     admission::{check_policy_heads_in, consume_execution_dispatch_in, validate_basis_in},
     journal::PolicyState,
     policy::{FreshnessProof, request_execution_dispatch_facts_from},
+    task_execution_context::TaskScopedAuthorization,
 };
 use crate::{
     binding::{SignedBinding, TaskBinding},
@@ -37,18 +38,24 @@ impl VerifiedDispatchFacts {
         &self,
         connection: &Connection,
         policy: &PolicyState,
+        scoped: &TaskScopedAuthorization,
         body: &Value,
         audience: &Audience,
         now_ms: u64,
     ) -> Result<RequestFacts> {
-        let current = dispatch_facts_from(connection, policy.verified(), body, audience, now_ms)?;
+        let current = dispatch_facts_from(
+            connection, scoped.state(policy.verified()), body, audience, now_ms,
+        )?;
         ensure!(
             current.facts == self.facts
                 && current.destination.grant_leaf() == self.destination.grant_leaf()
                 && current.destination.heads() == self.destination.heads(),
             "execution destination changed before admission"
         );
-        check_destination_heads_in(connection, current.destination.heads())?;
+        scoped.check_current_in(connection, policy.verified(), &current.facts, now_ms)?;
+        if scoped.task_policy().is_none() {
+            check_destination_heads_in(connection, current.destination.heads())?;
+        }
         Ok(current.facts)
     }
 }
@@ -649,16 +656,31 @@ impl Store {
         )
     }
 
-    pub fn bind_execution_dispatch(
+    pub(crate) fn execution_dispatch_facts_in_scope(
+        &self,
+        scoped: &TaskScopedAuthorization,
+        body: &Value,
+        audience: &Audience,
+        now_ms: u64,
+    ) -> Result<VerifiedDispatchFacts> {
+        let dispatch = dispatch_facts_from(
+            &self.connection, scoped.state(self.policy.verified()), body, audience, now_ms,
+        )?;
+        scoped.check_current_in(&self.connection, self.policy.verified(), dispatch.facts(), now_ms)?;
+        Ok(dispatch)
+    }
+
+    pub(crate) fn bind_execution_dispatch(
         &mut self,
         identity: &LocalIdentity,
         dispatch: &VerifiedDispatchFacts,
-        auth: &VerifiedAuthorization,
+        scoped: &TaskScopedAuthorization,
         proof: &FreshnessProof,
         transport: &TransportEvidence,
         body: &Value,
         now_ms: u64,
     ) -> Result<SignedBinding> {
+        let auth = scoped.authorization();
         ensure!(
             auth.action() == Action::ExecutionOpen && body["method"] == "bind_execution",
             "remote binding requires execution-open authorization"
@@ -695,19 +717,19 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        dispatch.revalidate(&tx, &self.policy, body, auth.audience(), now_ms)?;
-        check_policy_heads_in(&tx, self.policy.verified(), auth, now_ms)?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        dispatch.revalidate(&tx, &current, scoped, body, auth.audience(), now_ms)?;
         let current_key = format!("task-binding-current:{}", binding.task_ref);
-        let current: Option<String> = tx
+        let current_binding: Option<String> = tx
             .query_row(
                 "SELECT value FROM local_values WHERE space_id=? AND key=?",
                 params![space, current_key],
                 |row| row.get(0),
             )
             .optional()?;
-        if let Some(current) = current {
+        if let Some(current_binding) = current_binding {
             ensure!(
-                serde_json::from_str::<String>(&current)? == hash,
+                serde_json::from_str::<String>(&current_binding)? == hash,
                 "task is already bound; changing it requires execution-rebind authorization"
             );
             let (invocation, source): (String,String) = tx.query_row(
@@ -719,19 +741,20 @@ impl Store {
                     && serde_json::from_str::<Value>(&source)? == *body,
                 "binding retry differs from its original authorization"
             );
-            self.policy.verified().verify_freshness(
+            scoped.state(current.verified()).verify_freshness(
                 auth,
                 &proof.challenge,
                 &proof.receipts,
                 now_ms,
             )?;
             tx.commit()?;
+            self.policy = current;
             return Ok(signed);
         }
-        consume_execution_dispatch_in(
+        let admitted = consume_execution_dispatch_in(
             &tx,
-            &self.policy,
-            auth,
+            &current,
+            scoped,
             proof,
             transport,
             body,
@@ -751,7 +774,9 @@ impl Store {
             "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
             params![space, current_key, serde_json::to_string(&hash)?],
         )?;
+        scoped.bind_in(&tx, body, Some(&signed), admitted.admitted_at_ms)?;
         tx.commit()?;
+        self.policy = current;
         Ok(signed)
     }
 }
@@ -798,17 +823,18 @@ fn check_remote_session(
 }
 
 impl Store {
-    pub fn accept_execution_dispatch(
+    pub(crate) fn accept_execution_dispatch(
         &mut self,
         identity: &LocalIdentity,
         dispatch: &VerifiedDispatchFacts,
-        auth: &VerifiedAuthorization,
+        scoped: &TaskScopedAuthorization,
         proof: &FreshnessProof,
         transport: &TransportEvidence,
         body: &Value,
         request: &OperationRequest,
         now_ms: u64,
     ) -> Result<OperationRecord> {
+        let auth = scoped.authorization();
         ensure!(
             body["method"] == "operate"
                 && body["request"] == serde_json::to_value(request)?
@@ -876,17 +902,16 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let facts = dispatch.revalidate(&tx, &self.policy, body, auth.audience(), now_ms)?;
-        super::policy::authorize_invocation_for_body(self.policy.verified(),
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        let facts = dispatch.revalidate(&tx, &current, scoped, body, auth.audience(), now_ms)?;
+        super::policy::authorize_invocation_for_body(scoped.state(current.verified()),
             auth.signed_invocation(),
             &facts,
             transport,
             body,
             now_ms,
         )?;
-        check_policy_heads_in(&tx, self.policy.verified(), auth, now_ms)?;
-        self.policy
-            .verified()
+        scoped.state(current.verified())
             .verify_freshness(auth, &proof.challenge, &proof.receipts, now_ms)?;
         let previous: Option<(String,String,String,String,String)> = tx.query_row(
             "SELECT o.request,o.state,o.result,a.signed_invocation,a.source_body FROM operations o JOIN accepted_authorizations a ON a.space_id=o.space_id AND a.operation_id=o.operation_id WHERE o.space_id=? AND o.operation_id=?",
@@ -901,6 +926,7 @@ impl Store {
                 "operation ID reused with a different request"
             );
             tx.commit()?;
+            self.policy = current;
             return Ok(OperationRecord {
                 request: request.clone(),
                 state: serde_json::from_str(&state)?,
@@ -933,8 +959,8 @@ impl Store {
         crate::store::check_execution_resources_in(&tx, &request.target_node, &resources)?;
         let admission = consume_execution_dispatch_in(
             &tx,
-            &self.policy,
-            auth,
+            &current,
+            scoped,
             proof,
             transport,
             body,
@@ -948,13 +974,15 @@ impl Store {
             tx.execute("INSERT INTO resource_reservations(space_id,operation_id,target_node,resource) VALUES(?,?,?,?)",
                 params![request.network_id,request.operation_id,request.target_node,resource])?;
         }
+        scoped.bind_in(&tx, body, None, admission.admitted_at_ms)?;
         super::event_authorization::append_admitted_dispatch_in(
-            &tx, &self.policy, identity, &admission, request, now_ms,
+            &tx, &current, identity, &admission, request, now_ms,
         )?;
         let checkpoint = super::admission::prepare_local_admission_checkpoint_in(
-            &tx, &self.policy, &admission,
+            &tx, &current, &admission,
         )?;
         tx.commit()?;
+        self.policy = current;
         self.policy.local_admissions.insert(checkpoint);
         Ok(OperationRecord {
             request: request.clone(),
@@ -967,10 +995,11 @@ impl Store {
 fn dispatch_authorization_from(
     connection: &Connection,
     policy: &PolicyState,
+    identity: &LocalIdentity,
     space: &str,
     operation: &str,
     now_ms: u64,
-) -> Result<(crate::model::SignedEvent, VerifiedAuthorization)> {
+) -> Result<(crate::model::SignedEvent, TaskScopedAuthorization)> {
     let source = super::event_authorization::retained_operation_dispatch_in(
         connection, policy, space, operation,
     )?
@@ -986,14 +1015,35 @@ fn dispatch_authorization_from(
     let retained = events
         .get(&source.hash)
         .context("operation has no ready admitted dispatch")?;
-    let auth = super::event_authorization::current_event_authorization(
+    let crate::model::EventCause::Invocation { admission } = &retained.event.cause else {
+        anyhow::bail!("dispatch has no original admitted invocation");
+    };
+    let invocation = &admission.invocation.payload;
+    let facts = RequestFacts {
+        resource: invocation.resource.clone(),
+        action: invocation.action,
+        audience: invocation.audience.clone(),
+        operation_id: invocation.operation_id.clone(),
+        body_hash: ObjectHash::body(&admission.source_body)?,
+        context: invocation.context.clone(),
+    };
+    let scoped = TaskScopedAuthorization::for_admitted_operation_in(
+        connection, policy, identity, admission, &facts, now_ms,
+    )?;
+    let auth = super::event_authorization::event_authorization_in_view(
         policy,
         connection,
+        scoped.state(policy.verified()),
         &retained.event,
         &events,
         now_ms,
     )?;
-    Ok((source, auth))
+    ensure!(
+        auth.invocation_hash() == scoped.authorization().invocation_hash()
+            && auth.body_hash() == scoped.authorization().body_hash(),
+        "dispatch scope differs from its current event authorization"
+    );
+    Ok((source, scoped))
 }
 
 struct RetainedDispatch {
@@ -1177,21 +1227,22 @@ pub(super) fn retained_execution_history_reference_in(
 }
 
 fn retained_dispatch_authorization(
-    policy: &VerifiedPolicySet,
+    connection: &Connection,
+    policy: &PolicyState,
+    identity: &LocalIdentity,
     retained: &RetainedDispatch,
-    wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
     now_ms: u64,
-) -> Result<VerifiedAuthorization> {
-    let source = policy.verify_project_execution_source(&wire.handoff,now_ms)?;
-    let admitted = source.original_admission(&wire.handoff,now_ms)?;
+) -> Result<(TaskScopedAuthorization, RequestFacts)> {
     let invocation = &retained.admission.invocation.payload;
     let facts = RequestFacts {
         resource:invocation.resource.clone(), action:invocation.action,
         audience:invocation.audience.clone(), operation_id:invocation.operation_id.clone(),
         body_hash:ObjectHash::body(&retained.admission.source_body)?, context:invocation.context.clone(),
     };
-    policy.verify_operation_authorization(&admitted,&facts,
-        &retained.admission.transport.clone().into_evidence(),now_ms).map_err(Into::into)
+    let scoped = TaskScopedAuthorization::for_admitted_operation_in(
+        connection, policy, identity, &retained.admission, &facts, now_ms,
+    )?;
+    Ok((scoped, facts))
 }
 
 impl Store {
@@ -1302,6 +1353,8 @@ impl Store {
         vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
         bool,
     )> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         use vibeface_secure::{
             Identity,
             authorization::{
@@ -1309,16 +1362,27 @@ impl Store {
                 execution_handoff::{SignedExecutionHandoff, execution_submission_facts},
             },
         };
-        let (source, original) =
-            dispatch_authorization_from(&self.connection, &self.policy, space, operation, now_ms)?;
-        let body: String = self.connection.query_row(
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        let (source, scoped) =
+            dispatch_authorization_from(&tx, &current, identity, space, operation, now_ms)?;
+        let original = scoped.authorization();
+        let body: String = tx.query_row(
             "SELECT source_body FROM accepted_authorizations WHERE space_id=? AND operation_id=?",
             params![space, operation],
             |row| row.get(0),
         )?;
         let body: Value = serde_json::from_str(&body)?;
-        let dispatch = self.execution_dispatch_facts(&body, original.audience(), now_ms)?;
-        let handoff = self.execution_handoff_payload(
+        let dispatch = dispatch_facts_from(
+            &tx, scoped.state(current.verified()), &body, original.audience(), now_ms,
+        )?;
+        dispatch.revalidate(&tx, &current, &scoped, &body, original.audience(), now_ms)?;
+        let handoff = super::execution_handoff::execution_handoff_payload_in(
+            &tx,
+            &current,
+            &scoped,
             identity,
             space,
             operation,
@@ -1327,7 +1391,7 @@ impl Store {
             dispatch.destination.public_key().clone(),
             now_ms,
         )?;
-        let facts = execution_submission_facts(&handoff, &original)?;
+        let facts = execution_submission_facts(&handoff, original)?;
         let signer =
             Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
         let invocation = Signed::sign(
@@ -1350,11 +1414,12 @@ impl Store {
                 not_before_ms: now_ms,
                 expires_at_ms: now_ms
                     .checked_add(vibeface_secure::authorization::INVOCATION_MAX_AGE_MS)
-                    .context("handoff invocation deadline overflow")?,
+                    .context("handoff invocation deadline overflow")?
+                    .min(scoped.expires_at_ms()),
             },
             &signer,
         )?;
-        self.policy.verified().verify_invocation(
+        scoped.state(current.verified()).verify_invocation(
             &invocation,
             &facts,
             &TransportEvidence::VerifiedPeer {
@@ -1367,11 +1432,6 @@ impl Store {
             invocation,
         };
         let key = format!("project-execution-handoff:{operation}");
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        dispatch.revalidate(&tx, &self.policy, &body, original.audience(), now_ms)?;
-        check_policy_heads_in(&tx, self.policy.verified(), &original, now_ms)?;
         let previous: Option<String> = tx
             .query_row(
                 "SELECT value FROM local_values WHERE space_id=? AND key=?",
@@ -1389,6 +1449,7 @@ impl Store {
                 "stored execution handoff differs from its original dispatch"
             );
             tx.commit()?;
+            self.policy = current;
             return Ok((previous, false));
         }
         ensure!(tx.execute("UPDATE operations SET state='\"running\"' WHERE space_id=? AND operation_id=? AND state='\"accepted\"'",
@@ -1398,6 +1459,7 @@ impl Store {
             params![space, key, serde_json::to_string(&wire)?],
         )?;
         tx.commit()?;
+        self.policy = current;
         Ok((wire, true))
     }
 
@@ -1427,10 +1489,13 @@ impl Store {
         let tx = self.connection.unchecked_transaction()?;
         let current = PolicyState::reload_verified(&tx,&self.policy)?;
         let retained = retained_dispatch_from(&tx,identity,&result.handoff)?;
-        let original = retained_dispatch_authorization(current.verified(),&retained,&result.handoff,now_ms)?;
-        let verified = current.verified().verify_execution_handoff_result(result,&original,now_ms)?;
-        check_policy_heads_in(&tx,current.verified(),verified.original(),now_ms)?;
-        check_policy_heads_in(&tx,current.verified(),verified.submission(),now_ms)?;
+        let (scoped, facts) = retained_dispatch_authorization(&tx,&current,identity,&retained,now_ms)?;
+        let verified = scoped.state(current.verified()).verify_execution_handoff_result(result,scoped.authorization(),now_ms)?;
+        scoped.check_current_in(&tx,current.verified(),&facts,now_ms)?;
+        if scoped.task_policy().is_none() {
+            check_policy_heads_in(&tx,current.verified(),verified.original(),now_ms)?;
+            check_policy_heads_in(&tx,current.verified(),verified.submission(),now_ms)?;
+        }
         validate_operation_binding_from(&tx,&retained.request)?;
         tx.commit()?;
         Ok(())
@@ -1453,10 +1518,6 @@ impl Store {
         let current = PolicyState::reload_verified(&tx,&self.policy)?;
         let retained = retained_dispatch_from(&tx,identity,&result.handoff)?;
         let source = &retained.source;
-        let original = retained_dispatch_authorization(current.verified(),&retained,&result.handoff,now_ms)?;
-        let verified = current.verified().verify_execution_handoff_result(result,&original,now_ms)?;
-        check_policy_heads_in(&tx,current.verified(),verified.original(),now_ms)?;
-        check_policy_heads_in(&tx,current.verified(),verified.submission(),now_ms)?;
         let saved_wire: String = tx.query_row(
             "SELECT value FROM local_values WHERE space_id=? AND key=?",
             params![space, format!("project-execution-handoff:{operation}")],
@@ -1487,6 +1548,37 @@ impl Store {
             if *action == serde_json::to_value(&request)?),
             "operation differs from its admitted dispatch"
         );
+        if old_state == state && old_result == wrapper {
+            let invocation = &retained.admission.invocation.payload;
+            let facts = RequestFacts {
+                resource: invocation.resource.clone(), action: invocation.action,
+                audience: invocation.audience.clone(), operation_id: invocation.operation_id.clone(),
+                body_hash: ObjectHash::body(&retained.admission.source_body)?, context: invocation.context.clone(),
+            };
+            super::admission::validate_persisted_admission(&tx, &retained.admission)?;
+            super::admission::reconstruct_admission(
+                &tx, &current, &retained.admission, &facts,
+                &retained.admission.transport.clone().into_evidence(),
+            )?;
+            if old_state.terminal() {
+                crate::store::validate_released_operation_reservations_from(&tx,space,operation)?;
+            } else {
+                validate_operation_binding_from(&tx, &request)?;
+                super::admission::check_operation_reservations_in(&tx,&OperationRecord {
+                    request:request.clone(),state:old_state.clone(),result:old_result.clone(),
+                })?;
+            }
+            tx.commit()?;
+            self.policy = current;
+            return Ok(OperationRecord { request, state: old_state, result: old_result });
+        }
+        let (scoped, facts) = retained_dispatch_authorization(&tx,&current,identity,&retained,now_ms)?;
+        let verified = scoped.state(current.verified()).verify_execution_handoff_result(result,scoped.authorization(),now_ms)?;
+        scoped.check_current_in(&tx,current.verified(),&facts,now_ms)?;
+        if scoped.task_policy().is_none() {
+            check_policy_heads_in(&tx,current.verified(),verified.original(),now_ms)?;
+            check_policy_heads_in(&tx,current.verified(),verified.submission(),now_ms)?;
+        }
         validate_operation_binding_from(&tx, &request)?;
         let previous = (!old_result.is_null())
             .then(|| serde_json::from_value::<ExecutionHandoffResult>(old_result.clone()))
@@ -2071,7 +2163,7 @@ pub(crate) mod tests {
             self.store.bind_execution_dispatch(
                 &self.project.node,
                 &dispatch,
-                &auth,
+                &TaskScopedAuthorization::from_primary(auth.clone()),
                 &proof,
                 &transport,
                 &body,
@@ -2263,7 +2355,7 @@ pub(crate) mod tests {
         f.store.accept_execution_dispatch(
             &f.project.node,
             &facts,
-            &auth,
+            &TaskScopedAuthorization::from_primary(auth.clone()),
             &fresh,
             &transport,
             &body,
@@ -2310,7 +2402,7 @@ pub(crate) mod tests {
         f.store.accept_execution_dispatch(
             &f.project.node,
             &dispatch,
-            &auth,
+            &TaskScopedAuthorization::from_primary(auth.clone()),
             &proof,
             &transport,
             &body,
@@ -3010,7 +3102,7 @@ pub(crate) mod tests {
                 .accept_execution_dispatch(
                     &f.project.node,
                     &dispatch,
-                    &auth,
+                    &TaskScopedAuthorization::from_primary(auth.clone()),
                     &proof,
                     &transport,
                     &body,
@@ -3046,7 +3138,7 @@ pub(crate) mod tests {
         let accepted = f.store.accept_execution_dispatch(
             &f.project.node,
             &dispatch,
-            &auth,
+            &TaskScopedAuthorization::from_primary(auth.clone()),
             &proof,
             &transport,
             &body,
@@ -3076,7 +3168,7 @@ pub(crate) mod tests {
                 .accept_execution_dispatch(
                     &f.project.node,
                     &dispatch,
-                    &auth,
+                    &TaskScopedAuthorization::from_primary(auth.clone()),
                     &proof,
                     &transport,
                     &body,
