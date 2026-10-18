@@ -1551,13 +1551,22 @@ impl Store {
             |r| r.get(0),
         )?;
         ensure!(ready, "task creation changed before binding confirmation");
-        validate_session_ownership_from(
+        if !validate_session_ownership_from(
             &tx,
             &binding.network_id,
             &binding.target_node,
             &binding.session_id,
             &binding.conversation_id,
-        )?;
+        )? {
+            validate_local_session_intents_from(
+                &tx,
+                &binding.network_id,
+                &binding.target_node,
+                &binding.session_id,
+                &binding.conversation_id,
+                &BTreeSet::from([identity.node_id()?]),
+            )?;
+        }
         let current: Option<String> = tx
             .query_row(
                 "SELECT value FROM local_values WHERE network_id=? AND key=?",
@@ -1616,13 +1625,27 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_session_ownership_from(
+        if !validate_session_ownership_from(
             &tx,
             &binding.network_id,
             &binding.target_node,
             &binding.session_id,
             &binding.conversation_id,
-        )?;
+        )? {
+            let mut query =
+                tx.prepare("SELECT node_id FROM local_identities WHERE network_id=?")?;
+            let local_authors = query
+                .query_map([&binding.network_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+            validate_local_session_intents_from(
+                &tx,
+                &binding.network_id,
+                &binding.target_node,
+                &binding.session_id,
+                &binding.conversation_id,
+                &local_authors,
+            )?;
+        }
         let current: Option<String> = tx
             .query_row(
                 "SELECT value FROM local_values WHERE network_id=? AND key=?",
@@ -3171,7 +3194,8 @@ fn validate_session_ownership_from(
     target: &str,
     session: &str,
     conversation: &str,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut owned = false;
     let mut query = connection.prepare(
         "SELECT request FROM operations WHERE network_id=? AND target_node=? AND session_id=?",
     )?;
@@ -3183,6 +3207,7 @@ fn validate_session_ownership_from(
             previous.conversation_id == conversation,
             "execution session belongs to another conversation"
         );
+        owned = true;
     }
     let mut query = connection.prepare(
         "SELECT value FROM local_values WHERE network_id=? AND key LIKE 'task-binding-record:%'",
@@ -3196,6 +3221,7 @@ fn validate_session_ownership_from(
                 binding.conversation_id == conversation,
                 "execution session binding belongs to another conversation"
             );
+            owned = true;
         }
     }
     let events = load_events_from(connection, network)?;
@@ -3272,6 +3298,81 @@ fn validate_session_ownership_from(
                 stored.event.scope_id == conversation,
                 "execution session acknowledged by its executor belongs to another conversation"
             );
+            owned = true;
+        }
+    }
+    Ok(owned)
+}
+
+fn validate_local_session_intents_from(
+    connection: &Connection,
+    network: &str,
+    target: &str,
+    session: &str,
+    conversation: &str,
+    local_authors: &BTreeSet<String>,
+) -> Result<()> {
+    for stored in load_events_from(connection, network)?.values() {
+        if stored.status != "ready" || !local_authors.contains(&stored.event.author) {
+            continue;
+        }
+        let EventBody::DispatchRecorded {
+            operation_id,
+            task_id,
+            target_node,
+            session_id,
+            action,
+        } = &stored.event.body
+        else {
+            continue;
+        };
+        let Ok(request) = serde_json::from_value::<OperationRequest>(action.clone()) else {
+            continue;
+        };
+        if target_node == target
+            && session_id.as_deref() == Some(session)
+            && request.network_id == network
+            && request.conversation_id == stored.event.scope_id
+            && request.operation_id == *operation_id
+            && request.task_id == *task_id
+            && request.target_node == *target_node
+            && request.session_id == *session_id
+        {
+            ensure!(
+                request.conversation_id == conversation,
+                "execution session has a local dispatch for another conversation; reconcile its receipt before binding"
+            );
+        }
+    }
+    let mut query = connection.prepare(
+        "SELECT value FROM local_values WHERE network_id=? AND key LIKE 'agent-calls:v1:%'",
+    )?;
+    for encoded in query.query_map([network], |row| row.get::<_, String>(0))? {
+        let calls: Value = serde_json::from_str(&encoded?)?;
+        for call in calls
+            .as_object()
+            .context("invalid prepared call index")?
+            .values()
+        {
+            let scope = call["conversation_id"]
+                .as_str()
+                .context("invalid prepared call conversation")?;
+            for request in call["requests"]
+                .as_array()
+                .context("invalid prepared call requests")?
+            {
+                let request: OperationRequest = serde_json::from_value(request.clone())?;
+                ensure!(
+                    request.network_id == network && request.conversation_id == scope,
+                    "prepared call request has a different ownership scope"
+                );
+                if request.target_node == target && request.session_id.as_deref() == Some(session) {
+                    ensure!(
+                        scope == conversation,
+                        "execution session has a local prepared call for another conversation; reconcile its receipt before binding"
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -3772,13 +3873,19 @@ mod tests {
             3,
         )?;
         assert_eq!(store.messages(&network, "conversation")?.len(), 2);
+        let published = store.context(&network, "conversation", &[])?;
         assert!(
-            !store
-                .context(&network, "conversation", &[])?
+            !published
                 .events
                 .iter()
-                .any(|event| matches!(event.body, EventBody::DecisionRecorded { .. }))
+                .any(|event| matches!(&event.body, EventBody::DecisionRecorded { decision_id, .. } if decision_id == &format!("decision-{}", claimed.job.message_id)))
         );
+        assert!(published.events.iter().any(|event| matches!(
+            &event.body,
+            EventBody::DecisionRecorded { decision_id, tool_configuration, .. }
+                if decision_id == &format!("followup-intent:v1:{}", first.hash)
+                    && tool_configuration["type"] == "followup_intent_v1"
+        )));
         assert!(!store.scheduler_publication_pending(
             &network,
             "conversation",
@@ -3990,7 +4097,7 @@ mod tests {
         assert!(independent.errors.is_empty());
         assert_eq!(independent.published.len(), 1);
         assert_eq!(independent.published[0].job.conversation_id, "healthy");
-        assert_eq!(independent.published[0].event_hashes.len(), 2);
+        assert_eq!(independent.published[0].event_hashes.len(), 1);
         assert!(store.scheduler_publication_pending(
             &network,
             "conversation",
@@ -4012,7 +4119,7 @@ mod tests {
             flushed.published[0].job.state,
             JobState::Completed { .. }
         ));
-        assert_eq!(flushed.published[0].event_hashes.len(), 2);
+        assert_eq!(flushed.published[0].event_hashes.len(), 1);
         assert!(!store.scheduler_publication_pending(
             &network,
             "conversation",
@@ -5923,13 +6030,215 @@ mod tests {
     }
 
     #[test]
+    fn local_remote_execution_intents_block_foreign_bindings_before_ack() -> Result<()> {
+        for (prepared_only, install_first) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let gateway = LocalIdentity::generate();
+            let executor = LocalIdentity::generate();
+            let foreign_gateway = LocalIdentity::generate();
+            let network = gateway.fixture_network_id()?;
+            let target = executor.node_id()?;
+            let mut entry = Store::open(":memory:")?;
+            entry.install_trust_bundle(
+                &network,
+                &gateway.sign_network_fixture(
+                    1,
+                    vec![
+                        gateway.certificate(roles())?,
+                        executor.certificate(roles())?,
+                        foreign_gateway.certificate(roles())?,
+                    ],
+                )?,
+            )?;
+            entry.save_local_identity(&network, &gateway)?;
+            let creation = conversation(&mut entry, &gateway)?;
+            let original = OperationRequest {
+                operation_id: "pending-open".into(),
+                network_id: network.clone(),
+                conversation_id: "conversation".into(),
+                task_id: None,
+                target_node: target.clone(),
+                session_id: Some("pending-native".into()),
+                expected_revision: 0,
+                basis_heads: vec![creation.hash],
+                action: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
+                resources: vec![],
+                binding: None,
+                manager_authority: None,
+            };
+            if prepared_only {
+                entry.local_set(
+                    &network,
+                    "agent-calls:v1:attempt-a",
+                    &json!({"call-a":{
+                        "conversation_id":"conversation",
+                        "name":"delegate",
+                        "intent":{"text":"Bot A work"},
+                        "requests":[original.clone()]
+                    }}),
+                )?;
+            } else {
+                entry.append_event(
+                    &gateway,
+                    &network,
+                    "conversation",
+                    EventBody::DispatchRecorded {
+                        operation_id: original.operation_id.clone(),
+                        task_id: None,
+                        target_node: target.clone(),
+                        session_id: original.session_id.clone(),
+                        action: json!(original),
+                    },
+                    vec![],
+                    2,
+                )?;
+            }
+            assert!(entry.operations(&network)?.is_empty());
+            assert!(entry.sessions(&network)?.is_empty());
+            entry.append_event(
+                &gateway,
+                &network,
+                "other-chat",
+                EventBody::ConversationCreated {
+                    title: "Bot B".into(),
+                },
+                vec![],
+                3,
+            )?;
+            let task = entry.append_event(
+                &gateway,
+                &network,
+                "other-chat",
+                EventBody::TaskCreated {
+                    task_id: "task-b".into(),
+                    title: "B".into(),
+                    goal: "B".into(),
+                    acceptance: "Check".into(),
+                },
+                vec![],
+                4,
+            )?;
+            let mut binding = crate::binding::TaskBinding {
+                network_id: network.clone(),
+                conversation_id: "other-chat".into(),
+                task_ref: task.hash.clone(),
+                task_id: "task-b".into(),
+                authority_node: gateway.node_id()?,
+                generation: 1,
+                target_node: target,
+                session_id: "pending-native".into(),
+                open_spec: original.action.clone(),
+                previous_binding_hash: None,
+                previous_seal: None,
+            };
+            assert!(
+                entry
+                    .bind_task(&gateway, &binding)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("another conversation")
+            );
+            let proof = crate::binding::sign_binding(&gateway, &binding)?;
+            assert!(
+                entry
+                    .install_binding(&proof)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("another conversation")
+            );
+            assert!(entry.task_binding(&network, &task.hash)?.is_none());
+            let mut rejected = original.clone();
+            rejected.operation_id = "unadmitted-b".into();
+            rejected.conversation_id = "other-chat".into();
+            rejected.basis_heads = entry.heads(&network, "other-chat")?;
+            let foreign = foreign_gateway.sign_event(Event {
+                version: 1,
+                network_id: network.clone(),
+                scope_id: "other-chat".into(),
+                author: foreign_gateway.node_id()?,
+                sequence: 1,
+                previous: None,
+                parents: rejected.basis_heads.clone(),
+                created_at_ms: 5,
+                body: EventBody::DispatchRecorded {
+                    operation_id: rejected.operation_id.clone(),
+                    task_id: None,
+                    target_node: rejected.target_node.clone(),
+                    session_id: rejected.session_id.clone(),
+                    action: json!(rejected),
+                },
+                blobs: vec![],
+            })?;
+            assert_eq!(entry.ingest_event(&network, &foreign)?.status, "ready");
+            entry.append_event(
+                &gateway,
+                &network,
+                "other-chat",
+                EventBody::DispatchRecorded {
+                    operation_id: "mismatched-b".into(),
+                    task_id: None,
+                    target_node: rejected.target_node.clone(),
+                    session_id: rejected.session_id.clone(),
+                    action: json!(rejected),
+                },
+                vec![],
+                6,
+            )?;
+            let own_task = entry.append_event(
+                &gateway,
+                &network,
+                "conversation",
+                EventBody::TaskCreated {
+                    task_id: "task-a".into(),
+                    title: "A".into(),
+                    goal: "A".into(),
+                    acceptance: "Check".into(),
+                },
+                vec![],
+                7,
+            )?;
+            binding.conversation_id = "conversation".into();
+            binding.task_ref = own_task.hash;
+            binding.task_id = "task-a".into();
+            let own_proof = if install_first {
+                let proof = crate::binding::sign_binding(&gateway, &binding)?;
+                entry.install_binding(&proof)?;
+                proof
+            } else {
+                entry.bind_task(&gateway, &binding)?
+            };
+            assert_eq!(
+                entry.task_binding(&network, &binding.task_ref)?,
+                Some(own_proof)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn remote_executor_acknowledgement_prevents_gateway_binding_pollution() -> Result<()> {
         let gateway = LocalIdentity::generate();
         let executor = LocalIdentity::generate();
+        let foreign_gateway = LocalIdentity::generate();
         let network = gateway.fixture_network_id()?;
         let target = executor.node_id()?;
-        let mut entry = memory(&gateway, Some(&executor))?;
-        let mut execution = memory(&gateway, Some(&executor))?;
+        let mut entry = Store::open(":memory:")?;
+        entry.install_trust_bundle(
+            &network,
+            &gateway.sign_network_fixture(
+                1,
+                vec![
+                    gateway.certificate(roles())?,
+                    executor.certificate(roles())?,
+                    foreign_gateway.certificate(roles())?,
+                ],
+            )?,
+        )?;
+        entry.save_local_identity(&network, &gateway)?;
+        let mut execution = Store::open(":memory:")?;
+        execution.install_trust_bundle(&network, &entry.trust_bundle(&network)?.unwrap())?;
+        execution.save_local_identity(&network, &executor)?;
         let creation = conversation(&mut entry, &gateway)?;
         execution.ingest_event(&network, &creation)?;
         let mut original = OperationRequest {
@@ -6116,6 +6425,58 @@ mod tests {
         assert_eq!(
             execution.accept_operation(&network, &original)?.state,
             OperationState::Accepted
+        );
+        let foreign = foreign_gateway.sign_event(Event {
+            version: 1,
+            network_id: network.clone(),
+            scope_id: "other-chat".into(),
+            author: foreign_gateway.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: entry.heads(&network, "other-chat")?,
+            created_at_ms: 9,
+            body: EventBody::DispatchRecorded {
+                operation_id: rejected.operation_id.clone(),
+                task_id: rejected.task_id.clone(),
+                target_node: rejected.target_node.clone(),
+                session_id: rejected.session_id.clone(),
+                action: json!(rejected),
+            },
+            blobs: vec![],
+        })?;
+        entry.ingest_event(&network, &foreign)?;
+        entry.local_set(
+            &network,
+            "agent-calls:v1:rejected-b",
+            &json!({"call-b":{
+                "conversation_id":"other-chat",
+                "name":"delegate",
+                "intent":{"text":"B"},
+                "requests":[rejected]
+            }}),
+        )?;
+        let own_task = entry.append_event(
+            &gateway,
+            &network,
+            "conversation",
+            EventBody::TaskCreated {
+                task_id: "task-a".into(),
+                title: "A".into(),
+                goal: "A".into(),
+                acceptance: "Check".into(),
+            },
+            vec![],
+            10,
+        )?;
+        let mut own_binding = binding;
+        own_binding.conversation_id = "conversation".into();
+        own_binding.task_ref = own_task.hash;
+        own_binding.task_id = "task-a".into();
+        let own_proof = entry.bind_task(&gateway, &own_binding)?;
+        entry.install_binding(&own_proof)?;
+        assert_eq!(
+            entry.task_binding(&network, &own_binding.task_ref)?,
+            Some(own_proof)
         );
         Ok(())
     }
