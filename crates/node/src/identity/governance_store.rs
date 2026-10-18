@@ -134,20 +134,13 @@ fn source_root(connection: &Connection, source: &ResourceRef) -> Result<PathBuf>
 }
 
 fn verify_team_source(
-    connection: &Connection,
     policy: &journal::PolicyState,
     request: &Signed<TeamCreationRequest>,
     now_ms: u64,
-) -> Result<governance::VerifiedTeamCreationRequest> {
-    let mut statement = connection.prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?;
-    let journal = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .map(|row| Ok(serde_json::from_str::<JournalEntry>(&row?)?))
-        .collect::<Result<Vec<_>>>()?;
+) -> Result<(governance::VerifiedTeamCreationRequest, ObjectHash)> {
     let state = policy.verified();
-    let source = &request.payload.source_project;
     let current = state
-        .space(&source.space)
+        .space(&request.payload.source_project.space)
         .context("source space is unavailable")?;
     for leaf in &current.grants {
         if !state
@@ -156,46 +149,11 @@ fn verify_team_source(
         {
             continue;
         }
-        let Ok(bundle) = state.client_authorization_projection(
-            policy.pins(),
-            &journal,
-            &request.payload.owner_account,
-            &source.space,
-            &request.issuer,
-            leaf,
-            now_ms,
-        ) else {
-            continue;
-        };
-        let domains: BTreeSet<_> = bundle
-            .journal
-            .iter()
-            .filter_map(|entry| match entry {
-                JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
-                    Some(PolicyDomain::Account(value.payload.account.clone()))
-                }
-                JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => {
-                    Some(PolicyDomain::Space(value.payload.space.clone()))
-                }
-                JournalEntry::AccountCommit(value) => Some(PolicyDomain::Account(
-                    value.proposal.payload.account.clone(),
-                )),
-                JournalEntry::SpaceCommit(value) => {
-                    Some(PolicyDomain::Space(value.proposal.payload.space.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        let pins: Vec<_> = policy
-            .pins()
-            .iter()
-            .filter(|pin| domains.contains(&pin.domain))
-            .cloned()
-            .collect();
-        if let Ok(verified) =
-            governance::verify_team_creation_request(state, &bundle, &pins, request, now_ms)
+        match governance::verify_team_creation_request(state, leaf, policy.pins(), request, now_ms)
         {
-            return Ok(verified);
+            Ok(verified) => return Ok((verified, leaf.clone())),
+            Err(error @ AuthorizationError::BudgetExceeded) => return Err(error.into()),
+            Err(_) => {}
         }
     }
     bail!("team creation requires current owner authorization for the selected personal project")
@@ -448,8 +406,7 @@ impl Store {
         params: &Value,
         now_ms: u64,
     ) -> Result<Value> {
-        let _signature_scope =
-            (method == "execution_service_register").then(ScopedSignatureVerification::new);
+        let _signature_scope = ScopedSignatureVerification::new();
         self.governance_command_with_registration_freshness(
             identity, principal, method, params, now_ms, None,
         )
@@ -464,8 +421,7 @@ impl Store {
         now_ms: u64,
         registration_freshness: Option<&super::policy::FreshnessProof>,
     ) -> Result<Value> {
-        let _signature_scope =
-            (method == "execution_service_register").then(ScopedSignatureVerification::new);
+        let _signature_scope = ScopedSignatureVerification::new();
         ensure!(
             serde_json::to_vec(params)?.len() <= MAX_PROOF_BYTES,
             "governance request too large"
@@ -514,7 +470,7 @@ impl Store {
                     receipt::<TeamCreateResponse>(&tx, &key, &request_hash, &principal)?
                 {
                     check_team_receipt(&response, &request, &node)?;
-                    let policy = journal::PolicyState::load(&tx)?;
+                    let policy = journal::PolicyState::reload_verified(&tx, &self.policy)?;
                     tx.commit()?;
                     self.policy = policy;
                     return Ok(serde_json::to_value(response)?);
@@ -524,28 +480,16 @@ impl Store {
                     source_root(&tx, &request.payload.source_project)? == root,
                     "source project mapping changed"
                 );
-                let policy = journal::PolicyState::load(&tx)?;
-                let verified = verify_team_source(&tx, &policy, &request, now_ms)?;
+                let policy = journal::PolicyState::reload_verified(&tx, &self.policy)?;
+                let (verified, source_grant) = verify_team_source(&policy, &request, now_ms)?;
                 let update = policy.prepare_team_creation(&verified, now_ms)?;
-                let acceptance = Signed::sign(
-                    TeamCreationAcceptance {
-                        version: AUTH_VERSION,
-                        request_hash: request_hash.clone(),
-                        space: request.payload.team_project.space.clone(),
-                        owner_account: request.payload.owner_account.clone(),
-                        target_node_public_key: node,
-                        account_head: policy
-                            .verified()
-                            .head(&PolicyDomain::Account(
-                                request.payload.owner_account.clone(),
-                            ))
-                            .context("owner account head missing")?
-                            .clone(),
-                        nonce: request.payload.nonce.clone(),
-                        accepted_at_ms: now_ms,
-                        expires_at_ms: request.payload.expires_at_ms,
-                    },
+                let acceptance = governance::accept_team_creation_in_state(
+                    policy.verified(),
+                    &source_grant,
+                    policy.pins(),
+                    &request,
                     &signer,
+                    now_ms,
                 )?;
                 let response = TeamCreateResponse {
                     acceptance,
@@ -615,20 +559,12 @@ impl Store {
                     receipt::<SpaceCommitResponse>(&tx, &key, &request_hash, &principal)?
                 {
                     check_space_receipt(&response, &request, &node)?;
-                    let policy = if registration.is_some() {
-                        journal::PolicyState::reload_verified(&tx, &self.policy)?
-                    } else {
-                        journal::PolicyState::load(&tx)?
-                    };
+                    let policy = journal::PolicyState::reload_verified(&tx, &self.policy)?;
                     tx.commit()?;
                     self.policy = policy;
                     return Ok(serde_json::to_value(response)?);
                 }
-                let policy = if registration.is_some() {
-                    journal::PolicyState::reload_verified(&tx, &self.policy)?
-                } else {
-                    journal::PolicyState::load(&tx)?
-                };
+                let policy = journal::PolicyState::reload_verified(&tx, &self.policy)?;
                 let state = policy.verified();
                 let (commit_heads, authorization_expiry, execution_root) =
                     if let Some(registration) = &registration {
@@ -695,22 +631,28 @@ impl Store {
                 let expires_at_ms = now_ms
                     .saturating_add(EXECUTION_LEASE_MS)
                     .min(authorization_expiry);
-                let challenge = Signed::sign(
-                    PolicyCommit {
-                        version: AUTH_VERSION,
-                        previous: state
-                            .head(&PolicyDomain::Space(space.space.clone()))
-                            .context("space head missing")?
-                            .clone(),
-                        proposal_hash: request.proposal.hash()?,
-                        accepted_at_ms: 0,
-                        issued_at_ms: now_ms,
-                        expires_at_ms,
-                        nonce: request.nonce.clone(),
-                        dependencies: commit_heads,
-                    },
-                    &signer,
-                )?;
+                let challenge = if registration.is_none() {
+                    governance::issue_space_governance_challenge_in_state(
+                        state, &request, &signer, now_ms,
+                    )?
+                } else {
+                    Signed::sign(
+                        PolicyCommit {
+                            version: AUTH_VERSION,
+                            previous: state
+                                .head(&PolicyDomain::Space(space.space.clone()))
+                                .context("space head missing")?
+                                .clone(),
+                            proposal_hash: request.proposal.hash()?,
+                            accepted_at_ms: 0,
+                            issued_at_ms: now_ms,
+                            expires_at_ms,
+                            nonce: request.nonce.clone(),
+                            dependencies: commit_heads,
+                        },
+                        &signer,
+                    )?
+                };
                 let challenge_hash = challenge.challenge_hash()?;
                 let receipts = challenge
                     .payload
@@ -742,12 +684,18 @@ impl Store {
                         )?)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let mut accepted = challenge.payload;
-                accepted.accepted_at_ms = now_ms;
-                let committed = Committed {
-                    proposal: request.proposal,
-                    commit: Signed::sign(accepted, &signer)?,
-                    receipts,
+                let committed = if registration.is_none() {
+                    governance::accept_space_governance_change_in_state(
+                        state, &request, &challenge, &receipts, &signer, now_ms,
+                    )?
+                } else {
+                    let mut accepted = challenge.payload;
+                    accepted.accepted_at_ms = now_ms;
+                    Committed {
+                        proposal: request.proposal.clone(),
+                        commit: Signed::sign(accepted, &signer)?,
+                        receipts,
+                    }
                 };
                 if let Some(registration) = &registration {
                     execution_service::verify_execution_service_registration_commit(
@@ -837,8 +785,19 @@ mod tests {
         resource: ResourceId,
     }
 
-    fn prepare_team(network: &TestNetwork) -> Result<PreparedTeamCreation> {
+    fn prepare_team(network: &TestNetwork, store: &mut Store) -> Result<PreparedTeamCreation> {
         let root = Identity::generate().map_err(anyhow::Error::msg)?;
+        let authorization = bounded_client_authorization(
+            network,
+            store,
+            &ResourceRef {
+                space: network.space.clone(),
+                resource: network.resource.clone(),
+            },
+            &network.bundle.grant_leaf,
+            &network.pins,
+            now(),
+        )?;
         governance::prepare_team_creation(
             &root,
             &network.client,
@@ -846,8 +805,7 @@ mod tests {
             &network.node.public_key_hex()?,
             &network.recovery.public_key_hex(),
             network.resource.as_str(),
-            &serde_json::to_string(&network.pins)?,
-            &serde_json::to_string(&network.bundle)?,
+            &authorization,
             (now() + 90_000) as f64,
             now() as f64,
         )
@@ -855,7 +813,7 @@ mod tests {
     }
 
     fn create_team(network: &TestNetwork, store: &mut Store) -> Result<TeamClient> {
-        let prepared = prepare_team(network)?;
+        let prepared = prepare_team(network, store)?;
         let request: Signed<TeamCreationRequest> =
             serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
         let response: TeamCreateResponse = serde_json::from_value(store.governance_command(
@@ -871,8 +829,14 @@ mod tests {
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
+        let authorization = verified
+            .authorization()
+            .context("created team has no current authorization")?;
+        let mut bundle = network.bundle.clone();
+        bundle.journal.extend(request.payload.journal_delta.clone());
+        bundle.grant_leaf = authorization.grant_leaf().clone();
         Ok(TeamClient {
-            bundle: serde_json::from_str(&verified.bundle_json().map_err(anyhow::Error::msg)?)?,
+            bundle,
             pins: serde_json::from_str(&verified.pins_json().map_err(anyhow::Error::msg)?)?,
             space: request.payload.team_project.space,
             resource: request.payload.team_project.resource,
@@ -883,8 +847,22 @@ mod tests {
         fn pins_json(&self) -> Result<String> {
             Ok(serde_json::to_string(&self.pins)?)
         }
-        fn bundle_json(&self) -> Result<String> {
-            Ok(serde_json::to_string(&self.bundle)?)
+        fn authorization(
+            &self,
+            network: &TestNetwork,
+            store: &mut Store,
+        ) -> Result<VerifiedClientAuthorization> {
+            bounded_client_authorization(
+                network,
+                store,
+                &ResourceRef {
+                    space: self.space.clone(),
+                    resource: self.resource.clone(),
+                },
+                &self.bundle.grant_leaf,
+                &self.pins,
+                now(),
+            )
         }
         fn commit(
             &mut self,
@@ -938,8 +916,7 @@ mod tests {
                 now() as f64,
             )
             .map_err(anyhow::Error::msg)?;
-            self.bundle =
-                serde_json::from_str(&verified.bundle_json().map_err(anyhow::Error::msg)?)?;
+            self.bundle.journal.extend(response.journal_delta.clone());
             self.pins = serde_json::from_str(&verified.pins_json().map_err(anyhow::Error::msg)?)?;
             Ok(response)
         }
@@ -998,19 +975,13 @@ mod tests {
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
-        let source_auth = bounded_execution_authorization(
-            network,
-            store,
-            source,
-            &bundle.grant_leaf,
-            pins,
-            now(),
-        )?;
+        let source_auth =
+            bounded_client_authorization(network, store, source, &bundle.grant_leaf, pins, now())?;
         let owner_resource = ResourceRef {
             space: network.space.clone(),
             resource: network.resource.clone(),
         };
-        let owner = bounded_execution_authorization(
+        let owner = bounded_client_authorization(
             network,
             store,
             &owner_resource,
@@ -1054,7 +1025,7 @@ mod tests {
         .map_err(anyhow::Error::msg)
     }
 
-    fn bounded_execution_authorization(
+    fn bounded_client_authorization(
         network: &TestNetwork,
         store: &mut Store,
         resource: &ResourceRef,
@@ -1161,7 +1132,7 @@ mod tests {
             let result_authorization = verified.authorization();
             let result_pins: Vec<PolicyPin> =
                 serde_json::from_str(&verified.pins_json().map_err(anyhow::Error::msg)?)?;
-            let selection_authorization = bounded_execution_authorization(
+            let selection_authorization = bounded_client_authorization(
                 &network,
                 &mut store,
                 &execution,
@@ -1452,7 +1423,7 @@ mod tests {
             });
             drop(store);
             let mut store = Store::open(&path)?;
-            let original_owner = bounded_execution_authorization(
+            let original_owner = bounded_client_authorization(
                 &network,
                 &mut store,
                 &source,
@@ -1461,7 +1432,7 @@ mod tests {
                 now() + 2,
             )?;
             assert_eq!(original_owner.grant_leaf(), &network.bundle.grant_leaf);
-            let other_owner = bounded_execution_authorization(
+            let other_owner = bounded_client_authorization(
                 &network,
                 &mut store,
                 &source,
@@ -1471,7 +1442,7 @@ mod tests {
             )?;
             assert_eq!(other_owner.grant_leaf(), &project_grant.hash()?);
             assert!(
-                bounded_execution_authorization(
+                bounded_client_authorization(
                     &network,
                     &mut store,
                     &source,
@@ -1481,7 +1452,7 @@ mod tests {
                 )
                 .is_err()
             );
-            let selection_authorization = bounded_execution_authorization(
+            let selection_authorization = bounded_client_authorization(
                 &network,
                 &mut store,
                 &resource,
@@ -1899,6 +1870,17 @@ mod tests {
         let network = TestNetwork::new()?;
         let mut local = network.memory()?;
         let team_root = Identity::generate().map_err(anyhow::Error::msg)?;
+        let authorization = bounded_client_authorization(
+            &network,
+            &mut local,
+            &ResourceRef {
+                space: network.space.clone(),
+                resource: network.resource.clone(),
+            },
+            &network.bundle.grant_leaf,
+            &network.pins,
+            now(),
+        )?;
         let prepared_team = governance::prepare_team_creation(
             &team_root,
             &network.client,
@@ -1906,8 +1888,7 @@ mod tests {
             &network.node.public_key_hex()?,
             &network.recovery.public_key_hex(),
             network.resource.as_str(),
-            &serde_json::to_string(&network.pins)?,
-            &serde_json::to_string(&network.bundle)?,
+            &authorization,
             (now() + 90_000) as f64,
             now() as f64,
         )
@@ -1927,8 +1908,15 @@ mod tests {
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
-        let team_bundle: ClientAuthorizationBundle =
-            serde_json::from_str(&team_created.bundle_json().map_err(anyhow::Error::msg)?)?;
+        let mut team_bundle = network.bundle.clone();
+        team_bundle
+            .journal
+            .extend(team_request.payload.journal_delta.clone());
+        team_bundle.grant_leaf = team_created
+            .authorization()
+            .context("created Team authorization missing")?
+            .grant_leaf()
+            .clone();
         let source = team_request.payload.team_project;
         let remote_identity = LocalIdentity::generate();
         let remote_signer = Identity::from_secret_hex(&remote_identity.secret_key_hex)
@@ -2183,7 +2171,7 @@ mod tests {
         let finished_authorization = verified.authorization();
         let finished_pins: Vec<PolicyPin> =
             serde_json::from_str(&verified.pins_json().map_err(anyhow::Error::msg)?)?;
-        let selection_authorization = bounded_execution_authorization(
+        let selection_authorization = bounded_client_authorization(
             &network,
             &mut local,
             &execution,
@@ -2222,7 +2210,7 @@ mod tests {
         let path = network.directory.join("team.sqlite3");
         let mut store = network.at(&path)?;
         let mut other = Store::open(&path)?;
-        let prepared = prepare_team(&network)?;
+        let prepared = prepare_team(&network, &mut store)?;
         let request: Signed<TeamCreationRequest> =
             serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
         let params = json!({"request":request});
@@ -2362,7 +2350,7 @@ mod tests {
     fn team_creation_rejects_wrong_peer_node_locator_and_changed_source_root() -> Result<()> {
         let network = TestNetwork::new()?;
         let mut store = network.memory()?;
-        let prepared = prepare_team(&network)?;
+        let prepared = prepare_team(&network, &mut store)?;
         let request: Signed<TeamCreationRequest> =
             serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
         let params = json!({"request":request});
@@ -2459,8 +2447,7 @@ mod tests {
         let prepared = governance::prepare_space_membership_change(
             &serde_json::to_string(&membership)?,
             &network.client,
-            &team.pins_json()?,
-            &team.bundle_json()?,
+            &team.authorization(&network, &mut store)?,
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
@@ -2495,8 +2482,7 @@ mod tests {
         let prepared = governance::prepare_directional_grant(
             &serde_json::to_string(&grant)?,
             &network.client,
-            &team.pins_json()?,
-            &team.bundle_json()?,
+            &team.authorization(&network, &mut store)?,
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
@@ -2529,8 +2515,7 @@ mod tests {
         let prepared = governance::prepare_space_resource_registration(
             &serde_json::to_string(&resource)?,
             &network.client,
-            &team.pins_json()?,
-            &team.bundle_json()?,
+            &team.authorization(&network, &mut store)?,
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
@@ -2546,8 +2531,7 @@ mod tests {
             team.space.as_str(),
             child.as_str(),
             &network.client,
-            &team.pins_json()?,
-            &team.bundle_json()?,
+            &team.authorization(&network, &mut store)?,
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
@@ -2581,8 +2565,7 @@ mod tests {
         let prepared = governance::prepare_space_membership_change(
             &serde_json::to_string(&removal)?,
             &network.client,
-            &team.pins_json()?,
-            &team.bundle_json()?,
+            &team.authorization(&network, &mut store)?,
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;
@@ -2656,8 +2639,7 @@ mod tests {
         let prepared = governance::prepare_space_resource_registration(
             &serde_json::to_string(&resource)?,
             &network.client,
-            &team.pins_json()?,
-            &team.bundle_json()?,
+            &team.authorization(&network, &mut store)?,
             now() as f64,
         )
         .map_err(anyhow::Error::msg)?;

@@ -2105,11 +2105,35 @@ mod tests {
     #[test]
     fn team_creation_requires_current_verified_source_and_a_new_domain() -> Result<()> {
         use crate::identity::test_support::{TestNetwork, now};
-        use vibeface_secure::authorization::governance;
+        use vibeface_secure::authorization::{ResourceRef, governance};
 
         let network = TestNetwork::new()?;
         let mut store = network.memory()?;
         let at = now();
+        let audience = store
+            .policy
+            .verified()
+            .grant(&network.bundle.grant_leaf)
+            .context("source grant missing")?
+            .payload
+            .audience
+            .clone();
+        let authorization = crate::identity::client_policy_read::verified_client_policy_for_test(
+            &mut store,
+            &network.node,
+            &network.client,
+            &network.account,
+            vibeface_secure::authorization::client_policy_import::AuthorizationSelection {
+                resource: ResourceRef {
+                    space: network.space.clone(),
+                    resource: network.resource.clone(),
+                },
+                audience,
+                grant_leaf: network.bundle.grant_leaf.clone(),
+            },
+            &network.pins,
+            at,
+        )?;
         let prepared = governance::prepare_team_creation(
             &key(8),
             &network.client,
@@ -2117,8 +2141,7 @@ mod tests {
             &network.node.public_key_hex()?,
             PublicKey::of(&network.recovery).as_str(),
             network.resource.as_str(),
-            &serde_json::to_string(&network.pins)?,
-            &serde_json::to_string(&network.bundle)?,
+            &authorization,
             (at + 1_000_000) as f64,
             at as f64,
         )
@@ -2126,7 +2149,7 @@ mod tests {
         let signed = serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
         let verified = governance::verify_team_creation_request(
             store.policy.verified(),
-            &network.bundle,
+            &network.bundle.grant_leaf,
             &network.pins,
             &signed,
             at,
