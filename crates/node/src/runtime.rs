@@ -3777,7 +3777,6 @@ impl Runtime {
             receipts.extend(current);
         }
         receipts.sort_by(|left, right| left.payload.currents.cmp(&right.payload.currents));
-        receipts.dedup();
         let mut currents: Vec<_> = receipts
             .iter()
             .flat_map(|receipt| &receipt.payload.currents)

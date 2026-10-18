@@ -279,7 +279,6 @@ impl Runtime {
             receipt.payload.validate_currents()?;
         }
         receipts.sort_by(|left, right| left.payload.currents.cmp(&right.payload.currents));
-        receipts.dedup();
         match (wire, challenge) {
             (TaskBusinessWire::Submit(wire), TaskBusinessChallenge::Submit(challenge)) => {
                 let proof = ExecutionHandoffFreshness {
@@ -520,7 +519,6 @@ impl Runtime {
                 receipt.payload.validate_currents()?;
             }
             receipts.sort_by(|left, right| left.payload.currents.cmp(&right.payload.currents));
-            receipts.dedup();
             Ok(ExecutionHandoffResolutionFreshness {
                 challenge,
                 receipts,
