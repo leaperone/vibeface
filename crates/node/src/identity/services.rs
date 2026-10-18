@@ -1025,13 +1025,10 @@ mod tests {
         );
         assert!(!fixture.store.connection.is_autocommit());
         fixture.store.connection.execute_batch("ROLLBACK")?;
+        let original_sequence = expected[&fixture.trigger].event.sequence.to_string();
         for (column, changed, original) in [
             ("status", "pending", "ready"),
-            (
-                "author",
-                "another-author",
-                expected[&fixture.trigger].event.author.as_str(),
-            ),
+            ("sequence", "999", original_sequence.as_str()),
         ] {
             fixture.store.connection.execute(
                 &format!("UPDATE events SET {column}=? WHERE space_id=? AND hash=?"),
