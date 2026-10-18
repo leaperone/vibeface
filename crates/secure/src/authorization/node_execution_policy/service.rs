@@ -429,3 +429,383 @@ pub fn verify_node_history_policy_source(
     };
     Ok((source, request))
 }
+
+#[derive(Clone)]
+pub struct NodeTaskExecutionPolicyImport {
+    trust: VerifiedTaskExecutionTrust,
+    source: VerifiedTaskPolicySource,
+    request: NodeExecutionPolicyReadRequest,
+    header: Signed<remote_execution_policy::RemoteExecutionPolicySnapshot>,
+    import: policy_import::BoundedPolicyImport,
+    previous_page_hash: ObjectHash,
+    next_cursor: Option<ObjectHash>,
+    last_page: Option<Signed<remote_execution_policy::RemoteExecutionPolicyPage>>,
+    page_count: u64,
+    entry_count: u64,
+    complete: bool,
+    usage: ExecutionProofUsage,
+    page_envelope_hashes: Vec<ObjectHash>,
+    peer: ActualPolicyNoisePeer,
+}
+
+fn carrier<T: Serialize>(value: &T) -> Result<()> {
+    require(
+        canonical(value)?.len() <= MAX_PROOF_BYTES,
+        "native Node policy carrier exceeds 64 KiB",
+    )
+}
+
+fn check_request(request: &NodeExecutionPolicyReadRequest, now: u64) -> Result<()> {
+    carrier(request)?;
+    read_window(request.issued_at_ms(), request.expires_at_ms(), now)?;
+    validate_pins(request.execution_pins())?;
+    match request {
+        NodeExecutionPolicyReadRequest::Current(value) => {
+            value.verify_signature()?;
+            require(
+                value.payload.version == AUTH_VERSION
+                    && value.payload.purpose != RemoteExecutionPolicyPurpose::History,
+                "native current policy request changed its version or purpose",
+            )
+        }
+        NodeExecutionPolicyReadRequest::History(value) => {
+            value.verify_signature()?;
+            require(
+                value.payload.version == AUTH_VERSION,
+                "native History policy request changed its version",
+            )?;
+            remote_execution_history::validate_remote_execution_history_reference(
+                &value.payload.reference,
+            )
+        }
+    }
+}
+
+/// `peer` comes from the completed connection to C; a signed transcript cannot enter here.
+pub fn begin_node_task_policy_import(
+    trust: &VerifiedTaskExecutionTrust,
+    source: &VerifiedTaskPolicySource,
+    request: &NodeExecutionPolicyReadRequest,
+    header: &Signed<remote_execution_policy::RemoteExecutionPolicySnapshot>,
+    verified_floors: &[PolicyPin],
+    peer: &ActualPolicyNoisePeer,
+    now: u64,
+) -> Result<NodeTaskExecutionPolicyImport> {
+    let _signatures = ScopedSignatureVerification::new();
+    let same_source = match &source.source_scope {
+        TaskPolicySourceScope::Node(scope) => scope.request == *request,
+        TaskPolicySourceScope::Account(_) => false,
+    };
+    require(
+        same_source && source.verified_at_ms <= now && now < source.expires_at_ms,
+        "native Node policy import changed its verified local source",
+    )?;
+    check_request(request, now)?;
+    let typed = TaskExecutionPolicyRequest::Node(request.clone());
+    check_task_read_scope(trust, &typed)?;
+    let expected = &trust.selection().target_public_key;
+    require(
+        peer.public_key() == expected,
+        "native Node policy import reached another actual Noise peer",
+    )?;
+    carrier(header)?;
+    header.verify_signature()?;
+    read_window(
+        header.payload.issued_at_ms,
+        header.payload.expires_at_ms,
+        now,
+    )?;
+    let history = request.purpose() == RemoteExecutionPolicyPurpose::History;
+    require(
+        history == header.payload.history.is_some()
+            && &header.issuer == expected
+            && &header.payload.source_node_public_key == expected
+            && header.payload.version == AUTH_VERSION
+            && header.payload.request_hash == ObjectHash::body(request)?
+            && header.payload.saved_pins_hash == ObjectHash::body(&request.execution_pins())?
+            && header.payload.issued_at_ms >= request.issued_at_ms()
+            && header.payload.expires_at_ms <= request.expires_at_ms()
+            && !header.payload.target_heads.is_empty()
+            && header.payload.target_heads.len() <= MAX_POLICY_DOMAINS
+            && header
+                .payload
+                .target_heads
+                .windows(2)
+                .all(|pair| pair[0].domain < pair[1].domain),
+        "native Node policy snapshot changed its source, signed request or purpose",
+    )?;
+    let effective = effective_task_pins(trust, source, &typed, verified_floors)?;
+    let selected: Vec<_> = effective
+        .into_iter()
+        .filter(|pin| {
+            header
+                .payload
+                .target_heads
+                .iter()
+                .any(|head| head.domain == pin.domain)
+        })
+        .collect();
+    require(
+        selected.len() == header.payload.target_heads.len(),
+        "native Node policy snapshot introduced an unapproved dependency domain",
+    )?;
+    let original_minima = request
+        .execution_pins()
+        .iter()
+        .filter(|pin| selected.iter().any(|saved| saved.domain == pin.domain))
+        .filter_map(|pin| pin.minimum_head.clone())
+        .collect();
+    let import = policy_import::BoundedPolicyImport::new(selected, original_minima)?;
+    let mut usage = source.usage.clone();
+    match request {
+        NodeExecutionPolicyReadRequest::Current(value) => usage.record_signed(value)?,
+        NodeExecutionPolicyReadRequest::History(value) => usage.record_signed(value)?,
+    }
+    usage.record_metadata(request)?;
+    usage.record_signed(header)?;
+    finish_usage(&mut usage)?;
+    Ok(NodeTaskExecutionPolicyImport {
+        trust: trust.clone(),
+        source: source.clone(),
+        request: request.clone(),
+        header: header.clone(),
+        import,
+        previous_page_hash: header.hash()?,
+        next_cursor: None,
+        last_page: None,
+        page_count: 0,
+        entry_count: 0,
+        complete: false,
+        usage,
+        page_envelope_hashes: Vec::new(),
+        peer: peer.clone(),
+    })
+}
+
+struct CompletedNodePolicy {
+    trust: VerifiedTaskExecutionTrust,
+    source: VerifiedTaskPolicySource,
+    request: TaskExecutionPolicyRequest,
+    header: Signed<remote_execution_policy::RemoteExecutionPolicySnapshot>,
+    witness: Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+    foreign: policy_import::VerifiedPolicySnapshot,
+    usage: ExecutionProofUsage,
+    page_envelope_hashes: Vec<ObjectHash>,
+    origin: PolicyCarrierOrigin,
+}
+
+impl NodeTaskExecutionPolicyImport {
+    pub fn page_request(&self) -> remote_execution_policy::RemoteExecutionPolicyPageRequest {
+        remote_execution_policy::RemoteExecutionPolicyPageRequest {
+            snapshot_id: self.header.payload.snapshot_id.clone(),
+            request_hash: self.header.payload.request_hash.clone(),
+            cursor: self.next_cursor.clone(),
+        }
+    }
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
+
+    pub fn append_page(
+        &mut self,
+        page: &Signed<remote_execution_policy::RemoteExecutionPolicyPage>,
+        now: u64,
+    ) -> Result<()> {
+        let _signatures = ScopedSignatureVerification::new();
+        carrier(page)?;
+        read_window(
+            self.header.payload.issued_at_ms,
+            self.header.payload.expires_at_ms,
+            now,
+        )?;
+        page.verify_signature()?;
+        require(
+            page.issuer == self.header.issuer
+                && page.payload.version == AUTH_VERSION
+                && page.payload.request_hash == self.header.payload.request_hash
+                && page.payload.snapshot_id == self.header.payload.snapshot_id
+                && page.payload.target_heads_hash
+                    == ObjectHash::body(&self.header.payload.target_heads)?,
+            "native Node policy page changed its source or snapshot",
+        )?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_signed(page)?;
+        if self.last_page.as_ref() == Some(page) {
+            finish_usage(&mut usage)?;
+            self.usage = usage;
+            return Ok(());
+        }
+        require(
+            !self.complete
+                && page.payload.page_index == self.page_count
+                && page.payload.request_cursor == self.next_cursor
+                && page.payload.previous_page_hash == self.previous_page_hash
+                && page.payload.complete == page.payload.next_cursor.is_none()
+                && (page.payload.entry.is_some() || page.payload.complete),
+            "native Node policy page is missing, duplicated or out of order",
+        )?;
+        let mut staged = self.import.clone();
+        if let Some(entry) = &page.payload.entry {
+            usage.merge(&policy_proof::policy_entry_usage(staged.state(), entry)?);
+            usage.enforce_limits()?;
+            staged.apply_entry(entry.clone())?;
+        }
+        finish_usage(&mut usage)?;
+        let page_hash = page.hash()?;
+        let envelope_hash = ObjectHash::body(page)?;
+        self.import = staged;
+        self.previous_page_hash = page_hash;
+        self.next_cursor = page.payload.next_cursor.clone();
+        self.page_count += 1;
+        self.entry_count += u64::from(page.payload.entry.is_some());
+        self.complete = page.payload.complete;
+        self.last_page = Some(page.clone());
+        self.page_envelope_hashes.push(envelope_hash);
+        self.usage = usage;
+        Ok(())
+    }
+
+    fn finish_policy(
+        self,
+        witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+        now: u64,
+        history: bool,
+    ) -> Result<CompletedNodePolicy> {
+        let _signatures = ScopedSignatureVerification::new();
+        check_request(&self.request, now)?;
+        require(
+            history == (self.request.purpose() == RemoteExecutionPolicyPurpose::History)
+                && history == self.header.payload.history.is_some(),
+            "native Node policy completion changed its purpose",
+        )?;
+        carrier(witness)?;
+        witness.verify_signature()?;
+        read_window(
+            self.header.payload.issued_at_ms,
+            self.header.payload.expires_at_ms,
+            now,
+        )?;
+        read_window(
+            witness.payload.issued_at_ms,
+            witness.payload.expires_at_ms,
+            now,
+        )?;
+        require(
+            self.complete
+                && witness.issuer == self.header.issuer
+                && witness.payload.version == AUTH_VERSION
+                && witness.payload.source_node_public_key == self.header.issuer
+                && witness.payload.request_hash == self.header.payload.request_hash
+                && witness.payload.snapshot_id == self.header.payload.snapshot_id
+                && witness.payload.target_heads == self.header.payload.target_heads
+                && witness.payload.snapshot_hash == self.header.hash()?
+                && witness.payload.final_page_hash == self.previous_page_hash
+                && witness.payload.page_count == self.page_count
+                && witness.payload.entry_count == self.entry_count
+                && witness.payload.issued_at_ms >= self.header.payload.issued_at_ms
+                && witness.payload.expires_at_ms <= self.header.payload.expires_at_ms
+                && self.source.verified_at_ms <= now
+                && now < self.source.expires_at_ms
+                && self.peer.public_key() == &self.header.issuer,
+            "native Node policy witness changed its completed stream or actual peer",
+        )?;
+        let snapshot = self.import.finish(&self.header.payload.target_heads)?;
+        let verified = verify_node_execution_policy_read(
+            snapshot.state(),
+            &self.request,
+            &self.header.issuer,
+            self.request.issuer(),
+            self.header.payload.history.as_ref(),
+            now,
+        )?;
+        require(
+            verified.target_heads() == self.header.payload.target_heads
+                && snapshot.journal().iter().all(|entry| {
+                    policy_import::entry_hash(entry).is_ok_and(|hash| verified.allows_hash(&hash))
+                }),
+            "native Node policy stream contains objects outside its necessary reference closure",
+        )?;
+        let advanced: Vec<_> = snapshot
+            .pins()
+            .iter()
+            .cloned()
+            .map(|mut pin| {
+                pin.minimum_head = snapshot.state().head(&pin.domain).cloned();
+                pin
+            })
+            .collect();
+        let foreign = snapshot.with_independent_pins(&advanced)?;
+        let mut usage = verified.proof_usage().clone();
+        usage.merge(&self.source.usage);
+        usage.record_signed(&self.header)?;
+        usage.record_signed(witness)?;
+        usage.record_signed(self.trust.approval())?;
+        finish_usage(&mut usage)?;
+        let request = TaskExecutionPolicyRequest::Node(self.request);
+        check_task_read_scope(&self.trust, &request)?;
+        Ok(CompletedNodePolicy {
+            trust: self.trust,
+            source: self.source,
+            request,
+            header: self.header,
+            witness: witness.clone(),
+            foreign,
+            usage,
+            page_envelope_hashes: self.page_envelope_hashes,
+            origin: PolicyCarrierOrigin::DirectNoise(self.peer),
+        })
+    }
+
+    pub fn finish_current(
+        self,
+        witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+        now: u64,
+    ) -> Result<VerifiedTaskCurrentPolicy> {
+        let finished = self.finish_policy(witness, now, false)?;
+        let combined =
+            policy_import::merge_same_head_snapshots(&finished.source.snapshot, &finished.foreign)?;
+        let (primary_heads, foreign_heads) = combined.heads().iter().cloned().partition(|head| {
+            finished
+                .source
+                .primary_pins
+                .iter()
+                .any(|pin| pin.domain == head.domain)
+        });
+        let policy = VerifiedTaskCurrentPolicy {
+            selection: finished.request.selection()?,
+            context: finished.request.context()?,
+            source: finished.source,
+            trust: finished.trust,
+            request: finished.request,
+            snapshot: finished.header,
+            witness: finished.witness,
+            combined,
+            primary_heads,
+            foreign_heads,
+            usage: finished.usage,
+            page_envelope_hashes: finished.page_envelope_hashes,
+            origin: finished.origin,
+        };
+        policy.check_window(now)?;
+        Ok(policy)
+    }
+
+    pub fn finish_history(
+        self,
+        witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+        now: u64,
+    ) -> Result<VerifiedTaskHistoryPolicy> {
+        let finished = self.finish_policy(witness, now, true)?;
+        Ok(VerifiedTaskHistoryPolicy {
+            source: finished.source,
+            trust: finished.trust,
+            request: finished.request,
+            snapshot: finished.header,
+            witness: finished.witness,
+            foreign: finished.foreign,
+            usage: finished.usage,
+            page_envelope_hashes: finished.page_envelope_hashes,
+            origin: finished.origin,
+        })
+    }
+}
