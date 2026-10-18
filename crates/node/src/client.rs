@@ -681,6 +681,279 @@ async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Res
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn node_policy_reader_uses_real_noise_and_cannot_upgrade_its_session() -> Result<()> {
+        use crate::{
+            config::{self, Config},
+            identity::{foreign_execution_policy::tests::unseeded_fixture, test_support::now},
+            network::{MAX_FRAME_BYTES, NetworkConfig},
+            store::Store,
+        };
+        use axum::{
+            Router,
+            extract::{State as AxumState, WebSocketUpgrade},
+            routing::get,
+        };
+        use tokio::{net::TcpListener, task::JoinSet};
+        use vibeface_secure::{
+            Identity,
+            authorization::{
+                AUTH_VERSION, Nonce, ObjectHash,
+                node_execution_policy::{
+                    NodeExecutionPolicyReadIntent, NodeExecutionPolicyReadRequest,
+                },
+                remote_execution_policy::RemoteExecutionPolicyPageRequest,
+            },
+        };
+
+        fn policy_counts(store: &Store) -> Result<(u64, u64, u64)> {
+            Ok(store.connection.query_row(
+                "SELECT (SELECT count(*) FROM policy_pins),
+                    (SELECT count(*) FROM policy_journal),
+                    (SELECT count(*) FROM current_policy_heads)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?)
+        }
+
+        async fn upgrade(
+            AxumState(hub): AxumState<Arc<NetworkHub>>,
+            ws: WebSocketUpgrade,
+        ) -> impl axum::response::IntoResponse {
+            ws.max_message_size(MAX_FRAME_BYTES)
+                .max_frame_size(MAX_FRAME_BYTES)
+                .on_upgrade(|socket| async move {
+                    let _ = hub.accept(socket).await;
+                })
+        }
+
+        let mut fixture = unseeded_fixture()?;
+        let before_b = policy_counts(&fixture.store)?;
+        let before_c = policy_counts(&fixture.target)?;
+        let b_node_id = fixture.project.node.node_id()?;
+        assert_eq!(
+            fixture.target.connection.query_row(
+                "SELECT count(*) FROM node_certificates WHERE node_id=?",
+                [&b_node_id],
+                |row| row.get::<_, u64>(0),
+            )?,
+            0
+        );
+        assert!(
+            fixture
+                .target
+                .authorize_transport_node(&b_node_id, now())
+                .is_err()
+        );
+        assert!(
+            fixture
+                .store
+                .authorization_state()
+                .account(&fixture.executor.account)
+                .is_none()
+        );
+        let trust = fixture.store.approve_task_execution_policy(
+            &fixture.project.node,
+            &fixture.project.client.public_key_hex(),
+            &fixture.intent,
+            now(),
+        )?;
+        let original = &trust.original_intent().payload;
+        let signer = Identity::from_secret_hex(&fixture.project.node.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let request = NodeExecutionPolicyReadRequest::Current(Signed::sign(
+            NodeExecutionPolicyReadIntent {
+                version: AUTH_VERSION,
+                source_project: original.source_selection.resource.clone(),
+                selection: original.selection.clone(),
+                context: original.context.clone(),
+                expected_action: original.expected_action,
+                purpose: original.purpose,
+                execution_pins: original.execution_pins.clone(),
+                nonce: Nonce::random()?,
+                issued_at_ms: now(),
+                expires_at_ms: original.expires_at_ms,
+            },
+            &signer,
+        )?);
+
+        let dir = &fixture.executor.directory;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &serde_json::to_vec(&config::data_format())?,
+        )?;
+        let mut cfg = Config::local(
+            "127.0.0.1:4790".parse()?,
+            vec![fixture.executor.project.clone()],
+            false,
+        );
+        cfg.codex_socket = Some(dir.join("unavailable.sock"));
+        cfg.codex_bin = dir.join("missing-codex");
+        cfg.claude_bin = dir.join("missing-claude");
+        cfg.save(dir)?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&fixture.executor.node)?,
+        )?;
+        drop(fixture.executor.at(&dir.join("node.sqlite3"))?);
+        let node = Arc::new(Runtime::open(dir).await?);
+        *node.store.lock().await = fixture.target;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("ws://{}/api/network/ws", listener.local_addr()?);
+        let (target_network, mut incoming) = NetworkHub::new(
+            fixture.executor.node.clone(),
+            NetworkConfig {
+                advertise_urls: vec![url.clone()],
+                ..Default::default()
+            },
+        );
+        let router = Router::new()
+            .route("/api/network/ws", get(upgrade))
+            .with_state(target_network);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let server = node.clone();
+        tasks.spawn(async move {
+            while let Some(incoming) = incoming.recv().await {
+                assert_eq!(incoming.service, Service::Client);
+                let _ = serve(server.clone(), incoming.socket).await;
+            }
+        });
+        let (network, _) = NetworkHub::new(
+            fixture.project.node.clone(),
+            NetworkConfig {
+                bootstrap_urls: vec![url],
+                ..Default::default()
+            },
+        );
+
+        let target_key = &trust.selection().target_public_key;
+        let socket = network
+            .dial(&fixture.executor.node.node_id()?, Service::Client)
+            .await?;
+        let wrong_pin = Client::from_socket(socket, &fixture.project.node, target_key.as_str())
+            .await
+            .err()
+            .context("a public key must not pass the Noise fingerprint gate")?;
+        assert!(
+            wrong_pin
+                .to_string()
+                .contains("unexpected Noise peer identity")
+        );
+
+        let mut reader =
+            NodePolicyReadClient::connect(&network, &fixture.project.node, &trust).await?;
+        assert_eq!(reader.actual_noise_peer().public_key(), target_key);
+        let NodeReadResponse::Snapshot(snapshot) = reader
+            .read(&NodeReadRequest::Prepare(request.clone()))
+            .await?
+        else {
+            anyhow::bail!("expected a Node policy snapshot");
+        };
+        snapshot.verify_signature()?;
+        assert_eq!(&snapshot.issuer, target_key);
+        assert_eq!(snapshot.payload.request_hash, ObjectHash::body(&request)?);
+        for (method, params) in [
+            ("authenticate", json!({})),
+            ("rpc", json!({})),
+            ("identity", json!({"method":"status","params":{}})),
+        ] {
+            let error = reader
+                .client
+                .call(method, params)
+                .await
+                .err()
+                .context("a policy reader must not upgrade its session")?;
+            assert!(
+                error.to_string().contains("cannot change purpose"),
+                "{error}"
+            );
+        }
+
+        let mut cursor = None;
+        let mut previous = snapshot.hash()?;
+        let mut page_count = 0;
+        let mut entry_count = 0;
+        loop {
+            let NodeReadResponse::Page(page) = reader
+                .read(&NodeReadRequest::Page(RemoteExecutionPolicyPageRequest {
+                    snapshot_id: snapshot.payload.snapshot_id.clone(),
+                    request_hash: snapshot.payload.request_hash.clone(),
+                    cursor: cursor.clone(),
+                }))
+                .await?
+            else {
+                anyhow::bail!("expected a Node policy page");
+            };
+            page.verify_signature()?;
+            assert_eq!(&page.issuer, target_key);
+            assert_eq!(page.payload.snapshot_id, snapshot.payload.snapshot_id);
+            assert_eq!(page.payload.request_hash, snapshot.payload.request_hash);
+            assert_eq!(page.payload.page_index, page_count);
+            assert_eq!(page.payload.request_cursor, cursor);
+            assert_eq!(page.payload.previous_page_hash, previous);
+            previous = page.hash()?;
+            page_count += 1;
+            entry_count += u64::from(page.payload.entry.is_some());
+            if page.payload.complete {
+                assert!(page.payload.next_cursor.is_none());
+                break;
+            }
+            cursor = Some(
+                page.payload
+                    .next_cursor
+                    .context("next policy page missing")?,
+            );
+            ensure!(page_count < 128, "Node policy stream did not finish");
+        }
+        let NodeReadResponse::Witness(witness) = reader
+            .read(&NodeReadRequest::Finish(RemoteExecutionPolicyPageRequest {
+                snapshot_id: snapshot.payload.snapshot_id.clone(),
+                request_hash: snapshot.payload.request_hash.clone(),
+                cursor: None,
+            }))
+            .await?
+        else {
+            anyhow::bail!("expected a Node policy witness");
+        };
+        witness.verify_signature()?;
+        assert_eq!(&witness.issuer, target_key);
+        assert_eq!(witness.payload.snapshot_id, snapshot.payload.snapshot_id);
+        assert_eq!(witness.payload.request_hash, snapshot.payload.request_hash);
+        assert_eq!(witness.payload.snapshot_hash, snapshot.hash()?);
+        assert_eq!(witness.payload.final_page_hash, previous);
+        assert_eq!(witness.payload.page_count, page_count);
+        assert_eq!(witness.payload.entry_count, entry_count);
+        assert!(page_count > 0 && entry_count > 0);
+        assert_eq!(policy_counts(&fixture.store)?, before_b);
+        assert!(
+            fixture
+                .store
+                .authorization_state()
+                .account(&fixture.executor.account)
+                .is_none()
+        );
+        let target = node.store.lock().await;
+        assert_eq!(policy_counts(&target)?, before_c);
+        assert_eq!(
+            target.connection.query_row(
+                "SELECT count(*) FROM node_certificates WHERE node_id=?",
+                [&b_node_id],
+                |row| row.get::<_, u64>(0),
+            )?,
+            0
+        );
+        assert!(target.authorize_transport_node(&b_node_id, now()).is_err());
+        drop(target);
+        drop(reader);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        Ok(())
+    }
+
     #[test]
     fn node_policy_reader_sessions_cannot_upgrade_to_other_methods() -> Result<()> {
         let mut session = Session {
