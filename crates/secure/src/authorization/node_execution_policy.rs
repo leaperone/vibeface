@@ -555,6 +555,10 @@ impl TaskExecutionPolicyImport {
         page: &Signed<remote_execution_policy::RemoteExecutionPolicyPage>,
         now: u64,
     ) -> Result<()> {
+        require(
+            page.payload.entry.is_some() || page.payload.complete,
+            "native policy import rejects empty nonfinal pages",
+        )?;
         self.inner.append_native_page(page, now)?;
         let index = usize::try_from(page.payload.page_index)
             .map_err(|_| AuthorizationError::InvalidProof("native policy page index overflow"))?;
@@ -575,9 +579,10 @@ impl TaskExecutionPolicyImport {
         now: u64,
     ) -> Result<VerifiedTaskCurrentPolicy> {
         require(
-            self.inner.native_request().intent.payload.purpose
-                != RemoteExecutionPolicyPurpose::History,
-            "history policy cannot become current execution policy",
+            !self.source.retained
+                && self.inner.native_request().intent.payload.purpose
+                    != RemoteExecutionPolicyPurpose::History,
+            "retained or history policy cannot become current execution policy",
         )?;
         let remote = self.inner.finish_native(witness, now, false)?;
         VerifiedTaskCurrentPolicy::from_remote(
@@ -589,15 +594,86 @@ impl TaskExecutionPolicyImport {
             now,
         )
     }
+    pub fn finish_original_admission(
+        self,
+        witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+        proof: &events::AdmissionProof,
+    ) -> Result<VerifiedTaskOriginalAdmissionPolicy> {
+        require(
+            self.source.retained
+                && self.source.verified_at_ms == proof.admitted_at_ms
+                && self.inner.native_request().intent.payload.purpose
+                    != RemoteExecutionPolicyPurpose::History,
+            "retained policy requires its exact original admission clock and nonhistory purpose",
+        )?;
+        let remote = self
+            .inner
+            .finish_native(witness, proof.admitted_at_ms, false)?;
+        let policy = VerifiedTaskCurrentPolicy::from_remote(
+            self.trust,
+            self.source,
+            self.origin,
+            self.page_envelope_hashes,
+            remote,
+            proof.admitted_at_ms,
+        )?;
+        original_admission(policy, proof)
+    }
+    pub fn finish_retained_floors(
+        self,
+        witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+        original_clock: u64,
+    ) -> Result<Vec<PolicyPin>> {
+        require(
+            self.source.retained && self.source.verified_at_ms == original_clock,
+            "retained floor verification requires its original source clock",
+        )?;
+        let history = self.inner.native_request().intent.payload.purpose
+            == RemoteExecutionPolicyPurpose::History;
+        let remote = self.inner.finish_native(witness, original_clock, history)?;
+        let mut usage = remote.native_proof_usage().clone();
+        usage.merge(&self.source.usage);
+        remote.record_metadata(&mut usage)?;
+        usage.record_signed(remote.native_header())?;
+        usage.record_signed(self.trust.original_intent())?;
+        usage.record_signed(self.trust.approval())?;
+        usage.enforce_limits()?;
+        remote
+            .snapshot()
+            .pins()
+            .iter()
+            .filter(|pin| {
+                !self
+                    .source
+                    .primary_pins
+                    .iter()
+                    .any(|primary| primary.domain == pin.domain)
+            })
+            .map(|pin| {
+                let mut pin = pin.clone();
+                pin.minimum_head = Some(
+                    remote
+                        .snapshot()
+                        .heads()
+                        .iter()
+                        .find(|head| head.domain == pin.domain)
+                        .cloned()
+                        .ok_or(AuthorizationError::PolicyConflict)?,
+                );
+                Ok(pin)
+            })
+            .collect()
+    }
     pub fn finish_history(
         self,
         witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
         now: u64,
     ) -> Result<VerifiedTaskHistoryPolicy> {
         require(
-            self.inner.native_request().intent.payload.purpose
-                == RemoteExecutionPolicyPurpose::History,
-            "current policy cannot become history policy",
+            !self.source.retained
+                && self.inner.native_request().intent.payload.purpose
+                    == RemoteExecutionPolicyPurpose::History,
+            "retained or current policy cannot become history policy",
         )?;
         require(
             self.source.verified_at_ms <= now && now < self.source.expires_at_ms,
@@ -607,6 +683,10 @@ impl TaskExecutionPolicyImport {
         let request = TaskExecutionPolicyRequest::Account(remote.native_request().clone());
         let mut usage = remote.native_proof_usage().clone();
         usage.merge(&self.source.usage);
+        remote.record_metadata(&mut usage)?;
+        usage.record_signed(remote.native_header())?;
+        usage.record_signed(self.trust.original_intent())?;
+        usage.record_signed(self.trust.approval())?;
         usage.enforce_limits()?;
         Ok(VerifiedTaskHistoryPolicy {
             source: self.source,
@@ -659,6 +739,9 @@ impl VerifiedTaskCurrentPolicy {
         });
         let mut usage = remote.native_proof_usage().clone();
         usage.merge(&source.usage);
+        remote.record_metadata(&mut usage)?;
+        usage.record_signed(remote.native_header())?;
+        usage.record_signed(trust.original_intent())?;
         usage.record_signed(trust.approval())?;
         usage.enforce_limits()?;
         let policy = Self {
@@ -703,6 +786,19 @@ impl VerifiedTaskCurrentPolicy {
         context: &prepare::PrepareContext,
         now: u64,
     ) -> Result<()> {
+        require(
+            !self.source.retained,
+            "retained policy cannot authorize a current request",
+        )?;
+        self.check_scope_inner(facts, selection, context, now)
+    }
+    fn check_scope_inner(
+        &self,
+        facts: &RequestFacts,
+        selection: &RemoteExecutionPolicySelection,
+        context: &prepare::PrepareContext,
+        now: u64,
+    ) -> Result<()> {
         self.check_window(now)?;
         require(
             facts.resource == *self.request.source_project()
@@ -716,6 +812,71 @@ impl VerifiedTaskCurrentPolicy {
         )
     }
     pub fn check_body_scope(
+        &self,
+        invocation: &Signed<Invocation>,
+        facts: &RequestFacts,
+        body: &serde_json::Value,
+        now: u64,
+    ) -> Result<()> {
+        require(
+            !self.source.retained,
+            "retained policy cannot authorize a current body",
+        )?;
+        self.check_body_scope_inner(invocation, facts, body, now)
+    }
+    pub fn check_prepare_scope(
+        &self,
+        intent: &Signed<prepare::PrepareIntent>,
+        body: &serde_json::Value,
+        now: u64,
+    ) -> Result<()> {
+        require(
+            !self.source.retained,
+            "retained policy cannot authorize a current prepare",
+        )?;
+        let signatures = ScopedSignatureVerification::new();
+        intent.verify_signature()?;
+        let prepared = &intent.payload;
+        let request = &prepared.request;
+        require(
+            request.body_hash == ObjectHash::body(body)?,
+            "task policy body differs from the actual signed prepare",
+        )?;
+        let (execution_resource, target_public_key, execution_grant) =
+            prepare::remote_selection(body)?.ok_or(AuthorizationError::InvalidProof(
+                "task policy prepare has no remote selection",
+            ))?;
+        let facts = RequestFacts {
+            resource: request.resource.clone(),
+            action: request.action,
+            audience: request.audience.clone(),
+            operation_id: request.operation_id.clone(),
+            body_hash: request.body_hash.clone(),
+            context: request.context.clone(),
+        };
+        let context = prepare::PrepareContext {
+            context: request.context.clone(),
+            binding_generation: prepared.binding_generation,
+            canonical_cwd: prepared.canonical_cwd.clone(),
+            execution_target_public_key: prepared.execution_target_public_key.clone(),
+        };
+        self.check_scope(
+            &facts,
+            &RemoteExecutionPolicySelection {
+                execution_resource,
+                target_public_key,
+                execution_grant,
+            },
+            &context,
+            now,
+        )?;
+        prepare::check_raw_context(prepared, body, self.request.source_node())?;
+        let mut usage = self.usage.clone();
+        usage.record_signed(intent)?;
+        usage.record_actual_signature_counts(signatures.counts());
+        usage.enforce_limits()
+    }
+    fn check_body_scope_inner(
         &self,
         invocation: &Signed<Invocation>,
         facts: &RequestFacts,
@@ -743,7 +904,7 @@ impl VerifiedTaskCurrentPolicy {
             target_public_key,
             execution_grant,
         };
-        self.check_scope(facts, &selection, &self.context, now)?;
+        self.check_scope_inner(facts, &selection, &self.context, now)?;
         let raw = prepare::PrepareIntent {
             request: signed.clone(),
             binding_generation: self.context.binding_generation,
@@ -858,15 +1019,32 @@ impl VerifiedTaskHistoryPolicy {
     }
 }
 
+#[derive(Clone)]
 pub struct VerifiedTaskOriginalAdmissionPolicy {
     policy: VerifiedTaskCurrentPolicy,
+    state: VerifiedPolicySet,
+    primary_heads: Vec<PolicyStamp>,
+    foreign_heads: Vec<PolicyStamp>,
     admission: VerifiedAdmission,
     invocation_hash: ObjectHash,
+    proof_hash: ObjectHash,
+    usage: ExecutionProofUsage,
 }
 pub fn from_task_original_admission(
     policy: VerifiedTaskCurrentPolicy,
     proof: &events::AdmissionProof,
 ) -> Result<VerifiedTaskOriginalAdmissionPolicy> {
+    require(
+        !policy.source.retained,
+        "retained policy requires the original admission importer",
+    )?;
+    original_admission(policy, proof)
+}
+fn original_admission(
+    policy: VerifiedTaskCurrentPolicy,
+    proof: &events::AdmissionProof,
+) -> Result<VerifiedTaskOriginalAdmissionPolicy> {
+    let signatures = ScopedSignatureVerification::new();
     let value = &proof.invocation.payload;
     require(
         value.body_hash == ObjectHash::body(&proof.source_body)?,
@@ -889,28 +1067,46 @@ pub fn from_task_original_admission(
         execution_grant: selection.2,
     };
     let admission = remote_resolution_history::admitted(policy.state(), proof, &facts)?;
-    policy.check_scope(&facts, &selection, &policy.context, proof.admitted_at_ms)?;
-    policy.check_body_scope(
+    policy.check_scope_inner(&facts, &selection, &policy.context, proof.admitted_at_ms)?;
+    policy.check_body_scope_inner(
         &proof.invocation,
         &facts,
         &proof.source_body,
         proof.admitted_at_ms,
     )?;
+    let mut usage = policy.usage.clone();
+    usage.record_admission(proof)?;
+    usage.record_actual_signature_counts(signatures.counts());
+    usage.enforce_limits()?;
+    let state = remote_resolution_history::at_heads(policy.state(), &proof.challenge.policies)?;
+    let (primary_heads, foreign_heads) =
+        proof.challenge.policies.iter().cloned().partition(|head| {
+            policy
+                .source
+                .primary_pins
+                .iter()
+                .any(|pin| pin.domain == head.domain)
+        });
     Ok(VerifiedTaskOriginalAdmissionPolicy {
         invocation_hash: proof.invocation.hash()?,
+        proof_hash: ObjectHash::body(proof)?,
+        usage,
+        state,
+        primary_heads,
+        foreign_heads,
         policy,
         admission,
     })
 }
 impl VerifiedTaskOriginalAdmissionPolicy {
     pub fn state(&self) -> &VerifiedPolicySet {
-        self.policy.state()
+        &self.state
     }
     pub fn primary_heads(&self) -> &[PolicyStamp] {
-        self.policy.primary_heads()
+        &self.primary_heads
     }
     pub fn foreign_heads(&self) -> &[PolicyStamp] {
-        self.policy.foreign_heads()
+        &self.foreign_heads
     }
     pub fn pins(&self) -> &[PolicyPin] {
         self.policy.pins()
@@ -930,11 +1126,17 @@ impl VerifiedTaskOriginalAdmissionPolicy {
     pub fn signed_invocation_hash(&self) -> &ObjectHash {
         &self.invocation_hash
     }
+    pub fn proof_hash(&self) -> &ObjectHash {
+        &self.proof_hash
+    }
+    pub fn trust(&self) -> &VerifiedTaskExecutionTrust {
+        self.policy.trust()
+    }
     pub fn admission(&self) -> &VerifiedAdmission {
         &self.admission
     }
     pub fn proof_usage(&self) -> &ExecutionProofUsage {
-        self.policy.proof_usage()
+        &self.usage
     }
     pub fn original_page_envelope_hashes(&self) -> &[ObjectHash] {
         self.policy.original_page_envelope_hashes()
@@ -1315,7 +1517,19 @@ mod tests {
     #[test]
     fn native_task_import_keeps_foreign_policy_isolated_and_reverifies_retained_carriers() {
         let fixture = retained_history_fixture();
-        let now = 10_020;
+        let event: events::Event = serde_json::from_str(
+            &fixture
+                .actual
+                .handoff
+                .handoff
+                .project_dispatch
+                .canonical_body,
+        )
+        .unwrap();
+        let events::EventCause::Invocation { admission: proof } = event.cause else {
+            panic!("fixture has no original admission")
+        };
+        let now = proof.admitted_at_ms;
         let retained = require_confirmed_client_policy(&fixture.source).unwrap();
         let project = fixture
             .actual
@@ -1356,8 +1570,9 @@ mod tests {
             .grants
             .values()
             .find(|grant| {
-                grant.payload.grantee
-                    == Grantee::Actor(Actor::Service(ServiceId::from_key(&source_key)))
+                grant.hash().unwrap() == fixture.actual.handoff.invocation.payload.grant_leaf
+                    && grant.payload.grantee
+                        == Grantee::Actor(Actor::Service(ServiceId::from_key(&source_key)))
                     && grant.payload.actions.contains(&Action::ExecutionOpen)
                     && fixture
                         .state
@@ -1378,7 +1593,9 @@ mod tests {
         let context = prepare::PrepareContext {
             context: source_context,
             binding_generation: Some(1),
-            canonical_cwd: None,
+            canonical_cwd: fixture.binding.binding.open_spec["cwd"]
+                .as_str()
+                .map(str::to_owned),
             execution_target_public_key: Some(target.clone()),
         };
         let stream = super::super::remote_execution_policy::tests::remote_policy_stream(
@@ -1426,6 +1643,11 @@ mod tests {
             now,
         )
         .unwrap();
+        let mut empty = stream.pages[0].payload.clone();
+        empty.entry = None;
+        empty.complete = false;
+        let empty = Signed::sign(empty, &fixture.executor).unwrap();
+        assert!(import.append_page(&empty, now).is_err());
         for page in &stream.pages {
             import.append_page(page, now).unwrap();
         }
@@ -1470,6 +1692,70 @@ mod tests {
             completed.carrier_origin(),
             PolicyCarrierOrigin::SignedTranscript
         ));
+        let before = completed.proof_usage().counts();
+        let mut accounted = completed.proof_usage().clone();
+        accounted.record_signed(&stream.header).unwrap();
+        assert_eq!(
+            accounted.counts().unique_signed_objects,
+            before.unique_signed_objects
+        );
+        assert_eq!(
+            accounted.counts().unique_signatures,
+            before.unique_signatures
+        );
+        let prepared = prepare::PrepareIntent {
+            request: proof.invocation.payload.clone(),
+            binding_generation: context.binding_generation,
+            canonical_cwd: context.canonical_cwd.clone(),
+            execution_target_public_key: context.execution_target_public_key.clone(),
+        };
+        let signed_prepare = Signed::sign(prepared.clone(), &fixture.client).unwrap();
+        completed
+            .check_prepare_scope(&signed_prepare, &proof.source_body, now)
+            .unwrap();
+        let mut wrong_prepare = prepared.clone();
+        wrong_prepare.binding_generation = Some(2);
+        assert!(
+            completed
+                .check_prepare_scope(
+                    &Signed::sign(wrong_prepare, &fixture.client).unwrap(),
+                    &proof.source_body,
+                    now
+                )
+                .is_err()
+        );
+        let mut wrong_cwd = prepared;
+        wrong_cwd.canonical_cwd = Some("/another-directory".into());
+        assert!(
+            completed
+                .check_prepare_scope(
+                    &Signed::sign(wrong_cwd, &fixture.client).unwrap(),
+                    &proof.source_body,
+                    now
+                )
+                .is_err()
+        );
+        let mut changed_body = proof.source_body.clone();
+        changed_body["authorization_id"] = json!("another-operation");
+        assert!(
+            completed
+                .check_prepare_scope(&signed_prepare, &changed_body, now)
+                .is_err()
+        );
+        let original = from_task_original_admission(completed.clone(), &proof).unwrap();
+        assert_eq!(original.proof_hash(), &ObjectHash::body(&proof).unwrap());
+        assert!(
+            original
+                .primary_heads()
+                .iter()
+                .chain(original.foreign_heads())
+                .all(|head| proof.challenge.policies.contains(head)
+                    && original.state().head(&head.domain) == Some(head))
+        );
+        assert!(
+            original.proof_usage().counts().unique_signed_objects
+                > completed.proof_usage().counts().unique_signed_objects
+        );
         let facts = RequestFacts {
             resource: project,
             audience: stream
@@ -1561,12 +1847,38 @@ mod tests {
         for page in &stream.pages {
             restored.append_page(page, now).unwrap();
         }
-        let restored = restored.finish_current(&stream.witness, now).unwrap();
-        assert_eq!(restored.foreign_heads(), completed.foreign_heads());
+        assert!(
+            restored
+                .clone()
+                .finish_current(&stream.witness, now)
+                .is_err()
+        );
+        assert!(
+            restored
+                .clone()
+                .finish_history(&stream.witness, now)
+                .is_err()
+        );
+        let original_restored = restored
+            .clone()
+            .finish_original_admission(&stream.witness, &proof)
+            .unwrap();
+        assert_eq!(original_restored.proof_hash(), original.proof_hash());
+        assert_eq!(original_restored.foreign_heads(), original.foreign_heads());
         assert_eq!(
-            restored.original_page_envelope_hashes(),
+            original_restored.original_page_envelope_hashes(),
             completed.original_page_envelope_hashes()
         );
+        let floors = restored
+            .finish_retained_floors(&stream.witness, now)
+            .unwrap();
+        assert!(!floors.is_empty());
+        assert!(floors.iter().all(|pin| {
+            completed
+                .foreign_heads()
+                .iter()
+                .any(|head| pin.minimum_head.as_ref() == Some(head) && pin.domain == head.domain)
+        }));
         let mut stolen = stream.request.clone();
         stolen.delegation = Signed::sign(stolen.delegation.payload, &fixture.client).unwrap();
         assert!(
