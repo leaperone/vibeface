@@ -1964,6 +1964,7 @@ mod tests {
             "space_id":fixture.project.space,
             "resource_id":fixture.project.resource,
             "authorization_id":"history-bind",
+            "binding_generation":1,
             "execution_resource":selection.execution_resource,
             "target_public_key":selection.target_public_key,
             "execution_grant":selection.execution_grant,
