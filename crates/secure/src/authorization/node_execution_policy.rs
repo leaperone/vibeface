@@ -11,6 +11,11 @@ use super::{
 use crate::signature_verification::ScopedSignatureVerification;
 
 pub(super) mod service;
+mod freshness;
+pub use freshness::{
+    NodeExecutionFreshnessRead, VerifiedNodeExecutionFreshnessRead,
+    record_node_freshness_receipts, verify_node_execution_freshness_read,
+};
 pub use service::{
     NodeTaskExecutionPolicyImport, begin_node_task_policy_import,
     verify_node_history_policy_source, verify_node_service_policy_source,
