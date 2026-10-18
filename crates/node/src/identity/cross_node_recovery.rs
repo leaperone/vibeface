@@ -1178,6 +1178,12 @@ pub(crate) mod tests {
     fn twelve_enrolled_nodes_recover_through_finite_rpc_and_durable_target_import() -> Result<()> {
         let mut network = TestNetwork::new()?;
         let initial_entries = network.bundle.journal.len();
+        let initial_history_len = network
+            .memory()?
+            .authorization_state()
+            .account_history(&network.account)
+            .context("initial account history missing")?
+            .len();
         for _ in 0..12 {
             network.enroll_node(LocalIdentity::generate())?;
         }
@@ -1193,7 +1199,7 @@ pub(crate) mod tests {
                 .account_history(&network.account)
                 .context("account history missing")?
                 .len(),
-            13
+            initial_history_len + 12
         );
         network.conversation(&mut source, "archive")?;
         let original = network.message(&mut source, "archive", "preserved long history")?;
