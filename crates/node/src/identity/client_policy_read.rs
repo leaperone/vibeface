@@ -9,8 +9,8 @@ use vibeface_secure::{
     authorization::{
         AUTH_VERSION, AuthorizationError, MAX_PROOF_BYTES, Nonce, ObjectHash, PolicyDomain,
         PolicyStamp, PublicKey, ResourceRef, ResourceScope, Signed, SignedObject,
-        client_policy_import::*, execution_handoff::ExecutionProofUsage,
-        policy_proof::policy_entry_payload_usage,
+        VerifiedClientAuthorization, client_policy_import::*,
+        execution_handoff::ExecutionProofUsage, policy_proof::policy_entry_payload_usage,
     },
     signature_verification::ScopedSignatureVerification,
 };
@@ -79,6 +79,13 @@ struct RequestBinding {
 struct ConfirmationRecord {
     request: Signed<ClientPolicyAuthConfirmRequest>,
     confirmation: Signed<ClientPolicyAuthConfirmation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmedClientPolicyReference {
+    client_policy_context: ClientPolicyContextReference,
+    confirmation_hash: ObjectHash,
 }
 
 fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
@@ -816,6 +823,86 @@ impl Store {
         tx.commit()?;
         Ok(response)
     }
+
+    pub(crate) fn authenticate_confirmed_client_policy(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        now: u64,
+    ) -> Result<(VerifiedClientAuthorization, Value)> {
+        let _verification = ScopedSignatureVerification::new();
+        bounded(params.clone())?;
+        let reference: ConfirmedClientPolicyReference = serde_json::from_value(params.clone())?;
+        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record: ClientReadRecord = serde_json::from_str(
+            &metadata(
+                &tx,
+                &context_key(&reference.client_policy_context.snapshot_id),
+            )?
+            .context("client policy snapshot is missing")?,
+        )?;
+        let (_, _, mut usage) = verify_record(&tx, &self.policy, &record, &local, principal, now)?;
+        let witness = record
+            .witness
+            .as_ref()
+            .context("client policy import is not complete")?;
+        ensure!(
+            reference.client_policy_context
+                == (ClientPolicyContextReference {
+                    snapshot_id: record.snapshot.payload.snapshot_id.clone(),
+                    request_hash: request_hash(&record.request)?,
+                    snapshot_hash: record.snapshot.hash()?,
+                    witness_hash: witness.hash()?,
+                }),
+            "client policy session changed its exact context"
+        );
+        let confirmation: ConfirmationRecord = serde_json::from_str(
+            &metadata(&tx, &confirmation_key(&record.snapshot.payload.snapshot_id))?
+                .context("client policy authentication is not confirmed")?,
+        )?;
+        ensure!(
+            confirmation.confirmation.hash()? == reference.confirmation_hash,
+            "client policy session changed its confirmation receipt"
+        );
+        let authorization = verify_client_policy_server_session(
+            self.policy.verified().clone(),
+            &record.request,
+            &record.snapshot,
+            witness,
+            &confirmation.request,
+            &confirmation.confirmation,
+            &local,
+            &PublicKey::parse(principal)?,
+            now,
+        )?;
+        usage.record_signed(&confirmation.request)?;
+        usage.record_signed(&confirmation.confirmation)?;
+        let pins = authorization
+            .heads()
+            .iter()
+            .map(|head| {
+                self.policy
+                    .pins()
+                    .iter()
+                    .find(|pin| pin.domain == head.domain)
+                    .cloned()
+                    .context("client policy session dependency has no trusted pin")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let policy: Value =
+            serde_json::from_str(&authorization.policy_json().map_err(anyhow::Error::msg)?)?;
+        let response = finish_response(
+            json!({"scope":authorization.scope(),"policy":policy,
+            "resources":authorization.resources(),"pins":pins}),
+            usage,
+        )?;
+        tx.commit()?;
+        Ok((authorization, response))
+    }
 }
 
 fn next_selections_in(
@@ -1212,6 +1299,44 @@ mod tests {
         Ok(value)
     }
 
+    fn session_reference(confirmation: &Signed<ClientPolicyAuthConfirmation>) -> Result<Value> {
+        Ok(
+            json!({"client_policy_context":confirmation.payload.context,"confirmation_hash":confirmation.hash()?}),
+        )
+    }
+
+    fn server_session(
+        store: &mut Store,
+        network: &TestNetwork,
+        confirmation: &Signed<ClientPolicyAuthConfirmation>,
+    ) -> Result<VerifiedClientAuthorization> {
+        let params = session_reference(confirmation)?;
+        let verification = SignatureVerification::new();
+        let (authorization, metadata) = verification.run(|| {
+            store.authenticate_confirmed_client_policy(
+                &network.node,
+                &network.client.public_key_hex(),
+                &params,
+                now(),
+            )
+        })?;
+        assert!(verification.counts().actual_verifications <= 32);
+        assert!(serde_json::to_vec(&metadata)?.len() <= MAX_PROOF_BYTES);
+        assert!(metadata.get("authorization").is_none());
+        assert_eq!(
+            metadata["scope"],
+            serde_json::to_value(authorization.scope())?
+        );
+        assert_eq!(authorization.scope().account_id, network.account);
+        assert_eq!(authorization.grant_leaf(), &network.bundle.grant_leaf);
+        eprintln!(
+            "client_policy server_session: actual={}, hits={}",
+            verification.counts().actual_verifications,
+            verification.counts().cache_hits
+        );
+        Ok(authorization)
+    }
+
     fn confirmation_request(
         network: &TestNetwork,
         snapshot: &Signed<ClientPolicySnapshot>,
@@ -1294,6 +1419,44 @@ mod tests {
             request.hash()?
         );
         confirmation.verify_signature()?;
+        let session = server_session(&mut store, &network, &confirmation)?;
+        assert_eq!(session.resources().len(), 1);
+        let mut reference = session_reference(&confirmation)?;
+        reference["confirmation_hash"] =
+            serde_json::to_value(ObjectHash::body(&"other confirmation")?)?;
+        assert!(
+            store
+                .authenticate_confirmed_client_policy(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    &reference,
+                    now()
+                )
+                .is_err()
+        );
+        let params = session_reference(&confirmation)?;
+        let foreign = Identity::generate().map_err(anyhow::Error::msg)?;
+        assert!(
+            store
+                .authenticate_confirmed_client_policy(
+                    &network.node,
+                    &foreign.public_key_hex(),
+                    &params,
+                    now()
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .authenticate_confirmed_client_policy(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    &params,
+                    snapshot.payload.expires_at_ms
+                )
+                .is_err()
+        );
+        let params = serde_json::to_value(&request)?;
         assert_eq!(
             response,
             measured("confirm_retry", || store.confirm_client_policy_auth(
@@ -1472,7 +1635,26 @@ mod tests {
         let snapshot = begin(&mut store, &network, read_request(&network, true)?)?;
         let (_, witness) = import_pages(&mut store, &network, &snapshot, None)?;
         let confirm = serde_json::to_value(confirmation_request(&network, &snapshot, &witness)?)?;
+        let confirmed = store.confirm_client_policy_auth(
+            &network.node,
+            &network.client.public_key_hex(),
+            &confirm,
+            now(),
+        )?;
+        let confirmed: Signed<ClientPolicyAuthConfirmation> =
+            serde_json::from_value(confirmed["confirmation"].clone())?;
+        server_session(&mut store, &network, &confirmed)?;
         network.revoke_client(&mut writer)?;
+        assert!(
+            store
+                .authenticate_confirmed_client_policy(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    &session_reference(&confirmed)?,
+                    now() + 2
+                )
+                .is_err()
+        );
         assert!(
             store
                 .client_policy_page(
@@ -1508,7 +1690,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(count, 0);
+        assert_eq!(count, 1);
         Ok(())
     }
 
@@ -1725,6 +1907,10 @@ mod tests {
             )
         })?;
         let encoded_confirmation = serde_json::to_string(&response["confirmation"])?;
+        let confirmation: Signed<ClientPolicyAuthConfirmation> =
+            serde_json::from_str(&encoded_confirmation)?;
+        let session = server_session(&mut store, &network, &confirmation)?;
+        assert_eq!(session.resources().len(), 1);
         let authorization = measured_native("verify_confirmation", || {
             confirm_client_policy_authorization(
                 &authorization,
