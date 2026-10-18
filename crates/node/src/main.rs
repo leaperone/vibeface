@@ -571,7 +571,7 @@ async fn pair(options: Pair) -> Result<()> {
     let invitation = invitation(&options)?;
     let url = network_url(&invitation.url)?;
     let runtime = Runtime::open(&options.data.data_dir).await?;
-    let mut configuration = runtime.config.clone();
+    let mut configuration = Config::load(&options.data.data_dir)?;
     let identity = &runtime.identity;
     let payload = &invitation.invite.invite.payload;
     let pending_path = options.data.data_dir.join("pairing.pending.json");

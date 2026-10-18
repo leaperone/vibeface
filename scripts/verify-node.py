@@ -613,7 +613,8 @@ class Node:
             self.log = None
 
     def pair(self, owner, network, *, relay_url=None):
-        network_config = json.loads((self.directory / "config.json").read_text())["network"]
+        original_config = json.loads((self.directory / "config.json").read_text())
+        network_config = original_config["network"]
         invitation = owner.client.invite("node", ["gateway", "relay", "replica", "scheduler", "executor"])
         path = self.directory / "pair-invitation.json"
         private_json(path, {"url": relay_url or owner.url, "node_id": owner.node_id,
@@ -640,6 +641,9 @@ class Node:
         self.client.pair_client(owner.client, network, f"{self.name} independent client")
         self.client.url = self.url
         self.client.node_id = self.node_id
+        paired_config = json.loads((self.directory / "config.json").read_text())
+        require(paired_config["codex_socket"] == original_config["codex_socket"],
+                "pairing preserves managed or explicit Codex socket configuration")
         self.configure(network=network_config)
 
     def bootstrap(self):
@@ -797,9 +801,16 @@ def fixture_codex(arguments):
         stream, _ = listener.accept()
         stream.settimeout(5)
         header = b""
-        while not header.endswith(b"\r\n\r\n"):
-            header += stream.recv(1)
-            require(len(header) <= 16384, "fixture bounds WebSocket handshake")
+        try:
+            while not header.endswith(b"\r\n\r\n"):
+                part = stream.recv(1)
+                if not part:
+                    raise EOFError("fixture socket probe closed before WebSocket handshake")
+                header += part
+                require(len(header) <= 16384, "fixture bounds WebSocket handshake")
+        except (EOFError, OSError):
+            stream.close()
+            continue
         key = next(line.split(":", 1)[1].strip() for line in header.decode().splitlines()
                    if line.lower().startswith("sec-websocket-key:"))
         accept = base64.b64encode(hashlib.sha1(
