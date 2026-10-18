@@ -1417,32 +1417,6 @@ impl crate::runtime::Runtime {
                     now_ms,
                 )
                 .map(|(_, response)| response),
-            "device_directory" => {
-                let authenticated = store.authenticate_account(noise_public_key, params, now_ms)?;
-                let account = AccountId::parse(
-                    params["account_id"]
-                        .as_str()
-                        .context("account_id is required")?,
-                )?;
-                let document = store
-                    .policy
-                    .verified()
-                    .account(&account)
-                    .context("account policy is missing")?;
-                let devices = document
-                    .devices
-                    .iter()
-                    .map(|hash| {
-                        store
-                            .policy
-                            .verified()
-                            .device(hash)
-                            .cloned()
-                            .context("registered account device proof is missing")
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(json!({"authorization":authenticated["authorization"],"devices":devices}))
-            }
             "policy_commit" => {
                 let entries: Vec<JournalEntry> = serde_json::from_value(params["journal"].clone())?;
                 // Public signed updates prove their own exact authority; new roots are never learned here.

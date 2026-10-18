@@ -2456,7 +2456,7 @@ mod tests {
             .context("original resource is missing")?
             .payload
             .clone();
-        record.resource = other_resource_id;
+        record.resource = other_resource_id.clone();
         record.nonce = Nonce::random()?;
         let record = Signed::sign(record, &network.root)?;
         store.connection.execute(
