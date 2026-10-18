@@ -992,198 +992,198 @@ fn dispatch_request<'a>(
 ) -> futures_util::future::BoxFuture<'a, Result<Value>> {
     Box::pin(async move {
         session.select_method(method)?;
-        match method {
-            GATEWAY_SOURCE_METHOD => {
-                ensure!(
-                    invocation.is_none(),
-                    "gateway source transport does not accept an outer Invocation"
-                );
-                let request: GatewaySourceRequest = serde_json::from_value(params)?;
-                node.gateway_source_request(&session.noise_peer, request)
-                    .await
-            }
-            GATEWAY_FORWARD_METHOD => {
-                ensure!(
-                    invocation.is_none(),
-                    "gateway forward transport does not accept an outer Invocation"
-                );
-                let request: gateway_forward::GatewayForwardRequest =
-                    serde_json::from_value(params)?;
-                let reply = Box::pin(node.gateway_target_request(
-                    &session.noise_peer,
-                    request.header,
-                    request.original,
-                ))
-                .await?;
-                Ok(serde_json::to_value(reply)?)
-            }
-            TASK_RECEIPT_READ_METHOD => {
-                ensure!(
-                    invocation.is_none(),
-                    "task receipt reads do not accept an outer Invocation"
-                );
-                let request: Signed<TaskBusinessReceiptRead> = serde_json::from_value(params)?;
-                let receipts = node
-                    .task_business_receipt_read(&session.noise_peer, request)
-                    .await?;
-                Ok(serde_json::to_value(receipts)?)
-            }
-            TASK_BUSINESS_METHOD => {
-                ensure!(
-                    invocation.is_none(),
-                    "task business transport does not accept an outer Invocation"
-                );
-                session
-                    .task_business(node, serde_json::from_value(params)?)
-                    .await
-            }
-            NODE_POLICY_READ_METHOD => {
-                ensure!(
-                    invocation.is_none(),
-                    "node policy reads do not accept an Invocation"
-                );
-                let request: NodeReadRequest = serde_json::from_value(params)?;
-                let response = node
-                    .node_execution_policy_read(&session.public_key, request)
-                    .await?;
-                Ok(serde_json::to_value(response)?)
-            }
-            "info" => Ok(node.info()),
-            "authenticate" => {
-                let (verified, response) = {
-                    let mut store = node.store.lock().await;
-                    store.authenticate_confirmed_client_policy(
-                        &node.identity,
-                        &session.public_key,
-                        &params,
-                        crate::runtime::now_ms() as u64,
-                    )?
-                };
-                session.subscription = None;
-                session.remote_subscription = None;
-                session.authorization = Some(verified);
-                Ok(response)
-            }
-            "prepare_invocation" => {
-                let client = session
-                    .authorization
-                    .as_ref()
-                    .context("authenticate before preparing a request")?;
-                let intent = serde_json::from_value(params["intent"].clone())?;
-                node.prepare_client_request(
-                    client,
-                    params["body"].clone(),
-                    intent,
-                    &session.public_key,
-                )
+        dispatch_selected_request(node, session, method, params, invocation).await
+    })
+}
+
+fn dispatch_selected_request<'a>(
+    node: &'a Arc<Runtime>,
+    session: &'a mut Session,
+    method: &'a str,
+    params: Value,
+    invocation: Option<Signed<Invocation>>,
+) -> futures_util::future::BoxFuture<'a, Result<Value>> {
+    match method {
+        GATEWAY_SOURCE_METHOD => Box::pin(async move {
+            ensure!(
+                invocation.is_none(),
+                "gateway source transport does not accept an outer Invocation"
+            );
+            let request: GatewaySourceRequest = serde_json::from_value(params)?;
+            node.gateway_source_request(&session.noise_peer, request)
                 .await
-            }
-            "rpc" | "subscribe" => {
-                let client = session
-                    .authorization
-                    .as_ref()
-                    .context("authenticate before sending a request")?;
-                if params["method"] == "execution_observation" {
-                    ensure!(
-                        method == "rpc" && invocation.is_none(),
-                        "execution observation requires its dedicated signed request"
-                    );
-                    let observation: Signed<ExecutionObservationRequest> =
-                        serde_json::from_value(params["observation_request"].clone())?;
-                    let request = &observation.payload.request;
-                    ensure!(
-                        request.actor == Actor::Account(client.scope().account_id.clone())
-                            && request.device == client.scope().device_id
-                            && request.resource.space == client.scope().space_id
-                            && &request.audience == client.audience(),
-                        "observation differs from the authenticated client scope"
-                    );
-                    if client.audience() != &node.local_audience()? {
-                        return node
-                            .forward_client_execution_observation(
-                                client,
-                                &params,
-                                &session.public_key,
-                            )
-                            .await;
-                    }
-                    return node
-                        .observe_client_execution(
-                            params,
-                            TransportEvidence::DirectNoise {
-                                device: DeviceId::from_key(&PublicKey::parse(&session.public_key)?),
-                            },
-                        )
-                        .await;
-                }
+        }),
+        GATEWAY_FORWARD_METHOD => Box::pin(async move {
+            ensure!(
+                invocation.is_none(),
+                "gateway forward transport does not accept an outer Invocation"
+            );
+            let request: gateway_forward::GatewayForwardRequest = serde_json::from_value(params)?;
+            let reply = Box::pin(node.gateway_target_request(
+                &session.noise_peer,
+                request.header,
+                request.original,
+            ))
+            .await?;
+            Ok(serde_json::to_value(reply)?)
+        }),
+        TASK_RECEIPT_READ_METHOD => Box::pin(async move {
+            ensure!(
+                invocation.is_none(),
+                "task receipt reads do not accept an outer Invocation"
+            );
+            let request: Signed<TaskBusinessReceiptRead> = serde_json::from_value(params)?;
+            let receipts = node
+                .task_business_receipt_read(&session.noise_peer, request)
+                .await?;
+            Ok(serde_json::to_value(receipts)?)
+        }),
+        TASK_BUSINESS_METHOD => Box::pin(async move {
+            ensure!(
+                invocation.is_none(),
+                "task business transport does not accept an outer Invocation"
+            );
+            session
+                .task_business(node, serde_json::from_value(params)?)
+                .await
+        }),
+        NODE_POLICY_READ_METHOD => Box::pin(async move {
+            ensure!(
+                invocation.is_none(),
+                "node policy reads do not accept an Invocation"
+            );
+            let request: NodeReadRequest = serde_json::from_value(params)?;
+            let response = node
+                .node_execution_policy_read(&session.public_key, request)
+                .await?;
+            Ok(serde_json::to_value(response)?)
+        }),
+        "info" => Box::pin(async move { Ok(node.info()) }),
+        "authenticate" => Box::pin(async move {
+            let (verified, response) = {
+                let mut store = node.store.lock().await;
+                store.authenticate_confirmed_client_policy(
+                    &node.identity,
+                    &session.public_key,
+                    &params,
+                    crate::runtime::now_ms() as u64,
+                )?
+            };
+            session.subscription = None;
+            session.remote_subscription = None;
+            session.authorization = Some(verified);
+            Ok(response)
+        }),
+        "prepare_invocation" => Box::pin(async move {
+            let client = session
+                .authorization
+                .as_ref()
+                .context("authenticate before preparing a request")?;
+            let intent = serde_json::from_value(params["intent"].clone())?;
+            node.prepare_client_request(client, params["body"].clone(), intent, &session.public_key)
+                .await
+        }),
+        "rpc" | "subscribe" => Box::pin(async move {
+            let client = session
+                .authorization
+                .as_ref()
+                .context("authenticate before sending a request")?;
+            if params["method"] == "execution_observation" {
                 ensure!(
-                    params["space_id"].as_str() == Some(client.scope().space_id.as_str()),
-                    "request belongs to another space"
+                    method == "rpc" && invocation.is_none(),
+                    "execution observation requires its dedicated signed request"
                 );
-                let invocation = invocation.context("signed Invocation is required")?;
+                let observation: Signed<ExecutionObservationRequest> =
+                    serde_json::from_value(params["observation_request"].clone())?;
+                let request = &observation.payload.request;
                 ensure!(
-                    invocation.payload.grant_leaf == *client.grant_leaf(),
-                    "request uses another grant"
+                    request.actor == Actor::Account(client.scope().account_id.clone())
+                        && request.device == client.scope().device_id
+                        && request.resource.space == client.scope().space_id
+                        && &request.audience == client.audience(),
+                    "observation differs from the authenticated client scope"
                 );
                 if client.audience() != &node.local_audience()? {
-                    if method == "subscribe" {
-                        let cursor = node
-                            .remote_subscription_cursor(
-                                client,
-                                &params,
-                                &invocation,
-                                &session.public_key,
-                            )
-                            .await?;
-                        session.subscription = None;
-                        session.remote_subscription = Some(RemoteSubscription {
-                            body: params,
-                            invocation,
-                            cursor,
-                        });
-                        return Ok(json!({"subscribed":true}));
-                    }
                     return node
-                        .forward_client_request(client, &params, &invocation, &session.public_key)
+                        .forward_client_execution_observation(client, &params, &session.public_key)
                         .await;
                 }
-                let device = DeviceId::from_key(&PublicKey::parse(&session.public_key)?);
-                let transport = if invocation.payload.presenter == device {
-                    TransportEvidence::DirectNoise { device }
-                } else {
-                    TransportEvidence::GatewayNoise {
-                        device,
-                        gateway: DeviceId::from_key(&PublicKey::parse(
-                            &node.identity.public_key_hex()?,
-                        )?),
-                    }
-                };
-                let access = node
-                    .authorize_rpc(params.clone(), invocation, transport)
-                    .await?;
+                return node
+                    .observe_client_execution(
+                        params,
+                        TransportEvidence::DirectNoise {
+                            device: DeviceId::from_key(&PublicKey::parse(&session.public_key)?),
+                        },
+                    )
+                    .await;
+            }
+            ensure!(
+                params["space_id"].as_str() == Some(client.scope().space_id.as_str()),
+                "request belongs to another space"
+            );
+            let invocation = invocation.context("signed Invocation is required")?;
+            ensure!(
+                invocation.payload.grant_leaf == *client.grant_leaf(),
+                "request uses another grant"
+            );
+            if client.audience() != &node.local_audience()? {
                 if method == "subscribe" {
-                    node.validate_subscription(&access).await?;
-                    session.remote_subscription = None;
-                    session.subscription = Some(access);
-                    Ok(json!({"subscribed":true}))
-                } else {
-                    Box::pin(node.rpc(access, params)).await
+                    let cursor = node
+                        .remote_subscription_cursor(
+                            client,
+                            &params,
+                            &invocation,
+                            &session.public_key,
+                        )
+                        .await?;
+                    session.subscription = None;
+                    session.remote_subscription = Some(RemoteSubscription {
+                        body: params,
+                        invocation,
+                        cursor,
+                    });
+                    return Ok(json!({"subscribed":true}));
                 }
+                return node
+                    .forward_client_request(client, &params, &invocation, &session.public_key)
+                    .await;
             }
-            "identity" => {
-                let method = params["method"]
-                    .as_str()
-                    .context("identity method is required")?;
-                ensure!(
-                    method != "authenticate",
-                    "use the authenticate channel method to bind this session"
-                );
-                node.identity_command(&session.public_key, method, &params["params"])
-                    .await
+            let device = DeviceId::from_key(&PublicKey::parse(&session.public_key)?);
+            let transport = if invocation.payload.presenter == device {
+                TransportEvidence::DirectNoise { device }
+            } else {
+                TransportEvidence::GatewayNoise {
+                    device,
+                    gateway: DeviceId::from_key(&PublicKey::parse(
+                        &node.identity.public_key_hex()?,
+                    )?),
+                }
+            };
+            let access = node
+                .authorize_rpc(params.clone(), invocation, transport)
+                .await?;
+            if method == "subscribe" {
+                node.validate_subscription(&access).await?;
+                session.remote_subscription = None;
+                session.subscription = Some(access);
+                Ok(json!({"subscribed":true}))
+            } else {
+                Box::pin(node.rpc(access, params)).await
             }
-            _ => bail!("unknown client method"),
-        }
-    })
+        }),
+        "identity" => Box::pin(async move {
+            let method = params["method"]
+                .as_str()
+                .context("identity method is required")?;
+            ensure!(
+                method != "authenticate",
+                "use the authenticate channel method to bind this session"
+            );
+            node.identity_command(&session.public_key, method, &params["params"])
+                .await
+        }),
+        _ => Box::pin(async move { bail!("unknown client method") }),
+    }
 }
 
 fn client_endpoint(value: &str) -> Result<String> {
