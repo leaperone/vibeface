@@ -6,6 +6,7 @@ mod gateway_target;
 pub(crate) use gateway_forward::GatewaySourceRequest;
 
 mod dispatch;
+mod node_policy_read;
 
 use crate::identity::{
     policy::{FreshnessProof, RequestTransport},
@@ -5018,10 +5019,10 @@ impl Runtime {
         verification: SignatureVerification,
     ) -> Result<Access> {
         let now = now_ms() as u64;
-        let (session, facts) = {
+        let mut session = {
             let mut store = self.store.lock().await;
             verification.run(|| -> Result<_> {
-            let mut session = store.refresh_agent_session(session, now)?;
+            let session = store.refresh_agent_session(session, now)?;
             let origin = store.agent_origin(&session, now)?;
             if let Some((task, reference)) = origin.task {
                 ensure!(
@@ -5057,30 +5058,70 @@ impl Runtime {
                     }
                 };
             }
-            let facts = self.authorization_facts(&store, &body, &self.audience()?, now)?;
-            let delegated = store.authorization_state().verify_service_delegation(
-                &origin.parent, &session.service, &session.grant_leaf, &facts, now,
-            )?;
-            ensure!(delegated.device() == &session.device
-                && delegated.initiator() == &session.initiator
-                && delegated.initiating_grant() == session.initiating_grant.as_ref(),
-                "SDK request differs from its current admitted delegation");
-            let mut expected: BTreeMap<_, _> = delegated.heads().iter().cloned()
-                .map(|head| (head.domain.clone(), head)).collect();
-            if let Some(destination) = crate::identity::policy::execution_destination_for_body(
-                store.authorization_state(), &facts, &body, now,
-            )? {
-                for head in destination.heads() {
-                    ensure!(
-                        expected.insert(head.domain.clone(), head.clone())
-                            .is_none_or(|previous| previous == *head),
-                        "SDK execution destination has conflicting policy heads"
-                    );
+            Ok(session)
+            })?
+        };
+        let task_policy = self
+            .ensure_sdk_execution_task_policy(&session, &body)
+            .await?;
+        let now = now_ms() as u64;
+        let facts = {
+            let store = self.store.lock().await;
+            verification.run(|| -> Result<_> {
+                let origin = store.agent_origin(&session, now)?;
+                let facts = if let Some(task) = &task_policy {
+                    store
+                        .execution_dispatch_facts_with_task_policy(
+                            task,
+                            &body,
+                            &self.audience()?,
+                            now,
+                        )?
+                        .facts()
+                        .clone()
+                } else {
+                    self.authorization_facts(&store, &body, &self.audience()?, now)?
+                };
+                let policies = task_policy
+                    .as_ref()
+                    .map_or(store.authorization_state(), |task| task.state());
+                let delegated = policies.verify_service_delegation(
+                    &origin.parent,
+                    &session.service,
+                    &session.grant_leaf,
+                    &facts,
+                    now,
+                )?;
+                ensure!(
+                    delegated.device() == &session.device
+                        && delegated.initiator() == &session.initiator
+                        && delegated.initiating_grant() == session.initiating_grant.as_ref(),
+                    "SDK request differs from its current admitted delegation"
+                );
+                let mut expected: BTreeMap<_, _> = delegated
+                    .heads()
+                    .iter()
+                    .cloned()
+                    .map(|head| (head.domain.clone(), head))
+                    .collect();
+                if let Some(destination) = crate::identity::policy::execution_destination_for_body(
+                    policies, &facts, &body, now,
+                )? {
+                    for head in destination.heads() {
+                        ensure!(
+                            expected
+                                .insert(head.domain.clone(), head.clone())
+                                .is_none_or(|previous| previous == *head),
+                            "SDK execution destination has conflicting policy heads"
+                        );
+                    }
                 }
-            }
-            session.expected_policies = expected.into_values().collect();
-            session.expires_at_ms = session.expires_at_ms.min(delegated.expires_at_ms());
-            Ok((session, facts))
+                session.expected_policies = expected.into_values().collect();
+                session.expires_at_ms = session.expires_at_ms.min(delegated.expires_at_ms());
+                if let Some(task) = &task_policy {
+                    session.expires_at_ms = session.expires_at_ms.min(task.expires_at_ms());
+                }
+                Ok(facts)
             })?
         };
         let identity = vibeface_secure::Identity::from_secret_hex(&self.identity.secret_key_hex)

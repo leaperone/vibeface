@@ -307,6 +307,12 @@ impl Runtime {
                 .with_context(|| format!("remote execution requires the authorized {field}"))?
                 .clone();
         }
+        if body["method"] == "operate" {
+            *body = self
+                .normalize_execution_dispatch_with_verification(body.clone(), verification)
+                .await?;
+        }
+        self.ensure_sdk_execution_task_policy(session, body).await?;
         if tool != "send_execution" {
             return Ok(());
         }
