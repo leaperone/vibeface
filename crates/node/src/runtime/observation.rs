@@ -1,6 +1,7 @@
 use super::*;
 use serde::Deserialize;
 use vibeface_secure::authorization::{
+    Action,
     execution_handoff::{ExecutionHandoffResult, verify_execution_handoff_receipt_signature},
     execution_observation::{
         ExecutionObservationChallenge, ExecutionObservationFreshness, ExecutionObservationPurpose,
