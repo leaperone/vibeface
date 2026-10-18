@@ -5,8 +5,8 @@ use super::{
     },
     foreign_execution_policy::{
         bind_task_execution_policy_in, check_task_policy_heads_in,
-        current_task_execution_policy_in, original_task_execution_policy_in,
-        task_policy_for_binding_in,
+        current_task_execution_policy_in, current_task_readonly_policy_in,
+        original_task_execution_policy_in, task_policy_for_binding_in,
     },
     journal::PolicyState,
     policy::{RequestTransport, authorize_request_invocation_for_body},
@@ -25,7 +25,8 @@ use vibeface_secure::authorization::{
     Action, Actor, CheckStage, DeviceId, FreshnessChallenge, Invocation, Nonce, PublicKey,
     RequestFacts, ServiceId, Signed, TransportEvidence, VerifiedAuthorization, VerifiedPolicySet,
     node_execution_policy::{VerifiedTaskCurrentPolicy, VerifiedTaskOriginalAdmissionPolicy},
-    remote_execution_policy::RemoteExecutionPolicySelection,
+    prepare::PrepareContext,
+    remote_execution_policy::{RemoteExecutionPolicyPurpose, RemoteExecutionPolicySelection},
 };
 
 #[derive(Clone)]
@@ -119,14 +120,22 @@ impl TaskScopedAuthorization {
                 )
                 .context("NeedPolicySync: admitted resolver has no execution grant")?,
             };
-            Some(task_policy_for_binding_in(
+            let context = PrepareContext {
+                context: facts.context.clone(),
+                binding_generation: Some(binding.binding.generation),
+                canonical_cwd: None,
+                execution_target_public_key: Some(selection.target_public_key.clone()),
+            };
+            Some(current_task_readonly_policy_in(
                 connection,
                 policy,
                 &source,
                 binding,
-                &facts.resource,
                 &selection,
-                facts.action,
+                RemoteExecutionPolicyPurpose::Resolver,
+                invocation,
+                &proof.invocation.issuer,
+                &context,
                 now_ms,
             )?)
         } else {
