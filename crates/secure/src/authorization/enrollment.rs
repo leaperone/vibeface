@@ -2367,7 +2367,7 @@ mod tests {
             .iter_mut()
             .find(|pin| pin.domain == head.domain)
             .unwrap()
-            .minimum_head = Some(head);
+            .minimum_head = Some(head.clone());
         let current = f.authorization();
         assert!(
             verify_device_enrollment_intent_for_manager(

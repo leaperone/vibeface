@@ -1402,7 +1402,7 @@ impl crate::runtime::Runtime {
             | "cross_node_recovery_source_possession"
             | "cross_node_recovery_possession"
             | "cross_node_recovery_commit"
-            | "cross_node_recovery_install" => store.cross_node_recovery_command(
+            | "cross_node_recovery_install" | "cross_node_recovery_install_status" => store.cross_node_recovery_command(
                 &self.identity,
                 noise_public_key,
                 method,
@@ -1469,7 +1469,7 @@ impl crate::runtime::Runtime {
             ),
             "account_node_import_begin" | "account_node_import_page"
             | "account_node_import_finish" | "account_node_import_resume"
-            | "account_node_commit" | "account_node_install" | "account_node_status" => store
+            | "account_node_commit" | "account_node_install" | "account_node_install_status" | "account_node_status" => store
                 .node_enrollment_command(&self.identity, noise_public_key, method, params, now_ms),
             "team_create" | "space_policy_commit" => {
                 store.governance_command(&self.identity, noise_public_key, method, params, now_ms)
