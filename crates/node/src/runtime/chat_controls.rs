@@ -1104,19 +1104,6 @@ impl Runtime {
         Ok((proof, context))
     }
 
-    pub(super) async fn chat_task_status(
-        &self,
-        network: &str,
-        scope: &str,
-        task: &str,
-    ) -> Result<Value> {
-        let (proof, context) = self.chat_binding(network, scope, task).await?;
-        let request = bound_request(&*self.store.lock().await, &context, &proof)?
-            .context("task has no admitted execution")?;
-        self.chat_execution_status(network, scope, &request.operation_id)
-            .await
-    }
-
     pub(super) async fn chat_execution_status(
         &self,
         network: &str,

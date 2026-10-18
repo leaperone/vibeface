@@ -119,7 +119,7 @@ async fn queued_manager_cancellation_preserves_the_active_reply_and_other_messag
     let (network, node, access, cancel) = running_manager().await?;
     let dir = network.directory.clone();
     let manager = access.manager.as_ref().unwrap();
-    let mut enqueue = |id: &str| {
+    let enqueue = |id: &str| {
         let mut body = network.body("message", "conversation");
         body["message_id"] = json!(id);
         body["text"] = json!(id);

@@ -878,7 +878,7 @@ impl Runtime {
             let request = self.agent_work(access, reference).await?;
             let (_, record) = self.agent_receipt(access, &request).await?;
             let session = match request.session_id.as_deref() {
-                Some(session)
+                Some(_)
                     if record
                         .as_ref()
                         .is_some_and(|record| record.state != OperationState::Rejected) =>

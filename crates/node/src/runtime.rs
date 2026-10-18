@@ -56,7 +56,6 @@ mod manager_control_tests;
 mod progress_observation;
 mod schedule_delivery;
 pub use manager_control::ManagerAccess;
-pub(crate) use progress_observation::ObservationGuard;
 
 #[derive(Clone)]
 pub struct Access {
@@ -78,6 +77,7 @@ struct TaskScopedPrepareAuthorization {
 }
 
 impl TaskScopedPrepareAuthorization {
+    #[allow(clippy::too_many_arguments)]
     fn verify_in(
         connection: &rusqlite::Connection,
         policy: &crate::identity::journal::PolicyState,
@@ -3242,15 +3242,6 @@ impl Runtime {
         })
     }
 
-    async fn normalize_request_body(
-        self: &Arc<Self>,
-        space: &SpaceId,
-        body: Value,
-    ) -> Result<Value> {
-        self.normalize_request_body_with_verification(space, body, &SignatureVerification::new())
-            .await
-    }
-
     async fn normalize_request_body_with_verification(
         self: &Arc<Self>,
         space: &SpaceId,
@@ -3653,19 +3644,6 @@ impl Runtime {
         .await
     }
 
-    pub(crate) async fn collect_freshness_challenge(
-        &self,
-        space: &str,
-        challenge: &FreshnessChallenge,
-    ) -> Result<FreshnessProof> {
-        self.collect_freshness_challenge_with_verification(
-            space,
-            challenge,
-            &SignatureVerification::new(),
-        )
-        .await
-    }
-
     pub(crate) async fn collect_freshness_challenge_with_verification(
         &self,
         space: &str,
@@ -3912,7 +3890,7 @@ impl Runtime {
             access.authorization.action().is_read() && access.body["method"] != "operate",
             "subscription requires a read-only request"
         );
-        let mut store = self.store.lock().await;
+        let store = self.store.lock().await;
         let _verification = access.verification.enter();
         store.authorize_request_read(
             &access.authorization,
@@ -3964,7 +3942,7 @@ impl Runtime {
             Ok(freshness) => freshness,
             Err(_) => return Ok(false),
         };
-        let mut store = self.store.lock().await;
+        let store = self.store.lock().await;
         let _verification = verification.enter();
         if store
             .authorize_request_read(
@@ -4711,7 +4689,7 @@ impl Runtime {
                     })
                 }
                 "nodes" => {
-                    let mut store = self.store.lock().await;
+                    let store = self.store.lock().await;
                     let _verification = access.verification.enter();
                     store.authorize_request_read(
                         &access.authorization,
@@ -4728,7 +4706,7 @@ impl Runtime {
                     )
                 }
                 "conversations" => {
-                    let mut store = self.store.lock().await;
+                    let store = self.store.lock().await;
                     let _verification = access.verification.enter();
                     store.authorize_request_read(
                         &access.authorization,
@@ -4792,7 +4770,7 @@ impl Runtime {
                 }
                 "context" => {
                     let scope = scope.context("conversation_id is required")?;
-                    let mut store = self.store.lock().await;
+                    let store = self.store.lock().await;
                     let _verification = access.verification.enter();
                     store.authorize_request_read(
                         &access.authorization,
@@ -5065,7 +5043,7 @@ impl Runtime {
                         target == self.identity.node_id()?,
                         "query the target service directly"
                     );
-                    let mut store = self.store.lock().await;
+                    let store = self.store.lock().await;
                     let _verification = access.verification.enter();
                     store.authorize_request_read(
                         &access.authorization,
@@ -5092,7 +5070,7 @@ impl Runtime {
                         target == self.identity.node_id()?,
                         "query the target service directly"
                     );
-                    let mut store = self.store.lock().await;
+                    let store = self.store.lock().await;
                     let _verification = access.verification.enter();
                     store.authorize_request_read(
                         &access.authorization,
@@ -5107,7 +5085,7 @@ impl Runtime {
                         input["client_id"].as_str() == Some(access.authorization.device().as_str()),
                         "notification client differs from authenticated device"
                     );
-                    let mut store = self.store.lock().await;
+                    let store = self.store.lock().await;
                     let _verification = access.verification.enter();
                     store.authorize_request_read(
                         &access.authorization,
@@ -5157,7 +5135,7 @@ impl Runtime {
                 }
                 "export" => {
                     let scope = scope.context("conversation_id is required")?;
-                    let mut store = self.store.lock().await;
+                    let store = self.store.lock().await;
                     let _verification = access.verification.enter();
                     store.authorize_request_read(
                         &access.authorization,
@@ -5988,21 +5966,6 @@ impl Runtime {
         ensure!(path.is_dir(), "execution path must be a directory");
         Ok(path)
     }
-    async fn require_execution_scope(
-        &self,
-        access: &Access,
-        scope: &str,
-        target: &str,
-        session: &str,
-    ) -> Result<()> {
-        let context = self
-            .store
-            .lock()
-            .await
-            .context(&access.network_id, scope, &[])?;
-        ensure!(context.events.iter().any(|e| e.scope_id==scope && matches!(&e.body,EventBody::DispatchRecorded{target_node,session_id,..} if target_node==target && session_id.as_deref()==Some(session))),"execution session is outside this conversation");
-        Ok(())
-    }
     fn engine_action(&self, action: &Value) -> Result<EngineAction> {
         if action["type"] == "open" {
             let map = action.as_object().context("invalid action")?;
@@ -6278,12 +6241,13 @@ impl Runtime {
             cwd: PathBuf::from(&session.cwd),
             native_session_id: session.native_session_id.clone(),
         };
-        if !context.shared && native.executor == ExecutorKind::Codex {
-            if let Err(error) = self.ensure_personal_provider().await {
-                self.finish(&request, OperationState::Failed,
+        if !context.shared
+            && native.executor == ExecutorKind::Codex
+            && let Err(error) = self.ensure_personal_provider().await
+        {
+            self.finish(&request, OperationState::Failed,
                     json!({"error":format!("private Provider could not prepare before dispatch: {error:#}")})).await?;
-                return Err(error);
-            }
+            return Err(error);
         }
         self.supervise_execution(context.clone()).await;
         let store = self.store.clone();
@@ -6887,7 +6851,7 @@ impl Runtime {
                 &verification,
             )
             .await?;
-            let mut store = self.store.lock().await;
+            let store = self.store.lock().await;
             let _verification = verification.enter();
             store.authorize_request_read(
                 &access.authorization,
@@ -7204,7 +7168,7 @@ impl Runtime {
         let network = &access.network_id;
         let scope = input["conversation_id"].as_str().map(String::from);
         let scope = scope.context("conversation_id is required")?;
-        let mut store = self.store.lock().await;
+        let store = self.store.lock().await;
         let _verification = access.verification.enter();
         store.authorize_request_read(
             &access.authorization,
@@ -7212,7 +7176,7 @@ impl Runtime {
             &access.transport,
             now_ms() as u64,
         )?;
-        let context = store.context(network, &scope, &heads(&input)?)?;
+        let context = store.context(network, &scope, &heads(input)?)?;
         let operations = store
             .operations(network)?
             .into_iter()

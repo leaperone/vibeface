@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
-    sync::{Arc, Weak},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use vibeface_secure::authorization::{
@@ -20,9 +20,7 @@ const MAX_SCOPES: usize = 16;
 const MAX_EVENTS: usize = 64;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_SCOPE_BYTES: usize = 256 * 1024;
-const MAX_OBSERVERS: usize = 32;
-const MAX_TARGETS: usize = 8;
-const MAX_STREAMS: usize = 64;
+#[cfg(test)]
 const LEASE: Duration = Duration::from_secs(45);
 const RETENTION: Duration = Duration::from_secs(90);
 
@@ -135,33 +133,6 @@ impl ObservationState {
     fn remove(&mut self, id: &str) {
         self.leases.remove(id);
         self.prune();
-    }
-}
-
-/// Held by the encrypted client connection; every return/error path drops its lease.
-pub(crate) struct ObservationGuard {
-    runtime: Weak<Runtime>,
-    id: String,
-}
-
-impl ObservationGuard {
-    pub(crate) fn refresh(&self) {
-        if let Some(node) = self.runtime.upgrade()
-            && let Ok(mut state) = node.progress_observation.lock()
-            && let Some(lease) = state.leases.get_mut(&self.id)
-        {
-            lease.expires = Instant::now() + LEASE;
-        }
-    }
-}
-
-impl Drop for ObservationGuard {
-    fn drop(&mut self) {
-        if let Some(node) = self.runtime.upgrade()
-            && let Ok(mut state) = node.progress_observation.lock()
-        {
-            state.remove(&self.id);
-        }
     }
 }
 
@@ -316,59 +287,6 @@ impl Runtime {
             network_id: network.into(),
             payload,
         });
-    }
-
-    pub(crate) async fn observe_conversation(
-        self: &Arc<Self>,
-        access: &Access,
-        scope: &str,
-        targets: Vec<String>,
-    ) -> Result<ObservationGuard> {
-        ensure!(
-            access.account_actor(),
-            "progress observation requires an Account client"
-        );
-        let access = self.refresh_subscription(access).await?;
-        self.require_scope(&access, scope).await?;
-        let local = self.identity.node_id()?;
-        let targets = targets
-            .into_iter()
-            .filter(|target| target != &local)
-            .collect::<BTreeSet<_>>();
-        ensure!(targets.len() <= MAX_TARGETS, "too many progress sources");
-        {
-            let store = self.store.lock().await;
-            for target in &targets {
-                store.authorize_node(&access.network_id, target, None)?;
-            }
-        }
-        let mut state = self
-            .progress_observation
-            .lock()
-            .map_err(|_| anyhow::anyhow!("progress observer unavailable"))?;
-        state.prune();
-        ensure!(
-            state.leases.len() < MAX_OBSERVERS,
-            "too many progress observers"
-        );
-        let id = uuid::Uuid::new_v4().to_string();
-        state.leases.insert(
-            id.clone(),
-            Lease {
-                access: Arc::new(access.clone()),
-                scope: scope.into(),
-                targets,
-                expires: Instant::now() + LEASE,
-            },
-        );
-        if state.streams().len() > MAX_STREAMS {
-            state.remove(&id);
-            anyhow::bail!("too many observed progress streams");
-        }
-        Ok(ObservationGuard {
-            runtime: Arc::downgrade(self),
-            id,
-        })
     }
 
     pub(crate) async fn read_progress(&self, access: &Access, input: &Value) -> Result<Value> {

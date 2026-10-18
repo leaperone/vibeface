@@ -405,6 +405,7 @@ pub(super) fn report_intent_head_from(
     )
 }
 
+#[cfg(test)]
 pub(super) fn append_report_intent_from(
     connection: &Connection,
     policy: &crate::identity::journal::PolicyState,
@@ -727,7 +728,7 @@ fn policy_in_view(
         policy_state,
         network,
         scope,
-        &events,
+        events,
         task_ref,
         creation,
     )? {
@@ -737,7 +738,7 @@ fn policy_in_view(
             policy_state,
             network,
             scope,
-            &events,
+            events,
             &origin.trigger,
             false,
         )? {
@@ -764,7 +765,7 @@ fn policy_in_view(
                 && grant.task_ref == task_ref
                 && grant.grant_id == policy.grant_id
                 && stored.event.resource_id == creation.event.resource_id
-                && ancestor(&events, hash, task_ref),
+                && ancestor(events, hash, task_ref),
             "task grant has the wrong scope"
         );
         ensure!(
@@ -782,7 +783,7 @@ fn policy_in_view(
                     .checked_add(1)
                     .context("follow-up version exhausted")?
                 && grant.previous_head == policy.proof_heads[0]
-                && ancestor(&events, head, &grant.previous_head)
+                && ancestor(events, head, &grant.previous_head)
                 && (policy.target_node.is_empty() || grant.target_node == policy.target_node),
             "task follow-up version chain is invalid"
         );
@@ -936,7 +937,7 @@ fn validate_task_result_in_view(
     );
     ensure!(
         request.action["type"] == "send"
-            && ancestor(&events, &dispatch.envelope.hash, &policy.task_ref),
+            && ancestor(events, &dispatch.envelope.hash, &policy.task_ref),
         "task result is not derived from a task send"
     );
     let binding = request
@@ -958,28 +959,6 @@ fn validate_task_result_in_view(
         "follow-up dispatch task binding mismatch"
     );
     Ok(policy)
-}
-
-fn human_dispatch_source_from(
-    connection: &Connection,
-    policy: &crate::identity::journal::PolicyState,
-    network: &str,
-    scope: &str,
-    events: &BTreeMap<String, StoredEvent>,
-    dispatch: &StoredEvent,
-    request: &OperationRequest,
-) -> Result<()> {
-    human_dispatch_source_in_view(
-        connection,
-        policy,
-        policy.verified(),
-        network,
-        scope,
-        events,
-        dispatch,
-        request,
-        crate::runtime::now_ms() as u64,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1205,82 +1184,6 @@ pub(crate) fn validate_followup_result_in_view(
     Ok(result)
 }
 
-pub(super) fn validate_manager_dispatch_from(
-    connection: &Connection,
-    policy: &crate::identity::journal::PolicyState,
-    network: &str,
-    request: &OperationRequest,
-) -> Result<()> {
-    let Some(authority) = &request.manager_authority else {
-        return Ok(());
-    };
-    let events = scope_events(connection, policy, network, &request.conversation_id)?;
-    if matches!(events.get(&authority.trigger).map(|source| &source.event.body),
-        Some(EventBody::MessagePosted { role, .. }) if role == "user")
-    {
-        let mut dispatch = events.values().filter(|stored| matches!(&stored.event.body,
-            EventBody::DispatchRecorded { operation_id, action, .. }
-            if operation_id == &request.operation_id && serde_json::to_value(request).ok().as_ref() == Some(action)));
-        if let Some(stored) = dispatch.next() {
-            ensure!(dispatch.next().is_none(), "manager dispatch is ambiguous");
-            return human_dispatch_source_from(
-                connection,
-                policy,
-                network,
-                &request.conversation_id,
-                &events,
-                stored,
-                request,
-            );
-        }
-        // Admission validates the new dispatch's Service invocation. Here the existing
-        // Account trigger and its fixed scheduler are checked before that admission.
-        let source = events
-            .get(&authority.trigger)
-            .context("manager trigger missing")?;
-        ensure!(
-            authority.followup_version == 0
-                && matches!(&source.event.body,
-            EventBody::MessagePosted { role, scheduler_node: Some(target), .. }
-            if role == "user" && target == &authority.scheduler_node),
-            "invalid human manager source"
-        );
-        current_authority(connection, policy, &events, source)?;
-        ensure!(
-            matches!(
-                invocation(&source.event)?.invocation.payload.actor,
-                vibeface_secure::authorization::Actor::Account(_)
-            ),
-            "manager source is not an Account message"
-        );
-        ensure!(
-            request
-                .basis_heads
-                .iter()
-                .any(|head| head == &authority.trigger
-                    || ancestor(&events, head, &authority.trigger)),
-            "manager dispatch omits its Account source"
-        );
-        return Ok(());
-    }
-    let current = validate_followup_result_from(
-        connection,
-        policy,
-        network,
-        &request.conversation_id,
-        &authority.trigger,
-        &authority.scheduler_node,
-    )?;
-    ensure!(
-        current.version == authority.followup_version
-            && current.mode == FollowupMode::Continue
-            && request.task_id.is_some()
-            && request.task_id == current.task_id,
-        "autonomous dispatch permission was revoked or changed"
-    );
-    Ok(())
-}
-
 impl Store {
     pub fn report_intent_head(
         &self,
@@ -1499,7 +1402,7 @@ impl Store {
             .get(&current.task_ref)
             .context("task creation missing")?;
         ensure!(
-            &creation.event.resource_id == &auth.resource().resource,
+            creation.event.resource_id == auth.resource().resource,
             "follow-up task is outside the admitted resource"
         );
         if mode != FollowupMode::Off {

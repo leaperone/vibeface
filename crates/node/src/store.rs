@@ -407,7 +407,7 @@ impl Store {
         Self::open_for(path, OpenPurpose::Initialize)
     }
 
-    fn open_for(path: &Path, purpose: OpenPurpose) -> Result<Self> {
+    fn open_for(path: &Path, _purpose: OpenPurpose) -> Result<Self> {
         let memory = path == Path::new(":memory:");
         if !memory {
             prepare_database(path)?;
@@ -1374,6 +1374,7 @@ impl Store {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn stage_scheduler_terminal(
         &mut self,
         identity: &LocalIdentity,
@@ -3241,6 +3242,7 @@ fn select_scheduler_candidate_in(
     Ok((selection, None))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn claim_next_in(
     tx: &Connection,
     policy: &crate::identity::journal::PolicyState,
@@ -3439,7 +3441,7 @@ pub(crate) fn rebuild_projections_from(
         if blobs_complete
             && matches!(
                 crate::identity::event_authorization::validate_event_evidence(
-                    &policy, connection, &e.event, &events,
+                    policy, connection, &e.event, &events,
                 )?,
                 crate::identity::event_authorization::EventEvidenceStatus::Valid
             )
@@ -3809,7 +3811,7 @@ pub(crate) fn load_events_from(
     }
     for stored in result.values() {
         let evidence = crate::identity::event_authorization::validate_event_evidence(
-            &policy,
+            policy,
             connection,
             &stored.event,
             &result,
@@ -4044,13 +4046,7 @@ mod tests {
     use crate::identity::test_support::{TestNetwork, now};
     use anyhow::Result;
     use serde_json::json;
-    use vibeface_secure::{
-        Identity,
-        authorization::{
-            bootstrap::{self, recovery},
-            *,
-        },
-    };
+    use vibeface_secure::{Identity, authorization::*};
 
     fn setup() -> Result<(TestNetwork, Store)> {
         let network = TestNetwork::new()?;

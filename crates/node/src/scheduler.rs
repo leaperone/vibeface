@@ -10,7 +10,6 @@ use crate::{
 };
 use anyhow::{Context as _, Result, ensure};
 use futures_util::FutureExt;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -197,7 +196,7 @@ pub(crate) async fn run_admitted(
         let tools = if attempt.read_only { tools().into_iter().filter(|(name,_)| matches!(name.as_str(),"context"|"nodes"|"execution_status"|"call_lookup")).collect() } else { tools() };
         let config = ManagerConfig { kind, workspace:project_root, model:settings.model,
             timeout_secs:node.config.timeout_secs,custom_tools:tools,
-            tool_callback_url:Some(node.tool_url.get().context("local tools are not listening")?.clone()),tool_callback_token:Some(token.clone()), ..Default::default() };
+            tool_callback_url:Some(node.tool_url.get().context("local tools are not listening")?.clone()),tool_callback_token:Some(token.clone()) };
         if job.kind==TriggerKind::Autonomous { node.store.lock().await.reserve_budget(&space,&utc_day(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()),1,node.config.daily_decision_limit)?; }
         let cancel=node.register_manager_attempt(token.clone(),session.clone(),&attempt.id,&trigger,attempt.read_only).await?;
         registered=true;

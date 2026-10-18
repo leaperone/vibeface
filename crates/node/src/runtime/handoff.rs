@@ -21,6 +21,7 @@ use vibeface_secure::authorization::{
 use vibeface_secure::signature_verification::SignatureVerification;
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum HandoffExecutionPolicy {
     Primary,
     TaskBusiness {
@@ -30,6 +31,7 @@ enum HandoffExecutionPolicy {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 enum HandoffExecutionCheck {
     Primary {
         authorization: vibeface_secure::authorization::execution_handoff::VerifiedExecutionHandoff,
@@ -1509,31 +1511,28 @@ impl Runtime {
                     if let (Some(native), Some(turn)) = (
                         result.native_session_id.as_deref(),
                         result.result["turn"]["id"].as_str(),
-                    ) {
-                        if let Ok(Some(observed)) = self
-                            .engine
-                            .read_turn_authorized(&context, native, turn)
-                            .await
-                        {
-                            if matches!(
-                                observed["status"].as_str(),
-                                Some("completed" | "failed" | "interrupted")
-                            ) {
-                                let state = if observed["status"] == "completed" {
-                                    OperationState::Succeeded
-                                } else {
-                                    OperationState::Failed
-                                };
-                                self.finish_handoff_with_policy(
-                                    &value,
-                                    state,
-                                    provider_result(observed, Some(native)),
-                                    &completion_verification,
-                                    &policy,
-                                )
-                                .await?;
-                            }
-                        }
+                    ) && let Ok(Some(observed)) = self
+                        .engine
+                        .read_turn_authorized(&context, native, turn)
+                        .await
+                        && matches!(
+                            observed["status"].as_str(),
+                            Some("completed" | "failed" | "interrupted")
+                        )
+                    {
+                        let state = if observed["status"] == "completed" {
+                            OperationState::Succeeded
+                        } else {
+                            OperationState::Failed
+                        };
+                        self.finish_handoff_with_policy(
+                            &value,
+                            state,
+                            provider_result(observed, Some(native)),
+                            &completion_verification,
+                            &policy,
+                        )
+                        .await?;
                     }
                 }
                 Ok(result) => {
@@ -1573,7 +1572,7 @@ impl Runtime {
         value: AdmittedExecutionHandoff,
         policy: SharedHandoffExecutionPolicy,
     ) {
-        let mut context = context(&value);
+        let context = context(&value);
         let key = (context.space_id.to_string(), context.operation_id.clone());
         if !self.execution_leases.lock().await.insert(key.clone()) {
             return;
@@ -1613,19 +1612,16 @@ impl Runtime {
                 let renewal = node
                     .renew_handoff_execution_policy(&value, &policy, &verification)
                     .await;
-                match renewal {
-                    Ok(deadline) => context.lease_expires_at_ms = deadline,
-                    Err(error) => {
-                        let _ = node
-                            .stop_handoff_with_policy(
-                                &value,
-                                &format!("authorization lease could not renew: {error:#}"),
-                                &verification,
-                                &policy,
-                            )
-                            .await;
-                        break;
-                    }
+                if let Err(error) = renewal {
+                    let _ = node
+                        .stop_handoff_with_policy(
+                            &value,
+                            &format!("authorization lease could not renew: {error:#}"),
+                            &verification,
+                            &policy,
+                        )
+                        .await;
+                    break;
                 }
             }
             node.execution_leases.lock().await.remove(&key);

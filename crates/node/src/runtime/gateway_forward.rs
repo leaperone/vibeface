@@ -16,6 +16,7 @@ use vibeface_secure::authorization::{
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "stage", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum GatewaySourceRequest {
     Route {
         approval: Signed<GatewayRouteApproval>,

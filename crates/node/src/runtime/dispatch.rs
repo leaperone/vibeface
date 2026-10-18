@@ -27,18 +27,15 @@ pub(super) fn execution_operation_view(
     if let Some(dispatch) = store.operation_dispatch(
         &operation.request.network_id,
         &operation.request.operation_id,
-    )? {
-        if operation.request.target_node
-            == serde_json::from_str::<Event>(&dispatch.canonical_body)?.author
-        {
-            value["project_execution_origin"] =
-                json!(store.local_project_dispatch_origin(&dispatch)?);
-            value["project_dispatch"] = json!(dispatch);
-            value["project_execution_result"] = json!(store.local_project_execution_result(
-                &operation.request.network_id,
-                &operation.request.operation_id
-            )?);
-        }
+    )? && operation.request.target_node
+        == serde_json::from_str::<Event>(&dispatch.canonical_body)?.author
+    {
+        value["project_execution_origin"] = json!(store.local_project_dispatch_origin(&dispatch)?);
+        value["project_dispatch"] = json!(dispatch);
+        value["project_execution_result"] = json!(store.local_project_execution_result(
+            &operation.request.network_id,
+            &operation.request.operation_id
+        )?);
     }
     Ok(value)
 }
@@ -474,11 +471,6 @@ impl Runtime {
             );
         }
         Ok(())
-    }
-
-    pub(super) async fn normalize_execution_dispatch(&self, body: Value) -> Result<Value> {
-        self.normalize_execution_dispatch_with_verification(body, &SignatureVerification::new())
-            .await
     }
 
     pub(super) async fn normalize_execution_dispatch_with_verification(

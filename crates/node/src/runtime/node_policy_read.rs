@@ -28,6 +28,7 @@ struct SdkTaskPolicyInput {
     binding: Option<SignedBinding>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum SdkTaskPolicyRead {
     Primary,
     Cached(VerifiedTaskCurrentPolicy),
