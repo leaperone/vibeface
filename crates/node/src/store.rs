@@ -2363,8 +2363,15 @@ fn validate_scheduler_terminal(
                 !matches!(job.state, JobState::Cancelling { .. }),
                 "cancelled manager credentials cannot complete a reply"
             );
-            ensure!(events.iter().filter(|(body, _)| matches!(body, EventBody::DecisionRecorded { decision_id, .. } if decision_id == &format!("decision-{}", job.message_id))).count() == 1, "completed scheduler job requires one final decision");
             ensure!(events.iter().filter(|(body, _)| matches!(body, EventBody::MessagePosted { message_id, role, .. } if message_id == &job.message_id && role == "assistant")).count() == 1, "completed scheduler job requires one final reply");
+            ensure!(
+                events
+                    .iter()
+                    .filter(|(body, _)| matches!(body, EventBody::MessagePosted { .. }))
+                    .count()
+                    == 1,
+                "completed scheduler job cannot publish additional replies"
+            );
         }
         JobOutcome::Cancelled(evidence) => {
             ensure!(!evidence.is_empty(), "cancellation evidence is required")
@@ -3502,26 +3509,15 @@ mod tests {
     }
 
     fn completed_job_events(job: &SchedulerJob) -> Vec<(EventBody, Vec<BlobRef>)> {
-        vec![
-            (
-                EventBody::DecisionRecorded {
-                    decision_id: format!("decision-{}", job.message_id),
-                    text: "done".into(),
-                    effective_constraints: vec![],
-                    tool_configuration: json!({}),
-                },
-                vec![],
-            ),
-            (
-                EventBody::MessagePosted {
-                    message_id: job.message_id.clone(),
-                    role: "assistant".into(),
-                    text: "done".into(),
-                    scheduler_node: None,
-                },
-                vec![],
-            ),
-        ]
+        vec![(
+            EventBody::MessagePosted {
+                message_id: job.message_id.clone(),
+                role: "assistant".into(),
+                text: "done".into(),
+                scheduler_node: None,
+            },
+            vec![],
+        )]
     }
 
     #[test]
@@ -3549,6 +3545,42 @@ mod tests {
             .unwrap();
         let attempt = claimed.job.state.attempt().unwrap().id.clone();
         store.mark_started(&network, "conversation", &target, &first.hash, &attempt)?;
+        let mut wrong_reply = completed_job_events(&claimed.job);
+        if let EventBody::MessagePosted { message_id, .. } = &mut wrong_reply[0].0 {
+            *message_id = "different-reply".into();
+        }
+        assert!(
+            store
+                .finish_job(
+                    &owner,
+                    &network,
+                    "conversation",
+                    &target,
+                    &first.hash,
+                    &attempt,
+                    JobOutcome::Completed,
+                    wrong_reply,
+                    3
+                )
+                .is_err()
+        );
+        let mut duplicate_reply = completed_job_events(&claimed.job);
+        duplicate_reply.extend(completed_job_events(&claimed.job));
+        assert!(
+            store
+                .finish_job(
+                    &owner,
+                    &network,
+                    "conversation",
+                    &target,
+                    &first.hash,
+                    &attempt,
+                    JobOutcome::Completed,
+                    duplicate_reply,
+                    3
+                )
+                .is_err()
+        );
         let mut incomplete = completed_job_events(&claimed.job);
         incomplete.pop();
         assert!(
@@ -3664,6 +3696,13 @@ mod tests {
             3,
         )?;
         assert_eq!(store.messages(&network, "conversation")?.len(), 2);
+        assert!(
+            !store
+                .context(&network, "conversation", &[])?
+                .events
+                .iter()
+                .any(|event| matches!(event.body, EventBody::DecisionRecorded { .. }))
+        );
         assert!(!store.scheduler_publication_pending(
             &network,
             "conversation",
