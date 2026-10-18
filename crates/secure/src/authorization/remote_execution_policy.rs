@@ -545,6 +545,7 @@ pub fn build_remote_execution_history_policy_read_intent(
             .ok_or(AuthorizationError::PolicyConflict)?;
         usage.record_signed(&reference.source)?;
         usage.record_signed(&reference.old_submission)?;
+        usage.record_signed(&reference.observation_receipt)?;
         finish_usage(&mut usage)?;
         encode(&intent)
             .map_err(|_| AuthorizationError::InvalidProof("history intent encoding failed"))
