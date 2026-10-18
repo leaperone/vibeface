@@ -994,7 +994,7 @@ def verify_no_model_budget(nodes):
 
 
 def javascript_dependencies(content):
-    static = rb"\b(?:import|export)\s*(?:[^;\"'`]*?\bfrom\s*)?[\"'`]([^\"'`]+)[\"'`]"
+    static = rb"(?:^|[;}\n])\s*(?:import|export)\s*(?:[^;\"'`]*?\bfrom\s*)?[\"'`]([^\"'`]+)[\"'`]"
     dynamic = rb"\bimport\s*\(\s*[\"'`]([^\"'`]+)[\"'`]"
     return [address.decode() for pattern in (static, dynamic) for address in re.findall(pattern, content)]
 
