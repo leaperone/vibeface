@@ -291,7 +291,7 @@ pub fn verify_node_service_policy_source(
     let source = VerifiedTaskPolicySource {
         snapshot,
         primary_pins: primary_pins.to_vec(),
-        source_scope: TaskPolicySourceScope::Node(NodeTaskPolicySourceScope {
+        source_scope: Box::new(TaskPolicySourceScope::Node(NodeTaskPolicySourceScope {
             facts: child_facts.clone(),
             context: read_context.clone(),
             request: request.clone(),
@@ -301,7 +301,7 @@ pub fn verify_node_service_policy_source(
             current_binding: current_binding.cloned(),
             lease_expires_at_ms: lease_expires_at,
             provenance: Some(provenance.clone()),
-        }),
+        })),
         verified_at_ms: now,
         expires_at_ms: expires.min(lease_expires_at),
         usage,
@@ -441,7 +441,7 @@ pub fn verify_node_history_policy_source(
     let source = VerifiedTaskPolicySource {
         snapshot,
         primary_pins: primary_pins.to_vec(),
-        source_scope: TaskPolicySourceScope::Node(NodeTaskPolicySourceScope {
+        source_scope: Box::new(TaskPolicySourceScope::Node(NodeTaskPolicySourceScope {
             facts: RequestFacts {
                 resource: facts.resource.clone(),
                 action: facts.action,
@@ -458,7 +458,7 @@ pub fn verify_node_history_policy_source(
             current_binding: original_binding.cloned(),
             lease_expires_at_ms: current_reader.expires_at_ms(),
             provenance: provenance.cloned(),
-        }),
+        })),
         verified_at_ms: now,
         expires_at_ms: expires.min(current_reader.expires_at_ms()),
         usage,
@@ -579,7 +579,7 @@ fn begin_node_import(
     now: u64,
 ) -> Result<NodeTaskExecutionPolicyImport> {
     let _signatures = ScopedSignatureVerification::new();
-    let same_source = match &source.source_scope {
+    let same_source = match source.source_scope.as_ref() {
         TaskPolicySourceScope::Node(scope) => scope.request == *request,
         TaskPolicySourceScope::Account(_) => false,
     };

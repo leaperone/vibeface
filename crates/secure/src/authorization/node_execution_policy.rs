@@ -311,7 +311,7 @@ enum TaskPolicySourceScope {
 pub struct VerifiedTaskPolicySource {
     snapshot: policy_import::VerifiedPolicySnapshot,
     primary_pins: Vec<PolicyPin>,
-    source_scope: TaskPolicySourceScope,
+    source_scope: Box<TaskPolicySourceScope>,
     verified_at_ms: u64,
     expires_at_ms: u64,
     usage: ExecutionProofUsage,
@@ -358,7 +358,7 @@ pub fn task_policy_source_from_current(
     Ok(VerifiedTaskPolicySource {
         snapshot,
         primary_pins: primary_pins.to_vec(),
-        source_scope: TaskPolicySourceScope::Account(current.intent().clone()),
+        source_scope: Box::new(TaskPolicySourceScope::Account(current.intent().clone())),
         verified_at_ms: now,
         expires_at_ms: current
             .intent()
@@ -540,7 +540,7 @@ pub fn begin_task_policy_import(
     require(
         source.verified_at_ms <= now
             && now < source.expires_at_ms
-            && matches!(&source.source_scope, TaskPolicySourceScope::Account(intent)
+            && matches!(source.source_scope.as_ref(), TaskPolicySourceScope::Account(intent)
                 if intent == &request.intent),
         "task policy import changed its current native source",
     )?;
@@ -865,7 +865,7 @@ impl VerifiedTaskCurrentPolicy {
         selection: &RemoteExecutionPolicySelection,
         context: &prepare::PrepareContext,
     ) -> Result<()> {
-        let source_matches = match &self.source.source_scope {
+        let source_matches = match self.source.source_scope.as_ref() {
             TaskPolicySourceScope::Account(_) => {
                 facts.action == self.request.expected_action()
                     && facts.context == context.context

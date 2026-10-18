@@ -91,9 +91,9 @@ pub fn node_task_policy_source_from_retained(
     Ok(VerifiedTaskPolicySource {
         snapshot,
         primary_pins: original_pins,
-        source_scope: TaskPolicySourceScope::Node(
+        source_scope: Box::new(TaskPolicySourceScope::Node(
             service::NodeTaskPolicySourceScope::from_retained_sdk(&source, raw, original_request)?,
-        ),
+        )),
         verified_at_ms: original_clock,
         expires_at_ms: original_request.expires_at_ms().min(source.expires_at_ms()),
         usage,
