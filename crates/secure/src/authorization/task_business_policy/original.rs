@@ -480,6 +480,7 @@ impl VerifiedTaskBusinessOriginalSource {
 mod tests {
     use super::super::super::{
         client_policy_import::require_confirmed_client_policy,
+        events::StoredTransport,
         execution_handoff::{
             ExecutionHandoffAdmissionReceipt, ExecutionHandoffChallenge, ExecutionHandoffFreshness,
         },
