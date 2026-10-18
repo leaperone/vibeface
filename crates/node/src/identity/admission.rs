@@ -2764,10 +2764,12 @@ pub(crate) mod tests {
                 .is_err(),
                 "{sql}"
             );
-            assert!(
-                verified_admission_checkpoints_from(&tx, &store.policy).is_err(),
-                "{sql}"
-            );
+            if sql == "UPDATE events SET status='conflict' WHERE hash=?" {
+                let checkpoints = verified_admission_checkpoints_from(&tx, &store.policy)?;
+                assert!(!checkpoints.entries.contains_key(&(network.space.to_string(), id.clone())));
+            } else {
+                assert!(verified_admission_checkpoints_from(&tx, &store.policy).is_err(), "{sql}");
+            }
             tx.rollback()?;
             cached_without_crypto(&store, &proof, &facts)?;
         }
@@ -2966,7 +2968,11 @@ pub(crate) mod tests {
         let transport = proof.transport.clone().into_evidence();
         let admitted = cached_without_crypto(&store, &proof, &facts)?;
         let mut earlier = proof.clone();
-        earlier.admitted_at_ms = proof.admitted_at_ms - 1;
+        let accepted_at: u64 = store.connection.query_row(
+            "SELECT accepted_at_ms FROM policy_journal WHERE entry_hash=?",
+            [proof.challenge.policies[0].head.as_str()], |row| row.get(0),
+        )?;
+        earlier.admitted_at_ms = accepted_at.checked_sub(1).context("fixture policy predates the clock")?;
         assert!(
             store
                 .policy
@@ -3898,8 +3904,10 @@ mod manager_tests {
         let stored = load_authorization_from(
             &fixture.store.connection, fixture.network.space.as_str(), &first.manager_id,
         )?;
+        let mut uncached = fixture.store.policy.clone();
+        uncached.local_admissions = AdmissionCheckpoints::default();
         let facts = persisted_admission_facts(
-            &fixture.store.connection, &fixture.store.policy, &stored.proof,
+            &fixture.store.connection, &uncached, &stored.proof,
         )?;
         assert!(reconstruct_admission(
             &fixture.store.connection, &fixture.store.policy, &stored.proof,
