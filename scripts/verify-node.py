@@ -400,6 +400,8 @@ class Client:
         self.connection_policies = {}
         self.connection_scopes = {}
         self.connection_resources = {}
+        self.connection_authentication = {}
+        self.gateways = {}
         self.resource_id = None
         self.process = None
         self.node_id = None
@@ -414,7 +416,10 @@ class Client:
 
     def command(self, op, *, check=True, **arguments):
         if op in {"connect", "close", "authenticate"}:
-            self.connection_policies.pop(arguments.get("connection", "main"), None)
+            connection = arguments.get("connection", "main")
+            self.connection_policies.pop(connection, None)
+            if op in {"connect", "close"}:
+                self.gateways.pop(connection, None)
         if self.process is None:
             self.process = subprocess.Popen(
                 ["node", str(self.helper), str(self.module)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -461,6 +466,7 @@ class Client:
 
     def authenticate(self, *, resource_id=None, audience=None, host_public_key=None, connection="main",
                      trust_ref="primary", resource_kind="project", grant_leaf=None, activate=True):
+        require(connection not in self.gateways, "Gateway authentication must refresh the separate B source")
         selected_resource = resource_id or self.resource_id
         expected_host = host_public_key or self.host_public_key or self.node_public_key
         selected_audience = audience or (self.audience if expected_host == self.host_public_key else None)
@@ -482,10 +488,34 @@ class Client:
         self.connection_policies[connection] = policy
         self.connection_scopes[connection] = verified["scope"]
         self.connection_resources[connection] = selected_resource
+        self.connection_authentication[connection] = {"resource_id": selected_resource, "audience": selected_audience,
+            "host_public_key": expected_host, "trust_ref": trust_ref, "resource_kind": resource_kind,
+            "grant_leaf": grant_leaf, "activate": activate}
         if activate:
             self.scope, self.policy = verified["scope"], policy
             self.host_public_key, self.audience, self.resource_id = expected_host, policy["audience"], selected_resource
         return verified
+
+    def attach_gateway(self, card, *, source_connection="main", connection="project-gateway", refresh=True):
+        require(connection != source_connection and source_connection not in self.gateways,
+                "Gateway route retains a separate direct B policy connection")
+        require(source_connection in self.connection_authentication,
+                "Gateway route requires a confirmed B authorization")
+        if refresh:
+            self.authenticate(connection=source_connection, **self.connection_authentication[source_connection])
+        endpoint = card["gateway"]
+        self.command("connect", connection=connection, **endpoint)
+        self.gateways[connection] = {"card": copy.deepcopy(card), "source_connection": source_connection}
+        attached = self.command("attach_gateway", connection=connection, source_connection=source_connection, card=card)
+        require(attached["scope"] == self.connection_scopes[source_connection]
+                and attached["policy"] == self.connection_policies[source_connection],
+                "Gateway uses the exact confirmed B policy and scope")
+        self.connection_scopes[connection] = copy.deepcopy(attached["scope"])
+        self.connection_policies[connection] = copy.deepcopy(attached["policy"])
+        self.connection_resources[connection] = self.connection_resources[source_connection]
+        self.gateways[connection] = {"card": copy.deepcopy(card), "source_connection": source_connection,
+                                    "approval_hash": attached["gateway"]["approval_hash"]}
+        return attached
 
     def rpc(self, method, *, status=200, connection="main", remote=None, **arguments):
         scope = self.scope if connection == "main" else self.connection_scopes.get(connection, self.scope)
@@ -495,6 +525,7 @@ class Client:
         connection_policy = self.connection_policies.get(connection)
         if connection_policy is None or body["resource_id"] not in {
                 item["payload"]["resource"] for item in connection_policy["resources"]}:
+            require(connection not in self.gateways, "Gateway has no matching B authorization; refresh and attach its direct source")
             default_resource = self.resource_id
             self.authenticate(resource_id=body["resource_id"], connection=connection)
             self.resource_id = default_resource
@@ -579,7 +610,11 @@ class Client:
             if "error" in proof:
                 response = proof
             else:
-                self.signed_requests.setdefault(body["authorization_id"], copy.deepcopy(proof))
+                saved = self.signed_requests.setdefault(body["authorization_id"], copy.deepcopy(proof))
+                require(connection not in self.gateways or saved == proof,
+                        "one Gateway authorization ID retains its original signed request")
+                if method == "operate":
+                    self.operations[(body["space_id"], body["resource_id"], body["request"]["operation_id"])] = copy.deepcopy(body["request"])
                 response = self.command("request", method="rpc", params=proof["body"],
                                         invocation=proof["invocation"], connection=connection)
             result = response.get("result", {})
@@ -1419,16 +1454,103 @@ def seal_remote_execution(project, executor, registered, remote, conversation, t
     return seal
 
 
-def verify_remote_topology(run, binary, workspace, fixture, helper, module, nodes):
-    group = []
-    for name in ("REMOTE_A", "REMOTE_B", "REMOTE_C"):
-        node = Node(run, name, binary, workspace, fixture, helper, module)
-        nodes.append(node)
-        node.configure(network={"bootstrap_urls": [], "advertise_urls": [node.url.replace("http://", "ws://") + "/api/network/ws"],
-                                "mdns": False, "relay_enabled": True})
+def prepare_independent_gateway(gateway, project, conversation):
+    source = project.client
+    source.authenticate()
+    now = int(time.time() * 1000)
+    route = {"version": 2, "route_id": os.urandom(32).hex(), "generation": 1,
+             "gateway": gateway.node_public_key, "client_account": source.scope["account_id"],
+             "client_key": source.command("identity")["public_key"], "target_key": project.node_public_key,
+             "resource": {"space": source.scope["space_id"], "resource": source.resource_id},
+             "allowed_actions": ["conversation_read", "message_append", "execution_open", "execution_send",
+                                 "execution_rebind", "operation_status_read"],
+             "source_pins": source.command("get_trust")["pins"], "state": "active",
+             "issued_at_ms": now, "expires_at_ms": now + 3_600_000}
+    approval = gateway.client.command("sign_gateway_route", payload=route)
+    card = {"version": 2, "kind": "vibeface-gateway",
+            "gateway": {"url": gateway.url, "node_id": gateway.node_id,
+                        "node_public_key": gateway.node_public_key, "relay": False}, "approval": approval}
+    original_domains = primary_policy_domains(gateway)
+    attached = source.attach_gateway(card, refresh=False)
+    expected_hash = source.command("gateway_route_hash", approval=approval)
+    require(attached["gateway"]["approval_hash"] == expected_hash,
+            "Gateway installation matches the locally verified owner-signed approval hash")
+    direct = source.rpc("conversation", conversation_id=conversation)
+    forwarded = source.rpc("conversation", conversation_id=conversation, connection="project-gateway")
+    require(forwarded == direct, "independent A returns the exact B conversation through a verified reply")
+    source.attach_gateway(card, refresh=False)
+    for field, replacement in (("gateway", project.node_public_key), ("client_key", gateway.node_public_key),
+                               ("client_account", gateway.client.scope["account_id"]),
+                               ("target_key", gateway.node_public_key)):
+        changed = copy.deepcopy(card)
+        changed["approval"]["payload"][field] = replacement
+        rejected = source.command("attach_gateway", connection="project-gateway", source_connection="main",
+                                  card=changed, check=False)
+        require(not rejected["ok"], f"Gateway card rejects substituted {field} before forwarding")
+    source.rpc("message", connection="project-gateway", conversation_id=conversation,
+               message_id="independent-gateway-message", text="U selects A and retains B policy authority.")
+    require(sum(item["message_id"] == "independent-gateway-message"
+                for item in source.rpc("conversation", conversation_id=conversation)["messages"]) == 1,
+            "independent Gateway writes exactly once at B")
+    require(primary_policy_domains(gateway) == original_domains,
+            "A route and foreign source import do not install B primary policy")
+    return card, original_domains
+
+
+def finish_independent_gateway(gateway, project, executor, card, original_domains, conversation):
+    source = project.client
+    require(primary_policy_domains(gateway) == original_domains,
+            "A kept its own primary domains after B and C execution")
+    attached = source.attach_gateway(card)
+    gateway.stop()
+    gateway.start()
+    reconnected = source.command("reconnect_gateway", connection="project-gateway")
+    require(reconnected["source_ref"] == attached["gateway"]["source_ref"],
+            "A restart reuses the original source reference without reupload")
+    source.rpc("conversation", conversation_id=conversation, connection="project-gateway")
+    require(primary_policy_domains(gateway) == original_domains,
+            "A restores foreign route originals without seeding B or C primary policy")
+    revoked = copy.deepcopy(card["approval"]["payload"])
+    revoked.update(generation=revoked["generation"] + 1, state="revoked",
+                   issued_at_ms=int(time.time() * 1000))
+    approval = gateway.client.command("sign_gateway_route", payload=revoked)
+    committed = source.call("gateway_source", {"stage": "route", "approval": approval}, connection="project-gateway")
+    require(committed["approval"] == source.command("gateway_route_hash", approval=approval),
+            "A persists the exact owner-signed route revocation")
+    result = source.command("signed_request", connection="project-gateway",
+                            body={"method": "conversation", "space_id": source.scope["space_id"],
+                                  "resource_id": source.resource_id, "conversation_id": conversation,
+                                  "authorization_id": uuid.uuid4().hex}, check=False)
+    require(not result["ok"], "revoked A route does not silently fall back to direct B")
+    with sqlite3.connect(f"file:{gateway.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+        rows = {table: database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("events", "conversations", "messages", "tasks", "operations")}
+    require(not any(rows.values()), "A has no B business history or C operation outbox")
+    require(len({source.scope["account_id"], gateway.client.scope["account_id"], executor.client.scope["account_id"]}) == 3,
+            "A, B and C retain independent account owners")
+    return {"gateway": gateway.node_id, "project": project.node_id, "executor": executor.node_id,
+            "approval_hash": source.command("gateway_route_hash", approval=card["approval"]),
+            "primary_domains": sorted(original_domains), "gateway_business_rows": rows,
+            "checks": ["owner-signed route and local hash", "B original source upload and exact retry",
+                       "A to B signed read and write", "A to B to C execution and receipts",
+                       "A restart restores source", "owner revocation refuses forwarding without fallback"]}
+
+
+def verify_remote_topology(run, binary, workspace, fixture, helper, module, nodes, *, gateway=False):
+    group = [Node(run, name, binary, workspace, fixture, helper, module)
+             for name in ("REMOTE_A", "REMOTE_B", "REMOTE_C")]
+    nodes.extend(group)
+    for index in (1, 2, 0):
+        node = group[index]
+        configuration = {"network": {"bootstrap_urls": [group[1].url.replace("http://", "ws://") + "/api/network/ws"]
+                                      if gateway and index == 0 else [],
+                                      "advertise_urls": [node.url.replace("http://", "ws://") + "/api/network/ws"],
+                                      "mdns": False, "relay_enabled": True}}
+        if gateway and index == 0:
+            configuration["roles"] = ["gateway", "replica", "relay"]
+        node.configure(**configuration)
         node.start()
         node.bootstrap()
-        group.append(node)
     outsider, project, executor = group
     require(len({node.client.scope["account_id"] for node in group}) == 3,
             "remote acceptance starts three independently claimed empty databases")
@@ -1455,17 +1577,19 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
                    connection="remote-execution", trust_ref="remote-execution")
     remote = {"share": share, "trust_ref": "remote-execution", "source_connection": "main",
               "execution_connection": "remote-execution", "generation": 1, "approve": True}
+    gateway_card, gateway_domains = prepare_independent_gateway(outsider, project, conversation) if gateway else (None, None)
+    connection = "project-gateway" if gateway else "main"
     open_spec = {"type": "open", "executor": "claude_code", "cwd": str(workspace)}
-    source.bind_execution(conversation, task, executor, session, open_spec, remote=remote)
+    source.bind_execution(conversation, task, executor, session, open_spec, remote=remote, connection=connection)
     opened = request(source.scope["space_id"], conversation, executor, "remote-open", session, open_spec, task=task)
     opened["binding"] = source.bindings[(source.scope["space_id"], source.resource_id, conversation, task, session)]
-    source.rpc("operate", request=opened, remote=remote)
+    source.rpc("operate", request=opened, remote=remote, connection=connection)
 
     def remote_operation(operation_id):
-        return source.rpc("operation", target_node=executor.node_id, operation_id=operation_id, remote=remote)["operation"]
+        return source.rpc("operation", target_node=executor.node_id, operation_id=operation_id, remote=remote, connection=connection)["operation"]
 
     wait_for("independent C completes remote open", lambda: remote_operation("remote-open")["state"] == "succeeded")
-    current = source.rpc("session", target_node=executor.node_id, session_id=session, remote=remote)["session"]
+    current = source.rpc("session", target_node=executor.node_id, session_id=session, remote=remote, connection=connection)["session"]
     require(current["target_node"] == executor.node_id and current["binding_generation"] == 1,
             "native WASM verifies the C session receipt against the exact B binding")
     outsider.client.rpc("conversation", conversation_id=conversation, status=400)
@@ -1474,7 +1598,7 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
                    {"type": "send", "text": json.dumps({"label": "remote-result", "gate": str(gate), "result_size": 128})},
                    revision=current["revision"], task=task)
     sent.update(binding=opened["binding"], resources=[str(workspace)])
-    source.rpc("operate", request=sent, remote=remote)
+    source.rpc("operate", request=sent, remote=remote, connection=connection)
     original = copy.deepcopy(source.signed_requests["remote-send"])
     private_json(run / "remote-original-request.json", original)
     wait_for("C starts one accepted remote send", lambda: len(invocations(run, "remote-result")) == 1)
@@ -1485,15 +1609,23 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
         node.start()
     source.connect()
     source.authenticate()
+    if gateway:
+        source.attach_gateway(gateway_card, refresh=False)
     source.command("connect", url=executor.url, node_id=executor.node_id, node_public_key=executor.node_public_key,
                    connection="remote-execution", trust_ref="remote-execution")
     require(remote_operation("remote-send")["state"] == "succeeded" and len(invocations(run, "remote-result")) == 1,
             "B and C restart preserve the admitted remote result without replay")
-    source.call("rpc", original["body"], invocation=original["invocation"])
+    source.call("rpc", original["body"], invocation=original["invocation"], connection=connection)
     require(len(invocations(run, "remote-result")) == 1, "exact signed remote retry does not rerun C")
     changed = copy.deepcopy(original["body"])
     changed["request"]["session_id"] = "unapproved-session"
-    source.call("rpc", changed, invocation=original["invocation"], status=400)
+    if gateway:
+        changed_result = source.command("request", method="rpc", params=changed, invocation=original["invocation"],
+                                        connection=connection, check=False)
+        require(not changed_result["ok"] or changed_result["result"].get("error"),
+                "Gateway refuses an original signed request with a substituted session")
+    else:
+        source.call("rpc", changed, invocation=original["invocation"], status=400, connection=connection)
     require(len(invocations(run, "remote-result")) == 1, "a changed signed remote session cannot execute C")
     require(primary_policy_domains(project) == source_domains,
             "completed foreign import remains outside B primary policy")
@@ -1507,7 +1639,7 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
                          task_ref=opened["binding"]["binding"]["task_ref"], binding=opened["binding"],
                          previous_seal=seal, previous_target_public_key=executor.node_public_key,
                          target_node=executor.node_id, session_id=next_session, executor="claude_code", cwd=str(workspace),
-                         remote=replacement)
+                         remote=replacement, connection=connection)
     expected = {**opened["binding"]["binding"], "generation": 2, "session_id": next_session,
                 "previous_binding_hash": seal["seal"]["binding_hash"], "previous_seal": seal}
     next_binding = source.command("verify_task_binding", binding=rebound["binding"],
@@ -1515,9 +1647,9 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
     source.bindings[(source.scope["space_id"], source.resource_id, conversation, task, next_session)] = next_binding
     next_open = request(source.scope["space_id"], conversation, executor, "remote-rebound-open", next_session, open_spec, task=task)
     next_open["binding"] = next_binding
-    source.rpc("operate", request=next_open, remote=replacement)
+    source.rpc("operate", request=next_open, remote=replacement, connection=connection)
     wait_for("sealed Task opens only its next binding", lambda: source.rpc("operation", target_node=executor.node_id,
-              operation_id="remote-rebound-open", remote=replacement)["operation"]["state"] == "succeeded")
+              operation_id="remote-rebound-open", remote=replacement, connection=connection)["operation"]["state"] == "succeeded")
 
     team_prepared = source.command("prepare_team", handle="remote-team", trust_ref="remote-team",
                                    source_project=source.resource_id)
@@ -1528,14 +1660,15 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
                         host_public_key=project.node_public_key, activate=False)
     source.rpc("create_conversation", connection="team", conversation_id="team-only", title="Team isolation")
     source.rpc("conversation", conversation_id="team-only", status=400)
-    return {"accounts": [node.client.scope["account_id"] for node in group],
+    gateway_report = finish_independent_gateway(outsider, project, executor, gateway_card, gateway_domains, conversation) if gateway else None
+    return {"gateway": gateway_report, "accounts": [node.client.scope["account_id"] for node in group],
             "nodes": [node.node_id for node in group], "execution_resource": registered["resource_id"],
             "source_domains_before": sorted(source_domains), "executor_domains_before": sorted(executor_domains),
             "team_space": team["scope"]["space_id"], "original_request": "remote-original-request.json",
             "checks": ["B has no C primary policy", "C has no B account seed", "native bounded source and foreign policy imports",
                        "remote open/send receipts", "exact duplicate after B/C restart", "native seal and exact seal status",
                        "generation-2 rebind and new session open", "independent account rejection", "Team isolation"],
-            "not_checked": ["cross-account authenticated A Gateway", "replacement on a different C node",
+            "not_checked": ([] if gateway else ["cross-account authenticated A Gateway"]) + ["replacement on a different C node",
                             "SDK continuation without browser", "remote Unknown and revocation"]}
 
 
@@ -1770,8 +1903,9 @@ def acceptance(options):
                 "recovery does not replay accepted execution")
         report["not_checked"].remove("recovery on real Node wire")
         passed("encrypted typed recovery preserves account, resources and history and rejects the old device")
-        if options.remote_topology:
-            report["remote_topology"] = verify_remote_topology(run, binary, workspace, fixture, helper, module, nodes)
+        if options.remote_topology or options.gateway_topology:
+            report["remote_topology"] = verify_remote_topology(run, binary, workspace, fixture, helper, module, nodes,
+                                                              gateway=options.gateway_topology)
             report["not_checked"].extend(report["remote_topology"]["not_checked"])
             passed("three independent accounts, native foreign policy import, B/C execution restart and Team isolation",
                    "real_nodes_with_stream_json_fixture")
@@ -1811,6 +1945,7 @@ if __name__ == "__main__":
         parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "crates/node/web/generated/vibeface_secure.js")
         parser.add_argument("--codex-bin", default="codex")
         parser.add_argument("--skip-codex", action="store_true", help="omit real Codex transport checks and report that omission")
+        parser.add_argument("--gateway-topology", action="store_true", help="run owner-approved independent A Gateway to B Project to C Executor checks")
         parser.add_argument("--remote-topology", action="store_true", help="also run independent-account B/C execution and Team isolation checks")
         arguments = parser.parse_args()
         try:

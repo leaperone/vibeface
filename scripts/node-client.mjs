@@ -13,6 +13,8 @@ const decoder = new TextDecoder('utf-8', { fatal: true });
 const keys = new Map(['client', 'root', 'recovery'].map(name => [name, crypto.Identity.generate()]));
 const connections = new Map();
 const authorizations = new Map();
+const gateways = new Map();
+const gatewayPending = new Map();
 const verifiedBindings = new Map();
 const trusts = new Map();
 const preparations = new Map();
@@ -186,7 +188,7 @@ async function connect(input) {
     finally { channel.free(); }
   })();
   return {
-    events, frames, nodePublicKey: input.node_public_key, identityName: input.identity || 'client',
+    events, frames, nodePublicKey: input.node_public_key, nodeId: input.node_id, url: input.url, relay: Boolean(input.relay), identityName: input.identity || 'client',
     trustRef: input.trust_ref || 'primary',
     request(method, params, invocation) {
       if (closed) throw new Error('channel closed');
@@ -271,6 +273,7 @@ function checkedAuthorization(verified, expectedHostPublicKey, selectedTrust) {
 }
 
 async function authenticate(input, connectionName) {
+  assert(!gateways.has(connectionName), 'Gateway connections cannot authenticate; refresh their B source explicitly');
   authorizations.get(connectionName)?.verified.free();
   authorizations.delete(connectionName);
   const connection = connections.get(connectionName);
@@ -318,11 +321,13 @@ async function authenticate(input, connectionName) {
   let importer = crypto.beginClientPolicyImport(pins, JSON.stringify(request), JSON.stringify(begin.snapshot), signer, source, Date.now());
   let imported;
   let confirmed;
+  const frames = [{ stage: 'begin', request, snapshot: begin.snapshot }];
   try {
     for (;;) {
       const params = JSON.parse(importer.pageRequestJson());
       const response = await identityRequest(connection, 'client_policy_page', params);
       importer.appendPage(JSON.stringify(response.page), Date.now());
+      frames.push({ stage: 'page', page: response.page });
       if (response.page.payload.complete) break;
     }
     const witness = await identityRequest(connection, 'client_policy_witness', {
@@ -336,6 +341,7 @@ async function authenticate(input, connectionName) {
     ));
     const receipt = await identityRequest(connection, 'confirm_client_policy_auth', confirmRequest);
     confirmed = crypto.confirmClientPolicyAuthorization(imported, JSON.stringify(confirmRequest), JSON.stringify(receipt.confirmation), source, Date.now());
+    frames.push({ stage: 'finish', witness: witness.witness, confirm_request: confirmRequest, confirmation: receipt.confirmation });
     const checked = checkedAuthorization(confirmed, expectedHost, selectedTrust);
     if (input.resource_kind) assert.equal(checked.resources[0].payload.kind, input.resource_kind);
     const session = JSON.parse(confirmed.clientPolicyContextJson());
@@ -349,7 +355,7 @@ async function authenticate(input, connectionName) {
     assert.deepEqual(response.result.scope, checked.scope, 'session changed the verified scope');
     assert.deepEqual(response.result.policy, checked.policy, 'session changed the verified policy');
     assert.deepEqual(response.result.resources, checked.resources, 'session changed the verified Project');
-    authorizations.set(connectionName, { verified: confirmed, ...checked, selection, trustRef,
+    authorizations.set(connectionName, { verified: confirmed, ...checked, selection, trustRef, frames,
       forwarded: checked.policy.audience_public_key !== source });
     confirmed = undefined;
     saveTrust(trustRef, { ...selectedTrust, pins: selectedTrust.pins.map(pin => ({ ...pin,
@@ -357,6 +363,117 @@ async function authenticate(input, connectionName) {
     })) });
     return { ...checked, selection };
   } finally { importer?.free(); imported?.free(); confirmed?.free(); }
+}
+
+function gatewayBinding(connectionName) {
+  const binding = gateways.get(connectionName);
+  assert(binding?.state === 'ready', 'Gateway selection has no complete verified source');
+  assert.equal(authorizations.get(binding.sourceConnection), binding.authorization,
+    'Gateway source changed; attach the current confirmed B authorization');
+  assert.equal(connections.get(connectionName)?.nodePublicKey, binding.card.gateway.node_public_key,
+    'Gateway connection changed');
+  return binding;
+}
+
+async function gatewaySource(connection, frame) {
+  boundedCarrier(frame, {});
+  const response = await connection.request('gateway_source', frame);
+  boundedCarrier(frame, response);
+  if (response.error) {
+    const error = new Error(`Gateway source rejected: ${JSON.stringify(response.error)}`);
+    error.rpcMethod = 'gateway_source';
+    throw error;
+  }
+  assert(response.result && typeof response.result === 'object', 'Gateway returned no source result');
+  return response.result;
+}
+
+async function attachGateway(input, connectionName) {
+  const sourceConnection = input.source_connection || 'main';
+  assert.notEqual(connectionName, sourceConnection, 'Gateway needs a separate connection from B');
+  const connection = connections.get(connectionName);
+  const source = authorizations.get(sourceConnection);
+  const sourceChannel = connections.get(sourceConnection);
+  assert(source && sourceChannel && connection, 'Gateway requires an existing confirmed B connection');
+  const card = structuredClone(input.card);
+  assert.equal(card.version, 2);
+  assert.equal(card.kind, 'vibeface-gateway');
+  assert.equal(connection.nodePublicKey, card.gateway.node_public_key, 'Gateway card changed the actual A pin');
+  assert.equal(connection.nodeId, card.gateway.node_id, 'Gateway card changed the actual A Node');
+  assert.equal(connection.url, card.gateway.url, 'Gateway card changed the selected endpoint');
+  assert.equal(connection.relay, Boolean(card.gateway.relay), 'Gateway card changed the selected transport');
+  assert.equal(connection.identityName, sourceChannel.identityName, 'Gateway and B must use the same U identity');
+  assert.equal(sourceChannel.nodePublicKey, source.policy.audience_public_key, 'Gateway source must come directly from B');
+  const route = card.approval.payload;
+  assert.equal(route.gateway, connection.nodePublicKey);
+  assert.equal(route.client_key, identity(sourceChannel.identityName).publicKeyHex());
+  assert.equal(route.client_account, source.scope.account_id);
+  assert.equal(route.target_key, source.policy.audience_public_key);
+  assert.deepEqual(route.resource, { space: source.scope.space_id, resource: source.resources[0].payload.resource });
+  assert(Number.isSafeInteger(route.generation) && route.generation > 0, 'Gateway route requires a positive generation');
+  assert.equal(route.state, 'active', 'Gateway route is not active');
+  assert(Number.isSafeInteger(route.issued_at_ms) && Number.isSafeInteger(route.expires_at_ms)
+    && route.issued_at_ms <= Date.now() && Date.now() < route.expires_at_ms, 'Gateway route is outside its approved window');
+  const approvalHash = crypto.gatewayRouteApprovalHash(JSON.stringify(card.approval));
+  const selection = { state: 'selected', card, sourceConnection, authorization: source };
+  gateways.set(connectionName, selection);
+  const committed = await gatewaySource(connection, { stage: 'route', approval: card.approval });
+  assert.deepEqual(committed, { route_id: route.route_id, approval: approvalHash, generation: route.generation },
+    'Gateway installed a different owner-approved route');
+  let progress;
+  let sentPages = 0;
+  const totalPages = source.frames.filter(frame => frame.stage === 'page').length;
+  for (const original of source.frames) {
+    const frame = original.stage === 'begin'
+      ? { ...original, route_id: route.route_id } : { ...original, reference: progress.reference };
+    const next = await gatewaySource(connection, frame);
+    assert.equal(typeof next.reference, 'string', 'Gateway source has no cache reference');
+    if (progress) assert.equal(next.reference, progress.reference, 'Gateway source reference changed');
+    if (original.stage === 'page') sentPages++;
+    assert(Number.isSafeInteger(next.pages) && next.pages >= sentPages && next.pages >= (progress?.pages || 0)
+      && next.pages <= totalPages, 'Gateway source did not retain the exact page sequence');
+    assert.equal(typeof next.complete, 'boolean', 'Gateway source completion is invalid');
+    if (next.complete) assert.equal(next.pages, totalPages, 'Gateway completed without all original pages');
+    if (original.stage === 'finish') assert(next.complete, 'Gateway did not confirm the original finish');
+    progress = next;
+  }
+  assert(progress?.complete, 'Gateway source is incomplete');
+  assert.equal(gateways.get(connectionName), selection, 'Gateway selection changed during source import');
+  assert.equal(authorizations.get(sourceConnection), source, 'B authorization changed during source import');
+  const binding = { state: 'ready', card, sourceConnection, authorization: source, approvalHash, sourceRef: progress.reference };
+  gateways.set(connectionName, binding);
+  return { scope: source.scope, policy: source.policy, resources: source.resources, selection: source.selection,
+    gateway: { public_key: connection.nodePublicKey, approval_hash: approvalHash, source_ref: progress.reference,
+      generation: route.generation } };
+}
+
+async function forwardGateway(connectionName, original) {
+  const binding = gatewayBinding(connectionName);
+  const connection = connections.get(connectionName);
+  const sourceChannel = connections.get(binding.sourceConnection);
+  const originalJson = JSON.stringify(original);
+  const id = original.kind === 'prepare' ? null : original.body.authorization_id;
+  const key = id === null ? null : JSON.stringify([connectionName, id]);
+  assert(!key || !gatewayPending.has(key), 'Gateway request outcome is unknown; reconcile the original operation before another send');
+  const handle = crypto.prepareGatewayClientReply(binding.authorization.verified, originalJson,
+    binding.approvalHash, connection.nodePublicKey, identity(sourceChannel.identityName), Date.now());
+  const pending = { handle, original, binding, state: 'unknown' };
+  if (key) gatewayPending.set(key, pending);
+  let verified = false;
+  try {
+    const response = await gatewaySource(connection, { stage: 'forward', reference: binding.sourceRef, original });
+    assert.equal(gatewayBinding(connectionName), binding, 'Gateway route changed during this request');
+    const outcome = JSON.parse(handle.verifyReply(JSON.stringify(response.forward), JSON.stringify(response.reply),
+      JSON.stringify(response.outcome), Date.now()));
+    assert(['ok', 'error'].includes(outcome.kind), 'Gateway returned an invalid verified outcome');
+    verified = true;
+    return outcome.kind === 'ok' ? { result: outcome.value } : { error: outcome.value };
+  } finally {
+    if (verified || !key) {
+      handle.free();
+      if (key) gatewayPending.delete(key);
+    }
+  }
 }
 
 function retainPreparation(input, kind, prepared, trustRef) {
@@ -367,17 +484,19 @@ function retainPreparation(input, kind, prepared, trustRef) {
 }
 
 async function readRemotePolicy(input, connectionName) {
-  const source = authorizations.get(connectionName);
+  const binding = gateways.has(connectionName) ? gatewayBinding(connectionName) : null;
+  const sourceName = binding?.sourceConnection || connectionName;
+  const source = authorizations.get(sourceName);
   assert(source, 'remote policy needs a confirmed source authorization');
   assert(!remoteAuthorizations.has(input.handle), 'release the previous remote authorization explicitly');
-  const b = connections.get(input.source_connection || connectionName);
+  const b = connections.get(input.source_connection || sourceName);
   const c = connections.get(input.execution_connection);
   assert(b && c, 'remote policy needs separate pinned source and execution connections');
   assert.equal(b.nodePublicKey, source.policy.audience_public_key, 'source policy connection must reach B');
   assert.equal(c.nodePublicKey, input.selection.target_public_key, 'execution policy connection must reach C');
   const executionTrust = savedTrust(input.execution_trust_ref);
   assert.equal(executionTrust.scope.space_id, input.selection.execution_resource.space);
-  const signer = identity(connections.get(connectionName).identityName);
+  const signer = identity(connections.get(sourceName).identityName);
   const intent = JSON.parse(crypto.buildRemoteExecutionPolicyReadIntent(source.verified, JSON.stringify({
     selection: input.selection, context: input.raw_context, expected_action: input.action,
     purpose: input.purpose || 'execution', execution_pins: executionTrust.pins,
@@ -474,6 +593,8 @@ async function command(input) {
     JSON.stringify(input.binding), JSON.stringify(input.seal), input.project_public_key,
     input.execution_public_key, JSON.stringify(input.revision)));
   if (input.op === 'derive_authorization_id') return crypto.deriveAuthorizationId(input.kind, input.value);
+  if (input.op === 'sign_gateway_route') return JSON.parse(crypto.signGatewayRouteApproval(JSON.stringify(input.payload), identity(input.identity || 'root')));
+  if (input.op === 'gateway_route_hash') return crypto.gatewayRouteApprovalHash(JSON.stringify(input.approval));
   if (input.op === 'signed_invocation_hash') return crypto.signedInvocationHash(JSON.stringify(input.invocation));
   if (input.op === 'sign') return identity(input.identity).sign(input.domain, encoder.encode(typeof input.payload === 'string' ? input.payload : JSON.stringify(input.payload)));
   if (input.op === 'verify_space_fixture') {
@@ -608,6 +729,7 @@ async function command(input) {
     finally { verified.free(); }
   }
   if (input.op === 'connect') {
+    gateways.delete(connectionName);
     connections.get(connectionName)?.close();
     authorizations.get(connectionName)?.verified.free(); authorizations.delete(connectionName);
     connections.set(connectionName, await connect(input));
@@ -616,8 +738,21 @@ async function command(input) {
   const connection = connections.get(connectionName);
   if (!connection) throw new Error('no connection');
   if (input.op === 'authenticate') return authenticate(input, connectionName);
+  if (input.op === 'attach_gateway') return attachGateway(input, connectionName);
+  if (input.op === 'reconnect_gateway') {
+    const binding = gatewayBinding(connectionName);
+    connection.close();
+    const channel = await connect({ ...binding.card.gateway,
+      identity: connections.get(binding.sourceConnection).identityName });
+    assert.equal(gateways.get(connectionName), binding, 'Gateway selection changed during reconnect');
+    connections.set(connectionName, channel);
+    return { connected: true, source_ref: binding.sourceRef };
+  }
+  if (input.op === 'gateway_pending') return [...gatewayPending.values()].map(pending => ({
+    authorization_id: pending.original.body.authorization_id, operation_id: pending.original.body.operation_id
+      || pending.original.body.request?.operation_id, state: pending.state }));
   if (input.op === 'check_authorization_host') {
-    const auth = authorizations.get(connectionName);
+    const auth = gateways.has(connectionName) ? gatewayBinding(connectionName).authorization : authorizations.get(connectionName);
     assert(auth, 'no confirmed authorization');
     return checkedAuthorization(auth.verified, input.expected_host_public_key, savedTrust(auth.trustRef));
   }
@@ -710,10 +845,20 @@ async function command(input) {
       return result;
     } finally { verified.free(); }
   }
-  if (input.op === 'request') return connection.request(input.method, input.params || {}, input.invocation);
+  if (input.op === 'request') {
+    if (gateways.has(connectionName) && input.method === 'rpc') {
+      assert(input.invocation, 'Gateway business calls need the original signed invocation');
+      return forwardGateway(connectionName, { kind: input.params.method === 'operation' ? 'status' : 'invoke',
+        body: input.params, invocation: input.invocation });
+    }
+    return connection.request(input.method, input.params || {}, input.invocation);
+  }
   if (input.op === 'signed_request' || input.op === 'prepare_signed') {
-    const auth = authorizations.get(connectionName);
+    const binding = gateways.has(connectionName) ? gatewayBinding(connectionName) : null;
+    const auth = binding?.authorization || authorizations.get(connectionName);
     if (!auth) throw new Error('authenticate before signing a business request');
+    assert(!binding || !gatewayPending.has(JSON.stringify([connectionName, input.body.authorization_id])),
+      'Gateway request outcome is unknown; preserve its original signature and reconcile first');
     assert.equal(input.body.space_id, auth.scope.space_id);
     const action = expectedAction(input.body);
     const rawContext = input.raw_context || {
@@ -735,17 +880,19 @@ async function command(input) {
       auth.verified, body, JSON.stringify(rawContext), action,
       input.body.authorization_id, connection.nodePublicKey, signer, Date.now(),
     ));
-    const prepared = await connection.request('prepare_invocation', { body: input.body, intent });
+    const prepared = binding ? await forwardGateway(connectionName, { kind: 'prepare', body: input.body, intent })
+      : await connection.request('prepare_invocation', { body: input.body, intent });
     if (prepared.error) return prepared;
     const checked = checkedPreparation(input, rawContext, prepared.result);
     const template = JSON.stringify(prepared.result.invocation);
     const finalBody = JSON.stringify(checked.body);
     const invocation = JSON.parse(remote ? remote.remote.sign(auth.verified, template, finalBody, action,
-      input.body.authorization_id, connection.nodePublicKey, signer, Date.now()) : auth.forwarded
+      input.body.authorization_id, connection.nodePublicKey, signer, Date.now()) : binding || auth.forwarded
       ? crypto.signForwardedClientInvocation(auth.verified, template, finalBody, action, input.body.authorization_id, connection.nodePublicKey, signer, Date.now())
       : crypto.signClientInvocation(auth.verified, template, finalBody, action, input.body.authorization_id, signer, Date.now()));
     if (input.op === 'prepare_signed') return { body: checked.body, invocation };
-    return connection.request(input.method || 'rpc', checked.body, invocation);
+    return binding ? forwardGateway(connectionName, { kind: checked.body.method === 'operation' ? 'status' : 'invoke',
+      body: checked.body, invocation }) : connection.request(input.method || 'rpc', checked.body, invocation);
   }
   if (input.op === 'events') return connection.events;
   if (input.op === 'wire') return connection.frames.map(frame => frame.toString('hex'));
@@ -761,6 +908,7 @@ for await (const line of createInterface({ input: process.stdin })) {
 for (const connection of connections.values()) connection.close();
 for (const auth of authorizations.values()) auth.verified.free();
 for (const pending of preparations.values()) pending.prepared.free();
+for (const pending of gatewayPending.values()) pending.handle.free();
 for (const remote of remoteAuthorizations.values()) remote.remote.free();
 creation?.free();
 recoveryPreparation?.free();
