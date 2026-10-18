@@ -379,6 +379,32 @@ pub struct VerifiedTaskBusinessOperationCurrent {
 }
 
 impl VerifiedTaskBusinessOperationCurrent {
+    pub fn check_current(
+        &self,
+        primary: &VerifiedPolicySet,
+        local_c: &PublicKey,
+        saved_floors: &[PolicyPin],
+        now: u64,
+    ) -> Result<ExecutionProofUsage> {
+        let _signatures = ScopedSignatureVerification::new();
+        let candidate = begin_task_business_operation_current(
+            primary,
+            &self.original,
+            local_c,
+            saved_floors,
+            now,
+        )?;
+        if candidate.primary_heads() != self.primary_heads()
+            || candidate.dependencies() != self.dependencies()
+        {
+            return Err(AuthorizationError::NeedPolicySync(
+                candidate.dependencies().to_vec(),
+            ));
+        }
+        let verified = candidate.finish(&self.freshness, now)?;
+        Ok(verified.usage)
+    }
+
     pub fn handoff_authorization(&self) -> &VerifiedExecutionHandoff {
         &self.authorization
     }
