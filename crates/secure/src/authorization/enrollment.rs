@@ -217,9 +217,26 @@ fn actor<'a>(
     right: AccountRight,
     now: u64,
 ) -> Result<EnrollmentActor<'a>> {
+    actor_in(state, account, issuer, right, now, &mut Budget::default())
+}
+fn actor_in<'a>(
+    state: &'a VerifiedPolicySet,
+    account: &AccountId,
+    issuer: &PublicKey,
+    right: AccountRight,
+    now: u64,
+    budget: &mut Budget,
+) -> Result<EnrollmentActor<'a>> {
     let document = state
         .account(account)
         .ok_or(AuthorizationError::PolicyConflict)?;
+    budget.verify(
+        state
+            .accounts
+            .get(account)
+            .and_then(|account| account.history.last())
+            .ok_or(AuthorizationError::PolicyConflict)?,
+    )?;
     if *issuer == document.current_root {
         return Ok(EnrollmentActor::Root);
     }
@@ -234,7 +251,7 @@ fn actor<'a>(
     state.validate_certificate(
         certificate,
         now,
-        &mut Budget::default(),
+        budget,
         &mut BTreeMap::new(),
         &mut BTreeSet::new(),
     )?;
@@ -1593,6 +1610,104 @@ mod tests {
                 },
             )
         }
+        fn import_offer(&self, offer_json: &str, reader: &Identity) -> VerifiedEnrollmentOffer {
+            use crate::authorization::enrollment_policy_import::*;
+            let descriptor = verify_device_enrollment_offer(offer_json, NOW as f64).unwrap();
+            let request_json = build_enrollment_offer_policy_read_request(
+                &descriptor,
+                reader,
+                NOW as f64,
+                (NOW + 60_000) as f64,
+            )
+            .unwrap();
+            let request: Signed<EnrollmentPolicyReadRequest> = parse(&request_json).unwrap();
+            let signed_offer: Signed<EnrollmentOffer> = parse(offer_json).unwrap();
+            let context = enrollment_offer_policy_descriptor(&signed_offer);
+            let snapshot = Signed::sign(
+                EnrollmentPolicySnapshot {
+                    version: AUTH_VERSION,
+                    purpose: EnrollmentPolicyPurpose::BrowserDevice,
+                    credential_hash: enrollment_offer_hash(&signed_offer).unwrap(),
+                    request_hash: request.hash().unwrap(),
+                    snapshot_id: Nonce::random().unwrap(),
+                    descriptor_hash: ObjectHash::body(&context).unwrap(),
+                    reader_public_key: PublicKey::of(reader),
+                    target_public_key: PublicKey::of(reader),
+                    source_node_public_key: PublicKey::of(&key(4)),
+                    saved_pins_hash: ObjectHash::body(&context.pins).unwrap(),
+                    required_heads_hash: ObjectHash::body(&context.required_heads).unwrap(),
+                    target_heads: context.target_heads.clone(),
+                    issued_at_ms: NOW,
+                    expires_at_ms: request.payload.expires_at_ms,
+                },
+                &key(4),
+            )
+            .unwrap();
+            let mut import = begin_enrollment_offer_import(
+                &descriptor,
+                &request_json,
+                &encode(&snapshot).unwrap(),
+                reader,
+                &key(4).public_key_hex(),
+                NOW as f64,
+            )
+            .unwrap();
+            let mut previous = snapshot.hash().unwrap();
+            let mut cursor = None;
+            for (index, entry) in self.bundle.journal.iter().enumerate() {
+                let complete = index + 1 == self.bundle.journal.len();
+                let page = Signed::sign(
+                    EnrollmentPolicyPage {
+                        version: AUTH_VERSION,
+                        purpose: EnrollmentPolicyPurpose::BrowserDevice,
+                        credential_hash: enrollment_offer_hash(&signed_offer).unwrap(),
+                        request_hash: request.hash().unwrap(),
+                        snapshot_id: snapshot.payload.snapshot_id.clone(),
+                        snapshot_hash: snapshot.hash().unwrap(),
+                        request_cursor: cursor,
+                        page_index: index as u64,
+                        previous_page_hash: previous,
+                        entry: Some(entry.clone()),
+                        next_cursor: if complete {
+                            None
+                        } else {
+                            Some(ObjectHash::body(&("offer-test-cursor", index)).unwrap())
+                        },
+                        complete,
+                        issued_at_ms: NOW,
+                        expires_at_ms: request.payload.expires_at_ms,
+                    },
+                    &key(4),
+                )
+                .unwrap();
+                previous = page.hash().unwrap();
+                cursor = page.payload.next_cursor.clone();
+                import
+                    .append_page(&encode(&page).unwrap(), NOW as f64)
+                    .unwrap();
+            }
+            let witness = Signed::sign(
+                EnrollmentPolicyWitness {
+                    version: AUTH_VERSION,
+                    purpose: EnrollmentPolicyPurpose::BrowserDevice,
+                    credential_hash: enrollment_offer_hash(&signed_offer).unwrap(),
+                    request_hash: request.hash().unwrap(),
+                    snapshot_id: snapshot.payload.snapshot_id.clone(),
+                    snapshot_hash: snapshot.hash().unwrap(),
+                    target_heads_hash: ObjectHash::body(&context.target_heads).unwrap(),
+                    final_page_hash: previous,
+                    page_count: self.bundle.journal.len() as u64,
+                    entry_count: self.bundle.journal.len() as u64,
+                    issued_at_ms: NOW,
+                    expires_at_ms: request.payload.expires_at_ms,
+                },
+                &key(4),
+            )
+            .unwrap();
+            import
+                .finish(&encode(&witness).unwrap(), NOW as f64)
+                .unwrap()
+        }
         fn intent(&self, child: u8, rights: Vec<AccountRight>) -> DeviceEnrollmentIntent {
             DeviceEnrollmentIntent {
                 account: self.account(),
@@ -1840,19 +1955,12 @@ mod tests {
             enrollment_offer_hash(&signed).unwrap(),
             enrollment_offer_hash(&changed_signature).unwrap()
         );
-        assert!(verify_enrollment_offer(&changed_signature, NOW).is_err());
-        assert!(signed.payload.manager_journal.iter().all(|entry| matches!(
-            entry,
-            JournalEntry::AccountGenesis(_)
-                | JournalEntry::Account(_)
-                | JournalEntry::AccountCommit(_)
-                | JournalEntry::Device(_)
-                | JournalEntry::Authenticator(_)
-        )));
+        assert!(verify_enrollment_offer_current(&f.state(), &changed_signature, NOW).is_err());
+        assert!(!json.contains("manager_journal"));
         assert!(!json.contains("secret_hex"));
         assert!(!json.contains("grant_leaf"));
         assert_eq!(signed.payload.pins.len(), 2);
-        let verified = verify_device_enrollment_offer(&json, NOW as f64).unwrap();
+        let verified = f.import_offer(&json, &key(5));
         let intent_json =
             create_device_enrollment_intent_from_offer(&verified, &key(5), NOW as f64).unwrap();
         let intent: DeviceEnrollmentIntent = parse(&intent_json).unwrap();
@@ -1918,10 +2026,22 @@ mod tests {
                 3 => offer.expires_at_ms = NOW + INVOCATION_MAX_AGE_MS + 1,
                 _ => offer.entry.endpoint = "https://user:password@node.example".to_owned(),
             }
-            assert!(verify_enrollment_offer(&Signed::sign(offer, &key(3)).unwrap(), NOW).is_err());
+            assert!(
+                verify_enrollment_offer_current(
+                    &f.state(),
+                    &Signed::sign(offer, &key(3)).unwrap(),
+                    NOW
+                )
+                .is_err()
+            );
         }
         assert!(
-            verify_enrollment_offer(&Signed::sign(signed.payload, &key(2)).unwrap(), NOW).is_err()
+            verify_enrollment_offer_current(
+                &f.state(),
+                &Signed::sign(signed.payload, &key(2)).unwrap(),
+                NOW
+            )
+            .is_err()
         );
     }
 
@@ -1929,7 +2049,7 @@ mod tests {
     fn public_offer_roundtrips_large_valid_history_under_its_own_bound() {
         let mut f = Fixture::new();
         let mut state = f.state();
-        for _ in 0..40 {
+        for _ in 0..130 {
             let document =
                 Signed::sign(next_document(&state, &f.account()).unwrap(), &key(1)).unwrap();
             let head = state.install_account(document.clone()).unwrap();
@@ -1952,10 +2072,10 @@ mod tests {
             NOW as f64,
         )
         .unwrap();
-        assert!(json.len() > MAX_PROOF_BYTES);
+        assert!(f.bundle_json().len() > MAX_PROOF_BYTES);
         assert!(json.len() < MAX_ENROLLMENT_OFFER_BYTES);
-        assert!(decode_signed::<EnrollmentOffer>(json.as_bytes()).is_err());
-        let verified = verify_device_enrollment_offer(&json, NOW as f64).unwrap();
+        assert!(decode_signed::<EnrollmentOffer>(json.as_bytes()).is_ok());
+        let verified = f.import_offer(&json, &key(5));
         assert_eq!(
             verified.offer_hash().unwrap(),
             enrollment_offer_hash(&decode_enrollment_offer(json.as_bytes()).unwrap())
@@ -1993,7 +2113,7 @@ mod tests {
             NOW as f64,
         )
         .unwrap();
-        let offer = verify_device_enrollment_offer(&json, NOW as f64).unwrap();
+        let offer = f.import_offer(&json, &key(5));
         let intent_json =
             create_device_enrollment_intent_from_offer(&offer, &key(5), NOW as f64).unwrap();
         let canonical_json = verify_device_enrollment_intent_for_offer(
@@ -2341,7 +2461,7 @@ mod tests {
     }
 
     #[test]
-    fn passkey_offer_finish_has_an_account_journal_without_inventing_business_authority() {
+    fn passkey_offer_finish_returns_only_delta_without_inventing_client_authority() {
         let f = Fixture::new();
         let offer_json = create_device_enrollment_offer(
             &key(3),
@@ -2354,7 +2474,7 @@ mod tests {
             NOW as f64,
         )
         .unwrap();
-        let offer = verify_device_enrollment_offer(&offer_json, NOW as f64).unwrap();
+        let offer = f.import_offer(&offer_json, &key(5));
         let proof = f.passkey_proof(5);
         let signed = sign_passkey_enrollment_intent_from_offer(
             &encode(&proof.intent.payload).unwrap(),
@@ -2400,24 +2520,11 @@ mod tests {
                 | JournalEntry::Device(_)
                 | JournalEntry::Authenticator(_)
         )));
-        let account_pins: Vec<_> = result
-            .pins
-            .iter()
-            .filter(|pin| pin.domain == PolicyDomain::Account(f.account()))
-            .cloned()
-            .collect();
         assert!(
-            replay_policies(&account_pins, &{
-                let mut history = parse::<Signed<EnrollmentOffer>>(&offer_json)
-                    .unwrap()
-                    .payload
-                    .manager_journal;
-                history.extend(journal);
-                history
-            })
-            .unwrap()
-            .find_device(&proof.certificate.payload.device)
-            .is_ok()
+            f.after(&result)
+                .state()
+                .find_device(&proof.certificate.payload.device)
+                .is_ok()
         );
         let full_prepared = prepare_passkey_device_enrollment(
             &signed,
@@ -2498,7 +2605,7 @@ mod tests {
             NOW as f64,
         )
         .unwrap();
-        let verified_offer = verify_device_enrollment_offer(&offer, NOW as f64).unwrap();
+        let verified_offer = f.import_offer(&offer, &key(5));
         assert_eq!(
             verified_offer.offer_hash().unwrap(),
             ObjectHash::body(&parse::<Signed<EnrollmentOffer>>(&offer).unwrap())

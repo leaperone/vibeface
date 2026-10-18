@@ -1,4 +1,6 @@
 use super::{journal, policy::project_policy_in};
+
+mod policy_read;
 use crate::{crypto::LocalIdentity, store::Store};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -135,7 +137,11 @@ fn validate_completion(
     Ok(())
 }
 
-fn validate_enrollment_record(connection: &Connection, record: &EnrollmentRecord) -> Result<()> {
+fn validate_enrollment_record(
+    connection: &Connection,
+    policy: &journal::PolicyState,
+    record: &EnrollmentRecord,
+) -> Result<()> {
     let account = &record.unsigned_intent.account;
     let space = SpaceId::personal(account);
     ensure!(
@@ -157,15 +163,13 @@ fn validate_enrollment_record(connection: &Connection, record: &EnrollmentRecord
         "stored enrollment offer binding differs"
     );
     let at = record.unsigned_intent.certificate_not_before_ms;
-    let verified =
-        offer::verify_device_enrollment_offer(&encoded, at as f64).map_err(anyhow::Error::msg)?;
-    offer::verify_device_enrollment_intent_for_offer(
-        &verified,
-        &serde_json::to_string(&record.unsigned_intent)?,
-        record.new_device_public_key.as_str(),
-        at as f64,
-    )
-    .map_err(anyhow::Error::msg)?;
+    offer::verify_enrollment_record_history(
+        policy.verified(),
+        &signed,
+        &record.unsigned_intent,
+        None,
+        at,
+    )?;
     let (intent, certificate, completion) = match &record.phase {
         EnrollmentPhase::Requested => return Ok(()),
         EnrollmentPhase::Approved { intent } => (intent, None, None),
@@ -183,12 +187,13 @@ fn validate_enrollment_record(connection: &Connection, record: &EnrollmentRecord
         intent.payload == record.unsigned_intent && intent.issuer == signed.issuer,
         "stored manager approval differs"
     );
-    offer::verify_account_enrollment_from_offer(
-        &serde_json::to_string(intent)?,
-        &verified,
-        at as f64,
-    )
-    .map_err(anyhow::Error::msg)?;
+    offer::verify_enrollment_record_history(
+        policy.verified(),
+        &signed,
+        &record.unsigned_intent,
+        Some(intent),
+        at,
+    )?;
     if let Some(certificate) = certificate {
         validate_possession(&record.unsigned_intent, &record.nonce, certificate)?;
     }
@@ -250,7 +255,11 @@ pub(crate) fn validate_enrollment_storage(
                     && offer::enrollment_offer_hash(&signed)?.as_str() == hash,
                 "stored offer key differs from signed offer"
             );
-            offer::verify_enrollment_offer(&signed, signed.payload.issued_at_ms)?;
+            offer::verify_enrollment_offer_history(
+                policy.verified(),
+                &signed,
+                signed.payload.issued_at_ms,
+            )?;
             for pin in &signed.payload.pins {
                 ensure!(
                     policy
@@ -268,7 +277,7 @@ pub(crate) fn validate_enrollment_storage(
                     && key == request_key(&record.request_id),
                 "stored enrollment row scope differs"
             );
-            validate_enrollment_record(connection, &record)?;
+            validate_enrollment_record(connection, policy, &record)?;
         }
     }
     Ok(())
@@ -312,7 +321,7 @@ impl Store {
         signed: &Signed<EnrollmentOffer>,
         now: u64,
     ) -> Result<()> {
-        offer::verify_enrollment_offer(signed, now)?;
+        offer::verify_enrollment_offer_current(self.policy.verified(), signed, now)?;
         ensure!(
             signed.payload.entry.node_public_key.as_str() == identity.public_key_hex()?,
             "enrollment offer targets another Node"
@@ -379,7 +388,7 @@ impl Store {
             |row| row.get(0),
         )?;
         let record: EnrollmentRecord = serde_json::from_str(&encoded)?;
-        validate_enrollment_record(&self.connection, &record)?;
+        validate_enrollment_record(&self.connection, &self.policy, &record)?;
         ensure!(
             record.request_id == *hash && record.unsigned_intent.account == *account,
             "enrollment request scope changed"
@@ -524,18 +533,13 @@ impl Store {
                 );
                 let intent: DeviceEnrollmentIntent =
                     serde_json::from_value(params["intent"].clone())?;
-                let verified = offer::verify_device_enrollment_offer(
-                    &serde_json::to_string(&signed)?,
-                    now as f64,
-                )
-                .map_err(anyhow::Error::msg)?;
-                offer::verify_device_enrollment_intent_for_offer(
-                    &verified,
-                    &serde_json::to_string(&intent)?,
-                    key.as_str(),
-                    now as f64,
-                )
-                .map_err(anyhow::Error::msg)?;
+                offer::verify_enrollment_intent_in_state(
+                    self.policy.verified(),
+                    &signed,
+                    &intent,
+                    &key,
+                    now,
+                )?;
                 let id = ObjectHash::body(&(hash.clone(), &intent))?;
                 if let Ok((_, old)) = self.enrollment_record(&account, &id) {
                     return Ok(serde_json::to_value(old)?);
@@ -565,7 +569,7 @@ impl Store {
                 let mut records = Vec::new();
                 for row in rows {
                     let record: EnrollmentRecord = serde_json::from_str(&row?)?;
-                    validate_enrollment_record(&self.connection, &record)?;
+                    validate_enrollment_record(&self.connection, &self.policy, &record)?;
                     if record.offer_hash == hash {
                         records.push(record);
                     }
@@ -841,6 +845,70 @@ mod tests {
             at,
         )
     }
+    fn imported_offer(
+        network: &TestNetwork,
+        store: &mut Store,
+        offer_json: &str,
+        device: &Identity,
+        at: u64,
+    ) -> Result<offer::VerifiedEnrollmentOffer> {
+        let descriptor = offer::verify_device_enrollment_offer(offer_json, at as f64)
+            .map_err(anyhow::Error::msg)?;
+        store.enrollment_command(
+            &network.node,
+            &network.client.public_key_hex(),
+            "enrollment_offer_publish",
+            &json!({"offer":serde_json::from_str::<Value>(offer_json)?}),
+            at,
+        )?;
+        let request = offer::build_enrollment_offer_policy_read_request(
+            &descriptor,
+            device,
+            at as f64,
+            (at + 60_000) as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let response = store.begin_enrollment_policy_read(&network.node, &device.public_key_hex(),
+            &json!({"credential":{"purpose":"browser_device","credential":serde_json::from_str::<Value>(offer_json)?}, "request":serde_json::from_str::<Value>(&request)?}), at)?;
+        let source = network.node.public_key_hex()?;
+        let mut import = offer::begin_enrollment_offer_import(
+            &descriptor,
+            &request,
+            &serde_json::to_string(&response["snapshot"])?,
+            device,
+            &source,
+            at as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        loop {
+            let params: Value =
+                serde_json::from_str(&import.page_request_json().map_err(anyhow::Error::msg)?)?;
+            let response = store.enrollment_policy_page(
+                &network.node,
+                &device.public_key_hex(),
+                &params,
+                at,
+            )?;
+            import
+                .append_page(&serde_json::to_string(&response["page"])?, at as f64)
+                .map_err(anyhow::Error::msg)?;
+            if response["page"]["payload"]["complete"] == true {
+                break;
+            }
+        }
+        let mut params: Value =
+            serde_json::from_str(&import.page_request_json().map_err(anyhow::Error::msg)?)?;
+        params["cursor"] = Value::Null;
+        let response = store.enrollment_policy_witness(
+            &network.node,
+            &device.public_key_hex(),
+            &params,
+            at,
+        )?;
+        import
+            .finish(&serde_json::to_string(&response["witness"])?, at as f64)
+            .map_err(anyhow::Error::msg)
+    }
     struct Flow {
         network: TestNetwork,
         store: Store,
@@ -871,8 +939,7 @@ mod tests {
             )
             .map_err(anyhow::Error::msg)?;
             let device = Identity::generate().map_err(anyhow::Error::msg)?;
-            let verified = offer::verify_device_enrollment_offer(&offer, now() as f64)
-                .map_err(anyhow::Error::msg)?;
+            let verified = imported_offer(&network, &mut store, &offer, &device, now())?;
             let intent =
                 offer::create_device_enrollment_intent_from_offer(&verified, &device, now() as f64)
                     .map_err(anyhow::Error::msg)?;
@@ -955,8 +1022,13 @@ mod tests {
         }
 
         fn qualification(&self) -> Result<enrollment::VerifiedAccountEnrollment> {
-            let verified = offer::verify_device_enrollment_offer(&self.offer, now() as f64)
-                .map_err(anyhow::Error::msg)?;
+            let verified = imported_offer(
+                &self.network,
+                &mut self.network.memory()?,
+                &self.offer,
+                &self.device,
+                now(),
+            )?;
             offer::verify_account_enrollment_from_offer(&self.approval()?, &verified, now() as f64)
                 .map_err(anyhow::Error::msg)
         }
@@ -1050,6 +1122,94 @@ mod tests {
                 "space_head":self.store.authorization_state().head(&PolicyDomain::Space(self.network.space.clone()))}),
             ))
         }
+    }
+
+    #[test]
+    fn finite_offer_read_retries_exactly_and_rejects_cache_changes_and_revocation() -> Result<()> {
+        use vibeface_secure::authorization::enrollment_policy_import::{
+            EnrollmentPolicyPurpose, EnrollmentPolicyReadRequest,
+        };
+        let mut flow = Flow::new(false)?;
+        let descriptor = offer::verify_device_enrollment_offer(&flow.offer, now() as f64)
+            .map_err(anyhow::Error::msg)?;
+        let request_json = offer::build_enrollment_offer_policy_read_request(
+            &descriptor,
+            &flow.device,
+            now() as f64,
+            (now() + 60_000) as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let request: Signed<EnrollmentPolicyReadRequest> = serde_json::from_str(&request_json)?;
+        let params = json!({"credential":{"purpose":"browser_device","credential":serde_json::from_str::<Value>(&flow.offer)?},"request":request});
+        let key = flow.device.public_key_hex();
+        let begin =
+            flow.store
+                .begin_enrollment_policy_read(&flow.network.node, &key, &params, now())?;
+        assert_eq!(
+            begin,
+            flow.store
+                .begin_enrollment_policy_read(&flow.network.node, &key, &params, now())?
+        );
+        let before = flow.snapshot()?;
+        let mut changed = request.payload.clone();
+        changed.purpose = EnrollmentPolicyPurpose::AccountNode;
+        let changed = Signed::sign(changed, &flow.device)?;
+        let mut invalid = params.clone();
+        invalid["request"] = serde_json::to_value(changed)?;
+        assert!(
+            flow.store
+                .begin_enrollment_policy_read(&flow.network.node, &key, &invalid, now())
+                .is_err()
+        );
+        assert_eq!(flow.snapshot()?, before);
+        let page_request = json!({"snapshot_id":begin["snapshot"]["payload"]["snapshot_id"],"request_hash":request.hash()?,"cursor":Value::Null});
+        let page =
+            flow.store
+                .enrollment_policy_page(&flow.network.node, &key, &page_request, now())?;
+        assert_eq!(
+            page,
+            flow.store
+                .enrollment_policy_page(&flow.network.node, &key, &page_request, now())?
+        );
+        let mut next = page_request.clone();
+        next["cursor"] = page["page"]["payload"]["next_cursor"].clone();
+        let cache_key = format!(
+            "enrollment-policy-page:{}",
+            begin["snapshot"]["payload"]["snapshot_id"]
+                .as_str()
+                .unwrap()
+        );
+        let original: String = flow.store.connection.query_row(
+            "SELECT value FROM identity_meta WHERE key=?",
+            [&cache_key],
+            |row| row.get(0),
+        )?;
+        let mut damaged: Value = serde_json::from_str(&original)?;
+        damaged["page"]["payload"]["request_cursor"] = next["cursor"].clone();
+        flow.store.connection.execute(
+            "UPDATE identity_meta SET value=? WHERE key=?",
+            params![serde_json::to_string(&damaged)?, cache_key],
+        )?;
+        let before = flow.snapshot()?;
+        assert!(
+            flow.store
+                .enrollment_policy_page(&flow.network.node, &key, &next, now())
+                .is_err()
+        );
+        assert_eq!(flow.snapshot()?, before);
+        flow.store.connection.execute(
+            "UPDATE identity_meta SET value=? WHERE key=?",
+            params![original, cache_key],
+        )?;
+        flow.network.revoke_client(&mut flow.store)?;
+        let before = flow.snapshot()?;
+        assert!(
+            flow.store
+                .enrollment_policy_page(&flow.network.node, &key, &next, now())
+                .is_err()
+        );
+        assert_eq!(flow.snapshot()?, before);
+        Ok(())
     }
 
     #[test]
@@ -1294,10 +1454,15 @@ mod tests {
     #[test]
     fn pending_enrollment_limit_counts_active_distinct_requests_only() -> Result<()> {
         let mut flow = Flow::new(false)?;
-        let verified = offer::verify_device_enrollment_offer(&flow.offer, now() as f64)
-            .map_err(anyhow::Error::msg)?;
         for _ in 0..32 {
             flow.device = Identity::generate().map_err(anyhow::Error::msg)?;
+            let verified = imported_offer(
+                &flow.network,
+                &mut flow.store,
+                &flow.offer,
+                &flow.device,
+                now(),
+            )?;
             flow.intent = offer::create_device_enrollment_intent_from_offer(
                 &verified,
                 &flow.device,
@@ -1308,6 +1473,13 @@ mod tests {
             assert_eq!(flow.request()?, requested);
         }
         flow.device = Identity::generate().map_err(anyhow::Error::msg)?;
+        let verified = imported_offer(
+            &flow.network,
+            &mut flow.store,
+            &flow.offer,
+            &flow.device,
+            now(),
+        )?;
         flow.intent = offer::create_device_enrollment_intent_from_offer(
             &verified,
             &flow.device,
@@ -1344,8 +1516,13 @@ mod tests {
             later,
         )?;
         flow.hash = published["offer_hash"].clone();
-        let verified = offer::verify_device_enrollment_offer(&replacement, later as f64)
-            .map_err(anyhow::Error::msg)?;
+        let verified = imported_offer(
+            &flow.network,
+            &mut flow.store,
+            &replacement,
+            &flow.device,
+            later,
+        )?;
         flow.intent = offer::create_device_enrollment_intent_from_offer(
             &verified,
             &flow.device,
