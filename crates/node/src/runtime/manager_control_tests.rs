@@ -80,6 +80,64 @@ fn operation(access: &Access) -> OperationRequest {
 }
 
 #[tokio::test]
+async fn sdk_multiline_call_id_runs_command_once_and_can_be_looked_up() -> Result<()> {
+    let (dir, node, access, _cancel) = running_manager().await?;
+    let call_id =
+        "call-4b54f5fe-7ec8-49c3-87cc-4585e0c43006-3\nfc_afd18a25-35f8-99d3-92b1-37b9c066cd76_0";
+    let args = json!({
+        "command": "printf x >> count; cat count",
+        "cwd": dir.canonicalize()?,
+        "target_node": node.identity.node_id()?,
+        "timeout_secs": 10,
+    });
+    let first = node
+        .agent_tool(access.clone(), "command", args.clone(), call_id)
+        .await?;
+    let reference = first["call_ref"]
+        .as_str()
+        .context("missing call reference")?;
+    assert!(!reference.chars().any(char::is_control));
+    assert!(reference.len() <= 256);
+    assert_eq!(first["operations"][0]["state"], "succeeded");
+    assert_eq!(first["operations"][0]["receipt"]["result"]["stdout"], "x");
+
+    let repeated = node
+        .agent_tool(access.clone(), "command", args.clone(), call_id)
+        .await?;
+    assert_eq!(repeated["work_ref"], first["work_ref"]);
+    let mut explicit = args.clone();
+    explicit["call_ref"] = json!(reference);
+    let retried = node
+        .agent_tool(access.clone(), "command", explicit, "another-sdk-id")
+        .await?;
+    assert_eq!(retried["work_ref"], first["work_ref"]);
+    let looked_up = node
+        .agent_tool(
+            access.clone(),
+            "call_lookup",
+            json!({"call_ref": reference}),
+            "lookup",
+        )
+        .await?;
+    assert_eq!(looked_up["operations"], first["operations"]);
+    assert_eq!(std::fs::read_to_string(dir.join("count"))?, "x");
+
+    let mut invalid = args;
+    invalid["call_ref"] = json!(call_id);
+    let error = node
+        .agent_tool(access, "command", invalid, "valid-sdk-id")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "a bounded stable call reference is required"
+    );
+    drop(node);
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn queued_manager_cancellation_preserves_the_active_reply_and_other_messages() -> Result<()> {
     let (dir, node, access, cancel) = running_manager().await?;
     let manager = access.manager.as_ref().unwrap();
