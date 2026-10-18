@@ -1062,6 +1062,27 @@ pub(crate) fn require_confirmed_client_policy(
         ))
 }
 
+pub(crate) fn record_confirmed_client_policy_metadata(
+    authorization: &VerifiedClientAuthorization,
+    usage: &mut ExecutionProofUsage,
+) -> Result<()> {
+    require_confirmed_client_policy(authorization)?;
+    let provenance =
+        authorization
+            .client_policy_context
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "bounded client provenance is missing",
+            ))?;
+    usage.record_signed(&provenance.request)?;
+    usage.record_signed(&provenance.snapshot)?;
+    usage.record_signed(&provenance.witness)?;
+    usage.record_signed(provenance.confirmation.as_ref().ok_or(
+        AuthorizationError::InvalidProof("bounded client confirmation is missing"),
+    )?)?;
+    Ok(())
+}
+
 pub fn verify_client_policy_server_session(
     state: VerifiedPolicySet,
     read: &Signed<ClientPolicyReadRequest>,
