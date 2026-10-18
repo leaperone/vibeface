@@ -2488,8 +2488,10 @@ pub(crate) mod tests {
             )
             .unwrap();
             assert_eq!(delayed.pins_json().unwrap(), result.pins_json().unwrap());
+            let expires_at_ms = prepared.authorization.budget.expires_at_ms;
             let expired =
-                finish_space_governance_change(prepared, &committed, (END + 1) as f64).unwrap();
+                finish_space_governance_change(prepared, &committed, (expires_at_ms + 1) as f64)
+                    .unwrap();
             assert_eq!(expired.pins_json().unwrap(), result.pins_json().unwrap());
             assert_eq!(expired.scope_json().unwrap(), "null");
             assert!(
