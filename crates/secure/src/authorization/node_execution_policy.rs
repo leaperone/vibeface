@@ -10,6 +10,12 @@ use super::{
 };
 use crate::signature_verification::ScopedSignatureVerification;
 
+pub(super) mod service;
+pub use service::{
+    NodeTaskExecutionPolicyImport, begin_node_task_policy_import,
+    verify_node_history_policy_source, verify_node_service_policy_source,
+};
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NodeExecutionPolicyReadIntent {
@@ -274,10 +280,16 @@ impl TaskExecutionPolicyRequest {
 }
 
 #[derive(Clone)]
+enum TaskPolicySourceScope {
+    Account(Signed<RemoteExecutionPolicyReadIntent>),
+    Node(service::NodeTaskPolicySourceScope),
+}
+
+#[derive(Clone)]
 pub struct VerifiedTaskPolicySource {
     snapshot: policy_import::VerifiedPolicySnapshot,
     primary_pins: Vec<PolicyPin>,
-    intent: Signed<RemoteExecutionPolicyReadIntent>,
+    source_scope: TaskPolicySourceScope,
     verified_at_ms: u64,
     expires_at_ms: u64,
     usage: ExecutionProofUsage,
@@ -324,7 +336,7 @@ pub fn task_policy_source_from_current(
     Ok(VerifiedTaskPolicySource {
         snapshot,
         primary_pins: primary_pins.to_vec(),
-        intent: current.intent().clone(),
+        source_scope: TaskPolicySourceScope::Account(current.intent().clone()),
         verified_at_ms: now,
         expires_at_ms: current
             .intent()
@@ -506,7 +518,8 @@ pub fn begin_task_policy_import(
     require(
         source.verified_at_ms <= now
             && now < source.expires_at_ms
-            && source.intent == request.intent,
+            && matches!(&source.source_scope, TaskPolicySourceScope::Account(intent)
+                if intent == &request.intent),
         "task policy import changed its current native source",
     )?;
     let typed = TaskExecutionPolicyRequest::Account(request.clone());
@@ -801,12 +814,33 @@ impl VerifiedTaskCurrentPolicy {
     ) -> Result<()> {
         self.check_window(now)?;
         require(
+            matches!(
+                self.request.purpose(),
+                RemoteExecutionPolicyPurpose::Execution | RemoteExecutionPolicyPurpose::Resolver
+            ),
+            "observation policy cannot authorize a business request",
+        )?;
+        let source_matches = match &self.source.source_scope {
+            TaskPolicySourceScope::Account(_) => {
+                facts.action == self.request.expected_action()
+                    && facts.context == context.context
+                    && *context == self.context
+            }
+            TaskPolicySourceScope::Node(scope) => {
+                facts == &scope.facts
+                    && (context.context == scope.context.context
+                        || context.context == scope.facts.context)
+                    && context.binding_generation == scope.context.binding_generation
+                    && context.canonical_cwd == scope.context.canonical_cwd
+                    && context.execution_target_public_key
+                        == scope.context.execution_target_public_key
+            }
+        };
+        require(
             facts.resource == *self.request.source_project()
                 && facts.audience.service == ServiceId::from_key(self.request.source_node())
                 && facts.audience.device == DeviceId::from_key(self.request.source_node())
-                && facts.action == self.request.expected_action()
-                && facts.context == context.context
-                && *context == self.context
+                && source_matches
                 && *selection == self.selection,
             "task policy does not match this exact request scope, purpose or selection",
         )
@@ -1189,6 +1223,43 @@ fn read_window(issued: u64, expires: u64, now: u64) -> Result<()> {
     )
 }
 
+pub(super) fn verify_node_current_policy_claims(
+    state: &VerifiedPolicySet,
+    value: &NodeExecutionPolicyReadIntent,
+    local_c: &PublicKey,
+    actual_noise_b: &PublicKey,
+    now: u64,
+) -> Result<remote_execution_policy::ExecutionPolicyClosure> {
+    read_window(value.issued_at_ms, value.expires_at_ms, now)?;
+    validate_pins(&value.execution_pins)?;
+    require(
+        value.version == AUTH_VERSION
+            && value.purpose != RemoteExecutionPolicyPurpose::History
+            && value.context.context.workspace_resource.as_ref()
+                == Some(&value.source_project.resource)
+            && value.context.context.sdk_session.is_none()
+            && value.context.context.task.is_some()
+            && value.context.context.conversation.is_some()
+            && value.context.context.executor_kind.is_some()
+            && value
+                .context
+                .binding_generation
+                .is_some_and(|generation| generation > 0),
+        "node policy read changed its Task, purpose or source Project",
+    )?;
+    remote_execution_policy::verify_execution_policy_closure(
+        state,
+        &value.selection,
+        actual_noise_b,
+        &value.context,
+        value.expected_action,
+        value.purpose,
+        &value.execution_pins,
+        local_c,
+        now,
+    )
+}
+
 /// The caller supplies the real Noise key, without creating a business Peer capability.
 pub fn verify_node_execution_policy_read(
     state: &VerifiedPolicySet,
@@ -1212,32 +1283,15 @@ pub fn verify_node_execution_policy_read(
     let (heads, allowed_hashes, mut usage) = match request {
         NodeExecutionPolicyReadRequest::Current(intent) => {
             intent.verify_signature()?;
-            let value = &intent.payload;
             require(
-                value.version == AUTH_VERSION
-                    && value.purpose != RemoteExecutionPolicyPurpose::History
-                    && history_acceptance.is_none()
-                    && value.context.context.workspace_resource.as_ref()
-                        == Some(&value.source_project.resource)
-                    && value.context.context.sdk_session.is_none()
-                    && value.context.context.task.is_some()
-                    && value.context.context.conversation.is_some()
-                    && value.context.context.executor_kind.is_some()
-                    && value
-                        .context
-                        .binding_generation
-                        .is_some_and(|generation| generation > 0),
-                "node policy read changed its Task, purpose or source Project",
+                history_acceptance.is_none(),
+                "current read cannot carry History acceptance",
             )?;
-            let closure = remote_execution_policy::verify_execution_policy_closure(
+            let closure = verify_node_current_policy_claims(
                 state,
-                &value.selection,
-                actual_noise_b,
-                &value.context,
-                value.expected_action,
-                value.purpose,
-                &value.execution_pins,
+                &intent.payload,
                 local_c,
+                actual_noise_b,
                 now,
             )?;
             let mut usage = closure.usage;
@@ -1897,6 +1951,69 @@ mod tests {
                 now
             )
             .is_err()
+        );
+        let readonly_leaf = fixture
+            .state
+            .grants
+            .values()
+            .find(|grant| {
+                grant.payload.grantee
+                    == Grantee::Actor(Actor::Service(ServiceId::from_key(&source_key)))
+                    && prepare::remote_actions(&grant.payload.actions, true)
+            })
+            .unwrap();
+        let readonly_selection = RemoteExecutionPolicySelection {
+            execution_grant: readonly_leaf.hash().unwrap(),
+            ..selection.clone()
+        };
+        let mut readonly_context = context.clone();
+        readonly_context.canonical_cwd = None;
+        let observed = super::super::remote_execution_policy::tests::remote_policy_stream(
+            &source_auth,
+            &fixture.client,
+            &fixture.project_node,
+            &fixture.execution_bundle,
+            &fixture.pins,
+            &fixture.executor,
+            &readonly_selection,
+            &readonly_context,
+            Action::OperationResolve,
+            RemoteExecutionPolicyPurpose::ObservationRead,
+            now,
+        )
+        .unwrap();
+        let observed_source = verify_remote_execution_policy_delegation_source(
+            source_policy.state(),
+            &observed.request.intent,
+            &source_key,
+            &PublicKey::of(&fixture.client),
+            now,
+        )
+        .unwrap();
+        let observed_source =
+            task_policy_source_from_current(&observed_source, source_policy.pins(), now).unwrap();
+        let mut observed_import = begin_task_policy_import(
+            &trust,
+            &observed_source,
+            &observed.request,
+            &observed.header,
+            &[],
+            PolicyCarrierOrigin::SignedTranscript,
+            now,
+        )
+        .unwrap();
+        for page in &observed.pages {
+            observed_import.append_page(page, now).unwrap();
+        }
+        let observed_policy = observed_import
+            .finish_current(&observed.witness, now)
+            .unwrap();
+        let mut observed_facts = facts;
+        observed_facts.action = Action::OperationResolve;
+        assert!(
+            observed_policy
+                .check_scope(&observed_facts, &readonly_selection, &readonly_context, now)
+                .is_err()
         );
     }
 

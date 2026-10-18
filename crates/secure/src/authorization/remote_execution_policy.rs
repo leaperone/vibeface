@@ -940,6 +940,7 @@ pub(super) fn reference_closure(
 }
 
 pub(super) struct ExecutionPolicyClosure {
+    pub(super) expires_at_ms: u64,
     pub(super) heads: Vec<PolicyStamp>,
     pub(super) allowed_hashes: BTreeSet<ObjectHash>,
     pub(super) usage: ExecutionProofUsage,
@@ -1047,6 +1048,7 @@ pub(super) fn verify_execution_policy_closure(
     usage.record_chain_depth(chain.len());
     finish_usage(&mut usage)?;
     Ok(ExecutionPolicyClosure {
+        expires_at_ms: budget.expires_at_ms,
         heads,
         usage,
         allowed_hashes,

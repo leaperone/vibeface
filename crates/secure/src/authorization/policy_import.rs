@@ -27,15 +27,29 @@ pub(super) fn native_execution_source_snapshot(
     source: &remote_execution_policy::VerifiedRemoteExecutionPolicySourceIntent,
     primary_pins: &[PolicyPin],
 ) -> Result<VerifiedPolicySnapshot> {
+    native_source_snapshot(source.authorization().policy_snapshot.clone(), source.source_heads(), primary_pins)
+}
+
+pub(super) fn native_node_execution_source_snapshot(
+    source: &node_execution_policy::service::VerifiedNodeTaskPolicyAuthority,
+    primary_pins: &[PolicyPin],
+) -> Result<VerifiedPolicySnapshot> {
+    native_source_snapshot(source.state().clone(), source.heads(), primary_pins)
+}
+
+fn native_source_snapshot(
+    mut state: VerifiedPolicySet,
+    source_heads: &[PolicyStamp],
+    primary_pins: &[PolicyPin],
+) -> Result<VerifiedPolicySnapshot> {
     require(
         !primary_pins.is_empty()
             && primary_pins.len() <= MAX_POLICY_DOMAINS
             && primary_pins.windows(2).all(|pair| pair[0].domain < pair[1].domain),
         "native source requires sorted independent primary pins",
     )?;
-    let heads = source.source_heads().to_vec();
+    let heads = source_heads.to_vec();
     let domains: BTreeSet<_> = heads.iter().map(|head| head.domain.clone()).collect();
-    let mut state = source.authorization().policy_snapshot.clone();
     let mut pins = Vec::with_capacity(heads.len());
     for head in &heads {
         require(state.head(&head.domain) == Some(head), "native source changed its exact current heads")?;

@@ -710,6 +710,10 @@ impl NodeTaskExecutionPolicyImport {
         witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
         now: u64,
     ) -> Result<VerifiedTaskCurrentPolicy> {
+        require(
+            !self.source.retained,
+            "retained Node policy cannot become current",
+        )?;
         let finished = self.finish_policy(witness, now, false)?;
         let combined =
             policy_import::merge_same_head_snapshots(&finished.source.snapshot, &finished.foreign)?;
@@ -744,6 +748,10 @@ impl NodeTaskExecutionPolicyImport {
         witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
         now: u64,
     ) -> Result<VerifiedTaskHistoryPolicy> {
+        require(
+            !self.source.retained,
+            "retained Node policy cannot become a current History reader",
+        )?;
         let finished = self.finish_policy(witness, now, true)?;
         Ok(VerifiedTaskHistoryPolicy {
             source: finished.source,
