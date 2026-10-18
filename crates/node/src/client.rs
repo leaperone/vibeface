@@ -1786,7 +1786,11 @@ mod tests {
             source_context,
             business_wire_hash,
             challenge,
-        } = client.exchange(&request).await?
+        } = client.exchange(&request).await.context(if submit {
+            "request Task business Submit authorization challenge"
+        } else {
+            "request Task business Status current challenge"
+        })?
         else {
             anyhow::bail!("Task business omitted its genuine current challenge");
         };
@@ -1824,7 +1828,8 @@ mod tests {
                 challenge_hash: challenge.hash()?,
                 receipts,
             })
-            .await?;
+            .await
+            .context("consume genuine Task business current receipts")?;
         let value = match response {
             TaskBusinessResponse::Business(value) if submit => value,
             TaskBusinessResponse::Status(value) if !submit => value,
@@ -1854,16 +1859,17 @@ mod tests {
         )?)
     }
 
-    fn task_business_noise_setup() -> Result<Box<TaskBusinessNoiseSetup>> {
+    struct TaskBusinessNoiseBootstrap {
+        fixture: Box<crate::identity::foreign_execution_policy::tests::UnseededFixture>,
+        creator: crate::identity::test_support::TestNetwork,
+    }
+
+    fn task_business_noise_bootstrap() -> Result<Box<TaskBusinessNoiseBootstrap>> {
         use crate::identity::{
             execution_dispatch::tests::Fixture,
-            foreign_execution_policy::tests::{
-                UnseededFixture, admit_unseeded_dispatch, import_current_policy,
-                unseeded_fixture_with_source,
-            },
+            foreign_execution_policy::tests::unseeded_fixture_with_source,
             test_support::TestNetwork,
         };
-        use crate::runtime::now_ms;
         use vibeface_secure::authorization::{
             EventRef, ExecutionSourcePolicy, InvocationContext, ResourceRef, SessionRef,
             prepare::PrepareContext,
@@ -1905,16 +1911,46 @@ mod tests {
             node_public_key: PublicKey::parse(&project.node.public_key_hex()?)?,
             pins,
         };
-        let mut fixture = unseeded_fixture_with_source(
+        let fixture = unseeded_fixture_with_source(
             project,
             executor,
             store,
             context,
             false,
             Some(approved_source),
-        )?;
-        let remote = import_current_policy(&mut fixture)?;
-        let wire = admit_unseeded_dispatch(&mut fixture, &remote)?;
+        )
+        .context("create unseeded executor grant with independent source pins")?;
+        Ok(Box::new(TaskBusinessNoiseBootstrap {
+            fixture: Box::new(fixture),
+            creator,
+        }))
+    }
+
+    fn task_business_noise_dispatch(
+        bootstrap: &mut TaskBusinessNoiseBootstrap,
+    ) -> Result<Box<SignedExecutionHandoff>> {
+        use crate::identity::foreign_execution_policy::tests::{
+            admit_unseeded_dispatch, import_current_policy,
+        };
+        let remote = import_current_policy(&mut bootstrap.fixture)
+            .context("complete genuine foreign Task current policy")?;
+        Ok(Box::new(
+            admit_unseeded_dispatch(&mut bootstrap.fixture, &remote)
+                .context("admit the genuine signed bind and dispatch")?,
+        ))
+    }
+
+    fn task_business_noise_export(
+        bootstrap: Box<TaskBusinessNoiseBootstrap>,
+        wire: Box<SignedExecutionHandoff>,
+    ) -> Result<Box<TaskBusinessNoiseSetup>> {
+        use crate::identity::foreign_execution_policy::tests::UnseededFixture;
+        use crate::runtime::now_ms;
+        let TaskBusinessNoiseBootstrap {
+            mut fixture,
+            creator,
+        } = *bootstrap;
+        let wire = *wire;
         let business = TaskBusinessWire::Submit(wire.clone());
         let (source, authorization) = task_business_checked("source factory", || {
             fixture
@@ -1949,18 +1985,21 @@ mod tests {
                 .is_none()
         );
         let execution = fixture.intent.payload.selection.execution_resource.clone();
-        fixture.target.local_set(
-            fixture.executor.space.as_str(),
-            &format!("resource-root:{}", execution.resource),
-            &json!(fixture.executor.project),
-        )?;
+        fixture
+            .target
+            .local_set(
+                fixture.executor.space.as_str(),
+                &format!("resource-root:{}", execution.resource),
+                &json!(fixture.executor.project),
+            )
+            .context("persist C's exact execution resource root")?;
         let UnseededFixture {
             project,
             executor,
             store,
             target,
             ..
-        } = fixture;
+        } = *fixture;
         Ok(Box::new(TaskBusinessNoiseSetup {
             project,
             executor,
@@ -1976,84 +2015,138 @@ mod tests {
         }))
     }
 
+    fn task_business_noise_setup() -> Result<Box<TaskBusinessNoiseSetup>> {
+        let mut bootstrap =
+            task_business_noise_bootstrap().context("bootstrap independent Task policy roots")?;
+        let wire = task_business_noise_dispatch(&mut bootstrap)?;
+        task_business_noise_export(bootstrap, wire)
+            .context("export the immutable Task business source")
+    }
+
     fn task_business_noise_lifecycle(
         revoke: bool,
     ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>>>> {
         Box::pin(task_business_noise_lifecycle_inner(revoke))
     }
 
-    async fn task_business_noise_lifecycle_inner(revoke: bool) -> Result<()> {
-        use crate::{
-            config::{self, Config},
-            identity::test_support::{TestNetwork, now},
-            model::OperationState,
-            network::{MAX_FRAME_BYTES, NetworkConfig},
-            runtime::now_ms,
-            store::Store,
-        };
-        use axum::{
-            Router,
-            extract::{State as AxumState, WebSocketUpgrade},
-            routing::get,
-        };
+    struct TaskBusinessNoiseActors {
+        b: Arc<Runtime>,
+        c: Arc<Runtime>,
+        client: TaskBusinessClient,
+        tasks: tokio::task::JoinSet<()>,
+        b_listener: Option<tokio::net::TcpListener>,
+        b_url: String,
+        c_url: String,
+    }
+
+    fn task_business_runtime<'a>(
+        network: &'a crate::identity::test_support::TestNetwork,
+        store: crate::store::Store,
+        peer: &'a str,
+        own: &'a str,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Arc<Runtime>>> + 'a>> {
+        Box::pin(task_business_runtime_inner(network, store, peer, own))
+    }
+
+    async fn task_business_runtime_inner(
+        network: &crate::identity::test_support::TestNetwork,
+        store: crate::store::Store,
+        peer: &str,
+        own: &str,
+    ) -> Result<Arc<Runtime>> {
+        use crate::config::{self, Config};
+        let dir = &network.directory;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &serde_json::to_vec(&config::data_format())?,
+        )?;
+        let mut cfg = Config::local(
+            "127.0.0.1:4790".parse()?,
+            vec![network.project.clone()],
+            false,
+        );
+        cfg.codex_socket = Some(dir.join("unavailable.sock"));
+        cfg.codex_bin = dir.join("missing-codex");
+        cfg.claude_bin = dir.join("missing-claude");
+        cfg.network.bootstrap_urls = vec![peer.into()];
+        cfg.network.advertise_urls = vec![own.into()];
+        cfg.save(dir)?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&network.node)?,
+        )?;
+        drop(network.at(&dir.join("node.sqlite3"))?);
+        let value = Arc::new(
+            Box::pin(Runtime::open(dir))
+                .await
+                .context("open the genuine scoped Node runtime")?,
+        );
+        *value.store.lock().await = store;
+        Ok(value)
+    }
+
+    async fn task_business_network_upgrade(
+        axum::extract::State(hub): axum::extract::State<Arc<NetworkHub>>,
+        ws: axum::extract::WebSocketUpgrade,
+    ) -> impl axum::response::IntoResponse {
+        use crate::network::MAX_FRAME_BYTES;
+        ws.max_message_size(MAX_FRAME_BYTES)
+            .max_frame_size(MAX_FRAME_BYTES)
+            .on_upgrade(|socket| async move {
+                let _ = hub.accept(socket).await;
+            })
+    }
+
+    fn task_business_start_server(
+        tasks: &mut tokio::task::JoinSet<()>,
+        node: Arc<Runtime>,
+        listener: tokio::net::TcpListener,
+        own: String,
+        peer: String,
+    ) {
+        use crate::network::NetworkConfig;
+        use axum::{Router, routing::get};
+        use tokio::task::JoinSet;
+        let (hub, mut incoming) = NetworkHub::new(
+            node.identity.clone(),
+            NetworkConfig {
+                advertise_urls: vec![own],
+                bootstrap_urls: vec![peer],
+                ..Default::default()
+            },
+        );
+        let router = Router::new()
+            .route("/api/network/ws", get(task_business_network_upgrade))
+            .with_state(hub);
+        tasks.spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tasks.spawn(async move {
+            let mut clients = JoinSet::new();
+            while let Some(incoming) = incoming.recv().await {
+                assert_eq!(incoming.service, Service::Client);
+                let node = node.clone();
+                clients.spawn(async move {
+                    let _ = serve(node, incoming.socket).await;
+                });
+            }
+        });
+    }
+
+    fn task_business_noise_admit<'a>(
+        fixture: &'a mut TaskBusinessNoiseSetup,
+    ) -> std::pin::Pin<
+        Box<impl std::future::Future<Output = Result<Box<TaskBusinessNoiseActors>>> + 'a>,
+    > {
+        Box::pin(task_business_noise_admit_inner(fixture))
+    }
+
+    async fn task_business_noise_admit_inner(
+        fixture: &mut TaskBusinessNoiseSetup,
+    ) -> Result<Box<TaskBusinessNoiseActors>> {
+        use crate::runtime::now_ms;
         use tokio::{net::TcpListener, task::JoinSet};
-        use vibeface_secure::authorization::{
-            JournalEntry, PolicyDomain,
-            execution_handoff::{ExecutionHandoffResult, ExecutionHandoffState},
-        };
-
-        async fn upgrade(
-            AxumState(hub): AxumState<Arc<NetworkHub>>,
-            ws: WebSocketUpgrade,
-        ) -> impl axum::response::IntoResponse {
-            ws.max_message_size(MAX_FRAME_BYTES)
-                .max_frame_size(MAX_FRAME_BYTES)
-                .on_upgrade(|socket| async move {
-                    let _ = hub.accept(socket).await;
-                })
-        }
-        fn runtime<'a>(
-            network: &'a TestNetwork,
-            store: Store,
-            peer: &'a str,
-            own: &'a str,
-        ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Arc<Runtime>>> + 'a>>
-        {
-            Box::pin(runtime_inner(network, store, peer, own))
-        }
-
-        async fn runtime_inner(
-            network: &TestNetwork,
-            store: Store,
-            peer: &str,
-            own: &str,
-        ) -> Result<Arc<Runtime>> {
-            let dir = &network.directory;
-            config::private_write(
-                &dir.join("data-epoch.json"),
-                &serde_json::to_vec(&config::data_format())?,
-            )?;
-            let mut cfg = Config::local(
-                "127.0.0.1:4790".parse()?,
-                vec![network.project.clone()],
-                false,
-            );
-            cfg.codex_socket = Some(dir.join("unavailable.sock"));
-            cfg.codex_bin = dir.join("missing-codex");
-            cfg.claude_bin = dir.join("missing-claude");
-            cfg.network.bootstrap_urls = vec![peer.into()];
-            cfg.network.advertise_urls = vec![own.into()];
-            cfg.save(dir)?;
-            config::private_write(
-                &dir.join("identity.json"),
-                &serde_json::to_vec(&network.node)?,
-            )?;
-            drop(network.at(&dir.join("node.sqlite3"))?);
-            let value = Arc::new(Box::pin(Runtime::open(dir)).await?);
-            *value.store.lock().await = store;
-            Ok(value)
-        }
-        let mut fixture = task_business_noise_setup()?;
+        use vibeface_secure::authorization::execution_handoff::ExecutionHandoffState;
         let b_listener = TcpListener::bind("127.0.0.1:0").await?;
         let c_listener = TcpListener::bind("127.0.0.1:0").await?;
         let b_url = format!("ws://{}/api/network/ws", b_listener.local_addr()?);
@@ -2066,42 +2159,14 @@ mod tests {
             .c_store
             .take()
             .context("C setup store already moved")?;
-        let b = runtime(&fixture.project, b_store, &c_url, &b_url).await?;
-        let c = runtime(&fixture.executor, c_store, &b_url, &c_url).await?;
-        fn start_server(
-            tasks: &mut JoinSet<()>,
-            node: Arc<Runtime>,
-            listener: TcpListener,
-            own: String,
-            peer: String,
-        ) {
-            let (hub, mut incoming) = NetworkHub::new(
-                node.identity.clone(),
-                NetworkConfig {
-                    advertise_urls: vec![own],
-                    bootstrap_urls: vec![peer],
-                    ..Default::default()
-                },
-            );
-            let router = Router::new()
-                .route("/api/network/ws", get(upgrade))
-                .with_state(hub);
-            tasks.spawn(async move {
-                let _ = axum::serve(listener, router).await;
-            });
-            tasks.spawn(async move {
-                let mut clients = JoinSet::new();
-                while let Some(incoming) = incoming.recv().await {
-                    assert_eq!(incoming.service, Service::Client);
-                    let node = node.clone();
-                    clients.spawn(async move {
-                        let _ = serve(node, incoming.socket).await;
-                    });
-                }
-            });
-        }
+        let b = task_business_runtime(&fixture.project, b_store, &c_url, &b_url)
+            .await
+            .context("open Project B runtime")?;
+        let c = task_business_runtime(&fixture.executor, c_store, &b_url, &c_url)
+            .await
+            .context("open Executor C runtime")?;
         let mut tasks = JoinSet::new();
-        start_server(
+        task_business_start_server(
             &mut tasks,
             c.clone(),
             c_listener,
@@ -2193,11 +2258,40 @@ mod tests {
             admitted.receipt.payload.state,
             ExecutionHandoffState::Accepted
         );
-        let start_guard = c.hold_handoff_resolution_for_test().await;
-        start_server(&mut tasks, b.clone(), b_listener, b_url, c_url);
-        while Arc::strong_count(&c.maintenance) == 1 {
-            tokio::task::yield_now().await;
-        }
+        Ok(Box::new(TaskBusinessNoiseActors {
+            b,
+            c,
+            client,
+            tasks,
+            b_listener: Some(b_listener),
+            b_url,
+            c_url,
+        }))
+    }
+
+    fn task_business_noise_operate<'a>(
+        fixture: &'a TaskBusinessNoiseSetup,
+        actors: &'a TaskBusinessNoiseActors,
+        revoke: bool,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<
+                Output = Result<Box<crate::identity::execution_handoff::AdmittedExecutionHandoff>>,
+            > + 'a,
+        >,
+    > {
+        Box::pin(task_business_noise_operate_inner(fixture, actors, revoke))
+    }
+
+    async fn task_business_noise_operate_inner(
+        fixture: &TaskBusinessNoiseSetup,
+        actors: &TaskBusinessNoiseActors,
+        revoke: bool,
+    ) -> Result<Box<crate::identity::execution_handoff::AdmittedExecutionHandoff>> {
+        use crate::{identity::test_support::now, model::OperationState, runtime::now_ms};
+        use vibeface_secure::authorization::{JournalEntry, PolicyDomain};
+        let b = &actors.b;
+        let c = &actors.c;
         let (acceptance, mut recovery) = {
             let store = c.store.lock().await;
             let (_, acceptance) = store.execution_handoff_original_acceptance(
@@ -2308,6 +2402,29 @@ mod tests {
                 )
             })?
         };
+        Ok(Box::new(completed))
+    }
+
+    fn task_business_noise_verify<'a>(
+        fixture: &'a TaskBusinessNoiseSetup,
+        actors: &'a TaskBusinessNoiseActors,
+        completed: &'a crate::identity::execution_handoff::AdmittedExecutionHandoff,
+        revoke: bool,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + 'a>> {
+        Box::pin(task_business_noise_verify_inner(
+            fixture, actors, completed, revoke,
+        ))
+    }
+
+    async fn task_business_noise_verify_inner(
+        fixture: &TaskBusinessNoiseSetup,
+        actors: &TaskBusinessNoiseActors,
+        completed: &crate::identity::execution_handoff::AdmittedExecutionHandoff,
+        revoke: bool,
+    ) -> Result<()> {
+        use crate::{model::OperationState, runtime::now_ms};
+        let b = &actors.b;
+        let c = &actors.c;
         assert_eq!(
             completed.state,
             if revoke {
@@ -2374,7 +2491,30 @@ mod tests {
         )?;
         assert_eq!(reservations > 0, revoke);
         drop(c_store);
-        drop(start_guard);
+        Ok(())
+    }
+
+    fn task_business_noise_finish<'a>(
+        fixture: &'a TaskBusinessNoiseSetup,
+        actors: Box<TaskBusinessNoiseActors>,
+        revoke: bool,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + 'a>> {
+        Box::pin(task_business_noise_finish_inner(fixture, actors, revoke))
+    }
+
+    async fn task_business_noise_finish_inner(
+        fixture: &TaskBusinessNoiseSetup,
+        actors: Box<TaskBusinessNoiseActors>,
+        revoke: bool,
+    ) -> Result<()> {
+        use vibeface_secure::authorization::execution_handoff::ExecutionHandoffState;
+        let TaskBusinessNoiseActors {
+            b,
+            c,
+            mut client,
+            mut tasks,
+            ..
+        } = *actors;
         if !revoke {
             let status = task_business_rpc(
                 &mut client,
@@ -2401,6 +2541,40 @@ mod tests {
             tokio::task::yield_now().await;
         }
         Ok(())
+    }
+
+    async fn task_business_noise_lifecycle_inner(revoke: bool) -> Result<()> {
+        let mut fixture = task_business_noise_setup().context("Task business setup")?;
+        let mut actors = task_business_noise_admit(&mut fixture)
+            .await
+            .context("Task business independent Noise admission")?;
+        let c = actors.c.clone();
+        let start_guard = c.hold_handoff_resolution_for_test().await;
+        let listener = actors
+            .b_listener
+            .take()
+            .context("B receipt listener already started")?;
+        task_business_start_server(
+            &mut actors.tasks,
+            actors.b.clone(),
+            listener,
+            actors.b_url.clone(),
+            actors.c_url.clone(),
+        );
+        while Arc::strong_count(&c.maintenance) == 1 {
+            tokio::task::yield_now().await;
+        }
+        let completed = task_business_noise_operate(&fixture, &actors, revoke)
+            .await
+            .context("Task business current operation lifecycle")?;
+        task_business_noise_verify(&fixture, &actors, &completed, revoke)
+            .await
+            .context("Task business result and isolation assertions")?;
+        drop(start_guard);
+        drop(c);
+        task_business_noise_finish(&fixture, actors, revoke)
+            .await
+            .context("Task business final Status and process cleanup")
     }
 
     #[tokio::test]
