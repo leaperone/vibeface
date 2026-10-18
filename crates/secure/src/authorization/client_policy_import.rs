@@ -1074,10 +1074,10 @@ pub(crate) fn record_confirmed_client_policy_metadata(
             .ok_or(AuthorizationError::InvalidProof(
                 "bounded client provenance is missing",
             ))?;
-    usage.record_signed(&provenance.request)?;
-    usage.record_signed(&provenance.snapshot)?;
-    usage.record_signed(&provenance.witness)?;
-    usage.record_signed(provenance.confirmation.as_ref().ok_or(
+    usage.record_verified_object(&provenance.request)?;
+    usage.record_verified_object(&provenance.snapshot)?;
+    usage.record_verified_object(&provenance.witness)?;
+    usage.record_verified_object(provenance.confirmation.as_ref().ok_or(
         AuthorizationError::InvalidProof("bounded client confirmation is missing"),
     )?)?;
     Ok(())
