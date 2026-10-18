@@ -26,11 +26,14 @@ use std::{
     time::{Duration, Instant},
 };
 use vibeface_secure::authorization::{
-    Actor, DeviceId, Invocation, MAX_PROOF_BYTES, ObjectHash, PublicKey, Signed, TransportEvidence,
-    VerifiedClientAuthorization,
+    Actor, CheckStage, DeviceId, FreshnessReceipt, Invocation, MAX_PROOF_BYTES, ObjectHash,
+    PublicKey, Signed, TransportEvidence, VerifiedClientAuthorization,
     execution_observation::ExecutionObservationRequest,
     node_execution_policy::{ActualPolicyNoisePeer, VerifiedTaskExecutionTrust},
-    task_business_policy::TaskBusinessPolicyExport,
+    task_business_policy::{
+        TaskBusinessPolicyExport, TaskBusinessWire,
+        receipt::{TaskBusinessChallenge, TaskBusinessReceiptRead},
+    },
 };
 use vibeface_secure::{Channel, Handshake};
 
@@ -40,6 +43,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const HEARTBEAT: Duration = Duration::from_secs(20);
 const NODE_POLICY_READ_METHOD: &str = "node_policy_read";
 const TASK_BUSINESS_METHOD: &str = "task_business";
+const TASK_RECEIPT_READ_METHOD: &str = "task_business_receipt_read";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,25 +73,137 @@ struct Session {
 enum SessionPurpose {
     Client,
     NodePolicyRead,
+    TaskReceiptRead,
     TaskBusiness(TaskBusinessPhase),
 }
 enum TaskBusinessPhase {
     AwaitingBegin,
     Importing(TaskBusinessPolicyImportContext),
     Ready(TaskBusinessPolicySession),
+    Pending {
+        session: TaskBusinessPolicySession,
+        original: TaskBusinessPending,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskBusinessKind {
+    Business,
+    Status,
+}
+
+struct TaskBusinessPending {
+    wire: TaskBusinessWire,
+    challenge: TaskBusinessChallenge,
+    kind: TaskBusinessKind,
+}
+
+fn task_business_response_pending(
+    header_hash: &ObjectHash,
+    wire: TaskBusinessWire,
+    kind: TaskBusinessKind,
+    response: &TaskBusinessResponse,
+) -> Result<Option<TaskBusinessPending>> {
+    match response {
+        TaskBusinessResponse::Challenge {
+            source_context,
+            business_wire_hash,
+            challenge,
+        } => {
+            ensure!(
+                source_context == header_hash && *business_wire_hash == wire.hash()?,
+                "task business challenge changed its original context or wire"
+            );
+            let bound = match (&wire, challenge) {
+                (TaskBusinessWire::Submit(wire), TaskBusinessChallenge::Submit(challenge)) => {
+                    challenge.handoff_hash == wire.hash()?
+                        && match kind {
+                            TaskBusinessKind::Business => matches!(
+                                challenge.stage,
+                                CheckStage::Admit | CheckStage::RemoteRead
+                            ),
+                            TaskBusinessKind::Status => challenge.stage == CheckStage::RemoteRead,
+                        }
+                }
+                (TaskBusinessWire::Observe(wire), TaskBusinessChallenge::Observe(challenge)) => {
+                    challenge.observation_hash == wire.hash()?
+                        && challenge.stage == CheckStage::RemoteRead
+                }
+                (TaskBusinessWire::Resolve(wire), TaskBusinessChallenge::Resolve(challenge)) => {
+                    challenge.resolution_hash == wire.hash()?
+                }
+                _ => false,
+            };
+            ensure!(
+                bound,
+                "task business challenge changed its typed anchor or stage"
+            );
+            Ok(Some(TaskBusinessPending {
+                wire,
+                challenge: challenge.clone(),
+                kind,
+            }))
+        }
+        TaskBusinessResponse::Business(_) if kind == TaskBusinessKind::Business => Ok(None),
+        TaskBusinessResponse::Status(_) => Ok(None),
+        _ => bail!("task business response changed its request stage"),
+    }
+}
+
+impl TaskBusinessPhase {
+    fn apply_response(
+        &mut self,
+        wire: TaskBusinessWire,
+        kind: TaskBusinessKind,
+        response: &TaskBusinessResponse,
+    ) -> Result<()> {
+        let (session, previous_challenge) = match self {
+            Self::Ready(session) => (session, None),
+            Self::Pending { session, original } => (session, Some(original.challenge.hash()?)),
+            _ => bail!("task business response has no completed source"),
+        };
+        let pending = task_business_response_pending(
+            &session.source().header().hash()?,
+            wire,
+            kind,
+            response,
+        )?;
+        if let (Some(previous), Some(next)) = (previous_challenge, pending.as_ref()) {
+            ensure!(
+                previous == next.challenge.hash()?,
+                "pending task business challenge changed"
+            );
+        }
+        let session = match std::mem::replace(self, Self::AwaitingBegin) {
+            Self::Ready(session) | Self::Pending { session, .. } => session,
+            _ => unreachable!(),
+        };
+        *self = match pending {
+            Some(original) => Self::Pending { session, original },
+            None => Self::Ready(session),
+        };
+        Ok(())
+    }
 }
 impl SessionPurpose {
     fn select_method(&mut self, method: &str, authenticated: bool) -> Result<()> {
         match self {
-            Self::Client if matches!(method, NODE_POLICY_READ_METHOD | TASK_BUSINESS_METHOD) => {
+            Self::Client
+                if matches!(
+                    method,
+                    NODE_POLICY_READ_METHOD | TASK_BUSINESS_METHOD | TASK_RECEIPT_READ_METHOD
+                ) =>
+            {
                 ensure!(
                     !authenticated,
                     "policy transports require an independent unauthenticated session"
                 );
                 *self = if method == NODE_POLICY_READ_METHOD {
                     Self::NodePolicyRead
-                } else {
+                } else if method == TASK_BUSINESS_METHOD {
                     Self::TaskBusiness(TaskBusinessPhase::AwaitingBegin)
+                } else {
+                    Self::TaskReceiptRead
                 };
             }
             Self::NodePolicyRead => ensure!(
@@ -97,6 +213,10 @@ impl SessionPurpose {
             Self::TaskBusiness(_) => ensure!(
                 method == TASK_BUSINESS_METHOD,
                 "task business sessions cannot change purpose"
+            ),
+            Self::TaskReceiptRead => ensure!(
+                method == TASK_RECEIPT_READ_METHOD,
+                "task receipt reader sessions cannot change purpose"
             ),
             Self::Client => {}
         }
@@ -162,10 +282,55 @@ impl Session {
                 let TaskBusinessPhase::Ready(ready) = phase else {
                     bail!("finish the exact task business source before executing business");
                 };
-                let response = node.task_business(ready, &self.noise_peer, wire).await?;
-                Ok(serde_json::to_value(TaskBusinessResponse::Business(
-                    response,
-                ))?)
+                let response = node
+                    .task_business(ready, &self.noise_peer, wire.clone())
+                    .await?;
+                phase.apply_response(wire, TaskBusinessKind::Business, &response)?;
+                Ok(serde_json::to_value(response)?)
+            }
+            TaskBusinessRequest::Status { wire } => {
+                let TaskBusinessPhase::Ready(ready) = phase else {
+                    bail!(
+                        "task business status requires a completed source and no pending challenge"
+                    );
+                };
+                let response = node
+                    .task_business_status(ready, &self.noise_peer, wire.clone())
+                    .await?;
+                phase.apply_response(wire, TaskBusinessKind::Status, &response)?;
+                Ok(serde_json::to_value(response)?)
+            }
+            TaskBusinessRequest::Receipts {
+                source_context,
+                business_wire_hash,
+                challenge_hash,
+                receipts,
+            } => {
+                let TaskBusinessPhase::Pending { session, original } = phase else {
+                    bail!("task business receipts require an exact pending challenge");
+                };
+                ensure!(
+                    source_context == session.source().header().hash()?
+                        && business_wire_hash == original.wire.hash()?
+                        && challenge_hash == original.challenge.hash()?
+                        && receipts
+                            .iter()
+                            .all(|receipt| receipt.payload.challenge_hash == challenge_hash),
+                    "task business receipts changed the pending context, wire or challenge"
+                );
+                let wire = original.wire.clone();
+                let kind = original.kind;
+                let response = node
+                    .task_business_receipts(
+                        session,
+                        &self.noise_peer,
+                        wire.clone(),
+                        original.challenge.clone(),
+                        receipts,
+                    )
+                    .await?;
+                phase.apply_response(wire, kind, &response)?;
+                Ok(serde_json::to_value(response)?)
             }
         }
     }
@@ -197,6 +362,7 @@ enum TaskBusinessClientPhase {
     AwaitingBegin,
     Importing,
     Ready,
+    Pending(TaskBusinessPending),
 }
 
 #[derive(Deserialize)]
@@ -205,6 +371,94 @@ struct TaskBusinessReply {
     id: String,
     result: Option<TaskBusinessResponse>,
     error: Option<String>,
+}
+
+pub(crate) struct TaskBusinessReceiptClient {
+    client: Client,
+    header_hash: ObjectHash,
+    wire_hash: ObjectHash,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskBusinessReceiptReply {
+    id: String,
+    result: Option<Vec<Signed<FreshnessReceipt>>>,
+    error: Option<String>,
+}
+
+impl TaskBusinessReceiptClient {
+    pub(crate) async fn connect(
+        network: &NetworkHub,
+        identity: &LocalIdentity,
+        source: &TaskBusinessPolicySession,
+    ) -> Result<Self> {
+        let header = source.source().header();
+        ensure!(
+            identity.public_key_hex()? == header.payload.scope.target_public_key.as_str(),
+            "task receipt reader is not the original execution Node"
+        );
+        let target_node_id = crate::crypto::fingerprint(header.issuer.as_str())?;
+        let socket = network.dial(&target_node_id, Service::Client).await?;
+        let (client, peer) =
+            Client::from_socket_with_policy_peer(socket, identity, &target_node_id).await?;
+        ensure!(
+            peer.public_key() == &header.issuer,
+            "task receipt Noise source changed"
+        );
+        Ok(Self {
+            client,
+            header_hash: header.hash()?,
+            wire_hash: header.payload.scope.business_wire_hash.clone(),
+        })
+    }
+
+    pub(crate) async fn read(
+        &mut self,
+        request: &Signed<TaskBusinessReceiptRead>,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        ensure!(
+            request.payload.source_header_hash == self.header_hash
+                && request.payload.business_wire_hash == self.wire_hash,
+            "task receipt read changed the original source context or wire"
+        );
+        let challenge_hash = request.payload.challenge.hash()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let wire = serde_json::to_vec(&Request {
+            id: id.clone(),
+            method: TASK_RECEIPT_READ_METHOD.to_owned(),
+            params: serde_json::to_value(request)?,
+            invocation: None,
+        })?;
+        require_node_policy_carrier(wire.len(), 0)?;
+        tokio::time::timeout(CALL_TIMEOUT, async {
+            for record in secure(self.client.channel.seal_message(&wire))? {
+                send_frame(&mut self.client.socket, record).await?;
+            }
+            let bytes = receive_value(&mut self.client.socket, &mut self.client.channel).await?;
+            require_node_policy_carrier(wire.len(), bytes.len())?;
+            serde_json::from_slice::<UniqueJsonKeys>(&bytes)?;
+            let reply: TaskBusinessReceiptReply = serde_json::from_slice(&bytes)?;
+            ensure!(
+                reply.id == id,
+                "task receipt response changed its request ID"
+            );
+            let receipts = match (reply.result, reply.error) {
+                (Some(receipts), None) => receipts,
+                (None, Some(error)) => bail!("{error}"),
+                _ => bail!("invalid task receipt response"),
+            };
+            ensure!(
+                receipts
+                    .iter()
+                    .all(|receipt| receipt.payload.challenge_hash == challenge_hash),
+                "task receipts changed their original typed challenge hash"
+            );
+            Ok(receipts)
+        })
+        .await
+        .context("task receipt read timed out")?
+    }
 }
 
 impl TaskBusinessClient {
@@ -259,9 +513,37 @@ impl TaskBusinessClient {
             (TaskBusinessClientPhase::Ready, TaskBusinessRequest::Business(wire)) => {
                 ensure!(wire.hash()? == self.wire_hash, "task business wire changed");
             }
+            (TaskBusinessClientPhase::Ready, TaskBusinessRequest::Status { wire }) => {
+                ensure!(
+                    wire.hash()? == self.wire_hash,
+                    "task business status changed its wire"
+                );
+            }
+            (
+                TaskBusinessClientPhase::Pending(original),
+                TaskBusinessRequest::Receipts {
+                    source_context,
+                    business_wire_hash,
+                    challenge_hash,
+                    receipts,
+                },
+            ) => {
+                ensure!(
+                    *source_context == self.header_hash
+                        && *business_wire_hash == self.wire_hash
+                        && *challenge_hash == original.challenge.hash()?
+                        && receipts
+                            .iter()
+                            .all(|receipt| receipt.payload.challenge_hash == *challenge_hash),
+                    "task business receipts changed the pending context, wire or challenge"
+                );
+            }
             _ => bail!("task business request is out of order"),
         }
-        let policy = !matches!(request, TaskBusinessRequest::Business(_));
+        let policy = !matches!(
+            request,
+            TaskBusinessRequest::Business(_) | TaskBusinessRequest::Status { .. }
+        );
         let id = uuid::Uuid::new_v4().to_string();
         let wire = serde_json::to_vec(&Request {
             id: id.clone(),
@@ -294,6 +576,33 @@ impl TaskBusinessClient {
         })
         .await
         .context("task business response timed out; reconcile before retrying business")??;
+        let business = match request {
+            TaskBusinessRequest::Business(wire) => Some((wire.clone(), TaskBusinessKind::Business)),
+            TaskBusinessRequest::Status { wire } => Some((wire.clone(), TaskBusinessKind::Status)),
+            TaskBusinessRequest::Receipts { .. } => {
+                let TaskBusinessClientPhase::Pending(original) = &self.phase else {
+                    unreachable!()
+                };
+                Some((original.wire.clone(), original.kind))
+            }
+            _ => None,
+        };
+        if let Some((wire, kind)) = business {
+            let pending = task_business_response_pending(&self.header_hash, wire, kind, &response)?;
+            if let (TaskBusinessClientPhase::Pending(original), Some(next)) =
+                (&self.phase, pending.as_ref())
+            {
+                ensure!(
+                    original.challenge.hash()? == next.challenge.hash()?,
+                    "pending task business challenge changed"
+                );
+            }
+            self.phase = match pending {
+                Some(original) => TaskBusinessClientPhase::Pending(original),
+                None => TaskBusinessClientPhase::Ready,
+            };
+            return Ok(response);
+        }
         match (request, &response) {
             (
                 TaskBusinessRequest::SourceBegin { .. },
@@ -330,7 +639,6 @@ impl TaskBusinessClient {
                 );
                 self.phase = TaskBusinessClientPhase::Ready;
             }
-            (TaskBusinessRequest::Business(_), TaskBusinessResponse::Business(_)) => {}
             _ => bail!("task business response changed its request stage"),
         }
         Ok(response)
@@ -542,8 +850,8 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                             partial_started = None;
                             let request = parse_request(&plaintext).context("invalid client request")?;
                             validate_request(&request)?;
-                            let policy_carrier = request.method == NODE_POLICY_READ_METHOD
-                                || (request.method == TASK_BUSINESS_METHOD && request.params["stage"] != "business");
+                            let policy_carrier = matches!(request.method.as_str(), NODE_POLICY_READ_METHOD | TASK_RECEIPT_READ_METHOD)
+                                || (request.method == TASK_BUSINESS_METHOD && !matches!(request.params["stage"].as_str(), Some("business" | "status")));
                             if policy_carrier {
                                 require_node_policy_carrier(plaintext.len(), 0)?;
                             }
@@ -553,7 +861,7 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                                 Ok(result) => Response { id, result, error: None },
                                 Err(error) => Response { id, result: Value::Null, error: Some(error.to_string()) },
                             };
-                            if policy_carrier || matches!(session.purpose, SessionPurpose::NodePolicyRead) {
+                            if policy_carrier || matches!(session.purpose, SessionPurpose::NodePolicyRead | SessionPurpose::TaskReceiptRead) {
                                 require_node_policy_carrier(plaintext.len(), serde_json::to_vec(&response)?.len())?;
                             }
                             send_value(&mut socket, &mut channel, &response).await?;
@@ -640,6 +948,17 @@ async fn dispatch_request(
 ) -> Result<Value> {
     session.select_method(method)?;
     match method {
+        TASK_RECEIPT_READ_METHOD => {
+            ensure!(
+                invocation.is_none(),
+                "task receipt reads do not accept an outer Invocation"
+            );
+            let request: Signed<TaskBusinessReceiptRead> = serde_json::from_value(params)?;
+            let receipts = node
+                .task_business_receipt_read(&session.noise_peer, request)
+                .await?;
+            Ok(serde_json::to_value(receipts)?)
+        }
         TASK_BUSINESS_METHOD => {
             ensure!(
                 invocation.is_none(),
@@ -1117,6 +1436,7 @@ mod tests {
             ("rpc", json!({})),
             ("identity", json!({"method":"status","params":{}})),
             (TASK_BUSINESS_METHOD, json!({})),
+            (TASK_RECEIPT_READ_METHOD, json!({})),
         ] {
             let error = reader
                 .client
@@ -1225,6 +1545,7 @@ mod tests {
             "subscribe",
             "identity",
             TASK_BUSINESS_METHOD,
+            TASK_RECEIPT_READ_METHOD,
             "unknown",
         ] {
             assert!(purpose.select_method(method, false).is_err(), "{method}");
@@ -1235,7 +1556,11 @@ mod tests {
 
     #[test]
     fn task_business_sessions_stay_separate_from_client_authorization() -> Result<()> {
-        for method in [NODE_POLICY_READ_METHOD, TASK_BUSINESS_METHOD] {
+        for method in [
+            NODE_POLICY_READ_METHOD,
+            TASK_BUSINESS_METHOD,
+            TASK_RECEIPT_READ_METHOD,
+        ] {
             let mut authenticated = SessionPurpose::Client;
             assert!(authenticated.select_method(method, true).is_err());
             assert!(matches!(authenticated, SessionPurpose::Client));
@@ -1249,6 +1574,7 @@ mod tests {
             "identity",
             "subscribe",
             NODE_POLICY_READ_METHOD,
+            TASK_RECEIPT_READ_METHOD,
         ] {
             assert!(purpose.select_method(method, false).is_err(), "{method}");
         }
@@ -1256,6 +1582,25 @@ mod tests {
             purpose,
             SessionPurpose::TaskBusiness(TaskBusinessPhase::AwaitingBegin)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn task_receipt_reader_cannot_enter_a_business_or_client_lane() -> Result<()> {
+        let mut purpose = SessionPurpose::Client;
+        purpose.select_method(TASK_RECEIPT_READ_METHOD, false)?;
+        purpose.select_method(TASK_RECEIPT_READ_METHOD, false)?;
+        for method in [
+            "authenticate",
+            "rpc",
+            "identity",
+            "subscribe",
+            NODE_POLICY_READ_METHOD,
+            TASK_BUSINESS_METHOD,
+        ] {
+            assert!(purpose.select_method(method, false).is_err(), "{method}");
+        }
+        assert!(matches!(purpose, SessionPurpose::TaskReceiptRead));
         Ok(())
     }
 
