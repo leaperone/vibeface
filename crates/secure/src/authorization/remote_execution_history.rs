@@ -1042,8 +1042,9 @@ mod tests {
         let mut changed = receipts.clone();
         let mut payload = changed[batch].payload.clone();
         let mut extra = payload.currents[0].clone();
-        extra.domain =
-            PolicyDomain::Account(AccountId::from_root(&PublicKey::of(&Identity::generate())));
+        extra.domain = PolicyDomain::Account(AccountId::from_root(&PublicKey::of(
+            &Identity::generate().unwrap(),
+        )));
         payload.currents.push(extra);
         payload
             .currents
