@@ -12,8 +12,8 @@ use vibeface_secure::{
         },
         node_execution_policy::VerifiedTaskCurrentPolicy,
         task_business_policy::{
-            TaskBusinessAuthorization, TaskBusinessPolicyExport, TaskBusinessScope,
-            build_task_business_policy_export,
+            TaskBusinessAuthorization, TaskBusinessPolicyExport, TaskBusinessPurpose,
+            TaskBusinessScope, build_task_business_policy_export,
         },
     },
     signature_verification::{ScopedSignatureVerification, SignatureVerification},
@@ -47,9 +47,15 @@ impl TaskBusinessPolicySourceContext {
 }
 
 struct OutboxAnchor {
+    reference: OutboxReference,
+    wire_json: String,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct OutboxReference {
     space: String,
     key: String,
-    wire_json: String,
     nested: bool,
 }
 
@@ -144,15 +150,13 @@ fn retained_outbox(connection: &Connection, wire: &TaskBusinessWire) -> Result<O
         }
     };
     Ok(OutboxAnchor {
-        space,
-        key,
+        reference: OutboxReference { space, key, nested },
         wire_json,
-        nested,
     })
 }
 
 fn check_outbox(connection: &Connection, anchor: &OutboxAnchor) -> Result<()> {
-    let field = if anchor.nested {
+    let field = if anchor.reference.nested {
         "json_extract(value,'$.wire')"
     } else {
         "value"
@@ -162,7 +166,11 @@ fn check_outbox(connection: &Connection, anchor: &OutboxAnchor) -> Result<()> {
     );
     let same: bool = connection.query_row(
         &query,
-        params![anchor.space, anchor.key, anchor.wire_json],
+        params![
+            anchor.reference.space,
+            anchor.reference.key,
+            anchor.wire_json
+        ],
         |row| row.get(0),
     )?;
     ensure!(
@@ -170,6 +178,39 @@ fn check_outbox(connection: &Connection, anchor: &OutboxAnchor) -> Result<()> {
         "Task business immutable outbox changed during source export"
     );
     Ok(())
+}
+
+pub(super) fn source_originals_in(
+    connection: &Connection,
+    reference: &ObjectHash,
+    wire_hash: &ObjectHash,
+) -> Result<(Signed<TaskBusinessPolicyHeader>, TaskBusinessWire)> {
+    let header: Signed<TaskBusinessPolicyHeader> =
+        read(connection, &key("source-header", reference))?
+            .context("Task business source original header is missing")?;
+    ensure!(
+        header.hash()? == *reference && header.payload.scope.business_wire_hash == *wire_hash,
+        "Task business source changed its original header or wire hash"
+    );
+    let anchor: OutboxReference = read(connection, &key("source-outbox", reference))?
+        .context("Task business source original outbox reference is missing")?;
+    ensure!(
+        anchor.space == header.payload.scope.source_project.space.as_str(),
+        "Task business source original outbox belongs to another space"
+    );
+    let original = local_value(connection, &anchor.space, &anchor.key, anchor.nested)?;
+    let wire = match header.payload.scope.purpose {
+        TaskBusinessPurpose::Submit => TaskBusinessWire::Submit(serde_json::from_str(&original)?),
+        TaskBusinessPurpose::Observe => TaskBusinessWire::Observe(serde_json::from_str(&original)?),
+        TaskBusinessPurpose::ResolveUnknown | TaskBusinessPurpose::ReconcileTerminal => {
+            TaskBusinessWire::Resolve(serde_json::from_str(&original)?)
+        }
+    };
+    ensure!(
+        wire.scope()? == header.payload.scope,
+        "Task business source original outbox changed its complete wire"
+    );
+    Ok((header, wire))
 }
 
 fn current_task(
@@ -251,6 +292,17 @@ fn usage(mut usage: ExecutionProofUsage, request: &TaskBusinessRequest) -> Resul
 }
 
 impl Store {
+    pub(crate) fn task_business_source_originals(
+        &self,
+        reference: &ObjectHash,
+        wire_hash: &ObjectHash,
+    ) -> Result<(Signed<TaskBusinessPolicyHeader>, TaskBusinessWire)> {
+        let tx = self.connection.unchecked_transaction()?;
+        let originals = source_originals_in(&tx, reference, wire_hash)?;
+        tx.commit()?;
+        Ok(originals)
+    }
+
     pub(crate) fn begin_task_business_source(
         &mut self,
         identity: &LocalIdentity,
@@ -286,6 +338,11 @@ impl Store {
             &tx,
             &key("source-header", &exporter.header().hash()?),
             exporter.header(),
+        )?;
+        immutable(
+            &tx,
+            &key("source-outbox", &exporter.header().hash()?),
+            &outbox.reference,
         )?;
         tx.commit()?;
         Ok(TaskBusinessPolicySourceContext {
