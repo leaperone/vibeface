@@ -1012,6 +1012,89 @@ fn verify_challenge_record(
     Ok(())
 }
 
+pub(crate) fn persist_execution_handoff_operation_challenge_in(
+    connection: &Connection,
+    wire: &SignedExecutionHandoff,
+    challenge: &ExecutionHandoffChallenge,
+) -> Result<()> {
+    let signatures = vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+    ensure!(
+        matches!(challenge.stage, CheckStage::Start | CheckStage::Renew),
+        "operation challenge requires Start or Renew"
+    );
+    let (execution, original, operation) = scope(wire)?;
+    let stored = stored_from(connection, &execution, &original, &operation)?
+        .context("operation challenge has no executor acceptance")?;
+    ensure!(
+        stored.wire == *wire,
+        "operation challenge changed its accepted wire"
+    );
+    verify_local_handoff_checkpoint(connection, &stored)?;
+    let admitted = verify_execution_handoff_admission_checkpoint(
+        wire,
+        &stored.admission_receipt,
+        &stored.admission,
+        &StoredTransport::from(&stored.transport),
+        stored.admitted_at_ms,
+    )?;
+    let mut expected = stored.admission.challenge.clone();
+    expected.stage = challenge.stage;
+    expected.policies = challenge.policies.clone();
+    expected.nonce = challenge.nonce.clone();
+    expected.issued_at_ms = challenge.issued_at_ms;
+    expected.expires_at_ms = challenge.expires_at_ms;
+    ensure!(
+        expected == *challenge
+            && challenge.issued_at_ms >= stored.admitted_at_ms
+            && challenge.expires_at_ms > challenge.issued_at_ms
+            && challenge.expires_at_ms - challenge.issued_at_ms
+                <= vibeface_secure::authorization::EXECUTION_LEASE_MS
+            && !challenge.policies.is_empty()
+            && challenge.policies.len() <= vibeface_secure::authorization::MAX_POLICY_DOMAINS
+            && challenge
+                .policies
+                .windows(2)
+                .all(|pair| pair[0].domain < pair[1].domain),
+        "operation challenge changed its immutable accepted scope or lifetime"
+    );
+    super::execution_binding_seal::ensure_handoff_generation_open_in(connection, wire)?;
+    let mut usage = admitted.proof_usage().clone();
+    usage.record_metadata(challenge)?;
+    usage.record_actual_signature_counts(signatures.counts());
+    usage.enforce_limits()?;
+    connection.execute("INSERT INTO execution_handoff_challenges(execution_space_id,nonce,original_space_id,operation_id,handoff_hash,stage,challenge,expires_at_ms) VALUES(?,?,?,?,?,?,?,?)",
+        params![execution,challenge.nonce.as_str(),original,operation,wire.hash()?.as_str(),
+            serde_json::to_value(challenge.stage)?.as_str().context("invalid operation challenge stage")?,
+            serde_json::to_string(challenge)?,challenge.expires_at_ms])?;
+    Ok(())
+}
+
+pub(crate) fn check_execution_handoff_operation_challenge_in(
+    connection: &Connection,
+    wire: &SignedExecutionHandoff,
+    proof: &ExecutionHandoffFreshness,
+    consumed: bool,
+) -> Result<()> {
+    ensure!(
+        matches!(proof.challenge.stage, CheckStage::Start | CheckStage::Renew),
+        "operation challenge requires Start or Renew"
+    );
+    verify_challenge_record(connection, wire, proof, consumed)
+}
+
+pub(crate) fn consume_execution_handoff_operation_challenge_in(
+    connection: &Connection,
+    wire: &SignedExecutionHandoff,
+    proof: &ExecutionHandoffFreshness,
+) -> Result<()> {
+    check_execution_handoff_operation_challenge_in(connection, wire, proof, false)?;
+    ensure!(connection.execute(
+        "UPDATE execution_handoff_challenges SET consumed=1 WHERE execution_space_id=? AND nonce=? AND consumed=0",
+        params![wire.handoff.execution_resource.space.as_str(),proof.challenge.nonce.as_str()],
+    )? == 1, "operation challenge was already consumed");
+    Ok(())
+}
+
 fn consume_freshness_in(
     tx: &Transaction<'_>,
     policy: &PolicyState,
