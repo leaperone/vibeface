@@ -1492,6 +1492,26 @@ impl Store {
         }).transpose()
     }
 
+    pub(crate) fn execution_dispatch_uses_task_policy(
+        &self,
+        identity: &LocalIdentity,
+        wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+    ) -> Result<bool> {
+        let _signatures =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let tx = self.connection.unchecked_transaction()?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        let retained = retained_dispatch_from(&tx, identity, wire)?;
+        let original = super::task_execution_context::OriginalAdmissionView::load(
+            &tx,
+            &current,
+            &retained.admission,
+        )?;
+        let uses_task_policy = original.task_policy().is_some();
+        tx.commit()?;
+        Ok(uses_task_policy)
+    }
+
     pub fn prepare_execution_dispatch_observation(
         &self,
         identity: &LocalIdentity,
