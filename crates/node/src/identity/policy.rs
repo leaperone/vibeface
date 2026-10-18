@@ -1532,6 +1532,18 @@ impl crate::runtime::Runtime {
             "enrollment_policy_read_witness" => store.enrollment_policy_witness(
                 &self.identity, noise_public_key, params, now_ms,
             ),
+            "foreign_execution_policy_selection" => store.foreign_execution_policy_selection(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "foreign_execution_policy_begin" => store.foreign_execution_policy_begin(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "foreign_execution_policy_page" => store.foreign_execution_policy_page(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "foreign_execution_policy_finish" => store.foreign_execution_policy_finish(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
             "foreign_execution_policy_approve" => store.foreign_execution_policy_approve(
                 &self.identity, noise_public_key, params, now_ms,
             ),

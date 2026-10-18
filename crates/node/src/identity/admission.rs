@@ -1725,7 +1725,7 @@ fn manager_tool_authorization_from(
     Ok(auth)
 }
 
-fn check_manager_tool_in(
+pub(super) fn check_manager_tool_in(
     connection: &Connection,
     policy: &PolicyState,
     auth: &VerifiedAuthorization,

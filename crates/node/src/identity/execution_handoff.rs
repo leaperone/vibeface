@@ -1277,6 +1277,100 @@ fn ready_execution_source_events(
     Ok(events)
 }
 
+fn execution_handoff_payload_from(
+    connection: &Connection,
+    state: &VerifiedPolicySet,
+    scope: Option<&super::task_execution_context::TaskScopedAuthorization>,
+    identity: &LocalIdentity,
+    original_space: &str,
+    operation_id: &str,
+    execution_resource: ResourceRef,
+    execution_audience: vibeface_secure::authorization::Audience,
+    target_public_key: PublicKey,
+    now_ms: u64,
+) -> Result<ExecutionHandoff> {
+    let _signature_scope =
+        vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+    let events = ready_execution_source_events(connection, original_space, operation_id)?;
+    let mut dispatch = None;
+    for event in events.values() {
+        if matches!(&event.event.body, EventBody::DispatchRecorded { operation_id: candidate, .. } if candidate == operation_id)
+        {
+            ensure!(
+                dispatch.replace(event).is_none(),
+                "operation has conflicting admitted dispatches"
+            );
+        }
+    }
+    let dispatch = dispatch.context("operation has no admitted dispatch")?;
+    let original = capsule_admission(&dispatch.event)?;
+    if let Some(scope) = scope {
+        ensure!(
+            scope.authorization().invocation_hash() == &original.invocation.hash()?
+                && scope.authorization().body_hash() == &ObjectHash::body(&original.source_body)?,
+            "handoff source differs from its current scoped authorization"
+        );
+    }
+    let operation: OperationRequest =
+        serde_json::from_value(original.source_body["request"].clone())?;
+    let binding = operation
+        .binding
+        .as_ref()
+        .context("operation has no task binding")?;
+    let task = events
+        .get(&binding.binding.task_ref)
+        .context("operation task creation is missing")?;
+    let task_proof = capsule_admission(&task.event)?;
+    let sdk_origin = compact_sdk_from_events(&events, &original)?;
+    let task_sdk_origin = compact_sdk_from_events(&events, &task_proof)?;
+    ensure!(
+        identity.node_id()? == dispatch.event.author,
+        "source capsule signer is not the Project host"
+    );
+    let mut handoff = ExecutionHandoff {
+        version: AUTH_VERSION,
+        project_dispatch: dispatch.envelope.clone(),
+        task_creation: task.envelope.clone(),
+        sdk_origin,
+        task_sdk_origin,
+        execution_resource,
+        execution_audience,
+        target_public_key,
+        source_attestation: None,
+    };
+    let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
+        .map_err(anyhow::Error::msg)?;
+    handoff.attest_source(&signer)?;
+    original_capsule_authorization(state, &handoff, now_ms)?;
+    Ok(handoff)
+}
+
+pub(crate) fn execution_handoff_payload_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    scope: &super::task_execution_context::TaskScopedAuthorization,
+    identity: &LocalIdentity,
+    original_space: &str,
+    operation_id: &str,
+    execution_resource: ResourceRef,
+    execution_audience: vibeface_secure::authorization::Audience,
+    target_public_key: PublicKey,
+    now_ms: u64,
+) -> Result<ExecutionHandoff> {
+    execution_handoff_payload_from(
+        connection,
+        scope.state(policy.verified()),
+        Some(scope),
+        identity,
+        original_space,
+        operation_id,
+        execution_resource,
+        execution_audience,
+        target_public_key,
+        now_ms,
+    )
+}
+
 impl Store {
     pub fn execution_handoff_payload(
         &self,
@@ -1288,53 +1382,18 @@ impl Store {
         target_public_key: PublicKey,
         now_ms: u64,
     ) -> Result<ExecutionHandoff> {
-        let _signature_scope =
-            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
-        let events = ready_execution_source_events(&self.connection, original_space, operation_id)?;
-        let mut dispatch = None;
-        for event in events.values() {
-            if matches!(&event.event.body, EventBody::DispatchRecorded { operation_id: candidate, .. } if candidate == operation_id)
-            {
-                ensure!(
-                    dispatch.replace(event).is_none(),
-                    "operation has conflicting admitted dispatches"
-                );
-            }
-        }
-        let dispatch = dispatch.context("operation has no admitted dispatch")?;
-        let original = capsule_admission(&dispatch.event)?;
-        let operation: OperationRequest =
-            serde_json::from_value(original.source_body["request"].clone())?;
-        let binding = operation
-            .binding
-            .as_ref()
-            .context("operation has no task binding")?;
-        let task = events
-            .get(&binding.binding.task_ref)
-            .context("operation task creation is missing")?;
-        let task_proof = capsule_admission(&task.event)?;
-        let sdk_origin = compact_sdk_from_events(&events, &original)?;
-        let task_sdk_origin = compact_sdk_from_events(&events, &task_proof)?;
-        ensure!(
-            identity.node_id()? == dispatch.event.author,
-            "source capsule signer is not the Project host"
-        );
-        let mut handoff = ExecutionHandoff {
-            version: AUTH_VERSION,
-            project_dispatch: dispatch.envelope.clone(),
-            task_creation: task.envelope.clone(),
-            sdk_origin,
-            task_sdk_origin,
+        execution_handoff_payload_from(
+            &self.connection,
+            self.policy.verified(),
+            None,
+            identity,
+            original_space,
+            operation_id,
             execution_resource,
             execution_audience,
             target_public_key,
-            source_attestation: None,
-        };
-        let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
-            .map_err(anyhow::Error::msg)?;
-        handoff.attest_source(&signer)?;
-        original_capsule_authorization(self.policy.verified(), &handoff, now_ms)?;
-        Ok(handoff)
+            now_ms,
+        )
     }
 
     pub fn execution_handoff_authorization(
