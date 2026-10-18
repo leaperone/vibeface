@@ -811,18 +811,42 @@ impl Store {
             .collect()
     }
     pub fn task_creation(&self, network: &str, scope: &str, task_id: &str) -> Result<SignedEvent> {
-        let context = self.context(network, scope, &[])?;
-        ensure!(
-            context.missing.is_complete(),
-            "task history is incomplete or conflicting"
-        );
-        let matches = context.events.iter().filter(|event| {
-            event.scope_id == scope && matches!(&event.body, EventBody::TaskCreated { task_id: id, .. } if id == task_id)
-        }).collect::<Vec<_>>();
-        ensure!(matches.len() == 1, "task creation is missing or ambiguous");
-        let hash = digest(&serde_json::to_vec(matches[0])?);
-        self.event(network, &hash)?
-            .context("task creation envelope is missing")
+        let snapshot = if self.connection.is_autocommit() {
+            Some(self.connection.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let rows = self
+            .connection
+            .prepare("SELECT envelope FROM events WHERE space_id=? AND scope_id=? ORDER BY hash")?
+            .query_map(params![network, scope], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut creation = None;
+        let mut resource = None;
+        for encoded in rows {
+            let envelope: SignedEvent = serde_json::from_str(&encoded)?;
+            let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+            ensure!(
+                event.network_id == network
+                    && event.scope_id == scope
+                    && resource.as_ref().is_none_or(|id| id == &event.resource_id),
+                "task history belongs to another space, scope or resource"
+            );
+            resource = Some(event.resource_id);
+            if matches!(&event.body, EventBody::TaskCreated { task_id: id, .. } if id == task_id) {
+                ensure!(creation.is_none(), "task creation is ambiguous");
+                creation = Some(envelope);
+            }
+        }
+        let creation = creation.context("task creation is missing")?;
+        crate::identity::event_authorization::validate_retained_event_scope_in(
+            &self.connection,
+            &creation,
+        )?;
+        if let Some(snapshot) = snapshot {
+            snapshot.commit()?;
+        }
+        Ok(creation)
     }
 
     pub(crate) fn verify_binding_creation(
@@ -2247,6 +2271,59 @@ mod tests {
         let (auth, transport) = network.authorization(store, &body, now())?;
         let proof = network.freshness(store, &auth, CheckStage::Admit, now())?;
         store.rebind_task_authorized(&network.node, &auth, &proof, &transport, &body, now())
+    }
+
+    #[test]
+    fn task_creation_uses_its_complete_retained_scope_without_replaying_policy() -> Result<()> {
+        let (network, mut store) = setup()?;
+        let space = network.space.as_str();
+        network.conversation(&mut store, "conversation")?;
+        network.conversation(&mut store, "parallel")?;
+        let creation = network.task(&mut store, "conversation", "same-task")?;
+        let parallel = network.task(&mut store, "parallel", "same-task")?;
+        for _ in 0..40 {
+            network.message(&mut store, "conversation", "retained history")?;
+        }
+        let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        let actual =
+            verification.run(|| store.task_creation(space, "conversation", "same-task"))?;
+        assert_eq!(actual, creation);
+        assert_eq!(verification.counts().actual_verifications, 0);
+        assert_eq!(
+            store.task_creation(space, "parallel", "same-task")?,
+            parallel
+        );
+        assert!(
+            store
+                .task_creation(space, "conversation", "missing")
+                .is_err()
+        );
+        store.connection.execute_batch("BEGIN IMMEDIATE")?;
+        assert_eq!(
+            store.task_creation(space, "conversation", "same-task")?,
+            creation
+        );
+        assert!(!store.connection.is_autocommit());
+        store.connection.execute_batch("ROLLBACK")?;
+        store.connection.execute(
+            "UPDATE events SET sequence=999 WHERE space_id=? AND hash=?",
+            params![space, parallel.hash],
+        )?;
+        assert_eq!(
+            store.task_creation(space, "conversation", "same-task")?,
+            creation
+        );
+        assert!(store.task_creation(space, "parallel", "same-task").is_err());
+        store.connection.execute(
+            "UPDATE events SET status='pending' WHERE space_id=? AND hash=?",
+            params![space, creation.hash],
+        )?;
+        assert!(
+            store
+                .task_creation(space, "conversation", "same-task")
+                .is_err()
+        );
+        Ok(())
     }
 
     #[test]
