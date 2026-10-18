@@ -446,10 +446,21 @@ fn prefix(text: &str, max_bytes: usize) -> &str {
 fn bounded(value: &Value, bytes: usize) -> Value {
     let text = value.to_string();
     if text.len() <= bytes {
-        value.clone()
-    } else {
-        json!({"truncated":true,"excerpt":prefix(&text,bytes),"retrieve":"context"})
+        return value.clone();
     }
+    let truncated =
+        |limit| json!({"truncated":true,"excerpt":prefix(&text,limit),"retrieve":"context"});
+    let mut low = 0;
+    let mut high = bytes.min(text.len());
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if truncated(middle).to_string().len() <= bytes {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    truncated(low)
 }
 
 fn materialize(
@@ -647,6 +658,78 @@ mod tests {
         assert!(prompt.contains("\"truncated\":true"));
         assert!(prompt.contains("omitted_constraint_review"));
         assert_eq!(prefix("中文a", 4), "中");
+        Ok(())
+    }
+
+    #[test]
+    fn escaped_context_values_stay_within_their_serialized_budget() -> Result<()> {
+        for bytes in [2000, 4000, 6000] {
+            let value = bounded(&json!({"text":"\"".repeat(10000)}), bytes);
+            assert_eq!(value["truncated"], true);
+            assert!(serde_json::to_vec(&value)?.len() <= bytes);
+            assert_eq!(value["retrieve"], "context");
+        }
+        let identity = crate::crypto::LocalIdentity::generate();
+        let proof = identity
+            .sign_network_fixture(1, vec![identity.certificate(vec![NodeRole::Gateway])?])?;
+        let mut context = Context {
+            network_id: "network".into(),
+            scope_id: "bot".into(),
+            heads: vec![],
+            events: vec![],
+            missing: Default::default(),
+        };
+        let make = |sequence, body| Event {
+            version: crate::model::WIRE_VERSION,
+            network_id: "network".into(),
+            scope_id: "bot".into(),
+            author: "gateway".into(),
+            sequence,
+            previous: None,
+            parents: vec![],
+            created_at_ms: 0,
+            body,
+            blobs: vec![],
+        };
+        context.events.push(make(
+            1,
+            EventBody::BotCreated {
+                bot_id: "bot".into(),
+                name: "Bot".into(),
+                instructions: format!("{}{}", "\"".repeat(3650), "x".repeat(4542)),
+                project: None,
+                membership_role_proof: proof,
+            },
+        ));
+        context.events.push(make(
+            2,
+            EventBody::ContextCheckpoint {
+                summary: "\"".repeat(10000),
+                covered_heads: vec![],
+            },
+        ));
+        for sequence in 3..12 {
+            context.events.push(make(
+                sequence,
+                EventBody::MessagePosted {
+                    message_id: format!("message-{sequence}"),
+                    role: "user".into(),
+                    text: "\"".repeat(10000),
+                    scheduler_node: None,
+                },
+            ));
+        }
+        let trigger = digest(&serde_json::to_vec(context.events.last().unwrap())?);
+        let prompt = materialize(
+            &context,
+            &trigger,
+            &json!({"goal":"\"".repeat(10000)}),
+            &json!({"stdout":"\"".repeat(10000)}),
+            &[],
+            &[],
+        )?;
+        assert!(prompt.len() <= PROMPT_LIMIT);
+        assert!(prompt.contains("configured_bot"));
         Ok(())
     }
 
