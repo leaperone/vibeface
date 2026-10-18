@@ -21,6 +21,7 @@ use std::{
 use tokio::sync::{Mutex, broadcast, mpsc};
 
 mod agent_tools;
+mod blob_transfer;
 mod bots;
 mod chat_controls;
 mod commands;
@@ -55,7 +56,7 @@ mod tests {
     pub(super) fn fixture() -> Result<PathBuf> {
         fixture_under("")
     }
-    fn fixture_under(subdir: &str) -> Result<PathBuf> {
+    pub(super) fn fixture_under(subdir: &str) -> Result<PathBuf> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(subdir)
@@ -87,6 +88,237 @@ mod tests {
         )
         .await?;
         Ok(view.network_id)
+    }
+    #[tokio::test]
+    async fn net1_bad_prefix_rotates_from_the_first_source_and_empty_blob_falls_back() -> Result<()>
+    {
+        use crate::store::blob_transfer::BlobTransfer;
+        use axum::{
+            Router,
+            extract::{State, WebSocketUpgrade},
+            routing::get,
+        };
+        type Source = (Arc<PeerHub>, Arc<tokio::sync::Notify>);
+        async fn upgrade(
+            State((hub, disconnect)): State<Source>,
+            ws: WebSocketUpgrade,
+        ) -> impl axum::response::IntoResponse {
+            ws.max_message_size(crate::peer::MAX_PACKET_BYTES)
+                .max_frame_size(crate::peer::MAX_PACKET_BYTES)
+                .on_upgrade(|socket| async move {
+                    tokio::select! { _ = hub.accept(socket) => {}, _ = disconnect.notified() => {} }
+                })
+        }
+        let mut dirs = Vec::new();
+        let mut nodes = Vec::new();
+        for _ in 0..3 {
+            let dir = fixture_under("network-reliability")?;
+            nodes.push(Arc::new(Runtime::open(&dir).await?));
+            dirs.push(dir);
+        }
+        let owner = test_owner(&nodes[0])?;
+        let state = owner.sign_network_fixture(
+            1,
+            nodes
+                .iter()
+                .map(|node| node.identity.certificate(node.config.roles.clone()))
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        let network = state.genesis.network_id.clone();
+        for node in &nodes {
+            node.install_membership(state.clone()).await?;
+        }
+        let bytes = Arc::new(vec![0x57_u8; 96 * 1024]);
+        let blob = BlobRef {
+            hash: crypto::digest(&bytes),
+            size: bytes.len() as u64,
+        };
+        let empty = BlobRef {
+            hash: crypto::digest(b""),
+            size: 0,
+        };
+        let observed = Arc::new(Mutex::new(Vec::<(usize, String, u64)>::new()));
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut disconnects = Vec::new();
+        for index in 1..=2 {
+            let source = nodes[index].clone();
+            let disconnect = Arc::new(tokio::sync::Notify::new());
+            disconnects.push(disconnect.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("ws://{}/peer", listener.local_addr()?);
+            let router = Router::new()
+                .route("/peer", get(upgrade))
+                .with_state((source.hub.clone(), disconnect.clone()));
+            tasks.spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
+            let hub = nodes[0].hub.clone();
+            let scope = network.clone();
+            tasks.spawn(async move {
+                let _ = hub.connect(scope, url).await;
+            });
+            let mut inbound = source
+                .peer_rx
+                .lock()
+                .await
+                .take()
+                .context("missing source test receiver")?;
+            let observed = observed.clone();
+            let bytes = bytes.clone();
+            tasks.spawn(async move {
+                while let Some(message) = inbound.recv().await {
+                    let value = if message.payload["type"] == "blob" {
+                        let hash = message.payload["hash"].as_str().unwrap().to_owned();
+                        let offset = message.payload["offset"].as_u64().unwrap();
+                        let limit = message.payload["limit"].as_u64().unwrap() as usize;
+                        observed.lock().await.push((index,hash,offset));
+                        if index == 1 {
+                            if offset == 0 {
+                                json!({"size":bytes.len(),"data":hex::encode(vec![0x11_u8;limit.min(bytes.len())])})
+                            } else {
+                                // Drop the authenticated WebSocket after serving a stable corrupt prefix.
+                                disconnect.notify_one();
+                                continue;
+                            }
+                        } else if message.payload["hash"] == crypto::digest(b"") {
+                            json!({"size":0,"data":""})
+                        } else {
+                            let start = offset as usize;
+                            json!({"size":bytes.len(),"data":hex::encode(&bytes[start..start.saturating_add(limit).min(bytes.len())])})
+                        }
+                    } else { source.handle_peer(&message).await.unwrap_or_else(|error| json!({"error":error.to_string()})) };
+                    let _ = source.hub.respond(&message,value).await;
+                }
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while nodes[0].hub.online(&network).await.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        let a = nodes[1].identity.node_id()?;
+        let b = nodes[2].identity.node_id()?;
+        let sources = vec![
+            HistorySource {
+                node_id: a.clone(),
+                batch: None,
+            },
+            HistorySource {
+                node_id: b.clone(),
+                batch: None,
+            },
+        ];
+        let error = nodes[0]
+            .history_blob(&network, &sources, &blob)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("hash mismatch"));
+        assert!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .get_blob(&network, &blob.hash)?
+                .is_none()
+        );
+        let expected = BlobTransfer::receiving(&blob, &b, 0);
+        // Read through an independent connection: the next-source choice survives outside this call.
+        let connection = rusqlite::Connection::open(dirs[0].join("node.sqlite3"))?;
+        let raw: String = connection.query_row(
+            "SELECT value FROM local_values WHERE network_id=? AND key=?",
+            rusqlite::params![network, BlobTransfer::key(&blob)?],
+            |row| row.get(0),
+        )?;
+        assert_eq!(serde_json::from_str::<BlobTransfer>(&raw)?, expected);
+        let first = observed.lock().await.clone();
+        assert_eq!(
+            first
+                .iter()
+                .map(|(index, _, offset)| (*index, *offset))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (1, 65536), (2, 65536)]
+        );
+        let boundary = first.len();
+        assert!(nodes[0].history_blob(&network, &sources, &blob).await?);
+        assert_eq!(observed.lock().await[boundary], (2, blob.hash.clone(), 0));
+        assert_eq!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .get_blob(&network, &blob.hash)?
+                .unwrap(),
+            *bytes
+        );
+        assert!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .blob_transfer(&network, &blob)?
+                .is_none()
+        );
+        // A is still a valid member, but the actual transport is gone. Empty objects must try B.
+        assert!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .authorize_node(&network, &a, Some(NodeRole::Replica))
+                .is_ok()
+        );
+        let unavailable = nodes[0]
+            .read_peer(
+                &network,
+                &a,
+                json!({"type":"blob","hash":empty.hash,"offset":0,"limit":1}),
+            )
+            .await
+            .unwrap_err();
+        println!("NET1_EMPTY_SOURCE_FAILURE {unavailable:#}");
+        assert!(nodes[0].history_blob(&network, &sources, &empty).await?);
+        assert_eq!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .get_blob(&network, &empty.hash)?,
+            Some(Vec::new())
+        );
+        assert!(
+            nodes[0]
+                .store
+                .lock()
+                .await
+                .blob_transfer(&network, &empty)?
+                .is_none()
+        );
+        assert!(
+            observed
+                .lock()
+                .await
+                .iter()
+                .any(|(index, hash, offset)| *index == 2 && hash == &empty.hash && *offset == 0)
+        );
+        assert!(nodes[0].store.lock().await.operations(&network)?.is_empty());
+        drop(connection);
+        for disconnect in disconnects {
+            disconnect.notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !nodes[0].hub.online(&network).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        drop(nodes);
+        for dir in dirs {
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
     }
     #[tokio::test]
     async fn net1_pending_basis_rejects_before_scanning_history_and_ready_rechecks_content()
@@ -3498,6 +3730,8 @@ pub struct Runtime {
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
     manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
+    agent_blobs: Mutex<HashMap<agent_tools::AgentBlobKey, agent_tools::AgentBlobSnapshot>>,
+    blob_staging: Arc<blob_transfer::BlobStaging>,
     schedule_workers: Mutex<BTreeSet<(String, String)>>,
     schedule_wakeup: tokio::sync::Notify,
     observation: std::sync::Mutex<observation::ObservationState>,
@@ -3507,7 +3741,7 @@ pub struct Runtime {
     progress_sequences: std::sync::Mutex<HashMap<(String, String), u64>>,
     pub engine: Engine,
     _codex_process: Option<tokio::process::Child>,
-    _process_lock: std::fs::File,
+    _process_lock: Arc<std::fs::File>,
     peer_rx: Mutex<Option<mpsc::Receiver<Inbound>>>,
     network_rx: Mutex<Option<mpsc::Receiver<IncomingSocket>>>,
     engine_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
@@ -3568,9 +3802,11 @@ impl Runtime {
             "this Node requires an initialized data epoch 3 directory"
         );
         let mut config = Config::load(dir)?;
-        let process_lock = config::lock_data_dir(dir)?;
+        let process_lock = Arc::new(config::lock_data_dir(dir)?);
+        let blob_staging = blob_transfer::BlobStaging::open(dir, process_lock.clone())?;
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
+        store.attach_process_lock(process_lock.clone());
         let identities = Arc::new(IdentityStore::open(&dir.join("identity.sqlite3"))?);
         let networks = store.networks()?;
         ensure!(
@@ -3672,7 +3908,7 @@ impl Runtime {
             },
             tx,
         );
-        Ok(Self {
+        let node = Self {
             config,
             identity,
             store,
@@ -3682,6 +3918,8 @@ impl Runtime {
             events,
             agent_tokens: Mutex::new(HashMap::new()),
             manager_controls: Mutex::new(HashMap::new()),
+            agent_blobs: Mutex::new(HashMap::new()),
+            blob_staging,
             schedule_workers: Mutex::new(BTreeSet::new()),
             schedule_wakeup: tokio::sync::Notify::new(),
             observation: std::sync::Mutex::new(Default::default()),
@@ -3695,7 +3933,9 @@ impl Runtime {
             peer_rx: Mutex::new(Some(peer_rx)),
             network_rx: Mutex::new(Some(network_rx)),
             engine_rx: Mutex::new(Some(rx)),
-        })
+        };
+        node.recover_blob_staging(MAX_BLOB_BYTES as u64).await;
+        Ok(node)
     }
     pub async fn install_membership(&self, incoming: NetworkState) -> Result<AuthorizationView> {
         let _work = self.maintenance.enter()?;
@@ -3896,6 +4136,7 @@ impl Runtime {
             let mut tick = tokio::time::interval(Duration::from_secs(3));
             loop {
                 tick.tick().await;
+                node.recover_blob_staging(MAX_BLOB_BYTES as u64).await;
                 let networks = node.store.lock().await.networks().unwrap_or_default();
                 for network in networks {
                     let _ = node.sync_all(&network).await;
@@ -4254,41 +4495,6 @@ impl Runtime {
         }
         bail!("event unavailable from authorized replicas")
     }
-    async fn history_blob(
-        &self,
-        network: &str,
-        sources: &[HistorySource],
-        blob: &BlobRef,
-    ) -> Result<()> {
-        for source in sources {
-            let target = &source.node_id;
-            let result: Result<()> = async {
-                self.store.lock().await.authorize_node(network, target, Some(NodeRole::Replica))?;
-                let mut bytes = Vec::with_capacity(blob.size as usize);
-                while bytes.len() < blob.size as usize {
-                    self.store.lock().await.authorize_node(network, target, Some(NodeRole::Replica))?;
-                    let value = self.read_peer(network, target, json!({"type":"blob","hash":blob.hash,"offset":bytes.len(),"limit":65536})).await?;
-                    let encoded = value["data"].as_str().context("blob data is required")?;
-                    ensure!(encoded.len() <= 131072, "blob chunk too large");
-                    let chunk = hex::decode(encoded)?;
-                    ensure!(!chunk.is_empty() && chunk.len() <= 65536 && bytes.len() + chunk.len() <= blob.size as usize, "invalid blob chunk");
-                    bytes.extend(chunk);
-                }
-                let mut store = self.store.lock().await;
-                store.authorize_node(network, target, Some(NodeRole::Replica))?;
-                store.put_blob(network, blob, &bytes)?;
-                tracing::debug!(network, target, hash=%blob.hash, size=blob.size, "history blob fetched");
-                Ok(())
-            }.await;
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    tracing::debug!(network, target, error=%error, "blob source unavailable")
-                }
-            }
-        }
-        bail!("blob unavailable from authorized replicas")
-    }
     async fn sync_from(&self, network: &str, target: &str) -> Result<Vec<ClosureSync>> {
         self.store
             .lock()
@@ -4577,9 +4783,9 @@ impl Runtime {
                 continue;
             }
             match self.history_blob(network, &sources, &blob).await {
-                Ok(()) => {
+                Ok(changed) => {
                     missing.blobs.retain(|wanted| wanted != &blob);
-                    blobs_completed += 1;
+                    blobs_completed += usize::from(changed);
                 }
                 Err(error) => errors.push(error.to_string()),
             }
@@ -6160,26 +6366,25 @@ impl Runtime {
             }
             "blob" => {
                 self.require_role(network, NodeRole::Replica).await?;
-                self.store.lock().await.authorize_node(
-                    network,
-                    &message.origin,
-                    Some(NodeRole::Replica),
-                )?;
-                let bytes = self
-                    .store
-                    .lock()
-                    .await
-                    .get_blob(network, field(input, "hash")?)?
-                    .context("blob unavailable")?;
-                let offset = input["offset"]
-                    .as_u64()
-                    .context("offset required")?
-                    .min(usize::MAX as u64) as usize;
+                let offset = input["offset"].as_u64().context("offset required")?;
                 let limit = input["limit"].as_u64().unwrap_or(65536).clamp(1, 65536) as usize;
-                ensure!(offset <= bytes.len(), "invalid blob offset");
-                Ok(
-                    json!({"data":hex::encode(&bytes[offset..offset.saturating_add(limit).min(bytes.len())]),"size":bytes.len()}),
-                )
+                let mut store = self.store.lock().await;
+                let view = self.identities.public_state()?.project()?;
+                ensure!(view.network_id == *network, "wrong personal network");
+                view.authorize_node(&self.identity.node_id()?, Some(NodeRole::Replica))?;
+                let (size, bytes) = store
+                    .blob_range(
+                        network,
+                        &self.identity.node_id()?,
+                        &message.origin,
+                        field(input, "hash")?,
+                        offset,
+                        limit,
+                    )?
+                    .context("blob unavailable")?;
+                tracing::trace!(network, origin=%message.origin, request_id=%message.request_id, hash=%field(input,"hash")?, offset,
+                    returned_bytes=bytes.len(), size, "peer blob range served");
+                Ok(json!({"data":hex::encode(bytes),"size":size}))
             }
             "trust" => {
                 let state: NetworkState = serde_json::from_value(input["state"].clone())?;

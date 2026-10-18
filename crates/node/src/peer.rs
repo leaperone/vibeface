@@ -217,6 +217,16 @@ impl PeerHub {
             None,
         )?;
         let key = (network.to_owned(), packet.body.request_id.clone());
+        let blob_range = (packet.body.payload["type"] == "blob").then(|| {
+            (
+                packet.body.payload["hash"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                packet.body.payload["offset"].as_u64(),
+                packet.body.payload["limit"].as_u64(),
+            )
+        });
         let (reply, receive) = oneshot::channel();
         {
             let mut state = self.state.lock().await;
@@ -237,15 +247,21 @@ impl PeerHub {
             );
         }
         let result = match self.emit(packet).await {
-            Ok(()) => match tokio::time::timeout(REQUEST_TIMEOUT, receive).await {
-                Ok(Ok(value)) => Ok(value),
-                Ok(Err(_)) => Err(anyhow::anyhow!(
-                    "peer request cancelled; execution outcome may be unknown"
-                )),
-                Err(_) => Err(anyhow::anyhow!(
-                    "peer request timed out; execution outcome may be unknown"
-                )),
-            },
+            Ok(()) => {
+                if let Some((hash, offset, limit)) = blob_range {
+                    tracing::trace!(network, target, request_id=%key.1, hash, offset, limit,
+                        "peer blob request queued");
+                }
+                match tokio::time::timeout(REQUEST_TIMEOUT, receive).await {
+                    Ok(Ok(value)) => Ok(value),
+                    Ok(Err(_)) => Err(anyhow::anyhow!(
+                        "peer request cancelled; execution outcome may be unknown"
+                    )),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "peer request timed out; execution outcome may be unknown"
+                    )),
+                }
+            }
             Err(error) => Err(error),
         };
         self.state.lock().await.pending.remove(&key);
