@@ -7,15 +7,15 @@ import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import { conversationHref } from "./entry-url"
 import { isIncomplete, mergeBasis, missingCount } from "./labels"
 import {
-  frontierMap, inputText, parseConversation, parseConversations, parseNodes, parseNotifications, parseOperation,
-  parsePending, parsePendingMessages, parseBot, parseBots, parseCreateBot, record,
+  frontierMap, inputText, parseConversation, parseNodes, parseNotifications, parseOperation,
+  parsePending, parsePendingMessages, parseBot, parseBots, parseCreateBot, parsePendingBot, record,
   parseArtifactPage, hasQueuedMessage,
 } from "./model"
 import { errorText, parseReconcile, reconcileDecision, type ReconcileRecord } from "./reconcile"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
-  ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord,
-  PendingOperation, PendingMessage, WorkspaceView, ExecutionControlRequest, ExecutionControlAction, BotRecord, CreateBotRequest, BotProject,
+  ConversationPayload, NodeInfo, NotificationRecord,
+  PendingOperation, PendingMessage, WorkspaceView, ExecutionControlRequest, ExecutionControlAction, BotRecord, CreateBotRequest, PendingBot, BotProject,
 } from "./types"
 
 function useWorkspaceState(connection: ReadyConnection) {
@@ -28,14 +28,13 @@ function useWorkspaceState(connection: ReadyConnection) {
   const [noticeText, setNoticeText] = useState("")
   const [view, setView] = useState<WorkspaceView>("chat")
   const [nodes, setNodes] = useState<NodeInfo[]>([])
-  const [conversations, setConversations] = useState<ConversationSummary[]>([])
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
   const [notifications, setNotifications] = useState<NotificationRecord[]>([])
   const [pending, setPending] = useState<PendingOperation[]>([])
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([])
   const [bots, setBots] = useState<BotRecord[]>([])
-  const [pendingBot, setPendingBot] = useState<CreateBotRequest | null>(null)
+  const [pendingBot, setPendingBot] = useState<PendingBot | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [messageBusy, setMessageBusy] = useState(false)
   const [liveProgress, setLiveProgress] = useState<LiveProgress[]>([])
@@ -46,7 +45,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   const readSequence = useRef(0)
   const pendingRef = useRef<PendingOperation[]>([])
   const messagesRef = useRef<PendingMessage[]>([])
-  const botCreationRef = useRef<CreateBotRequest | null>(null)
+  const botCreationRef = useRef<PendingBot | null>(null)
   const notificationsRef = useRef<NotificationRecord[]>([])
   const inFlight = useRef(new Set<string>())
   const refreshingRef = useRef(false)
@@ -64,7 +63,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     return context
   }
   const requireBotContext = (id = activeId.current) => {
-    if (!bots.some((bot) => bot.conversation_id === id)) throw new Error("旧聊天只读，请在设置中接入机器人后再操作。")
+    if (!bots.some((bot) => bot.conversation_id === id)) throw new Error("请先选择机器人后再操作。")
     return requireContext(id)
   }
   const showError = (caught: unknown) => { if (current()) setError(errorText(caught)) }
@@ -180,19 +179,17 @@ function useWorkspaceState(connection: ReadyConnection) {
     refreshingConnection.current = connection
     setRefreshing(true)
     try {
-      const [rawNodes, rawConversations, rawNotifications, rawBots] = await Promise.all([
-        connection.rpc("nodes"), connection.rpc("conversations"), connection.rpc("notifications"), connection.rpc("bots"),
+      const [rawNodes, rawNotifications, rawBots] = await Promise.all([
+        connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"),
       ])
       requireCurrent()
-      const nextNodes = parseNodes(rawNodes), nextConversations = parseConversations(rawConversations), nextNotifications = parseNotifications(rawNotifications)
+      const nextNodes = parseNodes(rawNodes), nextNotifications = parseNotifications(rawNotifications)
       const nextBots = parseBots(rawBots)
-      setNodes(nextNodes); setConversations(nextConversations); setNotifications(nextNotifications); setBots(nextBots)
+      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots)
       notificationsRef.current = nextNotifications
-      if (!activeId.current) {
-        const selected = readStorage<string | null>(scoped("selected-bot"), null)
-        const bot = nextBots.find((item) => item.bot_id === selected) ?? nextBots[0]
-        if (bot) selectConversation(bot.conversation_id)
-      }
+      const selected = readStorage<string | null>(scoped("selected-bot"), null)
+      const bot = nextBots.find((item) => item.conversation_id === activeId.current) ?? nextBots.find((item) => item.bot_id === selected) ?? nextBots[0]
+      if (activeId.current !== (bot?.conversation_id ?? "")) selectConversation(bot?.conversation_id ?? "")
       if (activeId.current) await readConversation(activeId.current)
       requireCurrent()
       notifyBrowser(nextNotifications)
@@ -211,10 +208,10 @@ function useWorkspaceState(connection: ReadyConnection) {
   refreshRef.current = refresh
 
   const loadPending = () => {
-    const storedPending = parsePending(readStorage<unknown>(scoped("pending"), [], true), networkId)
+    const storedPending = parsePending(readStorage<unknown>(scoped("pending"), [], true))
     const storedMessages = parsePendingMessages(readStorage<unknown>(scoped("pending-messages"), [], true))
     const rawBot = readStorage<unknown>(scoped("pending-bot"), null, true)
-    const storedBot = rawBot == null ? null : parseCreateBot(rawBot)
+    const storedBot = rawBot == null ? null : parsePendingBot(rawBot)
     pendingRef.current = storedPending; setPending(storedPending)
     messagesRef.current = storedMessages; setPendingMessages(storedMessages)
     botCreationRef.current = storedBot; setPendingBot(storedBot)
@@ -287,12 +284,14 @@ function useWorkspaceState(connection: ReadyConnection) {
     if (current()) setError("")
     try { await action() } catch (caught) { showError(caught) }
   }
-  const submitExecutionControl = async (request: ExecutionControlRequest, expected: PendingOperation) => {
+  const submitPendingControl = async (expected: PendingOperation) => {
+    const request = expected.execution_control
     const result = parseOperation(record(await connection.rpc("execution_control", request)).operation)
     requireCurrent()
     if (result.request.operation_id !== request.operation_id || result.request.target_node !== expected.target_node || result.request.conversation_id !== request.conversation_id || result.request.session_id !== expected.session_id) throw new Error("控制回执与原请求不符，已保留原请求待核对。")
     removePending(request.operation_id)
-    setNoticeText(request.action.type === "interrupt" ? "停止请求已接收，是否结束以执行设备的最终结果为准。" : "本人操作已接收，请查看最新进展。")
+    const interrupt = request.action.type === "interrupt"
+    setNoticeText(interrupt ? "停止请求已接收，是否结束以执行设备的最终结果为准。" : "本人操作已接收，请查看最新进展。")
     if (activeId.current === request.conversation_id) await refreshRef.current()
   }
   const submitMessage = async (text: string) => {
@@ -326,6 +325,20 @@ function useWorkspaceState(connection: ReadyConnection) {
     }
   }
   const sameProject = (left?: BotProject, right?: BotProject) => left?.target_node === right?.target_node && left?.cwd === right?.cwd
+  const clearPendingBot = () => {
+    writeStorage(scoped("pending-bot"), null, true)
+    botCreationRef.current = null; setPendingBot(null)
+  }
+  const checkRejectedBot = async (pending: PendingBot): Promise<BotRecord | null> => {
+    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.entry.node_id) throw new Error("请回原入口核对机器人创建结果，原配置仍已保留。")
+    const known = parseBots(await connection.rpc("bots"))
+    requireCurrent()
+    const match = known.find((bot) => bot.bot_id === pending.bot_id || bot.conversation_id === pending.conversation_id)
+    if (match && (match.bot_id !== pending.bot_id || match.conversation_id !== pending.conversation_id || match.name !== pending.name || match.instructions !== pending.instructions || !sameProject(match.project, pending.project))) throw new Error("已找到相关机器人定义，请保留原请求并核对配置。")
+    clearPendingBot()
+    if (!match) setNoticeText("已确认机器人没有创建，可以修改配置后重新提交。")
+    return match ?? null
+  }
   const selectedBot = bots.find((bot) => bot.conversation_id === conversationId) ?? null
   const selectBot = async (bot: BotRecord) => {
     requireCurrent()
@@ -335,7 +348,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     await refreshRef.current()
   }
   const sendMessage = (input: string) => withMutation(`message:${activeId.current}`, async () => {
-    if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选择机器人。旧聊天可在设置中接入机器人。")
+    if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选择机器人。")
     const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)
     try { await submitMessage(text) } finally { if (current()) setMessageBusy(false) }
@@ -346,7 +359,7 @@ function useWorkspaceState(connection: ReadyConnection) {
 
   return {
     info: connection.info, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
-    error, noticeText, view, setView, nodes, conversations, conversationId, data, notifications, pending, bots, selectedBot, pendingBot,
+    error, noticeText, view, setView, nodes, conversationId, data, notifications, pending, bots, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress,
     writable: writeState === "writable" && current(),
     writeNotice: writeState === "readonly" ? "另一个页面正在操作此浏览器设备。此页只读，关闭其他页面后重新连接。"
@@ -355,21 +368,40 @@ function useWorkspaceState(connection: ReadyConnection) {
     syncText: !data ? "发一条消息开始对话。" : incomplete
       ? `上下文尚未完整，已暂停派发。缺少事件 ${missingCount(data.missing.events)}，附件 ${missingCount(data.missing.blobs)}，冲突 ${missingCount(data.missing.conflicts)}。`
       : `此入口已取得已知上下文，共 ${data.heads.length} 个历史位置。其他离线设备可能仍有未同步记录。`,
-    selectConversation, refresh, run, announce: setNoticeText, notificationButton,
+    refresh, run, announce: setNoticeText, notificationButton,
     selectBot,
-    createBot: (input: { name: string; instructions: string; project?: BotProject; conversation_id?: string }) => withMutation("create-bot", async () => {
+    createBot: (input: { name: string; instructions: string; project?: BotProject }) => withMutation("create-bot", async () => {
       const name = inputText(input.name, "机器人名称", 512), instructions = input.instructions.trim()
-      if (new TextEncoder().encode(instructions).length > 65536) throw new Error("职责说明不能超过 65536 字节。")
+      if (new TextEncoder().encode(instructions).length > 8192) throw new Error("职责说明不能超过 8192 字节。")
+      if (new TextEncoder().encode(JSON.stringify([name, instructions, input.project ?? null])).length > 12000) throw new Error("机器人配置不能超过 12000 字节，请缩短名称、职责或项目路径。")
       const prior = botCreationRef.current
-      if (prior && (prior.name !== name || prior.instructions !== instructions || !sameProject(prior.project, input.project) || input.conversation_id && prior.conversation_id !== input.conversation_id)) throw new Error("机器人创建结果尚未确认，请保留原配置重试。")
-      const request: CreateBotRequest = prior ?? { bot_id: newId(), conversation_id: input.conversation_id ?? newId(), name, instructions, project: input.project }
-      writeStorage(scoped("pending-bot"), request, true)
-      botCreationRef.current = request; setPendingBot(request)
-      const bot = parseBot(record(await connection.rpc("create_bot", request)).bot)
+      if (prior && (prior.name !== name || prior.instructions !== instructions || !sameProject(prior.project, input.project))) throw new Error("机器人创建结果尚未确认，请保留原配置重试。")
+      if (prior?.submission?.state === "rejected") {
+        const known = await checkRejectedBot(prior)
+        if (known) { await selectBot(known); return }
+        throw new Error("已确认机器人没有创建，可以修改配置后重新提交。")
+      }
+      const pending: PendingBot = prior ?? { bot_id: newId(), conversation_id: newId(), name, instructions, project: input.project, submission: { state: "unconfirmed", entry_node: connection.entry.node_id } }
+      const request: CreateBotRequest = parseCreateBot(pending)
+      writeStorage(scoped("pending-bot"), pending, true)
+      botCreationRef.current = pending; setPendingBot(pending)
+      let response: unknown
+      try { response = await connection.rpc("create_bot", request) }
+      catch (caught) {
+        if (!prior && current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
+          const rejected: PendingBot = { ...pending, submission: { state: "rejected", entry_node: connection.entry.node_id } }
+          writeStorage(scoped("pending-bot"), rejected, true)
+          botCreationRef.current = rejected; setPendingBot(rejected)
+          const known = await checkRejectedBot(rejected)
+          if (known) { await selectBot(known); return }
+          throw new Error(`${errorText(caught)} 已确认没有创建，可以修改配置后重新提交。`)
+        }
+        throw caught
+      }
+      const bot = parseBot(record(response).bot)
       requireCurrent()
       if (bot.bot_id !== request.bot_id || bot.conversation_id !== request.conversation_id || bot.name !== request.name || bot.instructions !== request.instructions || !sameProject(bot.project, request.project)) throw new Error("机器人创建回执与原配置不符，请核对原请求。")
-      writeStorage(scoped("pending-bot"), null, true)
-      botCreationRef.current = null; setPendingBot(null)
+      clearPendingBot()
       await selectBot(bot)
     }),
     sendMessage,
@@ -400,13 +432,28 @@ function useWorkspaceState(connection: ReadyConnection) {
       const request: ExecutionControlRequest = { operation_id: newId(), conversation_id: id, expected_operation_id: operationId, expected_revision: execution.revision, action }
       const pending: PendingOperation = { operation_id: request.operation_id, conversation_id: id, target_node: execution.target_node, session_id: execution.session_id, execution_control: request }
       replacePending([...pendingRef.current, pending])
-      await submitExecutionControl(request, pending)
+      await submitPendingControl(pending)
     }),
     retryExecutionControl: (operation: PendingOperation) => withMutation(`execution-control:${operation.operation_id}`, async () => {
-      requireBotContext(operation.conversation_id)
       const original = pendingRef.current.find((item) => item.operation_id === operation.operation_id)
-      if (!original?.execution_control) throw new Error("原控制请求不存在，请先核对持久状态。")
-      await submitExecutionControl(original.execution_control, original)
+      if (!original) throw new Error("原控制请求不存在，请先核对持久状态。")
+      requireBotContext(original.conversation_id)
+      await submitPendingControl(original)
+    }),
+    stopFollowup: (operationId: string) => withMutation(`stop-followup:${operationId}`, async () => {
+      const id = activeId.current, context = requireContext(id)
+      const goal = context.executions.find((item) => item.operation_id === operationId)?.goal
+      if (!goal) throw new Error("未找到此工作的后续授权，请先核对进展。")
+      if (goal.followup_mode === "off") return
+      try {
+        await connection.rpc("set_followup", { conversation_id: id, task_id: goal.task_id, mode: "off", expected_version: goal.followup_version, scheduler_node: goal.followup_scheduler_node })
+      } catch (caught) {
+        if (current() && activeId.current === id) await refreshRef.current().catch(showError)
+        throw caught
+      }
+      requireCurrent()
+      setNoticeText("已停止后续处理。正在运行的执行可单独停止。")
+      if (activeId.current === id) await refreshRef.current()
     }),
     resolveManagerUnknown: (trigger: string, evidence: string) => withMutation(`resolve-manager:${trigger}`, async () => {
       const id = activeId.current

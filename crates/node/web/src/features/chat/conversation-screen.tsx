@@ -25,7 +25,7 @@ export function ConversationScreen() {
   const messages = [...(data?.messages ?? []), ...liveMessages]
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const sendDisabled = !workspace.writable || !workspace.selectedBot || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
-  const hint = !workspace.connectionOnline ? '正在恢复只读连接。未确认操作保留原请求，不会自动重发。' : messagePending ? originalEntry ? '先核对原消息，再发送新内容。' : '原消息尚未确认，请回原入口核对或重试；当前入口可只读查看进展。' : workspace.writeNotice || (!workspace.selectedBot ? conversationId ? '旧聊天只读。可在设置中将它接入一个机器人。' : '创建或选择一个机器人，开始聊天。' : composerHint(gate)) || (data?.scheduler?.write_frozen ? '旧调用结果待核对，新的消息只允许只读交谈。' : activeJobs.some((job) => ['queued', 'claimed', 'running'].includes(job.state)) ? '可继续发送；新消息会可靠排队，后台任务继续运行。' : '')
+  const hint = !workspace.connectionOnline ? '正在恢复只读连接。未确认操作保留原请求，不会自动重发。' : messagePending ? originalEntry ? '先核对原消息，再发送新内容。' : '原消息尚未确认，请回原入口核对或重试；当前入口可只读查看进展。' : workspace.writeNotice || (!workspace.selectedBot ? '创建或选择一个机器人，开始聊天。' : composerHint(gate)) || (data?.scheduler?.write_frozen ? '旧调用结果待核对，新的消息只允许只读交谈。' : activeJobs.some((job) => ['queued', 'claimed', 'running'].includes(job.state)) ? '可继续发送；新消息会可靠排队，后台任务继续运行。' : '')
 
   useEffect(() => {
     if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)

@@ -25,7 +25,6 @@ import { Spinner } from "@/components/ui/spinner"
 import { useWorkspace } from "./context"
 import { DevicesScreen } from "./devices-screen"
 import { BotForm } from "./bot-form"
-import type { ConversationSummary } from "./types"
 
 export function WorkspaceShell() {
   return <SidebarProvider className="workspace-shell"><WorkspaceLayout /></SidebarProvider>
@@ -35,14 +34,13 @@ function WorkspaceLayout() {
   const workspace = useWorkspace()
   const { setOpenMobile } = useSidebar()
   const [creatingBot, setCreatingBot] = useState(false)
-  const [sourceConversation, setSourceConversation] = useState<ConversationSummary | undefined>()
   const creatorTrigger = useRef<HTMLElement | null>(null)
-  const title = workspace.view === "chat" ? workspace.selectedBot?.name || workspace.data?.conversation?.title || "机器人" : "设置"
+  const title = workspace.view === "chat" ? workspace.selectedBot?.name || "机器人" : "设置"
   const createLabel = workspace.pendingBot ? "核对机器人创建" : "创建机器人"
 
-  function openCreator(conversation?: ConversationSummary) {
+  function openCreator() {
     creatorTrigger.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    setSourceConversation(conversation); setCreatingBot(true); setOpenMobile(false)
+    setCreatingBot(true); setOpenMobile(false)
   }
 
   function restoreCreatorFocus() {
@@ -120,7 +118,7 @@ function WorkspaceLayout() {
         <header className="flex h-14 shrink-0 items-center gap-3 border-b px-4 sm:px-6">
           <SidebarTrigger aria-label="切换侧栏" title="切换侧栏" />
           <h1 className="min-w-0 flex-1 truncate text-sm font-semibold" title={title}>{title}</h1>
-          {workspace.view === "chat" && !workspace.conversationId ? <Button type="button" variant="secondary" disabled={!workspace.writable && !workspace.pendingBot} onClick={() => openCreator()}>{createLabel}</Button> : null}
+          {workspace.view === "chat" && !workspace.selectedBot ? <Button type="button" variant="secondary" disabled={!workspace.writable && !workspace.pendingBot} onClick={() => openCreator()}>{createLabel}</Button> : null}
           <Button type="button" size="icon" variant="ghost" disabled={!workspace.connectionOnline} aria-label="刷新状态" title="刷新状态" aria-busy={workspace.refreshing} onClick={() => { void workspace.run(async () => { await workspace.refresh(); workspace.announce("已刷新。") }) }}>
             {workspace.refreshing ? <Spinner /> : <RefreshCwIcon aria-hidden="true" />}
           </Button>
@@ -134,14 +132,10 @@ function WorkspaceLayout() {
             {workspace.data && workspace.incomplete ? <Alert role="status" data-incomplete="true"><AlertDescription>{workspace.syncText}</AlertDescription></Alert> : null}
           </div>
         ) : null}
-        {workspace.view === "chat" && !workspace.selectedBot && workspace.data?.conversation ? <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 px-4 py-3 sm:px-6">
-          <p className="text-sm text-muted-foreground">旧聊天记录仅供查看。接入新机器人后可以继续聊天。</p>
-          <Button type="button" variant="secondary" className="min-h-11" disabled={!workspace.writable || Boolean(workspace.pendingBot)} onClick={() => openCreator(workspace.data?.conversation ?? undefined)}>接入新机器人</Button>
-        </div> : null}
         <div className="conversation-view" hidden={workspace.view !== "chat"}><ConversationScreen /></div>
-        <DevicesScreen onCreateBot={openCreator} />
+        <DevicesScreen />
       </SidebarInset>
-      <BotForm open={creatingBot} onOpenChange={setCreatingBot} conversation={sourceConversation} restoreFocus={restoreCreatorFocus} />
+      <BotForm open={creatingBot} onOpenChange={setCreatingBot} restoreFocus={restoreCreatorFocus} />
     </>
   )
 }

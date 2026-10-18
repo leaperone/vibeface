@@ -9,37 +9,9 @@ export type NodeInfo = {
   capabilities?: { manager: string | null; executors: string[]; roots: string[] }
 }
 export type ConversationSummary = { conversation_id: string; title: string }
-export type TaskRecord = {
-  task_id: string
-  title: string
-  goal: string
-  acceptance: string
-  detail: string
-  status: string
-  followup_mode?: FollowupMode
-  followup_version?: number
-  followup_scheduler_node?: string
-  blobs?: { hash: string; size: number }[]
-  followup_error?: string
-  binding_error?: string
-  binding?: TaskBinding
-}
 export type FollowupMode = "off" | "report" | "continue"
 export type HumanQuestion = { id: string; header: string; question: string; options?: { label: string; description?: string }[]; is_secret?: boolean }
 export type HumanRequest = { request_id: string | number; kind: string; title?: string; text: string; choices?: { label: string; response: unknown }[]; questions?: HumanQuestion[] }
-export type TaskBinding = {
-  target_node: string
-  session_id: string
-  operation_id?: string
-  state?: string
-  capabilities: string[]
-  pending_requests: HumanRequest[]
-  current_turn?: string
-  latest_progress?: string
-  revision: number
-  freshness?: "local_ledger" | "cached" | "unknown"
-  checked_at_ms?: number
-}
 export type ManagerJob = {
   trigger: string
   state: string
@@ -59,16 +31,6 @@ export type SchedulerSnapshot = {
   capabilities?: { streaming: boolean; cancel: boolean; steer: boolean }
   write_frozen?: boolean
 }
-export type SessionRecord = {
-  executor: string
-  target_node: string
-  state: string
-  cwd: string
-  session_id: string
-  revision: number
-  native_session_id?: string
-  capabilities?: string[]
-}
 export type OperationRecord = {
   state: string
   request: { operation_id: string; target_node: string; conversation_id: string; session_id: string | null }
@@ -81,45 +43,9 @@ export type ConversationPayload = {
   messages: TranscriptMessage[]
   heads: string[]
   missing: MissingContext
-  tasks: TaskRecord[]
   executions: ExecutionActivityRecord[]
-  sessions: SessionRecord[]
   operations: OperationRecord[]
   scheduler: SchedulerSnapshot | null
-}
-export type OperateAction =
-  | { type: "open"; executor: string; cwd: string }
-  | { type: "read" }
-  | { type: "send"; text: string }
-  | { type: "steer"; text: string; turn_id: string }
-  | { type: "interrupt"; turn_id: string }
-  | { type: "respond_request"; request_id: string | number; response: Record<string, unknown> }
-
-export type OperationRequest = {
-  operation_id: string
-  network_id: string
-  conversation_id: string
-  task_id: string | null
-  target_node: string
-  session_id: string
-  expected_revision: number
-  basis_heads: string[]
-  resources: string[]
-  action: OperateAction
-}
-export type TaskControlRequest = {
-  operation_id: string
-  network_id: string
-  conversation_id: string
-  task_id: string
-  target_node: string
-  session_id: string
-  expected_operation_id: string
-  expected_revision: number
-  action: "interrupt" | "steer" | "respond_request"
-  text?: string
-  request_id?: string | number
-  response?: unknown
 }
 export type ExecutionControlAction =
   | { type: "interrupt" }
@@ -149,21 +75,22 @@ export type ExecutionActivityRecord = {
   blobs: { hash: string; size: number }[]
   source_trigger?: string
   source_message_id?: string
-  goal?: { title: string; acceptance: string; status: string }
+  goal?: { task_id: string; title: string; acceptance: string; status: string; followup_mode: FollowupMode; followup_version: number; followup_scheduler_node?: string }
 }
 export type PendingOperation = {
   operation_id: string
   target_node: string
   session_id: string | null
   conversation_id: string
-} & (
-  | { request: OperationRequest; control?: never; execution_control?: never }
-  | { request?: never; control: TaskControlRequest; execution_control?: never }
-  | { request?: never; control?: never; execution_control: ExecutionControlRequest }
-)
+  execution_control: ExecutionControlRequest
+}
 export type WorkspaceView = "chat" | "settings"
 export type { PendingMessage }
 
 export type BotProject = { target_node: string; cwd: string }
 export type CreateBotRequest = { bot_id: string; conversation_id: string; name: string; instructions: string; project?: BotProject }
 export type BotRecord = CreateBotRequest & { event_hash: string }
+
+export type PendingBot = CreateBotRequest & {
+  submission: { state: "unconfirmed" | "rejected"; entry_node: string }
+}

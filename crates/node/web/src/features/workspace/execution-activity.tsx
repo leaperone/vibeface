@@ -22,6 +22,7 @@ export function ExecutionActivity({ execution, conversationId }: { execution: Ex
   const targetOnline = workspace.nodes.some((node) => node.node_id === execution.target_node && node.online && !node.revoked)
   const pending = workspace.pending.filter((item) => item.conversation_id === conversationId && (item.execution_control?.expected_operation_id === execution.operation_id || item.target_node === execution.target_node && execution.session_id !== null && item.session_id === execution.session_id))
   const canControl = workspace.writable && Boolean(workspace.selectedBot) && targetOnline && execution.state !== "unknown" && execution.session_state !== "unknown" && execution.freshness !== "unknown" && pending.length === 0
+  const followupMode = execution.goal?.followup_mode
   return <Card>
     <CardHeader className="flex flex-wrap items-start justify-between gap-3">
       <CardTitle className="min-w-0 flex-1 break-words">{execution.title || "后台工作"}</CardTitle>
@@ -37,6 +38,11 @@ export function ExecutionActivity({ execution, conversationId }: { execution: Ex
         <ActionButton disabled={!workspace.connectionOnline} action={() => workspace.run(() => workspace.refreshExecution(execution.operation_id))}>核对进展</ActionButton>
         {execution.capabilities.includes("interrupt") ? <ActionButton disabled={!canControl} variant="destructive" action={() => workspace.run(() => workspace.executionControl(execution.operation_id, { type: "interrupt" }))}>停止当前执行</ActionButton> : null}
       </div>
+      {followupMode === "continue" || followupMode === "report" ? <section className="space-y-2 rounded-lg bg-muted p-3" aria-label="后续处理">
+        <p className="text-sm">{followupMode === "continue" ? "已授权继续处理这项工作。" : "已授权自动汇报这项工作的结果。"}</p>
+        <ActionButton disabled={!workspace.writable} action={() => workspace.run(() => workspace.stopFollowup(execution.operation_id))}>停止后续处理</ActionButton>
+        <p className="text-xs text-muted-foreground">停止后续处理不会中断已经开始的执行。</p>
+      </section> : null}
       {execution.capabilities.includes("steer") ? <Collapsible>
         <CollapsibleTrigger asChild><Button type="button" variant="ghost" disabled={!canControl} className="min-h-9 px-0">补充说明<ChevronDownIcon aria-hidden="true" /></Button></CollapsibleTrigger>
         <CollapsibleContent className="pt-3">
@@ -82,7 +88,7 @@ export function PendingExecutionControl({ operation }: { operation: PendingOpera
         setMissing(decision === "missing")
         setResultText(result.operation ? `执行设备已记录，${stateLabel(result.operation.state)}。` : "执行设备尚未找到原请求。")
       })}>核对原操作</ActionButton>
-      {operation.execution_control ? <ActionButton disabled={!workspace.writable || !workspace.selectedBot || !online} action={() => workspace.run(() => workspace.retryExecutionControl(operation))}>重试原请求</ActionButton> : null}
+      {operation.execution_control ? <ActionButton disabled={!workspace.writable || !online || !workspace.selectedBot} action={() => workspace.run(() => workspace.retryExecutionControl(operation))}>重试原请求</ActionButton> : null}
     </div>
     {resultText ? <p role="status" className="text-sm">{resultText}</p> : null}
     {missing ? <><p className="text-sm">确认原请求已结束后，可解除本地待核对记录。</p><ActionButton disabled={!workspace.writable} action={() => workspace.run(() => workspace.confirmMissing(operation.operation_id))}>确认原请求结束并解除待核对</ActionButton></> : null}
