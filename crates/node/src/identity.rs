@@ -11,6 +11,7 @@ pub(crate) mod event_authorization;
 pub(crate) mod execution_dispatch;
 pub(crate) mod execution_dispatch_resolution;
 pub(crate) mod execution_binding_seal;
+pub(crate) mod foreign_execution_policy;
 pub mod execution_handoff;
 pub(crate) mod governance_store;
 pub(crate) mod journal;

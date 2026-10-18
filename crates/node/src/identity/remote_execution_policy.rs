@@ -124,7 +124,7 @@ fn local_value(connection: &Connection, space: &str, key: &str) -> Result<Option
         .optional()?)
 }
 
-fn check_source_task(
+pub(super) fn check_source_task(
     connection: &Connection,
     intent: &Signed<RemoteExecutionPolicyReadIntent>,
     local: &PublicKey,
