@@ -12,6 +12,9 @@ use crate::signature_verification::ScopedSignatureVerification;
 
 pub(super) mod service;
 mod freshness;
+mod provenance;
+pub use provenance::{SdkPolicySourceFacts, SdkPolicySourceProvenance, SdkPolicySession,
+    SdkPolicyLease, sdk_policy_source_heads};
 pub use freshness::{
     NodeExecutionFreshnessRead, VerifiedNodeExecutionFreshnessRead,
     record_node_freshness_receipts, verify_node_execution_freshness_read,
