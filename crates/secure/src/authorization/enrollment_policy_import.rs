@@ -124,6 +124,20 @@ pub struct EnrollmentPolicyPageRequest {
     pub cursor: Option<ObjectHash>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentPolicyCacheBinding {
+    pub version: u16,
+    pub purpose: EnrollmentPolicyPurpose,
+    pub snapshot_id: Nonce,
+    pub request_cursor: Option<ObjectHash>,
+    pub page_hash: ObjectHash,
+}
+enrollment_policy_object!(
+    EnrollmentPolicyCacheBinding,
+    "enrollment-policy-page-cache-v2"
+);
+
 fn window(issued: u64, expires: u64, now: u64) -> Result<()> {
     validate_window(issued, expires, now)?;
     require(
@@ -762,5 +776,34 @@ mod tests {
             import.finish(&flow.witness, NOW).unwrap().heads(),
             flow.descriptor.target_heads
         );
+    }
+
+    #[test]
+    fn cache_binding_signature_covers_the_exact_snapshot_cursor_and_page() {
+        let source = key(71);
+        let binding = Signed::sign(
+            EnrollmentPolicyCacheBinding {
+                version: AUTH_VERSION,
+                purpose: EnrollmentPolicyPurpose::BrowserDevice,
+                snapshot_id: Nonce::from_bytes([72; 32]),
+                request_cursor: Some(ObjectHash::body(&"original cursor").unwrap()),
+                page_hash: ObjectHash::body(&"original signed page").unwrap(),
+            },
+            &source,
+        )
+        .unwrap();
+        binding.verify_signature().unwrap();
+        for field in 0..5 {
+            let mut changed = binding.clone();
+            match field {
+                0 => changed.payload.version += 1,
+                1 => changed.payload.purpose = EnrollmentPolicyPurpose::AccountNode,
+                2 => changed.payload.snapshot_id = Nonce::from_bytes([73; 32]),
+                3 => changed.payload.request_cursor = None,
+                4 => changed.payload.page_hash = ObjectHash::body(&"another page").unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(changed.verify_signature().is_err(), "field {field}");
+        }
     }
 }
