@@ -1575,6 +1575,9 @@ def chat_agent_checks(run, workspace, a, b, c, network, passed):
     require_quiet("restart never reruns the unknown command", lambda: marker.read_text() == "once")
     require(local_operation(b, network, operation_id)["request"]["session_id"] is None,
             "unknown command recovery does not create an SDK session")
+    wait_for("restarted executor reconnects before subsequent work", lambda:
+        any(row["node_id"] == b.node_id and row["online"] and row.get("capabilities")
+            for row in a.client.rpc("nodes")["nodes"]))
     passed("running command restart preserves Unknown and its original file effect without replay", operation_id=operation_id)
 
 
