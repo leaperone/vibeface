@@ -417,10 +417,10 @@ impl VerifiedRecoveryPolicyContext {
     pub fn witness(&self) -> &Signed<RecoveryContextWitness> {
         &self.witness
     }
-    pub fn verified_state(&self) -> &VerifiedPolicySet {
+    pub(crate) fn verified_state(&self) -> &VerifiedPolicySet {
         self.policy.state()
     }
-    pub fn verified_entries(&self) -> &[JournalEntry] {
+    pub(crate) fn verified_entries(&self) -> &[JournalEntry] {
         self.policy.journal()
     }
     pub(crate) fn policy(&self) -> &VerifiedPolicySnapshot {
