@@ -1227,17 +1227,13 @@ fn retained_dispatch_authorization(
     Ok((scoped, facts))
 }
 
-fn current_task_business_submit_in(
+fn current_task_business_operation_source_in(
     connection: &Connection,
     policy: &PolicyState,
     identity: &LocalIdentity,
-    wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
     retained: &RetainedDispatch,
     now_ms: u64,
-) -> Result<(
-    TaskScopedAuthorization,
-    vibeface_secure::authorization::execution_handoff::VerifiedExecutionHandoff,
-)> {
+) -> Result<TaskScopedAuthorization> {
     let invocation = &retained.admission.invocation.payload;
     let (source, scoped) = dispatch_authorization_from(
         connection,
@@ -1251,6 +1247,23 @@ fn current_task_business_submit_in(
         source == retained.source,
         "Task business submission changed its ready admitted dispatch"
     );
+    validate_operation_binding_from(connection, &retained.request)?;
+    Ok(scoped)
+}
+
+fn current_task_business_submit_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    identity: &LocalIdentity,
+    wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+    retained: &RetainedDispatch,
+    now_ms: u64,
+) -> Result<(
+    TaskScopedAuthorization,
+    vibeface_secure::authorization::execution_handoff::VerifiedExecutionHandoff,
+)> {
+    let scoped =
+        current_task_business_operation_source_in(connection, policy, identity, retained, now_ms)?;
     let verified = scoped.state(policy.verified()).verify_execution_handoff(
         wire,
         scoped.authorization(),
@@ -1262,11 +1275,27 @@ fn current_task_business_submit_in(
         None,
         now_ms,
     )?;
-    validate_operation_binding_from(connection, &retained.request)?;
     Ok((scoped, verified))
 }
 
 impl Store {
+    pub(crate) fn current_task_business_operation_source(
+        &self,
+        identity: &LocalIdentity,
+        wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+        now_ms: u64,
+    ) -> Result<TaskScopedAuthorization> {
+        let _signatures =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let tx = self.connection.unchecked_transaction()?;
+        let current = PolicyState::reload_verified(&tx, &self.policy)?;
+        let retained = retained_dispatch_from(&tx, identity, wire)?;
+        let scoped =
+            current_task_business_operation_source_in(&tx, &current, identity, &retained, now_ms)?;
+        tx.commit()?;
+        Ok(scoped)
+    }
+
     pub(crate) fn current_task_business_submit(
         &self,
         identity: &LocalIdentity,
