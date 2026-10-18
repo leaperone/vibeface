@@ -369,7 +369,21 @@ pub(crate) fn record_history_reference_metadata(
     usage.record_signed(&reference.source)?;
     usage.record_signed(&reference.old_submission)?;
     usage.record_signed(&reference.observation_receipt)?;
-    usage.record_metadata(reference)?;
+    let mut metadata = serde_json::to_value(reference)
+        .map_err(|_| AuthorizationError::InvalidProof("invalid historical reference metadata"))?;
+    for (field, hash) in [
+        ("source", ObjectHash::body(&reference.source)?),
+        ("old_submission", ObjectHash::body(&reference.old_submission)?),
+        ("observation_receipt", ObjectHash::body(&reference.observation_receipt)?),
+    ] {
+        metadata[field] = serde_json::json!({"signed_object_hash": hash});
+    }
+    if let Some(proof) = &reference.terminal_freshness {
+        metadata["terminal_freshness"] = serde_json::json!({"proof_hash": ObjectHash::body(proof)?});
+    }
+    usage.record_metadata(&serde_json::json!({
+        "reference_hash": ObjectHash::body(reference)?, "reference": metadata,
+    }))?;
     if let Some(proof) = &reference.terminal_freshness {
         require(
             proof.receipts.len() <= MAX_POLICY_DOMAINS
@@ -454,10 +468,7 @@ pub fn verify_remote_execution_history_acceptance(
         "history reached another executor",
     )?;
     let mut usage = ExecutionProofUsage::default();
-    usage.record_signed(&reference.source)?;
-    usage.record_signed(&reference.old_submission)?;
-    usage.record_signed(&reference.observation_receipt)?;
-    usage.record_metadata(reference)?;
+    record_history_reference_metadata(reference, &mut usage)?;
     let (decision_at_ms, heads, challenge_hash, issued, expires, receipts) = match acceptance {
         RemoteExecutionHistoryAcceptance::ExecutionResult {
             receipt,

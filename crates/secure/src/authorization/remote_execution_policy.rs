@@ -1017,7 +1017,6 @@ pub fn verify_remote_execution_policy_read(
     let mut usage = ExecutionProofUsage::default();
     usage.record_signed(&request.intent)?;
     usage.record_signed(&request.delegation)?;
-    usage.record_metadata(request)?;
     usage.record_budget(&budget)?;
     usage.record_chain_depth(chain.len());
     finish_usage(&mut usage)?;
@@ -1069,7 +1068,6 @@ pub fn verify_remote_execution_history_policy_read(
     let mut usage = verified.proof_usage().clone();
     usage.record_signed(&request.intent)?;
     usage.record_signed(&request.delegation)?;
-    usage.record_metadata(request)?;
     finish_usage(&mut usage)?;
     Ok(VerifiedRemoteExecutionPolicyRead {
         request: request.clone(),
@@ -1151,7 +1149,7 @@ impl VerifiedRemoteExecutionPolicy {
         usage.record_verified_object(&self.request.delegation)?;
         usage.record_verified_object(&self.header)?;
         usage.record_verified_object(&self.witness)?;
-        usage.record_metadata(&self.request)
+        Ok(())
     }
 }
 
@@ -1248,7 +1246,6 @@ fn begin_import_inner(
         record_confirmed_client_policy_metadata(source, &mut usage)?;
         usage.record_signed(&request.intent)?;
         usage.record_signed(&request.delegation)?;
-        usage.record_metadata(&request)?;
         usage.record_signed(&header)?;
         usage.record_budget(&current.budget)?;
         finish_usage(&mut usage)?;
