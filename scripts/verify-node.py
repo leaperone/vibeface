@@ -905,10 +905,8 @@ def fixture_wrapper(run, name, mode):
     return path
 
 
-def fixture_manager_settings(run, workspace):
-    return {"provider": "codex_sdk", "workspace": str(workspace), "model": "controlled-fixture",
-            "cursor_sdk_bin": "unused-fixture", "node_bin": sys.executable,
-            "codex_sdk_script": str(fixture_wrapper(run, "fixture-manager", "--fixture-manager"))}
+def fixture_manager_settings():
+    return {"provider": "codex_sdk", "model": "controlled-fixture"}
 
 
 def fixture_record(run, filename, record):
@@ -1392,21 +1390,22 @@ def verify_no_model_budget(nodes):
 
 
 def javascript_dependencies(content):
-    static = rb"\b(?:import|export)\s*(?:[^;\"'`]*?\bfrom\s*)?[\"'`]([^\"'`]+)[\"'`]"
+    # Static module specifiers cannot use templates; minifiers use them for ordinary strings.
+    static = rb"\b(?:import|export)\s*(?:[^;\"'`]*?\bfrom\s*)?[\"']([^\"']+)[\"']"
     dynamic = rb"\bimport\s*\(\s*[\"'`]([^\"'`]+)[\"'`]"
     return [address.decode() for pattern in (static, dynamic) for address in re.findall(pattern, content)]
 
 
 def verify_web_assets(node, module):
-    def fetch(path, *, method="GET", status=200):
+    def fetch(path, *, method="GET", status=200, max_bytes=8 * 1024 * 1024):
         request = urllib.request.Request(node.url + path, headers={"Origin": node.url}, method=method)
         try:
             response = urllib.request.urlopen(request, timeout=10)
         except urllib.error.HTTPError as error:
             response = error
         with response:
-            content = response.read(8 * 1024 * 1024 + 1)
-            require(response.status == status and len(content) <= 8 * 1024 * 1024,
+            content = response.read(max_bytes + 1)
+            require(response.status == status and len(content) <= max_bytes,
                     f"{method} {path}: expected bounded HTTP {status}")
             return content, response.headers
 
@@ -1487,7 +1486,7 @@ def verify_web_assets(node, module):
         body, missing_headers = fetch(path, status=404)
         require(body != shell and missing_headers["Cache-Control"] == "no-store", "unknown API and assets return uncached 404, never the SPA shell")
     for path in (module, module.with_name("vibeface_secure_bg.wasm")):
-        content, crypto_headers = fetch("/generated/" + path.name)
+        content, crypto_headers = fetch("/generated/" + path.name, max_bytes=path.stat().st_size)
         require(hashlib.sha256(content).hexdigest() == file_sha256(path),
                 "served browser cryptography matches the verified package resource")
         require(crypto_headers["Cache-Control"] == "no-store", "mutable browser cryptography cannot be cached across updates")
@@ -2781,7 +2780,7 @@ def bot_checks(run, workspace, a, b, c, space, passed, outsider):
                 for event in local_events(c, space, definition["conversation_id"], resource_id=a.client.resource_id))
             for definition in definitions))
     c.stop()
-    c.configure(manager=fixture_manager_settings(run, workspace), codex_bin=sys.executable)
+    c.configure(manager=fixture_manager_settings(), codex_bin=sys.executable)
     c.start()
     c.client.connect()
     c.client.authenticate()
@@ -2945,7 +2944,7 @@ def chat_agent_acceptance(options):
             node.configure(timeout_secs=600, codex_bin=str(codex) if name == "B" else sys.executable)
             nodes.append(node)
         a, b, c, outsider = nodes
-        a.configure(manager=fixture_manager_settings(run, workspace), daily_decision_limit=100)
+        a.configure(manager=fixture_manager_settings(), daily_decision_limit=100)
         a.start()
         verify_web_assets(a, module)
         space = a.bootstrap()
@@ -2997,7 +2996,7 @@ def phase1_acceptance(options):
     workspace = run / "workspace"
     workspace.mkdir()
     fixture = fixture_wrapper(run, "fixture-executor", "--fixture-executor")
-    manager = fixture_manager_settings(run, workspace)
+    manager = fixture_manager_settings()
     helper = Path(__file__).resolve().with_name("node-client.mjs")
     nodes = []
     report = {"status": "running", "source_binary": str(source_binary),
