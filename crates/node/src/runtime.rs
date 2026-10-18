@@ -30,6 +30,8 @@ use vibeface_secure::authorization::{
     INVOCATION_MAX_AGE_MS, Invocation, Nonce, ObjectHash, PolicyDomain, PublicKey, ResourceId,
     ResourceRef, ServiceId, Signed, SpaceId, TransportEvidence, VerifiedAuthorization,
     VerifiedClientAuthorization,
+    node_execution_policy::VerifiedTaskCurrentPolicy,
+    prepare::{PrepareIntent, VerifiedPrepareAuthorization},
 };
 use vibeface_secure::signature_verification::SignatureVerification;
 
@@ -42,6 +44,71 @@ pub struct Access {
     transport: TransportEvidence,
     body: Value,
     verification: SignatureVerification,
+}
+
+struct TaskScopedPrepareAuthorization {
+    intent: Signed<PrepareIntent>,
+    authorization: VerifiedPrepareAuthorization,
+    task_policy: Option<VerifiedTaskCurrentPolicy>,
+    transport: TransportEvidence,
+}
+
+impl TaskScopedPrepareAuthorization {
+    fn verify_in(
+        connection: &rusqlite::Connection,
+        policy: &crate::identity::journal::PolicyState,
+        source: &PublicKey,
+        intent: Signed<PrepareIntent>,
+        body: &Value,
+        audience: &Audience,
+        transport: TransportEvidence,
+        now: u64,
+    ) -> Result<Self> {
+        let task_policy =
+            crate::identity::foreign_execution_policy::current_task_prepare_policy_in(
+                connection, policy, source, &intent, body, now,
+            )?;
+        let state = task_policy
+            .as_ref()
+            .map_or(policy.verified(), |task| task.state());
+        let authorization = state.verify_prepare_intent(
+            &intent,
+            body,
+            authorization_action(body)?,
+            audience,
+            &transport,
+            now,
+        )?;
+        let mut usage = authorization.proof_usage().clone();
+        if let Some(task) = &task_policy {
+            usage.merge(task.proof_usage());
+        }
+        usage.record_signed(&intent)?;
+        if let Some(counts) = SignatureVerification::current_counts() {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
+        Ok(Self {
+            intent,
+            authorization,
+            task_policy,
+            transport,
+        })
+    }
+
+    fn check_same_policy(&self, current: &Self) -> Result<()> {
+        let same = match (&self.task_policy, &current.task_policy) {
+            (None, None) => true,
+            (Some(original), Some(current)) => {
+                original.request() == current.request()
+                    && original.snapshot() == current.snapshot()
+                    && original.witness() == current.witness()
+            }
+            _ => false,
+        };
+        ensure!(same, "NeedPolicySync: prepare Task policy changed");
+        Ok(())
+    }
 }
 
 impl Access {
@@ -2339,6 +2406,99 @@ impl Runtime {
         self.audience()
     }
 
+    fn check_client_policy_dependencies(
+        client: &VerifiedClientAuthorization,
+        request: &Invocation,
+        body: &Value,
+    ) -> Result<bool> {
+        let fields = ["execution_resource", "target_public_key", "execution_grant"];
+        if fields.iter().all(|field| body.get(*field).is_none()) {
+            ensure!(
+                request.expected_policies == client.heads(),
+                "client request changed its verified policy dependencies"
+            );
+            return Ok(false);
+        }
+        ensure!(
+            fields
+                .iter()
+                .all(|field| body.get(*field).is_some_and(|value| !value.is_null()))
+                && matches!(
+                    body["method"].as_str(),
+                    Some("operate" | "bind_execution" | "rebind_execution" | "resolve_unknown")
+                ),
+            "forwarded execution selection is incomplete or unsupported"
+        );
+        let _: ResourceRef = serde_json::from_value(body["execution_resource"].clone())?;
+        let key: PublicKey = serde_json::from_value(body["target_public_key"].clone())?;
+        let _: ObjectHash = serde_json::from_value(body["execution_grant"].clone())?;
+        ensure!(
+            request
+                .context
+                .execution_session
+                .as_ref()
+                .is_some_and(|session| {
+                    session.target == DeviceId::from_key(&key)
+                        && session.target != request.audience.device
+                })
+                && request.expected_policies.len()
+                    <= vibeface_secure::authorization::MAX_POLICY_DOMAINS
+                && request
+                    .expected_policies
+                    .windows(2)
+                    .all(|pair| pair[0].domain < pair[1].domain)
+                && client
+                    .heads()
+                    .iter()
+                    .all(|head| request.expected_policies.contains(head)),
+            "forwarded execution changed its source dependencies or target"
+        );
+        Ok(true)
+    }
+
+    fn client_forward_target(
+        &self,
+        store: &Store,
+        client: &VerifiedClientAuthorization,
+        now: u64,
+    ) -> Result<String> {
+        ensure!(
+            now < client.expires_at_ms(),
+            "forwarding client policy expired"
+        );
+        let snapshot = store.connection.unchecked_transaction()?;
+        let current =
+            crate::identity::journal::PolicyState::reload_verified(&snapshot, &store.policy)?;
+        crate::identity::client_policy_read::check_heads_in(&snapshot, &current, client.heads())?;
+        let local = self.audience()?;
+        let gateway = current
+            .verified()
+            .verify_transport_device(&local.device, now)?;
+        ensure!(
+            gateway.payload.subject == Actor::Service(local.service)
+                && gateway.payload.public_key.as_str() == self.identity.public_key_hex()?,
+            "forwarding Gateway differs from its current service certificate"
+        );
+        current.verified().verify_account_client_device(
+            &client.scope().account_id,
+            &client.scope().device_id,
+            now,
+        )?;
+        let certificate = current.verified().verify_service_device(
+            &client.scope().space_id,
+            &client.audience().device,
+            now,
+        )?;
+        ensure!(
+            certificate.payload.subject == Actor::Service(client.audience().service.clone())
+                && certificate.payload.public_key == *client.audience_public_key(),
+            "forwarded target differs from the verified service pin"
+        );
+        let target = crypto::fingerprint(certificate.payload.public_key.as_str())?;
+        snapshot.commit()?;
+        Ok(target)
+    }
+
     pub async fn forward_client_request(
         &self,
         client: &VerifiedClientAuthorization,
@@ -2392,10 +2552,10 @@ impl Runtime {
             value.version == AUTH_VERSION
                 && value.audience == *client.audience()
                 && value.presenter == self.audience()?.device
-                && value.grant_leaf == *client.grant_leaf()
-                && value.expected_policies == client.heads(),
+                && value.grant_leaf == *client.grant_leaf(),
             "forwarded authorization targets another route"
         );
+        Self::check_client_policy_dependencies(client, value, body)?;
         ensure!(
             value.resource.space == client.scope().space_id
                 && body["space_id"].as_str() == Some(client.scope().space_id.as_str())
@@ -2422,23 +2582,7 @@ impl Runtime {
         let target = {
             let store = self.store.lock().await;
             let _verification = verification.enter();
-            for stamp in client.heads() {
-                ensure!(
-                    store.authorization_state().head(&stamp.domain) == Some(stamp),
-                    "forwarding policy needs synchronization"
-                );
-            }
-            let certificate = store.authorization_state().verify_service_device(
-                &client.scope().space_id,
-                &value.audience.device,
-                now,
-            )?;
-            ensure!(
-                certificate.payload.subject == Actor::Service(value.audience.service.clone())
-                    && certificate.payload.public_key == *client.audience_public_key(),
-                "forwarded target differs from the verified service pin"
-            );
-            crypto::fingerprint(certificate.payload.public_key.as_str())?
+            self.client_forward_target(&store, client, now)?
         };
         self.peer_request(
             client.scope().space_id.as_str(),
@@ -2582,10 +2726,10 @@ impl Runtime {
         ensure!(
             claim.audience == *client.audience()
                 && claim.grant_leaf == *client.grant_leaf()
-                && claim.expected_policies == client.heads()
                 && claim.resource.space == client.scope().space_id,
             "prepare intent differs from selected client authorization"
         );
+        let remote = Self::check_client_policy_dependencies(client, claim, &body)?;
         ensure!(
             client
                 .resources()
@@ -2606,9 +2750,64 @@ impl Runtime {
                 gateway: local.device.clone(),
             }
         };
-        let action = authorization_action(&body)?;
-        let prepared = {
+        if client.audience() == &local {
+            let prepared = {
+                let store = self.store.lock().await;
+                verification.run(|| -> Result<_> {
+                    let snapshot = store.connection.unchecked_transaction()?;
+                    let current = crate::identity::journal::PolicyState::reload_verified(
+                        &snapshot,
+                        &store.policy,
+                    )?;
+                    let prepared = TaskScopedPrepareAuthorization::verify_in(
+                        &snapshot,
+                        &current,
+                        &PublicKey::parse(&self.identity.public_key_hex()?)?,
+                        intent.clone(),
+                        &body,
+                        &local,
+                        transport,
+                        now_ms() as u64,
+                    )?;
+                    snapshot.commit()?;
+                    Ok(prepared)
+                })?
+            };
+            return self.prepare_authorized_body(prepared, &verification).await;
+        }
+        ensure!(
+            claim.presenter == local.device,
+            "forwarded prepare requires this Gateway presenter"
+        );
+        let now = now_ms() as u64;
+        if remote {
+            ensure!(
+                serde_json::to_vec(&body)?.len() <= vibeface_secure::authorization::MAX_PROOF_BYTES
+                    && serde_json::to_vec(&intent)?.len()
+                        <= vibeface_secure::authorization::MAX_PROOF_BYTES,
+                "forwarded prepare exceeds the proof byte limit"
+            );
+            ensure!(
+                claim.version == AUTH_VERSION
+                    && claim.context.sdk_session.is_none()
+                    && body["space_id"].as_str() == Some(claim.resource.space.as_str())
+                    && body["resource_id"].as_str() == Some(claim.resource.resource.as_str())
+                    && authorization_action(&body)? == claim.action
+                    && client.actions().contains(&claim.action)
+                    && ObjectHash::body(&body)? == claim.body_hash
+                    && body["authorization_id"].as_str() == Some(claim.operation_id.as_str()),
+                "forwarded prepare differs from its signed request"
+            );
+            ensure!(
+                claim.not_before_ms <= now
+                    && now < claim.expires_at_ms
+                    && claim.expires_at_ms - claim.not_before_ms <= INVOCATION_MAX_AGE_MS,
+                "forwarded prepare expired"
+            );
+            verification.run(|| intent.verify_signature())?;
+        } else {
             let store = self.store.lock().await;
+            let action = authorization_action(&body)?;
             verification.run(|| {
                 store.authorization_state().verify_prepare_intent(
                     &intent,
@@ -2616,32 +2815,14 @@ impl Runtime {
                     action,
                     client.audience(),
                     &transport,
-                    now_ms() as u64,
+                    now,
                 )
-            })?
-        };
-        if client.audience() == &local {
-            return self
-                .prepare_authorized_body(prepared, &intent.payload.request, &verification)
-                .await;
+            })?;
         }
-        ensure!(
-            claim.presenter == local.device,
-            "forwarded prepare requires this Gateway presenter"
-        );
         let target = {
             let store = self.store.lock().await;
             let _verification = verification.enter();
-            let certificate = store.authorization_state().verify_service_device(
-                &client.scope().space_id,
-                &client.audience().device,
-                now_ms() as u64,
-            )?;
-            ensure!(
-                certificate.payload.public_key == *client.audience_public_key(),
-                "prepare host differs from independently verified pin"
-            );
-            crypto::fingerprint(certificate.payload.public_key.as_str())?
+            self.client_forward_target(&store, client, now)?
         };
         self.peer_request(
             client.scope().space_id.as_str(),
@@ -2653,10 +2834,10 @@ impl Runtime {
 
     async fn prepare_authorized_body(
         self: &Arc<Self>,
-        prepared: vibeface_secure::authorization::prepare::VerifiedPrepareAuthorization,
-        original: &Invocation,
+        scoped: TaskScopedPrepareAuthorization,
         verification: &SignatureVerification,
     ) -> Result<Value> {
+        let prepared = &scoped.authorization;
         ensure!(
             prepared.audience() == &self.audience()?,
             "prepare reached another resource host"
@@ -2669,11 +2850,30 @@ impl Runtime {
             )
             .await?;
         let now = now_ms() as u64;
+        let original = &scoped.intent.payload.request;
         self.check_execution_actor(&body, original)?;
         let facts = {
             let store = self.store.lock().await;
             let _verification = verification.enter();
-            if self.is_execution_metadata(&body)? {
+            let snapshot = store.connection.unchecked_transaction()?;
+            let current =
+                crate::identity::journal::PolicyState::reload_verified(&snapshot, &store.policy)?;
+            let rechecked = TaskScopedPrepareAuthorization::verify_in(
+                &snapshot,
+                &current,
+                &PublicKey::parse(&self.identity.public_key_hex()?)?,
+                scoped.intent.clone(),
+                prepared.raw_body(),
+                prepared.audience(),
+                scoped.transport.clone(),
+                now,
+            )?;
+            scoped.check_same_policy(&rechecked)?;
+            let state = rechecked
+                .task_policy
+                .as_ref()
+                .map_or(current.verified(), |task| task.state());
+            let facts = if self.is_execution_metadata(&body)? {
                 ensure!(
                     prepared.execution_destination().is_none(),
                     "metadata prepare cannot select executable C authority"
@@ -2688,8 +2888,18 @@ impl Runtime {
                     self.is_execution_resolution(&body)? || self.is_execution_dispatch(&body)?,
                     "remote prepare lost its destination"
                 );
-                let dispatch = store.execution_dispatch_facts(&body, prepared.audience(), now)?;
-                let current = dispatch.destination();
+                let facts = crate::identity::policy::request_execution_dispatch_facts_from(
+                    &snapshot,
+                    state,
+                    &body,
+                    prepared.audience(),
+                    selected,
+                    now,
+                )?;
+                let current = crate::identity::policy::execution_destination_for_body(
+                    state, &facts, &body, now,
+                )?
+                .context("normalized prepare has no execution destination")?;
                 ensure!(
                     current.resource() == selected.resource()
                         && current.audience() == selected.audience()
@@ -2698,15 +2908,17 @@ impl Runtime {
                         && current.heads() == selected.heads(),
                     "normalization changed the independently verified execution destination"
                 );
-                selected.check_facts(dispatch.facts())?;
-                dispatch.facts().clone()
+                selected.check_facts(&facts)?;
+                facts
             } else {
                 ensure!(
                     !self.is_execution_resolution(&body)? && !self.is_execution_dispatch(&body)?,
                     "prepare has no verified execution destination"
                 );
                 self.authorization_facts(&store, &body, prepared.audience(), now)?
-            }
+            };
+            snapshot.commit()?;
+            facts
         };
         ensure!(
             facts.resource == *prepared.resource()
@@ -5684,27 +5896,32 @@ impl Runtime {
             "peer authorization belongs to another space"
         );
         if kind == "prepare" {
-            let intent: Signed<vibeface_secure::authorization::prepare::PrepareIntent> =
-                serde_json::from_value(envelope["intent"].clone())?;
+            let intent: Signed<PrepareIntent> = serde_json::from_value(envelope["intent"].clone())?;
             let origin = DeviceId::from_key(&PublicKey::parse(&certificate.public_key)?);
-            let action = authorization_action(&body)?;
             let audience = self.audience()?;
             let prepared = {
                 let store = self.store.lock().await;
-                verification.run(|| {
-                    store.authorization_state().verify_prepare_intent(
-                        &intent,
+                verification.run(|| -> Result<_> {
+                    let snapshot = store.connection.unchecked_transaction()?;
+                    let current = crate::identity::journal::PolicyState::reload_verified(
+                        &snapshot,
+                        &store.policy,
+                    )?;
+                    let prepared = TaskScopedPrepareAuthorization::verify_in(
+                        &snapshot,
+                        &current,
+                        &PublicKey::parse(&self.identity.public_key_hex()?)?,
+                        intent,
                         &body,
-                        action,
                         &audience,
-                        &TransportEvidence::VerifiedPeer { origin },
+                        TransportEvidence::VerifiedPeer { origin },
                         now_ms() as u64,
-                    )
+                    )?;
+                    snapshot.commit()?;
+                    Ok(prepared)
                 })?
             };
-            return self
-                .prepare_authorized_body(prepared, &intent.payload.request, &verification)
-                .await;
+            return self.prepare_authorized_body(prepared, &verification).await;
         }
         let expected_method = match kind {
             "execute" => Some("operate"),
