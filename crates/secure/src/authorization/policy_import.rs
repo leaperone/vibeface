@@ -69,7 +69,7 @@ fn entry_domain(entry: &JournalEntry) -> PolicyDomain {
     }
 }
 
-fn entry_hash(entry: &JournalEntry) -> Result<ObjectHash> {
+pub(crate) fn entry_hash(entry: &JournalEntry) -> Result<ObjectHash> {
     match entry {
         JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => value.hash(),
         JournalEntry::AccountCommit(value) => value.proposal.hash(),

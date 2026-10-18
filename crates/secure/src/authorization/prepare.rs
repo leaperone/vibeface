@@ -74,7 +74,7 @@ impl VerifiedExecutionDestination {
     }
 }
 
-fn remote_actions(actions: &[Action], resolver: bool) -> bool {
+pub(super) fn remote_actions(actions: &[Action], resolver: bool) -> bool {
     if resolver {
         return actions.len() == 2
             && actions.contains(&Action::ExecutionResolve)
@@ -355,6 +355,8 @@ pub struct VerifiedRemoteExecution {
     heads: Vec<PolicyStamp>,
     verified_at_ms: u64,
     execution_pins: Vec<PolicyPin>,
+    purpose: remote_execution_policy::RemoteExecutionPolicyPurpose,
+    expires_at_ms: u64,
 }
 
 fn client_time(now: f64) -> Result<u64> {
@@ -365,70 +367,29 @@ fn client_time(now: f64) -> Result<u64> {
     Ok(now as u64)
 }
 
-/// Both pin sets come from independently saved trust, never from an unknown Node response.
+/// The execution policy can only be completed by its independently pinned purpose importer.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyRemoteExecution))]
 pub fn verify_remote_execution(
     auth: &VerifiedClientAuthorization,
-    project_bundle_json: &str,
-    project_pins_json: &str,
-    execution_bundle_json: &str,
-    execution_pins_json: &str,
-    selection_json: &str,
-    context_json: &str,
-    expected_action: &str,
+    execution: &remote_execution_policy::VerifiedRemoteExecutionPolicy,
     now_ms: f64,
 ) -> crate::Result<VerifiedRemoteExecution> {
     (|| -> Result<VerifiedRemoteExecution> {
-        let _signatures = crate::signature_verification::ScopedSignatureVerification::new();
+        let signatures = crate::signature_verification::ScopedSignatureVerification::new();
         let now = client_time(now_ms)?;
-        require(
-            project_bundle_json.len() <= 1_048_576
-                && execution_bundle_json.len() <= 1_048_576
-                && project_pins_json.len() <= MAX_PROOF_BYTES
-                && execution_pins_json.len() <= MAX_PROOF_BYTES
-                && selection_json.len() <= MAX_PROOF_BYTES
-                && context_json.len() <= MAX_PROOF_BYTES,
-            "remote execution proof is too large",
-        )?;
-        let project: ClientAuthorizationBundle = serde_json::from_str(project_bundle_json)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid Project policy bundle"))?;
-        let execution: ClientAuthorizationBundle = serde_json::from_str(execution_bundle_json)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid execution policy bundle"))?;
-        let project_pins: Vec<PolicyPin> = serde_json::from_str(project_pins_json)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid Project pins"))?;
-        let execution_pins: Vec<PolicyPin> = serde_json::from_str(execution_pins_json)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid independent execution pins"))?;
-        let (pins, tail) =
-            client_policy_tail(auth, &project, &project_pins, &execution, &execution_pins)?;
-        let state = replay_policy_tail(auth.policy_snapshot.clone(), &pins, &tail)?;
-        let baseline = revalidate_client_policy(auth, state.clone(), &project, &pins, now)?;
-        let selection: RemoteExecutionSelection = serde_json::from_str(selection_json)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid remote execution selection"))?;
-        require(
-            selection.execution_grant == execution.grant_leaf,
-            "execution bundle has another grant",
-        )?;
-        let context: PrepareContext = serde_json::from_str(context_json)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid remote prepare context"))?;
-        let action: Action = serde_json::from_value(Value::String(expected_action.into()))
-            .map_err(|_| AuthorizationError::InvalidProof("unknown remote action"))?;
-        let project = ResourceRef {
-            space: auth.scope.space_id.clone(),
-            resource: context.context.workspace_resource.clone().ok_or(
-                AuthorizationError::InvalidProof("remote Project resource is missing"),
-            )?,
+        let baseline = execution.revalidate(auth, now)?;
+        let source = client_policy_import::require_confirmed_client_policy(auth)?;
+        let merged = policy_import::merge_same_head_snapshots(source, execution.snapshot())?;
+        let state = merged.state().clone();
+        let intent = execution.intent();
+        let selection = RemoteExecutionSelection {
+            execution_resource: intent.selection.execution_resource.clone(),
+            target_public_key: intent.selection.target_public_key.clone(),
+            execution_grant: intent.selection.execution_grant.clone(),
         };
-        require(
-            scope_covers(&auth.grant_scope, &project)
-                && baseline.actions.contains(&action)
-                && context_tighter(&baseline.constraints.context, &context.context)
-                && context.execution_target_public_key.as_ref()
-                    == Some(&selection.target_public_key),
-            "remote selection differs from the verified client scope",
-        )?;
-        if baseline.constraints.require_webauthn_uv {
-            return Err(AuthorizationError::UserPresenceRequired);
-        }
+        let context = intent.context.clone();
+        let action = intent.expected_action;
+        let project = intent.source_selection.resource.clone();
         let destination = state.verify_execution_destination(
             &project,
             &auth.audience,
@@ -439,50 +400,40 @@ pub fn verify_remote_execution(
             action,
             now,
         )?;
-        let target = state.find_device(&DeviceId::from_key(&selection.target_public_key))?;
-        let mut budget = Budget::default();
-        let mut dependencies = baseline
+        let mut heads: BTreeMap<_, _> = baseline
             .heads
             .iter()
             .cloned()
             .map(|head| (head.domain.clone(), head))
             .collect();
-        state.validate_certificate(
-            target,
-            now,
-            &mut budget,
-            &mut dependencies,
-            &mut BTreeSet::new(),
-        )?;
-        state.expand_authorities(now, &mut budget, &mut dependencies)?;
+        for head in destination.heads() {
+            if let Some(previous) = heads.insert(head.domain.clone(), head.clone()) {
+                require(
+                    previous == *head,
+                    "remote policy dependencies have conflicting exact heads",
+                )?;
+            }
+        }
         let mut usage = execution_handoff::ExecutionProofUsage::default();
+        client_policy_import::record_confirmed_client_policy_metadata(auth, &mut usage)?;
+        execution.record_metadata(&mut usage)?;
         usage.record_budget(&baseline.budget)?;
         usage.record_budget(&destination.budget)?;
         usage.record_chain_depth(destination.grant_depth);
         usage.record_chain_depth(state.grant_chain(Some(&baseline.grant_leaf))?.len());
-        usage.record_budget(&budget)?;
-        usage.record_metadata(&selection)?;
-        usage.record_metadata(&context)?;
-        usage.record_actual_signature_counts(_signatures.counts());
+        usage.record_actual_signature_counts(signatures.counts());
         usage.enforce_limits()?;
-        let execution_pins = execution_pins
-            .into_iter()
-            .map(|mut pin| {
-                pin.minimum_head = Some(state.head(&pin.domain).cloned().ok_or(
-                    AuthorizationError::InvalidProof("independent execution policy is missing"),
-                )?);
-                Ok(pin)
-            })
-            .collect::<Result<Vec<_>>>()?;
         Ok(VerifiedRemoteExecution {
             state,
             source: auth.clone(),
             selection,
             context,
             action,
-            heads: dependencies.into_values().collect(),
+            heads: heads.into_values().collect(),
             verified_at_ms: now,
-            execution_pins,
+            execution_pins: execution.snapshot().pins().to_vec(),
+            purpose: intent.purpose,
+            expires_at_ms: execution.expires_at_ms(),
         })
     })()
     .map_err(|error| error.to_string())
@@ -515,7 +466,9 @@ impl VerifiedRemoteExecution {
         )?;
         let event: events::Event =
             serde_json::from_str(&actual.handoff.handoff.project_dispatch.canonical_body)
-                .map_err(|_| AuthorizationError::InvalidProof("invalid observation dispatch"))?;
+                .map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid observation dispatch")
+                })?;
         let events::EventCause::Invocation { admission } = &event.cause else {
             return Err(AuthorizationError::InvalidProof(
                 "observation has no original admission",
@@ -528,7 +481,8 @@ impl VerifiedRemoteExecution {
                 && actual.handoff.handoff.target_public_key == self.selection.target_public_key
                 && actual.handoff.invocation.issuer == self.source.audience_public_key
                 && actual.handoff.invocation.payload.action == Action::ExecutionSubmit
-                && actual.handoff.invocation.payload.resource == self.selection.execution_resource
+                && actual.handoff.invocation.payload.resource
+                    == self.selection.execution_resource
                 && admission.invocation.payload.resource.space == self.source.scope.space_id
                 && Some(&admission.invocation.payload.resource.resource)
                     == self.context.context.workspace_resource.as_ref()
@@ -575,7 +529,9 @@ impl VerifiedRemoteExecution {
         let body: Value = serde_json::from_str(expected_body_json)
             .map_err(|_| AuthorizationError::InvalidProof("invalid original browser body"))?;
         let invocation: Signed<Invocation> = serde_json::from_str(expected_invocation_json)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid original browser invocation"))?;
+            .map_err(|_| {
+                AuthorizationError::InvalidProof("invalid original browser invocation")
+            })?;
         let event: events::Event =
             serde_json::from_str(&actual.handoff.handoff.project_dispatch.canonical_body)
                 .map_err(|_| AuthorizationError::InvalidProof("invalid result dispatch"))?;
@@ -594,7 +550,8 @@ impl VerifiedRemoteExecution {
                         .find_device(&self.source.scope.device_id)?
                         .payload
                         .public_key
-                && invocation.payload.actor == Actor::Account(self.source.scope.account_id.clone()),
+                && invocation.payload.actor
+                    == Actor::Account(self.source.scope.account_id.clone()),
             "remote result differs from the original browser authorization",
         )?;
         Ok(actual)
@@ -606,13 +563,21 @@ impl VerifiedRemoteExecution {
         body: &Value,
         now: u64,
     ) -> Result<VerifiedClientAuthorization> {
+        let current = remote_execution_policy::revalidate_source(auth, now)?;
         require(
             now >= self.verified_at_ms
+                && now < self.expires_at_ms
                 && auth.scope == self.source.scope
                 && auth.heads == self.source.heads
                 && auth.grant_leaf == self.source.grant_leaf
                 && auth.audience == self.source.audience
-                && auth.audience_public_key == self.source.audience_public_key,
+                && auth.audience_public_key == self.source.audience_public_key
+                && auth
+                    .client_policy_context_json()
+                    .map_err(|_| AuthorizationError::InvalidProof("source is not confirmed"))?
+                    == self.source.client_policy_context_json().map_err(|_| {
+                        AuthorizationError::InvalidProof("source is not confirmed")
+                    })?,
             "remote handle belongs to a different or refreshed Project authorization",
         )?;
         let selected = remote_selection(body)?.ok_or(AuthorizationError::InvalidProof(
@@ -639,7 +604,7 @@ impl VerifiedRemoteExecution {
             self.action,
             now,
         )?;
-        let mut result = auth.clone();
+        let mut result = current;
         result.heads = self.heads.clone();
         Ok(result)
     }
@@ -664,14 +629,18 @@ impl VerifiedRemoteExecution {
                 "observation handoff is too large",
             )?;
             let original: execution_handoff::SignedExecutionHandoff =
-                serde_json::from_str(original_json)
-                    .map_err(|_| AuthorizationError::InvalidProof("invalid original handoff"))?;
+                serde_json::from_str(original_json).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid original handoff")
+                })?;
             let target =
                 execution_observation::ExecutionObservationTarget::from_original(&original)?;
             require(
-                self.action == Action::OperationResolve
+                self.purpose
+                    == remote_execution_policy::RemoteExecutionPolicyPurpose::ObservationRead
+                    && self.action == Action::OperationResolve
                     && now >= self.verified_at_ms
-                    && DeviceId::from_key(&PublicKey::of(signer)) == self.source.scope.device_id
+                    && DeviceId::from_key(&PublicKey::of(signer))
+                        == self.source.scope.device_id
                     && target.source.project.space == self.source.scope.space_id
                     && self.source.resources.iter().any(|record| {
                         record.payload.space == target.source.project.space
@@ -680,7 +649,8 @@ impl VerifiedRemoteExecution {
                     && target.execution_resource == self.selection.execution_resource
                     && target.target_public_key == self.selection.target_public_key
                     && self.context.context == target.context(&target.source.project.resource)
-                    && self.context.binding_generation == Some(target.source.binding_generation)
+                    && self.context.binding_generation
+                        == Some(target.source.binding_generation)
                     && self.context.execution_target_public_key.as_ref()
                         == Some(&target.target_public_key)
                     && original
@@ -699,11 +669,9 @@ impl VerifiedRemoteExecution {
                 "execution_grant": self.selection.execution_grant,
             });
             self.signing_authorization(&self.source, &body, now)?;
-            let expires =
-                now.checked_add(INVOCATION_MAX_AGE_MS)
-                    .ok_or(AuthorizationError::InvalidProof(
-                        "observation expiry overflow",
-                    ))?;
+            let expires = now.checked_add(INVOCATION_MAX_AGE_MS).ok_or(
+                AuthorizationError::InvalidProof("observation expiry overflow"),
+            )?;
             let signed = self.state.build_forwarded_execution_observation_request(
                 &original,
                 signer,
@@ -733,7 +701,8 @@ impl VerifiedRemoteExecution {
             use execution_handoff::*;
             let now = client_time(now_ms)?;
             require(
-                self.action == Action::OperationResolve
+                self.purpose == remote_execution_policy::RemoteExecutionPolicyPurpose::Resolver
+                    && self.action == Action::OperationResolve
                     && actual_json.len() <= MAX_EXECUTION_HANDOFF_BYTES
                     && body_json.len() <= MAX_PROOF_BYTES
                     && invocation_json.len() <= MAX_PROOF_BYTES,
@@ -767,7 +736,9 @@ impl VerifiedRemoteExecution {
             } else {
                 let result: ExecutionHandoffTerminalReconciliationResult =
                     serde_json::from_value(raw).map_err(|_| {
-                        AuthorizationError::InvalidProof("invalid terminal reconciliation result")
+                        AuthorizationError::InvalidProof(
+                            "invalid terminal reconciliation result",
+                        )
                     })?;
                 let clock = result
                     .freshness
@@ -883,7 +854,9 @@ impl VerifiedRemoteExecution {
             serde_json::to_string(
                 &serde_json::json!({"state":state,"purpose":purpose,"actual":encoded}),
             )
-            .map_err(|_| AuthorizationError::InvalidProof("verified resolution encoding failed"))
+            .map_err(|_| {
+                AuthorizationError::InvalidProof("verified resolution encoding failed")
+            })
         })()
         .map_err(|error| error.to_string())
     }
@@ -925,7 +898,8 @@ impl VerifiedRemoteExecution {
         (|| -> Result<String> {
             let now = client_time(now_ms)?;
             require(
-                self.action == Action::OperationResolve
+                self.purpose == remote_execution_policy::RemoteExecutionPolicyPurpose::Resolver
+                    && self.action == Action::OperationResolve
                     && actual_json.len() <= execution_handoff::MAX_EXECUTION_HANDOFF_BYTES,
                 "resolution needs an independently verified resolver grant",
             )?;
@@ -949,8 +923,9 @@ impl VerifiedRemoteExecution {
                 "resolver handle differs from the original task binding",
             )?;
             self.signing_authorization(&self.source, &body, now)?;
-            serde_json::to_string(&serde_json::json!({"body":body,"context":context}))
-                .map_err(|_| AuthorizationError::InvalidProof("resolution intent encoding failed"))
+            serde_json::to_string(&serde_json::json!({"body":body,"context":context})).map_err(
+                |_| AuthorizationError::InvalidProof("resolution intent encoding failed"),
+            )
         })()
         .map_err(|error| error.to_string())
     }
@@ -992,8 +967,8 @@ impl VerifiedRemoteExecution {
             )
             .ok_or_else(|| "verified execution resource is missing".to_owned())?;
         serde_json::to_string(&serde_json::json!({"selection":self.selection,"context":self.context,
-            "audience":Audience {service:record.payload.host.clone(),device:DeviceId::from_key(&self.selection.target_public_key)},
-            "pins":self.execution_pins})).map_err(|_| "remote metadata encoding failed".into())
+        "audience":Audience {service:record.payload.host.clone(),device:DeviceId::from_key(&self.selection.target_public_key)},
+        "pins":self.execution_pins,"purpose":self.purpose,"expires_at_ms":self.expires_at_ms})).map_err(|_| "remote metadata encoding failed".into())
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = sessionJson))]
@@ -1015,8 +990,8 @@ impl VerifiedRemoteExecution {
                 serde_json::from_str(receipt_json).map_err(|_| {
                     AuthorizationError::InvalidProof("invalid executor session receipt")
                 })?;
-            let binding: task_binding::SignedBinding =
-                serde_json::from_str(binding_json).map_err(|_| {
+            let binding: task_binding::SignedBinding = serde_json::from_str(binding_json)
+                .map_err(|_| {
                     AuthorizationError::InvalidProof("invalid executor session binding")
                 })?;
             let project = ResourceRef {
@@ -1063,8 +1038,10 @@ impl VerifiedRemoteExecution {
                 AuthorizationError::InvalidProof("session snapshot encoding failed")
             })?;
             value["target_node"] = Value::String(binding.binding.target_node.clone());
-            value["execution_session_receipt"] = serde_json::to_value(&receipt)
-                .map_err(|_| AuthorizationError::InvalidProof("session receipt encoding failed"))?;
+            value["execution_session_receipt"] =
+                serde_json::to_value(&receipt).map_err(|_| {
+                    AuthorizationError::InvalidProof("session receipt encoding failed")
+                })?;
             serde_json::to_string(&value)
                 .map_err(|_| AuthorizationError::InvalidProof("session proof encoding failed"))
         })()
@@ -1090,14 +1067,16 @@ impl VerifiedRemoteExecution {
             let now = client_time(now_ms)?;
             let body: Value = serde_json::from_str(body_json)
                 .map_err(|_| AuthorizationError::InvalidProof("invalid remote replay body"))?;
-            let invocation: Signed<Invocation> =
-                serde_json::from_str(invocation_json).map_err(|_| {
+            let invocation: Signed<Invocation> = serde_json::from_str(invocation_json)
+                .map_err(|_| {
                     AuthorizationError::InvalidProof("invalid remote replay invocation")
                 })?;
             let qualified = self.signing_authorization(auth, &body, now)?;
             let i = &invocation.payload;
             let action: Action = serde_json::from_value(Value::String(expected_action.into()))
-                .map_err(|_| AuthorizationError::InvalidProof("unknown remote replay action"))?;
+                .map_err(|_| {
+                    AuthorizationError::InvalidProof("unknown remote replay action")
+                })?;
             require(
                 i.actor == Actor::Account(qualified.scope.account_id.clone())
                     && i.device == qualified.scope.device_id
@@ -1153,11 +1132,17 @@ impl VerifiedRemoteExecution {
         identity: &Identity,
         now_ms: f64,
     ) -> crate::Result<String> {
+        require(
+            self.purpose
+                != remote_execution_policy::RemoteExecutionPolicyPurpose::ObservationRead,
+            "observation policy cannot prepare an execution or resolution write",
+        )
+        .map_err(|error| error.to_string())?;
         let now = client_time(now_ms).map_err(|error| error.to_string())?;
         let body: Value =
             serde_json::from_str(body_json).map_err(|_| "invalid remote request".to_owned())?;
-        let context: PrepareContext =
-            serde_json::from_str(context_json).map_err(|_| "invalid remote context".to_owned())?;
+        let context: PrepareContext = serde_json::from_str(context_json)
+            .map_err(|_| "invalid remote context".to_owned())?;
         require(
             context == self.context
                 && serde_json::to_value(self.action)
@@ -1194,6 +1179,11 @@ impl VerifiedRemoteExecution {
         now_ms: f64,
     ) -> crate::Result<String> {
         (|| -> Result<String> {
+            require(
+                self.purpose
+                    != remote_execution_policy::RemoteExecutionPolicyPurpose::ObservationRead,
+                "observation policy cannot sign an execution or resolution write",
+            )?;
             let now = client_time(now_ms)?;
             let body: Value = serde_json::from_str(body_json)
                 .map_err(|_| AuthorizationError::InvalidProof("invalid remote request"))?;

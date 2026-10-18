@@ -13,6 +13,7 @@ pub mod enrollment_policy_import;
 pub mod execution_handoff;
 pub mod execution_binding_seal;
 pub mod execution_observation;
+pub mod remote_execution_policy;
 pub mod execution_service;
 pub mod remote_share;
 pub mod remote_resolution_history;
