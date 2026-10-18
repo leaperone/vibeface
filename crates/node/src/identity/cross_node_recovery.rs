@@ -1012,6 +1012,100 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn twelve_enrolled_nodes_recover_through_finite_rpc_and_durable_target_import() -> Result<()> {
+        let mut network = TestNetwork::new()?;
+        let initial_entries = network.bundle.journal.len();
+        for _ in 0..12 {
+            network.enroll_node(LocalIdentity::generate())?;
+        }
+        assert_eq!(network.bundle.journal.len(), initial_entries + 24);
+        assert!(
+            serde_json::to_vec(&network.bundle)?.len()
+                > vibeface_secure::authorization::MAX_PROOF_BYTES
+        );
+        let mut source = network.at(&network.directory.join("source.sqlite3"))?;
+        assert_eq!(
+            source
+                .authorization_state()
+                .account_history(&network.account)
+                .context("account history missing")?
+                .len(),
+            13
+        );
+        network.conversation(&mut source, "archive")?;
+        let original = network.message(&mut source, "archive", "preserved long history")?;
+        let before = journal_count(&source)?;
+        let mut f = Fixture::from_source(network, source, original.clone())?;
+        let (prepared, request) = f.commit_request()?;
+        assert_eq!(
+            f.witness
+                .as_ref()
+                .context("completion witness missing")?
+                .payload
+                .entry_count,
+            before
+        );
+        let reference = f.reference.clone().context("reference missing")?;
+        let status = json!({"context":reference,"input_hash":ObjectHash::body(&request)?});
+        assert_eq!(
+            f.source.cross_node_recovery_command(
+                &f.network.node,
+                &f.next_client.public_key_hex(),
+                "cross_node_recovery_status",
+                &status,
+                now(),
+            )?["state"],
+            "not_committed"
+        );
+        let response = f.source_commit(&request, now())?;
+        let confirmed = cross_node::finish_cross_node_recovery_commit(
+            &prepared,
+            &serde_json::to_string(&response["committed"])?,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let installation: Value =
+            serde_json::from_str(&confirmed.installation_json().map_err(anyhow::Error::msg)?)?;
+        let committed_entries = journal_count(&f.source)?;
+        f.target = Store::open(f.network.directory.join("target.sqlite3"))?;
+        f.resume_target(&installation, now() + 200_000)?;
+        let installed = f.install(&installation, now() + 200_000)?;
+        assert_eq!(installed["installed"], true);
+        assert_eq!(installed["account_id"], f.network.account.as_str());
+        assert_eq!(
+            installed["node_public_key"],
+            f.target_node.public_key_hex()?
+        );
+        assert_eq!(journal_count(&f.target)?, committed_entries);
+        assert_eq!(f.install(&installation, now() + 200_000)?, installed);
+        let completed = f.source.cross_node_recovery_command(
+            &f.network.node,
+            &f.next_client.public_key_hex(),
+            "cross_node_recovery_status",
+            &status,
+            now() + 200_000,
+        )?;
+        assert_eq!(completed["state"], "committed");
+        assert_eq!(completed["committed"], response["committed"]);
+        assert_eq!(f.source_commit(&request, now() + 200_000)?, response);
+        assert_eq!(journal_count(&f.source)?, committed_entries);
+        let (read, facts, transport) = f.read_invocation("conversation")?;
+        f.source
+            .authorize_request(&read, &facts, &transport, now())?;
+        assert_eq!(
+            f.source.event(f.network.space.as_str(), &original.hash)?,
+            Some(original)
+        );
+        let (write, facts, transport) = f.read_invocation("message")?;
+        assert!(
+            f.source
+                .authorize_request(&write, &facts, &transport, now())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn source_commits_before_target_install_and_old_project_remains_read_only() -> Result<()> {
         let mut f = Fixture::new()?;
         let (prepared, request) = f.commit_request()?;
