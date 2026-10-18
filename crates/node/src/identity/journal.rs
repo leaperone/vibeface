@@ -1250,8 +1250,19 @@ mod tests {
             .accepted_journal_snapshot(&fixture.connection)
             .unwrap();
         assert_eq!(snapshot.accepted_len, 34);
+        let stale = fixture.state.clone();
         append_fixture(&mut fixture, &Fixture::with_root(60));
         let verification = vibeface_secure::signature_verification::SignatureVerification::new();
+        assert!(
+            verification
+                .run(|| stale.accepted_journal_snapshot(&fixture.connection))
+                .is_err()
+        );
+        assert!(
+            verification
+                .run(|| fixture.state.accepted_journal_snapshot(&fixture.connection))
+                .is_ok()
+        );
         let mut cursor = None;
         let mut hashes = Vec::new();
         for index in 0..3 {
