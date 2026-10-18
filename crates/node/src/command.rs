@@ -499,7 +499,15 @@ mod linux {
                 len: self.filter.len() as u16,
                 filter: self.filter.as_ptr().cast_mut(),
             };
-            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0
+            if unsafe {
+                libc::prctl(
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                )
+            } < 0
                 || unsafe {
                     libc::syscall(
                         libc::SYS_landlock_restrict_self,
@@ -507,7 +515,15 @@ mod linux {
                         0,
                     )
                 } < 0
-                || unsafe { libc::prctl(libc::PR_SET_SECCOMP, 2, &program) } < 0
+                || unsafe {
+                    libc::prctl(
+                        libc::PR_SET_SECCOMP,
+                        2 as libc::c_ulong,
+                        &program,
+                        0 as libc::c_ulong,
+                        0 as libc::c_ulong,
+                    )
+                } < 0
                 || unsafe { libc::syscall(libc::SYS_close_range, 3_u32, u32::MAX, 4_u32) } < 0
             {
                 return Err(io::Error::last_os_error());
@@ -666,18 +682,39 @@ mod linux {
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "cannot fork the seccomp test probe");
         if child == 0 {
-            let installed = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == 0
-                && unsafe { libc::prctl(libc::PR_SET_SECCOMP, 2, &program) } == 0;
-            if !installed {
+            if unsafe {
+                libc::prctl(
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                )
+            } < 0
+            {
                 unsafe {
-                    libc::_exit(120);
+                    libc::_exit(64 + *libc::__errno_location());
+                }
+            }
+            if unsafe {
+                libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    2 as libc::c_ulong,
+                    &program,
+                    0 as libc::c_ulong,
+                    0 as libc::c_ulong,
+                )
+            } < 0
+            {
+                unsafe {
+                    libc::_exit(128 + *libc::__errno_location());
                 }
             }
             let attached = unsafe { libc::shmat(segment.0, std::ptr::null(), 0) };
             let denied =
                 attached as isize == -1 && unsafe { *libc::__errno_location() } == libc::EPERM;
             unsafe {
-                libc::_exit(if denied { 0 } else { 121 });
+                libc::_exit(if denied { 0 } else { 1 });
             }
         }
         let mut status = 0;
@@ -688,10 +725,18 @@ mod linux {
             }
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINTR));
         }
-        assert_eq!(
-            status, 0,
-            "seccomp must reject attaching same-UID 0600 host shared memory"
+        assert!(
+            libc::WIFEXITED(status),
+            "seccomp probe exited abnormally: {status}"
         );
+        let exit = libc::WEXITSTATUS(status);
+        let step = match exit / 64 {
+            1 => "PR_SET_NO_NEW_PRIVS",
+            2 => "PR_SET_SECCOMP",
+            _ => "shmat denial",
+        };
+        let errno = matches!(exit / 64, 1 | 2).then_some(exit % 64);
+        assert_eq!(exit, 0, "seccomp probe failed at {step}, errno={errno:?}");
         let memory = unsafe { libc::shmat(segment.0, std::ptr::null(), 0) };
         assert_ne!(memory as isize, -1);
         assert_eq!(unsafe { memory.cast::<u8>().read() }, 0x5a);
@@ -747,6 +792,10 @@ mod tests {
             match sandboxed_command(&self.cwd) {
                 Ok(_) => true,
                 Err(error) => {
+                    assert!(
+                        std::env::var_os("VIBEFACE_REQUIRE_COMMAND_SANDBOX").is_none(),
+                        "required host command sandbox is unavailable: {error}"
+                    );
                     eprintln!("functional command test requires host sandbox support: {error}");
                     false
                 }
