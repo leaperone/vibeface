@@ -251,7 +251,7 @@ impl VerifiedPolicySet {
         let mut budget = Budget::default();
         let hash = budget.verify(signed)?;
         destination.check_facts(facts)?;
-        let current = self.verify_execution_destination_with_budget(
+        let mut current = self.verify_execution_destination_with_budget(
             &destination.project,
             &destination.project_audience,
             &destination.resource,
@@ -265,6 +265,12 @@ impl VerifiedPolicySet {
         if current.heads != destination.heads {
             return Err(AuthorizationError::NeedPolicySync(current.heads));
         }
+        self.retain_execution_transport_dependencies(
+            &signed.payload,
+            transport,
+            now_ms,
+            &mut current.budget,
+        )?;
         self.verify_signed_invocation_body(
             signed,
             hash,
@@ -274,6 +280,36 @@ impl VerifiedPolicySet {
             now_ms,
             AuthorizationPhase::Admission,
         )
+    }
+
+    fn retain_execution_transport_dependencies(
+        &self,
+        invocation: &Invocation,
+        transport: &TransportEvidence,
+        now_ms: u64,
+        budget: &mut Budget,
+    ) -> Result<()> {
+        let presenter = match transport {
+            TransportEvidence::GatewayNoise { device, gateway } => {
+                require(
+                    device == &invocation.device && gateway == &invocation.presenter,
+                    "gateway transport device mismatch",
+                )?;
+                gateway
+            }
+            TransportEvidence::VerifiedPeer { origin } => {
+                require(origin == &invocation.presenter, "peer presenter mismatch")?;
+                origin
+            }
+            TransportEvidence::DirectNoise { .. } | TransportEvidence::LocalAgentAdapter { .. } => {
+                return Ok(());
+            }
+        };
+        let mut dependencies = BTreeMap::new();
+        self.validate_presenter(presenter, now_ms, budget, &mut dependencies)?;
+        self.expand_authorities(now_ms, budget, &mut dependencies)?;
+        budget.dependencies.extend(dependencies);
+        Ok(())
     }
 }
 
@@ -2191,6 +2227,7 @@ impl VerifiedPolicySet {
             .transpose()?;
         if let Some(destination) = &destination {
             budget = destination.budget.clone();
+            self.retain_execution_transport_dependencies(i, transport, now_ms, &mut budget)?;
         }
         let facts = RequestFacts {
             resource: i.resource.clone(),
