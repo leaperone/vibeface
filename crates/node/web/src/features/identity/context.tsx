@@ -7,13 +7,16 @@ import {
   parseMember, parsePairReceipt, parseReview, parseSigning, parseView, record, same, signingPayload, text,
 } from '@/lib/node'
 import type { ConnectionEntry, EntryInfo, Member, MembershipView, NodeRole, PairReceipt, PublicIdentity, ReadyConnection, WaitingPair } from '@/lib/node'
+import { parseChanged } from '@/lib/progress'
+import type { ChangedEvent } from '@/lib/progress'
 import type { AuthenticationTrust } from '@/lib/secure'
 import { Identity, downloadPackage, openPackage, sealPackage, verifiedView, verifyAuthentication, verifyRecoveryResult, verifyState } from '@/lib/secure'
 
-type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'unpaired' | 'ready'
+type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'ready'
 type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; networkId: string; members: Member[]; newManager: Member; requiredNode: string }
 type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (members: Member[]) => Promise<void> }
-type Session = { channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number }
+type Session = { channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number; networkId?: string }
+type Reconnect = { entry: ConnectionEntry; networkId: string; attempt: number }
 type DeviceContextValue = {
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; pairs: PairReceipt[]; waiting: WaitingPair | null; review: Review | null; initialInvitation: string
@@ -25,6 +28,7 @@ type DeviceContextValue = {
   downloadBackup(): void; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
+class AuthenticationError extends Error {}
 const changed = () => new Error('设备连接已切换。原操作结果需要核对，不会自动重发。')
 function load(key: string): unknown { try { const value = localStorage.getItem(`vibeface.${key}`); return value ? JSON.parse(value) : null } catch { return null } }
 function store(key: string, value: unknown) { try { localStorage.setItem(`vibeface.${key}`, JSON.stringify(value)) } catch { throw new Error('浏览器无法保存设备记录。请允许此站点使用本地存储。') } }
@@ -66,12 +70,17 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const session = useRef<Session | null>(null)
   const connecting = useRef<AbortController | null>(null)
   const sensitive = useRef<Sensitive | null>(null)
-  const listeners = useRef(new Set<() => void>())
+  const listeners = useRef(new Set<(event: ChangedEvent) => void>())
+  const reconnect = useRef<Reconnect | null>(null)
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const identityRef = useRef<PublicIdentity | null>(null)
   const waitingRef = useRef<WaitingPair | null>(null)
 
   const cancelSensitive = useCallback(() => { sensitive.current?.cancel(); sensitive.current = null; setReview(null) }, [])
   const disconnect = useCallback(() => {
+    reconnect.current = null
+    if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current)
+    reconnectTimer.current = null
     generation.current += 1
     cancelSensitive()
     connecting.current?.abort(); connecting.current = null
@@ -101,34 +110,76 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const request = scoped(active)
     const own = identityRef.current
     if (!own) throw new Error('浏览器密钥尚未初始化。')
-    const { principal, view } = verifyAuthentication(authValue, own, expected)
+    let verified: ReturnType<typeof verifyAuthentication>
+    try {
+      verified = verifyAuthentication(authValue, own, expected)
+      const pinnedNetwork = load(`network-for.${active.entry.node_id}`)
+      if (pinnedNetwork && pinnedNetwork !== verified.principal.network_id) throw new Error('此设备返回了不同的个人网络。请先核对原授权。')
+      store(`network-for.${active.entry.node_id}`, verified.principal.network_id)
+      saveEntry(active.entry)
+    } catch (cause) { throw new AuthenticationError(messageOf(cause)) }
     if (session.current !== active) throw changed()
-    const pinnedNetwork = load(`network-for.${active.entry.node_id}`)
-    if (pinnedNetwork && pinnedNetwork !== principal.network_id) throw new Error('此设备返回了不同的个人网络。请先核对原授权。')
-    store(`network-for.${active.entry.node_id}`, principal.network_id)
-    saveEntry(active.entry)
+    const { principal, view } = verified
     await request('subscribe')
+    active.networkId = principal.network_id
+    reconnect.current = { entry: active.entry, networkId: principal.network_id, attempt: 0 }
     const connection: ReadyConnection = {
       generation: active.generation, entry: active.entry, principal, info: active.info,
       request: (method, params) => { if (session.current !== active) return Promise.reject(changed()); return request(method, params) },
       rpc: (method, params) => { if (session.current !== active) return Promise.reject(changed()); return request('rpc', { method, ...params }) },
-      subscribe(listener) { listeners.current.add(listener); return () => { listeners.current.delete(listener) } },
+      subscribe(listener) { if (session.current !== active || active.generation !== generation.current) return () => {}; listeners.current.add(listener); return () => { listeners.current.delete(listener) } },
       isCurrent: () => session.current === active && generation.current === active.generation,
     }
     setDirectory(view); setReady(connection); setPhase('ready'); setError(''); waitingRef.current = null; setWaiting(null); store('waiting-pair', null)
   }
-  async function open(entryValue: ConnectionEntry) {
+  function scheduleReconnect() {
+    const target = reconnect.current
+    if (!target || reconnectTimer.current !== null) return
+    reconnectTimer.current = setTimeout(async () => {
+      reconnectTimer.current = null
+      if (reconnect.current !== target) return
+      let active: Session | null = null
+      try {
+        active = await open(target.entry, true)
+        const auth = await callSession(active, 'authenticate', { network_id: target.networkId })
+        await authenticate(auth, active, { kind: 'network', networkId: target.networkId })
+      } catch (cause) {
+        if (reconnect.current !== target) return
+        if (active && session.current === active) {
+          if (isResponseError(cause) || cause instanceof AuthenticationError) {
+            reconnect.current = null
+            setReady(null); setDirectory(null); setPairs([]); setPhase('unpaired')
+            setError(`无法恢复原网络授权，请核对设备。${messageOf(cause)}`)
+          } else active.channel.close()
+        } else scheduleReconnect()
+      }
+    }, Math.min(1000 * 2 ** target.attempt++, 10000))
+  }
+  async function open(entryValue: ConnectionEntry, resuming = false) {
     const parsed = parseEntry(entryValue)
-    disconnect(); setPhase('connecting'); setEntry(parsed)
+    if (!resuming) { disconnect(); setPhase('connecting'); setEntry(parsed) }
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
     try {
       const channel = await connectDevice(parsed, {
         signal: controller.signal,
-        onEvent(value) { const event = record(value); if (version === generation.current && event.type === 'changed') for (const listener of listeners.current) listener() },
+        onEvent(value) {
+          if (version !== generation.current || session.current?.generation !== version || !session.current.networkId) return
+          if (!value || typeof value !== 'object' || Array.isArray(value)) return
+          const event = record(value)
+          if (event.type !== 'changed' || event.network_id !== undefined && event.network_id !== session.current.networkId) return
+          const payload = parseChanged(event.payload)
+          for (const listener of listeners.current) listener(payload)
+        },
         onClose(reason) {
           if (version !== generation.current) return
-          generation.current += 1; session.current = null; cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setWaiting(null); waitingRef.current = null; setPhase('disconnected'); setError(messageOf(reason))
+          generation.current += 1; session.current = null; cancelSensitive(); listeners.current.clear()
+          if (reconnect.current) {
+            setPhase('reconnecting'); setError('连接已断开，正在恢复只读订阅。未确认操作保留待核对，不会自动重发。')
+            scheduleReconnect()
+          } else {
+            setReady(null); setDirectory(null); setPairs([]); setWaiting(null); waitingRef.current = null; setPhase('disconnected'); setError(messageOf(reason))
+          }
         },
       })
       if (version !== generation.current) { channel.close(); throw changed() }
@@ -136,9 +187,15 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (version !== generation.current) { channel.close(); throw changed() }
       if (details.node_id !== parsed.node_id || details.public_key !== channel.publicKey) { channel.close(); throw new Error('入口报告的设备与已核验指纹不一致。') }
       const active = { channel, entry: parsed, info: details, generation: version }
-      session.current = active; setInfo(details); setPhase('unpaired'); return active
+      session.current = active; setInfo(details); if (!resuming) setPhase('unpaired'); return active
     } catch (cause) {
-      if (version === generation.current) { disconnect(); setError(messageOf(cause)) }
+      if (version === generation.current) {
+        if (resuming) {
+          generation.current += 1
+          const previous = session.current; session.current = null; controller.abort(); previous?.channel.close()
+          setPhase('reconnecting'); scheduleReconnect()
+        } else { disconnect(); setError(messageOf(cause)) }
+      }
       throw cause
     }
   }
@@ -160,7 +217,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     setDirectory(view); setPairs(pending)
   }
   async function createInvitation(kind: 'client' | 'node', selectedRoles: NodeRole[]) {
-    if (!ready?.principal.can_manage || !identityRef.current) throw new Error('此设备没有管理权限。')
+    if (!ready?.isCurrent() || !ready.principal.can_manage || !identityRef.current) throw new Error('当前连接尚未核验，或此设备没有管理权限。')
     const request = scoped()
     const requestedRoles = kind === 'node' ? [...new Set(selectedRoles)].sort() : []
     if (kind === 'node' && (!requestedRoles.includes('relay') || requestedRoles.some(role => ['gateway', 'scheduler', 'executor'].includes(role)) && !requestedRoles.includes('replica'))) throw new Error('运行节点需要中继权限，接入、调度和执行同时需要同步权限。')
@@ -175,7 +232,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     return JSON.stringify({ url: ready.entry.address, node_id: ready.entry.node_id, relay: ready.entry.relay, invite: result })
   }
   async function approvePair(requestId: string) {
-    if (!ready?.principal.can_manage || !identityRef.current) throw new Error('此设备没有管理权限。')
+    if (!ready?.isCurrent() || !ready.principal.can_manage || !identityRef.current) throw new Error('当前连接尚未核验，或此设备没有管理权限。')
     const request = scoped()
     const pending = pairs.find(item => item.request_id === requestId)
     if (!pending || !pending.new_subject_signature || pending.review.expires_at_ms <= Date.now()) throw new Error('新设备尚未确认，或请求已过期。请刷新后核对。')
@@ -188,7 +245,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     await request('pair_confirm', { request_id: requestId, inviter_signature, event }); await refreshDirectory()
   }
   async function revoke(subjectId: string) {
-    if (!ready?.principal.can_manage || !identityRef.current || !directory) throw new Error('此设备没有管理权限。')
+    if (!ready?.isCurrent() || !ready.principal.can_manage || !identityRef.current || !directory) throw new Error('当前连接尚未核验，或此设备没有管理权限。')
     const request = scoped()
     const member = directory.members.find(item => item.subject_id === subjectId)
     if (!member || member.manage) throw new Error('管理客户端的变更需要根恢复确认。')
@@ -375,7 +432,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         waitingRef.current = pending; setWaiting(pending)
       }
     }).catch(cause => { if (mounted) { setPhase(cause instanceof Error && 'code' in cause && cause.code === 'key_lost' ? 'key_lost' : 'blocked'); setError(messageOf(cause)) } })
-    return () => { mounted = false; generation.current += 1; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
+    return () => { mounted = false; generation.current += 1; reconnect.current = null; if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current); reconnectTimer.current = null; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }
   }, [])
   useEffect(() => {
     if (!waiting?.accepted) return

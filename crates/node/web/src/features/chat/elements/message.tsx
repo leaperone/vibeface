@@ -3,6 +3,7 @@ import { Message as MessageRoot, MessageContent, MessageHeader } from '@/compone
 
 import { messageKey, roleLabel } from '../protocol.ts'
 import type { TranscriptMessage } from '../types.ts'
+import { Artifact } from './artifact'
 
 export function Message({ message }: { message: TranscriptMessage }) {
   const user = message.role === 'user'
@@ -26,6 +27,7 @@ export function Message({ message }: { message: TranscriptMessage }) {
         <Bubble align={user ? 'end' : 'start'} variant={user ? 'muted' : 'ghost'}>
           <BubbleContent>{message.text}</BubbleContent>
         </Bubble>
+        {message.blobs?.map((blob) => <Artifact key={blob.hash} hash={blob.hash} size={blob.size} />)}
       </MessageContent>
     </MessageRoot>
   )

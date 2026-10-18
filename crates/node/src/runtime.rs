@@ -20,11 +20,22 @@ use std::{
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
 
+mod chat_controls;
+mod followup;
+mod manager_control;
+#[cfg(test)]
+mod manager_control_tests;
+mod observation;
+mod schedule_delivery;
+pub use manager_control::ManagerAccess;
+pub(crate) use observation::ObservationGuard;
+
 #[derive(Clone)]
 pub struct Access {
     pub network_id: String,
     pub human: bool,
     pub conversation_id: Option<String>,
+    pub manager: Option<ManagerAccess>,
 }
 
 #[cfg(test)]
@@ -37,7 +48,7 @@ mod tests {
             ),
         })
     }
-    fn fixture() -> Result<PathBuf> {
+    pub(super) fn fixture() -> Result<PathBuf> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("runtime-{}", uuid::Uuid::new_v4()));
@@ -52,7 +63,7 @@ mod tests {
         )?;
         Ok(dir)
     }
-    async fn conversation(node: &Runtime) -> Result<String> {
+    pub(super) async fn conversation(node: &Runtime) -> Result<String> {
         let owner = test_owner(node)?;
         let state = owner.sign_network_fixture(
             1,
@@ -102,22 +113,52 @@ mod tests {
             action,
             resources: vec![node.config.roots[0].to_string_lossy().into_owned()],
             binding: None,
+            manager_authority: None,
         };
         store.bind_test_operation(&node.identity, &mut request)?;
         store.accept_operation(network, &request)?;
         Ok(request)
     }
-    async fn task(node: &Arc<Runtime>, network: &str, task_id: &str, auto: bool) -> Result<()> {
+    fn configure_manager(dir: &Path) -> Result<()> {
+        let mut config = Config::load(dir)?;
+        config.manager = Some(config::ManagerSettings {
+            provider: "cursor_sdk".into(),
+            workspace: dir.into(),
+            model: "auto".into(),
+            cursor_sdk_bin: dir.join("must-not-spawn"),
+            node_bin: "node".into(),
+            codex_sdk_script: dir.join("must-not-run.mjs"),
+        });
+        config.save(dir)
+    }
+    async fn task(node: &Arc<Runtime>, network: &str, task_id: &str, report: bool) -> Result<()> {
+        let access = Access {
+            network_id: network.into(),
+            human: true,
+            conversation_id: None,
+            manager: None,
+        };
         node.rpc(
-            Access {
-                network_id: network.into(),
-                human: true,
-                conversation_id: None,
-            },
+            access.clone(),
             json!({"method":"create_task","conversation_id":"chat","task_id":task_id,
-                "title":"test","goal":"test","acceptance":"user verifies","auto_followup":auto}),
+                "title":"test","goal":"test","acceptance":"user verifies"}),
         )
         .await?;
+        if report {
+            let version = node
+                .store
+                .lock()
+                .await
+                .followup_policy(network, "chat", task_id)?
+                .version;
+            node.rpc(
+                access,
+                json!({"method":"set_followup","conversation_id":"chat",
+                "task_id":task_id,"mode":"report","expected_version":version,
+                "scheduler_node":node.identity.node_id()?}),
+            )
+            .await?;
+        }
         Ok(())
     }
     #[tokio::test]
@@ -191,7 +232,7 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         nodes.push(executor.certificate(vec![NodeRole::Replica, NodeRole::Executor])?);
         store.install_trust_bundle(&network, &owner.sign_network_fixture(2, nodes)?)?;
-        let request = OperationRequest {
+        let mut request = OperationRequest {
             operation_id: "operation".into(),
             network_id: network.clone(),
             conversation_id: "chat".into(),
@@ -203,7 +244,10 @@ mod tests {
             action: json!({"type":"send","text":"test"}),
             resources: vec![],
             binding: None,
+            manager_authority: None,
         };
+        store.bind_test_operation(&node.identity, &mut request)?;
+        let scheduler = node.identity.node_id()?;
         store.append_event(
             &node.identity,
             &network,
@@ -234,19 +278,15 @@ mod tests {
             vec![],
             now_ms(),
         )?;
-        require_executor_followup(&store, &network, &origin, "chat", &envelope.hash)?;
+        store.validate_followup_result(&network, "chat", &envelope.hash, &scheduler)?;
         assert!(
-            require_executor_followup(
-                &store,
-                &network,
-                &node.identity.node_id()?,
-                "chat",
-                &envelope.hash
-            )
-            .is_err()
+            store
+                .validate_followup_result(&network, "chat", &envelope.hash, &origin)
+                .is_err()
         );
         assert!(
-            require_executor_followup(&store, &network, &origin, "another-chat", &envelope.hash)
+            store
+                .validate_followup_result(&network, "another-chat", &envelope.hash, &scheduler)
                 .is_err()
         );
         let message = store.append_event(
@@ -263,7 +303,9 @@ mod tests {
             now_ms(),
         )?;
         assert!(
-            require_executor_followup(&store, &network, &origin, "chat", &message.hash).is_err()
+            store
+                .validate_followup_result(&network, "chat", &message.hash, &scheduler)
+                .is_err()
         );
         for (operation, target, status) in [
             ("not-dispatched", origin.as_str(), "succeeded"),
@@ -285,26 +327,16 @@ mod tests {
             let invalid =
                 store.append_event(&executor, &network, "chat", invalid, vec![], now_ms())?;
             assert!(
-                require_executor_followup(&store, &network, &origin, "chat", &invalid.hash)
+                store
+                    .validate_followup_result(&network, "chat", &invalid.hash, &scheduler)
                     .is_err()
             );
         }
-        store.append_event(
-            &executor,
-            &network,
-            "chat",
-            EventBody::DecisionRecorded {
-                decision_id: "auto:unapproved".into(),
-                text: "forged grant".into(),
-                effective_constraints: vec!["auto_followup:unapproved".into()],
-                tool_configuration: json!({"auto_followup":"unapproved"}),
-            },
-            vec![],
-            now_ms(),
-        )?;
         let mut unapproved = request.clone();
         unapproved.operation_id = "unapproved-operation".into();
         unapproved.task_id = Some("unapproved".into());
+        unapproved.binding = None;
+        store.bind_test_operation(&node.identity, &mut unapproved)?;
         store.append_event(
             &node.identity,
             &network,
@@ -335,7 +367,9 @@ mod tests {
             now_ms(),
         )?;
         assert!(
-            require_executor_followup(&store, &network, &origin, "chat", &invalid.hash).is_err()
+            store
+                .validate_followup_result(&network, "chat", &invalid.hash, &scheduler)
+                .is_err()
         );
         store.append_event(
             &node.identity,
@@ -350,7 +384,9 @@ mod tests {
             now_ms(),
         )?;
         assert!(
-            require_executor_followup(&store, &network, &origin, "chat", &envelope.hash).is_err()
+            store
+                .validate_followup_result(&network, "chat", &envelope.hash, &scheduler)
+                .is_err()
         );
         drop(store);
         drop(node);
@@ -360,10 +396,13 @@ mod tests {
     #[tokio::test]
     async fn unstarted_followup_survives_reopen_and_claimed_attempt_is_not_repeated() -> Result<()>
     {
+        use crate::scheduling::{JobState, TriggerKind};
+
         let dir = fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
-        task(&node, &network, "task", true).await?;
+        let local = node.identity.node_id()?;
+        task(&node, &network, "task", false).await?;
         let mut request = queued(
             &node,
             &network,
@@ -383,6 +422,20 @@ mod tests {
                 .revision;
             request.basis_heads = store.heads(&network, "chat")?;
             store.bind_test_operation(&node.identity, &mut request)?;
+            store.append_event(
+                &node.identity,
+                &network,
+                "chat",
+                EventBody::DispatchRecorded {
+                    operation_id: request.operation_id.clone(),
+                    task_id: request.task_id.clone(),
+                    target_node: request.target_node.clone(),
+                    session_id: request.session_id.clone(),
+                    action: json!(request),
+                },
+                vec![],
+                now_ms(),
+            )?;
             store.accept_operation(&network, &request)?;
             store.claim_operation(&network, &request.operation_id)?;
         }
@@ -393,76 +446,130 @@ mod tests {
         )
         .await?;
         node.flush_completions(&network).await?;
+        let marker_key = "followup-wait:v1:followup";
         let result_hash = {
+            let mut store = node.store.lock().await;
+            let result = store
+                .context(&network, "chat", &[])?
+                .events
+                .into_iter()
+                .find(|event| {
+                    matches!(&event.body, EventBody::ExecutionObserved { operation_id, status, .. }
+                        if operation_id == "followup" && status == "succeeded")
+                })
+                .context("completed operation has no durable result")?;
+            let result_hash = crypto::digest(&serde_json::to_vec(&result)?);
+            assert!(
+                store
+                    .local_value(&network, "completion:followup")?
+                    .is_none()
+            );
+            assert_eq!(
+                store.local_value(&network, marker_key)?.unwrap()["trigger"],
+                result_hash
+            );
+            assert!(store.scheduler_jobs(&network, "chat", &local)?.is_empty());
+            store.seal_binding(&node.identity, request.binding.as_ref().unwrap())?;
+            result_hash
+        };
+        drop(node);
+
+        let node = Arc::new(Runtime::open(&dir).await?);
+        node.flush_completions(&network).await?;
+        {
             let store = node.store.lock().await;
             assert!(
                 store
                     .local_value(&network, "completion:followup")?
-                    .is_some()
+                    .is_none()
             );
             assert_eq!(
-                store
-                    .pending_notifications(&network, "client")?
-                    .iter()
-                    .filter(|n| n.kind == "followup_waiting")
-                    .count(),
-                1
+                store.local_value(&network, marker_key)?.unwrap()["trigger"],
+                result_hash
             );
-            store.context(&network, "chat", &[])?.events.into_iter().find_map(|event| {
-                matches!(&event.body, EventBody::ExecutionObserved { operation_id, status, .. } if operation_id == "followup" && status == "succeeded")
-                    .then(|| crypto::digest(&serde_json::to_vec(&event).unwrap()))
-            }).unwrap()
+            assert!(store.scheduler_jobs(&network, "chat", &local)?.is_empty());
+        }
+        let grant = node
+            .set_followup(
+                &Access {
+                    network_id: network.clone(),
+                    human: true,
+                    conversation_id: Some("chat".into()),
+                    manager: None,
+                },
+                "chat",
+                &json!({"task_id":"task","mode":"report","expected_version":0,
+                    "scheduler_node":local}),
+            )
+            .await?;
+        assert_eq!(grant["policy"]["mode"], "report");
+        assert_eq!(grant["policy"]["version"], 1);
+        assert!(node.maybe_followup(&request, &result_hash).await?);
+        assert!(node.maybe_followup(&request, &result_hash).await?);
+        let queued_job = {
+            let store = node.store.lock().await;
+            assert!(store.local_value(&network, marker_key)?.is_none());
+            let jobs = store.scheduler_jobs(&network, "chat", &local)?;
+            assert_eq!(jobs.len(), 1);
+            let job = jobs.into_iter().next().unwrap();
+            assert_eq!(job.trigger, result_hash);
+            assert_eq!(job.kind, TriggerKind::Autonomous);
+            assert_eq!(job.state, JobState::Queued);
+            job
         };
-        // A durable execution result can migrate while its automatic follow-up is waiting for an Agent.
-        node.store
-            .lock()
-            .await
-            .seal_binding(&node.identity, request.binding.as_ref().unwrap())?;
         drop(node);
-        let mut config = Config::load(&dir)?;
-        config.manager = Some(config::ManagerSettings {
-            provider: "cursor_sdk".into(),
-            workspace: dir.clone(),
-            model: "auto".into(),
-            cursor_sdk_bin: dir.join("must-not-spawn"),
-            node_bin: "node".into(),
-            codex_sdk_script: dir.join("must-not-run.mjs"),
-        });
-        config.save(&dir)?;
+
         let node = Arc::new(Runtime::open(&dir).await?);
-        node.flush_completions(&network).await?;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if node
-                    .store
-                    .lock()
-                    .await
-                    .continuation(&network, &result_hash, "v1")
-                    .unwrap()
-                    .is_some_and(|claim| claim.state == "unknown")
-                {
-                    break;
+        let attempt = {
+            let mut store = node.store.lock().await;
+            assert_eq!(
+                store.scheduler_jobs(&network, "chat", &local)?,
+                vec![queued_job.clone()]
+            );
+            let claimed = store
+                .claim_next(&network, "chat", &local, "followup-boot-a", "test-sdk")?
+                .context("authorized result was not queued")?;
+            assert_eq!(claimed.job.trigger, result_hash);
+            assert_eq!(claimed.job.sequence, queued_job.sequence);
+            assert_eq!(claimed.job.message_id, queued_job.message_id);
+            let attempt = claimed.job.state.attempt().unwrap().clone();
+            assert!(attempt.read_only);
+            assert_eq!(attempt.followup_version, Some(1));
+            let started =
+                store.mark_started(&network, "chat", &local, &result_hash, &attempt.id)?;
+            assert_eq!(
+                started.state,
+                JobState::Running {
+                    attempt: attempt.clone()
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await?;
-        let status = crate::scheduler::status(&node, &network, "chat", &result_hash).await?;
-        assert_eq!(status["state"], "failed");
-        assert!(
-            node.store
-                .lock()
-                .await
-                .local_value(&network, "completion:followup")?
-                .is_none()
-        );
-        let claim = node
-            .store
-            .lock()
-            .await
-            .continuation(&network, &result_hash, "v1")?
-            .unwrap();
-        assert_eq!(claim.state, "unknown");
+            );
+            attempt
+        };
+        drop(node);
+
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let recovered = {
+            let mut store = node.store.lock().await;
+            assert!(
+                store
+                    .claim_next(&network, "chat", &local, "followup-boot-b", "test-sdk")?
+                    .is_none()
+            );
+            let job = store
+                .scheduler_job(&network, "chat", &result_hash, &local)?
+                .context("started follow-up was lost after reopen")?;
+            assert_eq!(
+                job.state,
+                JobState::Unknown {
+                    attempt,
+                    detail:
+                        "Node restarted after the SDK start boundary; this call was not replayed"
+                            .into(),
+                    fenced: false,
+                }
+            );
+            job
+        };
         node.flush_completions(&network).await?;
         node.finish(
             &request,
@@ -470,28 +577,36 @@ mod tests {
             json!({"result":"done"}),
         )
         .await?;
-        assert_eq!(
-            node.store
-                .lock()
-                .await
-                .continuation(&network, &result_hash, "v1")?
-                .unwrap(),
-            claim
-        );
-        assert_eq!(
-            crate::scheduler::status(&node, &network, "chat", &result_hash).await?,
-            status
-        );
-        assert_eq!(
-            node.store
-                .lock()
-                .await
-                .pending_notifications(&network, "client")?
-                .iter()
-                .filter(|n| n.kind == "followup_waiting")
-                .count(),
-            1
-        );
+        {
+            let mut store = node.store.lock().await;
+            assert_eq!(
+                store.scheduler_jobs(&network, "chat", &local)?,
+                vec![recovered]
+            );
+            assert!(
+                store
+                    .local_value(&network, "completion:followup")?
+                    .is_none()
+            );
+            assert!(store.local_value(&network, marker_key)?.is_none());
+            assert!(
+                store
+                    .claim_next(&network, "chat", &local, "followup-boot-b", "test-sdk")?
+                    .is_none()
+            );
+            assert_eq!(
+                store
+                    .context(&network, "chat", &[])?
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(&event.body, EventBody::ExecutionObserved { operation_id, status, .. }
+                            if operation_id == "followup" && status == "succeeded")
+                    })
+                    .count(),
+                1
+            );
+        }
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -506,6 +621,8 @@ mod tests {
             network_id: network.clone(),
             human: true,
             conversation_id: Some("chat".into()),
+
+            manager: None,
         };
         let agent = Access {
             human: false,
@@ -533,6 +650,7 @@ mod tests {
                 action: json!({"type":"open","executor":"claude_code","cwd":dir}),
                 resources: vec![],
                 binding: None,
+                manager_authority: None,
             };
             assert!(
                 node.dispatch(agent.clone(), request.clone())
@@ -566,6 +684,8 @@ mod tests {
             network_id: network.clone(),
             human: true,
             conversation_id: Some("chat".into()),
+
+            manager: None,
         };
         let mut associated = queued(
             &node,
@@ -662,6 +782,7 @@ mod tests {
     #[tokio::test]
     async fn peer_mutations_and_replica_reads_enforce_roles() -> Result<()> {
         let dir = fixture()?;
+        configure_manager(&dir)?;
         let mut node = Arc::new(Runtime::open(&dir).await?);
         let owner = LocalIdentity::generate();
         let replica = LocalIdentity::generate();
@@ -714,7 +835,7 @@ mod tests {
                 network_id: network.clone(),
                 origin: origin.node_id()?,
                 request_id: "approval-origin-test".into(),
-                payload: json!({"type":"execute","human":human,"request":request}),
+                payload: json!({"type":"execute","human":human,"request":request,"dispatch_head":"f".repeat(64)}),
                 broadcast: false,
             };
             assert_eq!(
@@ -722,6 +843,9 @@ mod tests {
                 expected
             );
         }
+        let missing = crypto::digest(b"not present on the receiver");
+        let schedule = json!({"type":"schedule","version":1,"target_node":node.identity.node_id()?,
+            "conversation_id":"chat","trigger":missing,"basis_heads":[missing]});
         let resolution = json!({"type":"resolve_unknown","target_node":node.identity.node_id()?,"operation_id":request.operation_id,"outcome":"succeeded","evidence":"verified test fixture process stopped"});
         for origin in [&replica, &relay] {
             let message = Inbound {
@@ -736,7 +860,7 @@ mod tests {
                 "Node lacks required role"
             );
             let message = Inbound {
-                payload: json!({"type":"schedule"}),
+                payload: schedule.clone(),
                 ..message
             };
             assert_eq!(
@@ -758,7 +882,7 @@ mod tests {
                 network_id: network.clone(),
                 origin: origin.node_id()?,
                 request_id: "schedule-role-test".into(),
-                payload: json!({"type":"schedule"}),
+                payload: schedule.clone(),
                 broadcast: false,
             };
             assert_eq!(
@@ -814,8 +938,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_message_retries_record_one_trigger() -> Result<()> {
         let dir = fixture()?;
+        configure_manager(&dir)?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
+        let wrong_entry = node.rpc(Access { network_id: network.clone(), human: true, conversation_id: None, manager: None },
+            json!({"method":"message","conversation_id":"chat","message_id":"wrong-entry","text":"same goal","entry_node":"another-gateway"})).await.unwrap_err();
+        assert!(wrong_entry.to_string().contains("original gateway"));
+        assert!(
+            node.store
+                .lock()
+                .await
+                .messages(&network, "chat")?
+                .is_empty()
+        );
         let barrier = Arc::new(tokio::sync::Barrier::new(16));
         let mut calls = Vec::new();
         for _ in 0..16 {
@@ -823,24 +958,155 @@ mod tests {
             let network = network.clone();
             let barrier = barrier.clone();
             calls.push(tokio::spawn(async move {
-                barrier.wait().await;
-                node.rpc(Access { network_id: network, human: true, conversation_id: None },
-                    json!({"method":"message", "conversation_id":"chat", "message_id":"same-message", "text":"same goal"})).await
-            }));
+                    barrier.wait().await;
+                    node.rpc(Access { network_id: network, human: true, conversation_id: None,
+    manager: None,
+    },
+                        json!({"method":"message", "conversation_id":"chat", "message_id":"same-message", "text":"same goal"})).await
+                }));
         }
         let mut triggers = BTreeSet::new();
         for call in calls {
-            triggers.insert(call.await??["trigger"].as_str().unwrap().to_owned());
+            let receipt = call.await??;
+            assert_eq!(receipt["state"], "queued");
+            assert_eq!(receipt["queued"], true);
+            assert_eq!(receipt["receipt"]["target_node"], node.identity.node_id()?);
+            triggers.insert(receipt["trigger"].as_str().unwrap().to_owned());
         }
         assert_eq!(triggers.len(), 1);
         let count = node.store.lock().await.context(&network, "chat", &[])?.events.iter()
-            .filter(|event| matches!(&event.body, EventBody::MessagePosted { message_id, .. } if message_id == "same-message")).count();
+                .filter(|event| matches!(&event.body, EventBody::MessagePosted { message_id, .. } if message_id == "same-message")).count();
         assert_eq!(count, 1);
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .scheduler_jobs(&network, "chat", &node.identity.node_id()?)?
+                .len(),
+            1
+        );
+        {
+            let mut store = node.store.lock().await;
+            let head = store.heads(&network, "chat")?.remove(0);
+            let envelope = store.event(&network, &head)?.context("head missing")?;
+            let mut event = store.verify_event(&network, &envelope)?;
+            event.sequence += 1;
+            event.previous = Some(head.clone());
+            event.parents = vec![head, "ab".repeat(32)];
+            event.body = EventBody::ContextCheckpoint {
+                summary: "child arrived before its other parent".into(),
+                covered_heads: vec![],
+            };
+            store.ingest_event(&network, &node.identity.sign_event(event)?)?;
+            assert!(!store.context(&network, "chat", &[])?.missing.is_complete());
+        }
+        let access = Access {
+            network_id: network.clone(),
+            human: true,
+            conversation_id: None,
+            manager: None,
+        };
+        let duplicate = node.rpc(access.clone(), json!({"method":"message","conversation_id":"chat","message_id":"same-message","text":"same goal"})).await?;
+        assert!(triggers.contains(duplicate["trigger"].as_str().context("trigger missing")?));
+        let changed = node.rpc(access.clone(), json!({"method":"message","conversation_id":"chat","message_id":"same-message","text":"changed goal"})).await.unwrap_err();
+        assert!(changed.to_string().contains("different content"));
+        let changed_intent = node.rpc(access.clone(), json!({"method":"message","conversation_id":"chat","message_id":"same-message","text":"same goal","report_results":true})).await.unwrap_err();
+        assert!(
+            changed_intent
+                .to_string()
+                .contains("cannot change its follow-up intent")
+        );
+        let fresh = node.rpc(access, json!({"method":"message","conversation_id":"chat","message_id":"new-message","text":"new goal"})).await.unwrap_err();
+        assert!(fresh.to_string().contains("context is incomplete"));
+        assert_eq!(
+            node.store
+                .lock()
+                .await
+                .scheduler_jobs(&network, "chat", &node.identity.node_id()?)?
+                .len(),
+            1
+        );
+        drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
     #[tokio::test]
-    async fn task_retry_recovers_missing_grant_once_without_reopening() -> Result<()> {
+    async fn shared_execution_session_is_projected_once_for_multiple_bound_tasks() -> Result<()> {
+        let dir = fixture()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let network = conversation(&node).await?;
+        let local = node.identity.node_id()?;
+        for task_id in ["a-old", "b-new"] {
+            task(&node, &network, task_id, false).await?;
+            let mut store = node.store.lock().await;
+            let creation = store.task_creation(&network, "chat", task_id)?;
+            store.bind_task(
+                &node.identity,
+                &crate::binding::TaskBinding {
+                    network_id: network.clone(),
+                    conversation_id: "chat".into(),
+                    task_ref: creation.hash,
+                    task_id: task_id.into(),
+                    authority_node: local.clone(),
+                    generation: 1,
+                    target_node: local.clone(),
+                    session_id: "shared".into(),
+                    open_spec: json!({"type":"open","executor":"codex","cwd":dir}),
+                    previous_binding_hash: None,
+                    previous_seal: None,
+                },
+            )?;
+        }
+        node.store.lock().await.upsert_session(
+            &network,
+            &ExecutionSession {
+                network_id: network.clone(),
+                target_node: local.clone(),
+                session_id: "shared".into(),
+                revision: 0,
+                state: "idle".into(),
+                executor: "codex".into(),
+                cwd: dir.to_string_lossy().into_owned(),
+                native_session_id: None,
+            },
+        )?;
+        let snapshot = node
+            .rpc(
+                Access {
+                    network_id: network,
+                    human: true,
+                    conversation_id: None,
+                    manager: None,
+                },
+                json!({"method":"conversation","conversation_id":"chat"}),
+            )
+            .await?;
+        assert_eq!(
+            snapshot["tasks"].as_array().context("tasks missing")?.len(),
+            2
+        );
+        assert_eq!(
+            snapshot["sessions"]
+                .as_array()
+                .context("sessions missing")?
+                .len(),
+            1
+        );
+        assert!(
+            snapshot["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|task| task["binding"]["session_id"] == "shared")
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_retry_requires_explicit_versioned_grant_without_reopening() -> Result<()> {
+        use crate::store::followup::FollowupMode;
         let dir = fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
@@ -865,18 +1131,64 @@ mod tests {
         }
         drop(node);
         let node = Arc::new(Runtime::open(&dir).await?);
+        let access = Access {
+            network_id: network.clone(),
+            human: true,
+            conversation_id: None,
+            manager: None,
+        };
         for _ in 0..2 {
             for task_id in ["active", "accepted", "cancelled"] {
-                task(&node, &network, task_id, true).await?;
+                let rejected = node.rpc(access.clone(), json!({"method":"create_task","conversation_id":"chat",
+                    "task_id":task_id,"title":"test","goal":"test","acceptance":"user verifies","auto_followup":true})).await.unwrap_err();
+                assert!(rejected.to_string().contains("task follow-up control"));
+                task(&node, &network, task_id, false).await?;
+                assert_eq!(
+                    node.store
+                        .lock()
+                        .await
+                        .followup_policy(&network, "chat", task_id)?
+                        .version,
+                    0
+                );
             }
         }
+        let grant = json!({"method":"set_followup","conversation_id":"chat","task_id":"active",
+            "mode":"report","expected_version":0,"scheduler_node":node.identity.node_id()?});
+        assert_eq!(
+            node.rpc(access.clone(), grant.clone()).await?["policy"]["version"],
+            1
+        );
+        assert!(node.rpc(access, grant).await.is_err());
         let store = node.store.lock().await;
-        assert!(followup_authorized(&store, &network, "chat", "active")?);
-        for task_id in ["accepted", "cancelled"] {
-            assert!(!followup_authorized(&store, &network, "chat", task_id)?);
+        assert_eq!(
+            store.followup_policy(&network, "chat", "active")?.mode,
+            FollowupMode::Report
+        );
+        for (task_id, status) in [("accepted", "accepted"), ("cancelled", "cancelled")] {
+            assert_eq!(
+                store.followup_policy(&network, "chat", task_id)?.mode,
+                FollowupMode::Off
+            );
+            assert_eq!(
+                store
+                    .tasks(&network, "chat")?
+                    .into_iter()
+                    .find(|task| task.task_id == task_id)
+                    .unwrap()
+                    .status,
+                status
+            );
         }
-        let grants = store.context(&network, "chat", &[])?.events.into_iter()
-            .filter(|event| matches!(&event.body, EventBody::DecisionRecorded { decision_id, .. } if decision_id.starts_with("auto:"))).count();
+        let grants = store
+            .context(&network, "chat", &[])?
+            .events
+            .into_iter()
+            .filter(|event| {
+                matches!(&event.body, EventBody::DecisionRecorded { tool_configuration, .. }
+                if tool_configuration["type"] == "task_followup_grant_v1")
+            })
+            .count();
         assert_eq!(grants, 1);
         drop(store);
         drop(node);
@@ -985,8 +1297,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn retrying_an_undelivered_message_reuses_its_event_and_attempts_scheduling() -> Result<()>
-    {
+    async fn retrying_an_undelivered_message_reuses_its_event_and_pending_delivery() -> Result<()> {
         let dir = fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
@@ -994,18 +1305,48 @@ mod tests {
             network_id: network.clone(),
             human: true,
             conversation_id: None,
+            manager: None,
         };
-        let request = json!({"method":"message","conversation_id":"chat","message_id":"retry-message","text":"test","scheduler_node":"offline-node"});
+        let mut request = json!({"method":"message","conversation_id":"chat","message_id":"retry-message","text":"test","scheduler_node":"unregistered-node"});
         assert!(node.rpc(access.clone(), request.clone()).await.is_err());
-        let first = node.store.lock().await.messages(&network, "chat")?;
-        assert_eq!(first.len(), 1);
-        assert!(node.rpc(access, request).await.is_err());
-        let retry = node.store.lock().await.messages(&network, "chat")?;
-        assert_eq!(retry.len(), 1);
-        assert_eq!(retry[0].event_hash, first[0].event_hash);
-        let other = node.rpc(Access { network_id: network.clone(), human: true, conversation_id: None }, json!({"method":"message","conversation_id":"chat","message_id":"retry-message","text":"test","scheduler_node":"different-node"})).await.unwrap_err();
-        assert!(other.to_string().contains("original scheduler"));
-        assert_eq!(node.store.lock().await.messages(&network, "chat")?.len(), 1);
+        assert!(
+            node.store
+                .lock()
+                .await
+                .messages(&network, "chat")?
+                .is_empty()
+        );
+        let target = LocalIdentity::generate();
+        let other = LocalIdentity::generate();
+        let owner = test_owner(&node)?;
+        node.install_membership(owner.sign_network_fixture(
+            2,
+            vec![
+                node.identity.certificate(node.config.roles.clone())?,
+                target.certificate(vec![NodeRole::Scheduler, NodeRole::Replica])?,
+                other.certificate(vec![NodeRole::Scheduler, NodeRole::Replica])?,
+            ],
+        )?)
+        .await?;
+        request["scheduler_node"] = json!(target.node_id()?);
+        let first = node.rpc(access.clone(), request.clone()).await?;
+        assert_eq!(first["state"], "pending_delivery");
+        assert_eq!(first["accepted"], true);
+        assert_eq!(first["queued"], false);
+        let retry = node.rpc(access.clone(), request.clone()).await?;
+        assert_eq!(retry["receipt"], first["receipt"]);
+        assert_eq!(retry["trigger"], first["trigger"]);
+        request["scheduler_node"] = json!(other.node_id()?);
+        let changed = node.rpc(access, request).await.unwrap_err();
+        assert!(changed.to_string().contains("different content or target"));
+        let store = node.store.lock().await;
+        assert_eq!(store.messages(&network, "chat")?.len(), 1);
+        let pending = store.scheduler_outbox(&network)?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].target_node, target.node_id()?);
+        assert_eq!(pending[0].trigger, first["trigger"].as_str().unwrap());
+        assert!(!pending[0].delivered);
+        drop(store);
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -1239,9 +1580,14 @@ pub struct Runtime {
     pub hub: Arc<PeerHub>,
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
+    manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
+    schedule_workers: Mutex<BTreeSet<(String, String)>>,
+    schedule_wakeup: tokio::sync::Notify,
+    observation: std::sync::Mutex<observation::ObservationState>,
     pub tool_url: std::sync::OnceLock<String>,
     pub maintenance: Arc<Gate>,
     completion_lock: Mutex<()>,
+    progress_sequences: std::sync::Mutex<HashMap<(String, String), u64>>,
     pub engine: Engine,
     _codex_process: Option<tokio::process::Child>,
     _process_lock: std::fs::File,
@@ -1293,106 +1639,6 @@ fn require_task_write(
     ensure!(
         human || !matches!(task.status.as_str(), "accepted" | "cancelled"),
         "only the user may reopen accepted or cancelled tasks"
-    );
-    Ok(())
-}
-
-fn followup_authorized(store: &Store, network: &str, scope: &str, task: &str) -> Result<bool> {
-    if store
-        .tasks(network, scope)?
-        .iter()
-        .find(|t| t.task_id == task)
-        .is_none_or(|task| matches!(task.status.as_str(), "accepted" | "cancelled"))
-    {
-        return Ok(false);
-    }
-    let context = store.context(network, scope, &[])?;
-    ensure!(
-        context.missing.is_complete(),
-        "follow-up context is incomplete"
-    );
-    Ok(context.events.iter().any(|event| {
-        event.scope_id == scope
-            && matches!(&event.body, EventBody::DecisionRecorded {
-                decision_id, effective_constraints, tool_configuration, ..
-            } if decision_id == &format!("auto:{task}")
-                && effective_constraints.contains(&format!("auto_followup:{task}"))
-                && tool_configuration["auto_followup"] == task)
-            && store
-                .authorize_node(network, &event.author, Some(NodeRole::Gateway))
-                .is_ok()
-    }))
-}
-
-fn require_executor_followup(
-    store: &Store,
-    network: &str,
-    origin: &str,
-    scope: &str,
-    trigger: &str,
-) -> Result<()> {
-    let envelope = store
-        .event(network, trigger)?
-        .context("follow-up result is missing")?;
-    let event = store.verify_event(network, &envelope)?;
-    ensure!(
-        event.author == origin && event.scope_id == scope,
-        "executor may only schedule its own result in this conversation"
-    );
-    let EventBody::ExecutionObserved {
-        operation_id,
-        task_id: Some(task),
-        target_node,
-        session_id,
-        status,
-        ..
-    } = &event.body
-    else {
-        bail!("executor follow-up requires a task result");
-    };
-    ensure!(
-        target_node == origin && matches!(status.as_str(), "succeeded" | "failed" | "rejected"),
-        "executor follow-up requires its known terminal result"
-    );
-    ensure!(
-        followup_authorized(store, network, scope, task)?,
-        "automatic follow-up needs an active task and user authorization"
-    );
-    let context = store.context(network, scope, &[trigger.to_owned()])?;
-    ensure!(
-        context.events.iter().any(|dispatch| {
-            let EventBody::DispatchRecorded {
-                operation_id: id,
-                task_id,
-                target_node: target,
-                session_id: session,
-                action,
-            } = &dispatch.body
-            else {
-                return false;
-            };
-            dispatch.scope_id == scope
-                && id == operation_id
-                && task_id.as_ref() == Some(task)
-                && target == origin
-                && session == session_id
-                && store
-                    .authorize_node(network, &dispatch.author, None)
-                    .is_ok_and(|author| {
-                        author.roles.contains(&NodeRole::Gateway)
-                            || author.roles.contains(&NodeRole::Scheduler)
-                    })
-                && serde_json::from_value::<OperationRequest>(action.clone()).is_ok_and(|request| {
-                    request.network_id == network
-                        && request.conversation_id == scope
-                        && request.operation_id == *operation_id
-                        && request.task_id.as_ref() == Some(task)
-                        && request.target_node == origin
-                        && request.session_id == *session_id
-                        && request.action["type"] == "send"
-                })
-        }),
-        "executor result has no matching dispatch"
     );
     Ok(())
 }
@@ -1518,9 +1764,14 @@ impl Runtime {
             hub,
             events,
             agent_tokens: Mutex::new(HashMap::new()),
+            manager_controls: Mutex::new(HashMap::new()),
+            schedule_workers: Mutex::new(BTreeSet::new()),
+            schedule_wakeup: tokio::sync::Notify::new(),
+            observation: std::sync::Mutex::new(Default::default()),
             tool_url: std::sync::OnceLock::new(),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             completion_lock: Mutex::new(()),
+            progress_sequences: std::sync::Mutex::new(HashMap::new()),
             engine,
             _codex_process: codex_process,
             _process_lock: process_lock,
@@ -1609,6 +1860,8 @@ impl Runtime {
         json!({"node_id":self.identity.node_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
+        self.start_schedule_delivery();
+        self.start_observation_worker();
         let mut receiver = self
             .peer_rx
             .lock()
@@ -1995,9 +2248,43 @@ impl Runtime {
         Ok(())
     }
     fn capabilities(&self) -> Value {
-        json!({"roots":self.config.roots,"executors":["codex","claude_code","cursor_agent"],"manager":self.config.manager.as_ref().map(|m|m.provider.clone())})
+        let manager =
+            self.config
+                .manager
+                .as_ref()
+                .and_then(|settings| match settings.provider.as_str() {
+                    "cursor_sdk" => Some(crate::manager::ManagerKind::CursorSdk),
+                    "codex_sdk" => Some(crate::manager::ManagerKind::CodexSdk),
+                    _ => None,
+                });
+        json!({"roots":self.config.roots,"executors":["codex","claude_code","cursor_agent"],
+            "executor_capabilities":{
+                "codex":{"actions":ExecutorKind::Codex.capabilities(),"verified":false},
+                "claude_code":{"actions":ExecutorKind::ClaudeCode.capabilities(),"verified":false},
+                "cursor_agent":{"actions":ExecutorKind::CursorAgent.capabilities(),"verified":false}},
+            "manager":self.config.manager.as_ref().map(|m|m.provider.clone()),
+            "manager_capabilities":manager.map(|kind|kind.capabilities()),"reliable_schedule":{"version":1}})
     }
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
+        let write = !matches!(
+            input["method"].as_str(),
+            Some(
+                "nodes"
+                    | "conversation"
+                    | "conversations"
+                    | "session"
+                    | "operation"
+                    | "notifications"
+                    | "export"
+            )
+        );
+        let task = input["task_id"]
+            .as_str()
+            .or_else(|| input["request"]["task_id"].as_str());
+        let _lease = self.manager_tool_lease(&access, write, task).await?;
+        self.rpc_inner(access, input).await
+    }
+    async fn rpc_inner(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         let current = self.membership_state().await?;
         let network = &access.network_id;
@@ -2106,155 +2393,48 @@ impl Runtime {
                     json!({"conversation_id":scope,"title":title,"heads":self.store.lock().await.heads(network,&scope)?}),
                 )
             }
-            "conversation" => {
+            "conversation" => self.conversation_snapshot(&access, &input).await,
+            "message" => self.accept_chat_message(&access, &input).await,
+            "set_followup" => {
                 let scope = scope.context("conversation_id is required")?;
-                self.sync_all(network).await?;
-                let facts = self.current_facts(network, &scope).await?;
-                let store = self.store.lock().await;
-                let context = store.context(network, &scope, &heads(&input)?)?;
-                Ok(
-                    json!({"conversation":store.conversations(network)?.into_iter().find(|c|c.conversation_id==scope),"messages":store.messages(network,&scope)?,"tasks":store.tasks(network,&scope)?,"heads":context.heads,"missing":context.missing,"sessions":facts["sessions"],"operations":facts["operations"]}),
-                )
+                let result = self.set_followup(&access, &scope, &input).await?;
+                self.schedule_wakeup.notify_one();
+                Ok(result)
             }
-            "message" => {
-                ensure!(access.human, "agents cannot recursively invoke managers");
-                let scope = scope.context("conversation_id is required")?;
-                let message_id = id(&input, "message_id")?;
-                let text = field(&input, "text")?.to_owned();
-                self.sync_all(network).await?;
-                ensure!(
-                    self.store
-                        .lock()
-                        .await
-                        .context(network, &scope, &heads(&input)?)?
-                        .missing
-                        .is_complete(),
-                    "context is incomplete; wait for synchronization"
-                );
-                let target = input["scheduler_node"]
-                    .as_str()
-                    .unwrap_or(&self.identity.node_id()?)
-                    .to_owned();
-                let trigger = {
-                    let mut store = self.store.lock().await;
-                    let duplicate = store
-                        .messages(network, &scope)?
-                        .into_iter()
-                        .find(|message| message.message_id == message_id);
-                    if let Some(old) = duplicate {
-                        ensure!(
-                            old.text == text && old.role == "user",
-                            "message ID reused with different content"
-                        );
-                        let envelope = store
-                            .event(network, &old.event_hash)?
-                            .context("message event missing")?;
-                        let event = store.verify_event(network, &envelope)?;
-                        ensure!(
-                            matches!(&event.body, EventBody::MessagePosted { scheduler_node: Some(selected), .. } if selected == &target),
-                            "retry this message through its original scheduler; send a new message to continue elsewhere"
-                        );
-                        old.event_hash
-                    } else {
-                        let event = store.append_event(
-                            &self.identity,
-                            network,
-                            &scope,
-                            EventBody::MessagePosted {
-                                message_id,
-                                role: "user".into(),
-                                text,
-                                scheduler_node: Some(target.clone()),
-                            },
-                            vec![],
-                            now_ms(),
-                        )?;
-                        self.publish_changed(network, &scope, &event.hash);
-                        event.hash
-                    }
-                };
-                if target == self.identity.node_id()? {
-                    self.require_role(network, NodeRole::Scheduler).await?;
-                    self.spawn_scheduler(network.clone(), scope, trigger.clone())?;
-                    Ok(json!({"state":"accepted","trigger":trigger}))
-                } else {
-                    self.peer_request(
-                        network,
-                        &target,
-                        json!({"type":"schedule","conversation_id":scope,"trigger":trigger}),
-                    )
-                    .await
-                }
-            }
+            "read_artifact" => self.read_artifact(&access, &input).await,
+            "task_control" => self.task_control(&access, &input).await,
+            "cancel_manager" => self.cancel_manager(&access, &input).await,
+            "resolve_manager_unknown" => self.resolve_manager_invocation(&access, &input).await,
             "create_task" => {
                 ensure!(
-                    access.human || input["auto_followup"].as_bool() != Some(true),
-                    "automatic follow-up needs user authorization"
+                    input["auto_followup"].as_bool() != Some(true),
+                    "use the task follow-up control to grant permission"
                 );
-                if input["auto_followup"].as_bool() == Some(true) {
-                    self.require_role(network, NodeRole::Gateway).await?;
-                }
                 let scope = scope.context("conversation_id is required")?;
-                let task_id = id(&input, "task_id")?;
-                let title = field(&input, "title")?;
-                let goal = field(&input, "goal")?;
-                let acceptance = field(&input, "acceptance")?;
-                let result = {
-                    let mut store = self.store.lock().await;
-                    let existing = store
-                        .tasks(network, &scope)?
-                        .into_iter()
-                        .find(|task| task.task_id == task_id);
-                    let terminal = existing.as_ref().is_some_and(|task| {
-                        matches!(task.status.as_str(), "accepted" | "cancelled")
-                    });
-                    let result = if let Some(old) = existing {
-                        ensure!(
-                            old.title == title && old.goal == goal && old.acceptance == acceptance,
-                            "task ID reused with different content"
-                        );
-                        json!(old)
-                    } else {
-                        let event = store.append_event(
-                            &self.identity,
-                            network,
-                            &scope,
-                            EventBody::TaskCreated {
-                                task_id: task_id.clone(),
-                                title: title.into(),
-                                goal: goal.into(),
-                                acceptance: acceptance.into(),
-                            },
-                            vec![],
-                            now_ms(),
-                        )?;
-                        self.publish_changed(network, &scope, &event.hash);
-                        json!(event)
-                    };
-                    if input["auto_followup"].as_bool() == Some(true)
-                        && !terminal
-                        && !followup_authorized(&store, network, &scope, &task_id)?
-                    {
-                        let event = store.append_event(
-                            &self.identity,
-                            network,
-                            &scope,
-                            EventBody::DecisionRecorded {
-                                decision_id: format!("auto:{task_id}"),
-                                text: format!(
-                                    "User enabled bounded automatic follow-up for task {task_id}"
-                                ),
-                                effective_constraints: vec![format!("auto_followup:{task_id}")],
-                                tool_configuration: json!({"auto_followup":task_id}),
-                            },
-                            vec![],
-                            now_ms(),
-                        )?;
-                        self.publish_changed(network, &scope, &event.hash);
-                    }
-                    result
+                let body = EventBody::TaskCreated {
+                    task_id: id(&input, "task_id")?,
+                    title: field(&input, "title")?.into(),
+                    goal: field(&input, "goal")?.into(),
+                    acceptance: field(&input, "acceptance")?.into(),
                 };
-                Ok(result)
+                let origin = access
+                    .manager
+                    .as_ref()
+                    .map(|m| (m.trigger.as_str(), m.attempt_id.as_str()));
+                let event = {
+                    let mut store = self.store.lock().await;
+                    Self::check_manager_permission(&store, &access, true, None)?;
+                    store.create_task_with_origin(
+                        &self.identity,
+                        network,
+                        &scope,
+                        body,
+                        origin,
+                        now_ms(),
+                    )?
+                };
+                self.publish_changed(network, &scope, &event.hash);
+                Ok(json!(event))
             }
             "update_task" => {
                 let scope = scope.context("conversation_id is required")?;
@@ -2273,6 +2453,7 @@ impl Runtime {
                 );
                 let event = {
                     let mut store = self.store.lock().await;
+                    Self::check_manager_permission(&store, &access, true, Some(&task_id))?;
                     require_task_write(&store, network, &scope, &task_id, access.human)?;
                     store.append_event(
                         &self.identity,
@@ -2388,8 +2569,12 @@ impl Runtime {
             .clone()
             .context("missing tool scope")?;
         self.require_scope(&access, &scope).await?;
+        let write = !matches!(name, "context" | "nodes" | "execution_status");
+        let _lease = self
+            .manager_tool_lease(&access, write, args["task_id"].as_str())
+            .await?;
         match name {
-            "nodes" => self.rpc(access, json!({"method":"nodes"})).await,
+            "nodes" => self.rpc_inner(access, json!({"method":"nodes"})).await,
             "context" => {
                 let context = self
                     .store
@@ -2437,7 +2622,7 @@ impl Runtime {
                 request["method"] = json!(name);
                 request["conversation_id"] = json!(scope);
                 request.as_object_mut().unwrap().remove("auto_followup");
-                self.rpc(access, request).await
+                self.rpc_inner(access, request).await
             }
             "open_execution" | "send_execution" => {
                 let target = field(&args, "target_node")?;
@@ -2490,6 +2675,7 @@ impl Runtime {
                     action,
                     resources: vec![],
                     binding: None,
+                    manager_authority: None,
                 };
                 self.dispatch(access, request).await
             }
@@ -2560,6 +2746,7 @@ impl Runtime {
 
     async fn prepare_operation_binding(
         self: &Arc<Self>,
+        access: &Access,
         request: &mut OperationRequest,
     ) -> Result<()> {
         self.cache_context_bindings(&request.network_id, &request.conversation_id)
@@ -2610,17 +2797,27 @@ impl Runtime {
                 .iter()
                 .any(|task| task.task_id == task_id)
             {
-                self.append(
-                    &request.network_id,
-                    &request.conversation_id,
-                    EventBody::TaskCreated {
-                        task_id: task_id.clone(),
-                        title: "Execution session".into(),
-                        goal: "User-requested execution".into(),
-                        acceptance: "The user verifies the result".into(),
-                    },
-                )
-                .await?;
+                let event = {
+                    let mut store = self.store.lock().await;
+                    Self::check_manager_permission(&store, access, true, Some(&task_id))?;
+                    store.create_task_with_origin(
+                        &self.identity,
+                        &request.network_id,
+                        &request.conversation_id,
+                        EventBody::TaskCreated {
+                            task_id: task_id.clone(),
+                            title: "Execution session".into(),
+                            goal: "User-requested execution".into(),
+                            acceptance: "The user verifies the result".into(),
+                        },
+                        access
+                            .manager
+                            .as_ref()
+                            .map(|manager| (manager.trigger.as_str(), manager.attempt_id.as_str())),
+                        now_ms(),
+                    )?
+                };
+                self.publish_changed(&request.network_id, &request.conversation_id, &event.hash);
             }
             request.task_id = Some(task_id);
         }
@@ -2778,7 +2975,6 @@ impl Runtime {
             &request.target_node,
             Some(NodeRole::Executor),
         )?;
-        self.sync_all(&access.network_id).await?;
         if !access.human
             && matches!(
                 request.action["type"].as_str(),
@@ -2794,7 +2990,18 @@ impl Runtime {
                 false,
             )?;
         }
-        self.prepare_operation_binding(&mut request).await?;
+        request.manager_authority = access.manager.as_ref().and_then(|manager| {
+            manager
+                .followup_version
+                .map(|version| ManagerDispatchAuthority {
+                    scheduler_node: manager.target_node.clone(),
+                    trigger: manager.trigger.clone(),
+                    followup_version: version,
+                })
+        });
+        self.prepare_operation_binding(&access, &mut request)
+            .await?;
+        Self::record_manager_operation(&mut *self.store.lock().await, &access, &request)?;
         let context = self.store.lock().await.context(
             &access.network_id,
             &request.conversation_id,
@@ -2838,30 +3045,52 @@ impl Runtime {
                     false,
                 )?;
             }
-            self.append(
-                &access.network_id,
-                &request.conversation_id,
-                EventBody::DispatchRecorded {
-                    operation_id: request.operation_id.clone(),
-                    task_id: request.task_id.clone(),
-                    target_node: request.target_node.clone(),
-                    session_id: request.session_id.clone(),
-                    action: serde_json::to_value(&request)?,
-                },
-            )
-            .await?
-            .hash
+            let event = {
+                let mut store = self.store.lock().await;
+                Self::check_manager_permission(&store, &access, true, request.task_id.as_deref())?;
+                store.append_event(
+                    &self.identity,
+                    &access.network_id,
+                    &request.conversation_id,
+                    EventBody::DispatchRecorded {
+                        operation_id: request.operation_id.clone(),
+                        task_id: request.task_id.clone(),
+                        target_node: request.target_node.clone(),
+                        session_id: request.session_id.clone(),
+                        action: serde_json::to_value(&request)?,
+                    },
+                    vec![],
+                    now_ms(),
+                )?
+            };
+            self.publish_changed(&access.network_id, &request.conversation_id, &event.hash);
+            event.hash
         };
         if request.target_node == self.identity.node_id()? {
-            self.admit_operation(request, access.human).await
+            self.admit_operation_checked(request, access.human, Some(&access))
+                .await
         } else {
+            Self::check_manager_permission(
+                &*self.store.lock().await,
+                &access,
+                true,
+                request.task_id.as_deref(),
+            )?;
             self.peer_request(&access.network_id,&request.target_node,json!({"type":"execute","request":request,"dispatch_head":head,"human":access.human})).await
         }
     }
     async fn admit_operation(
         self: &Arc<Self>,
+        request: OperationRequest,
+        human: bool,
+    ) -> Result<Value> {
+        self.admit_operation_checked(request, human, None).await
+    }
+    async fn admit_operation_checked(
+        self: &Arc<Self>,
         mut request: OperationRequest,
         human: bool,
+        manager_access: Option<&Access>,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         self.require_role(&request.network_id, NodeRole::Executor)
@@ -2876,6 +3105,9 @@ impl Runtime {
             "only the user may answer approvals"
         );
         let mut store = self.store.lock().await;
+        if let Some(access) = manager_access {
+            Self::check_manager_permission(&store, access, true, request.task_id.as_deref())?;
+        }
         let current = store.session(
             &request.network_id,
             &request.target_node,
@@ -3282,6 +3514,12 @@ impl Runtime {
                 return Ok(());
             }
         }
+        if state.terminal() {
+            self.progress_sequences
+                .lock()
+                .expect("progress sequence lock")
+                .remove(&(request.network_id.clone(), request.operation_id.clone()));
+        }
         self.store
             .lock()
             .await
@@ -3403,7 +3641,14 @@ impl Runtime {
         let kind = field(input, "type")?;
         let _work = (!matches!(
             kind,
-            "capabilities" | "inventory" | "event" | "blob" | "operation" | "task_binding"
+            "capabilities"
+                | "inventory"
+                | "event"
+                | "blob"
+                | "operation"
+                | "task_binding"
+                | "progress_read"
+                | "chat_task_status"
         ))
         .then(|| self.maintenance.enter())
         .transpose()?;
@@ -3521,7 +3766,6 @@ impl Runtime {
                 let request: OperationRequest = serde_json::from_value(input["request"].clone())?;
                 ensure!(request.network_id == *network, "wrong operation network");
                 // Admission holds the complete dispatched history before any external call.
-                self.sync_from(network, &message.origin).await?;
                 let mut wanted = request.basis_heads.clone();
                 wanted.push(field(input, "dispatch_head")?.into());
                 self.fetch_closure(network, &message.origin, &wanted)
@@ -3534,6 +3778,26 @@ impl Runtime {
                         .is_complete(),
                     "dispatch context is incomplete"
                 );
+                {
+                    let store = self.store.lock().await;
+                    let envelope = store
+                        .event(network, field(input, "dispatch_head")?)?
+                        .context("dispatch event is missing")?;
+                    let event = store.verify_event(network, &envelope)?;
+                    ensure!(
+                        event.author == message.origin
+                            && event.scope_id == request.conversation_id
+                            && matches!(&event.body, EventBody::DispatchRecorded { operation_id, action, .. }
+                            if operation_id == &request.operation_id && action == &serde_json::to_value(&request)?),
+                        "execution request does not match its original signed dispatch"
+                    );
+                    if let Some(authority) = &request.manager_authority {
+                        ensure!(
+                            !human && authority.scheduler_node == message.origin,
+                            "invalid autonomous dispatch authority"
+                        );
+                    }
+                }
                 self.cache_context_bindings(network, &request.conversation_id)
                     .await?;
                 let proof = request
@@ -3554,8 +3818,23 @@ impl Runtime {
             "operation" => Ok(
                 json!({"operation":self.store.lock().await.operation(network,field(input,"operation_id")?)?}),
             ),
-            "schedule" => {
-                self.require_role(network, NodeRole::Scheduler).await?;
+            "schedule" => self.receive_schedule(message).await,
+            "manager_status" => {
+                self.manager_status(
+                    network,
+                    field(input, "conversation_id")?,
+                    field(input, "trigger")?,
+                )
+                .await
+            }
+            "progress_read" => {
+                ensure!(
+                    !message.broadcast,
+                    "progress observation requires a direct request"
+                );
+                self.read_progress(network, &message.origin, input).await
+            }
+            "chat_task_status" => {
                 let sender =
                     self.store
                         .lock()
@@ -3563,37 +3842,37 @@ impl Runtime {
                         .authorize_node(network, &message.origin, None)?;
                 ensure!(
                     sender.roles.contains(&NodeRole::Gateway)
-                        || sender.roles.contains(&NodeRole::Scheduler)
-                        || sender.roles.contains(&NodeRole::Executor),
-                    "origin cannot schedule"
+                        || sender.roles.contains(&NodeRole::Scheduler),
+                    "origin cannot observe execution controls"
                 );
-                self.sync_from(network, &message.origin).await?;
-                let scope = id(input, "conversation_id")?;
-                let trigger = field(input, "trigger")?.to_owned();
-                self.fetch_closure(network, &message.origin, std::slice::from_ref(&trigger))
-                    .await?;
-                if !sender.roles.contains(&NodeRole::Gateway)
-                    && !sender.roles.contains(&NodeRole::Scheduler)
-                {
-                    require_executor_followup(
-                        &*self.store.lock().await,
-                        network,
-                        &message.origin,
-                        &scope,
-                        &trigger,
-                    )?;
-                }
-                self.spawn_scheduler(network.clone(), scope, trigger)?;
-                Ok(json!({"state":"accepted"}))
-            }
-            "manager_status" => {
-                crate::scheduler::status(
-                    self,
+                self.chat_task_status(
                     network,
                     field(input, "conversation_id")?,
-                    field(input, "trigger")?,
+                    field(input, "task_id")?,
                 )
                 .await
+            }
+            "cancel_manager" | "resolve_manager_unknown" => {
+                self.store.lock().await.authorize_node(
+                    network,
+                    &message.origin,
+                    Some(NodeRole::Gateway),
+                )?;
+                ensure!(
+                    input["human"] == true,
+                    "management control requires the user"
+                );
+                let access = Access {
+                    network_id: network.clone(),
+                    human: true,
+                    conversation_id: Some(field(input, "conversation_id")?.into()),
+                    manager: None,
+                };
+                if kind == "cancel_manager" {
+                    self.cancel_manager(&access, input).await
+                } else {
+                    self.resolve_manager_invocation(&access, input).await
+                }
             }
             "reconcile" => {
                 self.reconcile(
@@ -3659,7 +3938,27 @@ impl Runtime {
                 if cli_progress && event["executor"] != session.executor {
                     continue;
                 }
-                let _=self.events.send(Update{network_id:network.clone(),payload:json!({"type":"execution_progress","conversation_id":request.conversation_id,"session_id":request.session_id,"event":event})});
+                let sequence = {
+                    let mut sequences = self
+                        .progress_sequences
+                        .lock()
+                        .expect("progress sequence lock");
+                    let sequence = sequences
+                        .entry((network.clone(), request.operation_id.clone()))
+                        .or_default();
+                    *sequence += 1;
+                    *sequence
+                };
+                let turn = self
+                    .store
+                    .lock()
+                    .await
+                    .local_value(&network, &format!("turn:{}", request.operation_id))?;
+                self.publish_progress(&network, json!({"type":"execution_progress","conversation_id":request.conversation_id,
+                    "task_id":request.task_id,"task_ref":request.binding.as_ref().map(|proof| &proof.binding.task_ref),
+                    "target_node":request.target_node,"session_id":request.session_id,"operation_id":request.operation_id,
+                    "turn_id":turn.as_ref().and_then(|value|value["turn"]["id"].as_str()),
+                    "source":self.identity.node_id()?,"source_node":self.identity.node_id()?,"sequence":sequence,"progress":observation::execution_progress(&event)}));
                 if method == "turn/completed" {
                     let turn = field(&event["params"]["turn"], "id")?;
                     let known = self
@@ -3827,204 +4126,5 @@ impl Runtime {
         Ok(
             json!({"operation":self.store.lock().await.operation(network,&operation.request.operation_id)?}),
         )
-    }
-    fn spawn_scheduler(
-        self: &Arc<Self>,
-        network: String,
-        scope: String,
-        trigger: String,
-    ) -> Result<()> {
-        let work = self.maintenance.enter()?;
-        let node = self.clone();
-        tokio::spawn(async move {
-            let _work = work;
-            let access = Access {
-                network_id: network.clone(),
-                human: false,
-                conversation_id: Some(scope.clone()),
-            };
-            if let Err(error) =
-                crate::scheduler::run(node.clone(), access, scope.clone(), trigger.clone()).await
-                && crate::scheduler::status(&node, &network, &scope, &trigger)
-                    .await
-                    .is_ok_and(|status| status["state"] == "not_found")
-            {
-                let _ = node
-                    .raise_notification(
-                        &network,
-                        &scope,
-                        "manager_failed",
-                        &format!("管理 Agent 未完成：{error:#}"),
-                    )
-                    .await;
-            }
-        });
-        Ok(())
-    }
-    async fn maybe_followup(
-        self: &Arc<Self>,
-        request: &OperationRequest,
-        result_hash: &str,
-    ) -> Result<bool> {
-        let work = self.maintenance.enter()?;
-        let Some(task) = &request.task_id else {
-            return Ok(true);
-        };
-        {
-            let store = self.store.lock().await;
-            if store
-                .continuation(&request.network_id, result_hash, "v1")?
-                .is_some()
-                || !followup_authorized(
-                    &store,
-                    &request.network_id,
-                    &request.conversation_id,
-                    task,
-                )?
-            {
-                return Ok(true);
-            }
-        }
-        let target =
-            if self.config.manager.is_some() && self.config.roles.contains(&NodeRole::Scheduler) {
-                Some(self.identity.node_id()?)
-            } else {
-                let bundle = self
-                    .store
-                    .lock()
-                    .await
-                    .trust_bundle(&request.network_id)?
-                    .context("unknown network")?;
-                let online = self.hub.online(&request.network_id).await;
-                let mut target = None;
-                let view = bundle.project()?;
-                for member in view.members.into_iter().filter(|member| {
-                    member.kind == IdentityKind::Node
-                        && !view.revoked.contains(&member.subject_id)
-                        && member.node_roles.contains(&NodeRole::Scheduler)
-                        && online.contains(&member.subject_id)
-                }) {
-                    let node = member.certificate()?;
-                    if let Ok(Ok(cap)) = tokio::time::timeout(
-                        Duration::from_secs(3),
-                        self.peer_request(
-                            &request.network_id,
-                            &node.node_id,
-                            json!({"type":"capabilities"}),
-                        ),
-                    )
-                    .await
-                        && !cap["manager"].is_null()
-                    {
-                        target = Some(node.node_id);
-                        break;
-                    }
-                }
-                target
-            };
-        let Some(target) = target else {
-            let notification_id = format!("followup:{result_hash}:waiting");
-            let already = self.store.lock().await.context(&request.network_id, &request.conversation_id, &[])?.events.iter().any(|event| {
-                matches!(&event.body, EventBody::NotificationRaised { notification_id: old, .. } if old == &notification_id)
-            });
-            if !already {
-                self.append(
-                    &request.network_id,
-                    &request.conversation_id,
-                    EventBody::NotificationRaised {
-                        notification_id,
-                        kind: "followup_waiting".into(),
-                        text: "执行已完成，当前没有可达的管理 Agent；可从其他入口查看结果。".into(),
-                    },
-                )
-                .await?;
-            }
-            return Ok(false);
-        };
-        {
-            let mut store = self.store.lock().await;
-            if store
-                .continuation(&request.network_id, result_hash, "v1")?
-                .is_some()
-            {
-                return Ok(true);
-            }
-            store.claim_continuation(&request.network_id, result_hash, "v1", &target)?;
-        }
-        let node = self.clone();
-        let request = request.clone();
-        let result_hash = result_hash.to_owned();
-        tokio::spawn(async move {
-            let _work = work;
-            let access = Access {
-                network_id: request.network_id.clone(),
-                human: false,
-                conversation_id: Some(request.conversation_id.clone()),
-            };
-            let result = if target == node.identity.node_id().unwrap_or_default() {
-                crate::scheduler::run(
-                    node.clone(),
-                    access,
-                    request.conversation_id.clone(),
-                    result_hash.clone(),
-                )
-                .await
-            } else {
-                match node
-                    .peer_request(
-                        &request.network_id,
-                        &target,
-                        json!({"type":"schedule","conversation_id":request.conversation_id,"trigger":result_hash}),
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        let mut final_result = Err(anyhow::anyhow!(
-                            "scheduler result unknown; query its durable invocation status"
-                        ));
-                        for _ in 0..220 {
-                            tokio::time::sleep(Duration::from_secs(3)).await;
-                            match node
-                                .peer_request(
-                                    &request.network_id,
-                                    &target,
-                                    json!({"type":"manager_status","conversation_id":request.conversation_id,"trigger":result_hash}),
-                                )
-                                .await
-                            {
-                                Ok(value)
-                                    if matches!(value["state"].as_str(), Some("completed" | "failed" | "unknown")) =>
-                                {
-                                    final_result = Ok(value);
-                                    break;
-                                }
-                                Err(error) => {
-                                    final_result = Err(error);
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        final_result
-                    }
-                    Err(error) => Err(error),
-                }
-            };
-            let (state, value) = match result {
-                Ok(v) if v["state"] == "completed" => ("completed", v),
-                Ok(v) if v["state"] == "failed" => ("failed", v),
-                Ok(v) => ("unknown", v),
-                Err(e) => ("unknown", json!({"error":format!("{e:#}")})),
-            };
-            let _ = node.store.lock().await.finish_continuation(
-                &request.network_id,
-                &result_hash,
-                "v1",
-                &target,
-                state,
-                value,
-            );
-        });
-        Ok(true)
     }
 }

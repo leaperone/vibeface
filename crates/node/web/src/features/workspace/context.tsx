@@ -2,18 +2,20 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import type { ReadyConnection } from "@/lib/node"
-import { prepareSend } from "../chat/protocol"
+import { mergeProgress, type LiveProgress } from "@/lib/progress"
+import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import { conversationHref } from "./entry-url"
 import { isIncomplete, mergeBasis, missingCount, stateNames } from "./labels"
 import {
   frontierMap, inputText, parseConversation, parseConversations, parseNodes, parseNotifications, parseOperation,
   parsePending, parsePendingMessages, parsePendingConversation, parsePendingTasks, parseSession, record,
+  parseArtifactPage, hasQueuedMessage, canSelectScheduler,
 } from "./model"
 import { errorText, parseReconcile, reconcileDecision, type ReconcileRecord } from "./reconcile"
 import { networkKey, newId, readStorage, writeStorage } from "./storage"
 import type {
   ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, OperateAction,
-  OperationRequest, PendingOperation, PendingMessage, PendingConversation, PendingTask, SessionRecord, WorkspaceView,
+  OperationRequest, PendingOperation, PendingMessage, PendingConversation, PendingTask, SessionRecord, WorkspaceView, FollowupMode, TaskRecord, TaskControlRequest,
 } from "./types"
 
 function useWorkspaceState(connection: ReadyConnection) {
@@ -38,6 +40,7 @@ function useWorkspaceState(connection: ReadyConnection) {
   const [actual, setActual] = useState<Record<string, unknown>>({})
   const [refreshing, setRefreshing] = useState(false)
   const [messageBusy, setMessageBusy] = useState(false)
+  const [liveProgress, setLiveProgress] = useState<LiveProgress[]>([])
   const [schedulerNodeId, setSchedulerNodeId] = useState("")
   const [notificationButton, setNotificationButton] = useState({ label: "开启浏览器提醒", disabled: false })
   const alive = useRef(true)
@@ -90,6 +93,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     setConversationId(id)
     setData(null)
     setActual({})
+    setLiveProgress([])
     window.history.replaceState(null, "", conversationHref(window.location.href, id))
   }
   const readConversation = async (id: string) => {
@@ -105,6 +109,14 @@ function useWorkspaceState(connection: ReadyConnection) {
     }
     dataRef.current = next
     setData(next)
+    if (writer.current && messagesRef.current.some((item) => item.conversation_id === id && hasQueuedMessage(next.scheduler, item))) {
+      replaceMessages(messagesRef.current.filter((item) => item.conversation_id !== id || !hasQueuedMessage(next.scheduler, item)))
+    }
+    setLiveProgress((previous) => previous.filter((progress) => {
+      if (progress.kind === "execution") return next.tasks.some((task) => task.binding && task.binding.target_node === progress.target_node && task.binding.session_id === progress.session_id && (!task.binding.operation_id || task.binding.operation_id === progress.operation_id))
+      const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
+      return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "unknown", "rejected"].includes(job.state)
+    }))
     return next
   }
   const refreshNotificationButton = () => {
@@ -157,7 +169,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (activeId.current) await readConversation(activeId.current)
       requireCurrent()
       setSchedulerNodeId((previous) => {
-        const choices = nextNodes.filter((node) => !node.revoked && node.roles.includes("scheduler") && node.capabilities?.manager)
+        const choices = nextNodes.filter(canSelectScheduler)
         return choices.some((node) => node.node_id === previous) ? previous : choices[0]?.node_id ?? ""
       })
       notifyBrowser(nextNotifications)
@@ -221,7 +233,16 @@ function useWorkspaceState(connection: ReadyConnection) {
   useEffect(() => {
     if (!booted) return
     void refreshRef.current().catch(showError)
-    const unsubscribe = connection.subscribe(scheduleRefresh)
+    const unsubscribe = connection.subscribe((event) => {
+      if (!current()) return
+      if (event.type === "invalidate") { scheduleRefresh(); return }
+      if (event.conversation_id !== activeId.current) return
+      setLiveProgress((previous) => {
+        const next = mergeProgress(previous, event)
+        if (next.some((item) => item.needsRefresh && !previous.find((prior) => prior.key === item.key)?.needsRefresh)) scheduleRefresh()
+        return next
+      })
+    })
     const timer = window.setInterval(scheduleRefresh, 15000)
     const visible = () => { if (!document.hidden) scheduleRefresh() }
     document.addEventListener("visibilitychange", visible)
@@ -244,20 +265,28 @@ function useWorkspaceState(connection: ReadyConnection) {
     if (current()) setError("")
     try { await action() } catch (caught) { showError(caught) }
   }
+  const submitTaskControl = async (request: TaskControlRequest) => {
+    const result = parseOperation(record(await connection.rpc("task_control", request)).operation)
+    requireCurrent()
+    if (result.request.operation_id !== request.operation_id || result.request.target_node !== request.target_node || result.request.conversation_id !== request.conversation_id || result.request.session_id !== request.session_id) throw new Error("控制回执与原请求不符，已保留原编号待核对。")
+    removePending(request.operation_id)
+    setNoticeText(request.action === "interrupt" ? "停止请求已入账，当前执行是否结束以执行端终态为准。" : "本人操作已入账，请查看任务状态。")
+    if (activeId.current === request.conversation_id) await refreshRef.current()
+  }
   const incomplete = !data || isIncomplete(data.missing)
   const messagePending = pendingMessages.find((item) => item.conversation_id === conversationId) ?? null
   const selectedScheduler = nodes.find((node) => node.node_id === (messagePending?.scheduler_node ?? schedulerNodeId))
   const chatSlot = {
     conversationId: conversationId || null, schedulerNodeId: selectedScheduler?.node_id ?? null,
-    missing: incomplete, schedulerOnline: Boolean(selectedScheduler?.online && !selectedScheduler.revoked), managerReady: Boolean(selectedScheduler?.capabilities?.manager),
+    missing: incomplete, schedulerOnline: Boolean(selectedScheduler?.online && !selectedScheduler.revoked), schedulerAllowed: canSelectScheduler(selectedScheduler),
   }
 
   return {
-    info: connection.info, connectionOnline: current(), connectionText: "已建立端到端加密连接",
+    info: connection.info, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
     error, noticeText, view, setView, nodes, conversations, conversationId, data, notifications, pending, actual,
     canAutoFollowup, pendingConversation, pendingTask: pendingTasks.find((item) => item.conversation_id === conversationId) ?? null,
-    refreshing, schedulerNodeId, setSchedulerNodeId, incomplete, chatSlot, messagePending, messageBusy,
-    writable: writeState === "writable",
+    refreshing, schedulerNodeId, setSchedulerNodeId, incomplete, chatSlot, messagePending, messageBusy, liveProgress,
+    writable: writeState === "writable" && current(),
     writeNotice: writeState === "readonly" ? "另一个页面正在操作此浏览器设备。此页只读，关闭其他页面后重新连接。"
       : writeState === "unsupported" ? "浏览器未能提供跨页面写锁，此页只读。请使用支持 Web Locks 的安全浏览器入口。"
       : writeState === "checking" ? "正在核对浏览器设备的写入权限。" : "",
@@ -279,16 +308,15 @@ function useWorkspaceState(connection: ReadyConnection) {
       selectConversation(request.conversation_id); setView("chat")
       await refreshRef.current()
     }),
-    createTask: (input: { taskId: string; title: string; goal: string; acceptance: string; autoFollowup: boolean }) => withMutation(`create-task:${activeId.current}`, async () => {
+    createTask: (input: { taskId: string; title: string; goal: string; acceptance: string }) => withMutation(`create-task:${activeId.current}`, async () => {
       const context = requireContext(), id = context.conversation?.conversation_id
       if (!id) throw new Error("先选择会话。")
       const title = inputText(input.title, "工单标题", 65536)
       const goal = inputText(input.goal, "工单目标", 65536)
       const acceptance = inputText(input.acceptance, "验收条件", 65536)
-      if (input.autoFollowup && !canAutoFollowup) throw new Error("当前入口未启用接入角色，不能授权自动继续检查。")
       const prior = tasksRef.current.find((item) => item.conversation_id === id)
-      if (prior && (prior.title !== title || prior.goal !== goal || prior.acceptance !== acceptance || prior.auto_followup !== input.autoFollowup)) throw new Error("还有待确认的工单，请保留原内容与继续检查设置重试。")
-      const request = prior ?? { conversation_id: id, task_id: input.taskId, title, goal, acceptance, auto_followup: input.autoFollowup }
+      if (prior && (prior.title !== title || prior.goal !== goal || prior.acceptance !== acceptance)) throw new Error("还有待确认的工单，请保留原内容重试。")
+      const request = prior ?? { conversation_id: id, task_id: input.taskId, title, goal, acceptance }
       const next = [...tasksRef.current.filter((item) => item.conversation_id !== id), request]
       writeStorage(scoped("pending-tasks"), next, true)
       tasksRef.current = next; setPendingTasks(next)
@@ -305,21 +333,26 @@ function useWorkspaceState(connection: ReadyConnection) {
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),
-    sendMessage: (text: string) => withMutation(`message:${activeId.current}`, async () => {
+    sendMessage: (text: string, reportResults = false) => withMutation(`message:${activeId.current}`, async () => {
       const context = requireContext(), id = activeId.current
       const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
       const scheduler = nodes.find((item) => item.node_id === (prior?.scheduler_node ?? schedulerNodeId))
-      if (!scheduler?.online || scheduler.revoked || !scheduler.capabilities?.manager) throw new Error("原调度设备不可用，请先恢复连接并核对原消息。")
-      const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: scheduler.node_id, entryNode: connection.entry.node_id, pending: prior, heads: context.heads })
+      if (!canSelectScheduler(scheduler)) throw new Error("原调度设备的授权或已知管理配置不可用，请先核对原消息。")
+      const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: scheduler.node_id, entryNode: connection.entry.node_id, pending: prior, heads: context.heads, reportResults })
       if (!prepared.ok) throw new Error(prepared.error)
       replaceMessages([...messagesRef.current.filter((item) => item.conversation_id !== id), prepared.pending])
       setMessageBusy(true)
       try {
-        await connection.rpc("message", prepared.body)
+        const receipt = await connection.rpc("message", prepared.body)
         requireCurrent()
+        if (!isQueuedReceipt(receipt, prepared.pending)) {
+          setNoticeText("入口已接收请求，尚未确认目标调度端入队。保留原消息核对，不会自动重发。")
+          if (activeId.current === id) await refreshRef.current().catch(showError)
+          return
+        }
         replaceMessages(messagesRef.current.filter((item) => item.message_id !== prepared.pending.message_id))
-        setNoticeText("消息已提交，调度 Agent 正在处理。")
-        if (activeId.current === id) await refreshRef.current()
+        setNoticeText("消息已可靠入队，等待调度 Agent 处理。")
+        if (activeId.current === id) await refreshRef.current().catch(showError)
       } catch (caught) {
         if (current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
           const original = messagesRef.current.find((item) => item.message_id === prepared.pending.message_id)
@@ -328,6 +361,79 @@ function useWorkspaceState(connection: ReadyConnection) {
         throw caught
       } finally { if (current()) setMessageBusy(false) }
     }),
+    cancelManager: (trigger: string) => withMutation(`cancel-manager:${trigger}`, async () => {
+      const id = activeId.current
+      requireContext(id)
+      const receipt = record(await connection.rpc("cancel_manager", { conversation_id: id, trigger }))
+      requireCurrent()
+      const job = record(receipt.job)
+      if (receipt.publication_pending === true) setNoticeText("本轮已有结果，正在补齐发布；未提交停止请求。")
+      else if (receipt.cancel_requested === true && job.state === "cancelled") setNoticeText("本轮回复已停止。已派出的后台任务会单独继续。")
+      else if (receipt.cancel_requested === true) setNoticeText("已提交停止回复请求。已派出的后台任务会单独继续，最终状态以核对结果为准。")
+      else setNoticeText("本轮当前状态未接受停止请求，请核对最新状态。")
+      if (activeId.current === id) await refreshRef.current()
+    }),
+    setFollowup: (taskId: string, mode: FollowupMode) => withMutation(`followup:${taskId}`, async () => {
+      const id = activeId.current
+      const context = requireContext(id), task = context.tasks.find((item) => item.task_id === taskId)
+      if (task?.followup_version === undefined) throw new Error("当前入口尚未提供可核对的授权版本，请先更新节点并刷新。")
+      try { await connection.rpc("set_followup", { conversation_id: id, task_id: taskId, mode, expected_version: task.followup_version, scheduler_node: task.followup_scheduler_node ?? schedulerNodeId }) }
+      catch (caught) { if (current() && activeId.current === id) await refreshRef.current(); throw caught }
+      requireCurrent()
+      if (activeId.current === id) await refreshRef.current()
+    }),
+    cancelFollowup: (task: TaskRecord) => withMutation(`followup:${task.task_id}`, async () => {
+      const id = activeId.current
+      requireContext(id)
+      if (task.followup_version === undefined) throw new Error("当前入口尚未提供可核对的授权版本，请先更新节点并刷新。")
+      try { await connection.rpc("set_followup", { conversation_id: id, task_id: task.task_id, mode: "off", expected_version: task.followup_version, scheduler_node: task.followup_scheduler_node ?? schedulerNodeId }) }
+      catch (caught) { if (current() && activeId.current === id) await refreshRef.current(); throw caught }
+      requireCurrent()
+      await connection.rpc("update_task", { conversation_id: id, task_id: task.task_id, status: "cancelled", detail: task.detail })
+      requireCurrent()
+      setNoticeText("已取消尚未开始的后续安排；当前执行是否停止需单独核对。")
+      if (activeId.current === id) await refreshRef.current()
+    }),
+    taskControl: async (taskId: string, action: "status" | "interrupt" | "steer" | "respond_request", fields: { text?: string; request_id?: string | number; response?: unknown } = {}) => {
+      const id = activeId.current
+      if (action === "status") {
+        requireCurrent()
+        await connection.rpc("task_control", { conversation_id: id, task_id: taskId, action })
+        requireCurrent()
+        if (activeId.current === id) await refreshRef.current()
+        return
+      }
+      await withMutation(`task-control:${taskId}`, async () => {
+        const context = requireContext(id), task = context.tasks.find((item) => item.task_id === taskId), binding = task?.binding
+        if (!binding?.operation_id) throw new Error("缺少当前后台操作身份，请先核对执行状态。")
+        if (pendingRef.current.some((item) => item.target_node === binding.target_node && item.session_id === binding.session_id)) throw new Error("此执行有原操作待核对，请勿生成另一请求。")
+        const request: TaskControlRequest = { operation_id: newId(), network_id: networkId, conversation_id: id, task_id: taskId, target_node: binding.target_node, session_id: binding.session_id, expected_operation_id: binding.operation_id, expected_revision: binding.revision, action, ...fields }
+        replacePending([...pendingRef.current, { operation_id: request.operation_id, conversation_id: id, target_node: request.target_node, session_id: request.session_id, control: request }])
+        await submitTaskControl(request)
+      })
+    },
+    retryTaskControl: (operation: PendingOperation) => withMutation(`task-control:${operation.control?.task_id ?? operation.operation_id}`, async () => {
+      requireContext(operation.conversation_id)
+      const original = pendingRef.current.find((item) => item.operation_id === operation.operation_id)
+      if (!original?.control) throw new Error("原控制请求不存在，请先核对持久状态。")
+      await submitTaskControl(original.control)
+    }),
+    resolveManagerUnknown: (trigger: string, evidence: string) => withMutation(`resolve-manager:${trigger}`, async () => {
+      const id = activeId.current
+      requireContext(id)
+      if (new TextEncoder().encode(evidence.trim()).length < 12) throw new Error("请填写至少 12 字节的本人核查证据。")
+      await connection.rpc("resolve_manager_unknown", { conversation_id: id, trigger, evidence: evidence.trim() })
+      requireCurrent()
+      if (activeId.current === id) await refreshRef.current()
+    }),
+    readArtifact: async (hash: string, offset = 0) => {
+      const id = activeId.current
+      requireCurrent()
+      const result = parseArtifactPage(await connection.rpc("read_artifact", { conversation_id: id, blob_hash: hash, offset, limit: 65536 }), hash, offset)
+      requireCurrent()
+      if (activeId.current !== id) throw new Error("会话已切换，请在原会话中重新打开产物。")
+      return result
+    },
     releaseMessagePending: () => withMutation(`message:${activeId.current}`, async () => {
       requireCurrent()
       const id = activeId.current, original = messagesRef.current.find((item) => item.conversation_id === id)
@@ -399,7 +505,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (activeId.current === id) await refreshRef.current()
     }),
     ack: async (notificationId: string) => { requireWriter(); await connection.rpc("ack", { notification_id: notificationId }); requireCurrent(); await refreshRef.current() },
-    openNotification: async (notification: NotificationRecord) => { selectConversation(notification.conversation_id); setView(["approval", "needs_input"].includes(notification.kind) ? "sessions" : "chat"); await refreshRef.current() },
+    openNotification: async (notification: NotificationRecord) => { selectConversation(notification.conversation_id); setView("chat"); await refreshRef.current() },
     enableBrowserNotifications: async () => {
       requireCurrent()
       if (!("Notification" in window)) return

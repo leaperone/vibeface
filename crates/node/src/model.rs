@@ -159,6 +159,14 @@ pub struct Task {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct ManagerDispatchAuthority {
+    pub scheduler_node: NodeId,
+    pub trigger: EventHash,
+    pub followup_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct OperationRequest {
     pub operation_id: String,
     pub network_id: NetworkId,
@@ -172,6 +180,8 @@ pub struct OperationRequest {
     pub resources: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<crate::binding::SignedBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_authority: Option<ManagerDispatchAuthority>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

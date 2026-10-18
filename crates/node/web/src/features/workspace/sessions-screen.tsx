@@ -11,10 +11,10 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Textarea } from "@/components/ui/textarea"
 import { useWorkspace } from "./context"
 import { nodeName } from "./labels"
-import { parseAction } from "./model"
 import { ActionButton, DetailList, RawDetails, StatusBadge, SubmitButton } from "./present"
 import { reconcileDecision } from "./reconcile"
 import { newId } from "./storage"
+import { TaskActivity } from "./task-activity"
 import type { OperationRecord, PendingOperation, SessionRecord } from "./types"
 
 const executors = [
@@ -52,7 +52,7 @@ export function SessionsScreen() {
       <Collapsible open={open} onOpenChange={setOpen}>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-semibold">执行会话 <span className="text-sm font-normal text-muted-foreground">{sessions.length}</span></h2>
-          <CollapsibleTrigger asChild disabled={!workspace.conversationId}>
+          <CollapsibleTrigger asChild disabled={!workspace.conversationId || !workspace.writable}>
             <Button type="button"><PlusIcon />{open ? "收起表单" : "打开执行会话"}</Button>
           </CollapsibleTrigger>
         </div>
@@ -77,32 +77,34 @@ export function SessionsScreen() {
                   }).finally(() => setBusy(false))
                 }}
               >
-                <FieldGroup>
-                  <Field>
-                    <FieldLabel htmlFor="executor-node">执行设备</FieldLabel>
-                    <NativeSelect id="executor-node" name="target_node" required value={executorId} onChange={(event: ChangeEvent<HTMLSelectElement>) => setExecutorId(event.target.value)}>
-                      {devices.length ? devices.map((node) => (
-                        <NativeSelectOption key={node.node_id} value={node.node_id}>
-                          {nodeName(node.node_id)}{node.local ? " · 本机" : ""}{node.online ? "" : " · 离线"}
-                        </NativeSelectOption>
-                      )) : <NativeSelectOption value="">没有执行设备</NativeSelectOption>}
-                    </NativeSelect>
-                  </Field>
-                  <Field>
-                    <FieldLabel htmlFor="executor-kind">执行器</FieldLabel>
-                    <NativeSelect id="executor-kind" name="executor" value={kind} onChange={(event: ChangeEvent<HTMLSelectElement>) => setKind(event.target.value)}>
-                      {executors.map(([value, label]) => (
-                        <NativeSelectOption key={value} value={value} disabled={kinds.length > 0 && !kinds.includes(value)}>{label}</NativeSelectOption>
-                      ))}
-                    </NativeSelect>
-                  </Field>
-                  <Field>
-                    <FieldLabel htmlFor="session-cwd">工作目录</FieldLabel>
-                    <Input id="session-cwd" name="cwd" required placeholder="/Users/you/project" maxLength={4096} />
-                    <p className="text-sm text-muted-foreground">使用执行设备允许的目录。</p>
-                  </Field>
-                  <SubmitButton busy={busy}>打开会话</SubmitButton>
-                </FieldGroup>
+                <fieldset disabled={!workspace.writable} className="min-w-0">
+                  <FieldGroup>
+                    <Field>
+                      <FieldLabel htmlFor="executor-node">执行设备</FieldLabel>
+                      <NativeSelect id="executor-node" name="target_node" required value={executorId} onChange={(event: ChangeEvent<HTMLSelectElement>) => setExecutorId(event.target.value)}>
+                        {devices.length ? devices.map((node) => (
+                          <NativeSelectOption key={node.node_id} value={node.node_id}>
+                            {nodeName(node.node_id)}{node.local ? " · 本机" : ""}{node.online ? "" : " · 离线"}
+                          </NativeSelectOption>
+                        )) : <NativeSelectOption value="">没有执行设备</NativeSelectOption>}
+                      </NativeSelect>
+                    </Field>
+                    <Field>
+                      <FieldLabel htmlFor="executor-kind">执行器</FieldLabel>
+                      <NativeSelect id="executor-kind" name="executor" value={kind} onChange={(event: ChangeEvent<HTMLSelectElement>) => setKind(event.target.value)}>
+                        {executors.map(([value, label]) => (
+                          <NativeSelectOption key={value} value={value} disabled={kinds.length > 0 && !kinds.includes(value)}>{label}</NativeSelectOption>
+                        ))}
+                      </NativeSelect>
+                    </Field>
+                    <Field>
+                      <FieldLabel htmlFor="session-cwd">工作目录</FieldLabel>
+                      <Input id="session-cwd" name="cwd" required placeholder="/Users/you/project" maxLength={4096} />
+                      <p className="text-sm text-muted-foreground">使用执行设备允许的目录。</p>
+                    </Field>
+                    <SubmitButton busy={busy}>打开会话</SubmitButton>
+                  </FieldGroup>
+                </fieldset>
               </form>
             </CardContent>
           </Card>
@@ -167,7 +169,7 @@ function PendingCard({ operation }: { operation: PendingOperation }) {
           </CollapsibleTrigger>
           <CollapsibleContent className="pt-2"><code className="break-all text-xs">{operation.operation_id}</code></CollapsibleContent>
         </Collapsible>
-        <ActionButton action={async () => {
+        <ActionButton disabled={!workspace.writable} action={async () => {
           await workspace.run(async () => {
             const next = await workspace.reconcile(operation)
             if (reconcileDecision(next, operation) === "settled") return
@@ -179,7 +181,7 @@ function PendingCard({ operation }: { operation: PendingOperation }) {
         {missing ? (
           <>
             <p>执行设备当前未找到此编号。确认原请求已结束后，可解除本地待核对记录；不会重发操作。</p>
-            <ActionButton action={() => workspace.run(async () => { await workspace.confirmMissing(operation.operation_id) })}>确认原请求结束并解除待核对</ActionButton>
+            <ActionButton disabled={!workspace.writable} action={() => workspace.run(async () => { await workspace.confirmMissing(operation.operation_id) })}>确认原请求结束并解除待核对</ActionButton>
           </>
         ) : null}
       </CardContent>
@@ -190,26 +192,34 @@ function PendingCard({ operation }: { operation: PendingOperation }) {
 function SessionCard({ session, conversationId }: { session: SessionRecord; conversationId: string }) {
   const workspace = useWorkspace()
   const actual = workspace.actual[`${session.target_node}:${session.session_id}`]
+  const tasks = workspace.data?.tasks.filter((item) => item.binding?.target_node === session.target_node && item.binding.session_id === session.session_id) ?? []
+  if (tasks.length) return <div className="grid gap-3">
+    {tasks.map((task) => <TaskActivity key={task.task_id} task={task} conversationId={conversationId} />)}
+    <Card><CardContent><CommandForm session={session} conversationId={conversationId} /></CardContent></Card>
+  </div>
+  const canRead = session.capabilities?.includes("read")
   return (
     <Card>
       <CardHeader className="flex flex-wrap items-start justify-between gap-3">
         <CardTitle className="min-w-0 flex-1 break-words">{session.executor} · {nodeName(session.target_node)}</CardTitle>
         <StatusBadge value={session.state} />
       </CardHeader>
-      <CardContent>
+      <CardContent className="space-y-3">
         <p className="break-all text-sm">{session.cwd}</p>
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <p className="text-xs text-muted-foreground">{actual !== undefined ? "已读取实际状态" : "尚未读取实际状态"}</p>
-          <ActionButton disabled={!session.native_session_id} action={() => workspace.run(() => workspace.readSession(session))}>读取实际状态</ActionButton>
-        </div>
-        {session.state === "unknown" ? <p role="status" className="rounded-lg bg-amber-500/10 p-3 text-sm">结果未知。执行器可能仍在运行，先读取实际状态，不要重复派发。</p> : null}
-        {actual !== undefined ? <Approvals session={session} actual={actual} conversationId={conversationId} /> : null}
+        {canRead ? (
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-xs text-muted-foreground">{actual !== undefined ? "已读取实际状态" : "尚未读取实际状态"}</p>
+            <ActionButton disabled={!workspace.writable || !session.native_session_id} action={() => workspace.run(() => workspace.readSession(session))}>核对执行状态</ActionButton>
+          </div>
+        ) : null}
+        {session.state === "unknown" ? <p role="status" className="rounded-lg bg-amber-500/10 p-3 text-sm">结果未知。请到执行设备核对原进程与外部结果，不要重复派发。</p> : null}
+        {hasPendingRequests(actual) ? <p role="status" className="text-sm">此会话有待处理请求，请查看会话详情并到执行设备人工核对。</p> : null}
         <Collapsible>
           <CollapsibleTrigger asChild>
-            <Button type="button" variant="ghost" className="h-auto min-h-9 gap-2 px-0 text-muted-foreground [&[data-state=open]>svg]:rotate-180">会话详情<ChevronDownIcon className="size-4 shrink-0 transition-transform" /></Button>
+            <Button type="button" variant="ghost" className="h-auto min-h-9 gap-2 px-0 text-muted-foreground [&[data-state=open]>svg]:rotate-180">会话详情<ChevronDownIcon aria-hidden="true" className="size-4 shrink-0 transition-transform" /></Button>
           </CollapsibleTrigger>
           <CollapsibleContent className="grid gap-3 pt-3">
-            <DetailList pairs={[["会话 ID", session.session_id], ["版本", session.revision === undefined ? undefined : String(session.revision)]]} />
+            <DetailList pairs={[["会话 ID", session.session_id], ["版本", String(session.revision)]]} />
             {actual !== undefined ? <RawDetails title="实际执行状态" value={actual} /> : null}
           </CollapsibleContent>
         </Collapsible>
@@ -221,139 +231,41 @@ function SessionCard({ session, conversationId }: { session: SessionRecord; conv
 
 function CommandForm({ session, conversationId }: { session: SessionRecord; conversationId: string }) {
   const workspace = useWorkspace()
-  const [action, setAction] = useState("send")
   const [busy, setBusy] = useState(false)
   return (
     <Collapsible>
       <CollapsibleTrigger asChild>
-        <Button type="button" variant="ghost" className="h-auto min-h-9 gap-2 px-0 text-muted-foreground [&[data-state=open]>svg]:rotate-180">给执行器发指令<ChevronDownIcon className="size-4 shrink-0 transition-transform" /></Button>
+        <Button type="button" variant="ghost" disabled={!workspace.writable} className="h-auto min-h-9 gap-2 px-0 text-muted-foreground [&[data-state=open]>svg]:rotate-180">发送新一轮任务<ChevronDownIcon aria-hidden="true" className="size-4 shrink-0 transition-transform" /></Button>
       </CollapsibleTrigger>
       <CollapsibleContent forceMount className="pt-3 data-[state=closed]:hidden">
-        <form
-          onSubmit={(event) => {
-            event.preventDefault()
-            const form = event.currentTarget
-            if (!form.reportValidity()) return
-            const data = new FormData(form)
-            setBusy(true)
-            void workspace.run(async () => {
-              const next = parseAction({ type: action, text: String(data.get("text") ?? ""), turn_id: String(data.get("turn_id") ?? "") })
-              await workspace.operate(session, next, conversationId)
-              const text = form.elements.namedItem("text")
-              if (text instanceof HTMLTextAreaElement) text.value = ""
-            }).finally(() => setBusy(false))
-          }}
-        >
-          <FieldGroup>
-            <Field>
-              <FieldLabel htmlFor={`session-action-${session.session_id}`}>操作</FieldLabel>
-              <NativeSelect id={`session-action-${session.session_id}`} name="action" value={action} onChange={(event: ChangeEvent<HTMLSelectElement>) => setAction(event.target.value)}>
-                <NativeSelectOption value="send">发送新一轮任务</NativeSelectOption>
-                <NativeSelectOption value="steer">补充当前轮指令</NativeSelectOption>
-                <NativeSelectOption value="interrupt">中断当前轮</NativeSelectOption>
-              </NativeSelect>
-            </Field>
-            <Field hidden={action === "send"}>
-              <FieldLabel htmlFor={`session-turn-${session.session_id}`}>当前轮 ID</FieldLabel>
-              <Input id={`session-turn-${session.session_id}`} name="turn_id" required={action !== "send"} />
-            </Field>
-            {action === "interrupt" ? null : (
+        <form onSubmit={(event) => {
+          event.preventDefault()
+          const form = event.currentTarget
+          if (!form.reportValidity()) return
+          const text = String(new FormData(form).get("text") ?? "").trim()
+          setBusy(true)
+          void workspace.run(async () => {
+            await workspace.operate(session, { type: "send", text }, conversationId)
+            form.reset()
+          }).finally(() => setBusy(false))
+        }}>
+          <fieldset disabled={!workspace.writable} className="min-w-0">
+            <FieldGroup>
               <Field>
-                <FieldLabel htmlFor={`session-text-${session.session_id}`}>内容</FieldLabel>
-                <Textarea id={`session-text-${session.session_id}`} name="text" rows={3} required={action !== "interrupt"} />
+                <FieldLabel htmlFor={`session-text-${session.target_node}-${session.session_id}`}>内容</FieldLabel>
+                <Textarea id={`session-text-${session.target_node}-${session.session_id}`} name="text" rows={3} required maxLength={50000} />
               </Field>
-            )}
-            <SubmitButton busy={busy} variant="secondary">提交操作</SubmitButton>
-          </FieldGroup>
+              <SubmitButton busy={busy} variant="secondary">发送任务</SubmitButton>
+            </FieldGroup>
+          </fieldset>
         </form>
       </CollapsibleContent>
     </Collapsible>
   )
 }
 
-type ApprovalRequest = {
-  id: string | number
-  threadId?: string
-  raw: unknown
-}
-
-function readApprovals(actual: unknown): ApprovalRequest[] {
-  if (!actual || typeof actual !== "object" || !("pending_requests" in actual) || !Array.isArray(actual.pending_requests)) return []
-  const requests: ApprovalRequest[] = []
-  for (const request of actual.pending_requests) {
-    if (!request || typeof request !== "object" || !("id" in request)) continue
-    if (typeof request.id !== "string" && (typeof request.id !== "number" || !Number.isSafeInteger(request.id))) continue
-    if (typeof request.id === "string" && !request.id) continue
-    let threadId: string | undefined
-    if ("params" in request && request.params && typeof request.params === "object" && "threadId" in request.params) {
-      if (typeof request.params.threadId !== "string") continue
-      threadId = request.params.threadId
-    }
-    requests.push({ id: request.id, threadId, raw: request })
-  }
-  return requests
-}
-
-function Approvals({ session, actual, conversationId }: { session: SessionRecord; actual: unknown; conversationId: string }) {
-  return (
-    <>
-      {readApprovals(actual).map((request) => {
-        if (request.threadId && request.threadId !== session.native_session_id) return null
-        return <ApprovalForm key={`${typeof request.id}:${request.id}`} session={session} request={request} conversationId={conversationId} />
-      })}
-    </>
-  )
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value)
-}
-
-function ApprovalForm({
-  session,
-  request,
-  conversationId,
-}: {
-  session: SessionRecord
-  request: ApprovalRequest
-  conversationId: string
-}) {
-  const workspace = useWorkspace()
-  const [busy, setBusy] = useState(false)
-  return (
-    <section className="grid gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
-      <h3 className="text-sm font-semibold">等待人工审批</h3>
-      <RawDetails title="原始审批请求" value={request.raw} />
-      <form
-        onSubmit={(event) => {
-          event.preventDefault()
-          const form = event.currentTarget
-          if (!form.reportValidity()) return
-          setBusy(true)
-          void workspace.run(async () => {
-            const text = String(new FormData(form).get("response") ?? "")
-            let value: unknown
-            try {
-              value = JSON.parse(text)
-            } catch {
-              throw new Error("审批回复必须是有效 JSON。请按原始请求的格式填写。")
-            }
-            if (!isObject(value)) throw new Error("审批回复必须是 JSON 对象。")
-            await workspace.operate(session, { type: "respond_request", request_id: request.id, response: value }, conversationId)
-            workspace.clearActual(session)
-          }).finally(() => setBusy(false))
-        }}
-      >
-        <FieldGroup>
-          <Field>
-            <FieldLabel htmlFor={`approval-${session.session_id}-${request.id}`}>回复内容（JSON）</FieldLabel>
-            <Textarea id={`approval-${session.session_id}-${request.id}`} name="response" rows={3} required placeholder='{"decision":"decline"}' />
-          </Field>
-          <SubmitButton busy={busy}>发送人工决定</SubmitButton>
-        </FieldGroup>
-      </form>
-    </section>
-  )
+function hasPendingRequests(actual: unknown) {
+  return Boolean(actual && typeof actual === "object" && "pending_requests" in actual && Array.isArray(actual.pending_requests) && actual.pending_requests.length > 0)
 }
 
 function ResolveForm({ targetNode, operationId }: { targetNode: string; operationId: string }) {
@@ -372,21 +284,23 @@ function ResolveForm({ targetNode, operationId }: { targetNode: string; operatio
         }).finally(() => setBusy(false))
       }}
     >
-      <FieldGroup>
-        <p>只有你确认原进程和外部结果后，才能解除此操作占用的资源。</p>
-        <Field>
-          <FieldLabel htmlFor={`evidence-${operationId}`}>核查证据</FieldLabel>
-          <Textarea id={`evidence-${operationId}`} name="evidence" rows={3} required minLength={12} />
-        </Field>
-        <Field>
-          <FieldLabel htmlFor={`outcome-${operationId}`}>经本人核查的结果</FieldLabel>
-          <NativeSelect id={`outcome-${operationId}`} name="outcome" defaultValue="failed">
-            <NativeSelectOption value="failed">未完成，原执行已结束</NativeSelectOption>
-            <NativeSelectOption value="succeeded">已完成，结果已经核实</NativeSelectOption>
-          </NativeSelect>
-        </Field>
-        <SubmitButton busy={busy} variant="secondary">记录核查结果并解除占用</SubmitButton>
-      </FieldGroup>
+      <fieldset disabled={!workspace.writable} className="min-w-0">
+        <FieldGroup>
+          <p>只有你确认原进程和外部结果后，才能解除此操作占用的资源。</p>
+          <Field>
+            <FieldLabel htmlFor={`evidence-${operationId}`}>核查证据</FieldLabel>
+            <Textarea id={`evidence-${operationId}`} name="evidence" rows={3} required minLength={12} />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor={`outcome-${operationId}`}>经本人核查的结果</FieldLabel>
+            <NativeSelect id={`outcome-${operationId}`} name="outcome" defaultValue="failed">
+              <NativeSelectOption value="failed">未完成，原执行已结束</NativeSelectOption>
+              <NativeSelectOption value="succeeded">已完成，结果已经核实</NativeSelectOption>
+            </NativeSelect>
+          </Field>
+          <SubmitButton busy={busy} variant="secondary">记录核查结果并解除占用</SubmitButton>
+        </FieldGroup>
+      </fieldset>
     </form>
   )
 }

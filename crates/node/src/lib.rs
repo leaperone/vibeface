@@ -13,5 +13,6 @@ pub mod network;
 pub mod peer;
 pub mod runtime;
 pub mod scheduler;
+pub mod scheduling;
 pub mod store;
 pub mod update;

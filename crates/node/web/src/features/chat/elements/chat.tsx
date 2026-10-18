@@ -16,17 +16,20 @@ import {
 import { messageKey } from '../protocol.ts'
 import type { TranscriptMessage } from '../types.ts'
 import { Message } from './message.tsx'
+import type { ReactNode } from 'react'
 
 export function Chat({
   messages,
   emptyTitle,
   emptyDetail,
+  children,
 }: {
   messages: TranscriptMessage[]
   emptyTitle: string
   emptyDetail: string
+  children?: ReactNode
 }) {
-  if (messages.length === 0) {
+  if (messages.length === 0 && !children) {
     return (
       <Empty className="min-h-0 overflow-y-auto">
         <EmptyHeader>
@@ -51,6 +54,7 @@ export function Chat({
                 <Message message={message} />
               </MessageScrollerItem>
             ))}
+            {children}
           </MessageScrollerContent>
         </MessageScrollerViewport>
         <MessageScrollerButton aria-label="回到最新消息" />

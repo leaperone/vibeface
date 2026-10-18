@@ -4,17 +4,15 @@ use crate::{
     manager::{self, ManagerConfig, ManagerError, ManagerKind},
     model::{BlobRef, Context, EventBody, NodeRole},
     runtime::{Access, Runtime, Update},
+    scheduling::{JobOutcome, JobState, SchedulerJob, TriggerKind},
     store::Store,
 };
 use anyhow::{Context as _, Result, ensure};
-use serde::{Deserialize, Serialize};
+use futures_util::FutureExt;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use vibeface_bridge::agent::CustomToolConfig;
@@ -30,177 +28,34 @@ const CONSTRAINTS: &[&str] = &[
     "A completed executor turn requires assessment against the task acceptance criteria.",
 ];
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum InvocationState {
-    Running,
-    Completed,
-    Failed,
-    Unknown,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct Invocation {
-    state: InvocationState,
-    boot: String,
-    trigger: String,
-    message_id: String,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct LocalSession {
-    native_id: Option<String>,
-    sdk_config: Option<String>,
-    active: Option<Invocation>,
-}
-
-fn boot_id() -> &'static str {
+pub(crate) fn boot_id() -> &'static str {
     static BOOT: OnceLock<String> = OnceLock::new();
     BOOT.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
-fn key(kind: &str, conversation: &str, trigger: &str) -> String {
-    format!(
-        "scheduler:{kind}:{}",
-        digest(&serde_json::to_vec(&(conversation, trigger)).expect("string tuple serializes"))
-    )
-}
-
-fn load_session(store: &Store, network: &str, conversation: &str) -> Result<LocalSession> {
-    store
-        .local_value(network, &key("session", conversation, ""))?
-        .map(serde_json::from_value)
-        .transpose()
-        .map(|v| v.unwrap_or_default())
-        .map_err(Into::into)
-}
-
-fn save_session(
-    store: &mut Store,
-    network: &str,
-    conversation: &str,
-    session: &LocalSession,
-) -> Result<()> {
-    store.local_set(
-        network,
-        &key("session", conversation, ""),
-        &serde_json::to_value(session)?,
-    )
-}
-
-fn save_invocation(
-    store: &mut Store,
-    network: &str,
-    conversation: &str,
-    invocation: &Invocation,
-) -> Result<()> {
-    store.local_set(
-        network,
-        &key("invocation", conversation, &invocation.trigger),
-        &serde_json::to_value(invocation)?,
-    )
-}
-
-fn claim(
-    store: &mut Store,
-    network: &str,
-    conversation: &str,
-    trigger: &str,
-    boot: &str,
-    sdk_config: &str,
-) -> Result<(Invocation, Option<String>, bool)> {
-    if let Some(value) = store.local_value(network, &key("invocation", conversation, trigger))? {
-        let mut previous: Invocation = serde_json::from_value(value)?;
-        if previous.state == InvocationState::Running && previous.boot != boot {
-            previous.state = InvocationState::Unknown;
-            save_invocation(store, network, conversation, &previous)?;
-        }
-        return Ok((previous, None, false));
-    }
-    let mut session = load_session(store, network, conversation)?;
-    if let Some(active) = session.active.take() {
-        let mut active: Invocation = serde_json::from_value(
-            store
-                .local_value(network, &key("invocation", conversation, &active.trigger))?
-                .context("missing active scheduler invocation")?,
-        )?;
-        if active.state == InvocationState::Running {
-            ensure!(
-                active.boot != boot,
-                "a scheduler invocation is already running for this conversation"
-            );
-            active.state = InvocationState::Unknown;
-            save_invocation(store, network, conversation, &active)?;
-        }
-        if active.state == InvocationState::Unknown {
-            session.native_id = None;
-        }
-    }
-    if session.sdk_config.as_deref() != Some(sdk_config) {
-        session.native_id = None;
-        session.sdk_config = Some(sdk_config.into());
-    }
-    let invocation = Invocation {
-        state: InvocationState::Running,
-        boot: boot.into(),
-        trigger: trigger.into(),
-        message_id: format!(
-            "scheduler-message-{}",
-            digest(&serde_json::to_vec(&(network, conversation, trigger))?)
-        ),
-    };
-    save_invocation(store, network, conversation, &invocation)?;
-    let previous = session.native_id.clone();
-    session.active = Some(invocation.clone());
-    save_session(store, network, conversation, &session)?;
-    Ok((invocation, previous, true))
-}
-
-fn finish(
-    store: &mut Store,
-    network: &str,
-    conversation: &str,
-    invocation: &Invocation,
-) -> Result<()> {
-    save_invocation(store, network, conversation, invocation)?;
-    let mut session = load_session(store, network, conversation)?;
-    if session
-        .active
-        .as_ref()
-        .is_some_and(|a| a.trigger == invocation.trigger)
-    {
-        session.active = (invocation.state == InvocationState::Unknown).then(|| invocation.clone());
-        if invocation.state == InvocationState::Unknown {
-            session.native_id = None;
-        }
-        save_session(store, network, conversation, &session)?;
-    }
-    Ok(())
-}
-
-fn invocation_value(invocation: &Invocation) -> Value {
-    json!({"state":invocation.state,"trigger":invocation.trigger,"message_id":invocation.message_id,
-        "result":if invocation.state == InvocationState::Completed { json!({"message_id":invocation.message_id}) } else { Value::Null }})
-}
-
 pub(crate) fn maintenance_idle(store: &Store, network: &str) -> Result<()> {
-    for scope in store.scopes(network)? {
-        if let Some(active) = load_session(store, network, &scope)?.active {
-            let invocation: Invocation = serde_json::from_value(
-                store
-                    .local_value(network, &key("invocation", &scope, &active.trigger))?
-                    .context("missing active scheduler invocation")?,
-            )?;
-            ensure!(
-                !matches!(
-                    invocation.state,
-                    InvocationState::Running | InvocationState::Unknown
-                ),
-                crate::maintenance::Busy("scheduler invocation requires reconciliation".into())
-            );
-        }
-    }
-    Ok(())
+    store.scheduler_maintenance_idle(network)
+}
+
+fn invocation_value(job: &SchedulerJob, network: &str) -> Value {
+    let mut value = serde_json::to_value(job).expect("scheduler job serializes");
+    value["network_id"] = json!(network);
+    value["read_only"] = json!(job.state.attempt().is_some_and(|attempt| attempt.read_only));
+    value["reply_message_id"] = if matches!(job.state, JobState::Completed { .. }) {
+        json!(job.message_id)
+    } else {
+        Value::Null
+    };
+    value["error"] = match &job.state {
+        JobState::Failed { detail, .. } | JobState::Unknown { detail, .. } => json!(detail),
+        _ => Value::Null,
+    };
+    value["result"] = if matches!(job.state, JobState::Completed { .. }) {
+        json!({"message_id":job.message_id})
+    } else {
+        Value::Null
+    };
+    value
 }
 
 pub async fn status(
@@ -210,23 +65,23 @@ pub async fn status(
     trigger: &str,
 ) -> Result<Value> {
     let _work = node.maintenance.enter()?;
+    let target = node.identity.node_id()?;
     let mut store = node.store.lock().await;
-    let Some(value) = store.local_value(network, &key("invocation", conversation, trigger))? else {
-        return Ok(json!({"state":"not_found","trigger":trigger,"result":null}));
-    };
-    let mut invocation: Invocation = serde_json::from_value(value)?;
-    if invocation.state == InvocationState::Running && invocation.boot != boot_id() {
-        invocation.state = InvocationState::Unknown;
-        save_invocation(&mut store, network, conversation, &invocation)?;
-    }
-    Ok(invocation_value(&invocation))
+    store.recover_scheduler_jobs(network, &target, boot_id())?;
+    Ok(
+        match store.scheduler_job(network, conversation, trigger, &target)? {
+            Some(job) => invocation_value(&job, network),
+            None => json!({"state":"not_found","trigger":trigger,"result":null}),
+        },
+    )
 }
 
+/// Invocation only consumes durable admissions. Shared DAG imports never create runnable work.
 pub async fn run(
     node: Arc<Runtime>,
     access: Access,
     conversation: String,
-    trigger: String,
+    requested_trigger: String,
 ) -> Result<Value> {
     let _work = node.maintenance.enter()?;
     ensure!(
@@ -247,160 +102,243 @@ pub async fn run(
         _ => anyhow::bail!("unknown management SDK"),
     };
     let sdk_config = digest(&serde_json::to_vec(&settings)?);
-    let network = &access.network_id;
-    let (context, mut invocation, previous, fresh) = {
+    let network = access.network_id.clone();
+    let target = node.identity.node_id()?;
+    let claimed = {
         let mut store = node.store.lock().await;
-        store.authorize_node(
-            network,
-            &node.identity.node_id()?,
-            Some(NodeRole::Scheduler),
-        )?;
-        let envelope = store
-            .event(network, &trigger)?
-            .context("scheduler trigger is not present")?;
-        let event = store.verify_event(network, &envelope)?;
-        ensure!(
-            event.scope_id == conversation,
-            "scheduler trigger belongs to another conversation"
-        );
-        ensure!(
-            matches!(&event.body, EventBody::MessagePosted { role, .. } if role == "user")
-                || matches!(&event.body, EventBody::ExecutionObserved { status, .. } if matches!(status.as_str(), "completed" | "succeeded" | "failed" | "rejected" | "interrupted")),
-            "invalid scheduler trigger"
-        );
-        if let EventBody::MessagePosted { scheduler_node, .. } = &event.body {
-            ensure!(
-                scheduler_node.as_deref() == Some(node.identity.node_id()?.as_str()),
-                "this message is addressed to another scheduler; send a new message to continue here"
-            );
+        store.authorize_node(&network, &target, Some(NodeRole::Scheduler))?;
+        let requested = store
+            .scheduler_job(&network, &conversation, &requested_trigger, &target)?
+            .context("trigger has not been durably admitted")?;
+        if !matches!(requested.state, JobState::Queued) {
+            return Ok(invocation_value(&requested, &network));
         }
-        let context = store.context(network, &conversation, &[])?;
-        ensure!(
-            context.missing.is_complete(),
-            "conversation has missing or conflicting history; synchronize it before scheduling"
-        );
-        let (invocation, previous, fresh) = claim(
-            &mut store,
-            network,
-            &conversation,
-            &trigger,
-            boot_id(),
-            &sdk_config,
-        )?;
-        (context, invocation, previous, fresh)
-    };
-    if !fresh {
-        return Ok(invocation_value(&invocation));
-    }
-
-    let token = uuid::Uuid::new_v4().to_string();
-    let started = AtomicBool::new(false);
-    let outcome: Result<Value> = async {
-        let facts = node.current_facts(network, &conversation).await?;
-        let (tasks, targets) = {
-            let store = node.store.lock().await;
-            let view = store.trust_bundle(network)?.context("missing network trust")?.project()?;
-            let targets = view.members.into_iter()
-                .filter(|n| !view.revoked.contains(&n.subject_id) && n.kind == crate::identity::IdentityKind::Node && n.node_roles.contains(&NodeRole::Executor)).map(|n| n.subject_id).collect::<Vec<_>>();
-            (serde_json::to_value(store.tasks(network, &conversation)?)?, targets)
+        let Some(claimed) =
+            store.claim_next(&network, &conversation, &target, boot_id(), &sdk_config)?
+        else {
+            let requested = store
+                .scheduler_job(&network, &conversation, &requested_trigger, &target)?
+                .context("admitted trigger missing")?;
+            return Ok(invocation_value(&requested, &network));
         };
-        let prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &node.config.roots)?;
+        claimed
+    };
+    let mut job = claimed.job;
+    let trigger = job.trigger.clone();
+    let attempt = job
+        .state
+        .attempt()
+        .context("claimed scheduler attempt missing")?
+        .clone();
+    let token = uuid::Uuid::new_v4().to_string();
+    let mut started = false;
+    let mut tools_fenced = false;
+    let mut registered = false;
+    let outcome: Result<Value> = std::panic::AssertUnwindSafe(async {
+        let (context, tasks, facts, targets) = {
+            let store = node.store.lock().await;
+            let context = store.context(&network, &conversation, &job.basis_heads)?;
+            let tasks = serde_json::to_value(store.tasks(&network, &conversation)?)?;
+            let facts = known_facts(&store, &context)?;
+            let view = store.trust_bundle(&network)?.context("missing network trust")?.project()?;
+            let targets = view.members.into_iter().filter(|n| !view.revoked.contains(&n.subject_id) && n.kind == crate::identity::IdentityKind::Node && n.node_roles.contains(&NodeRole::Executor)).map(|n| n.subject_id).collect::<Vec<_>>();
+            (context,tasks,facts,targets)
+        };
+        ensure!(context.missing.is_complete(), "conversation has missing or conflicting history; synchronize it before scheduling");
+        let mut prompt = materialize(&context, &trigger, &tasks, &facts, &targets, &node.config.roots)?;
+        if attempt.read_only { prompt.push_str("\nThis management call is read-only. Read status and summarize existing results for the human; no write tool is authorized.\n"); }
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
+        let custom_tools = if attempt.read_only { tools().into_iter().filter(|(name,_)| matches!(name.as_str(),"context"|"nodes"|"execution_status")).collect() } else { tools() };
         let config = ManagerConfig {
             kind, workspace: settings.workspace, model: settings.model,
             timeout_secs: node.config.timeout_secs,
             cursor_sdk_bin: settings.cursor_sdk_bin, node_bin: settings.node_bin,
             codex_bin: node.config.codex_bin.clone(), codex_sdk_script: settings.codex_sdk_script,
-            custom_tools: tools(),
-            tool_callback_url: Some(local_url.clone()),
-            tool_callback_token: Some(token.clone()),
-            tool_cli: Some(std::env::current_exe()?),
+            custom_tools,
+            tool_callback_url: Some(local_url.clone()), tool_callback_token: Some(token.clone()), tool_cli: Some(std::env::current_exe()?),
             tool_env: BTreeMap::from([
-                ("VIBEFACE_NODE_URL".into(), local_url),
-                ("VIBEFACE_TOOL_TOKEN".into(), token.clone()),
-                ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
-                ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
+                ("VIBEFACE_NODE_URL".into(), local_url), ("VIBEFACE_TOOL_TOKEN".into(), token.clone()),
+                ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()), ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
             ]),
         };
-        {
-            let mut store = node.store.lock().await;
-            store.reserve_budget(network, &utc_day(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()), 1, node.config.daily_decision_limit)?;
+        if job.kind == TriggerKind::Autonomous {
+            node.store.lock().await.reserve_budget(&network, &utc_day(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()), 1, node.config.daily_decision_limit)?;
         }
-        node.agent_tokens.lock().await.insert(token.clone(), Access { network_id: network.clone(), human: false, conversation_id: Some(conversation.clone()) });
+        let cancel = node.register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, attempt.read_only).await?;
+        registered = true;
         let persist_node = node.clone();
         let persist_network = network.clone();
         let persist_conversation = conversation.clone();
+        let persist_target = target.clone();
+        let persist_trigger = trigger.clone();
+        let persist_attempt = attempt.id.clone();
         let progress_node = node.clone();
         let progress_network = network.clone();
         let progress_conversation = conversation.clone();
         let progress_trigger = trigger.clone();
-        started.store(true, Ordering::Relaxed);
-        let result = manager::run_manager(&config, &prompt, previous.as_deref(), move |id| async move {
-            let mut store = persist_node.store.lock().await;
-            let mut session = load_session(&store, &persist_network, &persist_conversation)?;
-            session.native_id = Some(id);
-            save_session(&mut store, &persist_network, &persist_conversation, &session)
-        }, move |progress| {
-            let _ = progress_node.events.send(Update { network_id: progress_network.clone(), payload: json!({
+        let progress_attempt = attempt.id.clone();
+        let progress_sequence = std::sync::atomic::AtomicU64::new(0);
+        node.store.lock().await.mark_started(&network, &conversation, &target, &trigger, &attempt.id)?;
+        started = true;
+        let result = manager::run_manager(&config, &prompt, claimed.previous_native_id.as_deref(), move |id| async move {
+            persist_node.store.lock().await.save_scheduler_native_id(&persist_network, &persist_conversation, &persist_target, &persist_trigger, &persist_attempt, &id)
+        }, cancel, move |progress| {
+            let sequence = progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            progress_node.publish_progress(&progress_network, json!({
                 "type":"manager_progress", "conversation_id":progress_conversation,
-                "trigger":progress_trigger, "progress":progress,
-            }) });
+                "trigger":progress_trigger, "invocation_id":progress_attempt, "source":progress_node.identity.node_id().ok(), "source_node":progress_node.identity.node_id().ok(), "sequence":sequence, "progress":progress,
+            }));
             async { Ok(()) }
         }).await?;
-        node.agent_tokens.lock().await.remove(&token);
+        node.fence_manager_attempt(&attempt.id).await?;
+        tools_fenced = true;
         let mut blobs = Vec::new();
         let output = if result.output.trim().is_empty() {
-            "调度器已完成本轮处理，请查看工单与执行会话状态。".into()
+            "管理 Agent 已完成本轮处理，可查看任务与执行状态。".into()
         } else if result.output.len() > INLINE_OUTPUT {
             let blob = BlobRef { hash: digest(result.output.as_bytes()), size: result.output.len() as u64 };
-            node.store.lock().await.put_blob(network, &blob, result.output.as_bytes())?;
-            let text = format!("{}\n\n[完整调度结果保存在附件 {}，可通过 context 工具读取。]", prefix(&result.output, INLINE_OUTPUT), blob.hash);
+            node.store.lock().await.put_blob(&network, &blob, result.output.as_bytes())?;
+            let text = format!("{}\n\n完整结果可从本条消息的附件打开。", prefix(&result.output, INLINE_OUTPUT));
             blobs.push(blob);
             text
         } else { result.output };
-        node.append_blobs(network, &conversation, EventBody::DecisionRecorded {
-            decision_id: format!("decision-{}", invocation.message_id), text: output.clone(),
-            effective_constraints: CONSTRAINTS.iter().map(|s| (*s).into()).collect(),
-            tool_configuration: json!({"provider":settings.provider,"model":config.model,"tools":tools().keys().collect::<Vec<_>>(),"trigger":trigger}),
-        }, blobs.clone()).await?;
-        node.append_blobs(network, &conversation, EventBody::MessagePosted {
-            message_id: invocation.message_id.clone(), role: "assistant".into(), text: output, scheduler_node: None,
-        }, blobs).await?;
-        invocation.state = InvocationState::Completed;
-        {
-            let mut store = node.store.lock().await;
-            finish(&mut store, network, &conversation, &invocation)?;
-        }
-        node.raise_notification(network, &conversation, "manager_response", "调度器已回复，可查看会话。").await?;
-        Ok(invocation_value(&invocation))
-    }.await;
-    node.agent_tokens.lock().await.remove(&token);
-    if let Err(error) = outcome {
-        if invocation.state != InvocationState::Completed {
+        let events = vec![
+            (EventBody::DecisionRecorded {
+                decision_id: format!("decision-{}", job.message_id), text: output.clone(),
+                effective_constraints: CONSTRAINTS.iter().map(|s| (*s).into()).collect(),
+                tool_configuration: json!({"provider":settings.provider,"model":config.model,"tools":config.custom_tools.keys().collect::<Vec<_>>(),"trigger":trigger,"read_only":attempt.read_only}),
+            }, blobs.clone()),
+            (EventBody::MessagePosted { message_id: job.message_id.clone(), role:"assistant".into(), text:output, scheduler_node:None },blobs),
+            (EventBody::NotificationRaised { notification_id:format!("manager:{}:completed",attempt.id),kind:"manager_response".into(),text:"管理 Agent 已回复。".into() },vec![]),
+        ];
+        job = node.store.lock().await.finish_job(&node.identity, &network, &conversation, &target, &trigger, &attempt.id, JobOutcome::Completed, events, crate::runtime::now_ms())?;
+        Ok(invocation_value(&job, &network))
+    }).catch_unwind().await.unwrap_or_else(|_| Err(anyhow::anyhow!("management attempt panicked; reconcile its outcome")));
+    let final_result: Result<Value> = async {
+        if let Err(error) = outcome {
+            if node.store.lock().await.scheduler_publication_pending(
+                &network,
+                &conversation,
+                &target,
+                &trigger,
+            )? {
+                let current = node
+                    .store
+                    .lock()
+                    .await
+                    .scheduler_job(&network, &conversation, &trigger, &target)?
+                    .context("management job missing")?;
+                let mut value = invocation_value(&current, &network);
+                value["publication_pending"] = json!(true);
+                return Ok(value);
+            }
+            let cancellation = error
+                .downcast_ref::<ManagerError>()
+                .is_some_and(|e| e.cancelled());
             let uncertain = error
                 .downcast_ref::<ManagerError>()
-                .map(|e| e.uncertain)
-                .unwrap_or_else(|| started.load(Ordering::Relaxed));
-            invocation.state = if uncertain {
-                InvocationState::Unknown
-            } else {
-                InvocationState::Failed
-            };
-            {
-                let mut store = node.store.lock().await;
-                finish(&mut store, network, &conversation, &invocation)?;
+                .map(|e| e.uncertain())
+                .unwrap_or(started);
+            if !registered {
+                tools_fenced = true;
             }
-            let text = if uncertain {
-                "调度调用的结果未知，请先核对执行状态；系统没有重新发送。"
+            if !tools_fenced {
+                tools_fenced = node.fence_manager_attempt(&attempt.id).await.is_ok();
+            }
+            let current = node
+                .store
+                .lock()
+                .await
+                .scheduler_job(&network, &conversation, &trigger, &target)?
+                .context("scheduler job missing")?;
+            let cancelled_before_start =
+                !started && matches!(current.state, JobState::Cancelling { .. });
+            let terminal = if (cancellation || cancelled_before_start) && tools_fenced {
+                JobOutcome::Cancelled(
+                    if cancelled_before_start {
+                        "cancelled before the SDK start boundary"
+                    } else {
+                        "SDK confirmed cancellation; Node tools are fenced"
+                    }
+                    .into(),
+                )
+            } else if uncertain || !tools_fenced {
+                JobOutcome::Unknown(error.to_string())
             } else {
-                "调度调用失败，请检查本机 SDK 配置或调用额度；系统没有重新发送。"
+                JobOutcome::Failed(error.to_string())
             };
-            node.raise_notification(network, &conversation, "manager_attention", text)
-                .await?;
+            let text = match terminal {
+                JobOutcome::Unknown(_) => {
+                    "管理调用的结果未知。系统已保留原调用，不会重发；请核对执行状态。"
+                }
+                JobOutcome::Cancelled(_) => "当前回复已停止，已派发的后台任务继续单独跟踪。",
+                _ => "管理调用失败，可检查本机 SDK 配置或自主调用额度。",
+            };
+            job = node.store.lock().await.finish_job(
+                &node.identity,
+                &network,
+                &conversation,
+                &target,
+                &trigger,
+                &attempt.id,
+                terminal,
+                vec![(
+                    EventBody::NotificationRaised {
+                        notification_id: format!("manager:{}:attention", attempt.id),
+                        kind: "manager_attention".into(),
+                        text: text.into(),
+                    },
+                    vec![],
+                )],
+                crate::runtime::now_ms(),
+            )?;
+            if tools_fenced && matches!(job.state, JobState::Unknown { .. }) {
+                node.store.lock().await.fence_manager_unknown(
+                    &network,
+                    &conversation,
+                    &target,
+                    &trigger,
+                    &attempt.id,
+                )?;
+            }
+            return Ok(invocation_value(&job, &network));
         }
-        return Err(error);
+        outcome
     }
-    outcome
+    .await;
+    node.finish_manager_attempt(&attempt.id).await;
+    if final_result.is_ok() {
+        publish_job(&node, &network, &conversation, &job);
+    }
+    final_result
+}
+
+fn publish_job(node: &Runtime, network: &str, conversation: &str, job: &SchedulerJob) {
+    let _ = node.events.send(Update { network_id: network.into(), payload: json!({"type":"changed","conversation_id":conversation,"trigger":job.trigger,"state":job.state.name()}) });
+}
+
+fn known_facts(store: &Store, context: &Context) -> Result<Value> {
+    let mut sessions = BTreeMap::new();
+    let mut operations = BTreeMap::new();
+    for event in &context.events {
+        if let EventBody::DispatchRecorded {
+            target_node,
+            session_id,
+            operation_id,
+            ..
+        } = &event.body
+        {
+            if let Some(session) = store.session(&context.network_id, target_node, session_id)? {
+                sessions.insert((target_node.clone(), session_id.clone()), session);
+            }
+            if let Some(operation) = store.operation(&context.network_id, operation_id)? {
+                operations.insert(operation_id.clone(), operation);
+            }
+        }
+    }
+    Ok(
+        json!({"freshness":"locally_known","sessions":sessions.into_values().collect::<Vec<_>>(),"operations":operations.into_values().collect::<Vec<_>>(),"note":"Read the relevant execution Node before a write; this summary performs no remote reconciliation."}),
+    )
 }
 
 fn prefix(text: &str, max_bytes: usize) -> &str {
@@ -571,164 +509,7 @@ fn utc_day(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        crypto::LocalIdentity,
-        model::{Event, MissingDependencies, WIRE_VERSION},
-    };
-
-    #[test]
-    fn invocation_replay_and_crash_do_not_relaunch_or_reuse_unknown_sdk_state() -> Result<()> {
-        let identity = LocalIdentity::generate();
-        let network = identity.fixture_network_id()?;
-        let mut store = Store::open(":memory:")?;
-        store.install_trust_bundle(
-            &network,
-            &identity
-                .sign_network_fixture(1, vec![identity.certificate(vec![NodeRole::Scheduler])?])?,
-        )?;
-        let (first, _, fresh) = claim(&mut store, &network, "chat", "trigger", "boot-a", "sdk-a")?;
-        assert!(fresh);
-        assert!(!claim(&mut store, &network, "chat", "trigger", "boot-a", "sdk-a")?.2);
-        assert!(claim(&mut store, &network, "chat", "other", "boot-a", "sdk-a").is_err());
-        let mut session = load_session(&store, &network, "chat")?;
-        session.native_id = Some("local-sdk-session".into());
-        save_session(&mut store, &network, "chat", &session)?;
-        let (old, _, fresh) = claim(&mut store, &network, "chat", "trigger", "boot-b", "sdk-a")?;
-        assert!(!fresh);
-        assert!(old.state == InvocationState::Unknown);
-        let (mut next, native, fresh) = claim(
-            &mut store,
-            &network,
-            "chat",
-            "new-human-input",
-            "boot-b",
-            "sdk-a",
-        )?;
-        assert!(fresh && native.is_none());
-        next.state = InvocationState::Completed;
-        finish(&mut store, &network, "chat", &next)?;
-        let mut session = load_session(&store, &network, "chat")?;
-        session.native_id = Some("completed-sdk-session".into());
-        let mut stale = next.clone();
-        stale.state = InvocationState::Running;
-        session.active = Some(stale);
-        save_session(&mut store, &network, "chat", &session)?;
-        let (mut after_crash, native, fresh) = claim(
-            &mut store,
-            &network,
-            "chat",
-            "after-completion-crash",
-            "boot-c",
-            "sdk-a",
-        )?;
-        assert!(fresh);
-        assert_eq!(native.as_deref(), Some("completed-sdk-session"));
-        assert!(
-            serde_json::from_value::<Invocation>(
-                store
-                    .local_value(&network, &key("invocation", "chat", &next.trigger))?
-                    .unwrap()
-            )?
-            .state
-                == InvocationState::Completed
-        );
-        after_crash.state = InvocationState::Completed;
-        finish(&mut store, &network, "chat", &after_crash)?;
-        assert!(
-            claim(
-                &mut store,
-                &network,
-                "chat",
-                "new-provider",
-                "boot-c",
-                "sdk-b"
-            )?
-            .1
-            .is_none()
-        );
-        assert!(
-            claim(
-                &mut store,
-                &network,
-                "other-chat",
-                &first.trigger,
-                "boot-b",
-                "sdk-a"
-            )?
-            .2
-        );
-        assert!(
-            !claim(
-                &mut store,
-                &network,
-                "chat",
-                "new-human-input",
-                "boot-b",
-                "sdk-a"
-            )?
-            .2
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn unknown_scheduler_blocks_updates_until_new_user_work_completes() -> Result<()> {
-        let identity = LocalIdentity::generate();
-        let network = identity.fixture_network_id()?;
-        let mut store = Store::open(":memory:")?;
-        store.install_trust_bundle(
-            &network,
-            &identity
-                .sign_network_fixture(1, vec![identity.certificate(vec![NodeRole::Scheduler])?])?,
-        )?;
-        store.append_event(
-            &identity,
-            &network,
-            "chat",
-            EventBody::ConversationCreated {
-                title: "test".into(),
-            },
-            vec![],
-            1,
-        )?;
-        let (mut invocation, _, _) = claim(
-            &mut store,
-            &network,
-            "chat",
-            "old-user-message",
-            "boot-a",
-            "sdk",
-        )?;
-        let mut session = load_session(&store, &network, "chat")?;
-        session.native_id = Some("uncertain-sdk-session".into());
-        save_session(&mut store, &network, "chat", &session)?;
-        invocation.state = InvocationState::Unknown;
-        finish(&mut store, &network, "chat", &invocation)?;
-        assert!(maintenance_idle(&store, &network).is_err());
-        let (old, native, fresh) = claim(
-            &mut store,
-            &network,
-            "chat",
-            "old-user-message",
-            "boot-b",
-            "sdk",
-        )?;
-        assert!(old.state == InvocationState::Unknown && native.is_none() && !fresh);
-        let (mut next, native, fresh) = claim(
-            &mut store,
-            &network,
-            "chat",
-            "new-user-message",
-            "boot-b",
-            "sdk",
-        )?;
-        assert!(fresh && native.is_none());
-        assert!(maintenance_idle(&store, &network).is_err());
-        next.state = InvocationState::Completed;
-        finish(&mut store, &network, "chat", &next)?;
-        maintenance_idle(&store, &network)?;
-        Ok(())
-    }
+    use crate::model::{Event, MissingDependencies, WIRE_VERSION};
 
     #[test]
     fn context_is_bounded_keeps_original_offsets_and_excludes_other_conversations() -> Result<()> {
