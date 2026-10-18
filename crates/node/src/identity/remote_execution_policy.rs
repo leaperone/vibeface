@@ -62,14 +62,18 @@ struct DelegationRecord {
 }
 
 fn finish_response(input: &Value, output: Value, mut usage: ExecutionProofUsage) -> Result<Value> {
-    #[cfg(test)]
-    let before_wire_metadata = usage.counts();
     ensure!(
         serde_json::to_vec(input)?.len() + serde_json::to_vec(&output)?.len() <= MAX_PROOF_BYTES,
         "remote execution policy input and output exceed 64 KiB"
     );
-    usage.record_metadata(input)?;
-    usage.record_metadata(&output)?;
+    let mut response_metadata = output.clone();
+    for field in ["delegation", "snapshot", "page", "witness"] {
+        if let Some(value) = response_metadata.get_mut(field) {
+            let hash = ObjectHash::body(&*value)?;
+            *value = json!({"signed_object_hash":hash});
+        }
+    }
+    usage.record_metadata(&response_metadata)?;
     if let Some(counts) =
         vibeface_secure::signature_verification::SignatureVerification::current_counts()
     {
@@ -79,17 +83,7 @@ fn finish_response(input: &Value, output: Value, mut usage: ExecutionProofUsage)
         );
         usage.record_actual_signature_counts(counts);
     }
-    let checked = usage.enforce_limits();
-    #[cfg(test)]
-    if checked.is_err() {
-        eprintln!(
-            "remote_policy_budget before_wire={before_wire_metadata:?} total={:?} input_bytes={} output_bytes={}",
-            usage.counts(),
-            serde_json::to_vec(input)?.len(),
-            serde_json::to_vec(&output)?.len(),
-        );
-    }
-    checked?;
+    usage.enforce_limits()?;
     Ok(output)
 }
 
@@ -99,7 +93,6 @@ fn record_request_usage(
 ) -> Result<()> {
     usage.record_signed(&request.intent)?;
     usage.record_signed(&request.delegation)?;
-    usage.record_metadata(request)?;
     Ok(())
 }
 
@@ -508,13 +501,11 @@ impl Store {
             );
             saved.delegation.verify_signature()?;
             usage.record_signed(&saved.delegation)?;
-            usage.record_metadata(&saved)?;
             return finish_response(params, json!({"delegation":saved.delegation}), usage);
         }
         let delegation = sign_remote_execution_policy_read_delegation(&verified, &signer, now)?;
         usage.record_signed(&delegation)?;
         let saved = DelegationRecord { intent, delegation };
-        usage.record_metadata(&saved)?;
         let response = finish_response(params, json!({"delegation":saved.delegation}), usage)?;
         tx.execute(
             "INSERT INTO identity_meta(key,value) VALUES(?,?)",
@@ -639,6 +630,7 @@ impl Store {
         );
         let (verified, cached, mut usage) =
             verify_record(&tx, &self.policy, &record, &local, principal, now)?;
+        usage.record_metadata(&request)?;
         if let Some(cached) = cached {
             if cached.payload.request_cursor == request.cursor {
                 return finish_response(params, json!({"page":cached}), usage);
@@ -766,7 +758,8 @@ impl Store {
                 && record.snapshot.payload.request_hash == request.request_hash,
             "remote execution policy witness request changed"
         );
-        let (_, _, usage) = verify_record(&tx, &self.policy, &record, &local, principal, now)?;
+        let (_, _, mut usage) = verify_record(&tx, &self.policy, &record, &local, principal, now)?;
+        usage.record_metadata(&request)?;
         finish_response(
             params,
             json!({"witness":record.witness.context("remote execution policy import is not complete")?}),
