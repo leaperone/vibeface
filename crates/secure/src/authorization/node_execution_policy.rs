@@ -59,7 +59,7 @@ pub struct NodeExecutionHistoryPolicyReadIntent {
     pub source_provenance: Option<ObjectHash>,
     pub source_project: ResourceRef,
     pub expected_action: Action,
-    pub reference: remote_execution_history::RemoteExecutionHistoryReference,
+    pub reference: Box<remote_execution_history::RemoteExecutionHistoryReference>,
     pub execution_pins: Vec<PolicyPin>,
     pub nonce: Nonce,
     pub issued_at_ms: u64,
@@ -163,7 +163,7 @@ impl NodeExecutionPolicyReadRequest {
     pub fn history(&self) -> Option<&remote_execution_history::RemoteExecutionHistoryReference> {
         match self {
             Self::Current(_) => None,
-            Self::History(value) => Some(&value.payload.reference),
+            Self::History(value) => Some(value.payload.reference.as_ref()),
         }
     }
 }
@@ -276,7 +276,7 @@ impl TaskExecutionPolicyRequest {
     }
     pub fn history(&self) -> Option<&remote_execution_history::RemoteExecutionHistoryReference> {
         match self {
-            Self::Account(value) => value.intent.payload.history.as_ref(),
+            Self::Account(value) => value.intent.payload.history.as_deref(),
             Self::Node(value) => value.history(),
         }
     }

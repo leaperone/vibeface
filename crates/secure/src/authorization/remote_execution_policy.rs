@@ -52,7 +52,7 @@ pub struct RemoteExecutionPolicyReadIntent {
     pub nonce: Nonce,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
-    pub history: Option<RemoteExecutionHistoryReference>,
+    pub history: Option<Box<RemoteExecutionHistoryReference>>,
 }
 
 macro_rules! policy_object {
@@ -588,7 +588,7 @@ pub fn build_remote_execution_history_policy_read_intent(
                 nonce: Nonce::random()?,
                 issued_at_ms: now,
                 expires_at_ms: expires,
-                history: Some(reference),
+                history: Some(Box::new(reference)),
             },
             signer,
         )?;
@@ -1774,7 +1774,7 @@ impl VerifiedRemoteExecutionHistoryPolicy {
         self.inner
             .intent()
             .history
-            .as_ref()
+            .as_deref()
             .ok_or(AuthorizationError::InvalidProof(
                 "historical policy has no original artifact reference",
             ))

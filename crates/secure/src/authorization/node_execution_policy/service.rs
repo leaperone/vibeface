@@ -413,7 +413,7 @@ pub fn verify_node_history_policy_source(
                 .map(|source| source.digest().clone()),
             source_project: facts.resource.clone(),
             expected_action: facts.action,
-            reference: reference.clone(),
+            reference: Box::new(reference.clone()),
             execution_pins: trust.pins().to_vec(),
             nonce: Nonce::random()?,
             issued_at_ms: now,
