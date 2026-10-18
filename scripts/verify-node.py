@@ -693,15 +693,19 @@ class Client:
                     "goal": goal, "acceptance": acceptance}
         response = self.rpc("create_task", conversation_id=conversation, task_id=task_id,
                             title=title, goal=goal, acceptance=acceptance)
-        envelope = response["creation"]
-        require(response["authority_public_key"] == authority.node_public_key
-                and response["task"]["task_creation"] == envelope,
-                "task response matches the independently pinned author and signed creation")
+        envelope = response["event"]
         verified = self.command("verify_event", envelope=envelope,
                                 space_id=self.scope["space_id"], resource_id=self.resource_id,
                                 author_public_key=authority.node_public_key)
-        require(verified["body"]["scope_id"] == conversation and verified["body"]["body"] == intended,
-                "signed task creation matches the independently specified conversation and task intent")
+        require(verified["body"]["author"] == authority.node_id
+                and verified["body"]["scope_id"] == conversation and verified["body"]["body"] == intended,
+                "signed task creation matches the independently pinned author, conversation and task intent")
+        projected = [task for task in self.rpc("conversation", conversation_id=conversation)["tasks"]
+                     if task["task_id"] == task_id]
+        require(len(projected) == 1 and all(projected[0][field] == value for field, value in {
+            "conversation_id": conversation, "title": title, "goal": goal,
+            "acceptance": acceptance, "event_hash": verified["hash"]}.items()),
+            "task projection retains the verified creation hash and original task intent")
         self.tasks[(self.scope["space_id"], self.resource_id, conversation, task_id)] = {
             "task_ref": verified["hash"],
             "authority_node": authority.node_id, "authority_public_key": authority.node_public_key}
@@ -1056,9 +1060,8 @@ def fixture_records(run, filename="manager-invocations.jsonl"):
 def stop_fixture_processes(run):
     if (run / "fixture-isolation.json").exists():
         stop_fixture_containers(run, remove=True)
-        return
     records = fixture_records(run) + fixture_records(run, "fixture-invocations.jsonl") + fixture_records(run, "codex-rpc.jsonl")
-    for pid in {record["pid"] for record in records}:
+    for pid in {record["pid"] for record in records if record["fixture_home"] == str(run)}:
         result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
         if str(run) in result.stdout and "--fixture-" in result.stdout:
             try:
@@ -2473,9 +2476,10 @@ def verify_remote_readonly(run, project, executor, outsider, registered, *, conn
         reader_share = create_execution_share(project, executor, registered, conversation, task, session, purpose="resolution")
         reader = {**writer, "share": reader_share, "approve": False}
         source.command("save_trust", trust_ref="remote-execution", trust=owner.command("get_trust", trust_ref="execution"))
-        gate = run / (label + "-complete")
+        gate = Path(open_spec["cwd"]) / (label + "-complete")
         sent = request(source.scope["space_id"], conversation, executor, label + "-send", session,
-                       {"type": "send", "text": json.dumps({"label": label, "gate": str(gate)})},
+                       {"type": "send", "text": json.dumps({"label": label, "gate": str(gate),
+                                                            "fixture_cwd": open_spec["cwd"]})},
                        revision=current["revision"], task=task)
         sent.update(binding=binding, resources=[open_spec["cwd"]])
         source.rpc("operate", request=sent, remote=writer, connection=connection)
@@ -2596,6 +2600,7 @@ def verify_remote_readonly(run, project, executor, outsider, registered, *, conn
 
 
 def verify_remote_topology(run, binary, workspace, fixture, helper, module, nodes, *, gateway=False):
+    isolation = fixture_isolation(run)
     group = [Node(run, name, binary, workspace, fixture, helper, module)
              for name in ("REMOTE_A", "REMOTE_B", "REMOTE_C")]
     nodes.extend(group)
@@ -2607,6 +2612,9 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
                                       "mdns": False, "relay_enabled": True}}
         if gateway and index == 0:
             configuration["roles"] = ["gateway", "replica", "relay"]
+        if index == 2:
+            disabled = str(Path(shutil.which("false")).resolve())
+            configuration.update(execution_isolation=isolation, claude_bin=disabled, codex_bin=disabled)
         node.configure(**configuration)
         node.start()
         node.bootstrap()
@@ -2652,9 +2660,10 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
     require(current["target_node"] == executor.node_id and current["binding_generation"] == 1,
             "native WASM verifies the C session receipt against the exact B binding")
     outsider.client.rpc("conversation", conversation_id=conversation, status=400)
-    gate = run / "remote-complete"
+    gate = workspace / "remote-complete"
     sent = request(source.scope["space_id"], conversation, executor, "remote-send", session,
-                   {"type": "send", "text": json.dumps({"label": "remote-result", "gate": str(gate), "result_size": 128})},
+                   {"type": "send", "text": json.dumps({"label": "remote-result", "gate": str(gate),
+                                                        "fixture_cwd": str(workspace), "result_size": 128})},
                    revision=current["revision"], task=task)
     sent.update(binding=opened["binding"], resources=[str(workspace)])
     source.rpc("operate", request=sent, remote=remote, connection=connection)
@@ -2724,7 +2733,8 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
     source.rpc("create_conversation", connection="team", conversation_id="team-only", title="Team isolation")
     source.rpc("conversation", conversation_id="team-only", status=400)
     gateway_report = finish_independent_gateway(outsider, project, executor, gateway_card, gateway_domains, conversation) if gateway else None
-    return {"gateway": gateway_report, "accounts": [node.client.scope["account_id"] for node in group],
+    return {"gateway": gateway_report, "execution_fixture_image": isolation["image"],
+            "accounts": [node.client.scope["account_id"] for node in group],
             "nodes": [node.node_id for node in group], "execution_resource": registered["resource_id"],
             "source_domains_before": sorted(source_domains), "executor_domains_before": sorted(executor_domains),
             "team_space": team["scope"]["space_id"], "original_request": "remote-original-request.json", "readonly": readonly,
@@ -3798,6 +3808,7 @@ def acceptance(options):
         for node in reversed(nodes):
             node.stop()
             node.client.close()
+        stop_fixture_processes(run)
         private_json(run / "report.json", report)
 
 
