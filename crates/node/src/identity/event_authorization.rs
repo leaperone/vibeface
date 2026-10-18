@@ -1503,12 +1503,13 @@ pub(crate) fn append_execution_handoff_observation_in(
 
 fn verify_resolution_observation_in(
     policy: &PolicyState,
-    _connection: &Connection,
+    connection: &Connection,
     result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffResolutionResult,
 ) -> Result<()> {
     let at = result.receipt.payload.issued_at_ms;
     let historical = policy.historical(&result.freshness.challenge.policies, at)?;
     let resolver = super::execution_handoff::resolution_resolver_from(
+        connection,
         policy,
         &historical,
         &result.resolution,
@@ -1521,12 +1522,13 @@ fn verify_resolution_observation_in(
 
 fn verify_terminal_reconciliation_in(
     policy: &PolicyState,
-    _connection: &Connection,
+    connection: &Connection,
     result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffTerminalReconciliationResult,
     now_ms: u64,
 ) -> Result<()> {
     let historical = policy.historical(&result.freshness.challenge.policies, now_ms)?;
     let resolver = super::execution_handoff::resolution_resolver_from(
+        connection,
         policy,
         &historical,
         &result.reconciliation,
@@ -2499,7 +2501,7 @@ mod tests {
         resign(&mut fixture)?;
         let changed = append_fixture(&mut fixture)?.remove(0);
         let event: Event = serde_json::from_str(&changed.canonical_body)?;
-        let events = load_events_from(&fixture.connection, &event.network_id)?;
+        let events = load_events_from(&fixture.connection, &fixture.policy, &event.network_id)?;
         let original_view =
             OriginalAdmissionView::load(&fixture.connection, &fixture.policy, admission(&event))?;
         let historical = original_view.state();
@@ -2595,7 +2597,7 @@ mod tests {
             session_id: "s1".into(),
             expected_revision: 0,
             basis_heads: heads_from_events(
-                &load_events_from(&fixture.connection, fixture.auth.resource().space.as_str())?,
+                &load_events_from(&fixture.connection, &fixture.policy, fixture.auth.resource().space.as_str())?,
                 "chat",
             ),
             action: open_spec,
@@ -2636,7 +2638,7 @@ mod tests {
             &request.network_id,
             &dispatch,
         )?;
-        let dispatch_events = load_events_from(&fixture.connection, &request.network_id)?;
+        let dispatch_events = load_events_from(&fixture.connection, &fixture.policy, &request.network_id)?;
         let original_view =
             OriginalAdmissionView::load(&fixture.connection, &fixture.policy, &original)?;
         let historical = original_view.state();
@@ -2762,7 +2764,7 @@ mod tests {
         );
         let receiver = Connection::open_in_memory()?;
         receiver.execute_batch(include_str!("../../migrations/202610180001_initial.sql"))?;
-        let events = load_events_from(&fixture.connection, &request.network_id)?;
+        let events = load_events_from(&fixture.connection, &fixture.policy, &request.network_id)?;
         assert_eq!(
             validate_event_evidence(&fixture.policy, &receiver, &event, &events)?,
             EventEvidenceStatus::Valid
@@ -2875,7 +2877,7 @@ mod tests {
             space.as_str(),
             &message,
         )?;
-        let all = load_events_from(&fixture.connection, space.as_str())?;
+        let all = load_events_from(&fixture.connection, &fixture.policy, space.as_str())?;
         let project_events = all
             .iter()
             .filter(|(_, e)| e.event.resource_id == original_resource)
@@ -3079,7 +3081,7 @@ mod tests {
             network.space.as_str(),
             &envelope,
         )?;
-        let events = load_events_from(&store.connection, network.space.as_str())?;
+        let events = load_events_from(&store.connection, &store.policy, network.space.as_str())?;
         assert_eq!(
             validate_event_evidence(&store.policy, &store.connection, &event, &events)?,
             EventEvidenceStatus::Valid

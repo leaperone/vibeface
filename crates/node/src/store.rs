@@ -65,6 +65,19 @@ fn schema_objects(connection: &Connection) -> Result<Vec<(String, String, String
 fn validate_persisted_state(connection: &Connection) -> Result<crate::identity::journal::PolicyState> {
     let snapshot = if connection.is_autocommit() { Some(connection.unchecked_transaction()?) } else { None };
     let mut policy = crate::identity::journal::PolicyState::load(connection)?;
+    let local_keys = connection.prepare(
+        "SELECT DISTINCT d.device_id,d.public_key,n.public_key FROM local_devices d JOIN node_certificates n ON n.space_id=d.space_id AND n.node_id=d.device_id ORDER BY d.public_key,d.device_id",
+    )?.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (device, public_key, certificate_key) in local_keys {
+        ensure!(public_key == certificate_key && crate::crypto::fingerprint(&public_key)? == device,
+            "local device key differs from its stored certificate");
+        let source = vibeface_secure::authorization::PublicKey::parse(&public_key)?;
+        crate::identity::foreign_execution_policy::rehydrate_task_execution_policy_in(
+            connection, &mut policy, &source,
+        )?;
+    }
+    crate::identity::foreign_execution_policy::validate_task_execution_policy_links_in(connection, &policy)?;
     let mut statement = connection.prepare("SELECT space_id,revision,bundle FROM spaces")?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -87,7 +100,7 @@ fn validate_persisted_state(connection: &Connection) -> Result<crate::identity::
             "stored space projection differs from verified policy"
         );
         seen.insert(id);
-        load_events_from(connection, &space)?;
+        load_events_from(connection, &policy, &space)?;
     }
     let expected: BTreeSet<_> = policy
         .pins()
@@ -474,6 +487,7 @@ impl Store {
     }
     pub fn verify_event(&self, network_id: &str, envelope: &SignedEvent) -> Result<Event> {
         let event = crate::identity::event_authorization::verify_event_envelope(
+            &self.connection,
             &self.policy,
             network_id,
             envelope,
@@ -506,7 +520,7 @@ impl Store {
         } else {
             tx.execute("INSERT INTO events(space_id,resource_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?,'pending')",params![network_id,event.resource_id.as_str(),envelope.hash,event.scope_id,event.author,event.sequence,encoded])?;
         }
-        rebuild_projections_from(&tx, network_id)?;
+        rebuild_projections_from(&tx, &self.policy, network_id)?;
         tx.commit()?;
         let status: String = self.connection.query_row(
             "SELECT status FROM events WHERE space_id=? AND hash=?",
@@ -520,7 +534,7 @@ impl Store {
         })
     }
     fn load_events(&self, network_id: &str) -> Result<BTreeMap<String, StoredEvent>> {
-        load_events_from(&self.connection, network_id)
+        load_events_from(&self.connection, &self.policy, network_id)
     }
     pub fn event(&self, network_id: &str, hash: &str) -> Result<Option<SignedEvent>> {
         optional_json(
@@ -670,7 +684,7 @@ impl Store {
             "INSERT INTO blobs(space_id,hash,size,content) VALUES(?,?,?,?) ON CONFLICT(space_id,hash) DO UPDATE SET size=excluded.size,content=excluded.content",
             params![network_id, expected.hash, expected.size, content],
         )?;
-        rebuild_projections_from(&tx, network_id)?;
+        rebuild_projections_from(&tx, &self.policy, network_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -698,7 +712,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        rebuild_projections_from(&tx, network_id)?;
+        rebuild_projections_from(&tx, &self.policy, network_id)?;
         tx.commit()?;
         Ok(())
     }
@@ -1476,9 +1490,12 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
-pub(crate) fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result<()> {
-    let policy = crate::identity::journal::PolicyState::load(connection)?;
-    let mut events = load_events_from(connection, network_id)?;
+pub(crate) fn rebuild_projections_from(
+    connection: &Connection,
+    policy: &crate::identity::journal::PolicyState,
+    network_id: &str,
+) -> Result<()> {
+    let mut events = load_events_from(connection, policy, network_id)?;
     let mut author_sequences: BTreeMap<(String, String, u64), Vec<String>> = BTreeMap::new();
     for (hash, e) in &events {
         author_sequences
@@ -1784,14 +1801,15 @@ pub(crate) fn heads_from_events(
 }
 pub(crate) fn load_events_from(
     connection: &Connection,
+    policy: &crate::identity::journal::PolicyState,
     network_id: &str,
 ) -> Result<BTreeMap<String, StoredEvent>> {
     let result = load_retained_event_rows_from(connection, network_id)?;
-    let policy = crate::identity::journal::PolicyState::load(connection)?;
     for stored in result.values() {
         ensure!(
             crate::identity::event_authorization::verify_event_envelope(
-                &policy,
+                connection,
+                policy,
                 network_id,
                 &stored.envelope,
             )? == stored.event,
@@ -3164,7 +3182,7 @@ mod tests {
             vec![root.hash.clone()],
         )?;
         let old_event = store.verify_event(space, &old)?;
-        let events = load_events_from(&store.connection, space)?;
+        let events = load_events_from(&store.connection, &store.policy, space)?;
         crate::identity::event_authorization::current_event_authorization(
             &store.policy,
             &store.connection,
@@ -3194,7 +3212,7 @@ mod tests {
                 .is_err()
         );
         assert!(store.verify_event(space, &old).is_ok());
-        let events = load_events_from(&store.connection, space)?;
+        let events = load_events_from(&store.connection, &store.policy, space)?;
         assert!(
             crate::identity::event_authorization::current_event_authorization(
                 &store.policy,
@@ -3228,7 +3246,7 @@ mod tests {
                 .message(&mut fresh, "conversation", "denied")
                 .is_err()
         );
-        let fresh_events = load_events_from(&fresh.connection, space)?;
+        let fresh_events = load_events_from(&fresh.connection, &fresh.policy, space)?;
         assert!(
             crate::identity::event_authorization::current_event_authorization(
                 &fresh.policy,

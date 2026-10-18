@@ -443,20 +443,22 @@ fn verify_capsule_sdk(
 }
 
 fn verify_capsule_admission(
+    connection: &Connection,
     policy: &PolicyState,
     proof: &crate::model::AdmissionProof,
     facts: &vibeface_secure::authorization::RequestFacts,
     origin: Option<&CompactSdkOrigin>,
 ) -> Result<vibeface_secure::authorization::VerifiedAdmission> {
-    let historical = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
+    let historical = super::task_execution_context::OriginalAdmissionView::load(connection, policy, proof)?;
     let admitted = super::admission::reconstruct_admission_uncached(
+        connection,
         policy,
         proof,
         facts,
         &proof.transport.clone().into_evidence(),
     )?;
     verify_capsule_sdk(
-        &historical,
+        historical.state(),
         policy,
         proof,
         facts,
@@ -2056,6 +2058,7 @@ struct StoredResolution {
 }
 
 pub(super) fn resolution_resolver_from(
+    connection: &Connection,
     policy: &PolicyState,
     current: &VerifiedPolicySet,
     wire: &SignedExecutionHandoffResolution,
@@ -2063,7 +2066,7 @@ pub(super) fn resolution_resolver_from(
 ) -> Result<VerifiedAuthorization> {
     let facts = execution_resolution_account_facts(&wire.resolution)?;
     let proof = &wire.resolution.account_admission;
-    let admitted = verify_capsule_admission(policy, proof, &facts, None)?;
+    let admitted = verify_capsule_admission(connection, policy, proof, &facts, None)?;
     Ok(current.verify_operation_authorization(
         &admitted,
         &facts,
@@ -5028,6 +5031,7 @@ pub(crate) mod tests {
         assert_ne!(result.result["original_actor"], result.result["resolver"]);
         verify_execution_resolution_receipt_signature(&result)?;
         let resolver = resolution_resolver_from(
+            &fixture.store.connection,
             &fixture.store.policy,
             fixture.store.policy.verified(),
             &wire,
@@ -6167,7 +6171,7 @@ pub(crate) mod tests {
         let source_event: Event =
             serde_json::from_str(&fixture.wire.handoff.project_dispatch.canonical_body)?;
         let mut events =
-            load_events_from(&fixture.store.connection, fixture.project.space.as_str())?;
+            load_events_from(&fixture.store.connection, &fixture.store.policy, fixture.project.space.as_str())?;
         events.insert(
             fixture.wire.handoff.project_dispatch.hash.clone(),
             StoredEvent {

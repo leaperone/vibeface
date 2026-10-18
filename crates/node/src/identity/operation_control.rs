@@ -388,6 +388,7 @@ impl Store {
                 let completion = completions[0];
                 ensure!(
                     super::event_authorization::verify_event_envelope(
+                        &tx,
                         &self.policy,
                         &binding.binding.network_id,
                         &completion.envelope,

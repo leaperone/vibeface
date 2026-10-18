@@ -232,7 +232,7 @@ fn checkpoint_from_verified_in(
     for envelope in &anchors {
         let event: crate::model::Event = serde_json::from_str(&envelope.canonical_body)?;
         ensure!(
-            super::event_authorization::verify_event_envelope(policy, &event.network_id, envelope)?
+            super::event_authorization::verify_event_envelope(connection, policy, &event.network_id, envelope)?
                 == event,
             "local admission checkpoint has an invalid event signature"
         );

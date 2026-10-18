@@ -114,7 +114,7 @@ pub(crate) fn resolve_agent_origin(
     let source = events.get(trigger).context("agent trigger is missing")?;
     let event = &source.event;
     ensure!(
-        verify_event_envelope(policy, &event.network_id, &source.envelope)? == *event,
+        verify_event_envelope(connection, policy, &event.network_id, &source.envelope)? == *event,
         "agent trigger differs from its signed envelope"
     );
     if matches!(&event.body, EventBody::MessagePosted { role, text, .. } if role == "user" && !text.trim().is_empty())
@@ -211,7 +211,7 @@ pub(crate) fn resolve_agent_origin(
     let parent =
         event_authorization_in_view(policy, connection, state, &message.event, events, now_ms)?;
     ensure!(
-        verify_event_envelope(policy, &event.network_id, &message.envelope)? == message.event,
+        verify_event_envelope(connection, policy, &event.network_id, &message.envelope)? == message.event,
         "continuation account message differs from its signed envelope"
     );
     ensure!(
@@ -259,7 +259,7 @@ pub(crate) fn resolve_agent_origin(
         {
             continue;
         }
-        if verify_event_envelope(policy, &event.network_id, &events[hash].envelope)
+        if verify_event_envelope(connection, policy, &event.network_id, &events[hash].envelope)
             .is_ok_and(|verified| verified == *decision)
             && event_authorization_in_view(policy, connection, state, decision, events, now_ms)
                 .is_ok_and(|grant| {
