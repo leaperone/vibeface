@@ -356,6 +356,8 @@ mod tests {
         resource: ResourceRef,
         owner_grant: ObjectHash,
         service_grant: ObjectHash,
+        pins: Vec<PolicyPin>,
+        journal: Vec<JournalEntry>,
     }
 
     impl Fixture {
@@ -427,6 +429,8 @@ mod tests {
                 resource,
                 owner_grant: bundle.grant_leaf,
                 service_grant: service.hash().unwrap(),
+                pins,
+                journal: bundle.journal,
             }
         }
 
@@ -558,6 +562,90 @@ mod tests {
                 .install_space(Signed::sign(document, &self.root).unwrap())
                 .unwrap();
         }
+
+        fn snapshot(&self) -> policy_import::VerifiedPolicySnapshot {
+            let heads: Vec<_> = self
+                .pins
+                .iter()
+                .map(|pin| self.state.head(&pin.domain).unwrap().clone())
+                .collect();
+            let mut import =
+                policy_import::BoundedPolicyImport::new(self.pins.clone(), heads.clone()).unwrap();
+            for entry in &self.journal {
+                import.apply_entry(entry.clone()).unwrap();
+            }
+            import.finish(&heads).unwrap()
+        }
+
+        fn task_policy_source(
+            &self,
+            remote: &Fixture,
+        ) -> (
+            node_execution_policy::VerifiedTaskExecutionTrust,
+            remote_execution_policy::RemoteExecutionPolicySelection,
+            prepare::PrepareContext,
+            RequestFacts,
+        ) {
+            let source = remote_execution_policy::tests::confirmed_source(
+                &ClientAuthorizationBundle {
+                    journal: self.journal.clone(),
+                    grant_leaf: self.owner_grant.clone(),
+                },
+                &self.pins,
+                &self.user,
+                &self.node,
+                &self.resource,
+                NOW,
+            )
+            .unwrap();
+            let target = PublicKey::of(&remote.node);
+            let selection = remote_execution_policy::RemoteExecutionPolicySelection {
+                execution_resource: remote.resource.clone(),
+                target_public_key: target.clone(),
+                execution_grant: remote.service_grant.clone(),
+            };
+            let mut facts = self.agent_facts();
+            facts.action = Action::ExecutionOpen;
+            facts.context.task = Some(EventRef::parse(&"aa".repeat(32)).unwrap());
+            facts.context.executor_kind = Some("codex".into());
+            facts.context.execution_session = Some(SessionRef {
+                target: DeviceId::from_key(&target),
+                session_id: "foreign-execution".into(),
+            });
+            let mut read = facts.context.clone();
+            read.sdk_session = None;
+            let context = prepare::PrepareContext {
+                context: read,
+                binding_generation: Some(1),
+                canonical_cwd: Some("/workspace".into()),
+                execution_target_public_key: Some(target),
+            };
+            let encoded = remote_execution_policy::build_remote_execution_policy_read_intent(
+                &source,
+                &serde_json::to_string(&serde_json::json!({
+                    "selection":selection, "context":context, "expected_action":Action::ExecutionOpen,
+                    "purpose":remote_execution_policy::RemoteExecutionPolicyPurpose::Execution,
+                    "execution_pins":remote.pins,
+                })).unwrap(),
+                &self.user, NOW as f64, (NOW + 500) as f64,
+            ).unwrap();
+            let intent: Signed<remote_execution_policy::RemoteExecutionPolicyReadIntent> =
+                serde_json::from_str(&encoded).unwrap();
+            let verified =
+                remote_execution_policy::verify_remote_execution_policy_delegation_source(
+                    &self.state,
+                    &intent,
+                    &PublicKey::of(&self.node),
+                    &PublicKey::of(&self.user),
+                    NOW,
+                )
+                .unwrap();
+            let trust = node_execution_policy::approve_task_execution_policy(
+                &verified, None, &self.node, NOW,
+            )
+            .unwrap();
+            (trust, selection, context, facts)
+        }
     }
 
     #[test]
@@ -579,6 +667,191 @@ mod tests {
         assert_eq!(proof.initiating_grant(), Some(&fixture.service_grant));
         assert_eq!(proof.account_grant.as_ref(), Some(&fixture.owner_grant));
         assert!(proof.expires_at_ms() > NOW + 100_000);
+    }
+
+    #[test]
+    fn sdk_policy_source_precedes_foreign_certificate_and_complete_business_verification() {
+        use node_execution_policy::service::verify_node_service_policy_source;
+        let fixture = Fixture::new();
+        let remote = Fixture::with_keys(20, NOW + 1_000);
+        let parent = fixture.parent(&fixture.owner_grant, NOW);
+        let (trust, selection, context, facts) = fixture.task_policy_source(&remote);
+        assert!(
+            fixture
+                .state
+                .find_device(&DeviceId::from_key(&PublicKey::of(&remote.node)))
+                .is_err()
+        );
+        let (_, request) = verify_node_service_policy_source(
+            &fixture.state,
+            &fixture.pins,
+            &trust,
+            &parent,
+            &fixture.audience().service,
+            &fixture.service_grant,
+            &facts,
+            &selection,
+            &context,
+            None,
+            NOW + 400,
+            &fixture.node,
+            remote_execution_policy::RemoteExecutionPolicyPurpose::Execution,
+            NOW,
+            NOW + 200,
+        )
+        .unwrap();
+        let node_execution_policy::NodeExecutionPolicyReadRequest::Current(intent) = request else {
+            panic!("SDK source did not sign a Node Current request")
+        };
+        intent.verify_signature().unwrap();
+        assert_eq!(intent.issuer, PublicKey::of(&fixture.node));
+        assert!(intent.payload.context.context.sdk_session.is_none());
+        assert!(facts.context.sdk_session.is_some());
+        assert_eq!(
+            fixture
+                .state
+                .verify_service_delegation(
+                    &parent,
+                    &fixture.audience().service,
+                    &fixture.service_grant,
+                    &facts,
+                    NOW,
+                )
+                .unwrap_err(),
+            AuthorizationError::Revoked
+        );
+
+        // The original business gate succeeds only after genuine C policy is available.
+        let combined =
+            policy_import::merge_same_head_snapshots(&fixture.snapshot(), &remote.snapshot())
+                .unwrap();
+        let delegated = combined
+            .state()
+            .verify_service_delegation(
+                &parent,
+                &fixture.audience().service,
+                &fixture.service_grant,
+                &facts,
+                NOW,
+            )
+            .unwrap();
+        assert!(
+            delegated.heads().contains(
+                remote
+                    .state
+                    .head(&PolicyDomain::Account(remote.account.clone()))
+                    .unwrap()
+            )
+        );
+        let invocation = Signed::sign(
+            Invocation {
+                version: AUTH_VERSION,
+                actor: Actor::Service(delegated.service().clone()),
+                device: delegated.device().clone(),
+                initiator: delegated.initiator().clone(),
+                initiating_grant: delegated.initiating_grant().cloned(),
+                resource: facts.resource.clone(),
+                action: facts.action,
+                audience: facts.audience.clone(),
+                presenter: delegated.device().clone(),
+                operation_id: facts.operation_id.clone(),
+                body_hash: facts.body_hash.clone(),
+                grant_leaf: delegated.grant_leaf().clone(),
+                expected_policies: delegated.heads().to_vec(),
+                context: facts.context.clone(),
+                nonce: Nonce::from_bytes([98; 32]),
+                not_before_ms: NOW,
+                expires_at_ms: delegated.expires_at_ms(),
+            },
+            &fixture.node,
+        )
+        .unwrap();
+        let verified = combined
+            .state()
+            .verify_invocation(
+                &invocation,
+                &facts,
+                &TransportEvidence::LocalAgentAdapter {
+                    service: fixture.audience().service,
+                    session: facts.context.sdk_session.clone().unwrap(),
+                },
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(verified.dependencies(), delegated.heads());
+    }
+
+    #[test]
+    fn sdk_policy_source_rejects_wrong_adapter_expired_lease_and_revoked_grant() {
+        use node_execution_policy::service::verify_node_service_policy_source;
+        let mut fixture = Fixture::new();
+        let remote = Fixture::with_keys(20, NOW + 1_000);
+        let parent = fixture.parent(&fixture.owner_grant, NOW);
+        let (trust, selection, context, facts) = fixture.task_policy_source(&remote);
+        let mut wrong = facts.clone();
+        wrong.context.sdk_session.as_mut().unwrap().target =
+            DeviceId::from_key(&PublicKey::of(&remote.node));
+        assert!(matches!(
+            fixture.state.verify_sdk_policy_read_source(
+                &parent,
+                &fixture.audience().service,
+                &fixture.service_grant,
+                &wrong,
+                NOW,
+            ),
+            Err(AuthorizationError::InvalidProof(
+                "SDK policy source has no matching local adapter session"
+            ))
+        ));
+        wrong = facts.clone();
+        wrong.context.sdk_session = None;
+        assert!(matches!(
+            fixture.state.verify_sdk_policy_read_source(
+                &parent,
+                &fixture.audience().service,
+                &fixture.service_grant,
+                &wrong,
+                NOW,
+            ),
+            Err(AuthorizationError::InvalidProof(
+                "SDK policy source has no matching local adapter session"
+            ))
+        ));
+        assert!(matches!(
+            verify_node_service_policy_source(
+                &fixture.state,
+                &fixture.pins,
+                &trust,
+                &parent,
+                &fixture.audience().service,
+                &fixture.service_grant,
+                &facts,
+                &selection,
+                &context,
+                None,
+                NOW,
+                &fixture.node,
+                remote_execution_policy::RemoteExecutionPolicyPurpose::Execution,
+                NOW,
+                NOW + 200,
+            ),
+            Err(AuthorizationError::InvalidProof(
+                "native policy source exceeds its current SDK lease"
+            ))
+        ));
+        let removed = fixture.service_grant.clone();
+        fixture.update_space(|document| document.grants.retain(|grant| grant != &removed));
+        let parent = fixture.parent(&fixture.owner_grant, NOW);
+        assert!(matches!(
+            fixture.state.verify_sdk_policy_read_source(
+                &parent,
+                &fixture.audience().service,
+                &fixture.service_grant,
+                &facts,
+                NOW,
+            ),
+            Err(AuthorizationError::Revoked)
+        ));
     }
 
     #[test]
