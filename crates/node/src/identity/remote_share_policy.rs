@@ -2,14 +2,14 @@ use super::{
     client_policy_read::{bounded, check_heads_in, encode, finish_response, metadata, signer},
     journal::{AcceptedJournalCursor, AcceptedJournalSnapshot, PolicyState},
 };
-use crate::{crypto::LocalIdentity, model::SignedEvent, store::Store};
+use crate::{crypto::LocalIdentity, store::Store};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use vibeface_secure::{
     authorization::{
-        AUTH_VERSION, EventRef, MAX_PROOF_BYTES, Nonce, ObjectHash, PublicKey, Signed,
+        AUTH_VERSION, MAX_PROOF_BYTES, Nonce, ObjectHash, PublicKey, Signed,
         execution_handoff::ExecutionProofUsage,
         policy_proof::policy_entry_payload_usage,
         remote_share::{
@@ -82,32 +82,46 @@ fn check_source_task(
     request: &Signed<RemoteSharePolicyReadRequest>,
 ) -> Result<()> {
     let intent = request.payload.intent.intent();
-    let creation = &intent.task_creation;
-    let event: crate::model::Event = serde_json::from_str(&creation.canonical_body)?;
+    let task = &intent.task_creation.payload;
     let context = &request.payload.intent.invocation().payload.context;
     ensure!(
-        matches!(&event.body, crate::model::EventBody::TaskCreated { .. })
-            && event.network_id == intent.project.space.as_str()
-            && event.resource_id == intent.project.resource
-            && context.conversation.as_deref() == Some(event.scope_id.as_str())
-            && context.task.as_ref() == Some(&EventRef::parse(&creation.hash)?),
+        task.project == intent.project
+            && task.source_node_public_key == intent.source_node_public_key
+            && context.conversation.as_deref() == Some(task.conversation_id.as_str())
+            && context.task.as_ref() == Some(&task.task),
         "remote share selected Task changed its Project or scope"
     );
-    let row: Option<(String, String, String, String, u64)> = connection
+    let ready: Option<bool> = connection
         .query_row(
-            "SELECT envelope,resource_id,scope_id,author,sequence FROM events WHERE space_id=? AND hash=? AND status='ready' AND length(CAST(envelope AS BLOB))<=?",
-            params![intent.project.space.as_str(), creation.hash, MAX_PROOF_BYTES],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            "WITH selected AS (
+                SELECT resource_id,scope_id,author,sequence,
+                    json_extract(envelope,'$.hash') AS envelope_hash,
+                    json_extract(envelope,'$.canonical_body') AS body
+                FROM events WHERE space_id=?1 AND hash=?2 AND status='ready'
+            ) SELECT 1 FROM selected
+                WHERE resource_id=?3 AND scope_id=?4 AND author=?5 AND sequence=?6
+                AND envelope_hash=?2
+                AND json_extract(body,'$.space_id')=?1
+                AND json_extract(body,'$.resource_id')=?3
+                AND json_extract(body,'$.scope_id')=?4
+                AND json_extract(body,'$.author')=?5
+                AND json_extract(body,'$.sequence')=?6
+                AND json_extract(body,'$.body.type')='task_created'
+                AND json_extract(body,'$.body.task_id')=?7",
+            params![
+                task.project.space.as_str(),
+                task.task.as_str(),
+                task.project.resource.as_str(),
+                task.conversation_id,
+                task.author,
+                task.sequence,
+                task.task_id,
+            ],
+            |row| row.get(0),
         )
         .optional()?;
-    let (saved, resource, scope, author, sequence) =
-        row.context("remote share selected Task is not ready on its source")?;
     ensure!(
-        serde_json::from_str::<SignedEvent>(&saved)? == *creation
-            && resource == event.resource_id.as_str()
-            && scope == event.scope_id
-            && author == event.author
-            && sequence == event.sequence,
+        ready == Some(true),
         "remote share selected Task differs from its retained ready row"
     );
     if let Some(binding) = &intent.old_binding {
@@ -118,7 +132,7 @@ fn check_source_task(
                 params![
                     format!("task-binding-record:{hash}"),
                     intent.project.space.as_str(),
-                    format!("task-binding-current:{}", creation.hash),
+                    format!("task-binding-current:{}", task.task),
                     MAX_PROOF_BYTES,
                     MAX_PROOF_BYTES,
                 ],
@@ -545,13 +559,19 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::test_support::{TestNetwork, now};
+    use crate::{
+        identity::test_support::{TestNetwork, now},
+        model::SignedEvent,
+    };
     use vibeface_secure::{
         Identity,
         authorization::{
-            Action, Actor, Audience, DeviceId, Invocation, InvocationContext, PolicyDomain,
-            ResourceRef, ServiceId,
-            remote_share::{RemoteShareIntent, RemoteSharePurpose, SignedRemoteShareIntent},
+            Action, Actor, Audience, DeviceId, EventRef, Invocation, InvocationContext,
+            PolicyDomain, ResourceRef, ServiceId,
+            remote_share::{
+                RemoteShareIntent, RemoteSharePurpose, RemoteShareTaskAttestation,
+                SignedRemoteShareIntent,
+            },
         },
         signature_verification::SignatureVerification,
     };
@@ -573,6 +593,29 @@ mod tests {
         reader: &Identity,
     ) -> Result<Signed<RemoteSharePolicyReadRequest>> {
         let source = PublicKey::parse(&network.node.public_key_hex()?)?;
+        let task_event: crate::model::Event = serde_json::from_str(&task.canonical_body)?;
+        let crate::model::EventBody::TaskCreated { task_id, .. } = &task_event.body else {
+            anyhow::bail!("test sharing requires a TaskCreated event");
+        };
+        let project = ResourceRef {
+            space: network.space.clone(),
+            resource: network.resource.clone(),
+        };
+        let task_creation = Signed::sign(
+            RemoteShareTaskAttestation {
+                version: AUTH_VERSION,
+                project: project.clone(),
+                task: EventRef::parse(&task.hash)?,
+                task_id: task_id.clone(),
+                conversation_id: task_event.scope_id.clone(),
+                author: task_event.author.clone(),
+                sequence: task_event.sequence,
+                source_node_public_key: source.clone(),
+                issued_at_ms: now(),
+                expires_at_ms: now() + 90_000,
+            },
+            &signer(&network.node)?,
+        )?;
         let mut heads = [
             PolicyDomain::Account(network.account.clone()),
             PolicyDomain::Space(network.space.clone()),
@@ -591,11 +634,8 @@ mod tests {
         let intent = RemoteShareIntent {
             version: AUTH_VERSION,
             purpose: RemoteSharePurpose::Execution,
-            project: ResourceRef {
-                space: network.space.clone(),
-                resource: network.resource.clone(),
-            },
-            task_creation: task.clone(),
+            project,
+            task_creation,
             source_node_public_key: source.clone(),
             requester: network.account.clone(),
             requester_device: DeviceId::from_key(&PublicKey::of(&network.client)),
