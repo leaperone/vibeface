@@ -1041,7 +1041,7 @@ async fn dispatch_request(
                 .await?;
             Ok(serde_json::to_value(response)?)
         }
-        "info" => Ok(node.info()),
+        "info" => Ok(node.info().await),
         "authenticate" => {
             let (verified, response) = {
                 let mut store = node.store.lock().await;

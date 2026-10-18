@@ -3774,8 +3774,9 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn info(&self) -> Value {
-        json!({"node_id":self.identity.node_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
+    pub async fn info(&self) -> Value {
+        let initialized = !self.store.lock().await.trusted_policy_pins().is_empty();
+        json!({"node_id":self.identity.node_id().ok(),"public_key":self.identity.public_key_hex().ok(),"initialized":initialized,"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let mut receiver = self

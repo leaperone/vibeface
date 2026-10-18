@@ -306,7 +306,7 @@ async fn bearer_access(app: &App, headers: &HeaderMap) -> ApiResult<crate::model
 }
 
 async fn info(State(app): State<App>) -> Json<Value> {
-    Json(app.node.info())
+    Json(app.node.info().await)
 }
 
 #[derive(Deserialize)]
