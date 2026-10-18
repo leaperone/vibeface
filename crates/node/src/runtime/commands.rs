@@ -10,6 +10,7 @@ impl Runtime {
             "invalid command type"
         );
         let mut spec: CommandSpec = serde_json::from_value(spec)?;
+        spec.validate()?;
         spec.cwd = self.allowed_path(
             spec.cwd
                 .to_str()

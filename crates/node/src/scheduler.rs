@@ -550,7 +550,7 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
         (
             "command",
             "Run a simple authorized shell command without starting a coding Agent. Omitted cwd/target use the Bot project preference when available; otherwise supply an allowed cwd. Reuse the returned call_ref for retries; unknown outcomes require reconciliation.",
-            json!({"command":string(),"cwd":string(),"target_node":string(),"timeout_secs":{"type":"integer","minimum":1},"call_ref":string()}),
+            json!({"command":string(),"cwd":string(),"target_node":string(),"timeout_secs":{"type":"integer","minimum":1,"maximum":crate::command::MAX_TIMEOUT_SECS},"call_ref":string()}),
             vec!["command"],
         ),
         (

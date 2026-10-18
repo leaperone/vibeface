@@ -247,10 +247,15 @@ impl Runtime {
                 let target = self.agent_target(access, &resolved, name).await?;
                 let cwd = field(&resolved, "cwd")?;
                 if name == "command" {
+                    let maximum_timeout = self
+                        .config
+                        .timeout_secs
+                        .min(crate::command::MAX_TIMEOUT_SECS)
+                        .max(1);
                     let timeout = intent["timeout_secs"]
                         .as_u64()
-                        .unwrap_or(self.config.timeout_secs)
-                        .clamp(1, self.config.timeout_secs.max(1));
+                        .unwrap_or(maximum_timeout)
+                        .clamp(1, maximum_timeout);
                     vec![make(
                         target,
                         None,
@@ -745,4 +750,51 @@ fn active_turn(status: &Value) -> Option<&str> {
         )
     })?["id"]
         .as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn command_preparation_bounds_default_and_requested_timeouts_before_admission()
+    -> Result<()> {
+        let dir = crate::runtime::tests::fixture()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let cwd = dir.canonicalize()?;
+        let network = crate::runtime::tests::conversation(&node).await?;
+        assert_eq!(node.config.timeout_secs, 600);
+        let access = Access {
+            network_id: network.clone(),
+            human: false,
+            conversation_id: Some("chat".into()),
+            manager: None,
+        };
+        for (requested, expected) in [
+            (None, crate::command::MAX_TIMEOUT_SECS),
+            (Some(600), crate::command::MAX_TIMEOUT_SECS),
+            (Some(10), 10),
+            (Some(0), 1),
+        ] {
+            let mut intent =
+                json!({"command":"pwd","cwd":cwd,"target_node":node.identity.node_id()?});
+            if let Some(requested) = requested {
+                intent["timeout_secs"] = json!(requested);
+            }
+            let prepared = node
+                .prepare_agent_call(&access, "command", intent, None)
+                .await?;
+            assert_eq!(prepared.requests.len(), 1);
+            let spec = node.command_spec(&prepared.requests[0].action)?;
+            assert_eq!(spec.timeout_secs, expected);
+            spec.validate()?;
+            assert!(prepared.requests[0].session_id.is_none());
+        }
+        let invalid = json!({"type":"command","command":"pwd","cwd":cwd,"timeout_secs":crate::command::MAX_TIMEOUT_SECS+1});
+        assert!(node.command_spec(&invalid).is_err());
+        assert!(node.store.lock().await.operations(&network)?.is_empty());
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 }
