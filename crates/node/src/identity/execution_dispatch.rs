@@ -904,6 +904,78 @@ fn dispatch_authorization_from(
     Ok((source.envelope.clone(), auth))
 }
 
+struct RetainedDispatch {
+    source: crate::model::SignedEvent,
+    admission: crate::model::AdmissionProof,
+    request: OperationRequest,
+}
+
+fn retained_dispatch_from(
+    connection: &Connection,
+    identity: &LocalIdentity,
+    wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+) -> Result<RetainedDispatch> {
+    use vibeface_secure::authorization::{DeviceId, execution_observation::ExecutionObservationTarget};
+    let target = ExecutionObservationTarget::from_original(wire)?;
+    let space = target.source.project.space.as_str();
+    let operation = &target.source.operation_id;
+    let encoded: String = connection.query_row(
+        "SELECT value FROM local_values WHERE space_id=? AND key=?",
+        params![space, format!("project-execution-handoff:{operation}")], |row| row.get(0),
+    )?;
+    ensure!(serde_json::from_str::<vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff>(&encoded)? == *wire,
+        "remote result differs from its durable submitted carrier");
+    let encoded: String = connection.query_row(
+        "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
+        params![space,operation],|row|row.get(0),
+    )?;
+    let request: OperationRequest = serde_json::from_str(&encoded)?;
+    let admission = super::admission::admission_for_operation_from(connection,space,operation)?;
+    let source = &wire.handoff.project_dispatch;
+    let event: crate::model::Event = serde_json::from_str(&source.canonical_body)?;
+    let (saved,resource,scope,author,sequence):(String,String,String,String,u64) = connection.query_row(
+        "SELECT envelope,resource_id,scope_id,author,sequence FROM events WHERE space_id=? AND hash=? AND status='ready'",
+        params![space,source.hash],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+    )?;
+    let local = PublicKey::parse(&identity.public_key_hex()?)?;
+    let checkpoint = wire.handoff.source_attestation.as_ref()
+        .context("remote result has no retained Project checkpoint")?;
+    checkpoint.verify_signature()?;
+    ensure!(checkpoint.issuer == local && checkpoint.payload == wire.handoff.source_statement()?
+        && wire.invocation.issuer == local
+        && admission.invocation.payload.audience.device == DeviceId::from_key(&local)
+        && admission.invocation.payload.resource == target.source.project
+        && serde_json::from_value::<OperationRequest>(admission.source_body["request"].clone())? == request
+        && serde_json::from_str::<crate::model::SignedEvent>(&saved)? == *source
+        && event.network_id == space && event.resource_id == target.source.project.resource
+        && resource == event.resource_id.as_str() && scope == event.scope_id
+        && author == event.author && sequence == event.sequence
+        && event.scope_id == request.conversation_id
+        && matches!(&event.cause,crate::model::EventCause::Invocation{admission:proof} if proof == &admission)
+        && matches!(&event.body,crate::model::EventBody::DispatchRecorded{operation_id,action,..}
+            if operation_id == operation && *action == serde_json::to_value(&request)?),
+        "retained remote dispatch changed its host, admission, request or ready row");
+    Ok(RetainedDispatch { source:source.clone(), admission, request })
+}
+
+fn retained_dispatch_authorization(
+    policy: &VerifiedPolicySet,
+    retained: &RetainedDispatch,
+    wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+    now_ms: u64,
+) -> Result<VerifiedAuthorization> {
+    let source = policy.verify_project_execution_source(&wire.handoff,now_ms)?;
+    let admitted = source.original_admission(&wire.handoff,now_ms)?;
+    let invocation = &retained.admission.invocation.payload;
+    let facts = RequestFacts {
+        resource:invocation.resource.clone(), action:invocation.action,
+        audience:invocation.audience.clone(), operation_id:invocation.operation_id.clone(),
+        body_hash:ObjectHash::body(&retained.admission.source_body)?, context:invocation.context.clone(),
+    };
+    policy.verify_operation_authorization(&admitted,&facts,
+        &retained.admission.transport.clone().into_evidence(),now_ms).map_err(Into::into)
+}
+
 impl Store {
     pub fn execution_dispatch_handoff(
         &self,
@@ -1154,50 +1226,16 @@ impl Store {
         result: &vibeface_secure::authorization::execution_handoff::ExecutionHandoffResult,
         now_ms: u64,
     ) -> Result<()> {
-        let receipt = &result.receipt.payload;
-        let space = receipt.original_space_id.as_str();
-        let operation = &receipt.operation_id;
-        let (source, original) =
-            dispatch_authorization_from(&self.connection, &self.policy, space, operation, now_ms)?;
-        ensure!(
-            result.handoff.handoff.project_dispatch == source
-                && vibeface_secure::authorization::DeviceId::from_key(&PublicKey::parse(
-                    &identity.public_key_hex()?
-                )?) == original.audience().device,
-            "handoff observation belongs to another Project dispatch or host"
-        );
-        ensure!(
-            self.execution_dispatch_handoff(space, operation)?.as_ref() == Some(&result.handoff),
-            "handoff observation differs from its durable submitted carrier"
-        );
-        let verified = self.policy.verified().verify_execution_handoff_ack(
-            &result.handoff,
-            &original,
-            &result.receipt,
-            &result.result,
-            now_ms,
-        )?;
-        check_policy_heads_in(
-            &self.connection,
-            self.policy.verified(),
-            verified.original(),
-            now_ms,
-        )?;
-        check_policy_heads_in(
-            &self.connection,
-            self.policy.verified(),
-            verified.submission(),
-            now_ms,
-        )?;
-        let stored = self
-            .operation(space, operation)?
-            .context("observed operation is missing")?;
-        let event: crate::model::Event = serde_json::from_str(&source.canonical_body)?;
-        ensure!(
-            matches!(&event.body,crate::model::EventBody::DispatchRecorded {action,..}
-            if *action == serde_json::to_value(&stored.request)?),
-            "observed operation differs from its accepted dispatch"
-        );
+        let _signatures = vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let tx = self.connection.unchecked_transaction()?;
+        let current = PolicyState::reload_verified(&tx,&self.policy)?;
+        let retained = retained_dispatch_from(&tx,identity,&result.handoff)?;
+        let original = retained_dispatch_authorization(current.verified(),&retained,&result.handoff,now_ms)?;
+        let verified = current.verified().verify_execution_handoff_result(result,&original,now_ms)?;
+        check_policy_heads_in(&tx,current.verified(),verified.original(),now_ms)?;
+        check_policy_heads_in(&tx,current.verified(),verified.submission(),now_ms)?;
+        validate_operation_binding_from(&tx,&retained.request)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1208,32 +1246,20 @@ impl Store {
         now_ms: u64,
     ) -> Result<OperationRecord> {
         use vibeface_secure::authorization::execution_handoff::ExecutionHandoffResult;
+        let _signatures = vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let receipt = &result.receipt.payload;
         let space = receipt.original_space_id.as_str();
         let operation = &receipt.operation_id;
-        let (source, original) =
-            dispatch_authorization_from(&self.connection, &self.policy, space, operation, now_ms)?;
-        ensure!(
-            result.handoff.handoff.project_dispatch == source
-                && vibeface_secure::authorization::DeviceId::from_key(&PublicKey::parse(
-                    &identity.public_key_hex()?
-                )?) == original.audience().device,
-            "handoff result belongs to another Project dispatch or host"
-        );
-        let verified = self.policy.verified().verify_execution_handoff_ack(
-            &result.handoff,
-            &original,
-            &result.receipt,
-            &result.result,
-            now_ms,
-        )?;
         let state: OperationState = serde_json::from_value(serde_json::to_value(receipt.state)?)?;
         let wrapper = serde_json::to_value(result)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_policy_heads_in(&tx, self.policy.verified(), verified.original(), now_ms)?;
-        check_policy_heads_in(&tx, self.policy.verified(), verified.submission(), now_ms)?;
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = PolicyState::reload_verified(&tx,&self.policy)?;
+        let retained = retained_dispatch_from(&tx,identity,&result.handoff)?;
+        let source = &retained.source;
+        let original = retained_dispatch_authorization(current.verified(),&retained,&result.handoff,now_ms)?;
+        let verified = current.verified().verify_execution_handoff_result(result,&original,now_ms)?;
+        check_policy_heads_in(&tx,current.verified(),verified.original(),now_ms)?;
+        check_policy_heads_in(&tx,current.verified(),verified.submission(),now_ms)?;
         let saved_wire: String = tx.query_row(
             "SELECT value FROM local_values WHERE space_id=? AND key=?",
             params![space, format!("project-execution-handoff:{operation}")],
@@ -1275,11 +1301,15 @@ impl Store {
                 "execution acknowledgement moved backwards or changed its carrier"
             );
             if old_state == state && previous.result == result.result {
+                if old_state.terminal() {
+                    crate::store::validate_released_operation_reservations_from(&tx,space,operation)?;
+                }
                 tx.execute(
                     "UPDATE operations SET result=? WHERE space_id=? AND operation_id=?",
                     params![serde_json::to_string(&wrapper)?, space, operation],
                 )?;
                 tx.commit()?;
+                self.policy = current;
                 return Ok(OperationRecord {
                     request,
                     state: old_state,
@@ -1297,6 +1327,9 @@ impl Store {
                 || old_state == OperationState::Accepted,
             "execution acknowledgement moved backwards"
         );
+        super::admission::check_operation_reservations_in(&tx,&OperationRecord {
+            request:request.clone(),state:old_state,result:old_result.clone(),
+        })?;
         tx.execute(
             "UPDATE operations SET state=?,result=? WHERE space_id=? AND operation_id=?",
             params![
@@ -1309,10 +1342,11 @@ impl Store {
         if state != OperationState::Accepted {
             super::event_authorization::append_execution_handoff_observation_in(
                 &tx,
-                &self.policy,
+                &current,
                 identity,
-                &source,
+                source,
                 result,
+                &verified,
                 now_ms,
             )?;
         }
@@ -1323,6 +1357,7 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        self.policy = current;
         Ok(OperationRecord {
             request,
             state,
