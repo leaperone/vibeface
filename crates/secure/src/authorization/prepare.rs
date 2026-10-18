@@ -377,6 +377,8 @@ pub fn verify_remote_execution(
     (|| -> Result<VerifiedRemoteExecution> {
         let signatures = crate::signature_verification::ScopedSignatureVerification::new();
         let now = client_time(now_ms)?;
+        require(execution.intent().purpose != remote_execution_policy::RemoteExecutionPolicyPurpose::History,
+            "history policy cannot authorize remote execution")?;
         let baseline = execution.revalidate(auth, now)?;
         let source = client_policy_import::require_confirmed_client_policy(auth)?;
         let merged = policy_import::merge_same_head_snapshots(source, execution.snapshot())?;

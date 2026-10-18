@@ -1,5 +1,8 @@
 //! Purpose-bound policy reads for a separately pinned remote executor.
 
+use super::remote_execution_history::{
+    RemoteExecutionHistoryAcceptance, RemoteExecutionHistoryReference,
+};
 use super::{
     client_policy_import::{
         AuthorizationSelection, ClientPolicyContextReference,
@@ -19,6 +22,7 @@ pub enum RemoteExecutionPolicyPurpose {
     Execution,
     ObservationRead,
     Resolver,
+    History,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +50,7 @@ pub struct RemoteExecutionPolicyReadIntent {
     pub nonce: Nonce,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
+    pub history: Option<RemoteExecutionHistoryReference>,
 }
 
 macro_rules! policy_object {
@@ -86,7 +91,7 @@ pub struct RemoteExecutionPolicyReadRequest {
     pub delegation: Signed<RemoteExecutionPolicyReadDelegation>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteExecutionPolicySnapshot {
     pub version: u16,
@@ -97,6 +102,7 @@ pub struct RemoteExecutionPolicySnapshot {
     pub source_node_public_key: PublicKey,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
+    pub history: Option<RemoteExecutionHistoryAcceptance>,
 }
 policy_object!(
     RemoteExecutionPolicySnapshot,
@@ -204,6 +210,18 @@ fn pins(pins: &[PolicyPin]) -> Result<()> {
 
 fn purpose_action(purpose: RemoteExecutionPolicyPurpose, action: Action) -> Result<Action> {
     match purpose {
+        RemoteExecutionPolicyPurpose::History => {
+            require(
+                matches!(
+                    action,
+                    Action::OperationStatusRead
+                        | Action::OperationResolve
+                        | Action::OperationReconcile
+                ),
+                "history requires current Project read permission",
+            )?;
+            Ok(action)
+        }
         RemoteExecutionPolicyPurpose::ObservationRead | RemoteExecutionPolicyPurpose::Resolver => {
             require(
                 action == Action::OperationResolve,
@@ -316,6 +334,23 @@ fn check_source_claims(
     window(value.issued_at_ms, value.expires_at_ms, now)?;
     pins(&value.execution_pins)?;
     purpose_action(value.purpose, value.expected_action)?;
+    match (&value.history, value.purpose) {
+        (Some(reference), RemoteExecutionPolicyPurpose::History) => require(
+            reference.source.payload.project == value.source_selection.resource
+                && reference.source.issuer == current.audience_public_key
+                && reference.old_submission.payload.resource == value.selection.execution_resource
+                && reference.old_submission.payload.grant_leaf == value.selection.execution_grant
+                && reference.target_public_key == value.selection.target_public_key
+                && reference.context()? == value.context,
+            "history intent changed its original artifact selection or context",
+        )?,
+        (None, purpose) if purpose != RemoteExecutionPolicyPurpose::History => {}
+        _ => {
+            return Err(AuthorizationError::InvalidProof(
+                "remote policy purpose and history differ",
+            ));
+        }
+    }
     let project = ResourceRef {
         space: current.resources[0].payload.space.clone(),
         resource: current.resources[0].payload.resource.clone(),
@@ -404,6 +439,7 @@ pub fn build_remote_execution_policy_read_intent(
                 nonce: Nonce::random()?,
                 issued_at_ms: now,
                 expires_at_ms: expires,
+                history: None,
             },
             signer,
         )?;
@@ -415,6 +451,103 @@ pub fn build_remote_execution_policy_read_intent(
         finish_usage(&mut usage)?;
         encode(&intent)
             .map_err(|_| AuthorizationError::InvalidProof("remote intent encoding failed"))
+    })()
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryIntentInput {
+    actual_json: String,
+    body_json: String,
+    invocation_json: String,
+    binding_json: Option<String>,
+}
+
+#[cfg_attr(target_arch="wasm32",wasm_bindgen::prelude::wasm_bindgen(js_name=buildRemoteExecutionHistoryPolicyReadIntent))]
+pub fn build_remote_execution_history_policy_read_intent(
+    source: &VerifiedClientAuthorization,
+    input_json: &str,
+    independent_execution_pins_json: &str,
+    signer: &Identity,
+    now_ms: f64,
+    expires_at_ms: f64,
+) -> crate::Result<String> {
+    let _scope = ScopedSignatureVerification::new();
+    (|| -> Result<String> {
+        require(
+            input_json.len() <= execution_handoff::MAX_EXECUTION_HANDOFF_BYTES,
+            "historical artifact input is too large",
+        )?;
+        let input: HistoryIntentInput = serde_json::from_str(input_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid historical artifact input"))?;
+        let reference = super::remote_execution_history::derive_reference(
+            &input.actual_json,
+            &input.body_json,
+            &input.invocation_json,
+            input.binding_json.as_deref().unwrap_or(""),
+        )?;
+        let now = bootstrap::timestamp(now_ms)?;
+        let expires = bootstrap::timestamp(expires_at_ms)?;
+        window(now, expires, now)?;
+        let current = revalidate_source(source, now)?;
+        let action = [
+            Action::OperationStatusRead,
+            Action::OperationResolve,
+            Action::OperationReconcile,
+        ]
+        .into_iter()
+        .find(|action| current.actions.contains(action))
+        .ok_or(AuthorizationError::InvalidProof(
+            "history requires current Project read permission",
+        ))?;
+        let execution_pins: Vec<PolicyPin> = parse(independent_execution_pins_json)?;
+        pins(&execution_pins)?;
+        let context = reference.context()?;
+        let selection = RemoteExecutionPolicySelection {
+            execution_resource: reference.old_submission.payload.resource.clone(),
+            target_public_key: reference.target_public_key.clone(),
+            execution_grant: reference.old_submission.payload.grant_leaf.clone(),
+        };
+        let intent = Signed::sign(
+            RemoteExecutionPolicyReadIntent {
+                version: AUTH_VERSION,
+                source_context: source_context(source)?,
+                source_selection: AuthorizationSelection {
+                    resource: reference.source.payload.project.clone(),
+                    audience: current.audience.clone(),
+                    grant_leaf: current.grant_leaf.clone(),
+                },
+                source_account: current.scope.account_id.clone(),
+                source_device_public_key: PublicKey::of(signer),
+                source_heads: current.heads.clone(),
+                selection,
+                context,
+                expected_action: action,
+                purpose: RemoteExecutionPolicyPurpose::History,
+                execution_pins,
+                nonce: Nonce::random()?,
+                issued_at_ms: now,
+                expires_at_ms: expires,
+                history: Some(reference),
+            },
+            signer,
+        )?;
+        check_source_intent(source, &intent, now)?;
+        let mut usage = ExecutionProofUsage::default();
+        record_confirmed_client_policy_metadata(source, &mut usage)?;
+        usage.record_budget(&current.budget)?;
+        usage.record_signed(&intent)?;
+        let reference = intent
+            .payload
+            .history
+            .as_ref()
+            .ok_or(AuthorizationError::PolicyConflict)?;
+        usage.record_signed(&reference.source)?;
+        usage.record_signed(&reference.old_submission)?;
+        finish_usage(&mut usage)?;
+        encode(&intent)
+            .map_err(|_| AuthorizationError::InvalidProof("history intent encoding failed"))
     })()
     .map_err(|error| error.to_string())
 }
@@ -544,6 +677,10 @@ fn check_request(request: &RemoteExecutionPolicyReadRequest, now: u64) -> Result
     pins(&intent.execution_pins)?;
     purpose_action(intent.purpose, intent.expected_action)?;
     require(
+        (intent.purpose == RemoteExecutionPolicyPurpose::History) == intent.history.is_some(),
+        "remote policy purpose changed its historical artifact",
+    )?;
+    require(
         intent.version == AUTH_VERSION
             && delegation.version == AUTH_VERSION
             && intent.source_device_public_key == request.intent.issuer
@@ -599,7 +736,7 @@ impl VerifiedRemoteExecutionPolicyRead {
     }
 }
 
-fn reference_closure(
+pub(super) fn reference_closure(
     state: &VerifiedPolicySet,
     initial: &[PolicyStamp],
     independent: &[PolicyPin],
@@ -790,6 +927,10 @@ pub fn verify_remote_execution_policy_read(
     let _scope = ScopedSignatureVerification::new();
     check_request(request, now)?;
     let intent = &request.intent.payload;
+    require(
+        intent.purpose != RemoteExecutionPolicyPurpose::History && intent.history.is_none(),
+        "history requires its independent read verifier",
+    )?;
     let selection = &intent.selection;
     require(
         &request.intent.issuer == noise_client && &selection.target_public_key == local_node,
@@ -886,6 +1027,56 @@ pub fn verify_remote_execution_policy_read(
     })
 }
 
+pub fn verify_remote_execution_history_policy_read(
+    state: &VerifiedPolicySet,
+    request: &RemoteExecutionPolicyReadRequest,
+    acceptance: &RemoteExecutionHistoryAcceptance,
+    local_node: &PublicKey,
+    noise_client: &PublicKey,
+    now: u64,
+) -> Result<VerifiedRemoteExecutionPolicyRead> {
+    let _scope = ScopedSignatureVerification::new();
+    check_request(request, now)?;
+    let intent = &request.intent.payload;
+    let reference = intent
+        .history
+        .as_ref()
+        .ok_or(AuthorizationError::InvalidProof(
+            "history policy requires its original artifact reference",
+        ))?;
+    require(
+        intent.purpose == RemoteExecutionPolicyPurpose::History
+            && &request.intent.issuer == noise_client
+            && &intent.selection.target_public_key == local_node
+            && reference.source.issuer == request.delegation.issuer
+            && reference.source.payload.project == intent.source_selection.resource
+            && reference.old_submission.issuer == request.delegation.issuer
+            && reference.old_submission.payload.resource == intent.selection.execution_resource
+            && reference.old_submission.payload.grant_leaf == intent.selection.execution_grant
+            && reference.context()? == intent.context,
+        "history policy changed its original artifact, reader or source service",
+    )?;
+    let verified = super::remote_execution_history::verify_remote_execution_history_policy(
+        state,
+        reference,
+        acceptance,
+        &intent.execution_pins,
+        local_node,
+        now,
+    )?;
+    let mut usage = verified.proof_usage().clone();
+    usage.record_signed(&request.intent)?;
+    usage.record_signed(&request.delegation)?;
+    usage.record_metadata(request)?;
+    finish_usage(&mut usage)?;
+    Ok(VerifiedRemoteExecutionPolicyRead {
+        request: request.clone(),
+        heads: verified.target_heads().to_vec(),
+        usage,
+        allowed_hashes: verified.allowed_hashes().clone(),
+    })
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct RemoteExecutionPolicyImport {
     request: RemoteExecutionPolicyReadRequest,
@@ -971,12 +1162,37 @@ pub fn begin_remote_execution_policy_import(
     expected_c_noise_key: &str,
     now_ms: f64,
 ) -> crate::Result<RemoteExecutionPolicyImport> {
+    begin_import_inner(
+        source,
+        request_json,
+        snapshot_json,
+        independent_execution_pins_json,
+        expected_c_noise_key,
+        now_ms,
+        false,
+    )
+}
+
+fn begin_import_inner(
+    source: &VerifiedClientAuthorization,
+    request_json: &str,
+    snapshot_json: &str,
+    independent_execution_pins_json: &str,
+    expected_c_noise_key: &str,
+    now_ms: f64,
+    history: bool,
+) -> crate::Result<RemoteExecutionPolicyImport> {
     let _scope = ScopedSignatureVerification::new();
     (|| -> Result<RemoteExecutionPolicyImport> {
         let now = bootstrap::timestamp(now_ms)?;
         let request: RemoteExecutionPolicyReadRequest = parse(request_json)?;
         let header: Signed<RemoteExecutionPolicySnapshot> = parse(snapshot_json)?;
         let independent: Vec<PolicyPin> = parse(independent_execution_pins_json)?;
+        require(
+            history == (request.intent.payload.purpose == RemoteExecutionPolicyPurpose::History)
+                && history == header.payload.history.is_some(),
+            "policy import changed its independent historical purpose",
+        )?;
         pins(&independent)?;
         check_request(&request, now)?;
         let current = check_source_intent(source, &request.intent, now)?;
@@ -1126,9 +1342,27 @@ impl RemoteExecutionPolicyImport {
         witness_json: &str,
         now_ms: f64,
     ) -> crate::Result<VerifiedRemoteExecutionPolicy> {
+        self.finish_inner(witness_json, now_ms, false)
+    }
+}
+
+impl RemoteExecutionPolicyImport {
+    fn finish_inner(
+        self,
+        witness_json: &str,
+        now_ms: f64,
+        history: bool,
+    ) -> crate::Result<VerifiedRemoteExecutionPolicy> {
         let _scope = ScopedSignatureVerification::new();
         (|| -> Result<VerifiedRemoteExecutionPolicy> {
             let now = bootstrap::timestamp(now_ms)?;
+            require(
+                history
+                    == (self.request.intent.payload.purpose
+                        == RemoteExecutionPolicyPurpose::History)
+                    && history == self.header.payload.history.is_some(),
+                "policy completion changed its independent historical purpose",
+            )?;
             let witness: Signed<RemoteExecutionPolicyWitness> = parse(witness_json)?;
             witness.verify_signature()?;
             window(
@@ -1158,13 +1392,24 @@ impl RemoteExecutionPolicyImport {
                 "execution policy witness changed its completed stream",
             )?;
             let snapshot = self.import.finish(&self.header.payload.target_heads)?;
-            let verified = verify_remote_execution_policy_read(
-                snapshot.state(),
-                &self.request,
-                &self.header.issuer,
-                &self.request.intent.issuer,
-                now,
-            )?;
+            let verified = if let Some(acceptance) = &self.header.payload.history {
+                verify_remote_execution_history_policy_read(
+                    snapshot.state(),
+                    &self.request,
+                    acceptance,
+                    &self.header.issuer,
+                    &self.request.intent.issuer,
+                    now,
+                )?
+            } else {
+                verify_remote_execution_policy_read(
+                    snapshot.state(),
+                    &self.request,
+                    &self.header.issuer,
+                    &self.request.intent.issuer,
+                    now,
+                )?
+            };
             require(
                 verified.target_heads() == self.header.payload.target_heads
                     && snapshot.journal().iter().all(|entry| {
@@ -1243,6 +1488,131 @@ impl VerifiedRemoteExecutionPolicy {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+pub struct RemoteExecutionHistoryPolicyImport {
+    inner: RemoteExecutionPolicyImport,
+}
+
+#[derive(Clone)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+pub struct VerifiedRemoteExecutionHistoryPolicy {
+    inner: VerifiedRemoteExecutionPolicy,
+}
+
+#[cfg_attr(target_arch="wasm32",wasm_bindgen::prelude::wasm_bindgen(js_name=beginRemoteExecutionHistoryPolicyImport))]
+pub fn begin_remote_execution_history_policy_import(
+    source: &VerifiedClientAuthorization,
+    request_json: &str,
+    snapshot_json: &str,
+    independent_execution_pins_json: &str,
+    expected_c_noise_key: &str,
+    now_ms: f64,
+) -> crate::Result<RemoteExecutionHistoryPolicyImport> {
+    Ok(RemoteExecutionHistoryPolicyImport {
+        inner: begin_import_inner(
+            source,
+            request_json,
+            snapshot_json,
+            independent_execution_pins_json,
+            expected_c_noise_key,
+            now_ms,
+            true,
+        )?,
+    })
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+impl RemoteExecutionHistoryPolicyImport {
+    #[cfg_attr(target_arch="wasm32",wasm_bindgen::prelude::wasm_bindgen(js_name=pageRequestJson))]
+    pub fn page_request_json(&self) -> crate::Result<String> {
+        self.inner.page_request_json()
+    }
+    #[cfg_attr(target_arch="wasm32",wasm_bindgen::prelude::wasm_bindgen(js_name=appendPage))]
+    pub fn append_page(&mut self, page_json: &str, now_ms: f64) -> crate::Result<()> {
+        self.inner.append_page(page_json, now_ms)
+    }
+    #[cfg_attr(target_arch="wasm32",wasm_bindgen::prelude::wasm_bindgen(js_name=proofUsageJson))]
+    pub fn proof_usage_json(&self) -> crate::Result<String> {
+        self.inner.proof_usage_json()
+    }
+    pub fn finish(
+        self,
+        witness_json: &str,
+        now_ms: f64,
+    ) -> crate::Result<VerifiedRemoteExecutionHistoryPolicy> {
+        Ok(VerifiedRemoteExecutionHistoryPolicy {
+            inner: self.inner.finish_inner(witness_json, now_ms, true)?,
+        })
+    }
+}
+
+impl VerifiedRemoteExecutionHistoryPolicy {
+    pub(crate) fn snapshot(&self) -> &VerifiedPolicySnapshot {
+        self.inner.snapshot()
+    }
+    pub(crate) fn reference(&self) -> Result<&RemoteExecutionHistoryReference> {
+        self.inner
+            .intent()
+            .history
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "historical policy has no original artifact reference",
+            ))
+    }
+    pub(crate) fn acceptance(&self) -> Result<&RemoteExecutionHistoryAcceptance> {
+        self.inner
+            .header
+            .payload
+            .history
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "historical policy has no original signature proof",
+            ))
+    }
+    pub(crate) fn revalidate(
+        &self,
+        source: &VerifiedClientAuthorization,
+        now: u64,
+    ) -> Result<VerifiedClientAuthorization> {
+        require(
+            self.inner.intent().purpose == RemoteExecutionPolicyPurpose::History,
+            "history requires its independent read purpose",
+        )?;
+        self.inner.revalidate(source, now)
+    }
+    pub(crate) fn record_metadata(&self, usage: &mut ExecutionProofUsage) -> Result<()> {
+        self.inner.record_metadata(usage)
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+impl VerifiedRemoteExecutionHistoryPolicy {
+    #[cfg_attr(target_arch="wasm32",wasm_bindgen::prelude::wasm_bindgen(js_name=revalidatePins))]
+    pub fn revalidate_pins(
+        &self,
+        latest_independent_pins_json: &str,
+        now_ms: f64,
+    ) -> crate::Result<VerifiedRemoteExecutionHistoryPolicy> {
+        Ok(Self {
+            inner: self
+                .inner
+                .revalidate_pins(latest_independent_pins_json, now_ms)?,
+        })
+    }
+    #[cfg_attr(target_arch="wasm32",wasm_bindgen::prelude::wasm_bindgen(js_name=metadataJson))]
+    pub fn metadata_json(&self) -> crate::Result<String> {
+        let reference = self.reference().map_err(|error| error.to_string())?;
+        encode(
+            &serde_json::json!({"purpose":"history","reference":reference,
+            "pins":self.inner.snapshot.pins(),"heads":self.inner.snapshot.heads(),
+            "expires_at_ms":self.inner.expires_at_ms()}),
+        )
+    }
+    #[cfg_attr(target_arch="wasm32",wasm_bindgen::prelude::wasm_bindgen(js_name=proofUsageJson))]
+    pub fn proof_usage_json(&self) -> crate::Result<String> {
+        self.inner.proof_usage_json()
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1533,6 +1903,7 @@ pub(crate) mod tests {
                 source_node_public_key: PublicKey::of(execution_node),
                 issued_at_ms: now,
                 expires_at_ms: now + 1_000,
+                history: None,
             },
             execution_node,
         )

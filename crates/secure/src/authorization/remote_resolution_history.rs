@@ -16,89 +16,86 @@ fn clock(now: f64) -> Result<u64> {
 
 fn load(
     reader: &VerifiedClientAuthorization,
-    project_json: &str,
-    project_pins_json: &str,
-    execution_json: &str,
-    execution_pins_json: &str,
+    policy: &remote_execution_policy::VerifiedRemoteExecutionHistoryPolicy,
+    actual_json: &str,
+    body_json: &str,
+    invocation_json: &str,
+    binding_json: &str,
     now: u64,
-) -> Result<VerifiedPolicySet> {
-    let project: ClientAuthorizationBundle = parse(project_json)?;
-    let execution: ClientAuthorizationBundle = parse(execution_json)?;
-    let project_pins: Vec<PolicyPin> = parse(project_pins_json)?;
-    let execution_pins: Vec<PolicyPin> = parse(execution_pins_json)?;
-    let current = replay_policies(&project_pins, &project.journal)?;
-    let key = &current
-        .find_device(&reader.scope.device_id)?
-        .payload
-        .public_key;
-    let baseline = verify_client_authorization(
-        project_json,
-        project_pins_json,
-        reader.scope.account_id.as_str(),
-        reader.scope.space_id.as_str(),
-        key.as_str(),
-        now as f64,
-    )
-    .map_err(|_| AuthorizationError::InvalidProof("historical reader is no longer authorized"))?;
+) -> Result<(
+    VerifiedPolicySet,
+    remote_execution_history::VerifiedHistoryAcceptance,
+    ExecutionProofUsage,
+)> {
+    let baseline = policy.revalidate(reader, now)?;
     require(
-        baseline.scope == reader.scope
-            && baseline.heads == reader.heads
-            && baseline.grant_leaf == reader.grant_leaf
-            && baseline.audience == reader.audience
-            && baseline.audience_public_key == reader.audience_public_key
-            && reader.actions.iter().any(|action| {
-                matches!(
-                    action,
-                    Action::OperationStatusRead
-                        | Action::OperationReconcile
-                        | Action::OperationResolve
-                )
-            }),
+        baseline.actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::OperationStatusRead | Action::OperationReconcile | Action::OperationResolve
+            )
+        }),
         "history requires current Project read permission",
     )?;
-    let mut pins = BTreeMap::<PolicyDomain, PolicyPin>::new();
-    for pin in project_pins.into_iter().chain(execution_pins) {
-        if let Some(saved) = pins.get_mut(&pin.domain) {
+    let reference = remote_execution_history::derive_reference(
+        actual_json,
+        body_json,
+        invocation_json,
+        binding_json,
+    )?;
+    require(
+        &reference == policy.reference()?,
+        "history changed its original complete signed artifact",
+    )?;
+    let source = client_policy_import::require_confirmed_client_policy(reader)?;
+    let merged = policy_import::merge_same_head_snapshots(source, policy.snapshot())?;
+    let state = merged.state().clone();
+    let accepted = remote_execution_history::verify_remote_execution_history_acceptance(
+        &state,
+        &reference,
+        policy.acceptance()?,
+        &reference.target_public_key,
+        now,
+    )?;
+    match policy.acceptance()? {
+        remote_execution_history::RemoteExecutionHistoryAcceptance::UnknownResolution {
+            receipt,
+            freshness,
+        } => {
+            let actual: ExecutionHandoffResolutionResult = parse(actual_json)?;
             require(
-                saved.genesis_root == pin.genesis_root,
-                "historical policy roots conflict",
+                receipt == &actual.receipt && freshness == &actual.freshness,
+                "history changed its original executor resolution proof",
             )?;
-            if let Some(candidate) = pin.minimum_head {
-                match &saved.minimum_head {
-                    Some(existing)
-                        if (existing.authority_epoch, existing.sequence)
-                            == (candidate.authority_epoch, candidate.sequence) =>
-                    {
-                        require(
-                            existing == &candidate,
-                            "historical policy watermarks conflict",
-                        )?
-                    }
-                    Some(existing)
-                        if (existing.authority_epoch, existing.sequence)
-                            > (candidate.authority_epoch, candidate.sequence) => {}
-                    _ => saved.minimum_head = Some(candidate),
-                }
-            }
-        } else {
-            pins.insert(pin.domain.clone(), pin);
         }
+        remote_execution_history::RemoteExecutionHistoryAcceptance::TerminalReconciliation {
+            observation_receipt,
+            freshness,
+        } => {
+            let actual: ExecutionHandoffTerminalReconciliationResult = parse(actual_json)?;
+            require(
+                observation_receipt == &actual.reconciliation.resolution.observation.receipt
+                    && freshness == &actual.freshness,
+                "history changed its original executor observation or reconciliation proof",
+            )?;
+        }
+        remote_execution_history::RemoteExecutionHistoryAcceptance::ExecutionResult { .. } => {}
     }
-    let mut seen = BTreeSet::new();
-    let journal = project
-        .journal
-        .into_iter()
-        .chain(execution.journal)
-        .filter_map(|entry| match ObjectHash::body(&entry) {
-            Ok(hash) if seen.insert(hash.clone()) => Some(Ok(entry)),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    replay_policies(&pins.into_values().collect::<Vec<_>>(), &journal)
+    let mut usage = accepted.proof_usage().clone();
+    usage.record_budget(&baseline.budget)?;
+    client_policy_import::record_confirmed_client_policy_metadata(reader, &mut usage)?;
+    policy.record_metadata(&mut usage)?;
+    if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts() {
+        usage.record_actual_signature_counts(counts);
+    }
+    usage.enforce_limits()?;
+    Ok((state, accepted, usage))
 }
 
-fn at_heads(current: &VerifiedPolicySet, heads: &[PolicyStamp]) -> Result<VerifiedPolicySet> {
+pub(super) fn at_heads(
+    current: &VerifiedPolicySet,
+    heads: &[PolicyStamp],
+) -> Result<VerifiedPolicySet> {
     let mut historical = current.clone();
     let mut domains = BTreeSet::new();
     for head in heads {
@@ -174,10 +171,7 @@ fn reader_scope(reader: &VerifiedClientAuthorization, resource: &ResourceRef) ->
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyRemoteResolutionHistory))]
 pub fn verify_remote_resolution_history(
     reader: &VerifiedClientAuthorization,
-    project_json: &str,
-    project_pins_json: &str,
-    execution_json: &str,
-    execution_pins_json: &str,
+    policy: &remote_execution_policy::VerifiedRemoteExecutionHistoryPolicy,
     actual_json: &str,
     body_json: &str,
     invocation_json: &str,
@@ -186,27 +180,28 @@ pub fn verify_remote_resolution_history(
     (|| -> Result<String> {
         let _signatures = crate::signature_verification::ScopedSignatureVerification::new();
         let now = clock(now_ms)?;
-        let state = load(
+        let (state, historical_proof, mut usage) = load(
             reader,
-            project_json,
-            project_pins_json,
-            execution_json,
-            execution_pins_json,
+            policy,
+            actual_json,
+            body_json,
+            invocation_json,
+            "",
             now,
         )?;
+        let decision_time = historical_proof.decision_at_ms();
         let body: Value = parse(body_json)?;
         let invocation: Signed<Invocation> = parse(invocation_json)?;
         invocation.verify_signature()?;
         let raw: Value = parse(actual_json)?;
         let unknown = raw.get("resolution").is_some();
-        let (wire, freshness, decision_time, outcome) = if unknown {
+        let (wire, freshness, outcome) = if unknown {
             let actual: ExecutionHandoffResolutionResult = serde_json::from_value(raw.clone())
                 .map_err(|_| AuthorizationError::InvalidProof("invalid historical resolution"))?;
             verify_execution_resolution_receipt_signature(&actual)?;
             (
                 actual.resolution,
                 actual.freshness,
-                actual.receipt.payload.issued_at_ms,
                 actual.handoff_receipt.payload.state,
             )
         } else {
@@ -214,13 +209,6 @@ pub fn verify_remote_resolution_history(
                 serde_json::from_value(raw.clone()).map_err(|_| {
                     AuthorizationError::InvalidProof("invalid historical reconciliation")
                 })?;
-            let decision = actual
-                .freshness
-                .receipts
-                .iter()
-                .map(|receipt| receipt.payload.issued_at_ms)
-                .max()
-                .unwrap_or(actual.freshness.challenge.issued_at_ms);
             let outcome = actual
                 .reconciliation
                 .resolution
@@ -228,7 +216,7 @@ pub fn verify_remote_resolution_history(
                 .receipt
                 .payload
                 .state;
-            (actual.reconciliation, actual.freshness, decision, outcome)
+            (actual.reconciliation, actual.freshness, outcome)
         };
         let proof = &wire.resolution.account_admission;
         let facts = execution_resolution_account_facts(&wire.resolution)?;
@@ -245,19 +233,34 @@ pub fn verify_remote_resolution_history(
             &proof.transport.clone().into_evidence(),
             decision_time,
         )?;
+        usage.record_admission(proof)?;
+        usage.record_authorization(&resolver)?;
         if unknown {
             let actual: ExecutionHandoffResolutionResult = serde_json::from_value(raw.clone())
                 .map_err(|_| AuthorizationError::InvalidProof("invalid historical resolution"))?;
             let verified =
                 decision.verify_execution_resolution_ack(&actual, &resolver, decision_time)?;
             decision.verify_execution_resolution_freshness(&verified, &freshness, decision_time)?;
+            usage.merge(verified.proof_usage());
+            usage.record_signed(&actual.receipt)?;
+            usage.record_signed(&actual.handoff_receipt)?;
         } else {
             let actual: ExecutionHandoffTerminalReconciliationResult =
                 serde_json::from_value(raw.clone()).map_err(|_| {
                     AuthorizationError::InvalidProof("invalid historical reconciliation")
                 })?;
-            decision.verify_execution_terminal_reconciliation(&actual, &resolver, decision_time)?;
+            let verified = decision.verify_execution_terminal_reconciliation(
+                &actual,
+                &resolver,
+                decision_time,
+            )?;
+            usage.merge(verified.proof_usage());
         }
+        if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts()
+        {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
         serde_json::to_string(&serde_json::json!({"historical":true,"state":outcome,
             "purpose":wire.resolution.purpose,"actual":raw}))
         .map_err(|_| AuthorizationError::InvalidProof("historical resolution encoding failed"))
@@ -268,10 +271,7 @@ pub fn verify_remote_resolution_history(
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyRemoteExecutionResultHistory))]
 pub fn verify_remote_execution_result_history(
     reader: &VerifiedClientAuthorization,
-    project_json: &str,
-    project_pins_json: &str,
-    execution_json: &str,
-    execution_pins_json: &str,
+    policy: &remote_execution_policy::VerifiedRemoteExecutionHistoryPolicy,
     actual_json: &str,
     body_json: &str,
     invocation_json: &str,
@@ -281,7 +281,8 @@ pub fn verify_remote_execution_result_history(
     (|| -> Result<String> {
         let _signatures = crate::signature_verification::ScopedSignatureVerification::new();
         let now = clock(now_ms)?;
-        let state = load(reader,project_json,project_pins_json,execution_json,execution_pins_json,now)?;
+        let (state, historical_proof, mut usage) = load(reader, policy, actual_json,
+            body_json, invocation_json, binding_json, now)?;
         let actual: ExecutionHandoffResult = parse(actual_json)?;
         let body: Value = parse(body_json)?;
         let invocation: Signed<Invocation> = parse(invocation_json)?;
@@ -296,23 +297,36 @@ pub fn verify_remote_execution_result_history(
                 .map_err(|_| AuthorizationError::InvalidProof("invalid historical binding"))?
             && invocation.payload.body_hash == ObjectHash::body(&body)?
             && actual.receipt.payload.issued_at_ms <= now
-            && actual.receipt.payload.issued_at_ms >= actual.handoff.invocation.payload.not_before_ms,
+            && actual.receipt.payload.issued_at_ms >= historical_proof.decision_at_ms(),
             "historical result changed the original browser request")?;
         let facts = RequestFacts {resource:invocation.payload.resource.clone(),action:invocation.payload.action,
             audience:invocation.payload.audience.clone(),operation_id:invocation.payload.operation_id.clone(),
             body_hash:ObjectHash::body(&body)?,context:invocation.payload.context.clone()};
         let accepted = admitted(&state,&proof,&facts)?;
-        let mut heads = actual.handoff.invocation.payload.expected_policies.clone();
-        for head in &proof.challenge.policies {
-            if !heads.iter().any(|current|current.domain == head.domain) { heads.push(head.clone()); }
-        }
-        let historical = at_heads(&state,&heads)?;
-        let time = actual.handoff.invocation.payload.not_before_ms;
+        let historical = at_heads(&state,historical_proof.heads())?;
+        let time = historical_proof.decision_at_ms();
         let original = historical.verify_operation_authorization(&accepted,&facts,
             &proof.transport.clone().into_evidence(),time)?;
-        historical.verify_execution_handoff(&actual.handoff,&original,
-            &TransportEvidence::VerifiedPeer {origin:actual.handoff.invocation.payload.presenter.clone()},None,time)?;
+        let remote_execution_history::RemoteExecutionHistoryAcceptance::ExecutionResult {
+            receipt, freshness, transport,
+        } = policy.acceptance()? else {
+            return Err(AuthorizationError::InvalidProof("execution history requires its original acceptance"));
+        };
+        let checkpoint = verify_execution_handoff_admission_checkpoint(&actual.handoff,
+            receipt, freshness, transport, time)?;
+        let verified = historical.verify_execution_handoff(&actual.handoff,&original,
+            &TransportEvidence::VerifiedPeer {origin:actual.handoff.invocation.payload.presenter.clone()},Some(&checkpoint),time)?;
         verify_execution_handoff_receipt_signature(&actual.handoff,&actual.receipt,&actual.result)?;
+        usage.record_admission(&proof)?;
+        usage.record_authorization(&original)?;
+        usage.merge(checkpoint.proof_usage());
+        usage.merge(verified.proof_usage());
+        usage.record_historical_handoff(&actual.handoff)?;
+        usage.record_signed(&actual.receipt)?;
+        if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts() {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
         serde_json::to_string(&serde_json::json!({"historical":true,"state":actual.receipt.payload.state,"actual":actual}))
             .map_err(|_| AuthorizationError::InvalidProof("historical execution result encoding failed"))
     })().map_err(|error|error.to_string())
