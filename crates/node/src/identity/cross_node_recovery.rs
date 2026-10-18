@@ -67,9 +67,7 @@ fn bounded(value: Value) -> Result<Value> {
 }
 
 fn carrier_bytes(input: &Value, output: &Value) -> Result<usize> {
-    Ok(serde_json::to_vec(input)?
-        .len()
-        .max(serde_json::to_vec(output)?.len()))
+    Ok(serde_json::to_vec(input)?.len() + serde_json::to_vec(output)?.len())
 }
 
 fn completed_in(
@@ -594,8 +592,20 @@ pub(crate) mod tests {
                 &self.capability.capability,
                 now(),
             )?;
+            let binding = self.target.cross_node_recovery_command(
+                &self.target_node,
+                &principal,
+                "cross_node_recovery_import_begin",
+                &json!({"request":self.request,"snapshot":snapshot}),
+                now(),
+            )?;
+            assert_eq!(binding["snapshot_id"], json!(snapshot.payload.snapshot_id));
+            assert_eq!(
+                binding["request_hash"],
+                json!(snapshot.payload.request_hash)
+            );
+            assert_eq!(binding["snapshot_hash"], json!(snapshot.hash()?));
             let mut cursor = None;
-            let mut pages = Vec::new();
             loop {
                 let response = self.source.cross_node_recovery_command(
                     &self.network.node, &principal, "cross_node_recovery_context_page",
@@ -604,9 +614,22 @@ pub(crate) mod tests {
                 let page: Signed<RecoveryContextPage> =
                     serde_json::from_value(response["page"].clone())?;
                 importer.append(page.clone(), now())?;
+                let imported = self.target.cross_node_recovery_command(
+                    &self.target_node,
+                    &principal,
+                    "cross_node_recovery_import_page",
+                    &json!({
+                        "snapshot_id":binding["snapshot_id"],
+                        "request_hash":binding["request_hash"],
+                        "snapshot_hash":binding["snapshot_hash"],
+                        "page":page,
+                    }),
+                    now(),
+                )?;
+                assert_eq!(imported["page_count"], page.payload.page_index + 1);
+                assert_eq!(imported["complete"], page.payload.complete);
                 cursor = page.payload.next_cursor.clone();
                 let complete = page.payload.complete;
-                pages.push(page);
                 if complete {
                     break;
                 }
@@ -619,22 +642,6 @@ pub(crate) mod tests {
                 serde_json::from_value(response["witness"].clone())?;
             let context = importer.finish_native(witness.clone(), now())?;
             let reference = context.reference()?;
-            self.target.cross_node_recovery_command(
-                &self.target_node,
-                &principal,
-                "cross_node_recovery_import_begin",
-                &json!({"request":self.request,"snapshot":snapshot}),
-                now(),
-            )?;
-            for page in pages {
-                self.target.cross_node_recovery_command(
-                    &self.target_node,
-                    &principal,
-                    "cross_node_recovery_import_page",
-                    &json!({"context":reference,"page":page}),
-                    now(),
-                )?;
-            }
             self.target.cross_node_recovery_command(
                 &self.target_node,
                 &principal,
@@ -892,6 +899,116 @@ pub(crate) mod tests {
         Ok(store
             .connection
             .query_row("SELECT count(*) FROM policy_journal", [], |row| row.get(0))?)
+    }
+
+    #[test]
+    fn target_accepts_each_bound_page_before_the_source_can_issue_a_witness() -> Result<()> {
+        let mut f = Fixture::new()?;
+        let principal = f.next_client.public_key_hex();
+        let response = f.source.cross_node_recovery_command(
+            &f.network.node,
+            &principal,
+            "cross_node_recovery_context",
+            &json!({"request":f.request}),
+            now(),
+        )?;
+        let snapshot: Signed<RecoveryContextSnapshot> =
+            serde_json::from_value(response["snapshot"].clone())?;
+        let binding = f.target.cross_node_recovery_command(
+            &f.target_node,
+            &principal,
+            "cross_node_recovery_import_begin",
+            &json!({"request":f.request,"snapshot":snapshot}),
+            now(),
+        )?;
+        let page = f.source.cross_node_recovery_command(
+            &f.network.node,
+            &principal,
+            "cross_node_recovery_context_page",
+            &json!({"snapshot_id":snapshot.payload.snapshot_id,"request_hash":snapshot.payload.request_hash,"cursor":null}),
+            now(),
+        )?;
+        assert_eq!(page["page"]["payload"]["complete"], false);
+        assert!(
+            f.source
+                .cross_node_recovery_command(
+                    &f.network.node,
+                    &principal,
+                    "cross_node_recovery_context_witness",
+                    &json!({"snapshot_id":snapshot.payload.snapshot_id,"request_hash":snapshot.payload.request_hash,"cursor":null}),
+                    now(),
+                )
+                .is_err()
+        );
+        let input = json!({
+            "snapshot_id":binding["snapshot_id"],
+            "request_hash":binding["request_hash"],
+            "snapshot_hash":binding["snapshot_hash"],
+            "page":page["page"],
+        });
+        for field in ["snapshot_id", "request_hash", "snapshot_hash"] {
+            let mut wrong = input.clone();
+            wrong[field] = if field == "snapshot_id" {
+                json!(Nonce::random()?)
+            } else {
+                json!(ObjectHash::body(&field)?)
+            };
+            assert!(
+                f.target
+                    .cross_node_recovery_command(
+                        &f.target_node,
+                        &principal,
+                        "cross_node_recovery_import_page",
+                        &wrong,
+                        now(),
+                    )
+                    .is_err()
+            );
+        }
+        let accepted = f.target.cross_node_recovery_command(
+            &f.target_node,
+            &principal,
+            "cross_node_recovery_import_page",
+            &input,
+            now(),
+        )?;
+        assert_eq!(accepted["page_count"], 1);
+        assert_eq!(accepted["complete"], false);
+        assert_eq!(
+            f.target.cross_node_recovery_command(
+                &f.target_node,
+                &principal,
+                "cross_node_recovery_import_page",
+                &input,
+                now(),
+            )?,
+            accepted
+        );
+        let context = f.imported()?;
+        let mut wrong = context.reference()?;
+        wrong.witness_hash = ObjectHash::body(&"another witness")?;
+        assert!(
+            f.target
+                .cross_node_recovery_command(
+                    &f.target_node,
+                    &principal,
+                    "cross_node_recovery_import_finish",
+                    &json!({"context":wrong,"witness":f.witness}),
+                    now(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            f.target.cross_node_recovery_command(
+                &f.target_node,
+                &principal,
+                "cross_node_recovery_import_finish",
+                &json!({"context":context.reference()?,"witness":f.witness}),
+                now(),
+            )?["state"],
+            "ready"
+        );
+        Ok(())
     }
 
     #[test]

@@ -92,17 +92,35 @@ impl TargetRecoveryImport {
         UntrustedTargetRecoveryCache::new(&self.request, &self.snapshot.payload.snapshot_id)
     }
 
-    fn check(&self, principal: &str, reference: &RecoveryContextReference) -> Result<()> {
+    fn check_snapshot(
+        &self,
+        principal: &str,
+        snapshot_id: &Nonce,
+        request_hash: &ObjectHash,
+        snapshot_hash: &ObjectHash,
+    ) -> Result<()> {
         require_principal(&self.request, principal)?;
         ensure!(
-            reference.snapshot_id == self.snapshot.payload.snapshot_id
-                && reference.request_hash == self.request.hash()?
-                && reference.snapshot_hash == self.snapshot.hash()?
-                && self
-                    .reference
-                    .as_ref()
-                    .is_none_or(|saved| saved == reference),
-            "target recovery changed its original snapshot or completion reference"
+            *snapshot_id == self.snapshot.payload.snapshot_id
+                && *request_hash == self.request.hash()?
+                && *snapshot_hash == self.snapshot.hash()?,
+            "target recovery changed its original snapshot"
+        );
+        Ok(())
+    }
+
+    fn check(&self, principal: &str, reference: &RecoveryContextReference) -> Result<()> {
+        self.check_snapshot(
+            principal,
+            &reference.snapshot_id,
+            &reference.request_hash,
+            &reference.snapshot_hash,
+        )?;
+        ensure!(
+            self.reference
+                .as_ref()
+                .is_none_or(|saved| saved == reference),
+            "target recovery changed its completion reference"
         );
         Ok(())
     }
@@ -111,12 +129,15 @@ impl TargetRecoveryImport {
         self.approved_at.unwrap_or(now)
     }
 
-    fn progress(&self) -> Value {
-        json!({
+    fn progress(&self) -> Result<Value> {
+        Ok(json!({
             "state": if matches!(self.state, TargetImportState::Ready(_)) {"ready"} else {"reading"},
             "page_count": self.next_page,
             "complete": self.complete,
-        })
+            "snapshot_id": self.snapshot.payload.snapshot_id,
+            "request_hash": self.snapshot.payload.request_hash,
+            "snapshot_hash": self.snapshot.hash()?,
+        }))
     }
 
     fn record_binding(&self, usage: &mut RecoveryProofUsage) -> Result<()> {
@@ -192,7 +213,7 @@ impl Store {
             complete: false,
             state: TargetImportState::Reading(importer),
         };
-        let response = active.progress();
+        let response = active.progress()?;
         let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
         active.record_binding(&mut usage)?;
         if let TargetImportState::Reading(importer) = &active.state {
@@ -259,7 +280,7 @@ impl Store {
             complete: false,
             state: TargetImportState::Reading(importer),
         };
-        let response = active.progress();
+        let response = active.progress()?;
         let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
         active.record_binding(&mut usage)?;
         usage.record_cross_approval(approval)?;
@@ -285,7 +306,9 @@ impl Store {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct PageInput {
-            context: RecoveryContextReference,
+            snapshot_id: Nonce,
+            request_hash: ObjectHash,
+            snapshot_hash: ObjectHash,
             page: Signed<RecoveryContextPage>,
         }
         #[derive(Deserialize)]
@@ -303,17 +326,21 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_claim_in(&tx, &active.request.payload.target_claim, &local)?;
-        let (reference, page) = if cached {
+        let page = if cached {
             let input: CachedInput = serde_json::from_value(params.clone())?;
             active.check(principal, &input.context)?;
-            let page = cache
+            cache
                 .load_page(&tx, active.next_page)?
-                .context("cached recovery page is missing")?;
-            (input.context, page)
+                .context("cached recovery page is missing")?
         } else {
             let input: PageInput = serde_json::from_value(params.clone())?;
-            active.check(principal, &input.context)?;
-            (input.context, input.page)
+            active.check_snapshot(
+                principal,
+                &input.snapshot_id,
+                &input.request_hash,
+                &input.snapshot_hash,
+            )?;
+            input.page
         };
         let TargetImportState::Reading(importer) = &active.state else {
             bail!("target recovery import is already complete");
@@ -355,7 +382,6 @@ impl Store {
             .target_recovery_import
             .as_mut()
             .context("target recovery import is missing")?;
-        active.reference = Some(reference);
         active.next_page = next_page;
         active.complete = page.payload.complete;
         active.state = TargetImportState::Reading(importer);
