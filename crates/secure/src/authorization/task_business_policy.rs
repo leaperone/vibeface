@@ -1,6 +1,8 @@
 //! A source policy stream bound to one immutable Task business wire.
 
+pub mod original;
 pub mod receipt;
+pub use original::*;
 
 use super::{
     events::{Event, EventCause},
