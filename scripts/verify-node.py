@@ -1944,9 +1944,9 @@ def enroll_account_node(authority, candidate):
     expected_grants = {digest: grantee for digest, grantee in before["grants"].items() if grantee == account_grantee}
     require(client.scope == scope and after == before,
             "Node enrollment preserves the original account and the authority's complete business policy")
-    require(expected_grants and projected["grants"] == expected_grants
+    require(expected_grants and projected["grants"] == before["grants"]
             and projected["space_heads"] == before["space_heads"],
-            "additional Node installs only the existing Account Grant projection and unchanged space heads")
+            "additional Node preserves the existing signed public grants and unchanged space heads")
     return {"node_id": candidate.node_id, "account_id": scope["account_id"],
             "business_policy_sha256": hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest(),
             "authority_before": before, "authority_after": after, "candidate_projection": projected,
@@ -3777,7 +3777,7 @@ def acceptance(options):
         gateway.start()
         report["node_enrollment"] = enroll_account_node(a, gateway)
         report["not_checked"].remove("additional same-Account Node enrollment")
-        passed("an additional Node installs the same Account Service and only the original Account Grant projection")
+        passed("an additional Node installs the same Account Service and preserves the original signed public grants")
         report["gateway"] = verify_account_gateway(a, gateway, conversation, second)
         report["not_checked"].remove("Gateway to registered Project host")
         passed("independent Gateway and host pins protect forwarded Account requests without Gateway private history")
