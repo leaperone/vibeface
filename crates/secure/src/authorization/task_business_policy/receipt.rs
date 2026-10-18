@@ -290,6 +290,8 @@ fn authorize_inner(
     now: u64,
     mut usage: ExecutionProofUsage,
 ) -> Result<VerifiedTaskBusinessReceiptAuthority> {
+    usage.merge(current.proof_usage());
+    usage.enforce_limits()?;
     let scope = wire.scope()?;
     require(
         &scope.source_node_public_key == local_b,
@@ -605,6 +607,21 @@ mod tests {
             now,
         )
         .unwrap();
+        let counts = authority.proof_usage().counts();
+        let mut merged = authority.proof_usage().clone();
+        merged.merge(readonly.proof_usage());
+        assert_eq!(
+            merged.counts().authorization_bytes,
+            counts.authorization_bytes
+        );
+        assert_eq!(
+            merged.counts().unique_signed_objects,
+            counts.unique_signed_objects
+        );
+        assert_eq!(merged.counts().unique_signatures, counts.unique_signatures);
+        assert!(
+            counts.unique_signed_objects > business.proof_usage().counts().unique_signed_objects
+        );
         let mut receipts = authority.sign_receipts(&fixture.project_node, now).unwrap();
         assert!(!receipts.is_empty());
         for head in &challenge.policies {
