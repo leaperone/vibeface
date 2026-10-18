@@ -350,6 +350,88 @@ fn facts(invocation: &Signed<Invocation>, body: &Value) -> Result<RequestFacts> 
     })
 }
 
+pub(crate) fn current_task_prepare_policy_in(
+    connection: &Connection,
+    primary: &super::super::journal::PolicyState,
+    source: &PublicKey,
+    prepare: &Signed<vibeface_secure::authorization::prepare::PrepareIntent>,
+    body: &Value,
+    now: u64,
+) -> Result<Option<VerifiedTaskCurrentPolicy>> {
+    if !remote_body(body) {
+        return Ok(None);
+    }
+    let mut selected: Option<VerifiedTaskCurrentPolicy> = None;
+    for policy in primary.task_execution_policy.current.values() {
+        if policy.request().source_node() != source
+            || policy.request().source_project() != &prepare.payload.request.resource
+        {
+            continue;
+        }
+        if policy.check_prepare_scope(prepare, body, now).is_err() {
+            continue;
+        }
+        if check_task_policy_heads_in(connection, policy).is_err() {
+            continue;
+        }
+        let mut usage = policy.proof_usage().clone();
+        check_current_anchor_in(connection, primary, source, policy, &mut usage)?;
+        usage.record_signed(prepare)?;
+        if let Some(counts) = SignatureVerification::current_counts() {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
+        if selected.as_ref().is_none_or(|prior| {
+            (
+                policy.snapshot().payload.issued_at_ms,
+                policy.witness().payload.issued_at_ms,
+            ) > (
+                prior.snapshot().payload.issued_at_ms,
+                prior.witness().payload.issued_at_ms,
+            )
+        }) {
+            selected = Some(policy.clone());
+        }
+    }
+    Ok(Some(selected.context(
+        "NeedPolicySync: this exact prepare has no current completed foreign policy",
+    )?))
+}
+
+fn check_current_anchor_in(
+    connection: &Connection,
+    primary: &super::super::journal::PolicyState,
+    source: &PublicKey,
+    policy: &VerifiedTaskCurrentPolicy,
+    usage: &mut ExecutionProofUsage,
+) -> Result<()> {
+    let reader = policy
+        .request()
+        .account_request()
+        .context("unsupported Task policy reader")?;
+    let binding = checked_source_task_binding_in(connection, &reader.intent, source, usage)?;
+    let candidate = reader.intent.payload.purpose == RemoteExecutionPolicyPurpose::Execution
+        && ((binding.is_none() && reader.intent.payload.expected_action == Action::ExecutionOpen)
+            || (binding.is_some()
+                && reader.intent.payload.expected_action == Action::ExecutionRebind));
+    if candidate {
+        check_candidate_anchor(policy.trust(), &reader.intent, binding.as_ref())?;
+    } else {
+        let association = binding_association_in(
+            connection,
+            primary,
+            binding.as_ref().context("current policy has no binding")?,
+            usage,
+        )?;
+        ensure!(
+            association.approval_ref == policy.trust().approval().hash()?,
+            "current policy changed its actual binding approval"
+        );
+        check_read_trust(&reader.intent, policy.trust())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn current_task_execution_policy_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
