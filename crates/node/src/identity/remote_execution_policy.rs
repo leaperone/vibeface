@@ -872,6 +872,387 @@ mod tests {
     }
 
     #[test]
+    fn remote_policy_history_imports_an_unapplied_result_after_writer_revocation() -> Result<()> {
+        use std::collections::BTreeMap;
+        use vibeface_secure::authorization::{
+            CheckStage, TransportEvidence,
+            execution_handoff::{ExecutionHandoffFreshness, ExecutionHandoffResult},
+            remote_execution_policy::{
+                begin_remote_execution_history_policy_import, begin_remote_execution_policy_import,
+                build_remote_execution_history_policy_read_intent,
+            },
+            remote_resolution_history::verify_remote_execution_result_history,
+        };
+
+        let mut fixture = Fixture::new()?;
+        let binding = fixture.bind()?;
+        let (body, operation) = fixture.operation(binding.clone(), "history-result")?;
+        let (dispatch, authorization, freshness, transport) = fixture.authorize(&body)?;
+        fixture.store.accept_execution_dispatch(
+            &fixture.project.node,
+            &dispatch,
+            &authorization,
+            &freshness,
+            &transport,
+            &body,
+            &operation,
+            now(),
+        )?;
+        let (wire, _) = fixture.store.prepare_execution_dispatch_handoff(
+            &fixture.project.node,
+            fixture.project.space.as_str(),
+            &operation.operation_id,
+            now(),
+        )?;
+        let mut target = fixture.executor.memory()?;
+        fixture.project.install(&mut target)?;
+        target.install_policy_journal(&fixture.journal, now())?;
+        target.local_set(
+            fixture.executor.space.as_str(),
+            &format!("resource-root:{}", fixture.execution.resource),
+            &json!(fixture.project.project),
+        )?;
+        let peer = TransportEvidence::VerifiedPeer {
+            origin: fixture.audience.device.clone(),
+        };
+        let challenge =
+            target.issue_execution_handoff_challenge(&wire, &peer, CheckStage::Admit, now())?;
+        let mut receipts =
+            target.sign_execution_handoff_receipts(&challenge, &fixture.project.node, now())?;
+        receipts.extend(target.sign_execution_handoff_receipts(
+            &challenge,
+            &fixture.executor.node,
+            now(),
+        )?);
+        target.accept_execution_handoff(
+            &fixture.executor.node,
+            &wire,
+            &ExecutionHandoffFreshness {
+                challenge,
+                receipts,
+            },
+            &peer,
+            now(),
+        )?;
+        let accepted = target.execution_handoff_status(
+            &fixture.executor.node,
+            fixture.execution.space.as_str(),
+            fixture.project.space.as_str(),
+            &operation.operation_id,
+            now(),
+        )?;
+        let actual = ExecutionHandoffResult {
+            handoff: wire,
+            receipt: accepted
+                .receipt
+                .context("accepted observation is missing")?,
+            result: accepted.result,
+        };
+        let source = verified_client_policy_for_test(
+            &mut fixture.store,
+            &fixture.project.node,
+            &fixture.project.client,
+            &fixture.project.account,
+            AuthorizationSelection {
+                resource: ResourceRef {
+                    space: fixture.project.space.clone(),
+                    resource: fixture.project.resource.clone(),
+                },
+                audience: fixture.audience.clone(),
+                grant_leaf: fixture.project.bundle.grant_leaf.clone(),
+            },
+            &fixture.project.pins,
+            now(),
+        )?;
+        let mut document = target
+            .policy
+            .verified()
+            .space(&fixture.executor.space)
+            .context("execution space is missing")?
+            .clone();
+        document.previous = target
+            .policy
+            .verified()
+            .head(&PolicyDomain::Space(fixture.executor.space.clone()))
+            .cloned();
+        document.sequence += 1;
+        document.grants.retain(|hash| hash != &fixture.grant);
+        target.install_policy_journal(
+            &[JournalEntry::Space(Signed::sign(
+                document,
+                &fixture.executor.root,
+            )?)],
+            now() + 1,
+        )?;
+        let mut pins: BTreeMap<_, _> = fixture
+            .project
+            .pins
+            .iter()
+            .chain(&fixture.executor.pins)
+            .cloned()
+            .map(|pin| (pin.domain.clone(), pin))
+            .collect();
+        for pin in pins.values_mut() {
+            pin.minimum_head = target.policy.verified().head(&pin.domain).cloned();
+        }
+        let pins: Vec<_> = pins.into_values().collect();
+        let pins_json = serde_json::to_string(&pins)?;
+        let actual_json = serde_json::to_string(&actual)?;
+        let body_json = serde_json::to_string(&body)?;
+        let invocation_json = serde_json::to_string(authorization.signed_invocation())?;
+        let binding_json = serde_json::to_string(&binding)?;
+        let intent_json = carrier(|| {
+            build_remote_execution_history_policy_read_intent(
+                &source,
+                &json!({
+                    "actual_json":actual_json,
+                    "body_json":body_json,
+                    "invocation_json":invocation_json,
+                    "binding_json":binding_json,
+                })
+                .to_string(),
+                &pins_json,
+                &fixture.project.client,
+                (now() + 1) as f64,
+                (now() + 60_000) as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let intent: Signed<RemoteExecutionPolicyReadIntent> = serde_json::from_str(&intent_json)?;
+        let mut current_context = intent.payload.context.clone();
+        current_context.canonical_cwd =
+            binding.binding.open_spec["cwd"].as_str().map(str::to_owned);
+        let current_intent = carrier(|| {
+            build_remote_execution_policy_read_intent(
+                &source,
+                &json!({
+                    "selection":intent.payload.selection,
+                    "context":current_context,
+                    "expected_action":Action::ExecutionOpen,
+                    "purpose":RemoteExecutionPolicyPurpose::Execution,
+                    "execution_pins":pins,
+                })
+                .to_string(),
+                &fixture.project.client,
+                (now() + 1) as f64,
+                (now() + 60_000) as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let current_intent: Signed<RemoteExecutionPolicyReadIntent> =
+            serde_json::from_str(&current_intent)?;
+        let current_delegation = carrier(|| {
+            fixture.store.remote_execution_policy_delegate(
+                &fixture.project.node,
+                &fixture.project.client.public_key_hex(),
+                &serde_json::to_value(&current_intent)?,
+                now() + 1,
+            )
+        })?;
+        let current_request = RemoteExecutionPolicyReadRequest {
+            intent: current_intent,
+            delegation: serde_json::from_value(current_delegation["delegation"].clone())?,
+        };
+        assert!(
+            target
+                .remote_execution_policy_prepare(
+                    &fixture.executor.node,
+                    &fixture.project.client.public_key_hex(),
+                    &serde_json::to_value(&current_request)?,
+                    now() + 1,
+                )
+                .is_err()
+        );
+        let delegation = carrier(|| {
+            fixture.store.remote_execution_policy_delegate(
+                &fixture.project.node,
+                &fixture.project.client.public_key_hex(),
+                &serde_json::to_value(&intent)?,
+                now() + 1,
+            )
+        })?;
+        let request = RemoteExecutionPolicyReadRequest {
+            intent,
+            delegation: serde_json::from_value(delegation["delegation"].clone())?,
+        };
+        let principal = fixture.project.client.public_key_hex();
+        let request_json = serde_json::to_string(&request)?;
+        let mut wrong = request.clone();
+        wrong.intent.payload.history.as_mut().unwrap().actual_hash =
+            ObjectHash::body(&"another result")?;
+        wrong.intent = Signed::sign(wrong.intent.payload, &fixture.project.client)?;
+        wrong.delegation.payload.intent_hash = wrong.intent.hash()?;
+        wrong.delegation = Signed::sign(wrong.delegation.payload, &signer(&fixture.project.node)?)?;
+        assert!(
+            target
+                .remote_execution_policy_prepare(
+                    &fixture.executor.node,
+                    &principal,
+                    &serde_json::to_value(&wrong)?,
+                    now() + 1,
+                )
+                .is_err()
+        );
+        let write_counts = |store: &Store| -> Result<u64> {
+            Ok(store.connection.query_row(
+                "SELECT (SELECT count(*) FROM authorization_nonces)+(SELECT count(*) FROM execution_handoff_nonces)+(SELECT count(*) FROM execution_handoffs)",
+                [], |row| row.get(0),
+            )?)
+        };
+        let before_writes = write_counts(&target)?;
+        let prepared = carrier(|| {
+            target.remote_execution_policy_prepare(
+                &fixture.executor.node,
+                &principal,
+                &serde_json::to_value(&request)?,
+                now() + 1,
+            )
+        })?;
+        let snapshot_json = serde_json::to_string(&prepared["snapshot"])?;
+        let snapshot: Signed<RemoteExecutionPolicySnapshot> =
+            serde_json::from_value(prepared["snapshot"].clone())?;
+        let target_key = fixture.executor.node.public_key_hex()?;
+        assert!(
+            begin_remote_execution_policy_import(
+                &source,
+                &request_json,
+                &snapshot_json,
+                &pins_json,
+                &target_key,
+                (now() + 1) as f64,
+            )
+            .is_err()
+        );
+        let mut import = carrier(|| {
+            begin_remote_execution_history_policy_import(
+                &source,
+                &request_json,
+                &snapshot_json,
+                &pins_json,
+                &target_key,
+                (now() + 1) as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let key = context_key(&snapshot.payload.snapshot_id);
+        let original_record =
+            metadata(&target.connection, &key)?.context("history snapshot record is missing")?;
+        let mut poisoned: RemoteExecutionReadRecord = serde_json::from_str(&original_record)?;
+        let Some(RemoteExecutionHistoryAcceptance::ExecutionResult { receipt, .. }) =
+            &mut poisoned.snapshot.payload.history
+        else {
+            anyhow::bail!("history snapshot has no original acceptance");
+        };
+        receipt.payload.admitted_at_ms += 1;
+        poisoned.snapshot =
+            Signed::sign(poisoned.snapshot.payload, &signer(&fixture.executor.node)?)?;
+        target.connection.execute(
+            "UPDATE identity_meta SET value=? WHERE key=?",
+            params![encode(&poisoned)?, &key],
+        )?;
+        let first_params: Value =
+            serde_json::from_str(&import.page_request_json().map_err(anyhow::Error::msg)?)?;
+        assert!(
+            target
+                .remote_execution_policy_page(
+                    &fixture.executor.node,
+                    &principal,
+                    &first_params,
+                    now() + 1,
+                )
+                .is_err()
+        );
+        let after_poison = metadata(&target.connection, &key)?.unwrap();
+        assert_eq!(after_poison, encode(&poisoned)?);
+        target.connection.execute(
+            "UPDATE identity_meta SET value=? WHERE key=?",
+            params![original_record, &key],
+        )?;
+        let mut pages = 0;
+        loop {
+            ensure!(pages < 128, "history policy stream did not finish");
+            let params: Value =
+                serde_json::from_str(&import.page_request_json().map_err(anyhow::Error::msg)?)?;
+            let response = carrier(|| {
+                target.remote_execution_policy_page(
+                    &fixture.executor.node,
+                    &principal,
+                    &params,
+                    now() + 1,
+                )
+            })?;
+            let page: Signed<RemoteExecutionPolicyPage> =
+                serde_json::from_value(response["page"].clone())?;
+            carrier(|| {
+                import
+                    .append_page(&serde_json::to_string(&page)?, (now() + 1) as f64)
+                    .map_err(anyhow::Error::msg)
+            })?;
+            pages += 1;
+            if page.payload.complete {
+                break;
+            }
+        }
+        let finish_params = json!({
+            "snapshot_id":snapshot.payload.snapshot_id,
+            "request_hash":snapshot.payload.request_hash,
+            "cursor":null,
+        });
+        let finished = carrier(|| {
+            target.remote_execution_policy_finish(
+                &fixture.executor.node,
+                &principal,
+                &finish_params,
+                now() + 1,
+            )
+        })?;
+        let history = carrier(|| {
+            import
+                .finish(
+                    &serde_json::to_string(&finished["witness"])?,
+                    (now() + 1) as f64,
+                )
+                .map_err(anyhow::Error::msg)
+        })?;
+        let verified = carrier(|| {
+            verify_remote_execution_result_history(
+                &source,
+                &history,
+                &actual_json,
+                &body_json,
+                &invocation_json,
+                &binding_json,
+                (now() + 1) as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let verified: Value = serde_json::from_str(&verified)?;
+        assert_eq!(verified["historical"], true);
+        assert_eq!(verified["state"], "accepted");
+        assert_eq!(verified["actual"], serde_json::to_value(&actual)?);
+        assert_eq!(write_counts(&target)?, before_writes);
+        let unapplied: Option<String> = fixture.store.connection.query_row(
+            "SELECT result FROM operations WHERE space_id=? AND operation_id=?",
+            params![fixture.project.space.as_str(), operation.operation_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(unapplied, None);
+        fixture.project.revoke_client(&mut fixture.store)?;
+        assert!(
+            fixture
+                .store
+                .remote_execution_policy_delegate(
+                    &fixture.project.node,
+                    &principal,
+                    &serde_json::to_value(&request.intent)?,
+                    now() + 2,
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn remote_policy_delegates_from_current_b_without_its_gateway_context_and_streams_only_c_references()
     -> Result<()> {
         let mut fixture = Fixture::new()?;
