@@ -354,7 +354,7 @@ fn known_facts(store: &Store, context: &Context) -> Result<Value> {
             .map(|record| serde_json::to_value(&record.state))
             .transpose()?
             .unwrap_or(json!("unconfirmed"));
-        work.push(json!({"work_ref":reference,"action":dispatched[&reference],"state":state,"result":record.as_ref().map(|record| &record.result)}));
+        work.push(json!({"work_ref":reference,"action":dispatched[reference],"state":state,"result":record.as_ref().map(|record| &record.result)}));
     }
     Ok(
         json!({"freshness":"locally_known","work":work,"note":"Read execution_status for current facts before acting. Offline device results can be delayed."}),
