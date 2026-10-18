@@ -320,11 +320,14 @@ impl VerifiedPolicySet {
             &origin.receipts,
             origin.admitted_at_ms,
         )?;
-        Ok(Some(historical.admit_operation(
-            &authorization,
-            &freshness,
-            origin.admitted_at_ms,
-        )?))
+        let mut admission =
+            historical.admit_operation(&authorization, &freshness, origin.admitted_at_ms)?;
+        admission.usage.merge(source.proof_usage());
+        if let Some(counts) = SignatureVerification::current_counts() {
+            admission.usage.record_actual_signature_counts(counts);
+        }
+        admission.usage.enforce_limits()?;
+        Ok(Some(admission))
     }
 
     fn verify_original_request_for_body(
