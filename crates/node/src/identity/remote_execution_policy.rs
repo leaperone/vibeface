@@ -127,20 +127,25 @@ fn check_source_task(
     let project = &value.source_selection.resource;
     let context = &value.context.context;
     let task = context.task.as_ref().context("policy read has no Task")?;
-    let creation: Option<String> = connection
+    let creation: Option<(String, String, String, String, u64)> = connection
         .query_row(
-            "SELECT envelope FROM events WHERE space_id=? AND hash=? AND status='ready' AND length(CAST(envelope AS BLOB))<=?",
-            params![project.space.as_str(), task.as_str(), MAX_PROOF_BYTES],
-            |row| row.get(0),
+            "SELECT envelope,resource_id,scope_id,author,sequence FROM events WHERE space_id=? AND hash=? AND status='ready' AND length(CAST(envelope AS BLOB))<=?",
+            params![project.space.as_str(), task.as_str(), crate::model::MAX_EVENT_BYTES * 6 + 1024],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
-    let creation: SignedEvent =
-        serde_json::from_str(&creation.context("policy read Task is not locally ready")?)?;
+    let (creation, resource, scope, author, sequence) =
+        creation.context("policy read Task is not locally ready")?;
+    let creation: SignedEvent = serde_json::from_str(&creation)?;
     let event =
         crate::crypto::verify_signed_event(project.space.as_str(), &creation, local.as_str())?;
     ensure!(
         creation.hash == task.as_str()
             && event.resource_id == project.resource
+            && event.resource_id.as_str() == resource
+            && event.scope_id == scope
+            && event.author == author
+            && event.sequence == sequence
             && context.conversation.as_deref() == Some(event.scope_id.as_str()),
         "policy read Task changed its current Project, authority or conversation"
     );
@@ -148,7 +153,7 @@ fn check_source_task(
         anyhow::bail!("policy read must reference the original TaskCreated event");
     };
     super::event_authorization::validate_retained_event_dependencies_in(connection, &creation)?;
-    usage.record_event(&creation)?;
+    usage.record_retained_event(&creation)?;
     let session = context
         .execution_session
         .as_ref()
@@ -1171,6 +1176,97 @@ mod tests {
             metadata(&fixture.store.connection, &delegation_key(&intent))?,
             before
         );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_policy_reads_large_retained_tasks_without_metering_their_business_payload()
+    -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let goal = "large task content ".repeat(MAX_PROOF_BYTES / 12);
+        let mut body = fixture.project.body("create_task", "conversation");
+        body["task_id"] = json!("large-remote-task");
+        body["title"] = json!("large task");
+        body["goal"] = json!(goal);
+        body["acceptance"] = json!("review result");
+        body["auto_followup"] = json!(false);
+        fixture.task = fixture.project.append(
+            &mut fixture.store,
+            &body,
+            crate::model::EventBody::TaskCreated {
+                task_id: "large-remote-task".into(),
+                title: "large task".into(),
+                goal,
+                acceptance: "review result".into(),
+            },
+            now(),
+        )?;
+        assert!(fixture.task.canonical_body.len() > MAX_PROOF_BYTES);
+        assert!(fixture.task.canonical_body.len() < crate::model::MAX_EVENT_BYTES);
+        let intent = read_intent(&fixture)?;
+        let local = PublicKey::parse(&fixture.project.node.public_key_hex()?)?;
+        let mut usage = ExecutionProofUsage::default();
+        carrier(|| check_source_task(&fixture.store.connection, &intent, &local, &mut usage))?;
+        assert!(usage.counts().authorization_bytes < MAX_PROOF_BYTES);
+        assert_eq!(usage.counts().unique_signed_objects, 1);
+        let delegated = delegate(&mut fixture, &intent)?;
+        let key = delegation_key(&intent);
+        let before = metadata(&fixture.store.connection, &key)?;
+        let original = serde_json::to_string(&fixture.task)?;
+        let mut event: crate::model::Event = serde_json::from_str(&fixture.task.canonical_body)?;
+        let crate::model::EventBody::TaskCreated { goal, .. } = &mut event.body else {
+            anyhow::bail!("fixture has no TaskCreated");
+        };
+        goal.push('!');
+        let mut tampered = fixture.task.clone();
+        tampered.canonical_body = serde_json::to_string(&event)?;
+        fixture.store.connection.execute(
+            "UPDATE events SET envelope=? WHERE space_id=? AND hash=?",
+            params![
+                serde_json::to_string(&tampered)?,
+                fixture.project.space.as_str(),
+                fixture.task.hash
+            ],
+        )?;
+        assert!(delegate(&mut fixture, &intent).is_err());
+        assert_eq!(metadata(&fixture.store.connection, &key)?, before);
+        fixture.store.connection.execute(
+            "UPDATE events SET envelope=? WHERE space_id=? AND hash=?",
+            params![original, fixture.project.space.as_str(), fixture.task.hash],
+        )?;
+        let mut tampered = fixture.task.clone();
+        let last = tampered.signature.pop().unwrap();
+        tampered.signature.push(if last == '0' { '1' } else { '0' });
+        fixture.store.connection.execute(
+            "UPDATE events SET envelope=? WHERE space_id=? AND hash=?",
+            params![
+                serde_json::to_string(&tampered)?,
+                fixture.project.space.as_str(),
+                fixture.task.hash
+            ],
+        )?;
+        assert!(delegate(&mut fixture, &intent).is_err());
+        assert_eq!(metadata(&fixture.store.connection, &key)?, before);
+        fixture.store.connection.execute(
+            "UPDATE events SET envelope=? WHERE space_id=? AND hash=?",
+            params![original, fixture.project.space.as_str(), fixture.task.hash],
+        )?;
+        fixture.store.connection.execute(
+            "UPDATE events SET scope_id='wrong-scope' WHERE space_id=? AND hash=?",
+            params![fixture.project.space.as_str(), fixture.task.hash],
+        )?;
+        assert!(delegate(&mut fixture, &intent).is_err());
+        fixture.store.connection.execute(
+            "UPDATE events SET scope_id='conversation',sequence=sequence+1 WHERE space_id=? AND hash=?",
+            params![fixture.project.space.as_str(), fixture.task.hash],
+        )?;
+        assert!(delegate(&mut fixture, &intent).is_err());
+        fixture.store.connection.execute(
+            "UPDATE events SET sequence=sequence-1 WHERE space_id=? AND hash=?",
+            params![fixture.project.space.as_str(), fixture.task.hash],
+        )?;
+        assert_eq!(delegate(&mut fixture, &intent)?, delegated);
+        assert_eq!(metadata(&fixture.store.connection, &key)?, before);
         Ok(())
     }
 
