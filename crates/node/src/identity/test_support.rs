@@ -417,9 +417,20 @@ impl TestNetwork {
             service: ServiceId::from_key(&key),
             device: DeviceId::from_key(&key),
         };
-        let facts = store.request_facts(body, &audience)?;
+        let dispatch = if ["execution_resource", "target_public_key", "execution_grant"]
+            .iter()
+            .any(|field| body.get(*field).is_some())
+        {
+            Some(store.execution_dispatch_facts(body, &audience, now)?)
+        } else {
+            None
+        };
+        let facts = match &dispatch {
+            Some(dispatch) => dispatch.facts().clone(),
+            None => store.request_facts(body, &audience)?,
+        };
         let device = DeviceId::from_key(&PublicKey::of(&self.client));
-        let expected_policies = vec![
+        let mut expected_policies = vec![
             store
                 .policy
                 .verified()
@@ -433,6 +444,11 @@ impl TestNetwork {
                 .context("space head missing")?
                 .clone(),
         ];
+        if let Some(dispatch) = &dispatch {
+            expected_policies.extend_from_slice(dispatch.destination().heads());
+            expected_policies.sort_by(|left, right| left.domain.cmp(&right.domain));
+            expected_policies.dedup();
+        }
         let invocation = Signed::sign(
             Invocation {
                 version: AUTH_VERSION,
@@ -459,6 +475,7 @@ impl TestNetwork {
             "SELECT signed_invocation,source_body FROM accepted_authorizations WHERE space_id=? AND authorization_id=?",
             params![self.space.as_str(),facts.operation_id], |row| Ok((row.get(0)?,row.get(1)?)),
         ).optional()?;
+        let is_new = stored.is_none();
         let invocation = match stored {
             Some((invocation, original)) if serde_json::from_str::<Value>(&original)? == *body => {
                 serde_json::from_str(&invocation)?
@@ -466,10 +483,26 @@ impl TestNetwork {
             _ => invocation,
         };
         let transport = TransportEvidence::DirectNoise { device };
-        Ok((
-            store.authorize_request(&invocation, &facts, &transport, now)?,
-            transport,
-        ))
+        let auth =
+            match store.authorize_request_for_body(&invocation, &facts, &transport, body, now) {
+                Ok(auth) => auth,
+                Err(error) => match (is_new, error.downcast_ref::<AuthorizationError>()) {
+                    (true, Some(AuthorizationError::NeedPolicySync(expected))) => {
+                        let mut payload = invocation.payload;
+                        payload.expected_policies = expected.clone();
+                        let invocation = Signed::sign(payload, &self.client)?;
+                        store.authorize_request_for_body(
+                            &invocation,
+                            &facts,
+                            &transport,
+                            body,
+                            now,
+                        )?
+                    }
+                    _ => return Err(error),
+                },
+            };
+        Ok((auth, transport))
     }
 
     pub fn freshness(
