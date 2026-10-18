@@ -1,6 +1,7 @@
 //! Read-only qualification of raw client intent before business-data normalization.
 
 use super::*;
+use super::execution_handoff::ExecutionProofUsage;
 use serde_json::Value;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1515,6 +1516,7 @@ fn check_raw_resolution(intent: &PrepareIntent, body: &Value, key: &PublicKey) -
 
 #[derive(Clone, Debug)]
 pub struct VerifiedPrepareAuthorization {
+    usage: ExecutionProofUsage,
     resource: ResourceRef,
     raw_body: Value,
     action: Action,
@@ -1524,6 +1526,9 @@ pub struct VerifiedPrepareAuthorization {
     destination: Option<VerifiedExecutionDestination>,
 }
 impl VerifiedPrepareAuthorization {
+    pub fn proof_usage(&self) -> &ExecutionProofUsage {
+        &self.usage
+    }
     pub fn execution_destination(&self) -> Option<&VerifiedExecutionDestination> {
         self.destination.as_ref()
     }
@@ -2243,7 +2248,7 @@ impl VerifiedPolicySet {
             issuer: signed.issuer.clone(),
             signature: signed.signature.clone(),
         };
-        self.verify_signed_invocation_body(
+        let verified = self.verify_signed_invocation_body(
             &request,
             hash,
             budget,
@@ -2252,7 +2257,11 @@ impl VerifiedPolicySet {
             now_ms,
             AuthorizationPhase::Admission,
         )?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_authorization(&verified)?;
+        usage.enforce_limits()?;
         Ok(VerifiedPrepareAuthorization {
+            usage,
             resource: i.resource.clone(),
             raw_body: raw_body.clone(),
             action: i.action,

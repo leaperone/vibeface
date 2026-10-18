@@ -1225,6 +1225,12 @@ fn for_carrier_usage(
     Ok(())
 }
 
+impl VerifiedClientAuthorization {
+    pub fn expires_at_ms(&self) -> u64 {
+        self.budget.expires_at_ms
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedClientAuthorization {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = clientPolicyContextJson))]
