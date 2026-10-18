@@ -9,8 +9,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use vibeface_secure::{
     authorization::{
-        AUTH_VERSION, Action, DeviceId, MAX_PROOF_BYTES, Nonce, ObjectHash, PublicKey, Signed,
+        AUTH_VERSION, Action, DeviceId, JournalEntry, MAX_PROOF_BYTES, Nonce, ObjectHash,
+        PolicyDomain, PolicyPin, PolicyStamp, PublicKey, Signed,
         execution_handoff::ExecutionProofUsage,
+        node_execution_policy::{
+            NodeExecutionPolicyReadRequest, VerifiedNodeExecutionPolicyRead,
+            verify_node_execution_policy_read,
+        },
         policy_proof::policy_entry_payload_usage,
         remote_execution_history::RemoteExecutionHistoryAcceptance,
         remote_execution_policy::{
@@ -29,7 +34,7 @@ use vibeface_secure::{
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RemoteExecutionReadRecord {
-    request: RemoteExecutionPolicyReadRequest,
+    request: PolicyReadRequest,
     snapshot: Signed<RemoteExecutionPolicySnapshot>,
     journal_snapshot: AcceptedJournalSnapshot,
     snapshot_salt: Nonce,
@@ -87,12 +92,138 @@ fn finish_response(input: &Value, output: Value, mut usage: ExecutionProofUsage)
     Ok(output)
 }
 
+fn finish_reader_response(
+    input: &Value,
+    output: Value,
+    usage: ExecutionProofUsage,
+    node_reader: bool,
+) -> Result<Value> {
+    if node_reader {
+        let (request_stage, response_stage, field) = if output.get("snapshot").is_some() {
+            ("prepare", "snapshot", "snapshot")
+        } else if output.get("page").is_some() {
+            ("page", "page", "page")
+        } else {
+            ("finish", "witness", "witness")
+        };
+        let request = json!({"stage":request_stage,"request":input});
+        let response = json!({"stage":response_stage,"response":output[field]});
+        ensure!(
+            serde_json::to_vec(&request)?.len() + serde_json::to_vec(&response)?.len()
+                <= MAX_PROOF_BYTES,
+            "Node policy read input and output exceed 64 KiB"
+        );
+    }
+    finish_response(input, output, usage)
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "reader",
+    content = "request",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum PolicyReadRequest {
+    Client(RemoteExecutionPolicyReadRequest),
+    Node(NodeExecutionPolicyReadRequest),
+}
+
+impl PolicyReadRequest {
+    fn hash(&self) -> Result<ObjectHash> {
+        Ok(match self {
+            Self::Client(request) => ObjectHash::body(request)?,
+            Self::Node(request) => ObjectHash::body(request)?,
+        })
+    }
+    fn issuer(&self) -> &PublicKey {
+        match self {
+            Self::Client(request) => &request.intent.issuer,
+            Self::Node(request) => request.issuer(),
+        }
+    }
+    fn nonce(&self) -> &Nonce {
+        match self {
+            Self::Client(request) => &request.intent.payload.nonce,
+            Self::Node(NodeExecutionPolicyReadRequest::Current(request)) => &request.payload.nonce,
+            Self::Node(NodeExecutionPolicyReadRequest::History(request)) => &request.payload.nonce,
+        }
+    }
+    fn execution_pins(&self) -> &[PolicyPin] {
+        match self {
+            Self::Client(request) => &request.intent.payload.execution_pins,
+            Self::Node(request) => request.execution_pins(),
+        }
+    }
+    fn issued_at_ms(&self) -> u64 {
+        match self {
+            Self::Client(request) => request.delegation.payload.issued_at_ms,
+            Self::Node(NodeExecutionPolicyReadRequest::Current(request)) => {
+                request.payload.issued_at_ms
+            }
+            Self::Node(NodeExecutionPolicyReadRequest::History(request)) => {
+                request.payload.issued_at_ms
+            }
+        }
+    }
+    fn expires_at_ms(&self) -> u64 {
+        match self {
+            Self::Client(request) => request.delegation.payload.expires_at_ms,
+            Self::Node(request) => request.expires_at_ms(),
+        }
+    }
+    fn is_node(&self) -> bool {
+        matches!(self, Self::Node(_))
+    }
+}
+
+enum VerifiedRead {
+    Client(VerifiedRemoteExecutionPolicyRead),
+    Node(VerifiedNodeExecutionPolicyRead),
+}
+impl VerifiedRead {
+    fn target_heads(&self) -> &[PolicyStamp] {
+        match self {
+            Self::Client(value) => value.target_heads(),
+            Self::Node(value) => value.target_heads(),
+        }
+    }
+    fn domains(&self) -> Vec<PolicyDomain> {
+        match self {
+            Self::Client(value) => value.domains(),
+            Self::Node(value) => value.domains(),
+        }
+    }
+    fn allows_entry(&self, entry: &JournalEntry) -> vibeface_secure::authorization::Result<bool> {
+        match self {
+            Self::Client(value) => value.allows_entry(entry),
+            Self::Node(value) => value.allows_entry(entry),
+        }
+    }
+    fn proof_usage(&self) -> &ExecutionProofUsage {
+        match self {
+            Self::Client(value) => value.proof_usage(),
+            Self::Node(value) => value.proof_usage(),
+        }
+    }
+}
+
 fn record_request_usage(
     usage: &mut ExecutionProofUsage,
-    request: &RemoteExecutionPolicyReadRequest,
+    request: &PolicyReadRequest,
 ) -> Result<()> {
-    usage.record_signed(&request.intent)?;
-    usage.record_signed(&request.delegation)?;
+    match request {
+        PolicyReadRequest::Client(request) => {
+            usage.record_signed(&request.intent)?;
+            usage.record_signed(&request.delegation)?;
+        }
+        PolicyReadRequest::Node(NodeExecutionPolicyReadRequest::Current(request)) => {
+            usage.record_signed(request)?
+        }
+        PolicyReadRequest::Node(NodeExecutionPolicyReadRequest::History(request)) => {
+            usage.record_signed(request)?
+        }
+    }
     Ok(())
 }
 
@@ -241,10 +372,12 @@ fn page_key(id: &Nonce) -> String {
     format!("remote-execution-policy-page:{id}")
 }
 
-fn request_key(request: &RemoteExecutionPolicyReadRequest) -> String {
+fn request_key(request: &PolicyReadRequest) -> String {
+    let reader = if request.is_node() { "node" } else { "client" };
     format!(
-        "remote-execution-policy-request:{}:{}",
-        request.intent.issuer, request.intent.payload.nonce
+        "remote-execution-policy-request:{reader}:{}:{}",
+        request.issuer(),
+        request.nonce()
     )
 }
 
@@ -269,46 +402,73 @@ fn snapshot_id(
 fn verify_read(
     connection: &Connection,
     policy: &PolicyState,
-    request: &RemoteExecutionPolicyReadRequest,
+    request: &PolicyReadRequest,
     local: &PublicKey,
     principal: &str,
     now: u64,
 ) -> Result<(
-    VerifiedRemoteExecutionPolicyRead,
+    VerifiedRead,
     Option<RemoteExecutionHistoryAcceptance>,
     ExecutionProofUsage,
 )> {
     let principal = PublicKey::parse(principal)?;
-    let (verified, history, mut usage) = if request.intent.payload.purpose
-        == RemoteExecutionPolicyPurpose::History
-    {
-        let reference = request
-            .intent
-            .payload
-            .history
-            .as_ref()
-            .context("history policy request has no original artifact reference")?;
-        let (acceptance, usage) = super::execution_handoff::remote_execution_history_acceptance_in(
-            connection, local, reference,
-        )?;
-        let verified = verify_remote_execution_history_policy_read(
-            policy.verified(),
-            request,
-            &acceptance,
-            local,
-            &principal,
-            now,
-        )?;
-        (verified, Some(acceptance), usage)
-    } else {
-        let verified = verify_remote_execution_policy_read(
-            policy.verified(),
-            request,
-            local,
-            &principal,
-            now,
-        )?;
-        (verified, None, ExecutionProofUsage::default())
+    let (verified, history, mut usage) = match request {
+        PolicyReadRequest::Client(request) => {
+            if request.intent.payload.purpose == RemoteExecutionPolicyPurpose::History {
+                let reference = request
+                    .intent
+                    .payload
+                    .history
+                    .as_ref()
+                    .context("history policy request has no original artifact reference")?;
+                let (acceptance, usage) =
+                    super::execution_handoff::remote_execution_history_acceptance_in(
+                        connection, local, reference,
+                    )?;
+                let verified = verify_remote_execution_history_policy_read(
+                    policy.verified(),
+                    request,
+                    &acceptance,
+                    local,
+                    &principal,
+                    now,
+                )?;
+                (VerifiedRead::Client(verified), Some(acceptance), usage)
+            } else {
+                let verified = verify_remote_execution_policy_read(
+                    policy.verified(),
+                    request,
+                    local,
+                    &principal,
+                    now,
+                )?;
+                (
+                    VerifiedRead::Client(verified),
+                    None,
+                    ExecutionProofUsage::default(),
+                )
+            }
+        }
+        PolicyReadRequest::Node(request) => {
+            let (history, usage) = if let Some(reference) = request.history() {
+                let (acceptance, usage) =
+                    super::execution_handoff::remote_execution_history_acceptance_in(
+                        connection, local, reference,
+                    )?;
+                (Some(acceptance), usage)
+            } else {
+                (None, ExecutionProofUsage::default())
+            };
+            let verified = verify_node_execution_policy_read(
+                policy.verified(),
+                request,
+                local,
+                &principal,
+                history.as_ref(),
+                now,
+            )?;
+            (VerifiedRead::Node(verified), history, usage)
+        }
     };
     usage.merge(verified.proof_usage());
     check_heads_in(connection, policy, verified.target_heads())?;
@@ -339,7 +499,7 @@ fn verify_record(
     principal: &str,
     now: u64,
 ) -> Result<(
-    VerifiedRemoteExecutionPolicyRead,
+    VerifiedRead,
     Option<Signed<RemoteExecutionPolicyPage>>,
     ExecutionProofUsage,
 )> {
@@ -349,9 +509,8 @@ fn verify_record(
     ensure!(
         record.snapshot.issuer == *local
             && snapshot.version == AUTH_VERSION
-            && snapshot.request_hash == ObjectHash::body(&record.request)?
-            && snapshot.saved_pins_hash
-                == ObjectHash::body(&record.request.intent.payload.execution_pins)?
+            && snapshot.request_hash == record.request.hash()?
+            && snapshot.saved_pins_hash == ObjectHash::body(&record.request.execution_pins())?
             && snapshot.snapshot_id
                 == snapshot_id(
                     &snapshot.request_hash,
@@ -361,10 +520,10 @@ fn verify_record(
             && snapshot.target_heads == verified.target_heads()
             && snapshot.source_node_public_key == *local
             && snapshot.history == history
-            && record.request.delegation.payload.issued_at_ms <= snapshot.issued_at_ms
+            && record.request.issued_at_ms() <= snapshot.issued_at_ms
             && snapshot.issued_at_ms <= now
             && now < snapshot.expires_at_ms
-            && snapshot.expires_at_ms == record.request.delegation.payload.expires_at_ms,
+            && snapshot.expires_at_ms == record.request.expires_at_ms(),
         "remote execution policy snapshot changed"
     );
     record.snapshot.verify_signature()?;
@@ -539,13 +698,49 @@ impl Store {
         let _verification = ScopedSignatureVerification::new();
         bounded(params.clone())?;
         let request: RemoteExecutionPolicyReadRequest = serde_json::from_value(params.clone())?;
+        self.prepare_execution_policy_read(
+            identity,
+            principal,
+            params,
+            PolicyReadRequest::Client(request),
+            now,
+        )
+    }
+
+    pub(super) fn node_execution_policy_prepare(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        request: NodeExecutionPolicyReadRequest,
+        now: u64,
+    ) -> Result<Value> {
+        let params = serde_json::to_value(&request)?;
+        self.prepare_execution_policy_read(
+            identity,
+            principal,
+            &params,
+            PolicyReadRequest::Node(request),
+            now,
+        )
+    }
+
+    fn prepare_execution_policy_read(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        request: PolicyReadRequest,
+        now: u64,
+    ) -> Result<Value> {
+        let _verification = ScopedSignatureVerification::new();
+        bounded(params.clone())?;
         let signer = signer(identity)?;
         let local = PublicKey::of(&signer);
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let nonce_key = request_key(&request);
-        let hash = ObjectHash::body(&request)?;
+        let hash = request.hash()?;
         if let Some(binding) = metadata(&tx, &nonce_key)? {
             let binding: RequestBinding = serde_json::from_str(&binding)?;
             ensure!(
@@ -562,7 +757,12 @@ impl Store {
                 "remote execution policy request binding changed"
             );
             let (_, _, usage) = verify_record(&tx, &self.policy, &record, &local, principal, now)?;
-            return finish_response(params, json!({"snapshot":record.snapshot}), usage);
+            return finish_reader_response(
+                params,
+                json!({"snapshot":record.snapshot}),
+                usage,
+                request.is_node(),
+            );
         }
         let (verified, history, mut usage) =
             verify_read(&tx, &self.policy, &request, &local, principal, now)?;
@@ -574,12 +774,12 @@ impl Store {
                 version: AUTH_VERSION,
                 request_hash: hash.clone(),
                 snapshot_id: id.clone(),
-                saved_pins_hash: ObjectHash::body(&request.intent.payload.execution_pins)?,
+                saved_pins_hash: ObjectHash::body(&request.execution_pins())?,
                 target_heads: verified.target_heads().to_vec(),
                 source_node_public_key: local,
                 history,
                 issued_at_ms: now,
-                expires_at_ms: request.delegation.payload.expires_at_ms,
+                expires_at_ms: request.expires_at_ms(),
             },
             &signer,
         )?;
@@ -599,7 +799,12 @@ impl Store {
         };
         record_request_usage(&mut usage, &request)?;
         usage.record_signed(&snapshot)?;
-        let response = finish_response(params, json!({"snapshot":snapshot}), usage)?;
+        let response = finish_reader_response(
+            params,
+            json!({"snapshot":snapshot}),
+            usage,
+            request.is_node(),
+        )?;
         tx.execute(
             "INSERT INTO identity_meta(key,value) VALUES(?,?)",
             params![context_key(&id), encode(&record)?],
@@ -625,6 +830,33 @@ impl Store {
         params: &Value,
         now: u64,
     ) -> Result<Value> {
+        self.execution_policy_page_for_reader(identity, principal, params, now, false)
+    }
+
+    pub(super) fn node_execution_policy_page(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        request: RemoteExecutionPolicyPageRequest,
+        now: u64,
+    ) -> Result<Value> {
+        self.execution_policy_page_for_reader(
+            identity,
+            principal,
+            &serde_json::to_value(request)?,
+            now,
+            true,
+        )
+    }
+
+    fn execution_policy_page_for_reader(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        now: u64,
+        node_reader: bool,
+    ) -> Result<Value> {
         let _verification = ScopedSignatureVerification::new();
         bounded(params.clone())?;
         let request: RemoteExecutionPolicyPageRequest = serde_json::from_value(params.clone())?;
@@ -638,6 +870,10 @@ impl Store {
             metadata(&tx, &key)?.context("remote execution policy snapshot is missing")?;
         let mut record: RemoteExecutionReadRecord = serde_json::from_str(&encoded)?;
         ensure!(
+            record.request.is_node() == node_reader,
+            "policy reader purpose changed"
+        );
+        ensure!(
             record.snapshot.payload.snapshot_id == request.snapshot_id
                 && record.snapshot.payload.request_hash == request.request_hash,
             "remote execution policy page request changed"
@@ -647,7 +883,7 @@ impl Store {
         usage.record_metadata(&request)?;
         if let Some(cached) = cached {
             if cached.payload.request_cursor == request.cursor {
-                return finish_response(params, json!({"page":cached}), usage);
+                return finish_reader_response(params, json!({"page":cached}), usage, node_reader);
             }
         }
         ensure!(
@@ -664,10 +900,11 @@ impl Store {
             scanned.scanned <= 32,
             "remote execution policy scan budget exceeded"
         );
-        let entry = scanned
-            .entry
-            .filter(|value| verified.allows_hash(&value.entry_hash))
-            .map(|value| value.entry);
+        let entry = if let Some(value) = scanned.entry {
+            verified.allows_entry(&value.entry)?.then_some(value.entry)
+        } else {
+            None
+        };
         if let Some(entry) = &entry {
             usage.merge(&policy_entry_payload_usage(entry)?);
         }
@@ -713,7 +950,7 @@ impl Store {
             let witness = Signed::sign(
                 RemoteExecutionPolicyWitness {
                     version: AUTH_VERSION,
-                    request_hash: ObjectHash::body(&record.request)?,
+                    request_hash: record.request.hash()?,
                     snapshot_id: record.snapshot.payload.snapshot_id.clone(),
                     target_heads: record.snapshot.payload.target_heads.clone(),
                     final_page_hash: page.hash()?,
@@ -722,14 +959,14 @@ impl Store {
                     snapshot_hash: record.snapshot.hash()?,
                     source_node_public_key: local,
                     issued_at_ms: now,
-                    expires_at_ms: record.request.delegation.payload.expires_at_ms,
+                    expires_at_ms: record.request.expires_at_ms(),
                 },
                 &signer,
             )?;
             usage.record_signed(&witness)?;
             record.witness = Some(witness);
         }
-        let response = finish_response(params, json!({"page":page}), usage)?;
+        let response = finish_reader_response(params, json!({"page":page}), usage, node_reader)?;
         tx.execute(
             "INSERT INTO identity_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             params![page_key(&record.snapshot.payload.snapshot_id), encode(&page)?],
@@ -752,6 +989,33 @@ impl Store {
         params: &Value,
         now: u64,
     ) -> Result<Value> {
+        self.execution_policy_finish_for_reader(identity, principal, params, now, false)
+    }
+
+    pub(super) fn node_execution_policy_finish(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        request: RemoteExecutionPolicyPageRequest,
+        now: u64,
+    ) -> Result<Value> {
+        self.execution_policy_finish_for_reader(
+            identity,
+            principal,
+            &serde_json::to_value(request)?,
+            now,
+            true,
+        )
+    }
+
+    fn execution_policy_finish_for_reader(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        now: u64,
+        node_reader: bool,
+    ) -> Result<Value> {
         let _verification = ScopedSignatureVerification::new();
         bounded(params.clone())?;
         let request: RemoteExecutionPolicyPageRequest = serde_json::from_value(params.clone())?;
@@ -768,16 +1032,21 @@ impl Store {
                 .context("remote execution policy snapshot is missing")?,
         )?;
         ensure!(
+            record.request.is_node() == node_reader,
+            "policy reader purpose changed"
+        );
+        ensure!(
             record.snapshot.payload.snapshot_id == request.snapshot_id
                 && record.snapshot.payload.request_hash == request.request_hash,
             "remote execution policy witness request changed"
         );
         let (_, _, mut usage) = verify_record(&tx, &self.policy, &record, &local, principal, now)?;
         usage.record_metadata(&request)?;
-        finish_response(
+        finish_reader_response(
             params,
             json!({"witness":record.witness.context("remote execution policy import is not complete")?}),
             usage,
+            node_reader,
         )
     }
 }
@@ -888,6 +1157,146 @@ mod tests {
             )
         })?;
         Ok(serde_json::from_value(response["delegation"].clone())?)
+    }
+
+    #[test]
+    fn node_policy_reader_streams_c_without_b_business_membership() -> Result<()> {
+        use vibeface_secure::authorization::node_execution_policy::NodeExecutionPolicyReadIntent;
+
+        let mut fixture = Fixture::new()?;
+        let original = read_intent(&mut fixture)?;
+        let source = PublicKey::parse(&fixture.project.node.public_key_hex()?)?;
+        let signer = Identity::from_secret_hex(&fixture.project.node.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        let request = NodeExecutionPolicyReadRequest::Current(Signed::sign(
+            NodeExecutionPolicyReadIntent {
+                version: AUTH_VERSION,
+                source_project: original.payload.source_selection.resource.clone(),
+                selection: original.payload.selection.clone(),
+                context: original.payload.context.clone(),
+                expected_action: original.payload.expected_action,
+                purpose: original.payload.purpose,
+                execution_pins: original.payload.execution_pins.clone(),
+                nonce: Nonce::random()?,
+                issued_at_ms: now(),
+                expires_at_ms: now() + 60_000,
+            },
+            &signer,
+        )?);
+        let path = fixture
+            .executor
+            .directory
+            .join("node-policy-only-c.sqlite3");
+        let mut target = fixture.executor.at(&path)?;
+        target.install_policy_journal(&fixture.journal, now())?;
+        assert!(
+            target
+                .authorize_transport_node(&fixture.project.node.node_id()?, now())
+                .is_err()
+        );
+        assert!(
+            carrier(|| target.node_execution_policy_prepare(
+                &fixture.executor.node,
+                &fixture.project.client.public_key_hex(),
+                request.clone(),
+                now(),
+            ))
+            .is_err()
+        );
+        let prepared = carrier(|| {
+            target.node_execution_policy_prepare(
+                &fixture.executor.node,
+                source.as_str(),
+                request.clone(),
+                now(),
+            )
+        })?;
+        let snapshot: Signed<RemoteExecutionPolicySnapshot> =
+            serde_json::from_value(prepared["snapshot"].clone())?;
+        snapshot.verify_signature()?;
+        assert_eq!(snapshot.payload.request_hash, ObjectHash::body(&request)?);
+        let mut cursor = None;
+        let mut page_count = 0;
+        let mut entry_count = 0;
+        loop {
+            let page_request = RemoteExecutionPolicyPageRequest {
+                request_hash: snapshot.payload.request_hash.clone(),
+                snapshot_id: snapshot.payload.snapshot_id.clone(),
+                cursor: cursor.clone(),
+            };
+            let params = serde_json::to_value(&page_request)?;
+            assert!(
+                target
+                    .remote_execution_policy_page(
+                        &fixture.executor.node,
+                        source.as_str(),
+                        &params,
+                        now(),
+                    )
+                    .is_err()
+            );
+            let response = carrier(|| {
+                target.node_execution_policy_page(
+                    &fixture.executor.node,
+                    source.as_str(),
+                    page_request.clone(),
+                    now(),
+                )
+            })?;
+            let page: Signed<RemoteExecutionPolicyPage> =
+                serde_json::from_value(response["page"].clone())?;
+            page.verify_signature()?;
+            assert_eq!(page.payload.page_index, page_count);
+            assert_eq!(page.payload.request_hash, snapshot.payload.request_hash);
+            assert_eq!(page.payload.request_cursor, cursor);
+            entry_count += u64::from(page.payload.entry.is_some());
+            let repeated = carrier(|| {
+                target.node_execution_policy_page(
+                    &fixture.executor.node,
+                    source.as_str(),
+                    page_request,
+                    now(),
+                )
+            })?;
+            assert_eq!(repeated, response);
+            page_count += 1;
+            if page.payload.complete {
+                break;
+            }
+            cursor = page.payload.next_cursor;
+            if page_count == 1 {
+                drop(target);
+                target = Store::open(&path)?;
+            }
+            ensure!(
+                page_count < 128,
+                "Node policy read did not finish its bounded journal"
+            );
+        }
+        let finished = carrier(|| {
+            target.node_execution_policy_finish(
+                &fixture.executor.node,
+                source.as_str(),
+                RemoteExecutionPolicyPageRequest {
+                    request_hash: snapshot.payload.request_hash.clone(),
+                    snapshot_id: snapshot.payload.snapshot_id.clone(),
+                    cursor: None,
+                },
+                now(),
+            )
+        })?;
+        let witness: Signed<RemoteExecutionPolicyWitness> =
+            serde_json::from_value(finished["witness"].clone())?;
+        witness.verify_signature()?;
+        assert_eq!(witness.payload.page_count, page_count);
+        assert_eq!(witness.payload.entry_count, entry_count);
+        assert_eq!(witness.payload.snapshot_hash, snapshot.hash()?);
+        assert!(
+            target
+                .authorize_transport_node(&fixture.project.node.node_id()?, now())
+                .is_err()
+        );
+        Ok(())
     }
 
     #[test]

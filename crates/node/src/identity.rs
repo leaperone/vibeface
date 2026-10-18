@@ -17,6 +17,7 @@ pub(crate) mod governance_store;
 pub(crate) mod journal;
 pub mod local;
 pub(crate) mod node_enrollment;
+pub(crate) mod node_execution_policy;
 pub(crate) mod operation_control;
 pub(crate) mod passkey_rpc;
 pub(crate) mod passkey_store;
