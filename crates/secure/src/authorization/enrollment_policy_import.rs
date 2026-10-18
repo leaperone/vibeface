@@ -88,6 +88,7 @@ pub struct EnrollmentPolicyPage {
     pub request_hash: ObjectHash,
     pub snapshot_id: Nonce,
     pub snapshot_hash: ObjectHash,
+    pub request_cursor: Option<ObjectHash>,
     pub page_index: u64,
     pub previous_page_hash: ObjectHash,
     pub entry: Option<JournalEntry>,
@@ -123,20 +124,6 @@ pub struct EnrollmentPolicyPageRequest {
     pub request_hash: ObjectHash,
     pub cursor: Option<ObjectHash>,
 }
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct EnrollmentPolicyCacheBinding {
-    pub version: u16,
-    pub purpose: EnrollmentPolicyPurpose,
-    pub snapshot_id: Nonce,
-    pub request_cursor: Option<ObjectHash>,
-    pub page_hash: ObjectHash,
-}
-enrollment_policy_object!(
-    EnrollmentPolicyCacheBinding,
-    "enrollment-policy-page-cache-v2"
-);
 
 fn window(issued: u64, expires: u64, now: u64) -> Result<()> {
     validate_window(issued, expires, now)?;
@@ -373,6 +360,7 @@ impl EnrollmentPolicyImport {
             !self.complete
                 && value.page_index == self.page_count
                 && value.previous_page_hash == self.previous_page_hash
+                && value.request_cursor == self.next_cursor
                 && value.complete == value.next_cursor.is_none(),
             "enrollment policy page is missing, duplicated or out of order",
         )?;
@@ -571,6 +559,7 @@ mod tests {
             .unwrap();
             let mut pages = Vec::new();
             let mut previous = snapshot.hash().unwrap();
+            let mut request_cursor = None;
             for (index, entry) in entries.iter().enumerate() {
                 let complete = index + 1 == entries.len();
                 let page = Signed::sign(
@@ -581,6 +570,7 @@ mod tests {
                         request_hash: request.hash().unwrap(),
                         snapshot_id: snapshot.payload.snapshot_id.clone(),
                         snapshot_hash: snapshot.hash().unwrap(),
+                        request_cursor: request_cursor.clone(),
                         page_index: index as u64,
                         previous_page_hash: previous,
                         entry: Some(entry.clone()),
@@ -593,6 +583,7 @@ mod tests {
                 )
                 .unwrap();
                 previous = page.hash().unwrap();
+                request_cursor = page.payload.next_cursor.clone();
                 pages.push(page);
             }
             let witness = Signed::sign(
@@ -749,6 +740,14 @@ mod tests {
         assert_eq!(import.page_request(), before);
         assert!(import.append_page(flow.pages[1].clone(), NOW).is_err());
         assert_eq!(import.page_request(), before);
+        let mut changed_cursor = flow.pages[0].clone();
+        changed_cursor.payload.request_cursor = Some(ObjectHash::body(&"another cursor").unwrap());
+        assert!(changed_cursor.verify_signature().is_err());
+        assert!(import.append_page(changed_cursor.clone(), NOW).is_err());
+        assert_eq!(import.page_request(), before);
+        let changed_cursor = Signed::sign(changed_cursor.payload, &flow.source).unwrap();
+        assert!(import.append_page(changed_cursor, NOW).is_err());
+        assert_eq!(import.page_request(), before);
         let mut invalid = flow.pages[0].payload.clone();
         let Some(JournalEntry::AccountGenesis(value)) = &mut invalid.entry else {
             unreachable!()
@@ -776,34 +775,5 @@ mod tests {
             import.finish(&flow.witness, NOW).unwrap().heads(),
             flow.descriptor.target_heads
         );
-    }
-
-    #[test]
-    fn cache_binding_signature_covers_the_exact_snapshot_cursor_and_page() {
-        let source = key(71);
-        let binding = Signed::sign(
-            EnrollmentPolicyCacheBinding {
-                version: AUTH_VERSION,
-                purpose: EnrollmentPolicyPurpose::BrowserDevice,
-                snapshot_id: Nonce::from_bytes([72; 32]),
-                request_cursor: Some(ObjectHash::body(&"original cursor").unwrap()),
-                page_hash: ObjectHash::body(&"original signed page").unwrap(),
-            },
-            &source,
-        )
-        .unwrap();
-        binding.verify_signature().unwrap();
-        for field in 0..5 {
-            let mut changed = binding.clone();
-            match field {
-                0 => changed.payload.version += 1,
-                1 => changed.payload.purpose = EnrollmentPolicyPurpose::AccountNode,
-                2 => changed.payload.snapshot_id = Nonce::from_bytes([73; 32]),
-                3 => changed.payload.request_cursor = None,
-                4 => changed.payload.page_hash = ObjectHash::body(&"another page").unwrap(),
-                _ => unreachable!(),
-            }
-            assert!(changed.verify_signature().is_err(), "field {field}");
-        }
     }
 }
