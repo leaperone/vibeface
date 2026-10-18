@@ -296,6 +296,14 @@ impl TaskBusinessOperationCheck {
         self.original.header_envelope_hash()
     }
 
+    pub fn original_witness_envelope_hash(&self) -> Result<ObjectHash> {
+        self.original.witness_envelope_hash()
+    }
+
+    pub fn original_page_envelope_hashes(&self) -> &[ObjectHash] {
+        self.original.original_page_envelope_hashes()
+    }
+
     pub fn acceptance_envelope_hash(&self) -> Result<ObjectHash> {
         self.original.acceptance_envelope_hash()
     }
@@ -459,6 +467,14 @@ impl VerifiedTaskBusinessOperationCurrent {
 
     pub fn original_header_envelope_hash(&self) -> Result<ObjectHash> {
         self.original.header_envelope_hash()
+    }
+
+    pub fn original_witness_envelope_hash(&self) -> Result<ObjectHash> {
+        self.original.witness_envelope_hash()
+    }
+
+    pub fn original_page_envelope_hashes(&self) -> &[ObjectHash] {
+        self.original.original_page_envelope_hashes()
     }
 
     pub fn acceptance_envelope_hash(&self) -> Result<ObjectHash> {
