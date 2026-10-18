@@ -235,6 +235,15 @@ pub fn verify_task_business_receipt_read(
     now: u64,
 ) -> Result<VerifiedTaskBusinessReceiptAuthority> {
     if let TaskBusinessWire::Submit(wire) = original_wire {
+        let TaskBusinessAuthorization::Submit(verified) = authorization else {
+            return Err(AuthorizationError::InvalidProof(
+                "Task business receipt changed its genuine business purpose",
+            ));
+        };
+        require(
+            verified.wire() == wire,
+            "Task business receipt changed its genuine original wire",
+        )?;
         return verify_task_business_operation_receipt_read(
             primary,
             current,
