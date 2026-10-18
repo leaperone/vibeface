@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { open, readFile } from 'node:fs/promises';
+import { lstat, open, readFile, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { resolve, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -22,6 +22,43 @@ function endpoint() {
     try {
       let result = null;
       switch (input.op) {
+        case 'fixture_identity': {
+          let fixture;
+          try {
+            const metadata = await lstat(input.identity_file);
+            assert(metadata.isFile() && !metadata.isSymbolicLink() && !(metadata.mode & 0o077), 'fixture identity must be a private regular file');
+            fixture = crypto.Identity.fromSecretHex(JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex);
+          } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+            fixture = crypto.Identity.generate();
+            try {
+              await writeFile(input.identity_file, JSON.stringify({secret_key_hex:fixture.secretHex()})+'\n', {mode:0o600,flag:'wx'});
+            } catch (error) { fixture.free(); throw error; }
+          }
+          if (input.expected_node_id) {
+            try { assert(fixture.nodeId() === input.expected_node_id, 'fixture identity must retain the pinned target'); }
+            catch (error) { fixture.free(); throw error; }
+          }
+          identity.free(); identity = fixture;
+          result = {public_key:identity.publicKeyHex(),node_id:identity.nodeId()};
+          break;
+        }
+        case 'fixture_reachability': {
+          const metadata = await lstat(input.identity_file);
+          assert(metadata.isFile() && !metadata.isSymbolicLink() && !(metadata.mode & 0o077), 'fixture identity must be a private regular file');
+          const fixture = crypto.Identity.fromSecretHex(JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex);
+          try {
+            assert(fixture.nodeId() === input.expected_node_id, 'fixture signer must match the original target');
+            assert(Number.isInteger(input.ttl_secs) && input.ttl_secs >= 1 && input.ttl_secs <= 180, 'fixture reachability TTL must be bounded');
+            assert(Array.isArray(input.relay_urls) && input.relay_urls.length <= 8, 'fixture relay list must be bounded');
+            const issued = Math.floor(Date.now() / 1000);
+            const record = {node_id:fixture.nodeId(),public_key:fixture.publicKeyHex(),direct_urls:[],relay_urls:input.relay_urls,
+              issued_at:issued,expires_at:issued+input.ttl_secs,signature:''};
+            record.signature = fixture.sign('reachability',new TextEncoder().encode(JSON.stringify(record)));
+            result = record;
+          } finally { fixture.free(); }
+          break;
+        }
         case 'fixture_event':
         case 'fixture_chain': {
           const secret = JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex;

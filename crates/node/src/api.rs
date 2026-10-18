@@ -383,12 +383,27 @@ fn validate_tool_call(name: &str, call_id: &str) -> ApiResult<()> {
     Ok(())
 }
 
-async fn network(State(app): State<App>, websocket: WebSocketUpgrade) -> Response {
+async fn network(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    websocket: WebSocketUpgrade,
+) -> Response {
+    let admission = match app.node.network.admit(peer.ip()) {
+        Ok(admission) => admission,
+        Err(error) => {
+            let status = if error.rate() {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            return (status, error.code()).into_response();
+        }
+    };
     websocket
         .max_message_size(65535)
         .max_frame_size(65535)
         .on_upgrade(move |socket| async move {
-            if let Err(error) = app.node.network.clone().accept(socket).await {
+            if let Err(error) = app.node.network.clone().accept(socket, admission).await {
                 tracing::debug!(%error, "network connection closed");
             }
         })

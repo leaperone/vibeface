@@ -13,6 +13,8 @@ with real Node processes and controlled provider protocol fixtures.
 Add --net1-lane 1 to check completed no-op syncs against the saved M0 baseline.
 Add --net1-lane 2 to check interrupted and crashed 32 MiB and 64 MiB relay downloads.
 Add --net1-lane 3 to verify a 100001-event closure across three authorized replicas.
+Add --net1-lane 4 to check production discovery through isolated directory sources.
+Add --net1-lane 5 or 6 to check reservation generations and real-source quotas.
 """
 
 import argparse
@@ -22,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -286,7 +289,7 @@ class RelayCapture:
                 self.connections.extend([client, server])
                 self.next_connection += 1
                 connection = self.next_connection
-                self.traffic[connection] = {"generation": generation, "binary_payload_bytes": 0, "binary_frames": 0}
+                self.traffic[connection] = {"generation": generation, "binary_payload_bytes": 0, "binary_frames": 0, "ping_frames": 0, "pong_frames": 0}
                 for source, target, direction in ((client, server, "to_relay"), (server, client, "from_relay")):
                     worker = threading.Thread(target=self.forward, args=(source, target, connection, generation, direction), daemon=True)
                     self.workers.append(worker)
@@ -336,6 +339,9 @@ class RelayCapture:
                         with self.lock:
                             self.traffic[connection]["binary_payload_bytes"] += len(payload)
                             self.traffic[connection]["binary_frames"] += 1
+                    elif buffer[0] & 15 in (9, 10):
+                        with self.lock:
+                            self.traffic[connection]["ping_frames" if buffer[0] & 15 == 9 else "pong_frames"] += 1
                     if self.retain_payloads or buffer[0] & 15 == 1:
                         self.payloads.append(payload)
                     if buffer[0] & 15 == 1:
@@ -344,6 +350,7 @@ class RelayCapture:
                             require(len(self.controls) < 4096, "bounded captured relay controls")
                             self.controls.append({"connection": connection, "generation": generation,
                                                   "direction": direction, "monotonic": received_monotonic, "wall_time": received_wall_time,
+                                                  "node_id": control.get("node_id") or (control.get("record") or {}).get("node_id"),
                                                   **{key: control[key] for key in ("type", "target", "service") if key in control}})
                     del buffer[:offset + length]
         except (OSError, ValueError, AssertionError) as error:
@@ -936,10 +943,14 @@ def stop_fixture_processes(run):
                 pass
 
 
-def websocket_receive(stream):
+def websocket_receive_frame(stream, maximum=1024 * 1024, *, expected_mask=None, deadline=None):
     def exact(length):
         value = b""
         while len(value) < length:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, "fixture frame shares the operation deadline")
+                stream.settimeout(remaining)
             block = stream.recv(length - len(value))
             if not block:
                 raise EOFError("fixture WebSocket closed")
@@ -947,27 +958,477 @@ def websocket_receive(stream):
         return value
 
     first, second = exact(2)
+    opcode = first & 15
+    require(first & 128 and not first & 0x70 and opcode in (1, 2, 8, 9, 10), "fixture requires unfragmented WS frames without reserved bits")
+    if expected_mask is not None:
+        require(bool(second & 128) == expected_mask, "fixture checks the WS masking direction")
     length = second & 127
     if length == 126:
         length = struct.unpack("!H", exact(2))[0]
     elif length == 127:
         length = struct.unpack("!Q", exact(8))[0]
-    require(length <= 1024 * 1024, "fixture bounds WebSocket messages")
+    require(length <= maximum, "fixture bounds WebSocket messages")
+    require(opcode < 8 or length <= 125, "fixture bounds WS control frames")
     mask = exact(4) if second & 128 else None
     payload = exact(length)
     if mask:
         payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
-    if first & 15 == 8:
+    if opcode == 8:
         raise EOFError("fixture WebSocket close frame")
-    require(first & 15 == 1, "fixture receives text RPC frames")
+    return opcode, payload
+
+
+def websocket_receive(stream):
+    opcode, payload = websocket_receive_frame(stream)
+    require(opcode == 1, "fixture receives text RPC frames")
     return json.loads(payload)
 
 
-def websocket_send(stream, value):
-    encoded = json.dumps(value).encode()
-    prefix = (bytes([0x81, len(encoded)]) if len(encoded) < 126 else
-              bytes([0x81, 126]) + struct.pack("!H", len(encoded)))
+def websocket_send_frame(stream, encoded, *, opcode=1, masked=False):
+    require(len(encoded) <= 1024 * 1024, "fixture bounds outgoing WebSocket frames")
+    mask_flag = 128 if masked else 0
+    prefix = (bytes([0x80 | opcode, mask_flag | len(encoded)]) if len(encoded) < 126 else
+              bytes([0x80 | opcode, mask_flag | 126]) + struct.pack("!H", len(encoded)) if len(encoded) <= 65535 else
+              bytes([0x80 | opcode, mask_flag | 127]) + struct.pack("!Q", len(encoded)))
+    if masked:
+        mask = os.urandom(4)
+        prefix += mask
+        encoded = bytes(value ^ mask[index % 4] for index, value in enumerate(encoded))
     stream.sendall(prefix + encoded)
+
+
+def websocket_send(stream, value):
+    websocket_send_frame(stream, json.dumps(value).encode())
+
+
+class NetworkDirectoryFixture:
+    """Bounded public-Control fixture; never forwards Publish or Reserve upstream."""
+    def __init__(self, name, *, record=None, record_factory=None):
+        self.name, self.record, self.record_factory = name, record, record_factory
+        self.port = available_port()
+        self.url = f"ws://127.0.0.1:{self.port}/api/network/ws"
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+        self.reply_gate = threading.Event()
+        self.reply_gate.set()
+        self.publish_gate = threading.Event()
+        self.publish_gate.set()
+        self.events, self.errors, self.streams, self.workers = [], [], {}, []
+        self.next_connection = 0
+        self.rejected_connections = 0
+        self.listener = socket.socket()
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", self.port))
+        self.listener.listen(16)
+        self.listener.settimeout(.2)
+        self.thread = threading.Thread(target=self.accept, daemon=True)
+        self.thread.start()
+
+    def note(self, kind, connection=None, **fields):
+        with self.lock:
+            require(len(self.events) < 4096, "bounded directory fixture evidence")
+            value = {"kind": kind, "connection": connection, "wall_time": time.time(), "monotonic": time.monotonic(), **fields}
+            self.events.append(value)
+            return value
+
+    def snapshot(self):
+        with self.lock:
+            return {"name": self.name, "url": self.url, "events": list(self.events), "errors": list(self.errors),
+                    "active_sockets": len(self.streams), "accepted_connections": self.next_connection,
+                    "fixture_capacity_rejections": self.rejected_connections,
+                    "fixture_scope": "original public Control only; Publish ACK is local, Reserve is refused, no upstream forwarding"}
+
+    def accept(self):
+        while not self.stopped.is_set():
+            try:
+                stream, peer = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with self.lock:
+                if self.stopped.is_set() or len(self.streams) >= 16 or self.next_connection >= 256:
+                    if not self.stopped.is_set():
+                        self.rejected_connections += 1
+                    stream.close()
+                    continue
+                self.next_connection += 1
+                connection = self.next_connection
+                self.streams[connection] = stream
+                worker = threading.Thread(target=self.serve, args=(stream, peer, connection), daemon=True)
+                self.workers.append(worker)
+                worker.start()
+
+    def serve(self, stream, peer, connection):
+        try:
+            stream.settimeout(15)
+            self.note("tcp_accepted", connection, peer_ip=peer[0])
+            headers = bytearray()
+            while b"\r\n\r\n" not in headers:
+                require(len(headers) < 16384, "bounded directory HTTP upgrade")
+                part = stream.recv(4096)
+                if not part:
+                    return
+                headers.extend(part)
+            head, extra = bytes(headers).split(b"\r\n\r\n", 1)
+            require(not extra and head.split(b"\r\n", 1)[0] == b"GET /api/network/ws HTTP/1.1", "directory fixture receives the expected WS endpoint")
+            values = dict(line.decode("ascii").split(":", 1) for line in head.split(b"\r\n")[1:])
+            values = {key.lower(): value.strip() for key, value in values.items()}
+            key = values["sec-websocket-key"]
+            require(len(base64.b64decode(key, validate=True)) == 16, "valid fixture WS upgrade key")
+            accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+            stream.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n").encode())
+            websocket_send(stream, {"type": "welcome", "nonce": os.urandom(32).hex()})
+            while True:
+                opcode, payload = websocket_receive_frame(stream, 16 * 1024, expected_mask=True)
+                if opcode == 9:
+                    websocket_send_frame(stream, payload, opcode=10)
+                    continue
+                if opcode == 10:
+                    continue
+                require(opcode == 1, "directory fixture accepts only public Control text")
+                control = json.loads(payload)
+                break
+            kind = control.get("type")
+            self.note("control_received", connection, control=kind, target=control.get("target"), node_id=control.get("node_id") or control.get("record", {}).get("node_id"))
+            if kind == "publish":
+                while not self.publish_gate.wait(.1):
+                    if self.stopped.is_set():
+                        return
+                websocket_send(stream, {"type": "published"})
+                self.note("publish_acknowledged_locally", connection)
+            elif kind == "reserve":
+                self.note("reserve_refused", connection)
+            elif kind == "lookup":
+                deadline = time.monotonic() + 35
+                while not self.reply_gate.wait(.1):
+                    if self.stopped.is_set() or time.monotonic() >= deadline:
+                        return
+                if self.stopped.is_set():
+                    return
+                record = self.record_factory(control["target"]) if self.record_factory else copy.deepcopy(self.record)
+                self.note("record_send_started", connection, target=control["target"],
+                          record_node_id=record.get("node_id") if record else None,
+                          issued_at=record.get("issued_at") if record else None, expires_at=record.get("expires_at") if record else None,
+                          signature_sha256=hashlib.sha256(record["signature"].encode()).hexdigest() if record else None)
+                websocket_send(stream, {"type": "record", "record": record})
+                self.note("record_sent", connection, target=control["target"])
+            else:
+                self.note("control_refused", connection, control=kind)
+        except (OSError, EOFError):
+            pass
+        except Exception as error:
+            with self.lock:
+                self.errors.append(f"{type(error).__name__}: {error}")
+        finally:
+            try:
+                stream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            stream.close()
+            with self.lock:
+                self.streams.pop(connection, None)
+
+    def release(self):
+        value = self.note("reply_gate_released")
+        self.reply_gate.set()
+        return value
+
+    def close(self):
+        self.stopped.set()
+        self.reply_gate.set()
+        self.publish_gate.set()
+        self.listener.close()
+        with self.lock:
+            streams = list(self.streams.values())
+        for stream in streams:
+            try:
+                stream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            stream.close()
+        self.thread.join(timeout=2)
+        deadline = time.monotonic() + 2
+        for worker in self.workers:
+            worker.join(timeout=max(0, deadline - time.monotonic()))
+        require(not self.thread.is_alive() and all(not worker.is_alive() for worker in self.workers), "directory fixture workers and sockets are reclaimed")
+
+
+class NetworkUpgradeRejected(AssertionError):
+    def __init__(self, summary):
+        self.summary = dict(summary)
+        super().__init__(f"isolated network upgrade rejected with HTTP {summary['upgrade_status']}")
+
+
+class NetworkControlSocket:
+    """A bounded raw client for original public Controls and actual TCP read stalls."""
+    def __init__(self, url, *, source_ip=None, deadline=None, forwarded_for=None, receive_buffer=None):
+        endpoint = urllib.parse.urlparse(url)
+        require(endpoint.scheme == "ws" and endpoint.path == "/api/network/ws" and not endpoint.query and not endpoint.fragment,
+                "network fixture uses the original local WS endpoint")
+        require(ipaddress.ip_address(endpoint.hostname).is_loopback, "network fixture connects only to an isolated loopback Node")
+        if source_ip is not None:
+            require(ipaddress.ip_address(source_ip).is_loopback, "network fixture binds only an existing loopback source")
+        self.stream = None
+        self.pending = bytearray()
+        self.closed = False
+        self.deadline = deadline
+        self.write_lock = threading.RLock()
+        self.pong_lock = threading.Lock()
+        self.pending_pong = None
+        self.summary = {"url": url, "requested_source_ip": source_ip, "opened_wall_time": time.time()}
+        try:
+            deadline = min(time.monotonic() + 10, self.deadline or float("inf"))
+            if receive_buffer is None:
+                self.stream = socket.create_connection((endpoint.hostname, endpoint.port or 80), timeout=10,
+                                                       source_address=(source_ip, 0) if source_ip else None)
+            else:
+                require(isinstance(receive_buffer, int) and 4096 <= receive_buffer <= 65536, "fixture receive buffer is explicitly bounded")
+                family = socket.AF_INET6 if ipaddress.ip_address(endpoint.hostname).version == 6 else socket.AF_INET
+                self.stream = socket.socket(family)
+                self.stream.settimeout(10)
+                self.stream.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+                if source_ip:
+                    self.stream.bind((source_ip, 0))
+                self.stream.connect((endpoint.hostname, endpoint.port or 80))
+                self.summary.update({"requested_receive_buffer": receive_buffer,
+                                     "actual_receive_buffer": self.stream.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)})
+            self.summary.update({"actual_local_address": list(self.stream.getsockname()), "actual_peer_address": list(self.stream.getpeername())})
+            nonce = base64.b64encode(os.urandom(16)).decode()
+            host = f"[{endpoint.hostname}]" if ":" in endpoint.hostname else endpoint.hostname
+            request = (f"GET {endpoint.path} HTTP/1.1\r\nHost: {host}:{endpoint.port or 80}\r\n"
+                       f"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {nonce}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+            if forwarded_for is not None:
+                ipaddress.ip_address(forwarded_for)
+                request = request[:-2] + f"X-Forwarded-For: {forwarded_for}\r\nForwarded: for={forwarded_for}\r\n\r\n"
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "raw client connects within its upgrade deadline")
+            self.stream.settimeout(remaining)
+            self.stream.sendall(request.encode())
+            headers = bytearray()
+            while b"\r\n\r\n" not in headers:
+                require(len(headers) < 16384, "bounded raw client WS upgrade")
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, "raw upgrade shares one complete handshake deadline")
+                self.stream.settimeout(remaining)
+                block = self.stream.recv(4096)
+                require(block, "raw client receives a complete upgrade response")
+                headers.extend(block)
+            head, body = bytes(headers).split(b"\r\n\r\n", 1)
+            lines = head.decode("ascii").split("\r\n")
+            self.summary["upgrade_status"] = int(lines[0].split()[1])
+            values = {key.lower(): value.strip() for key, value in (line.split(":", 1) for line in lines[1:])}
+            if self.summary["upgrade_status"] != 101:
+                length = int(values.get("content-length", "0"))
+                require(0 <= length <= 16384 and len(body) <= length, "raw upgrade rejection body stays bounded")
+                while len(body) < length:
+                    remaining = deadline - time.monotonic()
+                    require(remaining > 0, "HTTP rejection body shares the original upgrade deadline")
+                    self.stream.settimeout(remaining)
+                    block = self.stream.recv(length - len(body))
+                    require(block, "HTTP rejection includes its complete bounded body")
+                    body += block
+                self.summary["rejection_body"] = body.decode("utf8", errors="replace")
+                raise NetworkUpgradeRejected(self.summary)
+            expected = base64.b64encode(hashlib.sha1((nonce + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+            require(values.get("sec-websocket-accept") == expected, "raw fixture checks the actual WS handshake")
+            self.pending.extend(body)
+            welcome = self.control(deadline=deadline)
+            require(welcome.get("type") == "welcome" and isinstance(welcome.get("nonce"), str), "raw client receives the per-connection challenge")
+            self.nonce = welcome["nonce"]
+        except BaseException:
+            self.close()
+            raise
+
+    def recv(self, length):
+        if self.pending:
+            value = bytes(self.pending[:length])
+            del self.pending[:length]
+            return value
+        return self.stream.recv(length)
+
+    def sendall(self, value):
+        with self.write_lock:
+            self.stream.sendall(value)
+            with self.pong_lock:
+                pong, self.pending_pong = self.pending_pong, None
+            if pong is not None:
+                websocket_send_frame(self, pong, opcode=10, masked=True)
+
+    def pong(self, payload):
+        if self.write_lock.acquire(blocking=False):
+            try:
+                websocket_send_frame(self, payload, opcode=10, masked=True)
+            finally:
+                self.write_lock.release()
+        else:
+            with self.pong_lock:
+                self.pending_pong = payload
+
+    def settimeout(self, value):
+        self.stream.settimeout(value)
+
+    def control(self, *, deadline=None):
+        deadline = min(deadline or float("inf"), time.monotonic() + 10, self.deadline or float("inf"))
+        for _ in range(64):
+            opcode, payload = websocket_receive_frame(self, 16 * 1024, expected_mask=False, deadline=deadline)
+            if opcode == 9:
+                self.pong(payload)
+            elif opcode == 10:
+                continue
+            else:
+                require(opcode == 1, "raw fixture expects a public Control")
+                return json.loads(payload)
+        raise AssertionError("bounded raw control frames before response")
+
+    def send_control(self, value):
+        encoded = json.dumps(value, separators=(",", ":")).encode()
+        require(len(encoded) <= 16 * 1024, "raw public Control stays within the wire limit")
+        remaining = min(10, (self.deadline or float("inf")) - time.monotonic())
+        require(remaining > 0, "public Control stays inside the scenario deadline")
+        self.stream.settimeout(remaining)
+        websocket_send_frame(self, encoded, masked=True)
+
+    def send_binary(self, value):
+        require(len(value) <= 65535, "raw encrypted fixture respects the relay frame limit")
+        remaining = min(10, (self.deadline or float("inf")) - time.monotonic())
+        require(remaining > 0, "binary send stays inside the scenario deadline")
+        self.stream.settimeout(remaining)
+        websocket_send_frame(self, value, opcode=2, masked=True)
+
+    def binary(self):
+        deadline = min(time.monotonic() + 10, self.deadline or float("inf"))
+        for _ in range(64):
+            opcode, payload = websocket_receive_frame(self, 65535, expected_mask=False, deadline=deadline)
+            if opcode == 9:
+                self.pong(payload)
+            elif opcode == 10:
+                continue
+            else:
+                require(opcode == 2, "raw fixture receives only protected application frames after Ready")
+                return payload
+        raise AssertionError("bounded raw binary frames before response")
+
+    def reserve(self, owner):
+        proof = json.dumps({"nonce": self.nonce, "node_id": owner.node_id}, separators=(",", ":"))
+        self.send_control({"type": "reserve", "node_id": owner.node_id, "public_key": owner.public_key,
+                           "signature": owner.sign("relay-reserve", proof.encode())})
+        return self.control()
+
+    def attach(self, owner, token):
+        proof = json.dumps({"nonce": self.nonce, "token": token}, separators=(",", ":"))
+        self.send_control({"type": "attach", "token": token, "signature": owner.sign("relay-attach", proof.encode())})
+        return self.control()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.summary["closed_wall_time"] = time.time()
+        if self.stream is not None:
+            try:
+                self.stream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.stream.close()
+
+
+class NetworkCryptoFixture:
+    """One fixed, private fixture identity and Noise channel; never starts a model."""
+    def __init__(self, run, name, module, *, expected_node_id=None, deadline=None):
+        repository = Path(__file__).resolve().parents[1]
+        self.identity_file = run / f"{name}-identity.json"
+        self.deadline = deadline
+        require(self.identity_file.parent.resolve() == run.resolve() and self.identity_file.name == f"{name}-identity.json"
+                and "/" not in name and name not in (".", ".."), "fixture identity remains directly inside this private run")
+        self.process = subprocess.Popen(["node", str(repository / "scripts/crypto-client.mjs"), "--module", str(module)],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        try:
+            identity = self.command("fixture_identity", identity_file=str(self.identity_file), expected_node_id=expected_node_id)
+            self.node_id, self.public_key = identity["node_id"], identity["public_key"]
+        except BaseException:
+            self.close()
+            raise
+
+    def command(self, operation, **arguments):
+        require(self.process is not None and self.process.poll() is None, "fixed-identity crypto fixture remains alive")
+        encoded = (json.dumps({"op": operation, **arguments}) + "\n").encode()
+        require(len(encoded) <= 2 * 1024 * 1024, "crypto fixture request remains bounded")
+        deadline = min(time.monotonic() + 15, self.deadline or float("inf"))
+        os.set_blocking(self.process.stdin.fileno(), False)
+        pending = memoryview(encoded)
+        while pending:
+            remaining = deadline - time.monotonic()
+            require(remaining > 0 and select.select([], [self.process.stdin], [], remaining)[1], "crypto fixture request shares the command deadline")
+            try:
+                written = os.write(self.process.stdin.fileno(), pending[:4096])
+            except BlockingIOError:
+                continue
+            require(written > 0, "crypto fixture accepts the bounded request")
+            pending = pending[written:]
+        response = bytearray()
+        while b"\n" not in response:
+            remaining = deadline - time.monotonic()
+            require(remaining > 0 and select.select([self.process.stdout], [], [], remaining)[0], "crypto fixture complete response shares one bounded deadline")
+            block = os.read(self.process.stdout.fileno(), min(65536, 2 * 1024 * 1024 + 1 - len(response)))
+            require(block, "crypto fixture returns a complete JSON line before EOF")
+            response.extend(block)
+            require(len(response) <= 2 * 1024 * 1024, "crypto fixture response remains bounded before its newline")
+        require(response.endswith(b"\n") and response.count(b"\n") == 1, "one crypto fixture response corresponds to one command")
+        value = json.loads(response)
+        require(value.get("ok"), f"crypto fixture {operation} succeeds")
+        return value.get("result")
+
+    def sign(self, domain, payload):
+        return self.command("sign", domain=domain, data=payload.hex())
+
+    def close(self):
+        if self.process is not None:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+            self.process = None
+
+
+def network_fixture_noise(caller, target, caller_identity, target_identity):
+    context = "vibeface:net1:fixture:v1"
+    caller_identity.command("handshake", initiator=True, expected_peer_id=target_identity.node_id, context=context)
+    target_identity.command("handshake", initiator=False, expected_peer_id=caller_identity.node_id, context=context)
+    caller.send_binary(bytes.fromhex(caller_identity.command("write", data="")))
+    target_identity.command("read", data=target.binary().hex())
+    target.send_binary(bytes.fromhex(target_identity.command("write", data="")))
+    caller_identity.command("read", data=caller.binary().hex())
+    caller.send_binary(bytes.fromhex(caller_identity.command("write", data="")))
+    target_identity.command("read", data=target.binary().hex())
+    require(caller_identity.command("remote") == target_identity.node_id
+            and target_identity.command("remote") == caller_identity.node_id, "fixture Noise authenticates both fixed original identities")
+    caller_identity.command("finish")
+    target_identity.command("finish")
+    return {"caller_node_id": caller_identity.node_id, "target_node_id": target_identity.node_id,
+            "context": context, "scope": "fixture Noise over the original public relay; not personal-network member authorization"}
+
+
+def network_fixture_canary(sender, receiver, sender_identity, receiver_identity, label):
+    payload = ("NET-1 " + label + " " + uuid.uuid4().hex).encode()
+    require(len(payload) <= 4096, "canary remains bounded")
+    records = sender_identity.command("seal_message", data=payload.hex())
+    require(0 < len(records) <= 8, "bounded protected canary records")
+    for record in records:
+        sender.send_binary(bytes.fromhex(record))
+    opened = None
+    for _ in range(8):
+        opened = receiver_identity.command("open_record", data=receiver.binary().hex())
+        if opened is not None:
+            break
+    require(opened is not None and bytes.fromhex(opened) == payload, "the fixed receiving identity decrypts the exact end-to-end canary")
+    return {"label": label, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+            "sender_node_id": sender_identity.node_id, "receiver_node_id": receiver_identity.node_id, "decrypted_exactly": True}
 
 
 def fixture_codex(arguments):
@@ -3207,6 +3668,973 @@ def network_reliability_blob_resume(run, binary, workspace, fixture, helper, mod
             capture.close()
 
 
+def network_trace_records(node, offset=0, *, messages=None):
+    result = []
+    names = "source|class|target|reason|generation|previous|previous_source|previous_authenticated_secs|current|removed_pending|directory|outcome|cached|error|circuit|event|direction|queued_frames|queued_bytes|reader_held_bytes|writer_held_bytes|accepted_bytes|window_bytes|held_bytes|bytes|active"
+    path = node.directory / "process.log"
+    if not path.exists():
+        return result
+    position = offset
+    with path.open("rb") as stream:
+        stream.seek(offset)
+        for raw in stream:
+            if not raw.endswith(b"\n"):
+                break
+            line = re.sub(r"\x1b\[[0-9;]*m", "", raw.decode(errors="replace")).strip()
+            end = position + len(raw)
+            if messages is None or any(message in line for message in messages):
+                fields = {key: value.strip().strip('"') for key, value in re.findall(rf'\b({names})=("(?:\\.|[^"\\])*"|Some\([^)]*\)|[^\s,}}]+)', line)}
+                stamp = re.search(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z", line)
+                result.append({"log_offset": position, "log_end": end, "fields": fields, "message": line,
+                               "wall_time": datetime.fromisoformat(stamp.group().replace("Z", "+00:00")).timestamp() if stamp else None})
+            position = end
+    return result
+
+
+def network_core_evidence(evidence_dir, slice_name, tests):
+    require(evidence_dir is not None, "network lanes require frozen core evidence")
+    repository = Path(__file__).resolve().parents[1]
+    path = evidence_dir / f"m3-{slice_name}-core-slice.json"
+    manifest = json.loads(path.read_text())
+    if "checks" in manifest:
+        require(all(item.get("exit_code") == 0 for item in manifest["checks"]), "referenced core checks passed")
+        sources = manifest.get("source", manifest.get("sources"))
+        require(isinstance(sources, list) and sources, "frozen source evidence provides its actual nonempty source list")
+        log_names = [item["log"] for item in manifest["checks"] if item.get("log")]
+    else:
+        require(slice_name == "a2" and manifest.get("status") == "scoped pass"
+                and manifest.get("review", {}).get("verdict") == "scoped pass"
+                and not manifest["review"].get("unresolved_p1_p2")
+                and all(manifest["check_results"].get(key) == "pass" for key in ("clippy", "fmt", "diff_check")),
+                "A2 has its original scoped-pass check and independent-review schema")
+        sources = list(manifest["sources"].values())
+        log_names = list(manifest["final_checks"].values())
+    snapshots = []
+    for source in sources:
+        snapshot = repository / source.get("snapshot", manifest.get("snapshot", ""))
+        require(snapshot.is_file() and file_sha256(snapshot) == source["sha256"], "core source snapshot matches the frozen manifest")
+        snapshots.append(str(snapshot))
+    logs = []
+    text = ""
+    for name in log_names:
+        log = evidence_dir.parent / name
+        value = log.read_text()
+        text += value
+        logs.append({"path": str(log), "sha256": file_sha256(log)})
+    require(all(re.search(rf"test [^\n]*::{re.escape(name)} \.\.\. ok", text) for name in tests), "named source boundary cases have real passed logs")
+    return {"slice": slice_name, "manifest": str(path), "manifest_sha256": file_sha256(path), "source": sources,
+            "snapshots": snapshots, "logs": logs, "passed_cases": tests,
+            "scope": "production source boundary tests; exact live versus direct-ledger scope remains as declared by the core manifest",
+            "actual_ws": manifest.get("actual_ws"), "ledger_only": manifest.get("ledger_only"), "scope_notes": manifest.get("scope_notes")}
+
+
+def network_assert_source(entry, summary):
+    raw = entry["fields"].get("source", "")
+    if raw.startswith("Some(") and raw.endswith(")"):
+        raw = raw[5:-1].strip('"')
+    observed = ipaddress.ip_address(raw)
+    actual = ipaddress.ip_address(summary["actual_local_address"][0])
+    observed = observed.ipv4_mapped if isinstance(observed, ipaddress.IPv6Address) and observed.ipv4_mapped else observed
+    actual = actual.ipv4_mapped if isinstance(actual, ipaddress.IPv6Address) and actual.ipv4_mapped else actual
+    require(observed == actual, "server rejection uses the actual connected TCP source, including mapped IPv4 normalization")
+
+
+def network_circuit_exit(entry):
+    return ("network connection closed" in entry["message"]
+            and any(value in entry["message"] for value in ("relay caller disconnected", "relay target disconnected",
+                       "relay endpoint disconnected", "Connection reset without closing handshake", "relay accepts only encrypted binary frames")))
+
+
+def network_fixture_cleanup(sockets, identities, nodes, case):
+    errors = []
+    for kind, values in (("socket", sockets), ("crypto", identities), ("node", nodes)):
+        for value in reversed(values):
+            try:
+                value.stop() if kind == "node" else value.close()
+            except Exception as error:
+                errors.append({"kind": kind, "error_type": type(error).__name__})
+    ports = []
+    for node in nodes:
+        listen = json.loads((node.directory / "config.json").read_text())["listen"]
+        addresses = [(socket.AF_INET, "127.0.0.1")]
+        if listen.startswith("[::]"):
+            addresses.append((socket.AF_INET6, "::1"))
+        for family, host in addresses:
+            try:
+                with socket.socket(family) as probe:
+                    probe.settimeout(.3)
+                    closed = probe.connect_ex((host, node.port)) != 0
+                ports.append({"node": node.name, "host": host, "port": node.port, "closed": closed})
+            except OSError as error:
+                ports.append({"node": node.name, "host": host, "port": node.port, "closed": False, "probe_error": type(error).__name__})
+    case["raw_sockets"] = [value.summary for value in sockets]
+    case["cleanup"] = {"errors": errors, "ports": ports, "remaining_crypto_processes": sum(value.process is not None for value in identities),
+                       "remaining_owned_node_processes": sum(value.process is not None for value in nodes)}
+    if errors or not all(item["closed"] for item in ports) or case["cleanup"]["remaining_crypto_processes"] or case["cleanup"]["remaining_owned_node_processes"]:
+        case["status"] = "failed"
+    require(not errors and all(item["closed"] for item in ports)
+            and case["cleanup"]["remaining_crypto_processes"] == case["cleanup"]["remaining_owned_node_processes"] == 0,
+            "all owned network sockets, crypto helpers and Node processes are reclaimed")
+
+
+def network_reliability_reservation(run, binary, workspace, fixture, helper, module, report, nodes, evidence_dir):
+    case = {"status": "running", "group_deadline_seconds": 60, "stale_attach_expected": "old token can be removed before Attach; unknown or stale generation both reject it"}
+    report["cases"]["reservation_generation"] = case
+    sockets, identities = [], []
+    deadline = time.monotonic() + 60
+    env = {**os.environ, "RUST_LOG": "vibeface::network=debug,vibeface::api=debug", "NO_COLOR": "1"}
+
+    def remaining():
+        value = deadline - time.monotonic()
+        require(value > 0, "reservation scenario stays within its total deadline")
+        return value
+
+    def identity(name):
+        owner = NetworkCryptoFixture(run, name, module, deadline=deadline)
+        identities.append(owner)
+        return owner
+
+    def socket_at():
+        value = NetworkControlSocket(url, deadline=deadline)
+        sockets.append(value)
+        return value
+
+    def trace(message, **expected):
+        return next((entry for entry in network_trace_records(relay, messages=[message])
+                     if all(entry["fields"].get(key) == value for key, value in expected.items())), None)
+
+    def dial(reservation, owner):
+        caller = socket_at()
+        caller.send_control({"type": "dial", "target": owner.node_id, "service": "peer"})
+        incoming = reservation.control()
+        require(incoming.get("type") == "incoming" and incoming.get("service") == "peer", "current reservation receives the exact peer Dial")
+        return caller, incoming["token"]
+
+    try:
+        relay = Node(run, "R", binary, workspace, fixture, helper, module)
+        nodes.append(relay)
+        relay.configure(roles=["relay"], manager=None, codex_socket=str(run / "unused-codex.sock"),
+                        network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False, "relay_enabled": True})
+        relay.start(env=env)
+        url = relay.url.replace("http:", "ws:") + "/api/network/ws"
+        owner = identity("target")
+        caller_owner = identity("caller")
+        old = socket_at()
+        require(old.reserve(owner) == {"type": "reserved"}, "old fixed identity completes a real reservation challenge")
+        old_ready = wait_for("old generation ready trace", lambda: trace("relay reservation ready", target=owner.node_id), timeout=remaining())
+        old_generation = old_ready["fields"]["generation"]
+        first, token = dial(old, owner)
+        established_target = socket_at()
+        require(established_target.attach(owner, token) == {"type": "ready"} and first.control() == {"type": "ready"}, "old generation establishes both circuit legs")
+        noise = network_fixture_noise(first, established_target, caller_owner, owner)
+        before = network_fixture_canary(first, established_target, caller_owner, owner, "before-handoff")
+        old_pending_started = time.monotonic()
+        pending_caller, old_token = dial(old, owner)
+        token_tag = hashlib.sha256(old_token.encode()).hexdigest()
+        wait_for("minimum generation spacing before deliberate new challenge", lambda: old_ready["wall_time"] is not None and time.time() >= old_ready["wall_time"] + 1.1, timeout=remaining())
+        fresh = socket_at()
+        require(fresh.reserve(owner) == {"type": "reserved"}, "same fixed identity authenticates a fresh challenge without client-closing the old socket")
+        installed = wait_for("new generation installation", lambda: next((entry for entry in network_trace_records(relay, messages=["relay reservation installed"])
+            if entry["fields"].get("target") == owner.node_id and entry["fields"].get("generation") != old_generation), None), timeout=remaining())
+        generation = installed["fields"]["generation"]
+        require(old_generation in installed["fields"].get("previous", ""), "new generation explicitly replaces the original reservation")
+        previous_closed = wait_for("server actively reclaims the previous physical socket", lambda: trace("relay reservation previous socket closed", target=owner.node_id, generation=generation), timeout=remaining())
+        removed = wait_for("old cleanup is scoped to its previous generation", lambda: trace("relay reservation removed", target=owner.node_id, generation=old_generation, current="false"), timeout=remaining())
+        new_ready = wait_for("new reservation remains ready after old cleanup", lambda: trace("relay reservation ready", target=owner.node_id, generation=generation), timeout=remaining())
+        old.close()
+        after = network_fixture_canary(established_target, first, owner, caller_owner, "old-ready-circuit-after-handoff")
+        stale_cursor = (relay.directory / "process.log").stat().st_size
+        stale = socket_at()
+        require(time.monotonic() < old_pending_started + 10, "old token refusal precedes its natural expiry")
+        try:
+            stale.attach(owner, old_token)
+            raise AssertionError("old generation token must never attach to the new reservation")
+        except (EOFError, ConnectionResetError, BrokenPipeError) as error:
+            stale_failure = type(error).__name__
+        stale_trace = wait_for("old pending token is rejected by actual relay", lambda: next((entry for entry in network_trace_records(relay, stale_cursor)
+            if "unknown relay attachment" in entry["message"] or "stale relay attachment" in entry["message"] or entry["fields"].get("reason") == "stale_generation"), None), timeout=remaining())
+        require(time.monotonic() < old_pending_started + 10, "completed old-token refusal precedes natural expiry even including signature and response")
+        pending_caller.close()
+        new_caller_owner = identity("new-caller")
+        new_target_owner = identity("target")
+        require(new_target_owner.node_id == owner.node_id, "new circuit keeps the exact original target key")
+        new_caller, token = dial(fresh, owner)
+        new_target = socket_at()
+        require(new_target.attach(new_target_owner, token) == {"type": "ready"} and new_caller.control() == {"type": "ready"}, "new generation accepts a fresh attachment after old cleanup")
+        new_noise = network_fixture_noise(new_caller, new_target, new_caller_owner, new_target_owner)
+        new_canary = network_fixture_canary(new_caller, new_target, new_caller_owner, new_target_owner, "new-generation")
+        ready_exits = []
+        for caller_socket, target_socket in ((first, established_target), (new_caller, new_target)):
+            exit_cursor = (relay.directory / "process.log").stat().st_size
+            caller_socket.close()
+            target_socket.close()
+            ready_exits.append(wait_for("owned completed circuit actually exits before the quota subcase",
+                lambda exit_cursor=exit_cursor: next((entry for entry in network_trace_records(relay, exit_cursor) if network_circuit_exit(entry)), None), timeout=remaining()))
+        current_generation = generation
+        recovered_caller_identity = identity("new-caller")
+        recovered_target_identity = identity("target")
+        require(recovered_caller_identity.node_id == new_caller_owner.node_id and recovered_target_identity.node_id == owner.node_id,
+                "capacity recovery keeps both original fixture identities")
+        held, held_tokens = [], []
+        held_started = time.monotonic()
+        for _ in range(4):
+            value, held_token = dial(fresh, owner)
+            held.append(value)
+            held_tokens.append(held_token)
+        denied_cursor = (relay.directory / "process.log").stat().st_size
+        extra = socket_at()
+        extra.send_control({"type": "dial", "target": owner.node_id, "service": "peer"})
+        try:
+            extra.control()
+            raise AssertionError("fifth same-source circuit must be refused")
+        except (EOFError, ConnectionResetError, BrokenPipeError):
+            pass
+        denied = wait_for("actual source circuit refusal", lambda: next((entry for entry in network_trace_records(relay, denied_cursor, messages=["network admission rejected"])
+            if entry["fields"].get("reason") == "source_circuit"), None), timeout=remaining())
+        held_target = socket_at()
+        require(held_target.attach(new_target_owner, held_tokens[0]) == {"type": "ready"} and held[0].control() == {"type": "ready"}, "selected waiting circuit is attached before testing immediate transport cleanup")
+        cleanup_cursor = (relay.directory / "process.log").stat().st_size
+        held[0].close()
+        held_target.close()
+        selected_exit = wait_for("selected Ready circuit actually exits after both endpoints close", lambda: next((entry
+                 for entry in network_trace_records(relay, cleanup_cursor) if network_circuit_exit(entry)), None), timeout=remaining())
+        recovered, token = dial(fresh, owner)
+        recovered_target = socket_at()
+        require(recovered_target.attach(new_target_owner, token) == {"type": "ready"} and recovered.control() == {"type": "ready"}, "releasing only the current work restores capacity on the same reservation")
+        require(time.monotonic() < held_started + 10, "capacity recovers before the other pending circuits naturally expire")
+        recovered_noise = network_fixture_noise(recovered, recovered_target, recovered_caller_identity, recovered_target_identity)
+        recovered_canary = network_fixture_canary(recovered, recovered_target, recovered_caller_identity, recovered_target_identity, "after-quota-release")
+        require(time.monotonic() < held_started + 10, "recovered Noise and canary complete while the other pending requests remain unexpired")
+        require(not trace("relay reservation removed", target=owner.node_id, generation=current_generation), "current reservation was not torn down by rejected Dial")
+        core = network_core_evidence(evidence_dir, "a1", ["full_data_capacity_refuses_only_the_incoming_and_recovers_on_the_same_reservation"])
+        generations_core = network_core_evidence(evidence_dir, "a2", ["a2_new_challenge_cancels_blocked_publish_and_preserves_ready_circuit",
+            "a2_outer_abort_drops_an_attached_socket_waiting_in_the_receiver", "a2_real_full_source_and_global_handoff_uses_a_full_logical_table_fixture"])
+        case.update({"status": "passed", "target_node_id": owner.node_id, "old_generation": old_generation, "new_generation": generation,
+                     "old_ready": old_ready, "new_installed": installed, "previous_socket_closed": previous_closed,
+                     "old_cleanup": removed, "new_ready": new_ready, "old_token_sha256": token_tag, "stale_failure": stale_failure,
+                     "stale_trace": stale_trace, "old_noise": noise, "canary_before": before, "old_circuit_canary_after": after,
+                     "new_noise": new_noise, "new_canary": new_canary, "current_dial_refusal": denied,
+                     "ready_circuit_exits_before_quota": ready_exits, "selected_circuit_exit": selected_exit,
+                     "same_generation_recovered": generation, "recovered_noise": recovered_noise, "recovered_canary": recovered_canary,
+                     "core_boundary_evidence": [core, generations_core],
+                     "not_claimed": ["packaged target Node Data pool exhausted", "64 live source identities on one packaged Node"],
+                     "completed_wall_time": time.time(), "deadline_remaining_seconds": remaining()})
+        require(not invocations(run), "reservation acceptance never invokes an executor")
+        verify_no_model_budget(nodes)
+        require(file_sha256(binary) == report["binary_sha256"], "Lane 5 binary is immutable")
+        report["status"] = "passed"
+        report["fixture_invocations"] = 0
+    except Exception:
+        case["status"] = "failed"
+        raise
+    finally:
+        network_fixture_cleanup(sockets, identities, nodes, case)
+
+
+def network_reliability_duplex(run, binary, workspace, fixture, helper, module, report, nodes, evidence_dir):
+    case = {"status": "running", "group_deadline_seconds": 120, "fixture_messages": 160, "fixture_message_bytes": 60000,
+            "flow_identity": "local circuit digest plus fixed target; no attach token is exported"}
+    report["cases"]["budget_and_duplex"]["groups"]["slow_duplex"] = case
+    sockets, identities, own_nodes = [], [], []
+    flood_thread = None
+    flood = {"records_sent": 0, "bytes_sent": 0, "error_type": None}
+    deadline = time.monotonic() + 120
+
+    def remaining():
+        value = deadline - time.monotonic()
+        require(value > 0, "duplex group has one total deadline")
+        return value
+
+    def identity(name):
+        owner = NetworkCryptoFixture(run, name, module, deadline=deadline)
+        identities.append(owner)
+        return owner
+
+    def connection(*, receive_buffer=None):
+        value = NetworkControlSocket(url, deadline=deadline, receive_buffer=receive_buffer)
+        sockets.append(value)
+        return value
+
+    def flow_records():
+        return network_trace_records(relay, cursor, messages=["relay flow"])
+
+    def establish(reservation, caller_owner, target_owner, *, receive_buffer=None):
+        caller = connection()
+        caller.send_control({"type": "dial", "target": target_owner.node_id, "service": "peer"})
+        incoming = reservation.control()
+        require(incoming.get("type") == "incoming" and incoming.get("service") == "peer", "fixed target receives the original relay request")
+        target = connection(receive_buffer=receive_buffer)
+        require(target.attach(target_owner, incoming["token"]) == {"type": "ready"} and caller.control() == {"type": "ready"}, "both raw data legs reach Ready")
+        noise = network_fixture_noise(caller, target, caller_owner, target_owner)
+        return caller, target, noise
+
+    try:
+        relay = Node(run, "R-duplex", binary, workspace, fixture, helper, module)
+        nodes.append(relay)
+        own_nodes.append(relay)
+        relay.configure(roles=["relay"], manager=None, codex_socket=str(run / "unused-codex.sock"),
+                        network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False, "relay_enabled": True})
+        relay.start(env={**os.environ, "RUST_LOG": "vibeface::network=debug,vibeface::api=debug", "NO_COLOR": "1"})
+        url = relay.url.replace("http:", "ws:") + "/api/network/ws"
+        caller_owner, target_owner = identity("duplex-caller"), identity("duplex-target")
+        other_caller_owner, other_target_owner = identity("duplex-other-caller"), identity("duplex-other-target")
+        reservation, other_reservation = connection(), connection()
+        require(reservation.reserve(target_owner) == {"type": "reserved"}
+                and other_reservation.reserve(other_target_owner) == {"type": "reserved"}, "both fixed target reservations are ready")
+        cursor = (relay.directory / "process.log").stat().st_size
+        caller, stopped_target, noise = establish(reservation, caller_owner, target_owner, receive_buffer=8192)
+        records, expected_hashes = [], []
+        for sequence in range(160):
+            payload = sequence.to_bytes(8, "little") + bytes([sequence % 256]) * (60000 - 8)
+            expected_hashes.append(hashlib.sha256(payload).hexdigest())
+            sealed = caller_owner.command("seal_message", data=payload.hex())
+            records.extend(bytes.fromhex(value) for value in sealed)
+            require(len(records) <= 320 and sum(map(len, records)) <= 12 * 1024 * 1024, "encrypted flood fixture is bounded before sending")
+        before_flood = (relay.directory / "process.log").stat().st_size
+        paused = {"wall_time": time.time(), "monotonic": time.monotonic(), "target_socket": dict(stopped_target.summary),
+                  "mechanism": "the raw target performs no TCP recv between final Noise read and explicit resume; send remains independent"}
+        stable_pending = None
+
+        def send_flood():
+            try:
+                for value in records:
+                    caller.send_binary(value)
+                    flood["records_sent"] += 1
+                    flood["bytes_sent"] += len(value)
+            except Exception as error:
+                flood["error_type"] = type(error).__name__
+
+        flood_thread = threading.Thread(target=send_flood, daemon=True)
+        flood_thread.start()
+
+        def continuously_blocked():
+            nonlocal stable_pending
+            candidates = {}
+            for entry in network_trace_records(relay, before_flood, messages=["relay flow"]):
+                fields = entry["fields"]
+                if fields.get("target") != target_owner.node_id or fields.get("direction") != "caller_to_target":
+                    continue
+                circuit = fields.get("circuit")
+                require(circuit and re.fullmatch(r"[0-9a-f]{12}", circuit), "slow direction is associated with an actual local circuit tag")
+                if fields.get("event") == "write_pending":
+                    candidates[circuit] = {"write_pending": entry, "queue_full": None}
+                elif fields.get("event") in ("write_resumed", "closed"):
+                    candidates.pop(circuit, None)
+                elif fields.get("event") == "queue_full" and circuit in candidates:
+                    candidates[circuit]["queue_full"] = entry
+            latest = next(({"circuit": circuit, **value} for circuit, value in candidates.items() if value["queue_full"]), None)
+            if latest is None:
+                stable_pending = None
+                return None
+            key = (latest["circuit"], latest["write_pending"]["log_offset"])
+            if stable_pending is None or stable_pending["key"] != key:
+                stable_pending = {"key": key, "monotonic": time.monotonic()}
+                return None
+            elapsed = time.monotonic() - stable_pending["monotonic"]
+            return {**latest, "continuous_observed_seconds_before_progress": elapsed} if elapsed >= .5 else None
+
+        blocked = wait_for("actual same-flow pending write plus full queue while TCP reading is stopped", continuously_blocked,
+                           timeout=min(10, remaining()))
+        circuit = blocked["circuit"]
+        reverse = network_fixture_canary(stopped_target, caller, target_owner, caller_owner, "reverse-during-continuous-backpressure")
+        lookup_socket = connection()
+        lookup_socket.send_control({"type": "lookup", "target": other_target_owner.node_id})
+        lookup_reply = lookup_socket.control()
+        require(lookup_reply.get("type") == "record", "directory control progresses while the matched slow circuit remains blocked")
+        other_caller, other_target, other_noise = establish(other_reservation, other_caller_owner, other_target_owner)
+        other_canary = network_fixture_canary(other_caller, other_target, other_caller_owner, other_target_owner, "other-target-during-backpressure")
+        progress_done = {"wall_time": time.time(), "monotonic": time.monotonic()}
+        require(progress_done["monotonic"] < paused["monotonic"] + 10, "reverse and other-target progress precede the conservative pending-write deadline")
+        same_flow = [entry for entry in flow_records() if entry["fields"].get("circuit") == circuit and entry["fields"].get("target") == target_owner.node_id]
+        require(not any(entry["log_offset"] > blocked["write_pending"]["log_offset"] and entry["fields"].get("direction") == "caller_to_target"
+                        and entry["fields"].get("event") in ("write_resumed", "closed") for entry in same_flow),
+                "the same pending write stays unresolved through reverse, lookup and other-target completion")
+        resumed = {"wall_time": time.time(), "monotonic": time.monotonic()}
+        decrypted = []
+        for sequence in range(160):
+            opened = None
+            for _ in range(8):
+                opened = target_owner.command("open_record", data=stopped_target.binary().hex())
+                if opened is not None:
+                    break
+            require(opened is not None, "resumed reader reconstructs each bounded protected message")
+            payload = bytes.fromhex(opened)
+            require(len(payload) == 60000 and int.from_bytes(payload[:8], "little") == sequence
+                    and hashlib.sha256(payload).hexdigest() == expected_hashes[sequence], "resumed TCP reader decrypts exact ordered payload bytes")
+            decrypted.append(hashlib.sha256(payload).hexdigest())
+        flood_thread.join(timeout=min(5, remaining()))
+        require(not flood_thread.is_alive() and flood["error_type"] is None and flood["records_sent"] == len(records), "bounded sender finishes and is joined after the actual reader resumes")
+        same_flow = [entry for entry in flow_records() if entry["fields"].get("circuit") == circuit and entry["fields"].get("target") == target_owner.node_id]
+        interruptions = [entry for entry in same_flow if entry["log_offset"] > blocked["write_pending"]["log_offset"]
+                         and entry["fields"].get("direction") == "caller_to_target" and entry["fields"].get("event") in ("write_resumed", "closed")]
+        require(interruptions and interruptions[0]["fields"]["event"] == "write_resumed"
+                and interruptions[0]["wall_time"] is not None and interruptions[0]["wall_time"] >= progress_done["wall_time"]
+                and interruptions[0]["wall_time"] >= resumed["wall_time"],
+                "complete logs confirm the original blocked write resumed only after protected progress and explicit read restart")
+        snapshots = []
+        for entry in same_flow:
+            fields = entry["fields"]
+            queued_frames = int(fields["queued_frames"])
+            queued_bytes, reader_bytes, writer_bytes = (int(fields[key]) for key in ("queued_bytes", "reader_held_bytes", "writer_held_bytes"))
+            require(0 <= queued_frames <= 4 and 0 <= queued_bytes <= queued_frames * 65535
+                    and 0 <= reader_bytes <= 65535 and 0 <= writer_bytes <= 65535,
+                    "actual same-flow snapshots respect each bounded queue and held frame")
+            snapshots.append({"direction": fields["direction"], "event": fields["event"], "queued_frames": queued_frames,
+                              "application_held_bytes_this_direction": queued_bytes + reader_bytes + writer_bytes})
+        require(snapshots and any(value["direction"] == "caller_to_target" and value["event"] == "queue_full" for value in snapshots),
+                "actual same-R span snapshots contain the matched slow full queue")
+        caller.close()
+        stopped_target.close()
+        def closed_both_directions():
+            values = [entry for entry in flow_records() if entry["fields"].get("circuit") == circuit and entry["fields"].get("event") == "closed"]
+            return values if {entry["fields"].get("direction") for entry in values} == {"caller_to_target", "target_to_caller"} else None
+        closed = wait_for("both directions of the matched flow release their held frames", closed_both_directions, timeout=min(10, remaining()))
+        require({entry["fields"].get("direction") for entry in closed} == {"caller_to_target", "target_to_caller"}
+                and all(all(int(entry["fields"][key]) == 0 for key in ("queued_frames", "queued_bytes", "reader_held_bytes", "writer_held_bytes")) for entry in closed),
+                "actual closed snapshots show no queued or held application frames")
+        recovery_caller_owner, recovery_target_owner = identity("duplex-caller"), identity("duplex-target")
+        recovery_caller, recovery_target, recovery_noise = establish(reservation, recovery_caller_owner, recovery_target_owner)
+        recovery_canary = network_fixture_canary(recovery_caller, recovery_target, recovery_caller_owner, recovery_target_owner, "after-slow-circuit-cleanup")
+        core = network_core_evidence(evidence_dir, "x1", ["x1_shared_production_byte_rate_frame_and_liveness_boundaries",
+            "x1_each_silent_endpoint_expires_despite_continuous_opposite_traffic", "x1_stopped_tcp_reader_keeps_reverse_noise_and_other_target_progress",
+            "x1_two_real_writers_share_the_production_rate_and_total_byte_limit",
+            "x1_abort_and_timeout_during_rate_or_slow_write_release_io_and_allow_reuse"])
+        case.update({"status": "passed", "relay_node_id": relay.node_id, "target_node_id": target_owner.node_id, "circuit": circuit,
+            "noise": noise, "reader_paused": paused, "continuous_backpressure": blocked, "reverse_canary": reverse,
+            "directory_control": {"type": lookup_reply["type"], "target_node_id": other_target_owner.node_id,
+                                  "has_record": lookup_reply.get("record") is not None, "scope": "Control query progress; fixture target has no published directory record"},
+            "other_target_noise": other_noise, "other_target_canary": other_canary, "progress_done": progress_done, "reader_resumed": resumed,
+            "first_write_resumed_after_progress": interruptions[0], "decrypted_message_sha256": decrypted, "flood": flood,
+            "flow_snapshots": snapshots, "closed_same_flow": closed, "recovery_noise": recovery_noise, "recovery_canary": recovery_canary,
+            "observed_snapshot_note": "instantaneous application-held bytes per direction, not the whole process memory peak or WS/TCP buffers",
+            "structural_two_direction_application_bound": 786420, "core_boundary_evidence": [core],
+            "combined_64MiB_budget_scope": "production shared-byte/rate/frame boundary fixture; this packaged slow-flow flood remains below the full circuit budget"})
+    except Exception:
+        case["status"] = "failed"
+        raise
+    finally:
+        try:
+            network_fixture_cleanup(sockets, identities, own_nodes, case)
+        finally:
+            if flood_thread:
+                flood_thread.join(timeout=2)
+                case["flood_worker_joined"] = not flood_thread.is_alive()
+                if flood_thread.is_alive():
+                    case["status"] = "failed"
+                require(not flood_thread.is_alive(), "owned flood sender exits after exact socket cleanup")
+
+
+def network_reliability_budgets(run, binary, workspace, fixture, helper, module, report, nodes, evidence_dir):
+    case = {"status": "running", "groups": {}, "core_boundary_evidence": [],
+            "not_checked": ["X1 slow duplex and combined-byte budget", "production proxy users separated by IP"],
+            "source_boundary": "direct TCP into one temporary dual-stack listener; forwarded headers do not determine source"}
+    report["cases"]["budget_and_duplex"] = case
+    sockets, identities = [], []
+    env = {**os.environ, "RUST_LOG": "vibeface::network=debug,vibeface::api=debug", "NO_COLOR": "1"}
+    deadline = None
+
+    def remaining():
+        value = deadline - time.monotonic()
+        require(value > 0, "network budget group stays inside its total deadline")
+        return value
+
+    def start_relay(name):
+        node = Node(run, name, binary, workspace, fixture, helper, module)
+        nodes.append(node)
+        node.configure(roles=["relay"], manager=None, codex_socket=str(run / "unused-codex.sock"),
+                       listen=f"[::]:{node.port}", public_url=f"http://127.0.0.1:{node.port}", allow_insecure_lan=True,
+                       network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False, "relay_enabled": True})
+        node.start(env=env)
+        connection = http.client.HTTPConnection("::1", node.port, timeout=min(5, remaining()))
+        try:
+            connection.request("GET", "/api/info")
+            response = connection.getresponse()
+            require(response.status == 200 and json.loads(response.read(65536))["node_id"] == node.node_id,
+                    "both real loopback address families reach the same packaged Node identity")
+        finally:
+            connection.close()
+        return node
+
+    def open_at(node, source, *, forwarded_for=None):
+        host = "127.0.0.1" if source == "v4" else "[::1]"
+        value = NetworkControlSocket(f"ws://{host}:{node.port}/api/network/ws", source_ip="127.0.0.1" if source == "v4" else "::1",
+                                     deadline=deadline, forwarded_for=forwarded_for)
+        sockets.append(value)
+        return value
+
+    def identity(name):
+        owner = NetworkCryptoFixture(run, name, module, deadline=deadline)
+        identities.append(owner)
+        return owner
+
+    def reason(node, cursor, code):
+        return wait_for(f"actual {code} rejection", lambda: next((entry for entry in network_trace_records(node, cursor, messages=["network admission rejected"])
+            if entry["fields"].get("reason") == code), None), timeout=remaining())
+
+    def lookup(node, source):
+        value = open_at(node, source)
+        value.send_control({"type": "lookup", "target": node.node_id})
+        reply = value.control()
+        require(reply.get("type") == "record" and reply.get("record", {}).get("node_id") == node.node_id,
+                "other legal source completes a real target lookup")
+        summary = dict(value.summary)
+        value.close()
+        return {"source_socket": summary, "target_node_id": node.node_id, "record_received": True}
+
+    def closed_after_control(value):
+        try:
+            value.control()
+        except (EOFError, ConnectionResetError, BrokenPipeError):
+            return {"upgrade_status": 101, "closed_before_success": True, "socket": dict(value.summary)}
+        raise AssertionError("rejected WS work must close instead of returning success or merely timing out")
+
+    try:
+        deadline = time.monotonic() + 45
+        relay = start_relay("R-budget")
+        case["listener"] = {"listen": f"[::]:{relay.port}", "public_url": relay.url, "allow_insecure_lan": True,
+                            "scope": "temporary wildcard test listener; no production config changed", "node_id": relay.node_id}
+        initial_group_deadline = deadline
+        first_initial_started = time.monotonic()
+        deadline = min(deadline, first_initial_started + 10)
+        held_initial = [open_at(relay, "v4") for _ in range(4)]
+        cursor = (relay.directory / "process.log").stat().st_size
+        try:
+            open_at(relay, "v4", forwarded_for="198.51.100.61")
+            raise AssertionError("fifth real source Initial must fail before upgrade")
+        except NetworkUpgradeRejected as error:
+            initial_rejection = error.summary
+            require(error.summary["upgrade_status"] == 503 and "source_initial_socket" in error.summary["rejection_body"], "initial excess is explicit HTTP503 source rejection")
+        initial_reason = reason(relay, cursor, "source_initial_socket")
+        network_assert_source(initial_reason, initial_rejection)
+        other_initial = lookup(relay, "v6")
+        require(time.monotonic() < first_initial_started + 10, "other real source lookup completes while all four Initial slots remain unexpired")
+        for value in held_initial:
+            value.close()
+        deadline = initial_group_deadline
+        resumed_lookup = wait_for("source Initial capacity is reusable after exact owned sockets close", lambda: lookup(relay, "v4"), timeout=remaining())
+        case["groups"]["source_initial"] = {"status": "passed", "limit": 4, "rejected": initial_rejection,
+            "server_rejection": initial_reason, "other_real_source_lookup": other_initial, "released_source_lookup": resumed_lookup,
+            "held_sockets": [value.summary for value in held_initial], "forwarded_header_ignored": True}
+
+        deadline = time.monotonic() + 60
+        long_reservations, long_owners = [], []
+        for index in range(16):
+            owner = identity(f"long-source-{index}")
+            value = open_at(relay, "v4")
+            require(value.reserve(owner) == {"type": "reserved"}, "each distinct signed identity gets one source long socket")
+            long_owners.append(owner)
+            long_reservations.append(value)
+        extra_owner = identity("long-source-extra")
+        cursor = (relay.directory / "process.log").stat().st_size
+        extra = open_at(relay, "v4", forwarded_for="198.51.100.62")
+        proof = json.dumps({"nonce": extra.nonce, "node_id": extra_owner.node_id}, separators=(",", ":"))
+        extra.send_control({"type": "reserve", "node_id": extra_owner.node_id, "public_key": extra_owner.public_key,
+                            "signature": extra_owner.sign("relay-reserve", proof.encode())})
+        long_closed = closed_after_control(extra)
+        long_reason = reason(relay, cursor, "source_established_socket")
+        network_assert_source(long_reason, extra.summary)
+        other_long = lookup(relay, "v6")
+        release_cursor = (relay.directory / "process.log").stat().st_size
+        for value in long_reservations:
+            value.close()
+        wait_for("all sixteen exact source reservations actually clean up", lambda: len({entry["fields"].get("target") for entry in network_trace_records(relay, release_cursor, messages=["relay reservation removed"])
+                 if entry["fields"].get("target") in {owner.node_id for owner in long_owners}}) == 16, timeout=remaining())
+        case["groups"]["source_long_identity_isolation"] = {"status": "passed", "limit": 16,
+            "fixed_distinct_identities": [owner.node_id for owner in long_owners], "refused_new_identity": extra_owner.node_id,
+            "ws_close": long_closed, "server_rejection": long_reason, "other_real_source_lookup": other_long,
+            "removed_reservations": 16, "forwarded_header_ignored": True}
+        for owner in long_owners + [extra_owner]:
+            owner.close()
+
+        deadline = time.monotonic() + 45
+        t1, t2 = identity("target-one"), identity("target-two")
+        r1, r2 = open_at(relay, "v4"), open_at(relay, "v4")
+        require(r1.reserve(t1) == {"type": "reserved"} and r2.reserve(t2) == {"type": "reserved"}, "two fixed legal targets reserve independently")
+        caller_owner = identity("other-source-caller")
+        pending, tokens = [], []
+        first_pending = time.monotonic()
+        for _ in range(4):
+            value = open_at(relay, "v4")
+            value.send_control({"type": "dial", "target": t1.node_id, "service": "peer"})
+            incoming = r1.control()
+            require(incoming.get("type") == "incoming", "every pending Dial reaches the actual target reservation")
+            pending.append(value)
+            tokens.append(incoming["token"])
+        cursor = (relay.directory / "process.log").stat().st_size
+        source_excess = open_at(relay, "v4")
+        source_excess.send_control({"type": "dial", "target": t2.node_id, "service": "peer"})
+        source_closed = closed_after_control(source_excess)
+        source_reason = reason(relay, cursor, "source_circuit")
+        network_assert_source(source_reason, source_excess.summary)
+        cursor = (relay.directory / "process.log").stat().st_size
+        target_excess = open_at(relay, "v6")
+        target_excess.send_control({"type": "dial", "target": t1.node_id, "service": "peer"})
+        target_closed = closed_after_control(target_excess)
+        target_reason = reason(relay, cursor, "target_circuit")
+        network_assert_source(target_reason, target_excess.summary)
+        other_caller = open_at(relay, "v6")
+        other_caller.send_control({"type": "dial", "target": t2.node_id, "service": "peer"})
+        token = r2.control()["token"]
+        other_target = open_at(relay, "v4")
+        require(other_target.attach(t2, token) == {"type": "ready"} and other_caller.control() == {"type": "ready"}, "another real source and legal target get a complete circuit under overload")
+        noise = network_fixture_noise(other_caller, other_target, caller_owner, t2)
+        canary = network_fixture_canary(other_caller, other_target, caller_owner, t2, "other-target-under-load")
+        lookups = {source: lookup(relay, source) for source in ("v4", "v6")}
+        require(time.monotonic() < first_pending + 10, "source/target refusals and other-target progress precede pending Attach expiry")
+        for value in pending:
+            value.close()
+        r1.close()
+        r2.close()
+        other_caller.close()
+        other_target.close()
+        case["groups"]["source_and_target_circuits"] = {"status": "passed", "source_limit": 4, "target_limit": 4,
+            "source_refused_on_other_empty_target": {"close": source_closed, "trace": source_reason, "target": t2.node_id},
+            "other_source_refused_on_full_target": {"close": target_closed, "trace": target_reason, "target": t1.node_id},
+            "other_source_other_target_noise": noise, "canary": canary, "lookups": lookups,
+            "pending_tokens_sha256": [hashlib.sha256(token.encode()).hexdigest() for token in tokens], "preceded_pending_expiry": True}
+        relay.stop()
+
+        deadline = time.monotonic() + 55
+        rate_relay = start_relay("R-rate")
+        window_start = time.monotonic()
+        rate_results = [lookup(rate_relay, "v4") for _ in range(120)]
+        cursor = (rate_relay.directory / "process.log").stat().st_size
+        try:
+            open_at(rate_relay, "v4", forwarded_for="198.51.100.63")
+            raise AssertionError("121st source request must not upgrade")
+        except NetworkUpgradeRejected as error:
+            rate_rejected = error.summary
+            require(error.summary["upgrade_status"] == 429 and "source_rate" in error.summary["rejection_body"], "real same-source request rate uses HTTP429")
+        rate_reason = reason(rate_relay, cursor, "source_rate")
+        network_assert_source(rate_reason, rate_rejected)
+        rate_other = lookup(rate_relay, "v6")
+        require(time.monotonic() < window_start + 60, "all 120 requests and denial fit the unchanged source rate window")
+        case["groups"]["source_request_rate"] = {"status": "passed", "fresh_relay_node_id": rate_relay.node_id,
+            "accepted": len(rate_results), "source_limit": 120, "rejected": rate_rejected,
+            "server_rejection": rate_reason, "other_real_source_lookup": rate_other,
+            "window_seconds_observed": time.monotonic() - window_start, "forwarded_header_ignored": True,
+            "accepted_socket_sources": [value["source_socket"]["actual_local_address"] for value in rate_results]}
+        case["core_boundary_evidence"] = [network_core_evidence(evidence_dir, "a1", [
+            "real_sources_share_initial_limits_despite_forwarded_headers_and_ipv6_is_independent",
+            "real_source_request_rate_survives_socket_drop_and_another_source_can_lookup",
+            "waiting_attach_circuits_bound_real_sources_and_targets_and_leave_lookup_capacity",
+            "waiting_circuits_share_source_target_and_global_limits_and_drop_prunes_keys"])]
+        rate_relay.stop()
+        network_reliability_duplex(run, binary, workspace, fixture, helper, module, report, nodes, evidence_dir)
+        require(not invocations(run), "quota and control acceptance never invokes an executor")
+        verify_no_model_budget(nodes)
+        require(file_sha256(binary) == report["binary_sha256"], "Lane 6 uses one immutable binary")
+        case["not_checked"] = ["production proxy users separated by IP", "whole-process memory peak"]
+        case["status"] = report["status"] = "passed"
+        report["fixture_invocations"] = 0
+    except Exception:
+        case["status"] = "failed"
+        raise
+    finally:
+        network_fixture_cleanup(sockets, identities, nodes, case)
+
+
+def network_reliability_directory(run, binary, workspace, fixture, helper, module, report, nodes, evidence_dir):
+    repository = Path(__file__).resolve().parents[1]
+    trace_env = {**os.environ, "RUST_LOG": "vibeface::network=debug,vibeface::peer=debug,vibeface::runtime=debug,vibeface::api=debug", "NO_COLOR": "1"}
+    case = {"status": "running", "packaged_node_cases": {}, "core_boundary_evidence": [],
+            "not_checked": ["packaged Node full private-cache workload", "other NET-1 lanes", "distributed source quotas"],
+            "trigger": "cold Runtime member reconnect -> PeerHub.connect_target -> NetworkHub.dial/resolve -> Noise pinned to original B",
+            "fixture_scope": "controlled public directory protocol, no upstream Publish or Reserve; actual R supplies the healthy signed record"}
+    report["cases"]["directory_isolation"] = case
+    directories, capture, directory_capture = [], None, None
+
+    def directory_logs(node, offset, message):
+        result = []
+        with (node.directory / "process.log").open("rb") as stream:
+            stream.seek(offset)
+            for raw in stream:
+                if not raw.endswith(b"\n"):
+                    break
+                line = re.sub(r"\x1b\[[0-9;]*m", "", raw.decode(errors="replace")).strip()
+                if message not in line:
+                    continue
+                names = r"directory|target|outcome|cached|reason"
+                fields = {key: value.strip().strip('"') for key, value in re.findall(
+                    rf'\b({names})=(.*?)(?=\s+(?:{names})=|$)', line)}
+                stamp = re.search(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z", line)
+                result.append({"fields": fields, "wall_time": datetime.fromisoformat(stamp.group().replace("Z", "+00:00")).timestamp() if stamp else None,
+                               "message": line})
+        return result
+
+    def completed_queries(node, offset):
+        return directory_logs(node, offset, "directory query completed")
+
+    def core_boundaries():
+        require(evidence_dir is not None, "Lane 4 requires the frozen core WS boundary evidence directory")
+        entries = []
+        for slice_name, tests in (("d1", ["resolved_cache_is_private_bounded_and_full_cache_still_connects",
+                                          "directory_stream_delivers_before_slow_reply_and_drop_releases_sockets",
+                                          "records_expiring_while_waiting_for_state_are_not_stored_or_delivered"]),
+                                  ("d2", ["publication_preserves_relay_changes_during_an_inflight_publish",
+                                          "legacy_reservation_publish_full_keeps_reservation_but_invalid_record_closes_it",
+                                          "relay_refusal_does_not_republish_and_duplicate_entries_do_not_duplicate_tasks",
+                                          "directory_operations_have_one_deadline_across_welcome_and_reply"])):
+            manifest_path = evidence_dir / f"m3-{slice_name}-core-slice.json"
+            manifest = json.loads(manifest_path.read_text())
+            require(all(check.get("exit_code") == 0 for check in manifest["checks"]), "referenced frozen core checks all passed")
+            log = evidence_dir / f"m3-{slice_name}-network-final.log"
+            text = log.read_text()
+            require(all(f"test network::tests::{name} ... ok" in text for name in tests), "required source WS boundary cases have actual passed log lines")
+            snapshot_path = repository / manifest["snapshot"]
+            require(file_sha256(snapshot_path) == manifest["source"][0]["sha256"], "referenced production NetworkHub source snapshot matches its manifest")
+            entries.append({"slice": slice_name, "manifest": str(manifest_path), "manifest_sha256": file_sha256(manifest_path),
+                            "log": str(log), "log_sha256": file_sha256(log), "production_source": manifest["source"], "snapshot": str(snapshot_path),
+                            "passed_cases": tests, "scope": "actual NetworkHub source and real WS boundary tests, with direct cache/table fixtures; not a full-cache workload in the packaged Node"})
+        return entries
+
+    def signed_short_record():
+        result = subprocess.run(["node", str(repository / "scripts/crypto-client.mjs"), "--module", str(module)],
+                                input=json.dumps({"op": "fixture_reachability", "identity_file": str(b.directory / "identity.json"),
+                                                  "expected_node_id": b.node_id, "relay_urls": [unavailable.url], "ttl_secs": 2}) + "\n",
+                                capture_output=True, text=True, timeout=15)
+        require(result.returncode == 0, "temporary original target signs a short-lived reachability fixture")
+        response = json.loads(result.stdout)
+        require(response.get("ok"), "short-lived fixture signing succeeds without exposing private identity material")
+        return response["result"]
+
+    try:
+        case["core_boundary_evidence"] = core_boundaries()
+        for name in ("R", "A", "B", "D"):
+            node = Node(run, name, binary, workspace, fixture, helper, module)
+            node.configure(manager=None, codex_socket=str(run / "unavailable-codex.sock"))
+            nodes.append(node)
+        relay, a, b, directory = nodes
+        relay.configure(roles=["relay"], network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False, "relay_enabled": True})
+        capture = RelayCapture(relay.port, retain_payloads=False)
+        relay.configure(allowed_origins=[capture.url])
+        relay.start(env=trace_env)
+        relay_url = capture.url.replace("http:", "ws:") + "/api/network/ws"
+        directory_capture = RelayCapture(directory.port, retain_payloads=False)
+        directory.configure(roles=["relay"], allowed_origins=[directory_capture.url],
+                            network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False, "relay_enabled": False})
+        directory.start(env=trace_env)
+        directory_url = directory_capture.url.replace("http:", "ws:") + "/api/network/ws"
+        healthy = NetworkDirectoryFixture("healthy")
+        directories.append(healthy)
+        healthy.record_factory = lambda target: copy.deepcopy(healthy.record) if target == b.node_id else None
+        a.configure(network={"bootstrap_urls": [healthy.url], "advertise_urls": [], "mdns": False, "relay_enabled": False})
+        case["first_start_a_network"] = json.loads((a.directory / "config.json").read_text())["network"]
+        b.configure(network={"bootstrap_urls": [relay_url, directory_url], "advertise_urls": [], "mdns": False, "relay_enabled": False})
+        a.start(env=trace_env)
+        network = a.bootstrap()
+        b.pair(a, network)
+        b.configure(roles=["gateway", "replica"])
+        b.start(env=trace_env)
+
+        def target_record():
+            record = directory.client.command("network_probe", kind="record", url=directory.url, target=b.node_id)
+            require(record["direct_urls"] == [] and record["relay_urls"] == [relay_url], "healthy source provides the original B with only the actual relay path")
+            return record
+
+        healthy.record = wait_for("B reserves and signs its sole relay path", target_record)
+        b.client.connect(b.node_id)
+        wait_for("Lane 4 B independent client authorization", lambda: b.client.authenticate())
+        membership = a.client.call("directory")["state"]
+        wait_for("Lane 4 source and target memberships converge", lambda: b.client.call("directory")["state"] == membership)
+
+        def authenticated_target():
+            return next((node for node in a.client.rpc("nodes")["nodes"]
+                         if node["node_id"] == b.node_id and node["online"] and node.get("capabilities")), None)
+
+        wait_for("setup discovers B using only the healthy directory", authenticated_target)
+        a.stop()
+        a.configure(roles=["gateway", "replica"])
+        healthy.record = target_record()
+        wrong_record = relay.client.command("network_probe", kind="record", url=relay.url, target=relay.node_id)
+        invalid_signature = copy.deepcopy(healthy.record)
+        invalid_signature["signature"] = ("0" if invalid_signature["signature"][0] != "0" else "1") + invalid_signature["signature"][1:]
+        slow = NetworkDirectoryFixture("slow", record_factory=lambda target: copy.deepcopy(healthy.record) if target == b.node_id else None)
+        wrong = NetworkDirectoryFixture("wrong-identity", record_factory=lambda target: copy.deepcopy(wrong_record) if target == b.node_id else None)
+        bad_signature = NetworkDirectoryFixture("bad-signature", record_factory=lambda target: copy.deepcopy(invalid_signature) if target == b.node_id else None)
+        unavailable = NetworkDirectoryFixture("unavailable-short-path")
+        short = NetworkDirectoryFixture("short-expiry")
+        short.record_factory = lambda target: copy.deepcopy(short.record) if target == b.node_id else None
+        directories.extend([slow, wrong, bad_signature, unavailable, short])
+        for source in (healthy, slow, short):
+            source.reply_gate.clear()
+        sources = [short, wrong, bad_signature, slow, healthy]
+        a.configure(network={"bootstrap_urls": [source.url for source in sources], "advertise_urls": [], "mdns": False, "relay_enabled": False})
+        require(relay_url not in json.loads((a.directory / "config.json").read_text())["network"]["bootstrap_urls"], "cold A has no configured R relay URL")
+        log_offset = (a.directory / "process.log").stat().st_size
+        controls_offset = len(capture.controls)
+        cold_start = {"wall_time": time.time(), "monotonic": time.monotonic(), "a_log_offset": log_offset,
+                      "query_deadline_seconds": 10, "deadline_basis": "lower bound before spawning cold A; actual production queries start later"}
+        case.update({"network_id": network, "target_node_id": b.node_id, "source_node_id": a.node_id,
+                     "healthy_record": healthy.record, "wrong_identity_record_node_id": wrong_record["node_id"],
+                     "cold_start": cold_start, "a_process_log": str(a.directory / "process.log"),
+                     "configurations": {node.name: json.loads((node.directory / "config.json").read_text())["network"] for node in nodes}})
+        a.start(env=trace_env)
+        a.client.connect(a.node_id)
+        wait_for("cold A original management client authorization", lambda: a.client.authenticate())
+        wait_for("slow directory really receives Lookup(B)", lambda: any(event["kind"] == "control_received" and event.get("control") == "lookup" and event.get("target") == b.node_id for event in slow.snapshot()["events"]))
+        wait_for("short directory really receives Lookup(B) before signing", lambda: any(event["kind"] == "control_received" and event.get("control") == "lookup" and event.get("target") == b.node_id for event in short.snapshot()["events"]))
+        short.record = signed_short_record()
+        short.release()
+        accepted_short = wait_for("production resolver accepts the still-valid short record", lambda: next((entry for entry in completed_queries(a, log_offset)
+            if entry["fields"].get("directory") == short.url and entry["fields"].get("target") == b.node_id and entry["fields"].get("outcome") == "record"), None))
+        short_sent = next(event for event in short.snapshot()["events"] if event["kind"] == "record_send_started" and event.get("target") == b.node_id)
+        require(accepted_short["wall_time"] is not None and accepted_short["wall_time"] < short_sent["expires_at"], "short candidate is actually received while valid, not merely generated before expiry")
+        wait_for("accepted short candidate really expires before healthy release", lambda: time.time() >= short_sent["expires_at"], timeout=5)
+        rejected = {}
+        for source, reason in ((wrong, "another node"), (bad_signature, "signature")):
+            rejected[source.name] = wait_for(f"production rejects {source.name} independently", lambda source=source, reason=reason: next((entry for entry in completed_queries(a, log_offset)
+                if entry["fields"].get("directory") == source.url and entry["fields"].get("target") == b.node_id
+                and entry["fields"].get("outcome") == "rejected" and reason in entry["fields"].get("reason", "").lower()), None))
+        release = healthy.release()
+        require(time.monotonic() < cold_start["monotonic"] + 10, "healthy response is released before the conservative production query deadline")
+        target = wait_for("cold A authenticates original B before the unreleased slow query deadline", authenticated_target,
+                          timeout=max(.1, cold_start["monotonic"] + 10 - time.monotonic()))
+        query = a.client.rpc("operation", target_node=b.node_id, operation_id="net1-lane4-read-only")
+        finished = {"wall_time": time.time(), "monotonic": time.monotonic()}
+        require(query == {"operation": None}, "fixed original B returns its authenticated read-only operation result")
+        require(finished["monotonic"] < cold_start["monotonic"] + 10 and not slow.reply_gate.is_set(), "target Noise and query complete before the slow production query can time out or be released")
+        require(not any(event["kind"] == "record_sent" for event in slow.snapshot()["events"]), "the slow directory has not supplied a candidate before target authentication")
+        healthy_result = next(entry for entry in completed_queries(a, log_offset) if entry["fields"].get("directory") == healthy.url
+                              and entry["fields"].get("target") == b.node_id and entry["fields"].get("outcome") == "record")
+        controls = list(capture.controls[controls_offset:])
+        circuits = []
+        for event in controls:
+            if event.get("type") == "dial" and event.get("direction") == "to_relay" and event.get("target") == b.node_id and event.get("service") == "peer":
+                ready = next((value for value in controls if value["connection"] == event["connection"] and value.get("type") == "ready" and value["direction"] == "from_relay"), None)
+                if ready and capture.traffic[event["connection"]]["binary_payload_bytes"]:
+                    circuits.append({"dial": event, "ready": ready, **capture.traffic[event["connection"]]})
+        require(circuits, "actual R carries the cold source's peer dial to the fixed B and binary Noise/application traffic")
+        require(not invocations(run), "directory discovery and authorized queries never invoke a fixture executor")
+        verify_no_model_budget(nodes)
+        require(file_sha256(binary) == report["binary_sha256"], "Lane 4 keeps one immutable binary")
+        case["packaged_node_cases"]["D1_directory_isolation"] = {"status": "passed", "short_record_accepted": accepted_short,
+            "short_record_send": short_sent, "source_rejections": rejected, "healthy_release": release,
+            "healthy_candidate": healthy_result, "authenticated_target_capabilities": target, "original_target_query": query,
+            "query_finished": finished, "slow_reply_released": False, "data_carrying_peer_circuits": circuits,
+            "noise_evidence": "production connect_target pins original B; online remote capabilities and signed-origin B operation reply both succeed",
+            "all_directory_results": completed_queries(a, log_offset)}
+        slow_publication = NetworkDirectoryFixture("slow-publication")
+        slow_publication.publish_gate.clear()
+        directories.append(slow_publication)
+        b.stop()
+        b.configure(network={"bootstrap_urls": [relay_url, directory_url, slow_publication.url], "advertise_urls": [], "mdns": False, "relay_enabled": False})
+        restart = {"wall_time": time.time(), "monotonic": time.monotonic(),
+                   "b_log_offset": (b.directory / "process.log").stat().st_size,
+                   "relay_control_offset": len(capture.controls), "directory_control_offset": len(directory_capture.controls)}
+        b.start(env=trace_env)
+        held_publish = wait_for("B's independent slow publication actually enters the unreleased fixture", lambda: next((event for event in slow_publication.snapshot()["events"]
+            if event["kind"] == "control_received" and event.get("control") == "publish" and event.get("node_id") == b.node_id), None), timeout=5)
+        d_publication = wait_for("B's fresh publication to actual directory D is acknowledged despite slow publication elsewhere",
+            lambda: next((entry for entry in directory_logs(b, restart["b_log_offset"], "directory publication completed")
+                          if entry["fields"].get("directory") == directory_url and entry["fields"].get("outcome") == "published"), None), timeout=5)
+        wait_for("actual D still returns the original signed relay-only B record", target_record, timeout=5)
+        ongoing_target = wait_for("B's actual relay reservation and Incoming/Attach remain usable during slow publication", authenticated_target,
+                                 timeout=max(.1, restart["monotonic"] + 10 - time.monotonic()))
+        ongoing_query = a.client.rpc("operation", target_node=b.node_id, operation_id="net1-lane4-d2-read-only")
+        ongoing_finished = {"wall_time": time.time(), "monotonic": time.monotonic()}
+        require(ongoing_query == {"operation": None} and ongoing_finished["monotonic"] < restart["monotonic"] + 10,
+                "fresh B target query completes before the slow publication's conservative total deadline")
+        require(d_publication["wall_time"] is not None and d_publication["wall_time"] <= ongoing_finished["wall_time"],
+                "fresh D publication ACK precedes the successful query while the slow publication remains blocked")
+        require(not slow_publication.publish_gate.is_set()
+                and not any(event["kind"] == "publish_acknowledged_locally" for event in slow_publication.snapshot()["events"]),
+                "the slow publication has not replied while other relay work completes")
+        b_reservations = [event for event in capture.controls[restart["relay_control_offset"]:]
+                          if event.get("type") == "reserve" and event.get("node_id") == b.node_id]
+        require(len(b_reservations) == 1, "one actual B reservation establishes the healthy relay during the held publication")
+        reservation_connection = b_reservations[0]["connection"]
+        wait_for("actual directory D receives a signed B publication", lambda: any(event.get("type") == "publish" and event.get("node_id") == b.node_id
+                 for event in directory_capture.controls[restart["directory_control_offset"]:]), timeout=5)
+        wait_for("startup relay-change publications settle across the first rejected directory retry", lambda: len([event for event in directory_capture.controls[restart["directory_control_offset"]:]
+                 if event.get("type") == "reserve" and event.get("node_id") == b.node_id]) >= 2, timeout=10)
+        stable = {"wall_time": time.time(), "monotonic": time.monotonic(), "directory_control_offset": len(directory_capture.controls),
+                  "relay_control_offset": len(capture.controls),
+                  "directory_log_offset": (directory.directory / "process.log").stat().st_size,
+                  "reservation_heartbeat_baseline": dict(capture.traffic[reservation_connection])}
+        progress = []
+
+        def refused_without_republication():
+            fresh = list(directory_capture.controls[stable["directory_control_offset"]:])
+            reserves = [event for event in fresh if event.get("type") == "reserve" and event.get("node_id") == b.node_id]
+            publications = [event for event in fresh if event.get("type") == "publish" and event.get("node_id") == b.node_id]
+            require(not publications, "directory Reserve rejection does not drive a new B publication inside the stable pre-refresh window")
+            require(not any(event.get("type") == "reserve" and event.get("node_id") == b.node_id for event in capture.controls[stable["relay_control_offset"]:]),
+                    "the healthy B reservation remains the same during refused directory retries")
+            value = a.client.rpc("operation", target_node=b.node_id, operation_id="net1-lane4-d2-read-only")
+            require(value == {"operation": None}, "original B remains queryable during repeated directory Reserve rejection")
+            if not progress or progress[-1]["observed_reserve_refusals"] != len(reserves):
+                progress.append({"wall_time": time.time(), "monotonic": time.monotonic(), "observed_reserve_refusals": len(reserves), "original_target_query": value})
+            return reserves if len(reserves) >= 2 else None
+
+        refusals = wait_for("two actual rejected directory Reserve retries without republishing", refused_without_republication, timeout=15)
+        require(time.monotonic() - restart["monotonic"] < 60, "publication independence is measured before its periodic refresh")
+        heartbeat = capture.traffic[reservation_connection]
+        heartbeat_baseline = stable["reservation_heartbeat_baseline"]
+        wait_for("the unchanged B relay reservation advances actual Ping/Pong after the stable-window baseline",
+                 lambda: heartbeat["ping_frames"] > heartbeat_baseline["ping_frames"] and heartbeat["pong_frames"] > heartbeat_baseline["pong_frames"], timeout=25)
+        failed_slow_publication = wait_for("the blocked publication has its own bounded timeout", lambda: next((entry for entry in directory_logs(b, restart["b_log_offset"], "directory publication completed")
+            if entry["fields"].get("directory") == slow_publication.url and entry["fields"].get("outcome") == "rejected" and "timed out" in entry["fields"].get("reason", "")), None), timeout=15)
+        refusals = refused_without_republication()
+        require(refusals and time.monotonic() - restart["monotonic"] < 60, "the complete stable lifecycle observation remains before periodic refresh with the same relay reservation")
+        with (directory.directory / "process.log").open("rb") as stream:
+            stream.seek(stable["directory_log_offset"])
+            directory_rejections = [re.sub(r"\x1b\[[0-9;]*m", "", line) for line in stream.read().decode(errors="replace").splitlines()
+                                    if "public relay is disabled" in line]
+        require(len(directory_rejections) >= len(refusals), "actual relay-disabled directory logs fresh stable-window reservation rejection instead of silently losing requests")
+        case["packaged_node_cases"]["D2_publication_independence"] = {"status": "passed", "actual_directory": directory_url,
+            "actual_directory_relay_enabled": False, "healthy_relay": relay_url, "b_restart": restart,
+            "fresh_actual_D_publication": d_publication,
+            "held_publication": held_publish, "slow_publication_released": False, "ongoing_original_target_query": ongoing_query,
+            "ongoing_authenticated_target": ongoing_target, "ongoing_query_finished": ongoing_finished,
+            "stable_observation": stable, "reserve_refusals": refusals, "query_progress": progress,
+            "same_relay_reservation_connection": reservation_connection, "actual_heartbeat_frames": dict(heartbeat),
+            "heartbeat_timing_scope": "same reservation counter growth after the stable-window baseline; may follow slow-publication timeout, not claimed to overlap its entire blocked period",
+            "slow_publication_timeout": failed_slow_publication,
+            "actual_D_reservation_rejections": directory_rejections,
+            "actual_D_controls": list(directory_capture.controls[restart["directory_control_offset"]:]),
+            "b_publication_results": directory_logs(b, restart["b_log_offset"], "directory publication completed")}
+        require(not invocations(run), "D2 lifecycle and repeated target reads never invoke an executor")
+        verify_no_model_budget(nodes)
+        require(file_sha256(binary) == report["binary_sha256"], "Lane 4 keeps the same frozen binary through D2")
+        case["status"] = report["status"] = "passed"
+        report["fixture_invocations"] = 0
+        print(f"PASS NET-1 Lane 4 directory isolation and independent publication: {run / 'report.json'}", flush=True)
+    except Exception:
+        case["status"] = "failed"
+        raise
+    finally:
+        cleanup_errors = []
+        for node in reversed(nodes):
+            try:
+                node.stop()
+            except Exception as error:
+                cleanup_errors.append(f"{node.name}: {type(error).__name__}")
+        for source in directories:
+            try:
+                source.close()
+            except Exception as error:
+                cleanup_errors.append(f"{source.name}: {type(error).__name__}")
+        case["directory_fixtures"] = [source.snapshot() for source in directories]
+        if capture:
+            try:
+                capture.close()
+            except Exception as error:
+                cleanup_errors.append(f"capture: {type(error).__name__}")
+        if directory_capture:
+            try:
+                directory_capture.close()
+            except Exception as error:
+                cleanup_errors.append(f"directory capture: {type(error).__name__}")
+        case["cleanup"] = {"errors": cleanup_errors,
+                           "directory_active_sockets": sum(source.snapshot()["active_sockets"] for source in directories)}
+        require(not cleanup_errors and case["cleanup"]["directory_active_sockets"] == 0, "Lane 4 reclaims all owned process and fixture resources")
+        require(not any(source.errors for source in directories), "bounded directory fixtures complete without protocol errors")
+        require(not any(source.rejected_connections for source in directories), "fixture capacity does not confound production directory results")
+        require(capture is None or not capture.errors, "Lane 4 relay capture remains valid")
+        require(directory_capture is None or not directory_capture.errors, "Lane 4 actual-directory capture remains valid")
+
+
 def network_reliability_acceptance(options):
     binary = options.binary.resolve(strict=True)
     repository = Path(__file__).resolve().parents[1]
@@ -3219,7 +4647,7 @@ def network_reliability_acceptance(options):
     artifacts.mkdir(parents=True, exist_ok=True)
     lane = options.net1_lane
     baseline_report = None
-    run = artifacts / ({1: "lane-1-noop-", 2: "lane-2-resume-", 3: "lane-3-closure-"}.get(lane, "m0-baseline-") + uuid.uuid4().hex[:10])
+    run = artifacts / ({1: "lane-1-noop-", 2: "lane-2-resume-", 3: "lane-3-closure-", 4: "lane-4-directory-", 5: "lane-5-generations-", 6: "lane-6-budgets-"}.get(lane, "m0-baseline-") + uuid.uuid4().hex[:10])
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir(mode=0o700)
@@ -3238,6 +4666,16 @@ def network_reliability_acceptance(options):
                               "attachment crash recovery and 64 MiB completion", "rendered browser UI", "production networks"]}
     nodes, capture = [], None
     try:
+        if lane in (5, 6):
+            report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
+            report["not_checked"] = ["other NET-1 lanes", "rendered browser UI", "production networks"]
+            (network_reliability_reservation if lane == 5 else network_reliability_budgets)(run, binary, workspace, fixture, helper, module, report, nodes, options.evidence_dir)
+            return
+        if lane == 4:
+            report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
+            report["not_checked"] = ["packaged Node full private-cache workload", "other NET-1 lanes", "rendered browser UI", "production networks"]
+            network_reliability_directory(run, binary, workspace, fixture, helper, module, report, nodes, options.evidence_dir)
+            return
         if lane == 2:
             report["tracked_worktree_dirty"] = subprocess.run(["git", "diff", "--quiet", "HEAD"], cwd=repository).returncode != 0
             report["base_commit"] = "4947bc8e82be6a156b858c2ef3053bc42838b3be"
@@ -3484,7 +4922,7 @@ def network_reliability_acceptance(options):
         private_json(run / "report.json", report)
         if options.evidence_dir:
             options.evidence_dir.mkdir(parents=True, exist_ok=True)
-            evidence_path = options.evidence_dir / {1: "live/01-noop-sync.json", 2: "live/02-resume-blob.json", 3: "live/03-closure-progress.json"}.get(lane, "m0-baseline.json")
+            evidence_path = options.evidence_dir / {1: "live/01-noop-sync.json", 2: "live/02-resume-blob.json", 3: "live/03-closure-progress.json", 4: "live/04-directory-isolation.json", 5: "live/05-reservation-generation.json", 6: "live/06-budget-and-duplex.json"}.get(lane, "m0-baseline.json")
             evidence_path.parent.mkdir(parents=True, exist_ok=True)
             private_json(evidence_path, report)
 
@@ -3539,7 +4977,7 @@ if __name__ == "__main__":
         parser.add_argument("--codex-bin", default="codex")
         parser.add_argument("--skip-codex", action="store_true", help="omit real Codex transport checks and report that omission")
         parser.add_argument("--evidence-dir", type=Path, help="save compact NET-1 reports in the task evidence directory")
-        parser.add_argument("--net1-lane", type=int, choices=[1, 2, 3], help="run one focused NET-1 process lane")
+        parser.add_argument("--net1-lane", type=int, choices=[1, 2, 3, 4, 5, 6], help="run one focused NET-1 process lane")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run taskless tools, command isolation and startup subscription process checks")
