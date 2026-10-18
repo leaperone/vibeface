@@ -19,7 +19,7 @@ use crate::{
 use anyhow::{Context as _, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
