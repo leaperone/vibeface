@@ -176,6 +176,7 @@ impl AdmissionCheckpoints {
         policy: &PolicyState,
         proof: &AdmissionProof,
         facts: &RequestFacts,
+        allow_nonready_history: bool,
     ) -> Result<Option<(VerifiedAdmission, u64)>> {
         let invocation = &proof.invocation.payload;
         let Some(checkpoint) = self.entries.get(&(
@@ -203,11 +204,31 @@ impl AdmissionCheckpoints {
                 && checkpoint.admitted.admitted_at_ms() == proof.admitted_at_ms,
             "retained admission differs from its verified local checkpoint"
         );
-        let anchors = admission_anchors_in(connection, proof)?;
+        let anchors = if allow_nonready_history {
+            admission_anchor_envelopes_in(connection, proof)?
+        } else {
+            admission_anchors_in(connection, proof)?
+        };
         ensure!(
             anchors == checkpoint.anchors,
             "retained admission changed its ready canonical checkpoint"
         );
+        if allow_nonready_history {
+            for anchor in &anchors {
+                let event: crate::model::Event = serde_json::from_str(&anchor.canonical_body)?;
+                let dependencies = super::event_authorization::historical_event_dependencies_in(
+                    connection,
+                    policy,
+                    &event.network_id,
+                    &event.resource_id,
+                    &event.scope_id,
+                    std::slice::from_ref(&anchor.hash),
+                )?;
+                if dependencies.values().any(|stored| stored.status != "ready") {
+                    return Ok(None);
+                }
+            }
+        }
         checkpoint.proof_usage.enforce_limits()?;
         if let Some(snapshot) = snapshot {
             snapshot.commit()?;
@@ -575,7 +596,13 @@ pub(crate) fn reconstruct_admission(
     transport: &TransportEvidence,
 ) -> Result<VerifiedAdmission> {
     validate_admission_evidence(proof, transport)?;
-    reconstruct_stored_admission(connection, policy, proof, facts)
+    if let Some((admitted, _)) = policy
+        .local_admissions
+        .admitted_in(connection, policy, proof, facts, false)?
+    {
+        return Ok(admitted);
+    }
+    reconstruct_stored_admission_uncached(connection, policy, proof, facts)
 }
 
 pub(crate) fn reconstruct_stored_admission(
@@ -586,7 +613,7 @@ pub(crate) fn reconstruct_stored_admission(
 ) -> Result<VerifiedAdmission> {
     if let Some((admitted, _)) = policy
         .local_admissions
-        .admitted_in(connection, policy, proof, facts)?
+        .admitted_in(connection, policy, proof, facts, true)?
     {
         return Ok(admitted);
     }
@@ -1486,7 +1513,7 @@ fn verify_lease_record(
         if let Some((_, deadline)) =
             policy
                 .local_admissions
-                .admitted_in(connection, policy, &stored.proof, &facts)?
+                .admitted_in(connection, policy, &stored.proof, &facts, true)?
         {
             ensure!(
                 lease.deadline == deadline,
@@ -4825,11 +4852,35 @@ mod manager_tests {
             "UPDATE resource_reservations SET resource=?",
             [&request.resources[0]],
         )?;
-        network.complete(
-            &mut store,
-            &request,
+        store.finish_operation(
+            network.space.as_str(),
+            &request.operation_id,
             OperationState::Succeeded,
             serde_json::json!({"done":true}),
+        )?;
+        let result = store.seal_local_execution_result(
+            &network.node,
+            network.space.as_str(),
+            &request.operation_id,
+            now() + 2,
+        )?;
+        let dispatch = store
+            .operation_dispatch(network.space.as_str(), &request.operation_id)?
+            .context("dispatch missing")?;
+        store.append_derived_event(
+            &network.node,
+            network.space.as_str(),
+            &dispatch.hash,
+            EventBody::ExecutionObserved {
+                operation_id: request.operation_id.clone(),
+                task_id: request.task_id.clone(),
+                target_node: request.target_node.clone(),
+                session_id: request.session_id.clone(),
+                status: "succeeded".into(),
+                detail: serde_json::to_value(result)?,
+            },
+            vec![],
+            (now() + 2) as i64,
         )?;
         validate_persisted_authorizations(&store.connection, &store.policy)?;
         Ok(())
@@ -5038,6 +5089,19 @@ mod manager_tests {
     #[test]
     fn manager_claim_rolls_back_nonce_and_session_if_any_persisted_part_fails() -> Result<()> {
         let mut fixture = Fixture::new()?;
+        fixture.store.recover_scheduler_jobs(
+            fixture.network.space.as_str(),
+            &fixture.network.node.node_id()?,
+            "boot",
+        )?;
+        let scheduler_before = fixture
+            .store
+            .connection
+            .prepare("SELECT key,value FROM local_values ORDER BY key")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         assert!(
             fixture
                 .store
@@ -5062,7 +5126,23 @@ mod manager_tests {
             )?,
             0
         );
-        assert_eq!(fixture.store.connection.query_row("SELECT count(*) FROM local_values WHERE key LIKE 'scheduler:%' OR key LIKE 'manager-admission:%'", [], |row| row.get::<_,u64>(0))?,0);
+        let scheduler_after = fixture
+            .store
+            .connection
+            .prepare("SELECT key,value FROM local_values ORDER BY key")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(scheduler_after, scheduler_before);
+        assert_eq!(
+            fixture.store.connection.query_row(
+                "SELECT count(*) FROM authorization_nonces WHERE authorization_id=?",
+                [fixture.auth.operation_id()],
+                |row| row.get::<_, u64>(0)
+            )?,
+            0
+        );
         assert!(!fixture.store.connection.query_row(
             "SELECT consumed FROM authorization_challenges WHERE space_id=? AND nonce=?",
             params![

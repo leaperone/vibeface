@@ -21,9 +21,10 @@ use vibeface_secure::{
 };
 
 pub(crate) fn now() -> u64 {
-    static START: std::sync::LazyLock<u64> =
-        std::sync::LazyLock::new(|| crate::runtime::now_ms() as u64);
-    *START
+    std::thread_local! {
+        static START: u64 = crate::runtime::now_ms() as u64;
+    }
+    START.with(|start| *start)
 }
 const CERT_END: u64 = 10_000_000;
 
