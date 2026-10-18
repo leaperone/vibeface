@@ -1,12 +1,12 @@
 use super::{source::source_originals_in, *};
 use crate::{crypto::LocalIdentity, store::Store};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::Connection;
 use vibeface_secure::{
     Identity,
     authorization::{
-        FreshnessReceipt, MAX_PROOF_BYTES, PublicKey,
-        execution_handoff::ExecutionProofUsage,
+        CheckStage, FreshnessReceipt, MAX_PROOF_BYTES, PublicKey,
+        execution_handoff::{ExecutionHandoffResult, ExecutionProofUsage},
         node_execution_policy::{ActualPolicyNoisePeer, VerifiedTaskCurrentPolicy},
         task_business_policy::{
             TaskBusinessAuthorization,
@@ -124,6 +124,40 @@ impl Store {
             "Task business challenge changed its original source wire"
         );
         header.verify_signature()?;
+        let accepted = match (wire, challenge, authorization) {
+            (
+                TaskBusinessWire::Submit(submission),
+                TaskBusinessChallenge::Submit(challenge),
+                TaskBusinessAuthorization::Submit(authorization),
+            ) if challenge.stage == CheckStage::RemoteRead => {
+                let source = submission.handoff.source_statement()?;
+                let operation = self
+                    .operation(source.project.space.as_str(), &source.operation_id)?
+                    .context("Task business Status has no persisted Project operation")?;
+                let result: ExecutionHandoffResult = serde_json::from_value(operation.result)
+                    .context("Task business Status has no persisted executor acknowledgement")?;
+                ensure!(
+                    result.handoff == *submission,
+                    "Task business Status acknowledgement changed its original complete wire"
+                );
+                Some(
+                    current
+                        .state()
+                        .verify_execution_handoff_ack(
+                            submission,
+                            authorization.original(),
+                            &result.receipt,
+                            &result.result,
+                            now,
+                        )
+                        .context("verify Task business Status executor acknowledgement")?,
+                )
+            }
+            _ => None,
+        };
+        let authorization = accepted
+            .as_ref()
+            .map_or(authorization, TaskBusinessAuthorization::Submit);
         let authority = authorize_task_business_challenge(
             self.policy.verified(),
             current,
