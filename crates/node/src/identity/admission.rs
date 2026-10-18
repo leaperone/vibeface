@@ -40,6 +40,7 @@ pub(super) struct LocalAdmissionCheckpoint {
     operation_id: Option<String>,
     anchors: Vec<crate::model::SignedEvent>,
     admitted: VerifiedAdmission,
+    admission_expires_at_ms: u64,
     proof_usage: vibeface_secure::authorization::execution_handoff::ExecutionProofUsage,
 }
 
@@ -173,7 +174,7 @@ impl AdmissionCheckpoints {
         proof: &AdmissionProof,
         facts: &RequestFacts,
         transport: &TransportEvidence,
-    ) -> Result<Option<VerifiedAdmission>> {
+    ) -> Result<Option<(VerifiedAdmission, u64)>> {
         let invocation = &proof.invocation.payload;
         let Some(checkpoint) = self.entries.get(&(
             invocation.resource.space.to_string(),
@@ -206,7 +207,7 @@ impl AdmissionCheckpoints {
         if let Some(snapshot) = snapshot {
             snapshot.commit()?;
         }
-        Ok(Some(checkpoint.admitted.clone()))
+        Ok(Some((checkpoint.admitted.clone(), checkpoint.admission_expires_at_ms)))
     }
 }
 
@@ -257,6 +258,9 @@ fn checkpoint_from_verified_in(
         &proof.transport.clone().into_evidence(),
         proof.admitted_at_ms,
     )?;
+    let freshness = state.verify_freshness(
+        &authorization, &proof.challenge, &proof.receipts, proof.admitted_at_ms,
+    )?;
     let mut proof_usage =
         vibeface_secure::authorization::execution_handoff::ExecutionProofUsage::default();
     proof_usage.record_cached_admission(&authorization, proof)?;
@@ -268,6 +272,7 @@ fn checkpoint_from_verified_in(
         operation_id,
         anchors,
         admitted,
+        admission_expires_at_ms: freshness.expires_at_ms().min(authorization.expires_at_ms()),
         proof_usage,
     }))
 }
@@ -497,7 +502,7 @@ pub(crate) fn reconstruct_admission(
     facts: &RequestFacts,
     transport: &TransportEvidence,
 ) -> Result<VerifiedAdmission> {
-    if let Some(admitted) = policy
+    if let Some((admitted, _)) = policy
         .local_admissions
         .admitted_in(connection, proof, facts, transport)?
     {
@@ -1356,6 +1361,22 @@ fn verify_lease_record(
     stored: &StoredAdmission,
     lease: &LeaseRecord,
 ) -> Result<u64> {
+    let facts = persisted_admission_facts(connection, policy, &stored.proof)?;
+    if lease.proof.challenge.stage == CheckStage::Admit {
+        ensure!(
+            lease.checked_at_ms == stored.proof.admitted_at_ms
+                && lease.proof.challenge == stored.proof.challenge
+                && lease.proof.receipts == stored.proof.receipts,
+            "initial manager lease differs from its original admission"
+        );
+        if let Some((_, deadline)) = policy.local_admissions.admitted_in(
+            connection, &stored.proof, &facts, &stored.transport,
+        )? {
+            ensure!(lease.deadline == deadline,
+                "persisted lease deadline differs from verified local admission");
+            return Ok(deadline);
+        }
+    }
     let current = policy.verified();
     let retained =
         if policy.current_heads_at(&lease.proof.challenge.policies, lease.checked_at_ms)? {
@@ -1364,14 +1385,7 @@ fn verify_lease_record(
             Some(policy.historical(&lease.proof.challenge.policies, lease.checked_at_ms)?)
         };
     let historical = retained.as_ref().unwrap_or(current);
-    let facts = persisted_admission_facts(connection, policy, &stored.proof)?;
     let auth = if lease.proof.challenge.stage == CheckStage::Admit {
-        ensure!(
-            lease.checked_at_ms == stored.proof.admitted_at_ms
-                && lease.proof.challenge == stored.proof.challenge
-                && lease.proof.receipts == stored.proof.receipts,
-            "initial manager lease differs from its original admission"
-        );
         historical.verify_invocation(
             &stored.proof.invocation,
             &facts,
@@ -1579,6 +1593,7 @@ fn manager_lease_from(
     space: &str,
     manager_id: &str,
 ) -> Result<u64> {
+    let snapshot = if connection.is_autocommit() { Some(connection.unchecked_transaction()?) } else { None };
     let (_, stored, _) = load_manager_from(connection, space, manager_id)?;
     let lease: LeaseRecord = local_from(connection, space, &format!("lease:{manager_id}"))?
         .context("manager lease is missing")?;
@@ -1589,7 +1604,9 @@ fn manager_lease_from(
         ),
         "manager lease has incorrect stage"
     );
-    verify_lease_record(connection, policy, &stored, &lease)
+    let deadline = verify_lease_record(connection, policy, &stored, &lease)?;
+    if let Some(snapshot) = snapshot { snapshot.commit()?; }
+    Ok(deadline)
 }
 
 fn manager_authorization_from(
@@ -3642,6 +3659,26 @@ mod manager_tests {
         assert_eq!(checkpoint.anchors[0].hash, trigger);
         super::tests::cached_without_crypto(&fixture.store, &stored.proof, &facts)?;
         super::tests::cached_without_crypto(&fixture.store, &stored.proof, &facts)?;
+        assert_eq!(manager_lease_from(
+            &fixture.store.connection, &fixture.store.policy,
+            fixture.network.space.as_str(), &first.manager_id,
+        )?, first.lease_expires_at_ms);
+        for (path, value) in [
+            ("$.deadline", json!(first.lease_expires_at_ms + 1)),
+            ("$.checked_at_ms", json!(stored.proof.admitted_at_ms + 1)),
+            ("$.proof.challenge.stage", json!("renew")),
+            ("$.proof.receipts[0].signature", json!("00".repeat(64))),
+        ] {
+            let tx = fixture.store.connection.unchecked_transaction()?;
+            assert_eq!(tx.execute(
+                "UPDATE local_values SET value=json_set(value,?,json(?)) WHERE space_id=? AND key=?",
+                params![path, serde_json::to_string(&value)?, fixture.network.space.as_str(), format!("lease:{}", first.manager_id)],
+            )?, 1);
+            assert!(manager_lease_from(
+                &tx, &fixture.store.policy, fixture.network.space.as_str(), &first.manager_id,
+            ).is_err(), "{path}");
+            tx.rollback()?;
+        }
         let trigger_envelope = fixture
             .store
             .event(fixture.network.space.as_str(), trigger)?
