@@ -3,12 +3,14 @@
 
 The default run uses the installed Codex app-server only for native thread
 creation and reads. Delayed execution, restart and notification checks use an
-explicit stream-json fixture, never a model. All state and logs stay beneath
---artifacts with private permissions. The script prints no credentials.
+explicit stream-json fixture, never a model. Node state and process logs stay
+beneath --artifacts with private permissions. Controlled execution images build
+beneath the repository's ignored .artifacts. The script prints no credentials.
 --phase1 checks durable Manager queues, scoped tools and cross-entry progress
-using a controlled sidecar. It does not verify real provider model behavior.
+using the official SDK with an isolated controlled model CLI. It does not verify
+real provider model behavior.
 --chat-agent checks taskless tools, sandboxed commands and startup event recovery
-with real Node processes and controlled provider protocol fixtures.
+with real Node processes and isolated provider protocol fixtures.
 """
 
 import argparse
@@ -41,6 +43,7 @@ import uuid
 
 
 DATA_FORMAT = {"format": "vibeface-node", "data_epoch": 3, "layout_version": 1}
+FIXTURE_INSTANCE = uuid.uuid4().hex
 
 
 def require(condition, description):
@@ -875,13 +878,11 @@ def fixture_executor(arguments):
     native = arguments[arguments.index("--resume") + 1] if "--resume" in arguments else arguments[arguments.index("--session-id") + 1]
     request = json.loads(sys.stdin.read())
     invocation = {"native_session_id": native, "label": request["label"], "pid": os.getpid()}
-    with (run / "fixture-invocations.jsonl").open("a") as output:
-        output.write(json.dumps(invocation) + "\n")
-        output.flush()
+    fixture_record(run, "fixture-invocations.jsonl", invocation)
     print(json.dumps({"type": "system", "subtype": "init", "session_id": native}), flush=True)
     gate = request.get("gate")
     if gate:
-        while not Path(gate).exists():
+        while not fixture_gate(gate, request.get("fixture_cwd")).exists():
             print(json.dumps({"type": "stream_event", "session_id": native,
                               "event": {"type": "content_block_delta", "index": 0, "delta": {
                                   "type": "text_delta", "text": request["label"] + ":working"}}}), flush=True)
@@ -892,8 +893,7 @@ def fixture_executor(arguments):
 
 
 def invocations(run, label=None):
-    path = run / "fixture-invocations.jsonl"
-    records = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    records = fixture_records(run, "fixture-invocations.jsonl")
     return [record for record in records if label is None or record["label"] == label]
 
 
@@ -910,7 +910,135 @@ def fixture_manager_settings():
     return {"provider": "codex_sdk", "model": "controlled-fixture"}
 
 
+def fixture_isolation(run):
+    docker = shutil.which("docker")
+    require(docker, "controlled process acceptance requires real Docker isolation")
+    repo = Path(__file__).resolve().parents[1]
+    artifacts = repo / ".artifacts"
+    artifacts.mkdir(exist_ok=True)
+    build = Path(tempfile.mkdtemp(prefix="process-fixture-image-", dir=artifacts))
+    with (build / "base.log").open("wb") as log:
+        result = subprocess.run(["bash", str(repo / "scripts/build-execution-image.sh"),
+                                 "--output", str(build / "base")], stdout=log, stderr=log)
+    require(result.returncode == 0, f"production execution image builds; see {build / 'base.log'}")
+    base = (build / "base/image.id").read_text().strip()
+    require(re.fullmatch(r"sha256:[a-f0-9]{64}", base), "execution base has an immutable image ID")
+    tag = "vibeface-process-fixture-base:" + base.removeprefix("sha256:")
+    subprocess.run([docker, "tag", base, tag], check=True, capture_output=True)
+    context = build / "context"
+    context.mkdir()
+    shutil.copy2(__file__, context / "verify-node.py")
+    for name, mode in (("codex", "--fixture-model"), ("claude", "--fixture-executor")):
+        (context / name).write_text("#!/bin/sh\nexec /usr/bin/python3 /opt/vibeface/verify-node.py "
+                                   + mode + " --fixture-root /home/vibeface/fixture-control \"$@\"\n")
+    (context / "Dockerfile").write_text(
+        f"FROM {tag}\nUSER root\nCOPY --chmod=0555 verify-node.py /opt/vibeface/verify-node.py\n"
+        "COPY --chmod=0555 codex /usr/local/bin/codex\nCOPY --chmod=0555 claude /usr/local/bin/claude\n"
+        "USER 10001:10001\n")
+    with (build / "fixture.log").open("wb") as log:
+        result = subprocess.run([docker, "build", "--iidfile", str(build / "image.id"), str(context)],
+                                stdout=log, stderr=log)
+    require(result.returncode == 0, f"controlled model image builds; see {build / 'fixture.log'}")
+    image = (build / "image.id").read_text().strip()
+    require(re.fullmatch(r"sha256:[a-f0-9]{64}", image), "controlled model image has an immutable ID")
+    private_json(run / "fixture-isolation.json", {"image": image, "docker": docker, "build": str(build)})
+    return {"image": image, "docker_bin": docker, "egress": None}
+
+
+def fixture_gate(address, project=None):
+    path = Path(address)
+    if str(Path.cwd()) == "/project":
+        require(project, "container fixture gates retain their original authorized project")
+        path = Path("/project") / path.relative_to(project)
+    return path
+
+
+def fixture_files(run, name):
+    paths = [run / name, *sorted(run.glob("*/execution/*/home/fixture-control/" + name))]
+    return [path for path in paths if path.is_file()]
+
+
+def fixture_state_file(run, native):
+    paths = [path for path in fixture_files(run, "fixture-codex-state.json")
+             if native in json.loads(path.read_text())["threads"]]
+    require(len(paths) == 1, "native fixture state belongs to exactly one private execution home")
+    return paths[0]
+
+
+def fixture_containers(run, *, managers=False):
+    config = run / "fixture-isolation.json"
+    if not config.exists():
+        return []
+    settings = json.loads(config.read_text())
+    docker = settings["docker"]
+    containers = []
+    for node in run.iterdir():
+        if not node.is_dir() or not (node / "node.sqlite3").is_file():
+            continue
+        require(node.resolve().parent == run.resolve(), "container ownership uses only this run's private Nodes")
+        node_hash = hashlib.sha256(str(node.resolve()).encode()).hexdigest()
+        result = subprocess.run([docker, "ps", "--all", "--quiet", "--filter", "label=vibeface.node=" + node_hash],
+                                capture_output=True, text=True, check=True)
+        ids = result.stdout.split()
+        if not ids:
+            continue
+        inspected = json.loads(subprocess.check_output([docker, "inspect", *ids]))
+        for container in inspected:
+            labels = container["Config"]["Labels"]
+            require(labels.get("vibeface.node") == node_hash, "fixture container has the exact private Node label")
+            key = labels.get("vibeface.scope", "")
+            require(re.fullmatch(r"[a-f0-9]{64}", key), "fixture container scope is a hash")
+            mounts = {mount["Destination"]: Path(mount["Source"]).resolve() for mount in container["Mounts"]
+                      if mount["Type"] == "bind"}
+            require(container["Image"] == settings["image"] and set(mounts) == {
+                        "/project", "/home/vibeface", "/run/vibeface-control"}
+                    and mounts["/project"].is_relative_to((run / "workspace").resolve())
+                    and mounts.get("/home/vibeface") == node.resolve() / "execution" / key / "home"
+                    and mounts.get("/run/vibeface-control") == node.resolve() / "execution" / key / "control",
+                    "fixture container mounts only its independently checked private execution home and lease")
+            project = next(mount for mount in container["Mounts"] if mount["Destination"] == "/project")
+            require(container["HostConfig"]["ReadonlyRootfs"] and container["HostConfig"]["NetworkMode"] == "none"
+                    and (labels.get("vibeface.project-read-only") != "true" or not project["RW"]),
+                    "real fixture containers preserve the read-only root, private network and Manager project")
+            if not managers or labels.get("vibeface.project-read-only") == "true":
+                containers.append(container)
+    return containers
+
+
+def fixture_manager_container(run, node, job):
+    manager = "manager:" + job["trigger"] + ":" + job["attempt"]["id"]
+    key = hashlib.sha256(("manager\0" + node.client.scope["space_id"] + "\0"
+                          + job["resource_id"] + "\0" + manager).encode()).hexdigest()
+    containers = [item for item in fixture_containers(run, managers=True)
+                  if item["Config"]["Labels"]["vibeface.scope"] == key]
+    require(len(containers) == 1, "the original Manager attempt selects exactly one real owned container")
+    return containers[0]
+
+
+def require_fixture_stopped(run, container):
+    docker = json.loads((run / "fixture-isolation.json").read_text())["docker"]
+    observed = json.loads(subprocess.check_output([docker, "inspect", container["Id"]]))[0]
+    require(not observed["State"]["Running"] and observed["State"]["Pid"] == 0,
+            "the original owned container and all contained processes are stopped")
+
+
+def stop_fixture_containers(run, *, managers=False, remove=False):
+    config = run / "fixture-isolation.json"
+    if not config.exists():
+        return
+    docker = json.loads(config.read_text())["docker"]
+    for container in fixture_containers(run, managers=managers):
+        if container["State"]["Running"]:
+            subprocess.run([docker, "stop", "--time", "2", container["Id"]], check=True, capture_output=True)
+        require_fixture_stopped(run, container)
+        if remove:
+            subprocess.run([docker, "rm", container["Id"]], check=True, capture_output=True)
+
+
 def fixture_record(run, filename, record):
+    run.mkdir(parents=True, exist_ok=True, mode=0o700)
+    record.setdefault("instance", FIXTURE_INSTANCE)
+    record.setdefault("recorded_at_ns", time.time_ns())
     encoded = (json.dumps(record) + "\n").encode()
     descriptor = os.open(run / filename, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
@@ -920,11 +1048,15 @@ def fixture_record(run, filename, record):
 
 
 def fixture_records(run, filename="manager-invocations.jsonl"):
-    path = run / filename
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    records = [{**json.loads(line), "fixture_home": str(path.parent)}
+               for path in fixture_files(run, filename) for line in path.read_text().splitlines()]
+    return sorted(records, key=lambda record: record["recorded_at_ns"])
 
 
 def stop_fixture_processes(run):
+    if (run / "fixture-isolation.json").exists():
+        stop_fixture_containers(run, remove=True)
+        return
     records = fixture_records(run) + fixture_records(run, "fixture-invocations.jsonl") + fixture_records(run, "codex-rpc.jsonl")
     for pid in {record["pid"] for record in records}:
         result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
@@ -973,38 +1105,52 @@ def fixture_codex(arguments):
     """Implement an App Server protocol fixture without loading any provider."""
     run = Path(arguments[arguments.index("--fixture-root") + 1])
     address = arguments[arguments.index("--listen") + 1]
-    require(address.startswith("unix://"), "fixture only binds its private Unix socket")
-    socket_path = Path(address.removeprefix("unix://"))
+    stdio = address == "stdio://"
+    require(stdio or address.startswith("unix://"), "fixture only uses private stdio or Unix sockets")
+    run.mkdir(parents=True, exist_ok=True, mode=0o700)
     state_path = run / "fixture-codex-state.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {"threads": {}}
-    if socket_path.exists():
-        socket_path.unlink()
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(socket_path))
-    listener.listen(1)
-    disconnect_seen = None
+    if not stdio:
+        socket_path = Path(address.removeprefix("unix://"))
+        if socket_path.exists():
+            socket_path.unlink()
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(socket_path))
+        listener.listen(1)
+    disconnect = run / "fixture-codex-disconnect"
+    disconnect_seen = disconnect.read_text() if disconnect.exists() else None
     while True:
-        stream, _ = listener.accept()
-        stream.settimeout(5)
-        header = b""
-        try:
-            while not header.endswith(b"\r\n\r\n"):
-                part = stream.recv(1)
-                if not part:
-                    raise EOFError("fixture socket probe closed before WebSocket handshake")
-                header += part
-                require(len(header) <= 16384, "fixture bounds WebSocket handshake")
-        except (EOFError, OSError):
-            stream.close()
-            continue
-        key = next(line.split(":", 1)[1].strip() for line in header.decode().splitlines()
-                   if line.lower().startswith("sec-websocket-key:"))
-        accept = base64.b64encode(hashlib.sha1(
-            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
-        stream.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-                        "Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n").encode())
+        if stdio:
+            stream = sys.stdin.buffer
+        else:
+            stream, _ = listener.accept()
+            stream.settimeout(5)
+            header = b""
+            try:
+                while not header.endswith(b"\r\n\r\n"):
+                    part = stream.recv(1)
+                    if not part:
+                        raise EOFError("fixture socket probe closed before WebSocket handshake")
+                    header += part
+                    require(len(header) <= 16384, "fixture bounds WebSocket handshake")
+            except (EOFError, OSError):
+                stream.close()
+                continue
+            key = next(line.split(":", 1)[1].strip() for line in header.decode().splitlines()
+                       if line.lower().startswith("sec-websocket-key:"))
+            accept = base64.b64encode(hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+            stream.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                            "Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n").encode())
         connection = uuid.uuid4().hex
         subscribed = set()
+        buffered = b""
+
+        def emit(value):
+            if stdio:
+                print(json.dumps(value), flush=True)
+            else:
+                websocket_send(stream, value)
 
         def emit_approval(thread_id, thread):
             if not thread.get("directive", {}).get("approval") or not thread.get("turns"):
@@ -1014,7 +1160,7 @@ def fixture_codex(arguments):
                                 "itemId": "fixture-command", "command": "printf fixture",
                                 "cwd": thread["cwd"], "reason": "controlled approval acceptance"}}
             for _ in range(2):
-                websocket_send(stream, event)
+                emit(event)
             fixture_record(run, "codex-events.jsonl", {"connection": connection,
                            "thread_id": thread_id, "event": "approval", "copies": 2})
 
@@ -1029,21 +1175,35 @@ def fixture_codex(arguments):
                 for thread_id in list(subscribed):
                     thread = state["threads"][thread_id]
                     gate = thread.get("directive", {}).get("gate")
-                    if thread["status"]["type"] == "active" and gate and Path(gate).exists():
+                    if thread["status"]["type"] == "active" and gate and fixture_gate(
+                            gate, thread["directive"].get("fixture_cwd")).exists():
                         thread["status"] = {"type": "idle"}
                         turn = thread["turns"][-1]
                         turn.update(status="completed", items=[{"id": "fixture-answer", "type": "agentMessage",
                                                                "text": "fixture Codex terminal result"}])
                         private_json(state_path, state)
                         event = {"method": "turn/completed", "params": {"threadId": thread_id, "turn": turn}}
-                        websocket_send(stream, event)
-                        websocket_send(stream, event)
+                        emit(event)
+                        emit(event)
                         if thread.get("directive", {}).get("approval"):
-                            websocket_send(stream, {"method": "serverRequest/resolved",
-                                                   "params": {"requestId": "approval-" + thread_id}})
-                if not select.select([stream], [], [], 0.1)[0]:
-                    continue
-                message = websocket_receive(stream)
+                            emit({"method": "serverRequest/resolved", "params": {"requestId": "approval-" + thread_id}})
+                if stdio:
+                    if b"\n" not in buffered:
+                        if not select.select([stream], [], [], 0.1)[0]:
+                            continue
+                        part = os.read(stream.fileno(), 65536)
+                        if not part:
+                            break
+                        buffered += part
+                        require(len(buffered) <= 1024 * 1024, "fixture bounds pending stdio JSON-RPC")
+                        if b"\n" not in buffered:
+                            continue
+                    line, buffered = buffered.split(b"\n", 1)
+                    message = json.loads(line)
+                else:
+                    if not select.select([stream], [], [], 0.1)[0]:
+                        continue
+                    message = websocket_receive(stream)
                 fixture_record(run, "codex-rpc.jsonl", {"connection": connection, "pid": os.getpid(),
                                "message": message})
                 method = message.get("method")
@@ -1074,17 +1234,97 @@ def fixture_codex(arguments):
                         result = {"thread": thread}
                     subscribed.add(thread_id)
                 else:
-                    websocket_send(stream, {"id": message["id"], "error": {"code": -32601,
-                                            "message": "fixture does not implement " + method}})
+                    emit({"id": message["id"], "error": {"code": -32601,
+                          "message": "fixture does not implement " + method}})
                     continue
                 private_json(state_path, state)
-                websocket_send(stream, {"id": message["id"], "result": result})
+                emit({"id": message["id"], "result": result})
                 if method in {"thread/resume", "turn/start"}:
                     emit_approval(thread_id, thread)
         except (EOFError, OSError):
             pass
         finally:
+            if stdio:
+                return
             stream.close()
+
+
+def fixture_model(arguments):
+    if "app-server" in arguments:
+        return fixture_codex(arguments)
+    run = Path(arguments[arguments.index("--fixture-root") + 1])
+    run.mkdir(parents=True, exist_ok=True, mode=0o700)
+    prompt = sys.stdin.read()
+    catalog = prompt.split("Available tools for this invocation:\n", 1)[1]
+    tools = {name: {"description": description, "inputSchema": json.loads(schema)}
+             for name, description, schema in re.findall(
+                 r"(?:^|\n\n)([a-z][a-z0-9_]*)\n([^\n]*)\nJSON schema: (\{[^\n]*\})", catalog)}
+    require(tools, "official SDK prompt contains its scoped tool catalog")
+    private_json(run / "sdk-tool-catalog.json", tools)
+    start = prompt.rfind("\n\n{")
+    context, _ = json.JSONDecoder().raw_decode(prompt[start + 2:])
+    body = (context.get("trigger_event") or {}).get("body", {})
+    try:
+        value = json.loads(body.get("text", "{}"))
+        directive = value if isinstance(value, dict) else {}
+    except ValueError:
+        directive = {}
+    if directive.get("cancel_unknown"):
+        code = ("from pathlib import Path\nimport time\np=Path(" + repr(str(run)) + ")\n"
+                "(p/'detached-ready').touch()\n"
+                "while not (p/'after-cancel').exists(): time.sleep(0.1)\n"
+                "(p/'detached-after-cancel').touch()\n")
+        subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    session = arguments[arguments.index("resume") + 1] if "resume" in arguments else None
+    child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--fixture-manager",
+                              "--fixture-root", str(run)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, text=True, bufsize=1)
+
+    def send(value):
+        child.stdin.write(json.dumps(value) + "\n")
+        child.stdin.flush()
+
+    emit = lambda value: print(json.dumps(value), flush=True)
+    send({"type": "init", "prompt": prompt, "tools": tools, "session_id": session})
+    for line in child.stdout:
+        frame = json.loads(line)
+        kind = frame["type"]
+        if kind == "ready":
+            if session:
+                emit({"type": "thread.started", "thread_id": session})
+            send({"type": "ack"})
+        elif kind == "session":
+            session = frame["session_id"]
+            emit({"type": "thread.started", "thread_id": session})
+            emit({"type": "turn.started"})
+            send({"type": "session_ack"})
+        elif kind == "tool_call":
+            arguments = frame["arguments"]
+            command = ["/usr/local/bin/node", "/opt/vibeface/sdk/codex-manager.mjs", "tool",
+                       frame["name"], "--json", json.dumps(arguments)]
+            if frame["name"] not in {"nodes", "context", "execution_status", "call_lookup"}:
+                command.extend(["--call-ref", arguments.get("call_ref") or frame["call_id"]])
+            called = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            if called.returncode:
+                require(frame["name"] not in tools, "listed Node tools use their real scoped tool response")
+                require(called.stderr.strip() in {
+                    "Node tool rejected or unavailable; preserve call_ref and query call_lookup before retrying",
+                    "sidecar input closed"}, "unlisted tool is rejected by the real private SDK channel")
+                send({"type": "fixture_tool_denied", "call_id": frame["call_id"],
+                      "exit_code": called.returncode, "stderr": called.stderr.strip()})
+            else:
+                send({"type": "tool_result", "call_id": frame["call_id"], "result": json.loads(called.stdout)})
+        elif kind == "event":
+            emit(frame["event"])
+        elif kind == "result":
+            emit({"type": "item.completed", "item": {"id": "fixture-answer", "type": "agent_message",
+                                                       "text": frame["final_response"]}})
+            emit({"type": "turn.completed", "usage": {"input_tokens": 0, "output_tokens": 0,
+                                                        "cached_input_tokens": 0}})
+        else:
+            raise AssertionError("unexpected controlled model frame " + kind)
+    require(child.wait(timeout=5) == 0, "controlled model completed its protocol assertions")
 
 
 def fixture_manager(arguments):
@@ -1152,12 +1392,16 @@ def fixture_manager(arguments):
         require(encoded and len(encoded.encode()) <= 1024 * 1024,
                 "private tool result is present and bounded")
         frame = json.loads(encoded)
-        require(frame.get("type") == "tool_result" and frame.get("call_id") == call_id,
+        require(frame.get("type") in {"tool_result", "fixture_tool_denied"} and frame.get("call_id") == call_id,
                 "private tool result matches this transport attempt")
-        value = frame.get("result")
+        denied = frame["type"] == "fixture_tool_denied"
+        if denied:
+            require(not expected and name not in schemas and frame["exit_code"] != 0 and frame["stderr"],
+                    "read-only catalog rejects its absent write tool through the real SDK CLI")
+        value = frame if denied else frame.get("result")
         require(isinstance(value, dict), "private tool result is an object")
         error = value.get("error")
-        accepted = error is None
+        accepted = not denied and error is None
         if error is not None:
             require(isinstance(error, str), "private tool rejection has a bounded diagnostic")
             fixture_record(run, "manager-tool-errors.jsonl", {
@@ -1184,13 +1428,15 @@ def fixture_manager(arguments):
         arguments = {"target_node": dispatch_spec["target_node"], "cwd": dispatch_spec["cwd"],
                      "executor": dispatch_spec.get("executor", "claude_code"),
                      "text": json.dumps({"label": label, "gate": dispatch_spec.get("gate"),
+                                         "fixture_cwd": dispatch_spec["cwd"],
                                          "result_size": dispatch_spec.get("result_size", 0),
                                          "approval": dispatch_spec.get("approval", False)})}
         wait_for("delegate dispatches one durable open and send", lambda:
                  tool("delegate", arguments, call_ref="delegate-" + label).get("all_dispatched"))
     if autonomous:
         require(read_only, "ordinary result callbacks have server-enforced read-only authority")
-        tool("command", {"command": "printf forbidden > forbidden-followup", "cwd": str(run / "workspace")},
+        tool("command", {"command": "printf forbidden > forbidden-followup",
+                         "cwd": context["local_execution_roots"][0]},
              expected=False)
     for action in directive.get("tools", []):
         call_ref = action.get("call_ref")
@@ -1211,7 +1457,7 @@ def fixture_manager(arguments):
         sequence += 1
         emit({"type": "event", "event": {"type": "item.updated", "item": {
             "id": "fixture-text", "type": "agent_message", "text": label + ":" + str(sequence)}}})
-        if not gate or Path(gate).exists():
+        if not gate or fixture_gate(gate, context["local_execution_roots"][0]).exists():
             break
         if select.select([sys.stdin], [], [], 0.2)[0]:
             control = sys.stdin.readline()
@@ -1220,9 +1466,6 @@ def fixture_manager(arguments):
             if json.loads(control)["type"] == "cancel":
                 require(json.loads(control).get("session_id") == native,
                         "cancel targets the current native manager session")
-                if not directive.get("cancel_unknown"):
-                    emit({"type": "cancelled", "session_id": native,
-                          "confirmation": "managed_processes_exited"})
                 return
     emit({"type": "result", "session_id": native, "final_response": label + ":complete"})
 
@@ -2781,7 +3024,7 @@ def bot_checks(run, workspace, a, b, c, space, passed, outsider):
                 for event in local_events(c, space, definition["conversation_id"], resource_id=a.client.resource_id))
             for definition in definitions))
     c.stop()
-    c.configure(manager=fixture_manager_settings(), codex_bin=sys.executable)
+    c.configure(manager=fixture_manager_settings())
     c.start()
     c.client.connect()
     c.client.authenticate()
@@ -2837,18 +3080,21 @@ def startup_subscription_checks(run, workspace, a, b, c, space, passed):
     approval_id = notifications("needs_input")[0]["notification_id"]
     for node in (a, b, c):
         node.client.command("close")
-    previous_pids = {row["pid"] for row in rpc("initialize")}
+    previous_instances = {row["instance"] for row in rpc("initialize")}
     b.stop()
     b.start()
     restored = wait_for("Node startup subscribes known native work without any client connection", lambda:
-        next((row for row in rpc("thread/resume") if row["pid"] not in previous_pids
+        next((row for row in rpc("thread/resume") if row["instance"] not in previous_instances
               and row["message"]["params"].get("threadId") == native), None))
     require(restored["message"]["params"].get("excludeTurns") is True,
             "startup restores a native subscription without starting a model turn")
-    private_json(run / "fixture-codex-disconnect", "disconnect-once")
+    private_json(fixture_state_file(run, native).with_name("fixture-codex-disconnect"), uuid.uuid4().hex)
     wait_for("adapter reconnect restores the same native subscription", lambda:
-        len({row["connection"] for row in rpc("thread/resume") if row["pid"] == restored["pid"]
-             and row["message"]["params"].get("threadId") == native}) >= 2)
+        len({row["connection"] for row in rpc("thread/resume")
+             if row["message"]["params"].get("threadId") == native}) >= 2
+        and any(row["instance"] not in previous_instances and row["instance"] != restored["instance"]
+                and row["message"]["params"].get("threadId") == native
+                for row in rpc("thread/resume")))
     wait_for("reconnected native pending approval is replayed", lambda:
         len({row["connection"] for row in fixture_records(run, "codex-events.jsonl")
              if row["thread_id"] == native and row["event"] == "approval"}) >= 3)
@@ -2892,9 +3138,9 @@ def startup_subscription_checks(run, workspace, a, b, c, space, passed):
     native = rpc("turn/start")[-1]["message"]["params"]["threadId"]
     for node in (a, b, c):
         node.client.command("close")
-    previous_pids = {row["pid"] for row in rpc("initialize")}
+    previous_instances = {row["instance"] for row in rpc("initialize")}
     b.stop()
-    state_path = run / "fixture-codex-state.json"
+    state_path = fixture_state_file(run, native)
     state = json.loads(state_path.read_text())
     thread = state["threads"][native]
     thread["status"] = {"type": "idle"}
@@ -2903,7 +3149,7 @@ def startup_subscription_checks(run, workspace, a, b, c, space, passed):
     private_json(state_path, state)
     b.start()
     wait_for("startup reads the missed native terminal turn without any Web", lambda:
-        any(row["pid"] not in previous_pids and row["message"]["params"].get("threadId") == native
+        any(row["instance"] not in previous_instances and row["message"]["params"].get("threadId") == native
             for row in rpc("thread/turns/list")))
     wait_for("read-only native reconciliation confirms the original operation", lambda:
         (local_operation(b, space, operation_id, resource_id=a.client.resource_id) or {}).get("state") == "succeeded")
@@ -2925,15 +3171,16 @@ def chat_agent_acceptance(options):
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir()
-    fixture = fixture_wrapper(run, "fixture-executor", "--fixture-executor")
-    codex = fixture_wrapper(run, "fixture-codex", "--fixture-codex")
+    fixture = Path(shutil.which("false")).resolve()
+    isolation = fixture_isolation(run)
     helper = Path(__file__).resolve().with_name("node-client.mjs")
     nodes = []
     report = {"status": "running", "source_binary": str(binary), "binary_sha256": file_sha256(binary),
+              "execution_fixture_image": isolation["image"],
               "crypto_module_sha256": file_sha256(module),
               "wasm_sha256": file_sha256(module.with_name("vibeface_secure_bg.wasm")),
               "provider_calls": 0, "evidence": [], "not_checked": ["real provider model behavior",
-                  "rendered browser UI", "real LAN/public ingress", "Linux command sandbox on a macOS host"]}
+                  "rendered browser UI", "real LAN/public ingress"]}
 
     def passed(description, **evidence):
         report["evidence"].append({"check": description, **evidence})
@@ -2942,7 +3189,7 @@ def chat_agent_acceptance(options):
     try:
         for name in ("A", "B", "C", "BOT-OTHER-NETWORK"):
             node = Node(run, name, binary, workspace, fixture, helper, module)
-            node.configure(timeout_secs=600, codex_bin=str(codex) if name == "B" else sys.executable)
+            node.configure(timeout_secs=600, codex_bin=str(fixture), execution_isolation=isolation)
             nodes.append(node)
         a, b, c, outsider = nodes
         a.configure(manager=fixture_manager_settings(), daily_decision_limit=100)
@@ -2996,11 +3243,13 @@ def phase1_acceptance(options):
     shutil.copy2(source_binary, binary)
     workspace = run / "workspace"
     workspace.mkdir()
-    fixture = fixture_wrapper(run, "fixture-executor", "--fixture-executor")
+    fixture = Path(shutil.which("false")).resolve()
+    isolation = fixture_isolation(run)
     manager = fixture_manager_settings()
     helper = Path(__file__).resolve().with_name("node-client.mjs")
     nodes = []
     report = {"status": "running", "source_binary": str(source_binary),
+              "execution_fixture_image": isolation["image"],
               "binary_sha256": file_sha256(binary), "provider_calls": 0,
               "crypto_module_sha256": file_sha256(module),
               "wasm_sha256": file_sha256(module.with_name("vibeface_secure_bg.wasm")),
@@ -3052,24 +3301,18 @@ def phase1_acceptance(options):
         node.client.connect()
         wait_for(node.name + " authenticates its enrolled independent client", lambda: node.client.authenticate())
 
-    def stop_managers():
-        # Only fixture PIDs still belonging to this run may be stopped.
-        for record in fixture_records(run):
-            pid = record["pid"]
-            result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
-            if "--fixture-manager" in result.stdout and str(run) in result.stdout:
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+    def stop_manager(container):
+        docker = json.loads((run / "fixture-isolation.json").read_text())["docker"]
+        subprocess.run([docker, "stop", "--time", "2", container["Id"]], check=True, capture_output=True)
+        require_fixture_stopped(run, container)
 
     try:
         for name in ("A", "B", "C"):
             node = Node(run, name, binary, workspace, fixture, helper, module)
-            node.configure(timeout_secs=600)
+            node.configure(timeout_secs=600, codex_bin=str(fixture), execution_isolation=isolation)
             nodes.append(node)
         a, b, c = nodes
-        a.configure(manager=manager, codex_bin=sys.executable, daily_decision_limit=100)
+        a.configure(manager=manager, daily_decision_limit=100)
         a.start()
         verify_web_assets(a, module)
         space = a.bootstrap()
@@ -3081,7 +3324,7 @@ def phase1_acceptance(options):
         passed("three real Nodes enroll independent clients and explicit replica grants; Manager uses a controlled fixture")
 
         name = new_conversation("phase1-queue")
-        gate = run / "release-first"
+        gate = workspace / "release-first"
         first, original = send(a.client, name, "queue-first", gate=str(gate))
         require(first["queued"] is True, "local receipt confirms durable queue admission")
         wait_for("first management invocation starts", lambda: len(calls(name, label="queue-first")) == 1)
@@ -3163,26 +3406,39 @@ def phase1_acceptance(options):
         for unconfirmed in (False, True):
             name = new_conversation("phase1-cancel-" + str(unconfirmed).lower())
             cancelled, _ = send(a.client, name, "cancel-" + str(unconfirmed).lower(),
-                                gate=str(run / "never-release-cancel"), cancel_unknown=unconfirmed)
+                                gate=str(workspace / "never-release-cancel"), cancel_unknown=unconfirmed)
             wait_for("controlled management call starts before cancel", lambda: calls(name))
             active = wait_for("cancellation pins the current running attempt", lambda: state(cancelled, "running"))
+            container = fixture_manager_container(run, a, active)
+            home = Path(calls(name)[0]["fixture_home"])
+            if unconfirmed:
+                wait_for("contained detached child starts before cancellation", lambda: (home / "detached-ready").exists())
             reply = a.client.rpc("cancel_manager", conversation_id=name, trigger=cancelled["trigger"],
                                  attempt_id=active["attempt"]["id"])
             require(reply.get("cancel_requested") is True, "cancel request has an explicit pending state")
-            terminal = "unknown" if unconfirmed else "cancelled"
-            wait_for("cancel reflects actual confirmation evidence", lambda: state(cancelled, terminal))
-            require(len(calls(name)) == 1, "cancel does not restart the same management trigger")
-            passed("management cancellation becomes " + terminal + " according to controlled evidence",
-                   trigger=cancelled["trigger"], evidence_kind="controlled sidecar protocol only")
+            unknown = wait_for("real SDK cancellation preserves its uncertain original result", lambda:
+                (lambda job: job if job and job.get("fenced") else None)(state(cancelled, "unknown")))
+            require(unknown["attempt"]["id"] == active["attempt"]["id"] and len(calls(name)) == 1
+                    and conversation(a.client, name)["scheduler"]["write_frozen"],
+                    "cancel fences tools, preserves the original attempt and never restarts uncertain business work")
+            wait_for("Docker confirms all original Manager processes stopped", lambda:
+                     require_fixture_stopped(run, container) or True)
+            if unconfirmed:
+                (home / "after-cancel").touch()
+                require_quiet("a contained detached child cannot run after confirmed container stop", lambda:
+                              not (home / "detached-after-cancel").exists())
+            passed("real SDK cancellation remains Unknown while Docker proves contained process exit",
+                   trigger=cancelled["trigger"], detached_child=unconfirmed, container_id=container["Id"])
 
         name = new_conversation("phase1-restart")
-        interrupted, _ = send(a.client, name, "restart-running", gate=str(run / "never-release"))
+        interrupted, _ = send(a.client, name, "restart-running", gate=str(workspace / "never-release"))
         wait_for("old attempt crosses running boundary", lambda: state(interrupted, "running") and calls(name))
         queued, _ = send(a.client, name, "restart-queued")
         wait_for("second trigger is persisted before crash", lambda: state(queued, "queued"))
         old_attempt = state(interrupted, "running")["attempt"]["id"]
+        old_container = fixture_manager_container(run, a, state(interrupted, "running"))
         a.stop()
-        stop_managers()
+        stop_manager(old_container)
         a.start()
         reconnect(a)
         unknown = wait_for("restarted running attempt stays unknown", lambda: state(interrupted, "unknown"))
@@ -3262,7 +3518,7 @@ def phase1_acceptance(options):
         wait_for("third entry has imported the last human message", lambda:
                  any(message["message_id"] == "human-after-autonomous-budget" for message in conversation(c.client, name)["messages"]))
         c.stop()
-        c.configure(manager=manager, codex_bin=sys.executable)
+        c.configure(manager=manager)
         c.start()
         reconnect(c)
         require_quiet("imported shared DAG never manufactures local execution jobs after Manager activation", lambda:
@@ -3285,7 +3541,7 @@ def phase1_acceptance(options):
         for node in reversed(nodes):
             node.client.close()
             node.stop()
-        stop_managers()
+        stop_fixture_processes(run)
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
 
@@ -3592,6 +3848,8 @@ if __name__ == "__main__":
         fixture_manager(sys.argv[1:])
     elif "--fixture-codex" in sys.argv:
         fixture_codex(sys.argv[1:])
+    elif "--fixture-model" in sys.argv:
+        fixture_model(sys.argv[1:])
     else:
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("--binary", type=Path, required=True)
