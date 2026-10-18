@@ -604,8 +604,13 @@ impl Runtime {
                     && crypto::fingerprint(source.target_public_key().as_str())? == target,
                 "Task business source differs from its requested Project or target"
             );
-            self.request_execution_dispatch_task_business(source, authorization, wire, submit)
-                .await?
+            Box::pin(self.request_execution_dispatch_task_business(
+                source,
+                authorization,
+                wire,
+                submit,
+            ))
+            .await?
         } else {
             let kind = if submit {
                 "execution_handoff_submit"
