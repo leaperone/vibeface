@@ -2760,6 +2760,7 @@ impl Runtime {
     async fn freshness_scoped_with_verification(
         &self,
         authorization: &TaskScopedAuthorization,
+        transport: &TransportEvidence,
         stage: CheckStage,
         verification: &SignatureVerification,
     ) -> Result<FreshnessProof> {
@@ -2769,7 +2770,7 @@ impl Runtime {
             verification.run(|| store.issue_scoped_freshness(authorization, stage, now))?
         };
         self.collect_freshness_challenge_in_scope_with_verification(
-            authorization.resource().space.as_str(), &challenge, Some(authorization), verification,
+            authorization.resource().space.as_str(), &challenge, Some((authorization, transport)), verification,
         ).await
     }
 
@@ -2799,14 +2800,14 @@ impl Runtime {
         &self,
         space: &str,
         challenge: &FreshnessChallenge,
-        authorization: Option<&TaskScopedAuthorization>,
+        authorization: Option<(&TaskScopedAuthorization, &TransportEvidence)>,
         verification: &SignatureVerification,
     ) -> Result<FreshnessProof> {
         let (mut receipts, authorities) = {
             let store = self.store.lock().await;
             let receipts = verification
                 .run(|| store.sign_current_receipts(challenge, &self.identity, now_ms() as u64))?;
-            let policies = authorization.map_or(store.authorization_state(), |scope| scope.state(store.authorization_state()));
+            let policies = authorization.map_or(store.authorization_state(), |(scope, _)| scope.state(store.authorization_state()));
             let mut authorities = BTreeSet::new();
             for stamp in &challenge.policies {
                 if receipts
@@ -2832,6 +2833,34 @@ impl Runtime {
             (receipts, authorities)
         };
         for target in authorities {
+            if let Some((scoped, transport)) = authorization.filter(|(scoped, _)| {
+                scoped.task_policy().is_some_and(|task| {
+                    crypto::fingerprint(task.selection().target_public_key.as_str())
+                        .is_ok_and(|node| node == target)
+                })
+            }) {
+                let prepared = {
+                    let store = self.store.lock().await;
+                    verification.run(|| {
+                        store.task_execution_freshness_read(
+                            &self.identity, scoped, transport, challenge, now_ms() as u64,
+                        )
+                    })?
+                };
+                let mut client = crate::client::NodePolicyReadClient::connect(
+                    &self.network, &self.identity, &prepared.trust,
+                ).await?;
+                let reply = client.read(
+                    &crate::identity::node_execution_policy::NodeReadRequest::Freshness(
+                        prepared.request,
+                    ),
+                ).await?;
+                let crate::identity::node_execution_policy::NodeReadResponse::Receipts(current) = reply else {
+                    bail!("Node freshness returned another policy read stage");
+                };
+                receipts.extend(current);
+                continue;
+            }
             let reply = self
                 .peer_request(
                     space,
@@ -2932,7 +2961,7 @@ impl Runtime {
             CheckStage::Admit
         };
         let freshness = self
-            .freshness_scoped_with_verification(&authorization, stage, &verification)
+            .freshness_scoped_with_verification(&authorization, &transport, stage, &verification)
             .await?;
         Ok(Access {
             network_id: space.to_string(),
