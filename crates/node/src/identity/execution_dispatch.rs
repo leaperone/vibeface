@@ -17,7 +17,9 @@ use serde_json::{Value, json};
 use vibeface_secure::authorization::{
     Action, Audience, ObjectHash, PolicyDomain, PolicyStamp, PublicKey, RequestFacts, ResourceId,
     ResourceRef, SpaceId, TransportEvidence, VerifiedAuthorization, VerifiedPolicySet,
+    node_execution_policy::VerifiedTaskCurrentPolicy,
     prepare::VerifiedExecutionDestination,
+    remote_execution_policy::{RemoteExecutionPolicyPurpose, RemoteExecutionPolicySelection},
 };
 
 #[derive(Clone, Debug)]
@@ -668,6 +670,40 @@ impl Store {
             audience,
             now_ms,
         )
+    }
+
+    pub(crate) fn execution_dispatch_facts_with_task_policy(
+        &self,
+        task: &VerifiedTaskCurrentPolicy,
+        body: &Value,
+        audience: &Audience,
+        now_ms: u64,
+    ) -> Result<VerifiedDispatchFacts> {
+        super::foreign_execution_policy::check_task_policy_heads_in(&self.connection, task)?;
+        let selection = RemoteExecutionPolicySelection {
+            execution_resource: serde_json::from_value(body["execution_resource"].clone())?,
+            target_public_key: serde_json::from_value(body["target_public_key"].clone())?,
+            execution_grant: serde_json::from_value(body["execution_grant"].clone())?,
+        };
+        ensure!(
+            selection == *task.selection()
+                && task.request().expected_action() == crate::model::authorization_action(body)?
+                && matches!(
+                    task.request().purpose(),
+                    RemoteExecutionPolicyPurpose::Execution
+                        | RemoteExecutionPolicyPurpose::Resolver
+                ),
+            "dispatch differs from the current Task policy selection or purpose"
+        );
+        let dispatch = dispatch_facts_from(&self.connection, task.state(), body, audience, now_ms)?;
+        let mut context = dispatch.facts().context.clone();
+        context.sdk_session = None;
+        ensure!(
+            context == task.context().context,
+            "dispatch differs from the current Task policy execution context"
+        );
+        task.check_scope(dispatch.facts(), &selection, task.context(), now_ms)?;
+        Ok(dispatch)
     }
 
     pub(crate) fn execution_dispatch_facts_in_scope(
