@@ -1034,8 +1034,9 @@ pub(crate) fn persisted_admission_facts(
     if roots.is_empty() {
         return Ok(None);
     }
-    let events = retained_event_dependencies_in(
+    let events = historical_event_dependencies_in(
         connection,
+        policy,
         resource.space.as_str(),
         &resource.resource,
         scope,
@@ -1133,6 +1134,37 @@ pub(super) fn retained_event_dependencies_in(
     scope: &str,
     roots: &[String],
 ) -> Result<BTreeMap<String, StoredEvent>> {
+    retained_event_dependencies_at_readiness_in(connection, space, resource, scope, roots, true)
+}
+
+pub(super) fn historical_event_dependencies_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    space: &str,
+    resource: &ResourceId,
+    scope: &str,
+    roots: &[String],
+) -> Result<BTreeMap<String, StoredEvent>> {
+    let events = retained_event_dependencies_at_readiness_in(
+        connection, space, resource, scope, roots, false,
+    )?;
+    if events.values().any(|stored| stored.status != "ready") {
+        for stored in events.values() {
+            ensure!(verify_event_envelope(policy, space, &stored.envelope)? == stored.event,
+                "historical event differs from its signed envelope");
+        }
+    }
+    Ok(events)
+}
+
+fn retained_event_dependencies_at_readiness_in(
+    connection: &Connection,
+    space: &str,
+    resource: &ResourceId,
+    scope: &str,
+    roots: &[String],
+    require_ready: bool,
+) -> Result<BTreeMap<String, StoredEvent>> {
     let mut events = retained_scope_event_rows_in(connection, space, resource, scope)?;
     for hash in roots {
         let source = events
@@ -1144,7 +1176,9 @@ pub(super) fn retained_event_dependencies_in(
                 && source.event.scope_id == scope,
             "retained request history belongs to another resource or scope"
         );
-        validate_retained_event_dependencies_in(connection, &source.envelope)?;
+        ready_observation_dependencies_in(
+            connection, &source.envelope, "", "", vec![source.envelope.hash.clone()], require_ready,
+        )?;
     }
     let selected = closure_hashes(&events, roots);
     events.retain(|hash, _| selected.contains(hash));
@@ -1670,7 +1704,7 @@ pub(crate) fn validate_retained_event_dependencies_in(
     connection: &Connection,
     source: &SignedEvent,
 ) -> Result<()> {
-    ready_observation_dependencies_in(connection, source, "", "", vec![source.hash.clone()])?;
+    ready_observation_dependencies_in(connection, source, "", "", vec![source.hash.clone()], true)?;
     Ok(())
 }
 
@@ -1717,6 +1751,7 @@ fn ready_observation_scope_in(
         local_author,
         observation_slot,
         heads,
+        true,
     )?;
     ensure!(
         checkpoint.validated_events as u64 == row_count,
@@ -1731,6 +1766,7 @@ fn ready_observation_dependencies_in(
     local_author: &str,
     observation_slot: &str,
     heads: Vec<String>,
+    require_ready: bool,
 ) -> Result<ObservationScopeCheckpoint> {
     let expected: Event = serde_json::from_str(&source.canonical_body)?;
     let invocation_hash = admission(&expected).invocation.hash()?;
@@ -1779,7 +1815,7 @@ fn ready_observation_dependencies_in(
         );
         let event: Event = serde_json::from_str(&envelope.canonical_body)?;
         ensure!(
-            row.1 == "ready"
+            (!require_ready || row.1 == "ready")
                 && envelope.hash == hash
                 && crypto::digest(envelope.canonical_body.as_bytes()) == hash
                 && serde_json::to_string(&event)? == envelope.canonical_body

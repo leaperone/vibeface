@@ -93,6 +93,17 @@ fn admission_anchors_in(
     connection: &Connection,
     proof: &AdmissionProof,
 ) -> Result<Vec<crate::model::SignedEvent>> {
+    let anchors = admission_anchor_envelopes_in(connection, proof)?;
+    for envelope in &anchors {
+        super::event_authorization::validate_retained_event_dependencies_in(connection, envelope)?;
+    }
+    Ok(anchors)
+}
+
+fn admission_anchor_envelopes_in(
+    connection: &Connection,
+    proof: &AdmissionProof,
+) -> Result<Vec<crate::model::SignedEvent>> {
     let invocation = &proof.invocation.payload;
     let method = manager_field(&proof.source_body, "method")?;
     if matches!(
@@ -103,7 +114,7 @@ fn admission_anchors_in(
     }
     let encoded = if method == "agent_start" {
         vec![connection.query_row(
-            "SELECT envelope FROM events WHERE space_id=? AND hash=? AND status='ready'",
+            "SELECT envelope FROM events WHERE space_id=? AND hash=?",
             params![
                 invocation.resource.space.as_str(),
                 manager_field(&proof.source_body, "trigger")?
@@ -135,7 +146,6 @@ fn admission_anchors_in(
             ensure!(matches!(&event.cause, crate::model::EventCause::Invocation { admission } if admission == proof),
                 "admission checkpoint changed its original proof");
         }
-        super::event_authorization::validate_retained_event_dependencies_in(connection, &envelope)?;
         Ok(envelope)
     }).collect()
 }
@@ -206,13 +216,15 @@ fn checkpoint_from_verified_in(
     proof: &AdmissionProof,
     facts: RequestFacts,
     admitted: VerifiedAdmission,
+    allow_nonready_history: bool,
 ) -> Result<Option<LocalAdmissionCheckpoint>> {
     validate_persisted_admission(connection, proof)?;
     let operation_id = admission_operation_index_in(connection, proof)?;
-    let anchors = admission_anchors_in(connection, proof)?;
+    let anchors = admission_anchor_envelopes_in(connection, proof)?;
     if anchors.is_empty() {
         return Ok(None);
     }
+    let mut all_ready = true;
     for envelope in &anchors {
         let event: crate::model::Event = serde_json::from_str(&envelope.canonical_body)?;
         ensure!(
@@ -220,6 +232,18 @@ fn checkpoint_from_verified_in(
                 == event,
             "local admission checkpoint has an invalid event signature"
         );
+        if allow_nonready_history {
+            let dependencies = super::event_authorization::historical_event_dependencies_in(
+                connection, policy, &event.network_id, &event.resource_id,
+                &event.scope_id, std::slice::from_ref(&envelope.hash),
+            )?;
+            all_ready &= dependencies.values().all(|stored| stored.status == "ready");
+        } else {
+            super::event_authorization::validate_retained_event_dependencies_in(connection, envelope)?;
+        }
+    }
+    if !all_ready {
+        return Ok(None);
     }
     let retained = if policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)? {
         None
@@ -260,7 +284,7 @@ pub(super) fn prepare_local_admission_checkpoint_in(
         &facts,
         &proof.transport.clone().into_evidence(),
     )?;
-    checkpoint_from_verified_in(connection, policy, proof, facts, admitted)?
+    checkpoint_from_verified_in(connection, policy, proof, facts, admitted, false)?
         .context("local admission has no retained event checkpoint")
 }
 
@@ -751,8 +775,9 @@ fn persisted_admission_facts(
             body["basis_heads"].clone(),
         )?);
     }
-    let events = super::event_authorization::retained_event_dependencies_in(
+    let events = super::event_authorization::historical_event_dependencies_in(
         connection,
+        policy,
         space.as_str(),
         &resource,
         scope,
@@ -962,7 +987,7 @@ pub(crate) fn verified_admission_checkpoints_from(
         let admitted =
             reconstruct_admission_uncached(policy, &stored.proof, &facts, &stored.transport)?;
         if let Some(checkpoint) =
-            checkpoint_from_verified_in(connection, policy, &stored.proof, facts, admitted)?
+            checkpoint_from_verified_in(connection, policy, &stored.proof, facts, admitted, true)?
         {
             checkpoints.insert(checkpoint);
         }
@@ -3865,6 +3890,34 @@ mod manager_tests {
         validate_persisted_authorizations(&fixture.store.connection, &fixture.store.policy)?;
         fixture.store.connection.execute_batch(
             "UPDATE events SET status='conflict'; DELETE FROM tasks; DELETE FROM conversations;",
+        )?;
+        validate_persisted_authorizations(&fixture.store.connection, &fixture.store.policy)?;
+        assert_eq!(verified_admission_checkpoints_from(
+            &fixture.store.connection, &fixture.store.policy,
+        )?.len(), 0);
+        let stored = load_authorization_from(
+            &fixture.store.connection, fixture.network.space.as_str(), &first.manager_id,
+        )?;
+        let facts = persisted_admission_facts(
+            &fixture.store.connection, &fixture.store.policy, &stored.proof,
+        )?;
+        assert!(reconstruct_admission(
+            &fixture.store.connection, &fixture.store.policy, &stored.proof,
+            &facts, &stored.transport,
+        ).is_err());
+        let (hash, original): (String, String) = fixture.store.connection.query_row(
+            "SELECT hash,envelope FROM events ORDER BY hash LIMIT 1", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        fixture.store.connection.execute(
+            "UPDATE events SET envelope=json_set(envelope,'$.signature',?) WHERE hash=?",
+            params!["00".repeat(64), hash],
+        )?;
+        assert!(verified_admission_checkpoints_from(
+            &fixture.store.connection, &fixture.store.policy,
+        ).is_err());
+        fixture.store.connection.execute(
+            "UPDATE events SET envelope=? WHERE hash=?", params![original, hash],
         )?;
         validate_persisted_authorizations(&fixture.store.connection, &fixture.store.policy)?;
         fixture.store.connection.execute("UPDATE local_values SET value=json_set(value,'$.deadline',?) WHERE space_id=? AND key=?",
