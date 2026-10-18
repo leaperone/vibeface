@@ -1359,7 +1359,7 @@ def create_execution_share(project, executor, registered, conversation, task, se
     prepared = owner.command("prepare_share", handle="share-" + uuid.uuid4().hex,
                              connection="execution", source_handle=source_handle,
                              intent={"executionResourceId": registered["resource_id"], "actions": actions,
-                                     "expiresAt": params["expires_at_ms"]})
+                                     "expiresAt": int(time.time() * 1000) + 3_600_000})
     finished = finish_native_change(owner, prepared, "space_policy_commit", connection="execution")
     owner.authenticate(resource_id=registered["resource_id"], host_public_key=executor.node_public_key,
                        connection="execution", trust_ref="execution", resource_kind="execution_service",
