@@ -30,6 +30,8 @@ mod ingress;
 pub(crate) use ingress::ForeignExecutionPolicyCache;
 mod node;
 pub(crate) use node::PendingNodeTaskRead;
+mod readonly;
+pub(crate) use readonly::current_task_readonly_policy_in;
 mod provenance;
 pub(crate) use provenance::{
     TaskExecutionPolicyProvenance, bind_task_execution_policy_in, check_task_policy_heads_in,

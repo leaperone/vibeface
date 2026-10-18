@@ -357,7 +357,12 @@ pub(super) fn check_source_task(
                 && prior.session_id == session.session_id
                 && session.target == DeviceId::from_key(&value.selection.target_public_key)
                 && prior.open_spec["executor"].as_str() == context.executor_kind.as_deref()
-                && prior.open_spec["cwd"].as_str() == value.context.canonical_cwd.as_deref(),
+                && (prior.open_spec["cwd"].as_str() == value.context.canonical_cwd.as_deref()
+                    || (matches!(
+                        value.purpose,
+                        RemoteExecutionPolicyPurpose::ObservationRead
+                            | RemoteExecutionPolicyPurpose::Resolver
+                    ) && value.context.canonical_cwd.is_none())),
             "policy read changed the current binding target, session, executor or cwd"
         );
     }

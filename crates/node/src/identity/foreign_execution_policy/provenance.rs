@@ -50,7 +50,7 @@ impl TaskExecutionPolicyProvenance {
         self.current.insert(reference, policy);
     }
 
-    fn current_for_task(
+    pub(super) fn current_for_task(
         &self,
         project: &vibeface_secure::authorization::ResourceRef,
         task: &vibeface_secure::authorization::EventRef,
@@ -599,7 +599,7 @@ pub(crate) fn current_task_prepare_policy_in(
     )?))
 }
 
-fn check_current_anchor_in(
+pub(super) fn check_current_anchor_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
     source: &PublicKey,
