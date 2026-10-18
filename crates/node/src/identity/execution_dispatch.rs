@@ -877,10 +877,11 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let facts = dispatch.revalidate(&tx, &self.policy, body, auth.audience(), now_ms)?;
-        self.policy.verified().verify_invocation(
+        super::policy::authorize_invocation_for_body(self.policy.verified(),
             auth.signed_invocation(),
             &facts,
             transport,
+            body,
             now_ms,
         )?;
         check_policy_heads_in(&tx, self.policy.verified(), auth, now_ms)?;

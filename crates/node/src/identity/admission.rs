@@ -252,10 +252,11 @@ fn checkpoint_from_verified_in(
         Some(policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?)
     };
     let state = retained.as_ref().unwrap_or(policy.verified());
-    let authorization = state.verify_invocation(
+    let authorization = super::policy::authorize_invocation_for_body(state,
         &proof.invocation,
         &facts,
         &proof.transport.clone().into_evidence(),
+        &proof.source_body,
         proof.admitted_at_ms,
     )?;
     let freshness = state.verify_freshness(
@@ -457,7 +458,9 @@ fn consume_authorization_with_facts_in(
         check_manager_tool_in(tx, policy, auth, transport, now_ms)?;
     }
     let signed = auth.signed_invocation();
-    let checked = state.verify_invocation(signed, &facts, transport, now_ms)?;
+    let checked = super::policy::authorize_invocation_for_body(
+        state, signed, facts, transport, source_body, now_ms,
+    )?;
     ensure!(
         checked.invocation_hash() == auth.invocation_hash(),
         "authorization proof changed"
@@ -564,8 +567,9 @@ fn reconstruct_admission_in_state(
     facts: &RequestFacts,
     transport: &TransportEvidence,
 ) -> Result<VerifiedAdmission> {
-    let auth =
-        state.verify_invocation(&proof.invocation, facts, transport, proof.admitted_at_ms)?;
+    let auth = super::policy::authorize_invocation_for_body(
+        state, &proof.invocation, facts, transport, &proof.source_body, proof.admitted_at_ms,
+    )?;
     source_matches(&auth, &proof.source_body)?;
     let freshness = state.verify_freshness(
         &auth,
