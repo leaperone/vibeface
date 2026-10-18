@@ -2,15 +2,9 @@
 
 use super::*;
 use crate::authorization::{enrollment_policy_import::*, execution_handoff::ExecutionProofUsage};
+use crate::connection::ConnectionRoute;
 
 pub const MAX_ENROLLMENT_OFFER_BYTES: usize = MAX_PROOF_BYTES;
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct EnrollmentEntry {
-    pub endpoint: String,
-    pub node_public_key: PublicKey,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -20,7 +14,7 @@ pub struct EnrollmentOffer {
     pub pins: Vec<PolicyPin>,
     pub required_heads: Vec<PolicyStamp>,
     pub manager_certificate_hash: ObjectHash,
-    pub entry: EnrollmentEntry,
+    pub entry: ConnectionRoute,
     pub requested_rights: Vec<AccountRight>,
     pub certificate_expires_at_ms: u64,
     pub issued_at_ms: u64,
@@ -59,6 +53,22 @@ pub fn enrollment_offer_hash(offer: &Signed<EnrollmentOffer>) -> Result<ObjectHa
     ObjectHash::body(offer)
 }
 
+pub fn enrollment_request_hash(
+    offer_hash: &ObjectHash,
+    intent: &DeviceEnrollmentIntent,
+) -> Result<ObjectHash> {
+    ObjectHash::body(&(offer_hash, intent))
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = deviceEnrollmentRequestId))]
+pub fn device_enrollment_request_id(offer_hash: &str, intent_json: &str) -> crate::Result<String> {
+    let hash = ObjectHash::parse(offer_hash).map_err(|error| error.to_string())?;
+    let intent = parse::<DeviceEnrollmentIntent>(intent_json).map_err(|error| error.to_string())?;
+    enrollment_request_hash(&hash, &intent)
+        .map(|id| id.to_string())
+        .map_err(|error| error.to_string())
+}
+
 pub fn decode_enrollment_offer(bytes: &[u8]) -> Result<Signed<EnrollmentOffer>> {
     require(
         bytes.len() <= MAX_ENROLLMENT_OFFER_BYTES,
@@ -71,18 +81,6 @@ pub fn decode_enrollment_offer(bytes: &[u8]) -> Result<Signed<EnrollmentOffer>> 
         "enrollment offer too large",
     )?;
     Ok(offer)
-}
-
-fn endpoint_is_valid(value: &str) -> bool {
-    value.len() <= 4096
-        && (value.starts_with("https://") || value.starts_with("http://"))
-        && !value
-            .bytes()
-            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
-        && !value.contains(['#', '@'])
-        && value
-            .split_once("://")
-            .is_some_and(|(_, tail)| !tail.is_empty() && !tail.starts_with('/'))
 }
 
 fn verify_offer_descriptor(signed: &Signed<EnrollmentOffer>, now: u64) -> Result<()> {
@@ -99,7 +97,7 @@ fn verify_offer_descriptor(signed: &Signed<EnrollmentOffer>, now: u64) -> Result
             && offer.expires_at_ms <= offer.certificate_expires_at_ms
             && offer.requested_rights.len() <= 3
             && sorted_unique(&offer.requested_rights)
-            && endpoint_is_valid(&offer.entry.endpoint)
+            && offer.entry.validate().is_ok()
             && offer.pins.len() == 2
             && offer
                 .pins
@@ -426,6 +424,7 @@ pub fn create_device_enrollment_offer(
     account_id: &str,
     endpoint: &str,
     target_node_public_key: &str,
+    relay: bool,
     requested_rights_json: &str,
     certificate_expires_at_ms: f64,
     authorization: &VerifiedClientAuthorization,
@@ -463,10 +462,8 @@ pub fn create_device_enrollment_offer(
                 manager_certificate_hash: state
                     .find_device(&DeviceId::from_key(&PublicKey::of(manager)))?
                     .hash()?,
-                entry: EnrollmentEntry {
-                    endpoint: endpoint.to_owned(),
-                    node_public_key: PublicKey::parse(target_node_public_key)?,
-                },
+                entry: ConnectionRoute::new(endpoint, target_node_public_key, relay)
+                    .map_err(|_| AuthorizationError::InvalidProof("invalid enrollment route"))?,
                 requested_rights: parse(requested_rights_json)?,
                 certificate_expires_at_ms: expires,
                 issued_at_ms: now,

@@ -483,18 +483,41 @@ impl Store {
                 )?;
             }
             tx.commit()?;
-            return Ok(json!({"offer_hash":hash}));
+            let reference = vibeface_secure::connection::EnrollmentReference::from_offer(&signed)
+                .map_err(anyhow::Error::msg)?;
+            return Ok(json!({"offer_hash":hash,"reference":reference}));
         }
         let account = AccountId::parse(text(params, "account_id")?)?;
         let hash = ObjectHash::parse(text(params, "offer_hash")?)?;
+        if method == "enrollment_offer_get" {
+            let exists: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_values WHERE space_id=? AND key=?)",
+                params![SpaceId::personal(&account).as_str(), offer_key(&hash)],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(json!({"status":"not_found","account_id":account,"offer_hash":hash}));
+            }
+        }
         let signed = self.enrollment_offer(&account, &hash)?;
         if method == "enrollment_status" {
             let id = ObjectHash::parse(text(params, "request_id")?)?;
+            let exists: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_values WHERE space_id=? AND key=?)",
+                params![SpaceId::personal(&account).as_str(), request_key(&id)],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(
+                    json!({"status":"not_found","account_id":account,"offer_hash":hash,"request_id":id}),
+                );
+            }
             let (_, record) = self.enrollment_record(&account, &id)?;
-            ensure!(
-                record.offer_hash == hash,
-                "enrollment request belongs to another offer"
-            );
+            if record.offer_hash != hash {
+                return Ok(
+                    json!({"status":"not_found","account_id":account,"offer_hash":hash,"request_id":id}),
+                );
+            }
             if record.new_device_public_key.as_str() != principal {
                 self.current_enrollment_manager(&account, principal, now)?;
             } else if matches!(record.phase, EnrollmentPhase::Completed { .. }) {
@@ -540,7 +563,7 @@ impl Store {
                     &key,
                     now,
                 )?;
-                let id = ObjectHash::body(&(hash.clone(), &intent))?;
+                let id = offer::enrollment_request_hash(&hash, &intent)?;
                 if let Ok((_, old)) = self.enrollment_record(&account, &id) {
                     return Ok(serde_json::to_value(old)?);
                 }
@@ -819,7 +842,9 @@ mod tests {
         store: &mut Store,
         at: u64,
     ) -> Result<vibeface_secure::authorization::VerifiedClientAuthorization> {
-        use vibeface_secure::authorization::{client_policy_import::AuthorizationSelection, ResourceRef};
+        use vibeface_secure::authorization::{
+            ResourceRef, client_policy_import::AuthorizationSelection,
+        };
         let audience = store
             .policy
             .verified()
@@ -932,6 +957,7 @@ mod tests {
                 network.account.as_str(),
                 "https://node.example.test",
                 &network.node.public_key_hex()?,
+                false,
                 "[]",
                 (now() + 60_000) as f64,
                 &authorization(&network, &mut store, now())?,
@@ -1503,6 +1529,7 @@ mod tests {
             flow.network.account.as_str(),
             "https://node.example.test",
             &flow.network.node.public_key_hex()?,
+            false,
             "[]",
             (later + 60_000) as f64,
             &flow.authorization()?,
@@ -1556,6 +1583,7 @@ mod tests {
             flow.network.account.as_str(),
             "https://node.example.test",
             &flow.network.node.public_key_hex()?,
+            false,
             "[]",
             (now() + 60_000) as f64,
             &flow.authorization()?,
@@ -1571,14 +1599,14 @@ mod tests {
         let mut reference = flow.reference();
         reference["offer_hash"] = published["offer_hash"].clone();
         let before = flow.snapshot()?;
-        assert!(
+        assert_eq!(
             flow.call(
                 &flow.device.public_key_hex(),
                 "enrollment_status",
                 &reference,
                 now()
-            )
-            .is_err()
+            )?,
+            json!({"status":"not_found","account_id":reference["account_id"],"offer_hash":reference["offer_hash"],"request_id":reference["request_id"]})
         );
         reference["intent"] = serde_json::from_str(&flow.approval()?)?;
         assert!(

@@ -1962,6 +1962,7 @@ mod tests {
             f.account().as_str(),
             "https://node.example",
             &key(4).public_key_hex(),
+            false,
             "[]",
             END as f64,
             &f.authorization(),
@@ -1976,6 +1977,9 @@ mod tests {
             enrollment_offer_hash(&changed_signature).unwrap()
         );
         assert!(verify_enrollment_offer_current(&f.state(), &changed_signature, NOW).is_err());
+        let mut changed_route = signed.clone();
+        changed_route.payload.entry.relay = true;
+        assert!(verify_enrollment_offer_current(&f.state(), &changed_route, NOW).is_err());
         assert!(!json.contains("manager_journal"));
         assert!(!json.contains("secret_hex"));
         assert!(!json.contains("grant_leaf"));
@@ -1985,6 +1989,19 @@ mod tests {
             create_device_enrollment_intent_from_offer(&verified, &key(5), NOW as f64).unwrap();
         let intent: DeviceEnrollmentIntent = parse(&intent_json).unwrap();
         assert_eq!(intent, f.intent(5, vec![]));
+        let hash = enrollment_offer_hash(&signed).unwrap();
+        let request_id = device_enrollment_request_id(hash.as_str(), &intent_json).unwrap();
+        assert_eq!(
+            request_id,
+            enrollment_request_hash(&hash, &intent).unwrap().as_str()
+        );
+        let mut another = intent.clone();
+        another.new_device_public_key = PublicKey::of(&key(6));
+        assert_ne!(
+            request_id,
+            device_enrollment_request_id(hash.as_str(), &encode(&another).unwrap()).unwrap()
+        );
+        assert!(device_enrollment_request_id(hash.as_str(), "{}").is_err());
         assert!(
             sign_device_enrollment_intent(&intent_json, &key(3), &f.authorization(), NOW as f64)
                 .is_ok()
@@ -2006,6 +2023,7 @@ mod tests {
                 f.account().as_str(),
                 "https://node.example",
                 &key(4).public_key_hex(),
+                false,
                 "[]",
                 END as f64,
                 &f.authorization(),
@@ -2023,6 +2041,7 @@ mod tests {
             f.account().as_str(),
             "https://node.example",
             &key(4).public_key_hex(),
+            false,
             "[]",
             END as f64,
             &f.authorization(),
@@ -2086,6 +2105,7 @@ mod tests {
             f.account().as_str(),
             "https://node.example",
             &key(4).public_key_hex(),
+            false,
             "[]",
             END as f64,
             &f.authorization(),
@@ -2127,6 +2147,7 @@ mod tests {
             f.account().as_str(),
             "https://node.example",
             &key(4).public_key_hex(),
+            false,
             "[]",
             END as f64,
             &f.authorization(),
@@ -2218,6 +2239,7 @@ mod tests {
             f.account().as_str(),
             "https://node.example",
             &key(4).public_key_hex(),
+            false,
             "[]",
             END as f64,
             &authorization,
@@ -2662,6 +2684,7 @@ mod tests {
             f.account().as_str(),
             "https://node.example",
             &key(4).public_key_hex(),
+            false,
             "[]",
             END as f64,
             &f.authorization(),
@@ -2935,6 +2958,7 @@ mod tests {
             f.account().as_str(),
             "https://node.example",
             &key(4).public_key_hex(),
+            false,
             "[]",
             END as f64,
             &f.authorization(),

@@ -8,6 +8,7 @@ use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
 pub mod authorization;
+pub mod connection;
 pub mod membership;
 pub mod signature_verification;
 pub mod webauthn;
