@@ -3665,7 +3665,9 @@ def acceptance(options):
         dispatch(client, opened)
         changed = copy.deepcopy(opened)
         changed["action"]["cwd"] = str(run)
-        dispatch(client, changed, status=400)
+        original_open = client.signed_requests[opened["operation_id"]]
+        client.call("rpc", {**original_open["body"], "request": changed},
+                    invocation=original_open["invocation"], status=400)
         passed("verified TaskCreated and explicit TaskBinding govern execution; changed duplicate intent rejects")
 
         device = client.scope["device_id"]
