@@ -397,6 +397,7 @@ class Client:
         self.module = module
         self.scope = None
         self.policy = None
+        self.connection_policies = {}
         self.resource_id = None
         self.process = None
         self.node_id = None
@@ -409,6 +410,8 @@ class Client:
         self.operations = {}
 
     def command(self, op, *, check=True, **arguments):
+        if op in {"connect", "close", "authenticate"}:
+            self.connection_policies.pop(arguments.get("connection", "main"), None)
         if self.process is None:
             self.process = subprocess.Popen(
                 ["node", str(self.helper), str(self.module)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -475,12 +478,15 @@ class Client:
             self.resource_id = resources[0]["payload"]["resource"]
         require(self.resource_id in {item["payload"]["resource"] for item in resources},
                 "selected Project belongs to the verified resource projection")
+        self.connection_policies[connection] = self.policy
         return verified
 
     def rpc(self, method, *, status=200, connection="main", **arguments):
         body = {"method": method, "space_id": self.scope["space_id"],
                 "resource_id": self.resource_id, **arguments}
-        if body["resource_id"] not in {item["payload"]["resource"] for item in self.policy["resources"]}:
+        connection_policy = self.connection_policies.get(connection)
+        if connection_policy is None or body["resource_id"] not in {
+                item["payload"]["resource"] for item in connection_policy["resources"]}:
             default_resource = self.resource_id
             self.authenticate(resource_id=body["resource_id"], connection=connection)
             self.resource_id = default_resource
