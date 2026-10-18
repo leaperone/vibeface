@@ -48,14 +48,14 @@ impl AcceptedGatewayOriginal {
 #[derive(Clone, Debug)]
 pub(super) enum RequestOrigin {
     Existing(TransportEvidence),
-    Gateway(OriginalGatewayTransport),
+    Gateway(Box<OriginalGatewayTransport>),
     PortableIntent,
 }
 
 #[derive(Clone, Debug)]
 pub(super) enum AdmissionOrigin {
     Existing(TransportEvidence),
-    Gateway(OriginalGatewayTransport),
+    Gateway(Box<OriginalGatewayTransport>),
 }
 
 impl VerifiedAdmission {

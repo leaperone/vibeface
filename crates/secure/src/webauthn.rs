@@ -834,6 +834,7 @@ pub struct PasskeyAssertionProof {
     pub response: AssertionResponse,
 }
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub fn verify_assertion_json(
     proof_json: &str,
     trusted_state_json: &str,

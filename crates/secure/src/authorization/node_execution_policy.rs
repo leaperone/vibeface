@@ -72,6 +72,7 @@ impl SignedObject for NodeExecutionHistoryPolicyReadIntent {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "intent", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum NodeExecutionPolicyReadRequest {
     Current(Signed<NodeExecutionPolicyReadIntent>),
     History(Signed<NodeExecutionHistoryPolicyReadIntent>),
@@ -207,6 +208,7 @@ pub struct VerifiedNodeExecutionPolicyRead {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", content = "request", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum TaskExecutionPolicyRequest {
     Account(remote_execution_policy::RemoteExecutionPolicyReadRequest),
     Node(NodeExecutionPolicyReadRequest),
@@ -316,6 +318,7 @@ impl TaskExecutionPolicyRequest {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum TaskPolicySourceScope {
     Account(Signed<RemoteExecutionPolicyReadIntent>),
     Node(service::NodeTaskPolicySourceScope),

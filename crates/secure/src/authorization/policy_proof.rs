@@ -330,15 +330,14 @@ impl PolicyProof<'_> {
                 "missing current policy proof",
             ))?;
         self.witness(stamp)?;
-        if let PolicyDomain::Space(space) = domain {
-            if let Some(SpaceDocument {
+        if let PolicyDomain::Space(space) = domain
+            && let Some(SpaceDocument {
                 root: SpaceRoot::Personal { owner, .. },
                 ..
             }) = self.state.space(space)
-            {
-                let owner = owner.clone();
-                self.current(&PolicyDomain::Account(owner))?;
-            }
+        {
+            let owner = owner.clone();
+            self.current(&PolicyDomain::Account(owner))?;
         }
         Ok(())
     }

@@ -421,6 +421,7 @@ pub fn verify_enrollment_offer_policy_read(
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = createDeviceEnrollmentOffer))]
+#[allow(clippy::too_many_arguments)]
 pub fn create_device_enrollment_offer(
     manager: &Identity,
     account_id: &str,

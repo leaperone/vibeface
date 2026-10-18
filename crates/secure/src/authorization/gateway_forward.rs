@@ -203,6 +203,7 @@ impl VerifiedGatewayRoute {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum GatewaySourceFrame {
     Begin {
         request: Signed<ClientPolicyReadRequest>,

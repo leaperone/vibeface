@@ -443,6 +443,7 @@ fn verify_source(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_sdk_source_provenance(
     primary: &VerifiedPolicySet,
     parent: &VerifiedAuthorization,

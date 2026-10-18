@@ -10,8 +10,8 @@ use super::*;
     deny_unknown_fields
 )]
 enum PolicyWitness {
-    Account(Signed<AccountDocument>),
-    Space(Signed<SpaceDocument>),
+    Account(Box<Signed<AccountDocument>>),
+    Space(Box<Signed<SpaceDocument>>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -207,7 +207,7 @@ pub(crate) fn checkpoint_recovery_material_in_state(
         "private checkpoint needs current Root and RecoveryKey approval",
     )?;
     let mut budget = Budget::default();
-    scope_budget(&state, material, now, &mut budget)?;
+    scope_budget(state, material, now, &mut budget)?;
     let mut selected = budget.objects;
     selected.extend(account.payload.authenticators.iter().cloned());
     let mut objects = Vec::new();
@@ -246,11 +246,13 @@ pub(crate) fn checkpoint_recovery_material_in_state(
                 .iter()
                 .find(|value| account_stamp(value).as_ref() == Ok(&stamp))
                 .cloned()
+                .map(Box::new)
                 .map(PolicyWitness::Account),
             PolicyDomain::Space(id) if id == &material.scope.space_id => spaces
                 .iter()
                 .find(|value| space_stamp(value).as_ref() == Ok(&stamp))
                 .cloned()
+                .map(Box::new)
                 .map(PolicyWitness::Space),
             _ => None,
         }
@@ -267,7 +269,7 @@ pub(crate) fn checkpoint_recovery_material_in_state(
         if !policy_witnesses.iter().any(|witness| {
             matches!(witness, PolicyWitness::Account(value) if account_stamp(value).as_ref() == Ok(&stamp))
         }) {
-            policy_witnesses.push(PolicyWitness::Account(registered.clone()));
+            policy_witnesses.push(PolicyWitness::Account(Box::new(registered.clone())));
         }
     }
     let mut authority_changes = Vec::new();
@@ -413,8 +415,8 @@ pub(crate) fn recovery_material_usage(
         }
         for witness in &value.policy_witnesses {
             let entry = match witness {
-                PolicyWitness::Account(value) => JournalEntry::Account(value.clone()),
-                PolicyWitness::Space(value) => JournalEntry::Space(value.clone()),
+                PolicyWitness::Account(value) => JournalEntry::Account(value.as_ref().clone()),
+                PolicyWitness::Space(value) => JournalEntry::Space(value.as_ref().clone()),
             };
             usage.merge(&policy_entry_payload_usage(&entry)?);
         }
@@ -586,10 +588,10 @@ fn material_state_with_budget(
     for witness in &value.policy_witnesses {
         match witness {
             PolicyWitness::Account(signed) => {
-                account_history.insert(account_stamp(signed)?, signed.clone());
+                account_history.insert(account_stamp(signed)?, signed.as_ref().clone());
             }
             PolicyWitness::Space(signed) => {
-                space_history.insert(space_stamp(signed)?, signed.clone());
+                space_history.insert(space_stamp(signed)?, signed.as_ref().clone());
             }
         }
     }

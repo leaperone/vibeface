@@ -164,11 +164,11 @@ impl VerifiedExecutionServiceRegistrationRequest {
             actual_verifications: self
                 .crypto_counts
                 .as_ref()
-                .map_or(0, |counts| counts.actual_verifications as usize),
+                .map_or(0, |counts| counts.actual_verifications),
             cache_hits: self
                 .crypto_counts
                 .as_ref()
-                .map_or(0, |counts| counts.cache_hits as usize),
+                .map_or(0, |counts| counts.cache_hits),
         }
     }
 }
@@ -213,6 +213,7 @@ fn management_actions() -> Vec<Action> {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn authorization(
     state: &VerifiedPolicySet,
     account: &AccountId,
@@ -342,6 +343,7 @@ pub fn verify_execution_service_source_management(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_management_parent(
     state: &VerifiedPolicySet,
     account: &AccountId,
@@ -413,6 +415,7 @@ fn verify_management_parent(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn project_execution_service_selection(
     state: &VerifiedPolicySet,
     account: &AccountId,
@@ -1078,11 +1081,8 @@ fn finish_native_usage(usage: &mut ExecutionProofUsage) -> Result<RegistrationPr
         actual_verifications: counts
             .actual
             .as_ref()
-            .map_or(0, |value| value.actual_verifications as usize),
-        cache_hits: counts
-            .actual
-            .as_ref()
-            .map_or(0, |value| value.cache_hits as usize),
+            .map_or(0, |value| value.actual_verifications),
+        cache_hits: counts.actual.as_ref().map_or(0, |value| value.cache_hits),
     })
 }
 
@@ -1227,6 +1227,7 @@ pub struct PreparedExecutionServiceRegistration {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = prepareExecutionServiceRegistration))]
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_execution_service_registration(
     source: &VerifiedClientAuthorization,
     management: &VerifiedExecutionServiceManagementSelection,

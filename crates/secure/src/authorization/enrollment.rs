@@ -412,7 +412,7 @@ pub fn verify_account_enrollment_json(
         let state = snapshot.state();
         let signed: Signed<DeviceEnrollmentIntent> = decode_signed(signed_json.as_bytes())?;
         authorized_account(authorization, &signed.payload.account)?;
-        verify_account_enrollment(&state, &signed, time(now_ms)?)
+        verify_account_enrollment(state, &signed, time(now_ms)?)
     };
     verify().map_err(|e| e.to_string())
 }
@@ -428,7 +428,7 @@ pub fn verify_authenticator_enrollment_json(
         let state = snapshot.state();
         let signed: Signed<AuthenticatorEnrollmentIntent> = decode_signed(signed_json.as_bytes())?;
         authorized_account(authorization, &signed.payload.account)?;
-        verify_authenticator_enrollment(&state, &signed, time(now_ms)?)
+        verify_authenticator_enrollment(state, &signed, time(now_ms)?)
     };
     verify().map_err(|e| e.to_string())
 }
@@ -479,7 +479,7 @@ pub fn sign_device_enrollment_intent(
         let intent: DeviceEnrollmentIntent = parse(intent_json)?;
         authorized_account(authorization, &intent.account)?;
         let signed = Signed::sign(intent, signer)?;
-        verify_account_enrollment(&state, &signed, time(now_ms)?)?;
+        verify_account_enrollment(state, &signed, time(now_ms)?)?;
         Ok(signed)
     };
     encode(&sign().map_err(|e| e.to_string())?)
@@ -498,7 +498,7 @@ pub fn sign_authenticator_enrollment_intent(
         let intent: AuthenticatorEnrollmentIntent = parse(intent_json)?;
         authorized_account(authorization, &intent.account)?;
         let signed = Signed::sign(intent, signer)?;
-        verify_authenticator_enrollment(&state, &signed, time(now_ms)?)?;
+        verify_authenticator_enrollment(state, &signed, time(now_ms)?)?;
         Ok(signed)
     };
     encode(&sign().map_err(|e| e.to_string())?)
@@ -511,6 +511,7 @@ pub fn sign_authenticator_enrollment_intent(
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[allow(clippy::large_enum_variant)]
 pub enum AccountDeviceChange {
     Enrollment {
         intent: Signed<DeviceEnrollmentIntent>,
@@ -1276,7 +1277,7 @@ pub fn sign_passkey_enrollment_intent(
         let intent: DeviceEnrollmentIntent = parse(intent_json)?;
         authorized_account(authorization, &intent.account)?;
         let signed = Signed::sign(intent, new_device)?;
-        verify_passkey_enrollment_request(&state, &signed, time(now_ms)?)?;
+        verify_passkey_enrollment_request(state, &signed, time(now_ms)?)?;
         Ok(signed)
     };
     encode(&sign().map_err(|e| e.to_string())?)
@@ -1293,7 +1294,7 @@ pub fn verify_passkey_enrollment_request_json(
         let state = snapshot.state();
         let signed: Signed<DeviceEnrollmentIntent> = decode_signed(signed_json.as_bytes())?;
         authorized_account(authorization, &signed.payload.account)?;
-        verify_passkey_enrollment_request(&state, &signed, time(now_ms)?)
+        verify_passkey_enrollment_request(state, &signed, time(now_ms)?)
     };
     verify().map_err(|e| e.to_string())
 }

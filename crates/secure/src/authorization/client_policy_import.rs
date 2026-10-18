@@ -493,6 +493,7 @@ fn verify_client_policy_read_inner(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_client_policy_auth_confirm(
     state: &VerifiedPolicySet,
     read: &Signed<ClientPolicyReadRequest>,
@@ -589,6 +590,7 @@ fn verify_read_binding(
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = buildClientPolicyReadRequest))]
+#[allow(clippy::too_many_arguments)]
 pub fn build_client_policy_read_request(
     account: &str,
     space: &str,
@@ -1202,6 +1204,7 @@ pub(crate) fn record_confirmed_client_policy_metadata(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_client_policy_server_session(
     state: VerifiedPolicySet,
     read: &Signed<ClientPolicyReadRequest>,

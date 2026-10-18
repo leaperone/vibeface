@@ -656,10 +656,10 @@ fn check_pins(state: &VerifiedPolicySet, pins: &[PolicyPin], heads: &[PolicyStam
         )?;
     }
     for pin in pins {
-        if let Some(minimum) = &pin.minimum_head {
-            if minimum.domain != pin.domain || !state.roots.contains_key(minimum) {
-                return Err(AuthorizationError::NeedPolicySync(vec![minimum.clone()]));
-            }
+        if let Some(minimum) = &pin.minimum_head
+            && (minimum.domain != pin.domain || !state.roots.contains_key(minimum))
+        {
+            return Err(AuthorizationError::NeedPolicySync(vec![minimum.clone()]));
         }
     }
     Ok(())

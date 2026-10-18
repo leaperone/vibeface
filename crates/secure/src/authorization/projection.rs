@@ -1,6 +1,7 @@
 use super::*;
 
 impl VerifiedPolicySet {
+    #[allow(clippy::too_many_arguments)]
     pub fn client_authorization_projection(
         &self,
         pins: &[PolicyPin],

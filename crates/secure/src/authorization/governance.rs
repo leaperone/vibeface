@@ -348,7 +348,7 @@ pub fn prepare_space_membership_change(
         let now = time(now_ms)?;
         let (snapshot, current) = load(authorization, &PublicKey::of(signer), now)?;
         let state = snapshot.state();
-        let mut document = next_space(&state, &intent.space, &current.grant_leaf)?;
+        let mut document = next_space(state, &intent.space, &current.grant_leaf)?;
         document.memberships.retain(|hash| {
             state.membership(hash).is_none_or(|value| {
                 value.payload.subject != Actor::Account(intent.subject_account.clone())
@@ -424,7 +424,7 @@ fn prepare_directional_grant_inner(
             target.payload.public_key == intent.audience_node_public_key,
             "grant audience key mismatch",
         )?;
-        let mut document = next_space(&state, &intent.space, &current.grant_leaf)?;
+        let mut document = next_space(state, &intent.space, &current.grant_leaf)?;
         let grant = Signed::sign(
             Grant {
                 version: AUTH_VERSION,
@@ -477,7 +477,7 @@ pub fn prepare_space_grant_revocation(
         let now = time(now_ms)?;
         let (snapshot, current) = load(authorization, &PublicKey::of(signer), now)?;
         let state = snapshot.state();
-        let mut document = next_space(&state, &SpaceId::parse(space_id)?, &current.grant_leaf)?;
+        let mut document = next_space(state, &SpaceId::parse(space_id)?, &current.grant_leaf)?;
         let hash = ObjectHash::parse(grant_hash)?;
         require(
             document.grants.contains(&hash),
@@ -511,7 +511,7 @@ pub fn prepare_space_resource_registration(
             state.resource(&intent.space, &intent.resource).is_none(),
             "resource identity already registered",
         )?;
-        let mut document = next_space(&state, &intent.space, &current.grant_leaf)?;
+        let mut document = next_space(state, &intent.space, &current.grant_leaf)?;
         let record = Signed::sign(
             ResourceRecord {
                 version: AUTH_VERSION,
@@ -1205,6 +1205,7 @@ impl Drop for PreparedTeamCreation {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = prepareTeamCreation))]
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_team_creation(
     team_root: &Identity,
     governor: &Identity,
@@ -2054,7 +2055,7 @@ pub(crate) mod tests {
             &request,
             &PublicKey::of(node),
             &PublicKey::of(own),
-            now as u64,
+            now,
         )
         .unwrap();
         let snapshot = Signed::sign(
@@ -2066,8 +2067,8 @@ pub(crate) mod tests {
                 target_heads: current.heads().to_vec(),
                 selection: selection.clone(),
                 source_node_public_key: PublicKey::of(node),
-                issued_at_ms: now as u64,
-                expires_at_ms: now as u64 + 60_000,
+                issued_at_ms: now,
+                expires_at_ms: now + 60_000,
             },
             node,
         )
@@ -2122,8 +2123,8 @@ pub(crate) mod tests {
                 entry_count: bundle.journal.len() as u64,
                 snapshot_hash: snapshot.hash().unwrap(),
                 source_node_public_key: PublicKey::of(node),
-                issued_at_ms: now as u64,
-                expires_at_ms: now as u64 + 60_000,
+                issued_at_ms: now,
+                expires_at_ms: now + 60_000,
             },
             node,
         )
@@ -2152,7 +2153,7 @@ pub(crate) mod tests {
             &confirmation_request,
             &PublicKey::of(node),
             &PublicKey::of(own),
-            now as u64,
+            now,
         )
         .unwrap();
         let confirmation = Signed::sign(
@@ -2164,7 +2165,7 @@ pub(crate) mod tests {
                 target_heads: current.heads().to_vec(),
                 device_public_key: PublicKey::of(own),
                 source_node_public_key: PublicKey::of(node),
-                accepted_at_ms: now as u64,
+                accepted_at_ms: now,
             },
             node,
         )

@@ -161,22 +161,20 @@ impl VerifiedPolicySet {
             &mut dependencies,
             &mut BTreeSet::new(),
         )?;
-        if verify_execution_target {
-            if let Some(session) = &facts.context.execution_session {
-                let target = self.find_device(&session.target)?;
-                require(
-                    matches!(target.payload.subject, Actor::Service(_))
-                        && target.payload.uses.contains(&DeviceUse::Noise),
-                    "execution target is not a service",
-                )?;
-                self.validate_certificate(
-                    target,
-                    now_ms,
-                    &mut budget,
-                    &mut dependencies,
-                    &mut BTreeSet::new(),
-                )?;
-            }
+        if verify_execution_target && let Some(session) = &facts.context.execution_session {
+            let target = self.find_device(&session.target)?;
+            require(
+                matches!(target.payload.subject, Actor::Service(_))
+                    && target.payload.uses.contains(&DeviceUse::Noise),
+                "execution target is not a service",
+            )?;
+            self.validate_certificate(
+                target,
+                now_ms,
+                &mut budget,
+                &mut dependencies,
+                &mut BTreeSet::new(),
+            )?;
         }
         let path = self.grant_chain(Some(grant_leaf))?;
         let (initiating, _) =

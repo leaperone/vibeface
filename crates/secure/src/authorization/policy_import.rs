@@ -579,10 +579,10 @@ impl BoundedPolicyImport {
             }
             _ => {}
         }
-        if let Some(head) = staged.head(&entry_domain(&entry)) {
-            if self.required_heads.contains(head) {
-                self.seen_heads.insert(head.clone());
-            }
+        if let Some(head) = staged.head(&entry_domain(&entry))
+            && self.required_heads.contains(head)
+        {
+            self.seen_heads.insert(head.clone());
         }
         self.state = staged;
         if let Some(generation) = registered_generation(&entry) {
@@ -759,10 +759,10 @@ impl VerifiedPolicySnapshot {
         if let Some(generation) = registered_generation(first) {
             import.authenticator_generations.insert(generation);
         }
-        if let Some(head) = import.state.head(&entry_domain(first)) {
-            if import.required_heads.contains(head) {
-                import.seen_heads.insert(head.clone());
-            }
+        if let Some(head) = import.state.head(&entry_domain(first))
+            && import.required_heads.contains(head)
+        {
+            import.seen_heads.insert(head.clone());
         }
         import.entry_index.insert(hash, import.journal.len());
         import.journal.push(first.clone());

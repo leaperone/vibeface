@@ -344,6 +344,7 @@ impl VerifiedExecutionObservationRead {
 }
 
 impl VerifiedPolicySet {
+    #[allow(clippy::too_many_arguments)]
     pub fn build_forwarded_execution_observation_request(
         &self,
         original: &SignedExecutionHandoff,
@@ -396,6 +397,7 @@ impl VerifiedPolicySet {
         Ok(signed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn build_execution_observation_request(
         &self,
         original: &SignedExecutionHandoff,
@@ -969,6 +971,7 @@ pub(crate) mod tests {
 
     const NOW: u64 = 10_000;
 
+    #[allow(clippy::too_many_arguments)]
     fn produce_observation_request(
         original_json: &str,
         execution_grant: &str,

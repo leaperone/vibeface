@@ -139,6 +139,7 @@ struct Execute {
 }
 
 #[derive(Clone)]
+#[allow(clippy::type_complexity)]
 struct Reply(Arc<Mutex<Option<oneshot::Sender<Result<Value, CodexError>>>>>);
 
 impl Reply {

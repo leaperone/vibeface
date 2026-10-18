@@ -663,6 +663,7 @@ fn derive_dispatch_work(
     Ok(work)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_accepted_open(
     event: &events::Event,
     request: &serde_json::Value,

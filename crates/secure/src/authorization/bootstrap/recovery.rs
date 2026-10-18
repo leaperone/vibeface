@@ -371,6 +371,7 @@ pub(super) fn prepare_account_recovery_from_bundle(
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn prepare_account_recovery_preserving_source(
     material_json: &str,
     latest_bundle_json: &str,
@@ -410,6 +411,7 @@ fn prepare_account_recovery_preserving_source(
     prepare().map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_account_recovery_in_state(
     material: &RecoveryMaterial,
     recovery: &Identity,

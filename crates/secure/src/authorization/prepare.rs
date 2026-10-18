@@ -258,6 +258,7 @@ pub(super) fn remote_context_matches(
 }
 
 impl VerifiedPolicySet {
+    #[allow(clippy::too_many_arguments)]
     pub fn verify_execution_destination(
         &self,
         project: &ResourceRef,
@@ -282,6 +283,7 @@ impl VerifiedPolicySet {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn verify_execution_destination_with_budget(
         &self,
         project: &ResourceRef,
@@ -648,11 +650,11 @@ pub fn inspect_remote_execution_share(share_json: &str) -> crate::Result<String>
         )?;
         let mut selected = None;
         for entry in &share.authorization.journal {
-            if let JournalEntry::Grant(grant) = entry {
-                if grant.hash()? == share.selection.execution_grant {
-                    require(selected.is_none(), "duplicate selected execution Grant")?;
-                    selected = Some(grant);
-                }
+            if let JournalEntry::Grant(grant) = entry
+                && grant.hash()? == share.selection.execution_grant
+            {
+                require(selected.is_none(), "duplicate selected execution Grant")?;
+                selected = Some(grant);
             }
         }
         let signed = selected.ok_or(AuthorizationError::InvalidProof(
@@ -1059,15 +1061,14 @@ impl VerifiedRemoteExecution {
                 })?;
             self.check_original_work(&actual.handoff.handoff)?;
         }
-        if body["method"] == "operate" {
-            if let Some(execution_work::ExecutionWorkIntent::Command { request_hash, .. }) =
+        if body["method"] == "operate"
+            && let Some(execution_work::ExecutionWorkIntent::Command { request_hash, .. }) =
                 &self.work
-            {
-                require(
-                    *request_hash == ObjectHash::body(&body["request"])?,
-                    "remote handle approved another command request",
-                )?;
-            }
+        {
+            require(
+                *request_hash == ObjectHash::body(&body["request"])?,
+                "remote handle approved another command request",
+            )?;
         }
         let mut result = current;
         result.heads = self.heads.clone();
@@ -1598,6 +1599,7 @@ impl VerifiedRemoteExecution {
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = validateReplay))]
+    #[allow(clippy::too_many_arguments)]
     pub fn validate_replay(
         &self,
         auth: &VerifiedClientAuthorization,
@@ -1686,6 +1688,7 @@ impl VerifiedRemoteExecution {
         .map_err(|error| error.to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &self,
         auth: &VerifiedClientAuthorization,
@@ -1731,6 +1734,7 @@ impl VerifiedRemoteExecution {
             now_ms,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn sign(
         &self,
         auth: &VerifiedClientAuthorization,
@@ -3018,6 +3022,7 @@ pub(super) fn check_raw_context(
 
 /// The body and context come from user intent; the Gateway key comes from a pinned Noise route.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = signClientPrepareIntent))]
+#[allow(clippy::too_many_arguments)]
 pub fn sign_client_prepare_intent(
     auth: &VerifiedClientAuthorization,
     raw_body_json: &str,

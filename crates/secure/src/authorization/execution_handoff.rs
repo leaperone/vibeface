@@ -2720,12 +2720,12 @@ impl ExecutionProofUsage {
             "too many historical admission items",
         )?;
         let mut source = proof.source_body.clone();
-        if source["method"] == "message" {
-            if let Some(text) = source["text"].as_str() {
-                source["text"] = serde_json::json!({
-                    "payload_hash":ObjectHash::body(&text)?,"utf8_bytes":text.len(),
-                });
-            }
+        if source["method"] == "message"
+            && let Some(text) = source["text"].as_str()
+        {
+            source["text"] = serde_json::json!({
+                "payload_hash":ObjectHash::body(&text)?,"utf8_bytes":text.len(),
+            });
         }
         if source["method"] == "create_task" {
             for field in ["title", "goal", "acceptance"] {

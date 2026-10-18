@@ -172,6 +172,7 @@ fn verify_proposal(
     Ok(after)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn sign_recovery_node_possession_in_state(
     streamed: &StreamedRecoveryNodeRequest,
     read: &RecoveryReadRequest,

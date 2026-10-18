@@ -133,6 +133,7 @@ pub(super) fn source_read_actions() -> Vec<Action> {
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = buildCrossNodeRecoveryRequest))]
+#[allow(clippy::too_many_arguments)]
 pub fn build_cross_node_recovery_request(
     material_json: &str,
     next_root: &Identity,
@@ -549,6 +550,7 @@ pub(super) fn verify_delta_shape_in_state(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn verify_delta_in_state(
     signed: &Signed<CrossNodeRecoveryRequest>,
     node_request: &RecoveryNodeRequest,
@@ -574,6 +576,7 @@ pub(super) fn verify_delta_in_state(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn verify_delta_after_locally_approved_account(
     signed: &Signed<CrossNodeRecoveryRequest>,
     node_request: &RecoveryNodeRequest,
@@ -606,6 +609,7 @@ pub(super) fn verify_delta_after_locally_approved_account(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_delta_from_state(
     signed: &Signed<CrossNodeRecoveryRequest>,
     node_request: &RecoveryNodeRequest,

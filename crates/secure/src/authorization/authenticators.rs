@@ -166,16 +166,16 @@ impl VerifiedPolicySet {
         require(self.authenticators.len() < 4096, "too many authenticators")?;
         self.validate_authenticator(&signed, now_ms)?;
         let hash = signed.hash()?;
-        if let Some(account) = self.account(&signed.payload.account) {
-            if account.authenticators.contains(&hash) {
-                for other_hash in &account.authenticators {
-                    if let Some(other) = self.authenticators.get(other_hash) {
-                        require(
-                            other_hash == &hash
-                                || other.payload.credential_id != signed.payload.credential_id,
-                            "duplicate registered authenticator",
-                        )?;
-                    }
+        if let Some(account) = self.account(&signed.payload.account)
+            && account.authenticators.contains(&hash)
+        {
+            for other_hash in &account.authenticators {
+                if let Some(other) = self.authenticators.get(other_hash) {
+                    require(
+                        other_hash == &hash
+                            || other.payload.credential_id != signed.payload.credential_id,
+                        "duplicate registered authenticator",
+                    )?;
                 }
             }
         }

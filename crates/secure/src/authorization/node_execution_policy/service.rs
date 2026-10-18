@@ -170,6 +170,7 @@ pub(super) fn check_binding(
 }
 
 /// The Store checks the persisted SDK lease/origin and ready Task/binding in this transaction.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_node_service_policy_source(
     primary: &VerifiedPolicySet,
     primary_pins: &[PolicyPin],
@@ -294,6 +295,7 @@ pub fn verify_node_service_policy_source(
 }
 
 /// Current read authority permits retrieving old artifacts after their writer is revoked.
+#[allow(clippy::too_many_arguments)]
 pub fn verify_node_history_policy_source(
     primary: &VerifiedPolicySet,
     primary_pins: &[PolicyPin],

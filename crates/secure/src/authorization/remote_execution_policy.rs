@@ -847,10 +847,10 @@ pub(super) fn reference_closure(
                 genesis == pin.genesis_root,
                 "execution policy dependency has another independent genesis",
             )?;
-            if let Some(minimum) = &pin.minimum_head {
-                if !state.roots.contains_key(minimum) {
-                    return Err(AuthorizationError::NeedPolicySync(vec![minimum.clone()]));
-                }
+            if let Some(minimum) = &pin.minimum_head
+                && !state.roots.contains_key(minimum)
+            {
+                return Err(AuthorizationError::NeedPolicySync(vec![minimum.clone()]));
             }
             require(
                 state.roots.contains_key(head),
@@ -997,6 +997,7 @@ pub(super) struct ExecutionPolicyClosure {
     pub(super) usage: ExecutionProofUsage,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn verify_execution_policy_closure(
     state: &VerifiedPolicySet,
     selection: &RemoteExecutionPolicySelection,
@@ -2327,6 +2328,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn remote_policy_stream(
         source: &VerifiedClientAuthorization,
         client: &Identity,

@@ -46,6 +46,7 @@ impl LocallyApprovedRecoveryAccount {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn approve_recovery_source_proposal(
     proposal: &StreamedRecoveryNodeRequest,
     read: &RecoveryReadRequest,
@@ -82,6 +83,7 @@ pub fn approve_recovery_source_proposal(
     Ok((proof, approval))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn sign_source_proposal_approval_after_verification(
     read: &RecoveryReadRequest,
     context: &RecoveryContextReference,
@@ -137,6 +139,7 @@ pub(super) fn sign_source_proposal_approval_after_verification(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_recovery_source_proposal_approval(
     approval: &Signed<RecoverySourceProposalApproval>,
     read: &RecoveryReadRequest,

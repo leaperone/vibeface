@@ -17,6 +17,7 @@ use super::*;
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[allow(clippy::large_enum_variant)]
 pub enum TaskBusinessChallenge {
     Submit(ExecutionHandoffChallenge),
     Observe(ExecutionObservationChallenge),
@@ -223,6 +224,7 @@ pub fn authorize_task_business_challenge(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_task_business_receipt_read(
     primary: &VerifiedPolicySet,
     current: &VerifiedTaskCurrentPolicy,
@@ -282,6 +284,7 @@ pub fn verify_task_business_receipt_read(
     Ok(verified)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_task_business_operation_receipt_read(
     primary: &VerifiedPolicySet,
     current: &VerifiedTaskCurrentPolicy,
@@ -388,6 +391,7 @@ fn verify_receipt_request(
     Ok(usage)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn authorize_inner(
     primary: &VerifiedPolicySet,
     current: &VerifiedTaskCurrentPolicy,

@@ -1417,6 +1417,7 @@ impl VerifiedPolicySet {
     pub fn install_account(&mut self, signed: Signed<AccountDocument>) -> Result<PolicyStamp> {
         self.apply_account(signed, None, Budget::default(), None)
     }
+    #[allow(clippy::type_complexity)]
     fn apply_account(
         &mut self,
         signed: Signed<AccountDocument>,
@@ -1634,6 +1635,7 @@ impl VerifiedPolicySet {
     pub fn install_space(&mut self, signed: Signed<SpaceDocument>) -> Result<PolicyStamp> {
         self.apply_space(signed, None, Budget::default(), None)
     }
+    #[allow(clippy::type_complexity)]
     fn apply_space(
         &mut self,
         signed: Signed<SpaceDocument>,
@@ -2285,6 +2287,7 @@ impl VerifiedPolicySet {
             }
         }
     }
+    #[allow(clippy::type_complexity)]
     fn verify_grant_path(
         &self,
         path: &[&Signed<Grant>],
@@ -2335,10 +2338,9 @@ impl VerifiedPolicySet {
             let space = self
                 .space(&g.owner_space)
                 .ok_or(AuthorizationError::InvalidProof("missing resource space"))?;
-            if require_registered_leaf || index + 1 != path.len() {
-                if !space.grants.contains(&hash) {
-                    return Err(AuthorizationError::Revoked);
-                }
+            if (require_registered_leaf || index + 1 != path.len()) && !space.grants.contains(&hash)
+            {
+                return Err(AuthorizationError::Revoked);
             }
             self.historical_root(&g.issued_under)?;
             if index == 0 {
@@ -2395,10 +2397,9 @@ impl VerifiedPolicySet {
                 )?;
                 if let (Actor::Account(_), Grantee::Actor(Actor::Service(_))) =
                     (&signer, &g.grantee)
+                    && initiating.is_none()
                 {
-                    if initiating.is_none() {
-                        initiating = Some((signer, hash.clone()));
-                    }
+                    initiating = Some((signer, hash.clone()));
                 }
             }
             hashes.push(hash);
@@ -2543,6 +2544,7 @@ impl VerifiedPolicySet {
             phase,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn verify_signed_invocation_body(
         &self,
         signed: &Signed<Invocation>,
@@ -2589,6 +2591,7 @@ impl VerifiedPolicySet {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn verify_authorized_invocation_body(
         &self,
         signed: &Signed<Invocation>,
@@ -2893,25 +2896,25 @@ impl VerifiedPolicySet {
                     RequestOrigin::Existing(transport.clone())
                 }
                 InvocationTransport::DirectedGateway { proof, original } => {
-                    RequestOrigin::Gateway(OriginalGatewayTransport {
+                    RequestOrigin::Gateway(Box::new(OriginalGatewayTransport {
                         header: proof.header().clone(),
                         original: AcceptedGatewayOriginal::Full(original.clone()),
-                    })
+                    }))
                 }
                 InvocationTransport::GatewayTranscript { header, original } => {
-                    RequestOrigin::Gateway(OriginalGatewayTransport {
+                    RequestOrigin::Gateway(Box::new(OriginalGatewayTransport {
                         header: header.clone(),
                         original: AcceptedGatewayOriginal::Full(original.clone()),
-                    })
+                    }))
                 }
                 InvocationTransport::OriginalGateway(original) => {
-                    RequestOrigin::Gateway(original.clone())
+                    RequestOrigin::Gateway(Box::new(original.clone()))
                 }
                 InvocationTransport::CompactSdkParent { header, invocation } => {
-                    RequestOrigin::Gateway(OriginalGatewayTransport {
+                    RequestOrigin::Gateway(Box::new(OriginalGatewayTransport {
                         header: header.clone(),
                         original: AcceptedGatewayOriginal::SdkParent(invocation.clone()),
-                    })
+                    }))
                 }
                 InvocationTransport::PortableIntent => RequestOrigin::PortableIntent,
             },
@@ -3188,6 +3191,7 @@ fn space_stamp(signed: &Signed<SpaceDocument>) -> Result<PolicyStamp> {
         head: signed.hash()?,
     })
 }
+#[allow(clippy::too_many_arguments)]
 fn validate_root_transition(
     issuer: &PublicKey,
     old_root: &PublicKey,
@@ -5756,10 +5760,10 @@ impl VerifiedPolicySet {
         budget: &mut Budget,
     ) -> Result<()> {
         let d = &signed.payload;
-        if let Some(proof) = &d.device_enrollment {
-            if previous.device_enrollment.as_ref() != Some(proof) {
-                return enrollment::authorize_passkey_delta(self, signed, previous, at, budget);
-            }
+        if let Some(proof) = &d.device_enrollment
+            && previous.device_enrollment.as_ref() != Some(proof)
+        {
+            return enrollment::authorize_passkey_delta(self, signed, previous, at, budget);
         }
         self.authorize_authenticator_delta(signed, previous, at, budget)?;
         let device = DeviceId::from_key(&signed.issuer);
@@ -5898,6 +5902,7 @@ impl VerifiedPolicySet {
             "account device changed root-controlled policy",
         )
     }
+    #[allow(clippy::too_many_arguments)]
     fn governance_capability(
         &self,
         hash: &ObjectHash,
@@ -6122,6 +6127,7 @@ pub struct PolicyPin {
     rename_all = "snake_case",
     deny_unknown_fields
 )]
+#[allow(clippy::large_enum_variant)]
 pub enum JournalEntry {
     AccountGenesis(Signed<AccountDocument>),
     Account(Signed<AccountDocument>),
@@ -6212,6 +6218,7 @@ fn verify_client_policy_state(
     verify_client_policy_state_selected(state, bundle, pins, account, space, key, None, now_ms)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_client_policy_state_selected(
     state: VerifiedPolicySet,
     bundle: &ClientAuthorizationBundle,
@@ -6770,6 +6777,7 @@ pub fn sign_client_invocation(
 
 /// The Gateway key comes from the saved, independently pinned Noise connection.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = signForwardedClientInvocation))]
+#[allow(clippy::too_many_arguments)]
 pub fn sign_forwarded_client_invocation(
     auth: &VerifiedClientAuthorization,
     template_json: &str,
@@ -6799,6 +6807,7 @@ pub fn sign_forwarded_client_invocation(
     .map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_client_invocation_inner(
     auth: &VerifiedClientAuthorization,
     json: &str,
@@ -6843,6 +6852,7 @@ fn sign_client_invocation_inner(
         .map_err(|_| AuthorizationError::InvalidProof("client invocation encoding failed"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn validate_client_invocation_fields(
     auth: &VerifiedClientAuthorization,
     invocation: &Invocation,

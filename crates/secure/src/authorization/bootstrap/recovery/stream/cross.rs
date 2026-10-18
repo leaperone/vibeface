@@ -351,6 +351,7 @@ pub fn sign_cross_node_recovery_source_possession_in_state(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn sign_cross_node_recovery_source_possession_with_source_proof(
     possession: &StreamedCrossNodeRecoveryPossessionRequest,
     read: &RecoveryReadRequest,
@@ -374,6 +375,7 @@ pub fn sign_cross_node_recovery_source_possession_with_source_proof(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign_source_possession_cached(
     possession: &StreamedCrossNodeRecoveryPossessionRequest,
     read: &RecoveryReadRequest,
@@ -407,6 +409,7 @@ fn sign_source_possession_cached(
     Ok(proof)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn approve_cross_node_recovery_source_proposal(
     possession: &StreamedCrossNodeRecoveryPossessionRequest,
     read: &RecoveryReadRequest,
@@ -670,6 +673,7 @@ fn verify_stream_commit_after_local_approval(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_cross_node_recovery_stream_commit_with_source_approval(
     input: &StreamedCrossNodeRecoveryCommitRequest,
     read: &RecoveryReadRequest,
@@ -754,6 +758,7 @@ pub fn verify_cross_node_recovery_stream_commit_in_state(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_cross_node_recovery_stream_commit_with_source_proof(
     input: &StreamedCrossNodeRecoveryCommitRequest,
     read: &RecoveryReadRequest,
@@ -777,6 +782,7 @@ pub fn verify_cross_node_recovery_stream_commit_with_source_proof(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_stream_commit_cached(
     input: &StreamedCrossNodeRecoveryCommitRequest,
     read: &RecoveryReadRequest,

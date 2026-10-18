@@ -247,6 +247,7 @@ pub(crate) struct EnrollmentPolicyImport {
 }
 
 impl EnrollmentPolicyImport {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         descriptor: EnrollmentPolicyDescriptor,
         credential_hash: &ObjectHash,
