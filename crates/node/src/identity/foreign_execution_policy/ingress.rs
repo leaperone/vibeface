@@ -269,6 +269,7 @@ impl Store {
         )?;
         let trust = super::trust_for_read_in(
             &tx,
+            &self.policy,
             identity,
             &input.request.intent,
             input.approval_ref.as_ref(),
@@ -358,6 +359,7 @@ impl Store {
             current_source_in(&tx, &self.policy, identity, principal, &request.intent, now)?;
         super::trust_for_read_in(
             &tx,
+            &self.policy,
             identity,
             &request.intent,
             Some(&saved.approval_ref),
@@ -441,6 +443,7 @@ impl Store {
             current_source_in(&tx, &self.policy, identity, principal, &request.intent, now)?;
         super::trust_for_read_in(
             &tx,
+            &self.policy,
             identity,
             &request.intent,
             Some(&saved.approval_ref),

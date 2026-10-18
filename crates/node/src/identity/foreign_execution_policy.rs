@@ -32,7 +32,8 @@ mod provenance;
 pub(crate) use provenance::{
     TaskExecutionPolicyProvenance, bind_task_execution_policy_in, check_task_policy_heads_in,
     current_task_execution_policy_in, original_task_execution_policy_in,
-    rehydrate_task_execution_policy_in, validate_task_execution_policy_links_in,
+    rehydrate_task_execution_policy_in, task_policy_for_binding_in,
+    validate_task_execution_policy_links_in,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -83,7 +84,9 @@ fn retained_binding_in(
 
 fn binding_association_in(
     connection: &Connection,
+    primary: &super::journal::PolicyState,
     binding: &SignedBinding,
+    usage: &mut ExecutionProofUsage,
 ) -> Result<AdmissionAssociation> {
     let reference: ObjectHash = read_in(connection, &binding_association_key(binding)?)?
         .context("NeedPolicySync: current binding has no immutable foreign policy association")?;
@@ -109,6 +112,23 @@ fn binding_association_in(
             ),
         "foreign policy association differs from its original accepted binding admission"
     );
+    let policy = primary
+        .task_execution_policy
+        .current
+        .get(&association.policy_ref)
+        .context("NeedPolicySync: binding policy has no genuine original provenance")?;
+    ensure!(
+        policy.trust().approval().hash()? == association.approval_ref,
+        "foreign binding association changed its actual approved roots or writer"
+    );
+    let original = provenance::original_task_execution_policy_in(
+        connection,
+        primary,
+        policy.request().source_node(),
+        &proof,
+    )?
+    .context("foreign binding association has no original verified admission")?;
+    usage.merge(original.proof_usage());
     Ok(association)
 }
 
@@ -188,6 +208,7 @@ fn check_read_trust(
 
 fn trust_for_read_in(
     connection: &Connection,
+    primary: &super::journal::PolicyState,
     identity: &LocalIdentity,
     intent: &Signed<RemoteExecutionPolicyReadIntent>,
     supplied: Option<&ObjectHash>,
@@ -206,9 +227,11 @@ fn trust_for_read_in(
     } else {
         binding_association_in(
             connection,
+            primary,
             binding
                 .as_ref()
                 .context("foreign read has no original binding")?,
+            usage,
         )?
         .approval_ref
     };
@@ -367,16 +390,7 @@ impl Store {
         }
         let binding = read_binding_in(&tx, identity, &intent, &mut usage)?;
         let output = if let Some(binding) = &binding {
-            let association = binding_association_in(&tx, binding)?;
-            let proof = super::admission::load_admission_in(
-                &tx,
-                &binding.binding.network_id,
-                &association.authorization_id,
-            )?;
-            let original =
-                provenance::original_task_execution_policy_in(&tx, &self.policy, &local, &proof)?
-                    .context("NeedPolicySync: bound Task has no original verified foreign policy")?;
-            usage.merge(original.proof_usage());
+            let association = binding_association_in(&tx, &self.policy, binding, &mut usage)?;
             let trust = load_task_execution_trust_in(&tx, &local, &association.approval_ref)?;
             usage.record_signed(trust.original_intent())?;
             usage.record_signed(trust.approval())?;

@@ -183,6 +183,94 @@ fn remote_body(body: &Value) -> bool {
         .any(|field| body.get(*field).is_some())
 }
 
+pub(crate) fn task_policy_for_binding_in(
+    connection: &Connection,
+    primary: &super::super::journal::PolicyState,
+    source: &PublicKey,
+    binding: &SignedBinding,
+    project: &vibeface_secure::authorization::ResourceRef,
+    selection: &vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicySelection,
+    action: Action,
+    now: u64,
+) -> Result<VerifiedTaskCurrentPolicy> {
+    let hash = crate::binding::binding_hash(&binding.binding)?;
+    ensure!(
+        binding.binding.network_id == project.space.as_str()
+            && retained_binding_in(connection, project.space.as_str(), &hash, source)? == *binding,
+        "Task policy lookup changed its exact persisted binding"
+    );
+    let current: String = connection.query_row(
+        "SELECT value FROM local_values WHERE space_id=? AND key=?",
+        params![
+            project.space.as_str(),
+            format!("task-binding-current:{}", binding.binding.task_ref)
+        ],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        serde_json::from_str::<String>(&current)? == hash,
+        "Task policy lookup requires the actual current binding"
+    );
+    let encoded: String = connection.query_row("SELECT envelope FROM events WHERE space_id=? AND hash=? AND resource_id=? AND status='ready' AND length(CAST(envelope AS BLOB))<=?",
+        params![project.space.as_str(),binding.binding.task_ref,project.resource.as_str(),crate::model::MAX_EVENT_BYTES*6+1024],|row|row.get(0))?;
+    let task: crate::model::SignedEvent = serde_json::from_str(&encoded)?;
+    let event = crate::crypto::verify_signed_event(project.space.as_str(), &task, source.as_str())?;
+    ensure!(
+        task.hash == binding.binding.task_ref
+            && event.scope_id == binding.binding.conversation_id
+            && matches!(&event.body,crate::model::EventBody::TaskCreated{task_id,..} if task_id==&binding.binding.task_id),
+        "Task policy lookup changed its original ready Task"
+    );
+    super::super::event_authorization::validate_retained_event_dependencies_in(connection, &task)?;
+    let mut usage = ExecutionProofUsage::default();
+    usage.record_retained_event(&task)?;
+    usage.record_binding(binding)?;
+    let association = binding_association_in(connection, primary, binding, &mut usage)?;
+    let mut selected: Option<VerifiedTaskCurrentPolicy> = None;
+    for policy in primary.task_execution_policy.current.values() {
+        let context = policy.context();
+        if policy.request().source_node() != source
+            || policy.request().source_project() != project
+            || policy.request().expected_action() != action
+            || policy.selection() != selection
+            || policy.trust().approval().hash()? != association.approval_ref
+            || context.binding_generation != Some(binding.binding.generation)
+            || context.context.task.as_ref().map(|task| task.as_str())
+                != Some(binding.binding.task_ref.as_str())
+            || context.context.conversation.as_deref()
+                != Some(binding.binding.conversation_id.as_str())
+            || context
+                .context
+                .execution_session
+                .as_ref()
+                .map(|session| session.session_id.as_str())
+                != Some(binding.binding.session_id.as_str())
+            || context.context.executor_kind.as_deref()
+                != binding.binding.open_spec["executor"].as_str()
+            || context.canonical_cwd.as_deref() != binding.binding.open_spec["cwd"].as_str()
+            || now >= policy.expires_at_ms()
+            || now < policy.snapshot().payload.issued_at_ms
+            || now < policy.witness().payload.issued_at_ms
+        {
+            continue;
+        }
+        if check_task_policy_heads_in(connection, policy).is_err() {
+            continue;
+        }
+        if selected.as_ref().is_none_or(|prior| {
+            policy.snapshot().payload.issued_at_ms > prior.snapshot().payload.issued_at_ms
+        }) {
+            selected = Some(policy.clone());
+        }
+    }
+    let selected = selected.context(
+        "NeedPolicySync: current binding has no completed foreign policy for this exact action",
+    )?;
+    usage.merge(selected.proof_usage());
+    usage.enforce_limits()?;
+    Ok(selected)
+}
+
 fn facts(invocation: &Signed<Invocation>, body: &Value) -> Result<RequestFacts> {
     let value = &invocation.payload;
     ensure!(
@@ -236,6 +324,7 @@ pub(crate) fn current_task_execution_policy_in(
         let mut usage = ExecutionProofUsage::default();
         let trust = trust_for_read_in(
             connection,
+            primary,
             identity,
             &reader.intent,
             Some(&policy.trust().approval().hash()?),
