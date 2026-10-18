@@ -11,8 +11,7 @@ use super::*;
 pub use checkpoint::RecoveryPolicyCheckpoint;
 pub(crate) use checkpoint::{
     checkpoint_recovery_material_in_state, compact_recovery_material,
-    compact_recovery_material_in_state, material_state,
-    recovery_material_usage,
+    compact_recovery_material_in_state, material_state, recovery_material_usage,
 };
 use zeroize::Zeroize;
 
@@ -63,6 +62,8 @@ pub struct PreparedAccountRecovery {
     request: RecoveryNodeRequest,
     pins: Vec<PolicyPin>,
     journal: Vec<JournalEntry>,
+    before_state: VerifiedPolicySet,
+    verified_context: Option<stream::VerifiedRecoveryPolicyContext>,
     client_certificate: Signed<DeviceCertificate>,
     space_document: SpaceDocument,
     owner_grant: Signed<Grant>,
@@ -315,6 +316,62 @@ fn revoke_devices(
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = prepareAccountRecovery))]
 pub fn prepare_account_recovery(
     material_json: &str,
+    context: &stream::VerifiedRecoveryPolicyContext,
+    next_root: &Identity,
+    next_client: &Identity,
+    certificate_expires_at_ms: f64,
+    now_ms: f64,
+) -> crate::Result<PreparedAccountRecovery> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
+    let prepare = || -> Result<PreparedAccountRecovery> {
+        let material = read_material(material_json)?;
+        let recovery = validate_material(&material)?;
+        let now = timestamp(now_ms)?;
+        let read = context.request();
+        require(
+            read.kind() == stream::RecoveryContextKind::Account
+                && read.account() == &material.scope.account_id
+                && read.space() == &material.scope.space_id
+                && read.saved_pins() == material.pins
+                && read.source_node_public_key() == &material.entry.node_public_key
+                && read.new_device_public_key() == &PublicKey::of(next_client),
+            "recovery context changed the saved material or new client",
+        )?;
+        validate_recovery_context_current(context, now)?;
+        let mut prepared = prepare_account_recovery_in_state(
+            &material,
+            &recovery,
+            context.verified_state().clone(),
+            context.policy().pins(),
+            context.policy().journal(),
+            next_root,
+            next_client,
+            &context.snapshot().payload.claim,
+            timestamp(certificate_expires_at_ms)?,
+            now,
+            None,
+        )?;
+        prepared.verified_context = Some(context.clone());
+        Ok(prepared)
+    };
+    prepare().map_err(|error| error.to_string())
+}
+
+fn validate_recovery_context_current(
+    context: &stream::VerifiedRecoveryPolicyContext,
+    now: u64,
+) -> Result<()> {
+    let snapshot = &context.snapshot().payload;
+    validate_window(snapshot.issued_at_ms, snapshot.expires_at_ms, now)?;
+    let witness = &context.witness().payload;
+    validate_window(witness.issued_at_ms, witness.expires_at_ms, now)?;
+    let read = context.request();
+    read.verify(context.verified_state(), read.source_node_public_key(), now)
+}
+
+#[cfg(test)]
+pub(super) fn prepare_account_recovery_from_bundle(
+    material_json: &str,
     latest_bundle_json: &str,
     next_root: &Identity,
     next_client: &Identity,
@@ -344,234 +401,268 @@ fn prepare_account_recovery_preserving_source(
     now_ms: f64,
     preserved_source: Option<&ServiceId>,
 ) -> crate::Result<PreparedAccountRecovery> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
     let prepare = || -> Result<PreparedAccountRecovery> {
         let material = read_material(material_json)?;
         let recovery = validate_material(&material)?;
         let now_ms = timestamp(now_ms)?;
         let expires_at_ms = timestamp(certificate_expires_at_ms)?;
-        validate_window(now_ms, expires_at_ms, now_ms)?;
-        let node_key = claim.claim.payload.node_public_key.clone();
-        validate_claim(
-            &claim.claim,
-            &node_key,
-            &claim.claim.payload.claim_nonce,
-            now_ms,
-        )?;
         let latest = read_bundle(latest_bundle_json)?;
         require(
             latest.journal.len() <= 118,
             "recovery journal requires checkpoint",
         )?;
-        let mut state = replay_policies(&material.pins, &latest.journal)?;
-        let account = state
-            .account(&material.scope.account_id)
-            .ok_or(AuthorizationError::InvalidProof(
-                "missing current recovery account",
-            ))?
-            .clone();
-        let space = state
-            .space(&material.scope.space_id)
-            .ok_or(AuthorizationError::InvalidProof(
-                "missing current personal space",
-            ))?
-            .clone();
-        require(
-            space.root
-                == SpaceRoot::Personal {
-                    owner: material.scope.account_id.clone(),
-                    genesis_root: account.genesis_root.clone(),
-                }
-                && account.recovery.threshold == 1
-                && account.recovery.keys == [PublicKey::of(&recovery)],
-            "recovery key is no longer current",
-        )?;
-        let root_key = PublicKey::of(next_root);
-        let client_key = PublicKey::of(next_client);
-        require(
-            BTreeSet::from([
-                root_key.clone(),
-                client_key.clone(),
-                node_key.clone(),
-                PublicKey::of(&recovery),
-            ])
-            .len()
-                == 4
-                && state
-                    .account_history(&account.account)
-                    .is_some_and(|history| {
-                        history.iter().all(|a| {
-                            a.payload.current_root != root_key
-                                && a.payload.current_root != client_key
-                        })
-                    })
-                && !state.devices.values().any(|c| {
-                    c.payload.public_key == client_key || c.payload.public_key == root_key
-                }),
-            "recovery requires independent new root and client keys",
-        )?;
-        let expected_account_head = state
-            .head(&PolicyDomain::Account(account.account.clone()))
-            .cloned()
-            .ok_or(AuthorizationError::PolicyConflict)?;
-        let expected_space_head = state
-            .head(&PolicyDomain::Space(space.space.clone()))
-            .cloned()
-            .ok_or(AuthorizationError::PolicyConflict)?;
-        let authority = AuthorityBinding::from_key(node_key.clone());
-        let mut recovered = account.clone();
-        recovered.previous = Some(expected_account_head.clone());
-        recovered.authority_epoch = account
-            .authority_epoch
-            .checked_add(1)
-            .ok_or(AuthorizationError::PolicyConflict)?;
-        recovered.sequence = 0;
-        recovered.current_root = root_key.clone();
-        recovered.root_generation = account
-            .root_generation
-            .checked_add(1)
-            .ok_or(AuthorizationError::PolicyConflict)?;
-        recovered.authority = authority.clone();
-        recovered.devices = revoke_devices(
-            &state,
-            &account.devices,
-            &mut recovered.revoked_devices,
-            preserved_source.or(Some(&authority.service)),
-        )?;
-        recovered.enrollment.clear();
-        recovered.authenticators.clear();
-        recovered.authenticator_approval = None;
-        recovered.device_enrollment = None;
-        recovered.root_acceptance = None;
-        recovered.recovery_approvals.clear();
-        recovered.approve_recovery(&recovery)?;
-        recovered.accept_root(next_root)?;
-        let account_recovery = Signed::sign(recovered, &recovery)?;
-        let recovered_head = state.install_account(account_recovery.clone())?;
-        let certificate = |key: PublicKey, subject, uses, nonce| DeviceCertificate {
-            version: AUTH_VERSION,
-            owner: PolicyDomain::Account(account.account.clone()),
-            subject,
-            device: DeviceId::from_key(&key),
-            public_key: key,
-            uses,
-            possession: None,
-            enrollment_grant: None,
-            issued_under: recovered_head.clone(),
-            nonce,
-            not_before_ms: now_ms,
-            expires_at_ms,
-        };
-        let mut client_certificate = certificate(
-            client_key,
-            Actor::Account(account.account.clone()),
-            vec![
-                DeviceUse::Noise,
-                DeviceUse::AccountInvocation,
-                DeviceUse::EnrollDevice,
-            ],
-            Nonce::random()?,
-        );
-        client_certificate.prove_possession(next_client)?;
-        let client_certificate = Signed::sign(client_certificate, next_root)?;
-        state.install_device(client_certificate.clone(), now_ms)?;
-        let node_certificate = certificate(
-            node_key,
-            Actor::Service(authority.service.clone()),
-            vec![DeviceUse::Noise, DeviceUse::ServiceInvocation],
-            claim.claim.payload.claim_nonce.clone(),
-        );
-        let mut space_document = space.clone();
-        space_document.previous = Some(expected_space_head.clone());
-        space_document.authority_epoch = space
-            .authority_epoch
-            .checked_add(1)
-            .ok_or(AuthorizationError::PolicyConflict)?;
-        space_document.sequence = 0;
-        space_document.current_root = root_key;
-        space_document.root_generation = account_recovery.payload.root_generation;
-        space_document.authority = authority;
-        space_document.recovery = account_recovery.payload.recovery.clone();
-        space_document.devices = revoke_devices(
-            &state,
-            &space.devices,
-            &mut space_document.revoked_devices,
-            preserved_source,
-        )?;
-        space_document.grants.clear();
-        space_document.memberships.clear();
-        space_document.governance_grant = None;
-        space_document.root_acceptance = None;
-        space_document.recovery_approvals.clear();
-        let has_project = space
-            .resources
-            .iter()
-            .filter_map(|hash| state.resources.get(hash))
-            .any(|record| {
-                record.payload.kind == ResourceKind::Project
-                    && record.payload.host == space_document.authority.service
-            });
-        let new_project = if has_project {
-            None
-        } else {
-            Some((ResourceId::random()?, Nonce::random()?))
-        };
-        let selected_project = new_project
-            .as_ref()
-            .map(|(id, _)| id.clone())
-            .or_else(|| {
-                space
-                    .resources
-                    .iter()
-                    .filter_map(|h| state.resources.get(h))
-                    .find(|r| {
-                        r.payload.kind == ResourceKind::Project
-                            && r.payload.host == space_document.authority.service
-                    })
-                    .map(|r| r.payload.resource.clone())
-            })
-            .ok_or(AuthorizationError::InvalidProof("missing recovery project"))?;
-        let recovery_space_head = space_stamp(&Signed::sign(space_document.clone(), next_root)?)?;
-        let owner_grant = Signed::sign(
-            initial_owner_grant(
-                &account.account,
-                &space.space,
-                &Audience {
-                    service: space_document.authority.service.clone(),
-                    device: space_document.authority.device.clone(),
-                },
-                &recovery_space_head,
-                now_ms,
-                expires_at_ms,
-                Nonce::random()?,
-            ),
+        let state = replay_policies(&material.pins, &latest.journal)?;
+        prepare_account_recovery_in_state(
+            &material,
+            &recovery,
+            state,
+            &material.pins,
+            &latest.journal,
             next_root,
-        )?;
-        let service_grant = initial_service_grant(&owner_grant, &selected_project, next_client)?;
-        Ok(PreparedAccountRecovery {
-            request: RecoveryNodeRequest {
-                claim: claim.claim.clone(),
-                expected_account_head,
-                expected_space_head,
-                account_recovery,
-                node_certificate,
-            },
-            pins: material.pins.clone(),
-            journal: latest.journal,
-            client_certificate,
-            space_document,
-            owner_grant,
-            service_grant,
-            new_project,
-        })
+            next_client,
+            &claim.claim,
+            expires_at_ms,
+            now_ms,
+            preserved_source,
+        )
     };
     prepare().map_err(|e| e.to_string())
+}
+
+fn prepare_account_recovery_in_state(
+    material: &RecoveryMaterial,
+    recovery: &Identity,
+    before_state: VerifiedPolicySet,
+    pins: &[PolicyPin],
+    journal: &[JournalEntry],
+    next_root: &Identity,
+    next_client: &Identity,
+    claim: &Signed<NodeClaim>,
+    expires_at_ms: u64,
+    now_ms: u64,
+    preserved_source: Option<&ServiceId>,
+) -> Result<PreparedAccountRecovery> {
+    validate_window(now_ms, expires_at_ms, now_ms)?;
+    let node_key = claim.payload.node_public_key.clone();
+    validate_claim(claim, &node_key, &claim.payload.claim_nonce, now_ms)?;
+    let mut state = before_state.clone();
+    let account = state
+        .account(&material.scope.account_id)
+        .ok_or(AuthorizationError::InvalidProof(
+            "missing current recovery account",
+        ))?
+        .clone();
+    let space = state
+        .space(&material.scope.space_id)
+        .ok_or(AuthorizationError::InvalidProof(
+            "missing current personal space",
+        ))?
+        .clone();
+    require(
+        space.root
+            == SpaceRoot::Personal {
+                owner: material.scope.account_id.clone(),
+                genesis_root: account.genesis_root.clone(),
+            }
+            && account.recovery.threshold == 1
+            && account.recovery.keys == [PublicKey::of(recovery)],
+        "recovery key is no longer current",
+    )?;
+    let root_key = PublicKey::of(next_root);
+    let client_key = PublicKey::of(next_client);
+    require(
+        BTreeSet::from([
+            root_key.clone(),
+            client_key.clone(),
+            node_key.clone(),
+            PublicKey::of(recovery),
+        ])
+        .len()
+            == 4
+            && state
+                .account_history(&account.account)
+                .is_some_and(|history| {
+                    history.iter().all(|a| {
+                        a.payload.current_root != root_key && a.payload.current_root != client_key
+                    })
+                })
+            && !state
+                .devices
+                .values()
+                .any(|c| c.payload.public_key == client_key || c.payload.public_key == root_key),
+        "recovery requires independent new root and client keys",
+    )?;
+    let expected_account_head = state
+        .head(&PolicyDomain::Account(account.account.clone()))
+        .cloned()
+        .ok_or(AuthorizationError::PolicyConflict)?;
+    let expected_space_head = state
+        .head(&PolicyDomain::Space(space.space.clone()))
+        .cloned()
+        .ok_or(AuthorizationError::PolicyConflict)?;
+    let authority = AuthorityBinding::from_key(node_key.clone());
+    let mut recovered = account.clone();
+    recovered.previous = Some(expected_account_head.clone());
+    recovered.authority_epoch = account
+        .authority_epoch
+        .checked_add(1)
+        .ok_or(AuthorizationError::PolicyConflict)?;
+    recovered.sequence = 0;
+    recovered.current_root = root_key.clone();
+    recovered.root_generation = account
+        .root_generation
+        .checked_add(1)
+        .ok_or(AuthorizationError::PolicyConflict)?;
+    recovered.authority = authority.clone();
+    recovered.devices = revoke_devices(
+        &state,
+        &account.devices,
+        &mut recovered.revoked_devices,
+        preserved_source.or(Some(&authority.service)),
+    )?;
+    recovered.enrollment.clear();
+    recovered.authenticators.clear();
+    recovered.authenticator_approval = None;
+    recovered.device_enrollment = None;
+    recovered.root_acceptance = None;
+    recovered.recovery_approvals.clear();
+    recovered.approve_recovery(recovery)?;
+    recovered.accept_root(next_root)?;
+    let account_recovery = Signed::sign(recovered, recovery)?;
+    let recovered_head = state.install_account(account_recovery.clone())?;
+    let certificate = |key: PublicKey, subject, uses, nonce| DeviceCertificate {
+        version: AUTH_VERSION,
+        owner: PolicyDomain::Account(account.account.clone()),
+        subject,
+        device: DeviceId::from_key(&key),
+        public_key: key,
+        uses,
+        possession: None,
+        enrollment_grant: None,
+        issued_under: recovered_head.clone(),
+        nonce,
+        not_before_ms: now_ms,
+        expires_at_ms,
+    };
+    let mut client_certificate = certificate(
+        client_key,
+        Actor::Account(account.account.clone()),
+        vec![
+            DeviceUse::Noise,
+            DeviceUse::AccountInvocation,
+            DeviceUse::EnrollDevice,
+        ],
+        Nonce::random()?,
+    );
+    client_certificate.prove_possession(next_client)?;
+    let client_certificate = Signed::sign(client_certificate, next_root)?;
+    state.install_device(client_certificate.clone(), now_ms)?;
+    let node_certificate = certificate(
+        node_key,
+        Actor::Service(authority.service.clone()),
+        vec![DeviceUse::Noise, DeviceUse::ServiceInvocation],
+        claim.payload.claim_nonce.clone(),
+    );
+    let mut space_document = space.clone();
+    space_document.previous = Some(expected_space_head.clone());
+    space_document.authority_epoch = space
+        .authority_epoch
+        .checked_add(1)
+        .ok_or(AuthorizationError::PolicyConflict)?;
+    space_document.sequence = 0;
+    space_document.current_root = root_key;
+    space_document.root_generation = account_recovery.payload.root_generation;
+    space_document.authority = authority;
+    space_document.recovery = account_recovery.payload.recovery.clone();
+    space_document.devices = revoke_devices(
+        &state,
+        &space.devices,
+        &mut space_document.revoked_devices,
+        preserved_source,
+    )?;
+    space_document.grants.clear();
+    space_document.memberships.clear();
+    space_document.governance_grant = None;
+    space_document.root_acceptance = None;
+    space_document.recovery_approvals.clear();
+    let has_project = space
+        .resources
+        .iter()
+        .filter_map(|hash| state.resources.get(hash))
+        .any(|record| {
+            record.payload.kind == ResourceKind::Project
+                && record.payload.host == space_document.authority.service
+        });
+    let new_project = if has_project {
+        None
+    } else {
+        Some((ResourceId::random()?, Nonce::random()?))
+    };
+    let selected_project = new_project
+        .as_ref()
+        .map(|(id, _)| id.clone())
+        .or_else(|| {
+            space
+                .resources
+                .iter()
+                .filter_map(|h| state.resources.get(h))
+                .find(|r| {
+                    r.payload.kind == ResourceKind::Project
+                        && r.payload.host == space_document.authority.service
+                })
+                .map(|r| r.payload.resource.clone())
+        })
+        .ok_or(AuthorizationError::InvalidProof("missing recovery project"))?;
+    let recovery_space_head = space_stamp(&Signed::sign(space_document.clone(), next_root)?)?;
+    let owner_grant = Signed::sign(
+        initial_owner_grant(
+            &account.account,
+            &space.space,
+            &Audience {
+                service: space_document.authority.service.clone(),
+                device: space_document.authority.device.clone(),
+            },
+            &recovery_space_head,
+            now_ms,
+            expires_at_ms,
+            Nonce::random()?,
+        ),
+        next_root,
+    )?;
+    let service_grant = initial_service_grant(&owner_grant, &selected_project, next_client)?;
+    Ok(PreparedAccountRecovery {
+        request: RecoveryNodeRequest {
+            claim: claim.clone(),
+            expected_account_head,
+            expected_space_head,
+            account_recovery,
+            node_certificate,
+        },
+        pins: pins.to_vec(),
+        journal: journal.to_vec(),
+        before_state,
+        verified_context: None,
+        client_certificate,
+        space_document,
+        owner_grant,
+        service_grant,
+        new_project,
+    })
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl PreparedAccountRecovery {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = nodeRequestJson))]
     pub fn node_request_json(&self) -> crate::Result<String> {
-        encode(&self.request)
+        if let Some(context) = &self.verified_context {
+            encode(&stream::StreamedRecoveryNodeRequest {
+                context: context.reference().map_err(|error| error.to_string())?,
+                request: self.request.clone(),
+            })
+        } else {
+            encode(&self.request)
+        }
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = commitJson))]
@@ -584,11 +675,24 @@ impl PreparedAccountRecovery {
                     ))
                 && recovered.authorization.scope.account_id
                     == self.request.account_recovery.payload.account
+                && recovered.authorization.scope.space_id == self.space_document.space
                 && recovered.authorization.scope.device_id
                     == self.client_certificate.payload.device,
             "recovery result belongs to another proposal",
         )
         .map_err(|e| e.to_string())?;
+        if let Some(context) = &self.verified_context {
+            return encode(&stream::StreamedRecoveryCommitRequest {
+                context: context.reference().map_err(|error| error.to_string())?,
+                request_hash: ObjectHash::body(&self.request).map_err(|error| error.to_string())?,
+                expected_account_head: self.request.expected_account_head.clone(),
+                expected_space_head: self.request.expected_space_head.clone(),
+                journal_delta: recovered.bundle.journal[self.journal.len()..].to_vec(),
+                grant_leaf: recovered.bundle.grant_leaf.clone(),
+                new_device_public_key: self.client_certificate.payload.public_key.clone(),
+                claim_nonce: self.request.claim.payload.claim_nonce.clone(),
+            });
+        }
         encode(&RecoveryCommit {
             expected_account_head: &self.request.expected_account_head,
             expected_space_head: &self.request.expected_space_head,
@@ -681,8 +785,12 @@ pub fn finish_account_recovery(
     node_possession_signature: &str,
     now_ms: f64,
 ) -> crate::Result<CreatedAccount> {
-    let finish = || -> Result<(ClientAuthorizationBundle, Vec<PolicyPin>)> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
+    let finish = || -> Result<CreatedAccount> {
         let now_ms = timestamp(now_ms)?;
+        if let Some(context) = &prepared.verified_context {
+            validate_recovery_context_current(context, now_ms)?;
+        }
         require(
             PublicKey::of(next_root) == prepared.request.account_recovery.payload.current_root,
             "recovery root changed",
@@ -693,7 +801,7 @@ pub fn finish_account_recovery(
             &prepared.request.node_certificate.nonce,
             now_ms,
         )?;
-        let mut state = replay_policies(&prepared.pins, &prepared.journal)?;
+        let mut state = prepared.before_state.clone();
         let account_head = state.install_account(prepared.request.account_recovery.clone())?;
         let client_hash = state.install_device(prepared.client_certificate.clone(), now_ms)?;
         let mut node_certificate = prepared.request.node_certificate.clone();
@@ -774,45 +882,52 @@ pub fn finish_account_recovery(
                 pin.minimum_head = Some(space_head.clone());
             }
         }
-        let mut journal = prepared.journal.clone();
-        journal.extend([
+        let mut delta = vec![
             JournalEntry::Account(prepared.request.account_recovery.clone()),
             JournalEntry::Device(prepared.client_certificate.clone()),
             JournalEntry::Device(node_certificate),
             JournalEntry::Account(account),
             JournalEntry::Space(space_recovery),
-        ]);
+        ];
         if let Some(record) = new_resource {
-            journal.push(JournalEntry::Resource(record));
+            delta.push(JournalEntry::Resource(record));
         }
-        journal.extend([
+        delta.extend([
             JournalEntry::Grant(grant),
             JournalEntry::Space(space_document),
             JournalEntry::Grant(prepared.service_grant.clone()),
             JournalEntry::Space(service_document),
         ]);
-        Ok((
-            ClientAuthorizationBundle {
-                journal,
-                grant_leaf,
-            },
+        let mut journal = prepared.journal.clone();
+        journal.extend(delta.iter().cloned());
+        let bundle = ClientAuthorizationBundle {
+            journal,
+            grant_leaf,
+        };
+        let mut authorization = verify_client_policy_state(
+            state,
+            &bundle,
+            &pins,
+            prepared.request.account_recovery.payload.account.clone(),
+            prepared.space_document.space.clone(),
+            prepared.client_certificate.payload.public_key.clone(),
+            now_ms,
+        )?;
+        if let Some(context) = &prepared.verified_context {
+            authorization.imported_snapshot = Some(
+                context
+                    .policy()
+                    .apply_delta(&delta)?
+                    .with_independent_pins(&pins)?,
+            );
+        }
+        Ok(CreatedAccount {
+            bundle,
             pins,
-        ))
+            authorization,
+        })
     };
-    let (bundle, pins) = finish().map_err(|e| e.to_string())?;
-    let authorization = verify_client_authorization(
-        &encode(&bundle)?,
-        &encode(&pins)?,
-        prepared.request.account_recovery.payload.account.as_str(),
-        prepared.space_document.space.as_str(),
-        prepared.client_certificate.payload.public_key.as_str(),
-        now_ms,
-    )?;
-    Ok(CreatedAccount {
-        bundle,
-        pins,
-        authorization,
-    })
+    finish().map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -932,7 +1047,7 @@ mod tests {
     }
 
     fn prepared(account: &CreatedAccount, node: u8) -> PreparedAccountRecovery {
-        prepare_account_recovery(
+        prepare_account_recovery_from_bundle(
             &material(account),
             &account.bundle_json().unwrap(),
             &key(5),
@@ -1154,7 +1269,7 @@ mod tests {
             }
             assert!(inspect_account_recovery_material(&m.to_string(), RESTORE).is_err());
             assert!(
-                prepare_account_recovery(
+                prepare_account_recovery_from_bundle(
                     &m.to_string(),
                     &original.bundle_json().unwrap(),
                     &key(5),
@@ -1167,7 +1282,7 @@ mod tests {
             );
         }
         assert!(
-            prepare_account_recovery(
+            prepare_account_recovery_from_bundle(
                 "{}",
                 &original.bundle_json().unwrap(),
                 &key(5),
@@ -1282,7 +1397,7 @@ mod tests {
         let mut latest = original.bundle.clone();
         latest.journal.push(JournalEntry::Account(signed));
         assert!(
-            prepare_account_recovery(
+            prepare_account_recovery_from_bundle(
                 &material(&original),
                 &encode(&latest).unwrap(),
                 &key(5),
@@ -1296,7 +1411,7 @@ mod tests {
         let mut rollback = original.bundle.clone();
         rollback.journal.pop();
         assert!(
-            prepare_account_recovery(
+            prepare_account_recovery_from_bundle(
                 &material(&original),
                 &encode(&rollback).unwrap(),
                 &key(5),
@@ -1333,7 +1448,7 @@ mod tests {
         let original = account();
         for (root, client) in [(1, 6), (3, 6), (5, 3), (5, 1), (5, 5), (2, 6), (5, 4)] {
             assert!(
-                prepare_account_recovery(
+                prepare_account_recovery_from_bundle(
                     &material(&original),
                     &original.bundle_json().unwrap(),
                     &key(root),
@@ -1818,7 +1933,7 @@ mod tests {
 
     #[test]
     fn cross_node_recovery_requires_live_source_cas_two_possessions_and_exact_read_only_history() {
-        use super::cross_node::*;
+        use super::cross_node::{CrossNodeRecoveryRequest, legacy::*};
         let mut original = account();
         let backup = material(&original);
         let mut source_state = replay_policies(&original.pins, &original.bundle.journal).unwrap();

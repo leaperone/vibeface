@@ -1,5 +1,124 @@
 use super::{execution_handoff::ExecutionProofUsage, *};
 
+#[derive(Clone, Debug)]
+pub(crate) struct CachedPolicyProof {
+    known: BTreeMap<ObjectHash, Vec<u8>>,
+    accepted: BTreeMap<ObjectHash, Vec<u8>>,
+}
+
+impl CachedPolicyProof {
+    pub(crate) fn require_signed<T: SignedObject>(&self, value: &Signed<T>) -> Result<()> {
+        let hash = value.hash()?;
+        let bytes = canonical(value)?;
+        require(
+            self.known.get(&hash) == Some(&bytes) && self.accepted.get(&hash) == Some(&bytes),
+            "source proof omitted or changed a verified prefix object",
+        )
+    }
+    pub(crate) fn from_verified_prefix(
+        state: &VerifiedPolicySet,
+        entries: &[JournalEntry],
+    ) -> Result<Self> {
+        let mut known = BTreeMap::new();
+        fn insert<T: SignedObject>(
+            index: &mut BTreeMap<ObjectHash, Vec<u8>>,
+            value: &Signed<T>,
+        ) -> Result<()> {
+            let hash = value.hash()?;
+            let bytes = canonical(value)?;
+            if let Some(old) = index.insert(hash, bytes.clone()) {
+                require(old == bytes, "verified prefix changed a same-hash object")?;
+            }
+            Ok(())
+        }
+        for account in state.accounts.values() {
+            for value in &account.history {
+                insert(&mut known, value)?;
+            }
+        }
+        for space in state.spaces.values() {
+            for value in &space.history {
+                insert(&mut known, value)?;
+            }
+        }
+        for value in state.devices.values() {
+            insert(&mut known, value)?;
+        }
+        for value in state.resources.values() {
+            insert(&mut known, value)?;
+        }
+        for value in state.authenticators.values() {
+            insert(&mut known, value)?;
+        }
+        for value in state.memberships.values() {
+            insert(&mut known, value)?;
+        }
+        for value in state.grants.values() {
+            insert(&mut known, value)?;
+        }
+        let mut accepted = BTreeMap::new();
+        fn accept<T: SignedObject>(
+            known: &BTreeMap<ObjectHash, Vec<u8>>,
+            accepted: &mut BTreeMap<ObjectHash, Vec<u8>>,
+            value: &Signed<T>,
+        ) -> Result<()> {
+            let hash = value.hash()?;
+            let bytes = canonical(value)?;
+            require(
+                known.get(&hash) == Some(&bytes),
+                "source prefix differs from locally verified object",
+            )?;
+            accepted.insert(hash, bytes);
+            Ok(())
+        }
+        for entry in entries {
+            let account = match entry {
+                JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => Some(value),
+                JournalEntry::AccountCommit(value) => Some(&value.proposal),
+                _ => None,
+            };
+            if let Some(value) = account {
+                accept(&known, &mut accepted, value)?;
+                if let Some(proof) = &value.payload.device_enrollment {
+                    accept(&known, &mut accepted, &proof.certificate)?;
+                }
+                continue;
+            }
+            match entry {
+                JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => {
+                    accept(&known, &mut accepted, value)?
+                }
+                JournalEntry::SpaceCommit(value) => accept(&known, &mut accepted, &value.proposal)?,
+                JournalEntry::Device(value) => accept(&known, &mut accepted, value)?,
+                JournalEntry::Resource(value) => accept(&known, &mut accepted, value)?,
+                JournalEntry::Authenticator(value) => accept(&known, &mut accepted, value)?,
+                JournalEntry::Membership(value) => accept(&known, &mut accepted, value)?,
+                JournalEntry::Grant(value) => accept(&known, &mut accepted, value)?,
+                _ => unreachable!(),
+            }
+        }
+        Ok(Self { known, accepted })
+    }
+
+    fn record<T: SignedObject>(
+        &self,
+        usage: &mut ExecutionProofUsage,
+        value: &Signed<T>,
+    ) -> Result<()> {
+        let hash = value.hash()?;
+        if let Some(known) = self.known.get(&hash) {
+            let bytes = canonical(value)?;
+            require(
+                known == &bytes && self.accepted.get(&hash) == Some(&bytes),
+                "cached dependency is absent from the exact verified prefix",
+            )?;
+            usage.record_verified_object(value)
+        } else {
+            usage.record_signed(value)
+        }
+    }
+}
+
 struct PolicyProof<'a> {
     state: &'a VerifiedPolicySet,
     usage: ExecutionProofUsage,
@@ -7,9 +126,18 @@ struct PolicyProof<'a> {
     devices: BTreeSet<ObjectHash>,
     grants: BTreeSet<ObjectHash>,
     now_ms: u64,
+    cached: Option<&'a CachedPolicyProof>,
 }
 
 impl PolicyProof<'_> {
+    fn cached_metadata<T: SignedObject>(&mut self, value: &Signed<T>) -> Result<()> {
+        if let Some(cached) = self.cached {
+            cached.record(&mut self.usage, value)?;
+            self.usage.enforce_limits()
+        } else {
+            self.signed(value)
+        }
+    }
     fn signed<T: SignedObject>(&mut self, value: &Signed<T>) -> Result<()> {
         self.usage.record_signed(value)?;
         self.usage.enforce_limits()
@@ -316,7 +444,7 @@ impl PolicyProof<'_> {
     ) -> Result<()> {
         for hash in &document.devices {
             if let Some(value) = self.state.devices.get(hash) {
-                self.signed(value)?;
+                self.cached_metadata(value)?;
             } else {
                 let value = embedded.ok_or(AuthorizationError::InvalidProof(
                     "missing policy device proof",
@@ -329,7 +457,7 @@ impl PolicyProof<'_> {
             }
         }
         for hash in &document.authenticators {
-            self.signed(self.state.authenticators.get(hash).ok_or(
+            self.cached_metadata(self.state.authenticators.get(hash).ok_or(
                 AuthorizationError::InvalidProof("missing policy authenticator proof"),
             )?)?;
         }
@@ -377,32 +505,22 @@ impl PolicyProof<'_> {
 
     fn space_refs(&mut self, document: &SpaceDocument) -> Result<()> {
         for hash in &document.devices {
-            self.signed(
-                self.state
-                    .devices
-                    .get(hash)
-                    .ok_or(AuthorizationError::InvalidProof(
-                        "missing space device proof",
-                    ))?,
-            )?;
+            self.cached_metadata(self.state.devices.get(hash).ok_or(
+                AuthorizationError::InvalidProof("missing space device proof"),
+            )?)?;
         }
         for hash in &document.resources {
-            self.signed(self.state.resources.get(hash).ok_or(
+            self.cached_metadata(self.state.resources.get(hash).ok_or(
                 AuthorizationError::InvalidProof("missing space resource proof"),
             )?)?;
         }
         for hash in &document.grants {
-            self.signed(
-                self.state
-                    .grants
-                    .get(hash)
-                    .ok_or(AuthorizationError::InvalidProof(
-                        "missing space grant proof",
-                    ))?,
-            )?;
+            self.cached_metadata(self.state.grants.get(hash).ok_or(
+                AuthorizationError::InvalidProof("missing space grant proof"),
+            )?)?;
         }
         for hash in &document.memberships {
-            self.signed(self.state.memberships.get(hash).ok_or(
+            self.cached_metadata(self.state.memberships.get(hash).ok_or(
                 AuthorizationError::InvalidProof("missing space membership proof"),
             )?)?;
         }
@@ -504,6 +622,7 @@ pub fn policy_entry_payload_usage(entry: &JournalEntry) -> Result<ExecutionProof
         devices: BTreeSet::new(),
         grants: BTreeSet::new(),
         now_ms: 0,
+        cached: None,
     };
     match entry {
         JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
@@ -542,6 +661,14 @@ pub fn policy_entry_usage(
     state: &VerifiedPolicySet,
     entry: &JournalEntry,
 ) -> Result<ExecutionProofUsage> {
+    policy_entry_usage_with_cache(state, entry, None)
+}
+
+pub(crate) fn policy_entry_usage_with_cache(
+    state: &VerifiedPolicySet,
+    entry: &JournalEntry,
+    cached: Option<&CachedPolicyProof>,
+) -> Result<ExecutionProofUsage> {
     let now_ms = match entry {
         JournalEntry::AccountCommit(value) => value.commit.payload.accepted_at_ms,
         JournalEntry::SpaceCommit(value) => value.commit.payload.accepted_at_ms,
@@ -558,6 +685,7 @@ pub fn policy_entry_usage(
         devices: BTreeSet::new(),
         grants: BTreeSet::new(),
         now_ms,
+        cached,
     };
     match entry {
         JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
@@ -608,6 +736,66 @@ pub fn policy_entry_usage(
 mod tests {
     use super::*;
     use crate::{authorization::tests::Fixture, signature_verification::SignatureVerification};
+
+    #[test]
+    fn cached_metadata_requires_exact_prefix_and_fresh_certificates_keep_signatures() {
+        let fixture = Fixture::new();
+        let old = fixture.state.devices.values().next().unwrap().clone();
+        let cache = CachedPolicyProof::from_verified_prefix(
+            &fixture.state,
+            &[JournalEntry::Device(old.clone())],
+        )
+        .unwrap();
+        let signatures = SignatureVerification::new();
+        let mut usage = ExecutionProofUsage::default();
+        signatures.run(|| cache.record(&mut usage, &old)).unwrap();
+        assert_eq!(usage.counts().unique_signed_objects, 1);
+        assert_eq!(usage.counts().unique_signatures, 0);
+        assert_eq!(
+            usage.counts().authorization_bytes,
+            canonical(&old).unwrap().len()
+        );
+        assert_eq!(signatures.counts().actual_verifications, 0);
+        let missing = CachedPolicyProof::from_verified_prefix(&fixture.state, &[]).unwrap();
+        assert!(
+            missing
+                .record(&mut ExecutionProofUsage::default(), &old)
+                .is_err()
+        );
+        let mut changed = cache.clone();
+        changed
+            .accepted
+            .insert(old.hash().unwrap(), b"changed canonical object".to_vec());
+        assert!(
+            changed
+                .record(&mut ExecutionProofUsage::default(), &old)
+                .is_err()
+        );
+        let identity = Identity::from_secret_hex(&hex::encode([61; 32])).unwrap();
+        let mut payload = old.payload.clone();
+        payload.public_key = PublicKey::of(&identity);
+        payload.device = DeviceId::from_key(&payload.public_key);
+        payload.nonce = Nonce::from_bytes([62; 32]);
+        payload.prove_possession(&identity).unwrap();
+        let fresh = Signed::sign(payload, &fixture.root).unwrap();
+        let usage = policy_entry_usage_with_cache(
+            &fixture.state,
+            &JournalEntry::Device(fresh.clone()),
+            Some(&cache),
+        )
+        .unwrap();
+        assert!(usage.counts().unique_signatures >= 2);
+        let signatures = SignatureVerification::new();
+        signatures
+            .run(|| {
+                fixture
+                    .state
+                    .clone()
+                    .install_device(fresh.clone(), fresh.payload.not_before_ms)
+            })
+            .unwrap();
+        assert!(signatures.counts().actual_verifications >= 2);
+    }
 
     fn next(fixture: &Fixture) -> AccountDocument {
         let mut document = fixture.state.account(&fixture.account).unwrap().clone();

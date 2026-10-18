@@ -451,6 +451,29 @@ pub fn verify_recovery_stream_commit_in_state(
     before: &VerifiedPolicySet,
     now: u64,
 ) -> Result<VerifiedStreamedRecoveryCommit> {
+    verify_recovery_stream_commit(input, approved, read, before, None, now)
+}
+
+pub fn verify_recovery_stream_commit_with_source_proof(
+    input: &StreamedRecoveryCommitRequest,
+    approved: &StreamedRecoveryNodeRequest,
+    read: &RecoveryReadRequest,
+    before: &VerifiedPolicySet,
+    source: &VerifiedRecoverySourceProof,
+    now: u64,
+) -> Result<VerifiedStreamedRecoveryCommit> {
+    source.cache_for(read, before)?;
+    verify_recovery_stream_commit(input, approved, read, before, Some(source), now)
+}
+
+fn verify_recovery_stream_commit(
+    input: &StreamedRecoveryCommitRequest,
+    approved: &StreamedRecoveryNodeRequest,
+    read: &RecoveryReadRequest,
+    before: &VerifiedPolicySet,
+    source: Option<&VerifiedRecoverySourceProof>,
+    now: u64,
+) -> Result<VerifiedStreamedRecoveryCommit> {
     let _scope = crate::signature_verification::ScopedSignatureVerification::new();
     let mut usage = RecoveryProofUsage::new(canonical(input)?.len())?;
     require(
@@ -472,8 +495,14 @@ pub fn verify_recovery_stream_commit_in_state(
     verify_delta_shape(input, approved, read, before)?;
     usage.record_request(read)?;
     usage.record_current_source(read, before)?;
-    usage.record_node_request(approved, before)?;
-    usage.record_commit(input, before)?;
+    if let Some(source) = source {
+        source.record_proof_usage_into(&mut usage);
+        usage.record_node_request_with_source_proof(approved, before, source)?;
+        usage.record_commit_with_source_proof(input, before, source)?;
+    } else {
+        usage.record_node_request(approved, before)?;
+        usage.record_commit(input, before)?;
+    }
     let mut after = before.clone();
     for entry in &input.journal_delta {
         apply_policy_entry(&mut after, &[], entry.clone())?;

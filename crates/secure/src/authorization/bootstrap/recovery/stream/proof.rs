@@ -1,7 +1,10 @@
 use super::*;
 use crate::authorization::{
     execution_handoff::{ExecutionProofCounts, ExecutionProofUsage},
-    policy_proof::{policy_entry_payload_usage, policy_entry_usage},
+    policy_proof::{
+        CachedPolicyProof, policy_entry_payload_usage, policy_entry_usage,
+        policy_entry_usage_with_cache,
+    },
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -131,13 +134,34 @@ impl RecoveryProofUsage {
         value: &StreamedRecoveryNodeRequest,
         state: &VerifiedPolicySet,
     ) -> Result<()> {
+        self.record_node_request_cached(value, state, None)
+    }
+    pub fn record_node_request_with_source_proof(
+        &mut self,
+        value: &StreamedRecoveryNodeRequest,
+        state: &VerifiedPolicySet,
+        source: &VerifiedRecoverySourceProof,
+    ) -> Result<()> {
+        self.record_node_request_cached(
+            value,
+            state,
+            Some(source.cache_for_context(&value.context, state)?),
+        )
+    }
+    pub(crate) fn record_node_request_cached(
+        &mut self,
+        value: &StreamedRecoveryNodeRequest,
+        state: &VerifiedPolicySet,
+        cached: Option<&CachedPolicyProof>,
+    ) -> Result<()> {
         self.usage.record_metadata(&value.context)?;
         self.usage
             .record_metadata(&value.request.node_certificate)?;
         self.usage.record_signed(&value.request.claim)?;
-        self.usage.merge(&policy_entry_usage(
+        self.usage.merge(&policy_entry_usage_with_cache(
             state,
             &JournalEntry::Account(value.request.account_recovery.clone()),
+            cached,
         )?);
         self.usage.enforce_limits()
     }
@@ -146,14 +170,40 @@ impl RecoveryProofUsage {
         value: &StreamedRecoveryCommitRequest,
         state: &VerifiedPolicySet,
     ) -> Result<()> {
+        self.record_commit_cached(value, state, None)
+    }
+    pub fn record_commit_with_source_proof(
+        &mut self,
+        value: &StreamedRecoveryCommitRequest,
+        state: &VerifiedPolicySet,
+        source: &VerifiedRecoverySourceProof,
+    ) -> Result<()> {
+        self.record_commit_cached(
+            value,
+            state,
+            Some(source.cache_for_context(&value.context, state)?),
+        )
+    }
+    pub(crate) fn record_commit_cached(
+        &mut self,
+        value: &StreamedRecoveryCommitRequest,
+        state: &VerifiedPolicySet,
+        cached: Option<&CachedPolicyProof>,
+    ) -> Result<()> {
         self.usage.record_metadata(&serde_json::json!({"context":value.context,"request_hash":value.request_hash,
             "expected_account_head":value.expected_account_head,"expected_space_head":value.expected_space_head,
             "grant_leaf":value.grant_leaf,"new_device_public_key":value.new_device_public_key,"claim_nonce":value.claim_nonce}))?;
         let mut staged = state.clone();
         for entry in &value.journal_delta {
-            self.usage.merge(&policy_entry_usage(&staged, entry)?);
+            self.usage
+                .merge(&policy_entry_usage_with_cache(&staged, entry, cached)?);
             apply_policy_entry(&mut staged, &[], entry.clone())?;
         }
+        #[cfg(test)]
+        eprintln!(
+            "stream commit union {}",
+            serde_json::to_string(&self.usage.counts()).unwrap()
+        );
         self.usage.enforce_limits()
     }
     pub fn merge(&mut self, other: &Self) {

@@ -15,6 +15,7 @@ pub struct RecoveryContextImport {
     complete: bool,
     last_page: Option<Signed<RecoveryContextPage>>,
     last_usage: Option<RecoveryProofCounts>,
+    last_proof: Option<RecoveryProofUsage>,
 }
 
 #[derive(Clone, Debug)]
@@ -25,6 +26,7 @@ pub struct VerifiedRecoveryPolicyContext {
     witness: Signed<RecoveryContextWitness>,
     policy: VerifiedPolicySnapshot,
     usage: RecoveryProofCounts,
+    proof_usage: RecoveryProofUsage,
 }
 
 pub(super) fn validate_snapshot(
@@ -113,6 +115,7 @@ fn begin(
         complete: false,
         last_page: None,
         last_usage: None,
+        last_proof: None,
     })
 }
 
@@ -121,6 +124,38 @@ pub fn begin_recovery_context_import(
     material_json: &str,
     original_request_json: &str,
     snapshot_json: &str,
+    now_ms: f64,
+) -> crate::Result<RecoveryContextImport> {
+    begin_private_recovery_context_import(
+        material_json,
+        original_request_json,
+        snapshot_json,
+        RecoveryContextKind::Account,
+        now_ms,
+    )
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = beginCrossNodeRecoveryContextImport))]
+pub fn begin_cross_node_recovery_context_import(
+    material_json: &str,
+    original_request_json: &str,
+    snapshot_json: &str,
+    now_ms: f64,
+) -> crate::Result<RecoveryContextImport> {
+    begin_private_recovery_context_import(
+        material_json,
+        original_request_json,
+        snapshot_json,
+        RecoveryContextKind::CrossNode,
+        now_ms,
+    )
+}
+
+fn begin_private_recovery_context_import(
+    material_json: &str,
+    original_request_json: &str,
+    snapshot_json: &str,
+    kind: RecoveryContextKind,
     now_ms: f64,
 ) -> crate::Result<RecoveryContextImport> {
     let scope = crate::signature_verification::ScopedSignatureVerification::new();
@@ -137,9 +172,14 @@ pub fn begin_recovery_context_import(
             let material = read_material(material_json)?;
             validate_material(&material)?;
             let state = material_state(&material)?;
-            let signed: Signed<RecoveryContextRequest> =
-                decode_signed(original_request_json.as_bytes())?;
-            let request = RecoveryReadRequest::Account(signed);
+            let request = match kind {
+                RecoveryContextKind::Account => {
+                    RecoveryReadRequest::Account(decode_signed(original_request_json.as_bytes())?)
+                }
+                RecoveryContextKind::CrossNode => {
+                    RecoveryReadRequest::CrossNode(decode_signed(original_request_json.as_bytes())?)
+                }
+            };
             require(
                 request.saved_pins() == material.pins
                     && request.account() == &material.scope.account_id
@@ -181,7 +221,8 @@ pub fn begin_recovery_context_import(
             usage.merge_usage(&checkpoint::material_proof_usage(&material)?);
             usage.record_request(&import.request)?;
             usage.record_snapshot(&import.snapshot)?;
-            import.last_usage = Some(usage.finish()?);
+            import.last_usage = Some(usage.clone().finish()?);
+            import.last_proof = Some(usage);
             require(
                 scope.counts().actual_verifications <= MAX_PROOF_SIGNATURES,
                 "recovery import signature budget exceeded",
@@ -217,15 +258,30 @@ pub fn begin_cross_node_recovery_policy_import(
     )?;
     request.verify_signature()?;
     let snapshot: Signed<RecoveryContextSnapshot> = decode_signed(snapshot_json.as_bytes())?;
-    begin(
+    let mut import = begin(
         RecoveryReadRequest::CrossNode(request),
         snapshot,
         BTreeMap::new(),
         now_ms,
-    )
+    )?;
+    let mut usage = RecoveryProofUsage::new(
+        original_request_json
+            .len()
+            .saturating_add(snapshot_json.len()),
+    )?;
+    usage.record_request(&import.request)?;
+    usage.record_snapshot(&import.snapshot)?;
+    import.last_usage = Some(usage.clone().finish()?);
+    import.last_proof = Some(usage);
+    Ok(import)
 }
 
 impl RecoveryContextImport {
+    pub fn record_proof_usage_into(&self, usage: &mut RecoveryProofUsage) {
+        if let Some(proof) = &self.last_proof {
+            usage.merge(proof);
+        }
+    }
     fn progress(&self) -> crate::Result<String> {
         encode(
             &serde_json::json!({"page_count":self.page_count,"entry_count":self.entry_count,
@@ -246,7 +302,8 @@ impl RecoveryContextImport {
         if self.last_page.as_ref() == Some(&page) {
             let mut usage = RecoveryProofUsage::new(canonical(&page)?.len())?;
             usage.record_page_binding(&page)?;
-            self.last_usage = Some(usage.finish()?);
+            self.last_usage = Some(usage.clone().finish()?);
+            self.last_proof = Some(usage);
             return Ok(());
         }
         let value = &page.payload;
@@ -300,7 +357,8 @@ impl RecoveryContextImport {
                 }
             }
         }
-        let usage = usage.finish()?;
+        let proof_usage = usage;
+        let usage = proof_usage.clone().finish()?;
         let page_count = self
             .page_count
             .checked_add(1)
@@ -318,6 +376,7 @@ impl RecoveryContextImport {
         self.last_page = Some(page);
         self.policy = policy;
         self.last_usage = Some(usage);
+        self.last_proof = Some(proof_usage);
         Ok(())
     }
     pub fn finish_native(
@@ -358,13 +417,15 @@ impl RecoveryContextImport {
             .verify(policy.state(), self.request.source_node_public_key(), now)?;
         usage.record_request(&self.request)?;
         usage.record_current_source(&self.request, policy.state())?;
-        let usage = usage.finish()?;
+        let proof_usage = usage;
+        let usage = proof_usage.clone().finish()?;
         Ok(VerifiedRecoveryPolicyContext {
             request: self.request,
             snapshot: self.snapshot,
             witness,
             policy,
             usage,
+            proof_usage,
         })
     }
 }
@@ -408,6 +469,9 @@ impl RecoveryContextImport {
 }
 
 impl VerifiedRecoveryPolicyContext {
+    pub fn record_proof_usage_into(&self, usage: &mut RecoveryProofUsage) {
+        usage.merge(&self.proof_usage);
+    }
     pub fn request(&self) -> &RecoveryReadRequest {
         &self.request
     }
@@ -624,6 +688,97 @@ mod tests {
         assert_eq!(context.policy.journal(), original.bundle.journal);
         assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
         stages.push(serde_json::json!({"stage":"finish","usage":context.usage,"actual":signatures.counts()}));
+        let signatures = SignatureVerification::new();
+        let prepared = signatures
+            .run(|| prepare_account_recovery(&material, &context, &key(51), &key(50), EXPIRY, NOW))
+            .unwrap();
+        assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
+        stages.push(serde_json::json!({"stage":"prepare","actual":signatures.counts()}));
+        let approved: StreamedRecoveryNodeRequest =
+            serde_json::from_str(&prepared.node_request_json().unwrap()).unwrap();
+        let signatures = SignatureVerification::new();
+        let possession = signatures
+            .run(|| {
+                sign_recovery_node_possession_in_state(
+                    &approved,
+                    &read,
+                    &snapshot,
+                    &witness,
+                    &original.authorization.policy_snapshot,
+                    &key(4),
+                    read.nonce(),
+                    NOW as u64,
+                )
+            })
+            .unwrap();
+        assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
+        stages.push(serde_json::json!({"stage":"possession","actual":signatures.counts()}));
+        let signatures = SignatureVerification::new();
+        let recovered = signatures
+            .run(|| finish_account_recovery(&prepared, &key(51), possession.as_str(), NOW))
+            .unwrap();
+        assert!(recovered.authorization.imported_snapshot.is_some());
+        assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
+        stages.push(serde_json::json!({"stage":"recovery_finish","actual":signatures.counts()}));
+        let commit_json = prepared.commit_json(&recovered).unwrap();
+        let commit: StreamedRecoveryCommitRequest = serde_json::from_str(&commit_json).unwrap();
+        assert!(
+            verify_recovery_source_proof_prefix(
+                &read,
+                &snapshot,
+                &witness,
+                &original.authorization.policy_snapshot,
+                &[],
+                &PublicKey::of(&key(4)),
+                NOW as u64,
+            )
+            .is_err()
+        );
+        let signatures = SignatureVerification::new();
+        let committed = signatures.run(|| {
+            let source = verify_recovery_source_proof_prefix(
+                &read,
+                &snapshot,
+                &witness,
+                &original.authorization.policy_snapshot,
+                &original.bundle.journal,
+                &PublicKey::of(&key(4)),
+                NOW as u64,
+            )?;
+            verify_recovery_stream_commit_with_source_proof(
+                &commit,
+                &approved,
+                &read,
+                &original.authorization.policy_snapshot,
+                &source,
+                NOW as u64,
+            )
+        });
+        eprintln!(
+            "recovery commit actual {}",
+            serde_json::to_string(&signatures.counts()).unwrap()
+        );
+        let committed = committed.unwrap();
+        assert_eq!(
+            committed.authorization().scope,
+            recovered.authorization.scope
+        );
+        assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
+        stages.push(serde_json::json!({"stage":"commit","usage":committed.proof_usage(),"actual":signatures.counts()}));
+        let signatures = SignatureVerification::new();
+        let next_material = signatures
+            .run(|| {
+                build_recovered_account_recovery_material(
+                    &recovered,
+                    &key(51),
+                    &material,
+                    "https://node.example",
+                    NOW,
+                )
+            })
+            .unwrap();
+        assert!(next_material.len() <= MAX_RECOVERY_MATERIAL_BYTES);
+        stages.push(serde_json::json!({"stage":"backup","material_bytes":next_material.len(),"actual":signatures.counts()}));
         let max_actual = stages
             .iter()
             .filter_map(|stage| stage["actual"]["actual_verifications"].as_u64())
@@ -648,7 +803,9 @@ mod tests {
         if let Ok(path) = std::env::var("VIBEFACE_BOUNDED_RECOVERY_VECTOR") {
             let value = serde_json::json!({"now":NOW,"expiry":EXPIRY,"material":material,
                 "request":request,"snapshot":snapshot,"pages":pages,"witness":witness,
-                "expected":{"scope":original.authorization.scope,"heads":context.policy.heads()},"stages":stages});
+                "expected":{"scope":original.authorization.scope,"heads":context.policy.heads()},
+                "node_request":approved,"node_possession":possession,"commit":commit,
+                "next_material":next_material,"stages":stages});
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create(true).truncate(true);
             #[cfg(unix)]

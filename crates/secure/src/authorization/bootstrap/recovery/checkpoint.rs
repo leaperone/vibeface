@@ -801,7 +801,7 @@ mod tests {
         client: u8,
         now: f64,
     ) -> CreatedAccount {
-        let prepared = prepare_account_recovery(
+        let prepared = prepare_account_recovery_from_bundle(
             material,
             &current.bundle_json().unwrap(),
             &key(root),

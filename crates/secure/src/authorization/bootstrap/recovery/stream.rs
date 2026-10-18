@@ -4,18 +4,30 @@ use super::*;
 use context::RecoveryContextRequest;
 use cross_node::CrossNodeRecoveryRequest;
 
+pub(crate) mod cross;
 mod import;
 mod node;
 mod proof;
+mod source;
+pub use cross::{
+    VerifiedCrossNodeRecoveryInstallation, VerifiedStreamedCrossNodeRecoveryCommit,
+    accept_cross_node_recovery_stream_commit, approve_cross_node_recovery_import,
+    sign_cross_node_recovery_source_possession_in_state,
+    sign_cross_node_recovery_source_possession_with_source_proof,
+    verify_cross_node_recovery_stream_commit_in_state,
+    verify_cross_node_recovery_stream_commit_with_source_proof,
+    verify_cross_node_recovery_stream_installation,
+};
 pub use import::{
-    RecoveryContextImport, VerifiedRecoveryPolicyContext, begin_cross_node_recovery_policy_import,
-    begin_recovery_context_import,
+    RecoveryContextImport, VerifiedRecoveryPolicyContext, begin_cross_node_recovery_context_import,
+    begin_cross_node_recovery_policy_import, begin_recovery_context_import,
 };
 pub use node::{
     VerifiedStreamedRecoveryCommit, sign_recovery_node_possession_in_state,
-    verify_recovery_stream_commit_in_state,
+    verify_recovery_stream_commit_in_state, verify_recovery_stream_commit_with_source_proof,
 };
 pub use proof::{RecoveryProofCounts, RecoveryProofUsage, validate_recovery_context_page_carrier};
+pub use source::{VerifiedRecoverySourceProof, verify_recovery_source_proof_prefix};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

@@ -2290,6 +2290,13 @@ impl ExecutionProofUsage {
         ))?);
         Ok(())
     }
+    pub(crate) fn record_verified_object<T: SignedObject>(
+        &mut self,
+        value: &Signed<T>,
+    ) -> Result<()> {
+        self.objects.insert(value.hash()?, canonical(value)?.len());
+        Ok(())
+    }
     pub fn record_metadata<T: Serialize>(&mut self, value: &T) -> Result<()> {
         self.metadata
             .insert(ObjectHash::body(value)?, canonical(value)?.len());
