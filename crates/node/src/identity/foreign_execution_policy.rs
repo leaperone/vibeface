@@ -746,7 +746,7 @@ pub(crate) mod tests {
         Ok(result)
     }
 
-    fn import_current_policy(fixture: &mut UnseededFixture) -> Result<VerifiedRemoteExecution> {
+    pub(crate) fn import_current_policy(fixture: &mut UnseededFixture) -> Result<VerifiedRemoteExecution> {
         let principal = fixture.project.client.public_key_hex();
         let approved = carrier(|| {
             fixture.store.foreign_execution_policy_approve(

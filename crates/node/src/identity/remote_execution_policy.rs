@@ -1831,10 +1831,15 @@ mod tests {
 
     #[test]
     fn remote_policy_history_imports_an_unapplied_result_after_writer_revocation() -> Result<()> {
+        use crate::identity::foreign_execution_policy::{
+            current_task_prepare_policy_in,
+            tests::{UnseededFixture, import_current_policy, unseeded_fixture},
+        };
         use std::collections::BTreeMap;
         use vibeface_secure::authorization::{
-            CheckStage, TransportEvidence,
+            CheckStage, DeviceId, Invocation, RequestFacts, TransportEvidence,
             execution_handoff::{ExecutionHandoffFreshness, ExecutionHandoffResult},
+            prepare::PrepareIntent,
             remote_execution_policy::{
                 begin_remote_execution_history_policy_import, begin_remote_execution_policy_import,
                 build_remote_execution_history_policy_read_intent,
@@ -1842,36 +1847,212 @@ mod tests {
             remote_resolution_history::verify_remote_execution_result_history,
         };
 
-        let mut fixture = Fixture::new()?;
-        let binding = fixture.bind()?;
-        let (body, operation) = fixture.operation(binding.clone(), "history-result")?;
-        let (dispatch, authorization, freshness, transport) = fixture.authorize(&body)?;
-        fixture.store.accept_execution_dispatch(
-            &fixture.project.node,
-            &dispatch,
-            &crate::identity::task_execution_context::TaskScopedAuthorization::from_primary(authorization.clone()),
-            &freshness,
-            &transport,
-            &body,
-            &operation,
-            now(),
-        )?;
-        let (wire, _) = fixture.store.prepare_execution_dispatch_handoff(
-            &fixture.project.node,
-            fixture.project.space.as_str(),
-            &operation.operation_id,
-            now(),
-        )?;
-        let mut target = fixture.executor.memory()?;
+        let mut fixture = unseeded_fixture()?;
+        let remote = import_current_policy(&mut fixture)?;
+        let context = fixture.intent.payload.context.clone();
+        let local = PublicKey::parse(&fixture.project.node.public_key_hex()?)?;
+        let audience = fixture.intent.payload.source_selection.audience.clone();
+        let selection = fixture.intent.payload.selection.clone();
+        assert!(
+            fixture
+                .store
+                .policy
+                .verified()
+                .account(&fixture.executor.account)
+                .is_none()
+        );
+        let authorize = |fixture: &mut UnseededFixture, body: &Value| -> Result<_> {
+            let operation_id = body["authorization_id"]
+                .as_str()
+                .context("history operation ID is missing")?;
+            let prepared = carrier(|| {
+                remote
+                    .prepare(
+                        &fixture.source,
+                        &body.to_string(),
+                        &serde_json::to_string(&context)?,
+                        "execution_open",
+                        operation_id,
+                        local.as_str(),
+                        &fixture.project.client,
+                        now() as f64,
+                    )
+                    .map_err(anyhow::Error::msg)
+            })?;
+            let prepared: Signed<PrepareIntent> = serde_json::from_str(&prepared)?;
+            carrier(|| {
+                current_task_prepare_policy_in(
+                    &fixture.store.connection,
+                    &fixture.store.policy,
+                    &local,
+                    &prepared,
+                    body,
+                    now(),
+                )?
+                .context("history prepare has no completed foreign policy")
+            })?;
+            let invocation = carrier(|| {
+                remote
+                    .sign(
+                        &fixture.source,
+                        &serde_json::to_string(&prepared.payload.request)?,
+                        &body.to_string(),
+                        "execution_open",
+                        operation_id,
+                        local.as_str(),
+                        &fixture.project.client,
+                        now() as f64,
+                    )
+                    .map_err(anyhow::Error::msg)
+            })?;
+            let invocation: Signed<Invocation> = serde_json::from_str(&invocation)?;
+            let signed = &invocation.payload;
+            let facts = RequestFacts {
+                resource: signed.resource.clone(),
+                action: signed.action,
+                audience: signed.audience.clone(),
+                operation_id: signed.operation_id.clone(),
+                body_hash: signed.body_hash.clone(),
+                context: signed.context.clone(),
+            };
+            let transport = TransportEvidence::DirectNoise {
+                device: DeviceId::from_key(&PublicKey::of(&fixture.project.client)),
+            };
+            let scoped = carrier(|| {
+                fixture.store.authorize_scoped_request_for_body(
+                    &fixture.project.node,
+                    &invocation,
+                    &facts,
+                    &transport,
+                    body,
+                    now(),
+                )
+            })?;
+            let dispatch = carrier(|| {
+                fixture
+                    .store
+                    .execution_dispatch_facts_in_scope(&scoped, body, &audience, now())
+            })?;
+            let challenge = carrier(|| {
+                fixture
+                    .store
+                    .issue_scoped_freshness(&scoped, CheckStage::Admit, now())
+            })?;
+            let mut receipts = carrier(|| {
+                fixture
+                    .store
+                    .sign_current_receipts(&challenge, &fixture.project.node, now())
+            })?;
+            receipts.extend(carrier(|| {
+                fixture
+                    .target
+                    .sign_current_receipts(&challenge, &fixture.executor.node, now())
+            })?);
+            Ok((
+                invocation,
+                scoped,
+                dispatch,
+                crate::identity::policy::FreshnessProof {
+                    challenge,
+                    receipts,
+                },
+                transport,
+            ))
+        };
+        let bind_body = json!({
+            "method":"bind_execution",
+            "space_id":fixture.project.space,
+            "resource_id":fixture.project.resource,
+            "authorization_id":"history-bind",
+            "execution_resource":selection.execution_resource,
+            "target_public_key":selection.target_public_key,
+            "execution_grant":selection.execution_grant,
+            "conversation_id":"foreign-conversation",
+            "task_id":"foreign-task",
+            "task_ref":context.context.task,
+            "target_node":fixture.executor.node.node_id()?,
+            "session_id":"foreign-session",
+            "executor":"codex",
+            "cwd":fixture.project.project,
+        });
+        let (_, scoped, dispatch, freshness, transport) = authorize(&mut fixture, &bind_body)?;
+        let binding = carrier(|| {
+            fixture.store.bind_execution_dispatch(
+                &fixture.project.node,
+                &dispatch,
+                &scoped,
+                &freshness,
+                &transport,
+                &bind_body,
+                now(),
+            )
+        })?;
+        let operation = crate::model::OperationRequest {
+            operation_id: "history-result".into(),
+            network_id: fixture.project.space.to_string(),
+            conversation_id: "foreign-conversation".into(),
+            task_id: Some("foreign-task".into()),
+            target_node: fixture.executor.node.node_id()?,
+            session_id: "foreign-session".into(),
+            expected_revision: 0,
+            basis_heads: vec![binding.binding.task_ref.clone()],
+            action: binding.binding.open_spec.clone(),
+            resources: vec![
+                binding.binding.open_spec["cwd"]
+                    .as_str()
+                    .context("history binding cwd is missing")?
+                    .into(),
+            ],
+            binding: Some(binding.clone()),
+        };
+        let body = json!({
+            "method":"operate",
+            "space_id":fixture.project.space,
+            "resource_id":fixture.project.resource,
+            "authorization_id":operation.operation_id,
+            "execution_resource":selection.execution_resource,
+            "target_public_key":selection.target_public_key,
+            "execution_grant":selection.execution_grant,
+            "request":operation,
+        });
+        let (invocation, scoped, dispatch, freshness, transport) = authorize(&mut fixture, &body)?;
+        carrier(|| {
+            fixture.store.accept_execution_dispatch(
+                &fixture.project.node,
+                &dispatch,
+                &scoped,
+                &freshness,
+                &transport,
+                &body,
+                &operation,
+                now(),
+            )
+        })?;
+        let (wire, _) = carrier(|| {
+            fixture.store.prepare_execution_dispatch_handoff(
+                &fixture.project.node,
+                fixture.project.space.as_str(),
+                &operation.operation_id,
+                now(),
+            )
+        })?;
+        assert!(
+            fixture
+                .store
+                .policy
+                .verified()
+                .account(&fixture.executor.account)
+                .is_none()
+        );
+        let mut target = fixture.target;
         fixture.project.install(&mut target)?;
-        target.install_policy_journal(&fixture.journal, now())?;
         target.local_set(
             fixture.executor.space.as_str(),
-            &format!("resource-root:{}", fixture.execution.resource),
+            &format!("resource-root:{}", selection.execution_resource.resource),
             &json!(fixture.project.project),
         )?;
         let peer = TransportEvidence::VerifiedPeer {
-            origin: fixture.audience.device.clone(),
+            origin: audience.device.clone(),
         };
         let challenge =
             target.issue_execution_handoff_challenge(&wire, &peer, CheckStage::Admit, now())?;
@@ -1894,7 +2075,7 @@ mod tests {
         )?;
         let accepted = target.execution_handoff_status(
             &fixture.executor.node,
-            fixture.execution.space.as_str(),
+            selection.execution_resource.space.as_str(),
             fixture.project.space.as_str(),
             &operation.operation_id,
             now(),
@@ -1916,7 +2097,7 @@ mod tests {
                     space: fixture.project.space.clone(),
                     resource: fixture.project.resource.clone(),
                 },
-                audience: fixture.audience.clone(),
+                audience: audience.clone(),
                 grant_leaf: fixture.project.bundle.grant_leaf.clone(),
             },
             &fixture.project.pins,
@@ -1934,7 +2115,9 @@ mod tests {
             .head(&PolicyDomain::Space(fixture.executor.space.clone()))
             .cloned();
         document.sequence += 1;
-        document.grants.retain(|hash| hash != &fixture.grant);
+        document
+            .grants
+            .retain(|hash| hash != &selection.execution_grant);
         target.install_policy_journal(
             &[JournalEntry::Space(Signed::sign(
                 document,
@@ -1957,7 +2140,7 @@ mod tests {
         let pins_json = serde_json::to_string(&pins)?;
         let actual_json = serde_json::to_string(&actual)?;
         let body_json = serde_json::to_string(&body)?;
-        let invocation_json = serde_json::to_string(authorization.signed_invocation())?;
+        let invocation_json = serde_json::to_string(&invocation)?;
         let binding_json = serde_json::to_string(&binding)?;
         let intent_json = carrier(|| {
             build_remote_execution_history_policy_read_intent(
