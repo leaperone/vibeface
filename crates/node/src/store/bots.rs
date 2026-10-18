@@ -147,6 +147,10 @@ pub(super) fn validate_bot_projections_from(
         if stored.status != "ready" {
             continue;
         }
+        if dependencies(&stored.event).any(|dependency| invalid.contains(dependency)) {
+            invalid.insert(hash.clone());
+            continue;
+        }
         let Some(bot) = project_bot(hash, &stored.event) else {
             continue;
         };
@@ -413,6 +417,33 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(invalid_status, "invalid");
+        let descendant = owner.sign_event(Event {
+            version: WIRE_VERSION,
+            network_id: network.clone(),
+            scope_id: "attacker-history".into(),
+            author: owner.node_id()?,
+            sequence: 1,
+            previous: None,
+            parents: vec![invalid.hash],
+            created_at_ms: 5,
+            body: EventBody::BotCreated {
+                bot_id: "legitimate-bot".into(),
+                name: "Invalid descendant".into(),
+                instructions: String::new(),
+                project: None,
+                membership_role_proof: store.trust_bundle(&network)?.unwrap(),
+            },
+            blobs: vec![],
+        })?;
+        assert_eq!(store.ingest_event(&network, &descendant)?.status, "invalid");
+        assert_eq!(store.bots(&network)?.len(), 1);
+        assert!(
+            store
+                .context(&network, "legitimate-history", &[])?
+                .missing
+                .is_complete()
+        );
+        assert_eq!(store.messages(&network, "legitimate-history")?.len(), 1);
         Ok(())
     }
 
