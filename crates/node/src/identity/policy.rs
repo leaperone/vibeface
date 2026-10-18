@@ -1446,6 +1446,18 @@ impl crate::runtime::Runtime {
             "enrollment_policy_read_witness" => store.enrollment_policy_witness(
                 &self.identity, noise_public_key, params, now_ms,
             ),
+            "remote_execution_policy_delegate" => store.remote_execution_policy_delegate(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "remote_execution_policy_prepare" => store.remote_execution_policy_prepare(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "remote_execution_policy_page" => store.remote_execution_policy_page(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
+            "remote_execution_policy_finish" => store.remote_execution_policy_finish(
+                &self.identity, noise_public_key, params, now_ms,
+            ),
             "execution_share_policy_prepare" => store.execution_share_policy_prepare(
                 &self.identity, noise_public_key, params, now_ms,
             ),

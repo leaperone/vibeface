@@ -22,6 +22,7 @@ pub(crate) mod passkey_store;
 pub mod policy;
 pub(crate) mod recovery;
 pub(crate) mod remote_share_policy;
+pub(crate) mod remote_execution_policy;
 pub mod services;
 pub mod webauthn;
 
