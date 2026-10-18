@@ -2135,7 +2135,7 @@ mod tests {
         };
         assert!(deadline >= first_deadline);
         if revoke {
-            fixture.project.revoke_client(&mut b.store.lock().await)?;
+            fixture.project.revoke_client(&mut *b.store.lock().await)?;
             assert!(
                 task_business_operation_current(&b, &c, &original, CheckStage::Renew)
                     .await
