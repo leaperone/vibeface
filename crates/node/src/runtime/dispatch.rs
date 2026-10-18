@@ -88,11 +88,30 @@ impl Runtime {
                 .is_some_and(|target| target != local))
     }
 
+    pub(super) fn is_remote_execution_seal(&self, body: &Value) -> bool {
+        matches!(
+            body["method"].as_str(),
+            Some("seal_remote_execution" | "remote_execution_seal_status")
+        )
+    }
+
     pub(super) fn check_execution_actor(
         &self,
         body: &Value,
         invocation: &Invocation,
     ) -> Result<()> {
+        if self.is_remote_execution_seal(body) || body["method"] == "rebind_execution" {
+            ensure!(
+                matches!(invocation.actor, Actor::Account(_))
+                    && invocation.initiator == invocation.actor
+                    && invocation.initiating_grant.is_none()
+                    && invocation.context.sdk_session.is_none()
+                    && body["sdk_session"].is_null()
+                    && body["parent_invocation"].is_null(),
+                "execution rebind and seal require an independent account action"
+            );
+            return Ok(());
+        }
         let resolution = self.is_execution_resolution(body)?;
         if !resolution && !self.is_execution_metadata(body)? {
             return Ok(());
@@ -120,7 +139,7 @@ impl Runtime {
         let selected = ["execution_resource", "target_public_key", "execution_grant"];
         let target = match body["method"].as_str() {
             Some("operate") => body["request"]["target_node"].as_str(),
-            Some("bind_execution") => body["target_node"].as_str(),
+            Some("bind_execution" | "rebind_execution") => body["target_node"].as_str(),
             _ => None,
         };
         let local = self.identity.node_id()?;
@@ -147,7 +166,9 @@ impl Runtime {
         audience: &Audience,
         now: u64,
     ) -> Result<RequestFacts> {
-        if self.is_execution_metadata(body)? {
+        if self.is_remote_execution_seal(body) {
+            store.remote_execution_seal_facts(body, audience, now)
+        } else if self.is_execution_metadata(body)? {
             if let Some(facts) = store.execution_dispatch_metadata_facts(body, audience, now)? {
                 return Ok(facts);
             }

@@ -89,6 +89,53 @@ fn provider_result(mut value: Value, native: Option<&str>) -> Value {
 }
 
 impl Runtime {
+    pub(super) async fn seal_remote_execution(
+        self: &Arc<Self>,
+        access: &Access,
+        body: &Value,
+    ) -> Result<Value> {
+        use crate::identity::execution_binding_seal::RemoteExecutionSealPreflight;
+
+        access.require_body(body)?;
+        let _seal = self.handoff_resolution_lock.lock().await;
+        let preflight = {
+            let store = self.store.lock().await;
+            access.verification.run(|| {
+                store.authorize_remote_execution_seal_fence(
+                    &self.identity,
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    body,
+                    now_ms() as u64,
+                )
+            })?
+        };
+        let context = match preflight {
+            RemoteExecutionSealPreflight::Existing(seal) => {
+                return Ok(json!({"seal":seal}));
+            }
+            RemoteExecutionSealPreflight::Fence(context) => context,
+        };
+        let (stopped, _) = self.engine.fence_operation(&context).await?;
+        self.engine.complete_fenced_operation(&stopped).await?;
+        let seal = {
+            let mut store = self.store.lock().await;
+            access.verification.run(|| {
+                store.seal_remote_execution_authorized(
+                    &self.identity,
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    body,
+                    &stopped,
+                    now_ms() as u64,
+                )
+            })?
+        };
+        Ok(json!({"seal":seal}))
+    }
+
     pub(super) async fn complete_execution_dispatch(
         self: &Arc<Self>,
         operation: &OperationRecord,

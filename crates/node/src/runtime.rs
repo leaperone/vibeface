@@ -2705,7 +2705,7 @@ impl Runtime {
                     !self.is_execution_resolution(&body)? && !self.is_execution_dispatch(&body)?,
                     "prepare has no verified execution destination"
                 );
-                store.request_facts(&body, prepared.audience())?
+                self.authorization_facts(&store, &body, prepared.audience(), now)?
             }
         };
         ensure!(
@@ -4111,6 +4111,21 @@ impl Runtime {
                 };
                 Ok(json!({"seal":seal}))
             }
+            "seal_remote_execution" => self.seal_remote_execution(&access, &input).await,
+            "remote_execution_seal_status" => {
+                let mut store = self.store.lock().await;
+                let seal = access.verification.run(|| {
+                    store.remote_execution_seal_status_authorized(
+                        &self.identity,
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        &input,
+                        now_ms() as u64,
+                    )
+                })?;
+                Ok(json!({"seal":seal}))
+            }
             "rebind_execution" => self.rebind_execution(&access, &input).await,
             "operate" => {
                 let request: OperationRequest = serde_json::from_value(input["request"].clone())?;
@@ -4621,14 +4636,32 @@ impl Runtime {
         let binding = {
             let mut store = self.store.lock().await;
             access.verification.run(|| {
-                store.rebind_task_authorized(
-                    &self.identity,
-                    &access.authorization,
-                    &access.freshness,
-                    &access.transport,
-                    input,
-                    now_ms() as u64,
-                )
+                let now = now_ms() as u64;
+                if self.is_execution_dispatch(input)? {
+                    let dispatch = store.execution_dispatch_facts(
+                        input,
+                        access.authorization.audience(),
+                        now,
+                    )?;
+                    store.rebind_execution_dispatch_authorized(
+                        &self.identity,
+                        &dispatch,
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        input,
+                        now,
+                    )
+                } else {
+                    store.rebind_task_authorized(
+                        &self.identity,
+                        &access.authorization,
+                        &access.freshness,
+                        &access.transport,
+                        input,
+                        now,
+                    )
+                }
             })?
         };
         Ok(json!({"binding":binding}))
