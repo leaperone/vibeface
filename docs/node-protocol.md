@@ -114,7 +114,7 @@ WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"d
 
 `/api/tools` 只接受本机 SDK 调用期间签发的短期 bearer token，权限固定到一个个人网络和业务会话。它不是供外部 Bot 保存的长期身份，不能添加或撤销设备、回答审批或验收工单。管理 SDK 使用独立随机端口的回环 listener，不依赖公网或 LAN 地址。
 
-HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目标入队以版本化调度回执为准，任务是否完成仍查询执行账本及工单状态。
+HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目标入队以版本化调度回执为准，工作是否完成仍查询执行账本及结果。
 
 ## RPC 方法
 
@@ -123,9 +123,11 @@ HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目
 | method | 主要字段 | 结果或行为 |
 |---|---|---|
 | `nodes` | 无 | 已授权 Node、可达性和当前可查能力 |
+| `bots` | 无 | 当前个人网络的持久机器人定义 |
+| `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project` | 本人显式创建机器人并绑定独立聊天历史；完整请求精确去重 |
 | `conversations` | 无 | 本地已知业务会话 |
 | `create_conversation` | `conversation_id`、`title` | 以稳定 ID 创建会话，同 ID 同内容可去重 |
-| `conversation` | `conversation_id`、可选 `basis_heads` | 本机已知消息、工单、heads、missing、调度队列、执行摘要及事实新鲜度 |
+| `conversation` | `conversation_id`、可选 `basis_heads` | 本机已知消息、机器人定义、executions 投影、历史目标、heads、missing、调度队列及事实新鲜度 |
 | `message` | `conversation_id`、`message_id`、`text`、可选 `basis_heads`、`scheduler_node`、`report_results` | 原子保存用户消息、汇报意图和本机 inbox 或 outbox，返回调度回执 |
 | `create_task` | `conversation_id`、`task_id`、`title`、`goal`、`acceptance` | 创建工单；`auto_followup=true` 被拒绝，授权使用 `set_followup` |
 | `update_task` | `conversation_id`、`task_id`、`status`、`detail` | 追加工单状态变化 |
@@ -133,6 +135,7 @@ HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目
 | `cancel_manager` | `conversation_id`、`trigger` | 本人请求停止指定管理轮，返回取消请求状态，不表示后台任务已停止 |
 | `resolve_manager_unknown` | `conversation_id`、`trigger`、`evidence` | 本人核对旧管理轮及原操作证据后解除管理写冻结，不重做旧触发 |
 | `task_control` | `conversation_id`、`task_id`、`action`，写控制另需 `operation_id`、`expected_operation_id`、`expected_revision` | 读取具体任务状态，或按原绑定执行 `steer`、`interrupt`、`respond_request` |
+| `execution_control` | `conversation_id`、`operation_id`、`expected_operation_id`、`expected_revision`、`action` | 从原签名派发解析目标和执行资源，按真实能力控制后台工作，不要求 Task |
 | `read_artifact` | `conversation_id`、`blob_hash`、可选 `offset`、`limit` | 分页读取本网络、该会话实际引用的 UTF-8 文本附件 |
 | `operate` | `request` | 向指定执行 Node 提交 `OperationRequest` |
 | `session` | `target_node`、`session_id` | 查询原执行会话及当前事实 |
@@ -146,13 +149,21 @@ HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目
 
 工单状态为 `open`、`working`、`blocked`、`needs_review`、`accepted` 或 `cancelled`。`accepted` 和 `cancelled` 只能由本人设置，Agent 不能将它们改回活动状态。`resolve_unknown.outcome` 为 `succeeded` 或 `failed`，证据至少 12 字节。
 
-`message_id`、`conversation_id`、`task_id` 和 `operation_id` 是业务去重身份。重试保留原 ID 和原内容；同 ID 换内容会被拒绝。管理 Agent 的可用工具仅为 `nodes`、`context`、`create_task`、`update_task`、`open_execution`、`send_execution` 和 `execution_status`。
+`bot_id`、`message_id`、`conversation_id`、`task_id` 和 `operation_id` 是业务去重身份。重试保留原 ID 和原内容；同 ID 换内容会被拒绝。聊天 Agent 的工具为 `nodes`、`context`、`command`、`delegate`、`continue_execution`、`execution_status`、`stop_execution` 和只读的 `call_lookup`。只读结果回调只得到查询工具。
+
+Bot 定义包含独立的 `bot_id`、内部 `conversation_id`、`name`、`instructions`、可选 `project` 和来源 `event_hash`。`project` 为 `{ target_node, cwd }`，只表达执行偏好，不授予权限。`BotCreated` 进入对应聊天的签名 DAG，Store 从事件重建投影。创建新机器人时，聊天与 Bot 定义在同一事务保存；也可由本人显式选用尚未归属机器人的完整旧历史。导入或重建定义不启动模型。
+
+Node 的 manager 配置保存本机 SDK adapter 和凭证，Bot 定义保存职责。每个 Bot 的内部聊天 scope 独立，原生 SDK 缓存仍按网络、scope 和本机节点保存。缓存不是共享聊天的事实来源。
+
+写工具在副作用前保存稳定调用引用与已准备的实际请求。程序生成 operation/session ID 并固定目标与 revision；恢复先读取原调用，不能根据同一命令文本猜测是否重复，也不能换目标重派。
 
 `conversation.scheduler` 包含 `jobs`、`provider`、`model`、`capabilities` 和 `write_frozen`。每个 job 保留 `trigger`、`target_node`、`kind`、`sequence`、`state` 及可用的 `message_id`、`read_only`、`reply_message_id`。`kind` 为 `human` 或 `autonomous`。完成消息替换同一调用的临时文字，不把临时文字当成已持久保存的回答。
 
 任务包含 `followup_mode` 和 `followup_version`。已验证的 `binding` 包含目标、会话、原操作、revision、真实 `capabilities` 和 `pending_requests`。远端摘要保留缓存或未知标记，`facts_freshness=local_known_history` 不证明全网最新。
 
 `task_control.action=status` 是只读查询。其他动作返回完整 `OperationRecord`，重试必须保留原控制 `operation_id` 和内容。Node 检查原操作及 revision，解析真实 turn 和审批请求。`steer` 另需 `text`，`respond_request` 另需 `request_id` 和 `response`。过期请求被拒绝，模型不能回答审批。
+
+`execution_control.action` 为互斥对象，支持 `{ type: "interrupt" }`、`{ type: "steer", text }` 或 `{ type: "respond_request", request_id, response }`。Node 从 `expected_operation_id` 找到原派发，不信任客户端传入执行目标。审批仍要求本人和有效原请求；重试保留完整载荷与原控制 ID。无 SDK 会话的短命令只声明实际支持的查询能力，不伪造 SDK 中断。
 
 `read_artifact` 返回 `{ blob_hash, text, offset, next_offset, size }`。偏移与长度按 UTF-8 字节计算，`limit` 范围为 4 至 65536，默认 65536。偏移必须位于字符边界；下一页使用返回的 `next_offset`，为 `null` 时结束。Node 核对签名附件引用、长度和哈希，正文未同步、非 UTF-8 或仅凭其他会话的哈希猜读都会拒绝。
 
@@ -208,9 +219,9 @@ job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`f
 }
 ```
 
-`task_id` 可为 `null`。`basis_heads` 标记本次操作依据的已知历史。目标 Node 在接单前拉取并校验其依赖闭包、派发记录和必要附件。空数组不表示全网没有其他历史。
+`task_id` 可为 `null`。普通打开和发送操作不创建隐式 Task。`session_id` 可为 `null`，SDK 动作必须指定真实逻辑会话，短命令必须为 `null` 且 `expected_revision=0`。`basis_heads` 标记本次操作依据的已知历史。目标 Node 在接单前拉取并校验其依赖闭包、派发记录和必要附件。空数组不表示全网没有其他历史。
 
-Agent 向已关联工单的执行会话提交新工作时，必须显式提供活动工单的 `task_id`，不能省略编号来绕过验收或取消。本人可明确提交不关联工单的操作；从未关联工单的会话也允许 `null`。Rust 在派发前取得工单唯一执行绑定，执行端独立验签。
+向已关联显式 Task 的执行会话提交新工作时，必须保留活动 Task 的 `task_id`，不能省略编号来绕过验收或取消。普通无 Task 操作使用独立的未绑定会话，接单与领取执行事务都核验会话归属原 conversation。显式 Task 路径仍在派发前取得唯一执行绑定，执行端独立验签。
 
 | action.type | 其他字段 | 执行器支持 |
 |---|---|---|
@@ -220,20 +231,27 @@ Agent 向已关联工单的执行会话提交新工作时，必须显式提供�
 | `steer` | `turn_id`、`text` | Codex |
 | `interrupt` | `turn_id` | Codex |
 | `respond_request` | 原始 `request_id`、`response` | Codex，仅本人 |
+| `command` | `command`、`cwd`、`timeout_secs` | Node 受限命令，不调用编码 SDK |
 
 执行器枚举为 `codex`、`claude_code`、`cursor_agent`。逻辑 session ID 与执行器原生 session ID 分开保存。审批回答必须绑定当前仍有效的原请求，Node 不自动批准。
 
-`OperationRequest.binding` 是 Rust 派发时取得的 `SignedBinding`。调用方可省略，由 Node 填写。执行端实际接单时必须验证该凭据，不能只依靠请求中的目标字段。
+`OperationRequest.binding` 在显式 Task 路径是 Rust 派发时取得的 `SignedBinding`。调用方可省略，由 Node 填写。执行端实际接单时必须验证该凭据，不能只依靠请求中的目标字段。普通无 Task 操作允许无 binding，仍验证签名派发、本人网络、conversation、执行角色、目录、版本及资源互斥。
 
 自主继续派发还包含 Node 生成的 `manager_authority`，固定 `scheduler_node`、结果 `trigger` 和 `followup_version`。它与完整请求一起进入签名派发事件。执行端核对原签名记录，在首次接单事务内重新检查当前授权版本。已经持久接单的原操作仍按原账本继续，撤权后的旧在途请求不能新接单。
 
 绑定正文包含 `network_id`、`conversation_id`、`task_ref`、`task_id`、`authority_node`、`generation`、`target_node`、`session_id`、`open_spec`、`previous_binding_hash` 和 `previous_seal`。`task_ref` 固定到真实 `TaskCreated` 事件 hash。该创建事件的作者 Node 对首个执行位置执行持久 CAS，两个调度器向不同目标并发派发也只能取得一份绑定。这个 Node 只负责该绑定的唯一确认，不是会话调度负责人。
 
-已有绑定的会话可在创建 Node 离线后继续向原执行 Node 提交操作。新绑定无法取得唯一确认时拒绝派发，不能在另一台设备自行建立替代。没有显式 `task_id` 的新执行会话由 Rust 创建稳定的内部任务，控制及后续操作继承已有绑定。
+已有绑定的会话可在创建 Node 离线后继续向原执行 Node 提交操作。新绑定无法取得唯一确认时拒绝派发，不能在另一台设备自行建立替代。普通执行不合成内部任务，也不能借无 Task 分支使用已经具有显式绑定的会话。
 
 更换执行位置由本人调用 `rebind_execution`，原执行端先明确封存旧绑定，新代绑定引用前代证明。`unknown` 阻止封存和迁移，不用超时假定原执行已经停止。
 
 `expected_revision` 必须匹配执行 Node 当前会话版本。打开及发送操作将工作目录和额外资源规范化，检查本机父子目录重叠。控制操作不能申请额外资源。此机制不提供跨设备共享文件系统的全局锁。
+
+短命令复用同一操作账本、目录互斥和结果回送，不创建 `ExecutionSession`。输出有界，环境不继承 Node 或 Provider 凭证，实际文件读写受平台沙箱限制。缺少沙箱能力时拒绝执行，不降级为裸 shell。超时或取消后的副作用无法证明时保留 `unknown`。
+
+macOS 使用系统 `sandbox-exec`。Linux 要求支持 Landlock ABI 6 的内核及 seccomp，旧内核明确拒绝该工具；还会拒绝无法按目录约束的文件元数据修改。受限短命令不是完整开发环境，依赖受限进程操作的复杂工具需使用已有编码执行器。
+
+新增 Bot 事件和可空 `session_id` 改变了协议内容。旧节点可能无法解码新历史或命令请求，不承诺新旧程序混用时双向可写；同一私人网络的相关节点应使用支持这些字段的版本。本地数据库升级保留已有操作及资源预留，不重放副作用。
 
 操作状态如下：
 
