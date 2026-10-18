@@ -53,6 +53,7 @@ fn signed_receipts(
 fn resolution_authorization(
     fixture: &RetainedHistoryFixture,
     current: &VerifiedTaskCurrentPolicy,
+    evidence: &str,
     now: u64,
 ) -> VerifiedExecutionResolution {
     let state = current.state();
@@ -70,7 +71,7 @@ fn resolution_authorization(
         "target_node": binding.target_node,
         "session_id": binding.session_id,
         "outcome": "succeeded",
-        "evidence": "executor signed the terminal outcome",
+        "evidence": evidence,
         "execution_resource": selection.execution_resource,
         "target_public_key": selection.target_public_key,
         "execution_grant": selection.execution_grant,
@@ -266,7 +267,12 @@ fn task_business_resolution_receipts_keep_typed_hash_after_writer_revocation() {
             .check_execution_handoff_current(&submission, now)
             .is_err()
     );
-    let resolution = resolution_authorization(&fixture, &readonly, now);
+    let resolution = resolution_authorization(
+        &fixture,
+        &readonly,
+        "executor signed the terminal outcome",
+        now,
+    );
     let wire = TaskBusinessWire::Resolve(resolution.wire().clone());
     let challenge = ExecutionHandoffResolutionChallenge::new(
         &resolution,
@@ -386,6 +392,7 @@ fn task_business_resolution_receipts_keep_typed_hash_after_writer_revocation() {
             source_header_hash: export.header().hash().unwrap(),
             business_wire_hash: wire.hash().unwrap(),
             challenge: typed,
+            acceptance: None,
             nonce: Nonce::random().unwrap(),
             issued_at_ms: now,
             expires_at_ms: now + 200,
@@ -421,4 +428,169 @@ fn task_business_resolution_receipts_keep_typed_hash_after_writer_revocation() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn task_business_resolution_receipts_reject_combined_current_policy_budget() {
+    const BASELINE_EVIDENCE: &str = "executor signed the terminal outcome";
+    let mut fixture = retained_history_fixture_with_execution_source();
+    let now = fixture.invocation.payload.not_before_ms + 20;
+    let writer = current_policy(&fixture);
+    revoke_writer(&mut fixture, &writer);
+    let readonly = readonly_policy(
+        &fixture,
+        writer.trust(),
+        RemoteExecutionPolicyPurpose::Resolver,
+        now,
+    );
+    let baseline = resolution_authorization(&fixture, &readonly, BASELINE_EVIDENCE, now);
+    let request_for = |resolution: &VerifiedExecutionResolution| {
+        let wire = TaskBusinessWire::Resolve(resolution.wire().clone());
+        let challenge = TaskBusinessChallenge::Resolve(
+            ExecutionHandoffResolutionChallenge::new(
+                resolution,
+                Nonce::random().unwrap(),
+                now,
+                now + 300,
+            )
+            .unwrap(),
+        );
+        let export = build_task_business_policy_export(
+            &readonly,
+            TaskBusinessAuthorization::Resolve(resolution),
+            &wire,
+            &fixture.project_node,
+            now,
+        )
+        .unwrap();
+        let read = Signed::sign(
+            TaskBusinessReceiptRead {
+                version: AUTH_VERSION,
+                source_header_hash: export.header().hash().unwrap(),
+                business_wire_hash: wire.hash().unwrap(),
+                challenge,
+                acceptance: None,
+                nonce: Nonce::random().unwrap(),
+                issued_at_ms: now,
+                expires_at_ms: now + 200,
+            },
+            &fixture.executor,
+        )
+        .unwrap();
+        (wire, export.header().clone(), read)
+    };
+    let (baseline_wire, baseline_header, baseline_read) = request_for(&baseline);
+    let source = require_confirmed_client_policy(&fixture.source).unwrap();
+    let b_key = PublicKey::of(&fixture.project_node);
+    let actual_c = noise_peer(&fixture.executor, &fixture.project_node);
+    authorize_task_business_challenge(
+        source.state(),
+        &readonly,
+        TaskBusinessAuthorization::Resolve(&baseline),
+        &baseline_wire,
+        &baseline_read.payload.challenge,
+        &b_key,
+        now,
+    )
+    .unwrap();
+    verify_task_business_receipt_read(
+        source.state(),
+        &readonly,
+        TaskBusinessAuthorization::Resolve(&baseline),
+        &baseline_header,
+        &baseline_wire,
+        &actual_c,
+        &baseline_read,
+        &b_key,
+        now,
+    )
+    .unwrap();
+
+    baseline.proof_usage().enforce_limits().unwrap();
+    readonly.proof_usage().enforce_limits().unwrap();
+    let baseline_bytes = baseline.proof_usage().counts().authorization_bytes;
+    let mut combined = baseline.proof_usage().clone();
+    combined.merge(readonly.proof_usage());
+    let current_unique_bytes = combined.counts().authorization_bytes - baseline_bytes;
+    let mut direct_usage = baseline.proof_usage().clone();
+    direct_usage
+        .record_metadata(&baseline_read.payload.challenge)
+        .unwrap();
+    let mut read_usage = baseline.proof_usage().clone();
+    read_usage.record_signed(&baseline_header).unwrap();
+    read_usage.record_signed(&baseline_read).unwrap();
+    let entry_overhead = direct_usage
+        .counts()
+        .authorization_bytes
+        .max(read_usage.counts().authorization_bytes)
+        - baseline_bytes;
+    assert!(
+        current_unique_bytes > entry_overhead + 1,
+        "current unique bytes {current_unique_bytes} must exceed receipt entry overhead {entry_overhead}"
+    );
+    let headroom = (current_unique_bytes + entry_overhead) / 2;
+    let added_evidence_bytes = MAX_PROOF_BYTES
+        .checked_sub(baseline_bytes + headroom)
+        .expect("baseline and measured receipt headroom must leave room for evidence");
+    let evidence = "e".repeat(BASELINE_EVIDENCE.len() + added_evidence_bytes);
+    assert!(evidence.len() <= 65_536);
+    let resolution = resolution_authorization(&fixture, &readonly, &evidence, now);
+    let (wire, header, read) = request_for(&resolution);
+    resolution.proof_usage().enforce_limits().unwrap();
+    assert_eq!(
+        resolution.proof_usage().counts().authorization_bytes,
+        baseline_bytes + added_evidence_bytes
+    );
+    let mut direct_usage = resolution.proof_usage().clone();
+    direct_usage
+        .record_metadata(&read.payload.challenge)
+        .unwrap();
+    direct_usage.enforce_limits().unwrap();
+    let mut read_usage = resolution.proof_usage().clone();
+    read_usage.record_signed(&header).unwrap();
+    read_usage.record_signed(&read).unwrap();
+    read_usage.enforce_limits().unwrap();
+    let mut combined = resolution.proof_usage().clone();
+    combined.merge(readonly.proof_usage());
+    assert!(combined.counts().authorization_bytes > MAX_PROOF_BYTES);
+    assert!(matches!(
+        combined.enforce_limits(),
+        Err(AuthorizationError::BudgetExceeded)
+    ));
+    println!(
+        "resolution_receipt_budget current={} business={} direct_without_current={} read_without_current={} combined={} current_unique={} evidence={}",
+        readonly.proof_usage().counts().authorization_bytes,
+        resolution.proof_usage().counts().authorization_bytes,
+        direct_usage.counts().authorization_bytes,
+        read_usage.counts().authorization_bytes,
+        combined.counts().authorization_bytes,
+        current_unique_bytes,
+        evidence.len(),
+    );
+    assert!(matches!(
+        authorize_task_business_challenge(
+            source.state(),
+            &readonly,
+            TaskBusinessAuthorization::Resolve(&resolution),
+            &wire,
+            &read.payload.challenge,
+            &b_key,
+            now,
+        ),
+        Err(AuthorizationError::BudgetExceeded)
+    ));
+    assert!(matches!(
+        verify_task_business_receipt_read(
+            source.state(),
+            &readonly,
+            TaskBusinessAuthorization::Resolve(&resolution),
+            &header,
+            &wire,
+            &actual_c,
+            &read,
+            &b_key,
+            now,
+        ),
+        Err(AuthorizationError::BudgetExceeded)
+    ));
 }

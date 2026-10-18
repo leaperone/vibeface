@@ -6,6 +6,7 @@ mod resolution_tests;
 use super::super::{
     execution_handoff::{ExecutionHandoffChallenge, ExecutionHandoffResolutionChallenge},
     execution_observation::ExecutionObservationChallenge,
+    remote_execution_history::RemoteExecutionHistoryAcceptance,
 };
 use super::*;
 
@@ -166,13 +167,14 @@ impl TaskBusinessChallenge {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskBusinessReceiptRead {
     pub version: u16,
     pub source_header_hash: ObjectHash,
     pub business_wire_hash: ObjectHash,
     pub challenge: TaskBusinessChallenge,
+    pub acceptance: Option<RemoteExecutionHistoryAcceptance>,
     pub nonce: Nonce,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
@@ -232,18 +234,123 @@ pub fn verify_task_business_receipt_read(
     local_b: &PublicKey,
     now: u64,
 ) -> Result<VerifiedTaskBusinessReceiptAuthority> {
+    if let TaskBusinessWire::Submit(wire) = original_wire {
+        return verify_task_business_operation_receipt_read(
+            primary,
+            current,
+            original_header,
+            wire,
+            actual_c_noise,
+            request,
+            local_b,
+            now,
+        );
+    }
     let _signatures = ScopedSignatureVerification::new();
+    require(
+        request.payload.acceptance.is_none(),
+        "current read-only business receipts do not accept a submission checkpoint",
+    )?;
+    let usage = verify_receipt_request(
+        original_header,
+        original_wire,
+        actual_c_noise,
+        request,
+        local_b,
+        now,
+    )?;
+    let mut verified = authorize_inner(
+        primary,
+        current,
+        authorization,
+        original_wire,
+        &request.payload.challenge,
+        local_b,
+        now,
+        usage,
+    )?;
+    verified.expires_at_ms = verified.expires_at_ms.min(request.payload.expires_at_ms);
+    Ok(verified)
+}
+
+pub fn verify_task_business_operation_receipt_read(
+    primary: &VerifiedPolicySet,
+    current: &VerifiedTaskCurrentPolicy,
+    original_header: &Signed<TaskBusinessPolicyHeader>,
+    original_wire: &SignedExecutionHandoff,
+    actual_c_noise: &ActualPolicyNoisePeer,
+    request: &Signed<TaskBusinessReceiptRead>,
+    local_b: &PublicKey,
+    now: u64,
+) -> Result<VerifiedTaskBusinessReceiptAuthority> {
+    let _signatures = ScopedSignatureVerification::new();
+    let wire = TaskBusinessWire::Submit(original_wire.clone());
+    let mut usage = verify_receipt_request(
+        original_header,
+        &wire,
+        actual_c_noise,
+        request,
+        local_b,
+        now,
+    )?;
+    let TaskBusinessChallenge::Submit(challenge) = &request.payload.challenge else {
+        return Err(AuthorizationError::InvalidProof(
+            "accepted operation requires its original handoff challenge",
+        ));
+    };
+    require(
+        matches!(
+            challenge.stage,
+            CheckStage::Start | CheckStage::Renew | CheckStage::RemoteRead
+        ),
+        "Task business admission receipts require their original Client session",
+    )?;
+    let acceptance =
+        request
+            .payload
+            .acceptance
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "operation receipt reads require the executor's signed admission checkpoint",
+            ))?;
+    let operation = super::original_operation::verify_task_business_receipt_operation(
+        current,
+        original_header,
+        original_wire,
+        acceptance,
+        challenge,
+        now,
+    )?;
+    require(
+        operation.acceptance_envelope_hash() == &ObjectHash::body(acceptance)?,
+        "operation receipt read changed its verified executor checkpoint",
+    )?;
+    usage.merge(operation.proof_usage());
+    usage.enforce_limits()?;
+    let mut verified = authorize_inner(
+        primary,
+        current,
+        TaskBusinessAuthorization::Submit(operation.authorization()),
+        &wire,
+        &request.payload.challenge,
+        local_b,
+        now,
+        usage,
+    )?;
+    verified.expires_at_ms = verified.expires_at_ms.min(request.payload.expires_at_ms);
+    Ok(verified)
+}
+
+fn verify_receipt_request(
+    original_header: &Signed<TaskBusinessPolicyHeader>,
+    original_wire: &TaskBusinessWire,
+    actual_c_noise: &ActualPolicyNoisePeer,
+    request: &Signed<TaskBusinessReceiptRead>,
+    local_b: &PublicKey,
+    now: u64,
+) -> Result<ExecutionProofUsage> {
     carrier(request)?;
     carrier(original_header)?;
-    if let TaskBusinessChallenge::Submit(challenge) = &request.payload.challenge {
-        require(
-            matches!(
-                challenge.stage,
-                CheckStage::Start | CheckStage::Renew | CheckStage::RemoteRead
-            ),
-            "Task business admission receipts require their original Client session",
-        )?;
-    }
     window(
         request.payload.issued_at_ms,
         request.payload.expires_at_ms,
@@ -269,18 +376,7 @@ pub fn verify_task_business_receipt_read(
     let mut usage = ExecutionProofUsage::default();
     usage.record_signed(original_header)?;
     usage.record_signed(request)?;
-    let mut verified = authorize_inner(
-        primary,
-        current,
-        authorization,
-        original_wire,
-        &request.payload.challenge,
-        local_b,
-        now,
-        usage,
-    )?;
-    verified.expires_at_ms = verified.expires_at_ms.min(request.payload.expires_at_ms);
-    Ok(verified)
+    Ok(usage)
 }
 
 fn authorize_inner(
@@ -425,8 +521,10 @@ mod tests {
     use super::*;
     use crate::authorization::{
         client_policy_import::require_confirmed_client_policy,
+        events::StoredTransport,
         execution_handoff::{
-            ExecutionHandoffFreshness, verify_execution_handoff_admission_checkpoint,
+            ExecutionHandoffAdmissionReceipt, ExecutionHandoffFreshness,
+            verify_execution_handoff_admission_checkpoint,
         },
         execution_observation::tests::{
             RetainedHistoryFixture, retained_history_fixture_with_execution_source,
@@ -734,6 +832,7 @@ mod tests {
                 source_header_hash: export.header().hash().unwrap(),
                 business_wire_hash: business_wire.hash().unwrap(),
                 challenge: typed,
+                acceptance: None,
                 nonce: Nonce::random().unwrap(),
                 issued_at_ms: now,
                 expires_at_ms: now + 300,
@@ -824,17 +923,34 @@ mod tests {
                 );
             }
         }
+        let accepted_freshness = ExecutionHandoffFreshness {
+            challenge: challenge.clone(),
+            receipts,
+        };
+        let freshness = current
+            .state()
+            .verify_execution_handoff_freshness(&business, &accepted_freshness, now)
+            .unwrap();
         current
             .state()
-            .verify_execution_handoff_freshness(
-                &business,
-                &ExecutionHandoffFreshness {
-                    challenge: challenge.clone(),
-                    receipts,
-                },
-                now,
-            )
+            .admit_execution_handoff(&business, &freshness, now)
             .unwrap();
+        let accepted_transport = StoredTransport::from(&transport);
+        let acceptance = RemoteExecutionHistoryAcceptance::ExecutionResult {
+            receipt: Signed::sign(
+                ExecutionHandoffAdmissionReceipt::new(
+                    &fixture.actual.handoff,
+                    &accepted_freshness,
+                    &accepted_transport,
+                    now,
+                )
+                .unwrap(),
+                &fixture.executor,
+            )
+            .unwrap(),
+            freshness: accepted_freshness,
+            transport: accepted_transport,
+        };
         let mut changed = challenge.clone();
         changed.original_body_hash = ObjectHash::body(&"another original body").unwrap();
         assert!(
@@ -887,7 +1003,7 @@ mod tests {
             receipt,
             freshness,
             transport: accepted_transport,
-        } = &fixture.acceptance
+        } = &acceptance
         else {
             panic!("fixture has no accepted handoff")
         };
@@ -925,6 +1041,7 @@ mod tests {
                 source_header_hash: expired_header.hash().unwrap(),
                 business_wire_hash: wire.hash().unwrap(),
                 challenge: renew.clone(),
+                acceptance: Some(acceptance.clone()),
                 nonce: Nonce::random().unwrap(),
                 issued_at_ms: now + 6,
                 expires_at_ms: now + 400,
