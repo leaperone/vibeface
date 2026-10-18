@@ -239,6 +239,7 @@ mod tests {
                 version: AUTH_VERSION,
                 read: NodeExecutionPolicyReadIntent {
                     version: AUTH_VERSION,
+                    source_provenance: None,
                     source_project: project,
                     selection: RemoteExecutionPolicySelection {
                         execution_resource: resource.clone(),

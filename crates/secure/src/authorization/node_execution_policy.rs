@@ -10,24 +10,31 @@ use super::{
 };
 use crate::signature_verification::ScopedSignatureVerification;
 
-pub(super) mod service;
 mod freshness;
 mod provenance;
-pub use provenance::{SdkPolicySourceFacts, SdkPolicySourceProvenance, SdkPolicySession,
-    SdkPolicyLease, sdk_policy_source_heads};
+mod retained;
+pub(super) mod service;
 pub use freshness::{
-    NodeExecutionFreshnessRead, VerifiedNodeExecutionFreshnessRead,
-    record_node_freshness_receipts, verify_node_execution_freshness_read,
+    NodeExecutionFreshnessRead, VerifiedNodeExecutionFreshnessRead, record_node_freshness_receipts,
+    verify_node_execution_freshness_read,
 };
+pub use provenance::{
+    SdkPolicyLease, SdkPolicySession, SdkPolicySourceFacts, SdkPolicySourceProvenance,
+    VerifiedSdkSourceProvenance, restore_sdk_source_provenance, sdk_policy_source_heads,
+    verify_sdk_source_provenance,
+};
+pub use retained::node_task_policy_source_from_retained;
 pub use service::{
     NodeTaskExecutionPolicyImport, begin_node_task_policy_import,
-    verify_node_history_policy_source, verify_node_service_policy_source,
+    begin_retained_node_task_policy_import, verify_node_history_policy_source,
+    verify_node_service_policy_source,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NodeExecutionPolicyReadIntent {
     pub version: u16,
+    pub source_provenance: Option<ObjectHash>,
     pub source_project: ResourceRef,
     pub selection: RemoteExecutionPolicySelection,
     pub context: prepare::PrepareContext,
@@ -47,6 +54,7 @@ impl SignedObject for NodeExecutionPolicyReadIntent {
 #[serde(deny_unknown_fields)]
 pub struct NodeExecutionHistoryPolicyReadIntent {
     pub version: u16,
+    pub source_provenance: Option<ObjectHash>,
     pub source_project: ResourceRef,
     pub expected_action: Action,
     pub reference: remote_execution_history::RemoteExecutionHistoryReference,
@@ -68,6 +76,12 @@ pub enum NodeExecutionPolicyReadRequest {
 }
 
 impl NodeExecutionPolicyReadRequest {
+    pub fn source_provenance(&self) -> Option<&ObjectHash> {
+        match self {
+            Self::Current(value) => value.payload.source_provenance.as_ref(),
+            Self::History(value) => value.payload.source_provenance.as_ref(),
+        }
+    }
     pub fn issuer(&self) -> &PublicKey {
         match self {
             Self::Current(value) => &value.issuer,
@@ -837,9 +851,11 @@ impl VerifiedTaskCurrentPolicy {
         context: &prepare::PrepareContext,
         now: u64,
     ) -> Result<()> {
-        require(!self.source.retained
-            && self.request.purpose() == RemoteExecutionPolicyPurpose::ObservationRead,
-            "observation source requires a current dedicated readonly policy")?;
+        require(
+            !self.source.retained
+                && self.request.purpose() == RemoteExecutionPolicyPurpose::ObservationRead,
+            "observation source requires a current dedicated readonly policy",
+        )?;
         self.check_window(now)?;
         self.check_exact_scope(facts, selection, context)
     }
@@ -2080,6 +2096,7 @@ mod tests {
         context.workspace_resource = Some(project.resource.clone());
         let value = NodeExecutionPolicyReadIntent {
             version: AUTH_VERSION,
+            source_provenance: None,
             source_project: project,
             selection: RemoteExecutionPolicySelection {
                 execution_resource: resource.clone(),

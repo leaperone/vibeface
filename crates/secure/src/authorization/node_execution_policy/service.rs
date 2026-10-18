@@ -13,6 +13,31 @@ pub(super) struct NodeTaskPolicySourceScope {
     service_grant: Option<ObjectHash>,
     current_binding: Option<SignedBinding>,
     lease_expires_at_ms: u64,
+    provenance: Option<SdkPolicySourceProvenance>,
+}
+
+impl NodeTaskPolicySourceScope {
+    pub(super) fn from_retained_sdk(
+        source: &VerifiedSdkSourceProvenance,
+        raw: &SdkPolicySourceProvenance,
+        request: &NodeExecutionPolicyReadRequest,
+    ) -> Result<Self> {
+        require(
+            source.digest() == &ObjectHash::body(raw)?,
+            "retained SDK source changed its verified provenance",
+        )?;
+        Ok(Self {
+            facts: source.facts().clone(),
+            context: request.context()?,
+            request: request.clone(),
+            parent: Some(source.parent().clone()),
+            service: Some(raw.session.service.clone()),
+            service_grant: Some(raw.service_grant.clone()),
+            current_binding: raw.current_binding.clone(),
+            lease_expires_at_ms: source.expires_at_ms(),
+            provenance: Some(raw.clone()),
+        })
+    }
 }
 
 /// Produced only after a current local reader or SDK delegation has been checked.
@@ -21,6 +46,12 @@ pub(crate) struct VerifiedNodeTaskPolicyAuthority {
     heads: Vec<PolicyStamp>,
 }
 impl VerifiedNodeTaskPolicyAuthority {
+    pub(super) fn from_sdk_provenance(source: &VerifiedSdkSourceProvenance) -> Self {
+        Self {
+            state: source.state().clone(),
+            heads: source.heads().to_vec(),
+        }
+    }
     pub(crate) fn state(&self) -> &VerifiedPolicySet {
         &self.state
     }
@@ -36,7 +67,7 @@ fn finish_usage(usage: &mut ExecutionProofUsage) -> Result<()> {
     usage.enforce_limits()
 }
 
-fn source_project(
+pub(super) fn source_project(
     primary: &VerifiedPolicySet,
     project: &ResourceRef,
     audience: &Audience,
@@ -54,7 +85,7 @@ fn source_project(
     )
 }
 
-fn check_sdk_read_context(
+pub(super) fn check_sdk_read_context(
     facts: &RequestFacts,
     context: &prepare::PrepareContext,
     local: &PublicKey,
@@ -93,7 +124,7 @@ fn check_sdk_read_context(
     )
 }
 
-fn check_binding(
+pub(super) fn check_binding(
     trust: &VerifiedTaskExecutionTrust,
     context: &prepare::PrepareContext,
     binding: Option<&SignedBinding>,
@@ -164,7 +195,7 @@ pub fn verify_node_service_policy_source(
     selection: &RemoteExecutionPolicySelection,
     read_context: &prepare::PrepareContext,
     current_binding: Option<&SignedBinding>,
-    lease_expires_at: u64,
+    provenance: &SdkPolicySourceProvenance,
     identity: &Identity,
     purpose: RemoteExecutionPolicyPurpose,
     now: u64,
@@ -177,6 +208,17 @@ pub fn verify_node_service_policy_source(
         "History requires a current read source and its original artifact",
     )?;
     read_window(now, expires, now)?;
+    let verified_source = verify_sdk_source_provenance(
+        primary,
+        parent,
+        provenance,
+        service,
+        service_grant,
+        child_facts,
+        current_binding,
+        now,
+    )?;
+    let lease_expires_at = verified_source.expires_at_ms();
     require(
         now < lease_expires_at && expires <= lease_expires_at,
         "native policy source exceeds its current SDK lease",
@@ -195,13 +237,10 @@ pub fn verify_node_service_policy_source(
         &local,
         child_facts.action,
     )?;
-    let delegated =
-        primary.verify_sdk_policy_read_source(parent, service, service_grant, child_facts, now)?;
     require(
         service == &ServiceId::from_key(&local)
-            && delegated.service() == service
-            && delegated.device() == &DeviceId::from_key(&local)
-            && expires <= delegated.expires_at_ms(),
+            && provenance.session.device == DeviceId::from_key(&local)
+            && expires <= verified_source.expires_at_ms(),
         "native policy source is not this Node's current service delegation",
     )?;
     let expected_action = match purpose {
@@ -223,6 +262,7 @@ pub fn verify_node_service_policy_source(
     let request = NodeExecutionPolicyReadRequest::Current(Signed::sign(
         NodeExecutionPolicyReadIntent {
             version: AUTH_VERSION,
+            source_provenance: Some(verified_source.digest().clone()),
             source_project: child_facts.resource.clone(),
             selection: selection.clone(),
             context: read_context.clone(),
@@ -236,11 +276,8 @@ pub fn verify_node_service_policy_source(
         identity,
     )?);
     check_task_read_scope(trust, &TaskExecutionPolicyRequest::Node(request.clone()))?;
-    let mut usage = delegated.proof_usage().clone();
-    let authority = VerifiedNodeTaskPolicyAuthority {
-        state: primary.clone(),
-        heads: delegated.heads().to_vec(),
-    };
+    let mut usage = verified_source.proof_usage().clone();
+    let authority = VerifiedNodeTaskPolicyAuthority::from_sdk_provenance(&verified_source);
     let snapshot = policy_import::native_node_execution_source_snapshot(&authority, primary_pins)?;
     if let NodeExecutionPolicyReadRequest::Current(value) = &request {
         usage.record_signed(value)?;
@@ -263,9 +300,10 @@ pub fn verify_node_service_policy_source(
             service_grant: Some(service_grant.clone()),
             current_binding: current_binding.cloned(),
             lease_expires_at_ms: lease_expires_at,
+            provenance: Some(provenance.clone()),
         }),
         verified_at_ms: now,
-        expires_at_ms: expires.min(delegated.expires_at_ms()).min(lease_expires_at),
+        expires_at_ms: expires.min(lease_expires_at),
         usage,
         retained: false,
     };
@@ -280,6 +318,7 @@ pub fn verify_node_history_policy_source(
     current_reader: &VerifiedAuthorization,
     reference: &remote_execution_history::RemoteExecutionHistoryReference,
     original_binding: Option<&SignedBinding>,
+    provenance: Option<&SdkPolicySourceProvenance>,
     identity: &Identity,
     now: u64,
     expires: u64,
@@ -288,7 +327,37 @@ pub fn verify_node_history_policy_source(
     read_window(now, expires, now)?;
     primary.check_current(current_reader, now)?;
     let local = PublicKey::of(identity);
-    let facts = &current_reader.signed_invocation().payload;
+    let invocation = &current_reader.signed_invocation().payload;
+    let verified_source = provenance
+        .map(|record| {
+            verify_sdk_source_provenance(
+                primary,
+                current_reader,
+                record,
+                &record.session.service,
+                &record.service_grant,
+                &record.child_facts.request_facts(),
+                record.current_binding.as_ref(),
+                now,
+            )
+        })
+        .transpose()?;
+    let account_facts = RequestFacts {
+        resource: invocation.resource.clone(),
+        action: invocation.action,
+        audience: invocation.audience.clone(),
+        operation_id: invocation.operation_id.clone(),
+        body_hash: invocation.body_hash.clone(),
+        context: invocation.context.clone(),
+    };
+    let facts = verified_source
+        .as_ref()
+        .map(VerifiedSdkSourceProvenance::facts)
+        .unwrap_or(&account_facts);
+    require(
+        facts.context.sdk_session.is_none() || verified_source.is_some(),
+        "native SDK History requires its complete source provenance",
+    )?;
     source_project(primary, &facts.resource, &facts.audience, &local)?;
     remote_execution_history::validate_remote_execution_history_reference(reference)?;
     let context = reference.context()?;
@@ -323,6 +392,9 @@ pub fn verify_node_history_policy_source(
     let request = NodeExecutionPolicyReadRequest::History(Signed::sign(
         NodeExecutionHistoryPolicyReadIntent {
             version: AUTH_VERSION,
+            source_provenance: verified_source
+                .as_ref()
+                .map(|source| source.digest().clone()),
             source_project: facts.resource.clone(),
             expected_action: facts.action,
             reference: reference.clone(),
@@ -334,12 +406,22 @@ pub fn verify_node_history_policy_source(
         identity,
     )?);
     check_task_read_scope(trust, &TaskExecutionPolicyRequest::Node(request.clone()))?;
-    let authority = VerifiedNodeTaskPolicyAuthority {
-        state: primary.clone(),
-        heads: current_reader.dependencies().to_vec(),
-    };
+    let authority = verified_source
+        .as_ref()
+        .map(VerifiedNodeTaskPolicyAuthority::from_sdk_provenance)
+        .unwrap_or_else(|| VerifiedNodeTaskPolicyAuthority {
+            state: primary.clone(),
+            heads: current_reader.dependencies().to_vec(),
+        });
     let snapshot = policy_import::native_node_execution_source_snapshot(&authority, primary_pins)?;
     let mut usage = ExecutionProofUsage::default();
+    if let Some(source) = &verified_source {
+        require(
+            expires <= source.expires_at_ms(),
+            "native History exceeds its SDK source authority",
+        )?;
+        usage.merge(source.proof_usage());
+    }
     usage.record_authorization(current_reader)?;
     usage.record_signed(trust.original_intent())?;
     usage.record_signed(trust.approval())?;
@@ -370,6 +452,7 @@ pub fn verify_node_history_policy_source(
             service_grant: None,
             current_binding: original_binding.cloned(),
             lease_expires_at_ms: current_reader.expires_at_ms(),
+            provenance: provenance.cloned(),
         }),
         verified_at_ms: now,
         expires_at_ms: expires.min(current_reader.expires_at_ms()),
@@ -394,7 +477,7 @@ pub struct NodeTaskExecutionPolicyImport {
     complete: bool,
     usage: ExecutionProofUsage,
     page_envelope_hashes: Vec<ObjectHash>,
-    peer: ActualPolicyNoisePeer,
+    origin: PolicyCarrierOrigin,
 }
 
 fn carrier<T: Serialize>(value: &T) -> Result<()> {
@@ -440,6 +523,56 @@ pub fn begin_node_task_policy_import(
     peer: &ActualPolicyNoisePeer,
     now: u64,
 ) -> Result<NodeTaskExecutionPolicyImport> {
+    require(
+        !source.retained,
+        "retained Node policy requires its original transcript importer",
+    )?;
+    require(
+        peer.public_key() == &trust.selection().target_public_key,
+        "native Node policy import reached another actual Noise peer",
+    )?;
+    begin_node_import(
+        trust,
+        source,
+        request,
+        header,
+        verified_floors,
+        PolicyCarrierOrigin::DirectNoise(peer.clone()),
+        now,
+    )
+}
+
+pub fn begin_retained_node_task_policy_import(
+    trust: &VerifiedTaskExecutionTrust,
+    source: &VerifiedTaskPolicySource,
+    request: &NodeExecutionPolicyReadRequest,
+    header: &Signed<remote_execution_policy::RemoteExecutionPolicySnapshot>,
+    original_clock: u64,
+) -> Result<NodeTaskExecutionPolicyImport> {
+    require(
+        source.retained && source.verified_at_ms == original_clock,
+        "retained Node policy requires its exact original source clock",
+    )?;
+    begin_node_import(
+        trust,
+        source,
+        request,
+        header,
+        &[],
+        PolicyCarrierOrigin::SignedTranscript,
+        original_clock,
+    )
+}
+
+fn begin_node_import(
+    trust: &VerifiedTaskExecutionTrust,
+    source: &VerifiedTaskPolicySource,
+    request: &NodeExecutionPolicyReadRequest,
+    header: &Signed<remote_execution_policy::RemoteExecutionPolicySnapshot>,
+    verified_floors: &[PolicyPin],
+    origin: PolicyCarrierOrigin,
+    now: u64,
+) -> Result<NodeTaskExecutionPolicyImport> {
     let _signatures = ScopedSignatureVerification::new();
     let same_source = match &source.source_scope {
         TaskPolicySourceScope::Node(scope) => scope.request == *request,
@@ -453,10 +586,6 @@ pub fn begin_node_task_policy_import(
     let typed = TaskExecutionPolicyRequest::Node(request.clone());
     check_task_read_scope(trust, &typed)?;
     let expected = &trust.selection().target_public_key;
-    require(
-        peer.public_key() == expected,
-        "native Node policy import reached another actual Noise peer",
-    )?;
     carrier(header)?;
     header.verify_signature()?;
     read_window(
@@ -527,7 +656,7 @@ pub fn begin_node_task_policy_import(
         complete: false,
         usage,
         page_envelope_hashes: Vec::new(),
-        peer: peer.clone(),
+        origin,
     })
 }
 
@@ -541,6 +670,36 @@ struct CompletedNodePolicy {
     usage: ExecutionProofUsage,
     page_envelope_hashes: Vec<ObjectHash>,
     origin: PolicyCarrierOrigin,
+}
+
+impl CompletedNodePolicy {
+    fn into_current_at(self, now: u64) -> Result<VerifiedTaskCurrentPolicy> {
+        let combined =
+            policy_import::merge_same_head_snapshots(&self.source.snapshot, &self.foreign)?;
+        let (primary_heads, foreign_heads) = combined.heads().iter().cloned().partition(|head| {
+            self.source
+                .primary_pins
+                .iter()
+                .any(|pin| pin.domain == head.domain)
+        });
+        let policy = VerifiedTaskCurrentPolicy {
+            selection: self.request.selection()?,
+            context: self.request.context()?,
+            source: self.source,
+            trust: self.trust,
+            request: self.request,
+            snapshot: self.header,
+            witness: self.witness,
+            combined,
+            primary_heads,
+            foreign_heads,
+            usage: self.usage,
+            page_envelope_hashes: self.page_envelope_hashes,
+            origin: self.origin,
+        };
+        policy.check_window(now)?;
+        Ok(policy)
+    }
 }
 
 impl NodeTaskExecutionPolicyImport {
@@ -655,7 +814,12 @@ impl NodeTaskExecutionPolicyImport {
                 && witness.payload.expires_at_ms <= self.header.payload.expires_at_ms
                 && self.source.verified_at_ms <= now
                 && now < self.source.expires_at_ms
-                && self.peer.public_key() == &self.header.issuer,
+                && match &self.origin {
+                    PolicyCarrierOrigin::DirectNoise(peer) => {
+                        peer.public_key() == &self.header.issuer
+                    }
+                    PolicyCarrierOrigin::SignedTranscript => self.source.retained,
+                },
             "native Node policy witness changed its completed stream or actual peer",
         )?;
         let snapshot = self.import.finish(&self.header.payload.target_heads)?;
@@ -701,7 +865,7 @@ impl NodeTaskExecutionPolicyImport {
             foreign,
             usage,
             page_envelope_hashes: self.page_envelope_hashes,
-            origin: PolicyCarrierOrigin::DirectNoise(self.peer),
+            origin: self.origin,
         })
     }
 
@@ -714,33 +878,63 @@ impl NodeTaskExecutionPolicyImport {
             !self.source.retained,
             "retained Node policy cannot become current",
         )?;
-        let finished = self.finish_policy(witness, now, false)?;
-        let combined =
-            policy_import::merge_same_head_snapshots(&finished.source.snapshot, &finished.foreign)?;
-        let (primary_heads, foreign_heads) = combined.heads().iter().cloned().partition(|head| {
-            finished
-                .source
-                .primary_pins
-                .iter()
-                .any(|pin| pin.domain == head.domain)
-        });
-        let policy = VerifiedTaskCurrentPolicy {
-            selection: finished.request.selection()?,
-            context: finished.request.context()?,
-            source: finished.source,
-            trust: finished.trust,
-            request: finished.request,
-            snapshot: finished.header,
-            witness: finished.witness,
-            combined,
-            primary_heads,
-            foreign_heads,
-            usage: finished.usage,
-            page_envelope_hashes: finished.page_envelope_hashes,
-            origin: finished.origin,
-        };
-        policy.check_window(now)?;
-        Ok(policy)
+        self.finish_policy(witness, now, false)?
+            .into_current_at(now)
+    }
+
+    pub fn finish_original_admission(
+        self,
+        witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+        proof: &events::AdmissionProof,
+    ) -> Result<VerifiedTaskOriginalAdmissionPolicy> {
+        require(
+            self.source.retained
+                && self.source.verified_at_ms == proof.admitted_at_ms
+                && self.request.purpose() != RemoteExecutionPolicyPurpose::History,
+            "retained Node policy requires its exact original admission clock and nonhistory purpose",
+        )?;
+        let policy = self
+            .finish_policy(witness, proof.admitted_at_ms, false)?
+            .into_current_at(proof.admitted_at_ms)?;
+        original_admission(policy, proof)
+    }
+
+    pub fn finish_retained_floors(
+        self,
+        witness: &Signed<remote_execution_policy::RemoteExecutionPolicyWitness>,
+        original_clock: u64,
+    ) -> Result<Vec<PolicyPin>> {
+        require(
+            self.source.retained && self.source.verified_at_ms == original_clock,
+            "retained Node floors require their exact original source clock",
+        )?;
+        let history = self.request.purpose() == RemoteExecutionPolicyPurpose::History;
+        let completed = self.finish_policy(witness, original_clock, history)?;
+        completed
+            .foreign
+            .pins()
+            .iter()
+            .filter(|pin| {
+                !completed
+                    .source
+                    .primary_pins
+                    .iter()
+                    .any(|primary| primary.domain == pin.domain)
+            })
+            .map(|pin| {
+                let mut pin = pin.clone();
+                pin.minimum_head = Some(
+                    completed
+                        .foreign
+                        .heads()
+                        .iter()
+                        .find(|head| head.domain == pin.domain)
+                        .cloned()
+                        .ok_or(AuthorizationError::PolicyConflict)?,
+                );
+                Ok(pin)
+            })
+            .collect()
     }
 
     pub fn finish_history(
