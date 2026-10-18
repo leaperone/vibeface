@@ -1147,6 +1147,18 @@ fn retained_dispatch_from(
     identity: &LocalIdentity,
     wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
 ) -> Result<RetainedDispatch> {
+    retained_dispatch_with_key_from(
+        connection,
+        &PublicKey::parse(&identity.public_key_hex()?)?,
+        wire,
+    )
+}
+
+fn retained_dispatch_with_key_from(
+    connection: &Connection,
+    local: &PublicKey,
+    wire: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+) -> Result<RetainedDispatch> {
     use vibeface_secure::authorization::{DeviceId, execution_observation::ExecutionObservationTarget};
     let target = ExecutionObservationTarget::from_original(wire)?;
     let space = target.source.project.space.as_str();
@@ -1169,13 +1181,12 @@ fn retained_dispatch_from(
         "SELECT envelope,resource_id,scope_id,author,sequence FROM events WHERE space_id=? AND hash=? AND status='ready'",
         params![space,source.hash],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
     )?;
-    let local = PublicKey::parse(&identity.public_key_hex()?)?;
     let checkpoint = wire.handoff.source_attestation.as_ref()
         .context("remote result has no retained Project checkpoint")?;
     checkpoint.verify_signature()?;
-    ensure!(checkpoint.issuer == local && checkpoint.payload == wire.handoff.source_statement()?
-        && wire.invocation.issuer == local
-        && admission.invocation.payload.audience.device == DeviceId::from_key(&local)
+    ensure!(checkpoint.issuer == *local && checkpoint.payload == wire.handoff.source_statement()?
+        && wire.invocation.issuer == *local
+        && admission.invocation.payload.audience.device == DeviceId::from_key(local)
         && admission.invocation.payload.resource == target.source.project
         && serde_json::from_value::<OperationRequest>(admission.source_body["request"].clone())? == request
         && serde_json::from_str::<crate::model::SignedEvent>(&saved)? == *source
@@ -1188,6 +1199,84 @@ fn retained_dispatch_from(
             if operation_id == operation && *action == serde_json::to_value(&request)?),
         "retained remote dispatch changed its host, admission, request or ready row");
     Ok(RetainedDispatch { source:source.clone(), admission, request })
+}
+
+pub(super) fn validate_retained_remote_dispatch_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    proof: &crate::model::AdmissionProof,
+    admitted: &vibeface_secure::authorization::VerifiedAdmission,
+    facts: &RequestFacts,
+    operation: &OperationRecord,
+) -> Result<()> {
+    use vibeface_secure::authorization::{
+        Actor, DeviceId, ServiceId,
+        execution_handoff::{SignedExecutionHandoff, execution_submission_facts},
+    };
+
+    let encoded: String = connection.query_row(
+        "SELECT value FROM local_values WHERE space_id=? AND key=?",
+        params![
+            operation.request.network_id,
+            format!("project-execution-handoff:{}", operation.request.operation_id)
+        ],
+        |row| row.get(0),
+    )?;
+    let wire: SignedExecutionHandoff = serde_json::from_str(&encoded)?;
+    let host = &wire.invocation.issuer;
+    ensure!(
+        admitted.signed_invocation() == &proof.invocation
+            && admitted.admitted_at_ms() == proof.admitted_at_ms
+            && facts.audience.device == DeviceId::from_key(host)
+            && facts.audience.service == ServiceId::from_key(host),
+        "retained dispatch host differs from its verified admission"
+    );
+    let retained = retained_dispatch_with_key_from(connection, host, &wire)?;
+    ensure!(
+        retained.admission == *proof && retained.request == operation.request,
+        "retained dispatch differs from its admitted operation"
+    );
+    crate::crypto::verify_signed_event(
+        &operation.request.network_id,
+        &retained.source,
+        host.as_str(),
+    )?;
+    super::event_authorization::validate_retained_event_dependencies_in(
+        connection,
+        &retained.source,
+    )?;
+    let view = super::task_execution_context::OriginalAdmissionView::load(
+        connection, policy, proof,
+    )?;
+    let original = view.state().verify_admitted_operation_authorization(
+        admitted,
+        facts,
+        proof.admitted_at_ms,
+    )?;
+    let submission = execution_submission_facts(&wire.handoff, &original)?;
+    let invocation = &wire.invocation.payload;
+    ensure!(
+        invocation.actor == Actor::Service(ServiceId::from_key(host))
+            && invocation.device == DeviceId::from_key(host)
+            && invocation.presenter == DeviceId::from_key(host)
+            && invocation.resource == submission.resource
+            && invocation.action == submission.action
+            && invocation.audience == submission.audience
+            && invocation.operation_id == submission.operation_id
+            && invocation.body_hash == submission.body_hash
+            && invocation.context == submission.context
+            && proof.source_body["execution_resource"]
+                == serde_json::to_value(&submission.resource)?
+            && proof.source_body["target_public_key"]
+                == serde_json::to_value(&wire.handoff.target_public_key)?
+            && proof.source_body["execution_grant"].as_str()
+                == Some(invocation.grant_leaf.as_str())
+            && operation.request.target_node
+                == crate::crypto::fingerprint(wire.handoff.target_public_key.as_str())?,
+        "retained remote submission differs from its original destination or request"
+    );
+    wire.invocation.verify_signature()?;
+    Ok(())
 }
 
 pub(super) fn retained_execution_history_reference_in(

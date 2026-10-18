@@ -1059,11 +1059,6 @@ pub(crate) fn verified_admission_checkpoints_from(
         let facts = persisted_admission_facts(connection, policy, &stored.proof)?;
         let admitted =
             reconstruct_stored_admission_uncached(connection, policy, &stored.proof, &facts)?;
-        if let Some(checkpoint) =
-            checkpoint_from_verified_in(connection, policy, &stored.proof, facts, admitted, true)?
-        {
-            checkpoints.insert(checkpoint);
-        }
         match operation_id {
             Some(operation_id) => {
                 ensure!(
@@ -1106,10 +1101,17 @@ pub(crate) fn verified_admission_checkpoints_from(
                     params![space, format!("lease:{operation_id}")],
                     |row| row.get(0),
                 )?;
-                ensure!(
-                    operation.state != OperationState::Running || has_lease,
-                    "running operation has no verified lease"
-                );
+                if operation.state == OperationState::Running && !has_lease {
+                    super::execution_dispatch::validate_retained_remote_dispatch_in(
+                        connection,
+                        policy,
+                        &stored.proof,
+                        &admitted,
+                        &facts,
+                        &operation,
+                    )
+                    .context("running operation has neither a verified local lease nor a retained remote dispatch")?;
+                }
                 if has_lease {
                     lease_deadline_from(connection, policy, &space, &operation_id)?;
                 }
@@ -1118,6 +1120,11 @@ pub(crate) fn verified_admission_checkpoints_from(
                 stored.proof.source_body["method"] != "operate",
                 "operation authorization has no operation index"
             ),
+        }
+        if let Some(checkpoint) =
+            checkpoint_from_verified_in(connection, policy, &stored.proof, facts, admitted, true)?
+        {
+            checkpoints.insert(checkpoint);
         }
         if stored.proof.source_body["method"] == "agent_start" {
             let (claim, original, invocation) = load_manager_from(connection, &space, &id)?;
@@ -4436,6 +4443,32 @@ mod manager_tests {
             params![request.operation_id, request.operation_id],
         )?;
         network.claim(&mut store, &request.operation_id)?;
+        validate_persisted_authorizations(&store.connection, &store.policy)?;
+        let lease_key = format!("lease:{}", request.operation_id);
+        let lease: String = store.connection.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![network.space.as_str(), lease_key],
+            |row| row.get(0),
+        )?;
+        store.connection.execute(
+            "DELETE FROM local_values WHERE space_id=? AND key=?",
+            params![network.space.as_str(), lease_key],
+        )?;
+        assert!(validate_persisted_authorizations(&store.connection, &store.policy).is_err());
+        let handoff_key = format!("project-execution-handoff:{}", request.operation_id);
+        store.connection.execute(
+            "INSERT INTO local_values(space_id,key,value) VALUES(?,?,'{}')",
+            params![network.space.as_str(), handoff_key],
+        )?;
+        assert!(validate_persisted_authorizations(&store.connection, &store.policy).is_err());
+        store.connection.execute(
+            "DELETE FROM local_values WHERE space_id=? AND key=?",
+            params![network.space.as_str(), handoff_key],
+        )?;
+        store.connection.execute(
+            "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
+            params![network.space.as_str(), lease_key, lease],
+        )?;
         validate_persisted_authorizations(&store.connection, &store.policy)?;
         store.connection.execute(
             "UPDATE resource_reservations SET resource=resource || '/different'",

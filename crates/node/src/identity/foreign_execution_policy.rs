@@ -1517,7 +1517,55 @@ pub(crate) mod tests {
                 .is_none()
         );
         let path = fixture.project.directory.join("foreign-approval.sqlite3");
+        let handoff_key = format!("project-execution-handoff:{}", operation.operation_id);
+        let stored_wire: String = fixture.store.connection.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![fixture.project.space.as_str(), handoff_key],
+            |row| row.get(0),
+        )?;
+        let has_local_lease = |connection: &Connection| -> Result<bool> {
+            Ok(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_values WHERE space_id=? AND key=?)",
+                params![fixture.project.space.as_str(), format!("lease:{}", operation.operation_id)],
+                |row| row.get(0),
+            )?)
+        };
+        assert!(!has_local_lease(&fixture.store.connection)?);
+        for field in ["signature", "attestation", "dispatch", "target", "resource", "grant", "operation", "context"] {
+            let mut changed = serde_json::to_value(&original)?;
+            match field {
+                "signature" => changed["invocation"]["signature"] = json!("00".repeat(64)),
+                "attestation" => changed["handoff"]["source_attestation"]["signature"] = json!("00".repeat(64)),
+                "dispatch" => changed["handoff"]["project_dispatch"]["signature"] = json!("00".repeat(64)),
+                "target" => changed["handoff"]["target_public_key"] = json!(local),
+                "resource" => changed["handoff"]["execution_resource"]["resource"] = json!(fixture.project.resource),
+                "grant" => changed["invocation"]["payload"]["grant_leaf"] = json!(source_grant),
+                "operation" => changed["invocation"]["payload"]["operation_id"] = json!("another-operation"),
+                "context" => changed["invocation"]["payload"]["context"]["conversation"] = json!("another-conversation"),
+                _ => unreachable!(),
+            }
+            fixture.store.connection.execute(
+                "UPDATE local_values SET value=? WHERE space_id=? AND key=?",
+                params![serde_json::to_string(&changed)?, fixture.project.space.as_str(), handoff_key],
+            )?;
+            assert!(Store::open(&path).is_err(), "accepted changed remote {field}");
+            assert_eq!(fixture.store.operation(fixture.project.space.as_str(), &operation.operation_id)?.unwrap().state,
+                crate::model::OperationState::Running);
+        }
+        fixture.store.connection.execute(
+            "UPDATE local_values SET value=? WHERE space_id=? AND key=?",
+            params![stored_wire, fixture.project.space.as_str(), handoff_key],
+        )?;
         let reopened = Store::open(&path)?;
+        assert_eq!(reopened.operation(fixture.project.space.as_str(), &operation.operation_id)?.unwrap().state,
+            crate::model::OperationState::Unknown);
+        assert!(!has_local_lease(&reopened.connection)?);
+        let restored_wire: String = reopened.connection.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![fixture.project.space.as_str(), handoff_key],
+            |row| row.get(0),
+        )?;
+        assert_eq!(restored_wire, stored_wire);
         let retained = carrier(|| {
             original_task_execution_policy_in(
                 &reopened.connection,
@@ -1543,6 +1591,10 @@ pub(crate) mod tests {
                 .is_none()
         );
         carrier(|| fixture.project.revoke_client(&mut fixture.store))?;
+        let reopened_again = Store::open(&path)?;
+        assert_eq!(reopened_again.operation(fixture.project.space.as_str(), &operation.operation_id)?.unwrap().state,
+            crate::model::OperationState::Unknown);
+        assert!(!has_local_lease(&reopened_again.connection)?);
         assert!(
             carrier(
                 || fixture.store.prepare_task_execution_dispatch_observation(
@@ -1562,6 +1614,37 @@ pub(crate) mod tests {
             ))
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_running_dispatch_recovers_after_source_revocation() -> Result<()> {
+        let (mut fixture, _, _, original) = readonly_observation_fixture()?;
+        let operation = &original.invocation.payload.operation_id;
+        let space = fixture.project.space.as_str();
+        let key = format!("project-execution-handoff:{operation}");
+        let before: String = fixture.store.connection.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![space, key],
+            |row| row.get(0),
+        )?;
+        assert_eq!(fixture.store.operation(space, operation)?.unwrap().state,
+            crate::model::OperationState::Running);
+        fixture.project.revoke_client(&mut fixture.store)?;
+        let reopened = Store::open(fixture.project.directory.join("foreign-approval.sqlite3"))?;
+        assert_eq!(reopened.operation(space, operation)?.unwrap().state,
+            crate::model::OperationState::Unknown);
+        let after: String = reopened.connection.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![space, key],
+            |row| row.get(0),
+        )?;
+        assert_eq!(after, before);
+        assert!(!reopened.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_values WHERE space_id=? AND key=?)",
+            params![space, format!("lease:{operation}")],
+            |row| row.get::<_, bool>(0),
+        )?);
         Ok(())
     }
 
