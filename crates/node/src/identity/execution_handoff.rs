@@ -1270,14 +1270,14 @@ struct StoredExecutionSession {
     work: ExecutionWork,
 }
 
-fn session_record(session: &ExecutionSession, work: &ExecutionWork) -> Result<String> {
+pub(super) fn session_record(session: &ExecutionSession, work: &ExecutionWork) -> Result<String> {
     Ok(serde_json::to_string(&StoredExecutionSession {
         session: session.clone(),
         work: work.clone(),
     })?)
 }
 
-fn session_from(
+pub(super) fn session_from(
     connection: &Connection,
     execution: &str,
     original: &str,
@@ -5494,10 +5494,18 @@ pub(crate) mod tests {
             };
             let facts = execution_resolution_account_facts(&resolution)?;
             let policy = self.store.policy.verified();
-            let first = policy.verify_invocation(
+            let destination = super::super::policy::execution_destination_for_body(
+                policy,
+                &facts,
+                &resolution.account_admission.source_body,
+                now() + 50,
+            )?
+            .context("resolution fixture destination")?;
+            let first = policy.verify_invocation_with_execution_destination(
                 &resolution.account_admission.invocation,
                 &facts,
                 &transport,
+                &destination,
                 now() + 50,
             );
             let auth = match first {
@@ -5505,10 +5513,11 @@ pub(crate) mod tests {
                     account.expected_policies = expected;
                     resolution.account_admission.invocation =
                         Signed::sign(account, &self.executor.client)?;
-                    policy.verify_invocation(
+                    policy.verify_invocation_with_execution_destination(
                         &resolution.account_admission.invocation,
                         &facts,
                         &transport,
+                        &destination,
                         now() + 50,
                     )?
                 }
@@ -5740,10 +5749,12 @@ pub(crate) mod tests {
                 body_hash: invocation.body_hash,
                 context: invocation.context,
             };
-            let auth = self.store.policy.verified().verify_invocation(
+            let auth = super::super::policy::authorize_invocation_for_body(
+                self.store.policy.verified(),
                 &proof.invocation,
                 &facts,
                 &proof.transport.existing_evidence()?,
+                &proof.source_body,
                 now() + 50,
             )?;
             proof.challenge = FreshnessChallenge::new(
@@ -6716,10 +6727,12 @@ pub(crate) mod tests {
                     body_hash: invocation.body_hash,
                     context: invocation.context,
                 };
-                let auth = fixture.store.policy.verified().verify_invocation(
+                let auth = super::super::policy::authorize_invocation_for_body(
+                    fixture.store.policy.verified(),
                     &admission.invocation,
                     &facts,
                     &admission.transport.existing_evidence()?,
+                    &admission.source_body,
                     now(),
                 )?;
                 admission.challenge = FreshnessChallenge::new(
@@ -6870,20 +6883,33 @@ pub(crate) mod tests {
             let transport = admission.transport.existing_evidence()?;
             admission.invocation = Signed::sign(invocation.clone(), &fixture.project.client)?;
             let policy = fixture.store.policy.verified();
-            let auth =
-                match policy.verify_invocation(&admission.invocation, &facts, &transport, now()) {
-                    Err(AuthorizationError::NeedPolicySync(expected)) => {
-                        invocation.expected_policies = expected;
-                        admission.invocation = Signed::sign(invocation, &fixture.project.client)?;
-                        policy.verify_invocation(
-                            &admission.invocation,
-                            &facts,
-                            &transport,
-                            now(),
-                        )?
-                    }
-                    result => result?,
-                };
+            let destination = super::super::policy::execution_destination_for_body(
+                policy,
+                &facts,
+                &admission.source_body,
+                now(),
+            )?
+            .context("deep grant fixture destination")?;
+            let auth = match policy.verify_invocation_with_execution_destination(
+                &admission.invocation,
+                &facts,
+                &transport,
+                &destination,
+                now(),
+            ) {
+                Err(AuthorizationError::NeedPolicySync(expected)) => {
+                    invocation.expected_policies = expected;
+                    admission.invocation = Signed::sign(invocation, &fixture.project.client)?;
+                    policy.verify_invocation_with_execution_destination(
+                        &admission.invocation,
+                        &facts,
+                        &transport,
+                        &destination,
+                        now(),
+                    )?
+                }
+                result => result?,
+            };
             admission.challenge = FreshnessChallenge::new(
                 &auth,
                 CheckStage::Admit,
@@ -8090,7 +8116,6 @@ pub(crate) mod tests {
                 "other-task-secret-DO-NOT-DISCLOSE",
             )?,
         };
-        altered.handoff.attest_source(&signer)?;
         let mut carrier = altered.invocation.payload.clone();
         carrier.body_hash = ObjectHash::body(&altered.handoff)?;
         altered.invocation = Signed::sign(carrier, &signer)?;
@@ -8143,7 +8168,6 @@ pub(crate) mod tests {
             *goal = "changed task input".into();
         }
         *task_creation = fixture.project.node.sign_event(task)?;
-        altered.handoff.attest_source(&signer)?;
         resign_carrier(&mut altered)?;
         assert!(
             fixture
@@ -8255,10 +8279,12 @@ pub(crate) mod tests {
             body_hash: invocation.body_hash,
             context: invocation.context,
         };
-        let auth = fixture.store.policy.verified().verify_invocation(
+        let auth = super::super::policy::authorize_invocation_for_body(
+            fixture.store.policy.verified(),
             &admission.invocation,
             &facts,
             &admission.transport.existing_evidence()?,
+            &admission.source_body,
             now(),
         )?;
         admission.challenge = FreshnessChallenge::new(

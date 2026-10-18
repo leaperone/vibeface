@@ -201,19 +201,19 @@ fn quiescent_in(
             ensure!(!locks, "terminal execution still has resource reservations");
         }
     }
-    let (record,binding,revision):(String,String,u64)=connection.query_row(
-        "SELECT record,binding,revision FROM execution_handoff_sessions WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=?",
-        params![target.session.execution_resource.space.as_str(),source.original_project.space.as_str(),source.original_project.resource.as_str(),target.binding.binding.target_node,target.binding.binding.session_id],
-        |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-    ).context("executor session is missing")?;
-    let session: ExecutionSession = serde_json::from_str(&record)?;
+    let (session, binding, work) = super::execution_handoff::session_from(
+        connection,
+        target.session.execution_resource.space.as_str(),
+        source.original_project.space.as_str(),
+        source.original_project.resource.as_str(),
+        &target.binding.binding.target_node,
+        Some(&target.binding.binding.session_id),
+    )?
+    .context("executor session is missing")?;
     ensure!(
-        serde_json::from_str::<crate::binding::SignedBinding>(&binding)? == target.binding
-            && session.network_id == target.session.execution_resource.space.as_str()
-            && session.target_node == target.binding.binding.target_node
-            && session.session_id == target.binding.binding.session_id
-            && session.revision == revision
-            && revision == target.session.revision
+        binding.as_ref() == Some(&target.binding)
+            && work == source.work
+            && session.revision == target.session.revision
             && !matches!(session.state.as_str(), "running" | "unknown"),
         "executor session changed or remains uncertain"
     );
@@ -652,7 +652,7 @@ impl Store {
         session.native_session_id = None;
         ensure!(tx.execute(
             "UPDATE execution_handoff_sessions SET record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=? AND revision=?",
-            params![serde_json::to_string(&session)?,target.session.execution_resource.space.as_str(),source.original_project.space.as_str(),source.original_project.resource.as_str(),session.target_node,session.session_id,session.revision],
+            params![super::execution_handoff::session_record(&session, &source.work)?,target.session.execution_resource.space.as_str(),source.original_project.space.as_str(),source.original_project.resource.as_str(),session.target_node,session.session_id,session.revision],
         )?==1,"executor session changed before seal");
         tx.execute("INSERT INTO execution_binding_seals(original_space_id,original_resource_id,task_ref,target_node,generation,execution_space_id,execution_resource_id,binding_hash,seal_invocation_hash,admission,seal) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             params![source.original_project.space.as_str(),source.original_project.resource.as_str(),task.as_str(),target.binding.binding.target_node,generation,target.session.execution_resource.space.as_str(),target.session.execution_resource.resource.as_str(),seal.seal.binding_hash,auth.signed_invocation().hash()?.as_str(),serde_json::to_string(&admission)?,serde_json::to_string(&seal)?])?;
