@@ -20,6 +20,9 @@ pub(crate) enum GatewaySourceRequest {
     Route {
         approval: Signed<GatewayRouteApproval>,
     },
+    RouteStatus {
+        approval: Signed<GatewayRouteApproval>,
+    },
     Begin {
         route_id: Nonce,
         request: Signed<ClientPolicyReadRequest>,
@@ -55,6 +58,15 @@ impl Runtime {
                     now_ms() as u64,
                 )?;
                 Ok(serde_json::to_value(committed)?)
+            }
+            GatewaySourceRequest::RouteStatus { approval } => {
+                let status = self.store.lock().await.gateway_route_status(
+                    &self.identity,
+                    actual.public_key(),
+                    &approval,
+                    now_ms() as u64,
+                )?;
+                Ok(serde_json::to_value(status)?)
             }
             GatewaySourceRequest::Begin {
                 route_id,

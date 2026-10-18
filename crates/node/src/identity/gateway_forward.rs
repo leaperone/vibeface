@@ -3,22 +3,25 @@ use crate::{crypto::LocalIdentity, store::Store};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use vibeface_secure::authorization::{
-    AccountId, DeviceId, MAX_PROOF_BYTES, Nonce, ObjectHash, PolicyDomain, PolicyPin, PublicKey,
-    Signed,
+    AUTH_VERSION, AccountId, DeviceCertificate, DeviceId, DeviceUse, JournalEntry,
+    MAX_POLICY_DOMAINS, MAX_PROOF_BYTES, Nonce, ObjectHash, PolicyDomain, PolicyPin, PublicKey,
+    Signed, SpaceId, SpaceRoot,
     client_policy_import::{
         ClientPolicyAuthConfirmRequest, ClientPolicyAuthConfirmation, ClientPolicyPage,
         ClientPolicyReadRequest, ClientPolicySnapshot, ClientPolicyWitness,
     },
+    execution_handoff::ExecutionProofUsage,
     gateway_forward::{
         GatewayClientPolicyImport, GatewayForwardHeader, GatewayOriginal, GatewayRouteApproval,
         GatewaySourceFrame, VerifiedGatewayClientSource, VerifiedGatewayRoute,
         begin_gateway_client_import, verify_gateway_original, verify_gateway_route,
         verify_gateway_route_approval,
     },
+    policy_proof::{policy_entry_payload_usage, policy_entry_usage},
 };
-use vibeface_secure::signature_verification::ScopedSignatureVerification;
+use vibeface_secure::signature_verification::{ScopedSignatureVerification, SignatureVerification};
 
 const PREFIX: &str = "gateway-policy-v2";
 
@@ -63,6 +66,27 @@ pub(crate) struct GatewayRouteCommit {
     route_id: Nonce,
     approval: ObjectHash,
     generation: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct GatewayRouteStatus {
+    route_id: Nonce,
+    approval: ObjectHash,
+    generation: u64,
+    checked_at_ms: u64,
+    #[serde(flatten)]
+    result: GatewayRouteStatusResult,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum GatewayRouteStatusResult {
+    Installed,
+    Superseded {
+        current_approval: ObjectHash,
+        current_generation: u64,
+    },
+    NotInstalled,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,15 +201,167 @@ fn current_floors(connection: &Connection, approved: &[PolicyPin]) -> Result<Vec
 }
 
 fn local_account(primary: &PolicyState, local: &PublicKey) -> Result<AccountId> {
-    let certificate = primary.verified().find_device(&DeviceId::from_key(local))?;
+    let state = primary.verified();
+    let device = DeviceId::from_key(local);
+    primary
+        .pins()
+        .iter()
+        .find_map(|pin| {
+            let PolicyDomain::Account(account) = &pin.domain else {
+                return None;
+            };
+            let document = state.account(account)?;
+            (!document.revoked_devices.contains(&device)
+                && document.devices.iter().any(|hash| {
+                    state.device(hash).is_some_and(|certificate| {
+                        certificate.payload.public_key == *local
+                            && certificate.payload.device == device
+                            && certificate.payload.owner == PolicyDomain::Account(account.clone())
+                    })
+                }))
+            .then(|| account.clone())
+        })
+        .context("gateway route requires a claimed Account Node")
+}
+
+fn active_device<'a>(
+    primary: &'a PolicyState,
+    device: &DeviceId,
+) -> Option<&'a Signed<DeviceCertificate>> {
+    let state = primary.verified();
+    primary.pins().iter().find_map(|pin| {
+        let (devices, revoked) = match &pin.domain {
+            PolicyDomain::Account(account) => {
+                let document = state.account(account)?;
+                (&document.devices, &document.revoked_devices)
+            }
+            PolicyDomain::Space(space) => {
+                let document = state.space(space)?;
+                (&document.devices, &document.revoked_devices)
+            }
+        };
+        if revoked.contains(device) {
+            return None;
+        }
+        devices.iter().find_map(|hash| {
+            state.device(hash).filter(|certificate| {
+                certificate.payload.device == *device && certificate.payload.owner == pin.domain
+            })
+        })
+    })
+}
+
+fn verify_route_status_request(
+    primary: &PolicyState,
+    local: &PublicKey,
+    actual_client: &PublicKey,
+    approval: &Signed<GatewayRouteApproval>,
+    now: u64,
+) -> Result<ExecutionProofUsage> {
+    let state = primary.verified();
+    let account = local_account(primary, local)?;
+    let space = SpaceId::personal(&account);
+    let client =
+        state.verify_account_client_device(&account, &DeviceId::from_key(actual_client), now)?;
+    let service = state.verify_service_device(&space, &DeviceId::from_key(local), now)?;
     ensure!(
-        certificate.payload.public_key == *local,
-        "gateway local certificate key differs"
+        service.payload.public_key == *local
+            && service.payload.owner == PolicyDomain::Account(account.clone())
+            && service.payload.uses.contains(&DeviceUse::ServiceInvocation),
+        "gateway route status requires the current local Account service"
     );
-    let PolicyDomain::Account(account) = &certificate.payload.owner else {
-        anyhow::bail!("gateway route requires a claimed Account Node");
-    };
-    Ok(account.clone())
+    let history = state
+        .account_history(&account)
+        .context("gateway account history is missing")?;
+    let signer = history
+        .iter()
+        .rev()
+        .find(|document| document.payload.current_root == approval.issuer)
+        .context("gateway route approval was not signed by a verified account root")?;
+    approval.verify_signature()?;
+    let route = &approval.payload;
+    ensure!(
+        route.version == AUTH_VERSION
+            && route.gateway == *local
+            && route.gateway != route.client_key
+            && route.gateway != route.target_key
+            && route.client_key != route.target_key
+            && route.generation > 0
+            && !route.allowed_actions.is_empty()
+            && route
+                .allowed_actions
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && route.issued_at_ms < route.expires_at_ms
+            && route.issued_at_ms <= now
+            && !route.source_pins.is_empty()
+            && route.source_pins.len() <= MAX_POLICY_DOMAINS
+            && route
+                .source_pins
+                .windows(2)
+                .all(|pair| pair[0].domain < pair[1].domain)
+            && route.source_pins.iter().all(|pin| pin
+                .minimum_head
+                .as_ref()
+                .is_none_or(|head| head.domain == pin.domain)),
+        "invalid gateway route status original"
+    );
+    let mut usage = ExecutionProofUsage::default();
+    usage.record_signed(approval)?;
+    for certificate in [client, service] {
+        usage.merge(&policy_entry_usage(
+            state,
+            &JournalEntry::Device(certificate.clone()),
+        )?);
+    }
+    usage.merge(&policy_entry_payload_usage(&JournalEntry::Account(
+        signer.clone(),
+    ))?);
+    let mut pending = vec![PolicyDomain::Account(account), PolicyDomain::Space(space)];
+    let mut seen = BTreeSet::new();
+    while let Some(domain) = pending.pop() {
+        if !seen.insert(domain.clone()) {
+            continue;
+        }
+        ensure!(
+            seen.len() <= MAX_POLICY_DOMAINS,
+            "too many gateway status policy domains"
+        );
+        let authority = match &domain {
+            PolicyDomain::Account(account) => {
+                let document = state
+                    .account_history(account)
+                    .and_then(|history| history.last())
+                    .context("gateway status account dependency is missing")?;
+                usage.merge(&policy_entry_payload_usage(&JournalEntry::Account(
+                    document.clone(),
+                ))?);
+                &document.payload.authority
+            }
+            PolicyDomain::Space(space) => {
+                let document = state
+                    .space_history(space)
+                    .and_then(|history| history.last())
+                    .context("gateway status space dependency is missing")?;
+                if let SpaceRoot::Personal { owner, .. } = &document.payload.root {
+                    pending.push(PolicyDomain::Account(owner.clone()));
+                }
+                usage.merge(&policy_entry_payload_usage(&JournalEntry::Space(
+                    document.clone(),
+                ))?);
+                &document.payload.authority
+            }
+        };
+        if let Some(certificate) = active_device(primary, &authority.device) {
+            usage.merge(&policy_entry_usage(
+                state,
+                &JournalEntry::Device(certificate.clone()),
+            )?);
+            pending.push(certificate.payload.owner.clone());
+        }
+    }
+    usage.enforce_limits()?;
+    Ok(usage)
 }
 
 fn route_in(
@@ -259,6 +435,80 @@ fn check_client(route: &VerifiedGatewayRoute, actual_client: &PublicKey) -> Resu
 }
 
 impl Store {
+    pub(crate) fn gateway_route_status(
+        &mut self,
+        identity: &LocalIdentity,
+        actual_client: &PublicKey,
+        approval: &Signed<GatewayRouteApproval>,
+        now: u64,
+    ) -> Result<GatewayRouteStatus> {
+        let _signatures = ScopedSignatureVerification::new();
+        encode(approval)?;
+        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let primary = PolicyState::reload_verified(&tx, &self.policy)?;
+        let mut usage =
+            verify_route_status_request(&primary, &local, actual_client, approval, now)?;
+        let hash = approval.hash()?;
+        let result = match read::<RouteRecord>(&tx, &key("route", &approval.payload.route_id))? {
+            Some(record) => {
+                let saved: Signed<GatewayRouteApproval> =
+                    read(&tx, &key("approval", &record.approval))?
+                        .context("gateway route original is missing")?;
+                ensure!(
+                    saved.hash()? == record.approval
+                        && saved.payload.route_id == approval.payload.route_id
+                        && saved.payload.generation == record.generation
+                        && saved.payload.gateway == local,
+                    "gateway route status differs from its stored original"
+                );
+                let account = local_account(&primary, &local)?;
+                let signer = primary
+                    .verified()
+                    .account_history(&account)
+                    .and_then(|history| {
+                        history
+                            .iter()
+                            .find(|document| document.payload.current_root == saved.issuer)
+                    })
+                    .context("stored gateway route has no verified account root")?;
+                saved.verify_signature()?;
+                usage.record_signed(&saved)?;
+                usage.merge(&policy_entry_payload_usage(&JournalEntry::Account(
+                    signer.clone(),
+                ))?);
+                if record.approval == hash {
+                    ensure!(saved == *approval, "gateway route status original changed");
+                    GatewayRouteStatusResult::Installed
+                } else if record.generation >= approval.payload.generation {
+                    GatewayRouteStatusResult::Superseded {
+                        current_approval: record.approval,
+                        current_generation: record.generation,
+                    }
+                } else {
+                    GatewayRouteStatusResult::NotInstalled
+                }
+            }
+            None => GatewayRouteStatusResult::NotInstalled,
+        };
+        let status = GatewayRouteStatus {
+            route_id: approval.payload.route_id.clone(),
+            approval: hash,
+            generation: approval.payload.generation,
+            checked_at_ms: now,
+            result,
+        };
+        usage.record_metadata(&status)?;
+        if let Some(counts) = SignatureVerification::current_counts() {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
+        tx.commit()?;
+        Ok(status)
+    }
+
     pub(crate) fn install_gateway_route(
         &mut self,
         identity: &LocalIdentity,
@@ -640,6 +890,312 @@ mod tests {
         witness: Signed<ClientPolicyWitness>,
         confirm: Signed<ClientPolicyAuthConfirmRequest>,
         confirmation: Signed<ClientPolicyAuthConfirmation>,
+    }
+
+    fn route_approval(a: &TestNetwork, b: &TestNetwork) -> Result<Signed<GatewayRouteApproval>> {
+        Ok(Signed::sign(
+            GatewayRouteApproval {
+                version: AUTH_VERSION,
+                route_id: Nonce::random()?,
+                generation: 1,
+                gateway: PublicKey::parse(&a.node.public_key_hex()?)?,
+                client_account: b.account.clone(),
+                client_key: PublicKey::of(&b.client),
+                target_key: PublicKey::parse(&b.node.public_key_hex()?)?,
+                resource: ResourceRef {
+                    space: b.space.clone(),
+                    resource: b.resource.clone(),
+                },
+                allowed_actions: vec![Action::MessageAppend],
+                source_pins: b.pins.clone(),
+                state: GatewayRouteState::Active,
+                issued_at_ms: now(),
+                expires_at_ms: now() + 90_000,
+            },
+            &a.root,
+        )?)
+    }
+
+    #[test]
+    fn gateway_route_status_distinguishes_originals_without_mutation() -> Result<()> {
+        let a = TestNetwork::new()?;
+        let b = TestNetwork::new()?;
+        let mut store = a.memory()?;
+        let original = route_approval(&a, &b)?;
+        let client = PublicKey::of(&a.client);
+        let hash = original.hash()?;
+        let changes = store.connection.total_changes();
+        let missing = store.gateway_route_status(&a.node, &client, &original, now())?;
+        assert_eq!(
+            serde_json::to_value(missing)?,
+            json!({
+                "route_id":original.payload.route_id, "approval":hash, "generation":1,
+                "checked_at_ms":now(), "status":"not_installed"
+            })
+        );
+        let expired = original.payload.expires_at_ms;
+        assert!(
+            store
+                .install_gateway_route(&a.node, &original, expired)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .gateway_route_status(&a.node, &client, &original, expired)?
+                .result,
+            GatewayRouteStatusResult::NotInstalled
+        );
+        assert_eq!(store.connection.total_changes(), changes);
+        store.install_gateway_route(&a.node, &original, now())?;
+        let changes = store.connection.total_changes();
+        assert_eq!(
+            serde_json::to_value(
+                store.gateway_route_status(&a.node, &client, &original, expired)?
+            )?,
+            json!({
+                "route_id":original.payload.route_id, "approval":hash, "generation":1,
+                "checked_at_ms":expired, "status":"installed"
+            })
+        );
+        let mut competing = original.payload.clone();
+        competing.expires_at_ms += 1;
+        let competing = Signed::sign(competing, &a.root)?;
+        assert!(
+            store
+                .install_gateway_route(&a.node, &competing, now())
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(store.gateway_route_status(
+                &a.node,
+                &client,
+                &competing,
+                now()
+            )?)?,
+            json!({
+                "route_id":competing.payload.route_id, "approval":competing.hash()?, "generation":1,
+                "checked_at_ms":now(), "status":"superseded",
+                "current_approval":hash, "current_generation":1
+            })
+        );
+        let mut next = original.payload.clone();
+        next.generation = 2;
+        next.state = GatewayRouteState::Revoked;
+        let next = Signed::sign(next, &a.root)?;
+        assert_eq!(
+            store
+                .gateway_route_status(&a.node, &client, &next, now())?
+                .result,
+            GatewayRouteStatusResult::NotInstalled
+        );
+        assert_eq!(store.connection.total_changes(), changes);
+        store.install_gateway_route(&a.node, &next, now())?;
+        let changes = store.connection.total_changes();
+        assert_eq!(
+            store
+                .gateway_route_status(&a.node, &client, &next, expired)?
+                .result,
+            GatewayRouteStatusResult::Installed
+        );
+        assert_eq!(
+            store
+                .gateway_route_status(&a.node, &client, &original, now())?
+                .result,
+            GatewayRouteStatusResult::Superseded {
+                current_approval: next.hash()?,
+                current_generation: 2,
+            }
+        );
+        assert_eq!(store.connection.total_changes(), changes);
+        assert!(store.policy.gateway_policy.sources.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_route_status_rejects_other_signers_clients_and_invalid_carriers() -> Result<()> {
+        let a = TestNetwork::new()?;
+        let b = TestNetwork::new()?;
+        let mut store = a.memory()?;
+        let original = route_approval(&a, &b)?;
+        let client = PublicKey::of(&a.client);
+        let foreign = Signed::sign(original.payload.clone(), &b.root)?;
+        assert!(
+            store
+                .gateway_route_status(&a.node, &client, &foreign, now())
+                .is_err()
+        );
+        assert!(
+            store
+                .gateway_route_status(&a.node, &PublicKey::of(&b.client), &original, now())
+                .is_err()
+        );
+        assert!(
+            store
+                .gateway_route_status(&b.node, &client, &original, now())
+                .is_err()
+        );
+        let mut forged = original.clone();
+        forged.payload.expires_at_ms += 1;
+        assert!(
+            store
+                .gateway_route_status(&a.node, &client, &forged, now())
+                .is_err()
+        );
+        let mut future = original.payload.clone();
+        future.issued_at_ms = now() + 1;
+        let future = Signed::sign(future, &a.root)?;
+        assert!(
+            store
+                .gateway_route_status(&a.node, &client, &future, now())
+                .is_err()
+        );
+        let mut oversized = original.payload.clone();
+        oversized.allowed_actions = vec![Action::MessageAppend; MAX_PROOF_BYTES];
+        let oversized = Signed::sign(oversized, &a.root)?;
+        assert!(
+            store
+                .gateway_route_status(&a.node, &client, &oversized, now())
+                .is_err()
+        );
+        let request = json!({"stage":"route_status", "approval":original});
+        assert!(matches!(
+            serde_json::from_value::<crate::runtime::GatewaySourceRequest>(request.clone())?,
+            crate::runtime::GatewaySourceRequest::RouteStatus { approval } if approval == original
+        ));
+        let mut unexpected = request;
+        unexpected["route_id"] = json!(original.payload.route_id);
+        assert!(
+            serde_json::from_value::<crate::runtime::GatewaySourceRequest>(unexpected).is_err()
+        );
+        let cert = store.policy.verified().verify_account_client_device(
+            &a.account,
+            &DeviceId::from_key(&client),
+            now(),
+        )?;
+        let expired = cert.payload.expires_at_ms;
+        assert!(
+            store
+                .gateway_route_status(&a.node, &client, &original, expired)
+                .is_err()
+        );
+        a.revoke_client(&mut store)?;
+        assert!(
+            store
+                .gateway_route_status(&a.node, &client, &original, now() + 1)
+                .is_err()
+        );
+        let mut revoked_service = a.memory()?;
+        a.revoke_node(&mut revoked_service)?;
+        assert!(
+            revoked_service
+                .gateway_route_status(&a.node, &client, &original, now() + 1)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_route_status_keeps_old_root_queries_readonly_after_rotation() -> Result<()> {
+        let a = TestNetwork::new()?;
+        let b = TestNetwork::new()?;
+        let path = a.directory.join("gateway-route-status.sqlite3");
+        let mut store = a.at(&path)?;
+        let original = route_approval(&a, &b)?;
+        let missing = route_approval(&a, &b)?;
+        store.install_gateway_route(&a.node, &original, now())?;
+        let next_root = vibeface_secure::Identity::generate().map_err(anyhow::Error::msg)?;
+        let mut account = store
+            .policy
+            .verified()
+            .account(&a.account)
+            .context("account missing")?
+            .clone();
+        account.previous = store
+            .policy
+            .verified()
+            .head(&PolicyDomain::Account(a.account.clone()))
+            .cloned();
+        account.sequence += 1;
+        account.root_generation += 1;
+        account.current_root = PublicKey::of(&next_root);
+        account.accept_root(&next_root)?;
+        let mut space = store
+            .policy
+            .verified()
+            .space(&a.space)
+            .context("space missing")?
+            .clone();
+        space.previous = store
+            .policy
+            .verified()
+            .head(&PolicyDomain::Space(a.space.clone()))
+            .cloned();
+        space.sequence += 1;
+        space.root_generation += 1;
+        space.current_root = PublicKey::of(&next_root);
+        store.install_policy_journal(
+            &[
+                JournalEntry::Account(Signed::sign(account, &a.root)?),
+                JournalEntry::Space(Signed::sign(space, &next_root)?),
+            ],
+            now() + 1,
+        )?;
+        drop(store);
+        let mut store = Store::open(&path)?;
+        let client = PublicKey::of(&a.client);
+        assert!(
+            store
+                .install_gateway_route(&a.node, &missing, now() + 1)
+                .is_err()
+        );
+        let changes = store.connection.total_changes();
+        assert_eq!(
+            store
+                .gateway_route_status(&a.node, &client, &original, now() + 1)?
+                .result,
+            GatewayRouteStatusResult::Installed
+        );
+        let expired = missing.payload.expires_at_ms;
+        assert_eq!(
+            store
+                .gateway_route_status(&a.node, &client, &missing, expired)?
+                .result,
+            GatewayRouteStatusResult::NotInstalled
+        );
+        assert_eq!(store.connection.total_changes(), changes);
+        assert_eq!(
+            store
+                .policy
+                .verified()
+                .account(&a.account)
+                .context("account missing")?
+                .current_root,
+            PublicKey::of(&next_root)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_route_status_rejects_corrupt_saved_generation() -> Result<()> {
+        let a = TestNetwork::new()?;
+        let b = TestNetwork::new()?;
+        let mut store = a.memory()?;
+        let original = route_approval(&a, &b)?;
+        store.install_gateway_route(&a.node, &original, now())?;
+        write(
+            &store.connection,
+            &key("route", &original.payload.route_id),
+            &RouteRecord {
+                approval: original.hash()?,
+                generation: 2,
+            },
+        )?;
+        assert!(
+            store
+                .gateway_route_status(&a.node, &PublicKey::of(&a.client), &original, now())
+                .is_err()
+        );
+        Ok(())
     }
 
     fn source_material(network: &TestNetwork, store: &mut Store) -> Result<SourceMaterial> {
