@@ -303,7 +303,7 @@ fn check_heads(connection: &Connection, heads: &[PolicyStamp]) -> Result<()> {
     Ok(())
 }
 
-fn retained_agent_events(
+pub(crate) fn retained_agent_events(
     connection: &Connection,
     space: &str,
     trigger: &str,

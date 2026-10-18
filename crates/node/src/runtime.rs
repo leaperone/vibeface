@@ -2196,13 +2196,19 @@ fn followup_authorized(store: &Store, network: &str, scope: &str, task: &str) ->
     if matches!(task.status.as_str(), "accepted" | "cancelled") {
         return Ok(false);
     }
-    let context = store.context(network, scope, &[])?;
+    let events = crate::identity::services::retained_agent_events(
+        &store.connection,
+        network,
+        &task.event_hash,
+    )?;
     ensure!(
-        context.missing.is_complete(),
-        "follow-up context is incomplete"
+        events
+            .get(&task.event_hash)
+            .is_some_and(|event| event.event.scope_id == scope),
+        "follow-up task belongs to another conversation"
     );
-    let events = crate::store::load_events_from(&store.connection, network)?;
-    for event in &context.events {
+    for stored in events.values() {
+        let event = &stored.event;
         if event.scope_id != scope
             || !matches!(&event.body,EventBody::DecisionRecorded {decision_id,effective_constraints,tool_configuration,..}
             if decision_id==&format!("auto:{}",task.task_id)
@@ -2274,48 +2280,55 @@ fn require_executor_followup(
         followup_authorized(store, network, scope, task)?,
         "automatic follow-up needs an active task and user authorization"
     );
-    let context = store.context(network, scope, &[trigger.to_owned()])?;
-    let events = crate::store::load_events_from(&store.connection, network)?;
+    let events =
+        crate::identity::services::retained_agent_events(&store.connection, network, trigger)?;
+    let causal = crate::store::closure_hashes(&events, &[trigger.to_owned()]);
     ensure!(
-        context.events.iter().any(|dispatch| {
-            let EventBody::DispatchRecorded {
-                operation_id: id,
-                task_id,
-                target_node: target,
-                session_id: session,
-                action,
-            } = &dispatch.body
-            else {
-                return false;
-            };
-            dispatch.scope_id == scope
-                && id == operation_id
-                && task_id.as_ref() == Some(task)
-                && target == origin
-                && session == session_id
-                && store
-                    .authorize_node(network, &dispatch.author, None)
-                    .is_ok()
-                && crate::identity::event_authorization::current_event_authorization(
-                    &store.policy,
-                    &store.connection,
-                    dispatch,
-                    &events,
-                    now_ms() as u64,
-                )
-                .is_ok_and(|auth| {
-                    auth.action() == vibeface_secure::authorization::Action::ExecutionSend
-                })
-                && serde_json::from_value::<OperationRequest>(action.clone()).is_ok_and(|request| {
-                    request.network_id == network
-                        && request.conversation_id == scope
-                        && request.operation_id == *operation_id
-                        && request.task_id.as_ref() == Some(task)
-                        && request.target_node == origin
-                        && request.session_id == *session_id
-                        && request.action["type"] == "send"
-                })
-        }),
+        causal
+            .iter()
+            .filter_map(|hash| events.get(hash))
+            .any(|stored| {
+                let dispatch = &stored.event;
+                let EventBody::DispatchRecorded {
+                    operation_id: id,
+                    task_id,
+                    target_node: target,
+                    session_id: session,
+                    action,
+                } = &dispatch.body
+                else {
+                    return false;
+                };
+                dispatch.scope_id == scope
+                    && id == operation_id
+                    && task_id.as_ref() == Some(task)
+                    && target == origin
+                    && session == session_id
+                    && store
+                        .authorize_node(network, &dispatch.author, None)
+                        .is_ok()
+                    && crate::identity::event_authorization::current_event_authorization(
+                        &store.policy,
+                        &store.connection,
+                        dispatch,
+                        &events,
+                        now_ms() as u64,
+                    )
+                    .is_ok_and(|auth| {
+                        auth.action() == vibeface_secure::authorization::Action::ExecutionSend
+                    })
+                    && serde_json::from_value::<OperationRequest>(action.clone()).is_ok_and(
+                        |request| {
+                            request.network_id == network
+                                && request.conversation_id == scope
+                                && request.operation_id == *operation_id
+                                && request.task_id.as_ref() == Some(task)
+                                && request.target_node == origin
+                                && request.session_id == *session_id
+                                && request.action["type"] == "send"
+                        },
+                    )
+            }),
         "executor result has no matching dispatch"
     );
     Ok(())
