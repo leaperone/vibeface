@@ -300,6 +300,7 @@ test("future processing can be revoked while the current execution is unknown an
   const require = (specifier: string) => {
     if (specifier === "react") return { useId: () => "work", useState: (initial: unknown) => [initial, () => {}] }
     if (specifier === "react/jsx-runtime") return { jsx, jsxs: jsx }
+    if (specifier === "../identity/context") return { useDevice: () => ({ directory: { members: [{ subject_id: "executor", name: "工作电脑" }] } }) }
     if (specifier === "./context") return { useWorkspace: () => ({ pending: [], nodes: [], writable: true, selectedBot: null, connectionOnline: true, run: (action: () => Promise<void>) => action(), stopFollowup: async (operationId: string) => { stopped.push(operationId) } }) }
     if (specifier === "./labels") return { nodeName: () => "device", stateLabel: () => "unknown" }
     return ui
