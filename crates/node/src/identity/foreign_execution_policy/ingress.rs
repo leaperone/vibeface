@@ -15,13 +15,13 @@ use vibeface_secure::authorization::{
 
 #[derive(Default)]
 pub(crate) struct ForeignExecutionPolicyCache {
-    pending: BTreeMap<ObjectHash, CachedImport>,
+    pub(super) pending: BTreeMap<ObjectHash, CachedImport>,
 }
 
-struct CachedImport {
-    importer: super::node::TaskPolicyImport,
-    page_hashes: Vec<ObjectHash>,
-    ready_for_finish: bool,
+pub(super) struct CachedImport {
+    pub(super) importer: super::node::TaskPolicyImport,
+    pub(super) page_hashes: Vec<ObjectHash>,
+    pub(super) ready_for_finish: bool,
 }
 
 enum CompletedPolicy {
@@ -169,7 +169,7 @@ pub(super) fn floors_in(connection: &Connection, pins: &[PolicyPin]) -> Result<V
     Ok(floors)
 }
 
-fn advance_floors_in(
+pub(super) fn advance_floors_in(
     connection: &Connection,
     pins: &[PolicyPin],
     heads: &[PolicyStamp],
