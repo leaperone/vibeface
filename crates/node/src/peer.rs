@@ -253,6 +253,7 @@ impl PeerHub {
     pub async fn online(&self, network: &str) -> Vec<NodeId> {
         let candidates: BTreeSet<_> = {
             let state = self.state.lock().await;
+            let has_route = state.links.keys().any(|(n, _)| n == network);
             state
                 .links
                 .keys()
@@ -262,7 +263,9 @@ impl PeerHub {
                     state
                         .reachable
                         .iter()
-                        .filter(|((n, _), time)| n == network && time.elapsed() < IDLE_TIMEOUT)
+                        .filter(|((n, _), time)| {
+                            has_route && n == network && time.elapsed() < IDLE_TIMEOUT
+                        })
                         .map(|((_, n), _)| n.clone()),
                 )
                 .collect()
@@ -1162,6 +1165,88 @@ mod tests {
         .await?;
         assert!(result.is_err());
         assert!(server.online(&owner.fixture_network_id()?).await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lost_last_link_stops_reporting_cached_presence_and_allows_reconnect() -> Result<()> {
+        let a = LocalIdentity::generate();
+        let b = LocalIdentity::generate();
+        let network = a.fixture_network_id()?;
+        let target = b.node_id()?;
+        let (server, _) = hub(&a, &a, &[&a, &b])?;
+        let (client, _) = hub(&a, &b, &[&a, &b])?;
+        let mut tasks = Tasks(Vec::new());
+        let url = serve(server.clone(), &mut tasks).await?;
+        let peer = client.clone();
+        let scope = network.clone();
+        let endpoint = url.clone();
+        let connection = tokio::spawn(async move {
+            let _ = peer.connect(scope, endpoint).await;
+        });
+        wait_link(&server, &network, &target).await?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !server
+                .state
+                .lock()
+                .await
+                .reachable
+                .contains_key(&(network.clone(), target.clone()))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert!(server.online(&network).await.contains(&target));
+        connection.abort();
+        let _ = connection.await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !server.state.lock().await.links.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        let unrelated = "f".repeat(64);
+        let (send, _receive) = mpsc::channel(1);
+        server.state.lock().await.links.insert(
+            (unrelated.clone(), target.clone()),
+            Link {
+                id: "another-network".into(),
+                outbound: true,
+                send,
+            },
+        );
+        assert!(server.online(&network).await.is_empty());
+        server
+            .state
+            .lock()
+            .await
+            .links
+            .remove(&(unrelated, target.clone()));
+
+        let (restarted, mut inbound) = hub(&a, &b, &[&a, &b])?;
+        let peer = restarted.clone();
+        let scope = network.clone();
+        tasks.0.push(tokio::spawn(async move {
+            let _ = peer.connect(scope, url).await;
+        }));
+        wait_link(&server, &network, &target).await?;
+        let peer = server.clone();
+        let scope = network.clone();
+        let request = tokio::spawn(async move {
+            peer.request(&scope, &target, json!({"query":"after restart"}))
+                .await
+        });
+        let received = tokio::time::timeout(Duration::from_secs(3), inbound.recv())
+            .await?
+            .context("missing request after reconnect")?;
+        restarted
+            .respond(&received, json!({"reconnected":true}))
+            .await?;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), request).await???,
+            json!({"reconnected":true})
+        );
         Ok(())
     }
 
