@@ -154,6 +154,7 @@ impl NodePolicyReadClient {
                     (NodeReadRequest::Prepare(_), NodeReadResponse::Snapshot(_))
                         | (NodeReadRequest::Page(_), NodeReadResponse::Page(_))
                         | (NodeReadRequest::Finish(_), NodeReadResponse::Witness(_))
+                        | (NodeReadRequest::Freshness(_), NodeReadResponse::Receipts(_))
                 ),
                 "node policy response changed its read stage"
             );
