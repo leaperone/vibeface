@@ -844,9 +844,6 @@ mod tests {
     }
 
     impl TeamClient {
-        fn pins_json(&self) -> Result<String> {
-            Ok(serde_json::to_string(&self.pins)?)
-        }
         fn authorization(
             &self,
             network: &TestNetwork,
@@ -2495,17 +2492,19 @@ mod tests {
                 _ => None,
             })
             .context("grant missing")??;
-        let mut child_bundle = team.bundle.clone();
-        child_bundle.grant_leaf = child.clone();
-        vibeface_secure::authorization::verify_client_authorization(
-            &serde_json::to_string(&child_bundle)?,
-            &team.pins_json()?,
-            network.account.as_str(),
-            team.space.as_str(),
-            &network.client.public_key_hex(),
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
+        let child_authorization = bounded_client_authorization(
+            &network,
+            &mut store,
+            &ResourceRef {
+                space: team.space.clone(),
+                resource: team.resource.clone(),
+            },
+            &child,
+            &team.pins,
+            now(),
+        )?;
+        assert_eq!(child_authorization.grant_leaf(), &child);
+        assert_eq!(child_authorization.actions(), &[Action::ConversationRead]);
         let resource = SpaceResourceIntent {
             space: team.space.clone(),
             resource: ResourceId::random()?,
@@ -2545,16 +2544,17 @@ mod tests {
                 .grants
                 .contains(&child)
         );
-        child_bundle = team.bundle.clone();
-        child_bundle.grant_leaf = child.clone();
         assert!(
-            vibeface_secure::authorization::verify_client_authorization(
-                &serde_json::to_string(&child_bundle)?,
-                &team.pins_json()?,
-                network.account.as_str(),
-                team.space.as_str(),
-                &network.client.public_key_hex(),
-                now() as f64,
+            bounded_client_authorization(
+                &network,
+                &mut store,
+                &ResourceRef {
+                    space: team.space.clone(),
+                    resource: team.resource.clone()
+                },
+                &child,
+                &team.pins,
+                now(),
             )
             .is_err()
         );
