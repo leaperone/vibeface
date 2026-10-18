@@ -83,6 +83,8 @@ pub(crate) struct TargetRecoveryImport {
     approved_at: Option<u64>,
     historical_completion: Option<ObjectHash>,
     next_page: u64,
+    saved_page_count: u64,
+    saved_page_hash: Option<ObjectHash>,
     complete: bool,
     state: TargetImportState,
 }
@@ -133,6 +135,7 @@ impl TargetRecoveryImport {
         Ok(json!({
             "state": if matches!(self.state, TargetImportState::Ready(_)) {"ready"} else {"reading"},
             "page_count": self.next_page,
+            "saved_page_count": self.saved_page_count,
             "complete": self.complete,
             "snapshot_id": self.snapshot.payload.snapshot_id,
             "request_hash": self.snapshot.payload.request_hash,
@@ -203,6 +206,18 @@ impl Store {
         let cache =
             UntrustedTargetRecoveryCache::new(&input.request, &input.snapshot.payload.snapshot_id)?;
         cache.store_header(&tx, &input.snapshot)?;
+        let frontier = cache.load_live_frontier(&tx)?;
+        let saved_page_count = frontier
+            .as_ref()
+            .map(|page| {
+                page.payload
+                    .page_index
+                    .checked_add(1)
+                    .context("target recovery frontier page count overflow")
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let saved_page_hash = frontier.as_ref().map(Signed::hash).transpose()?;
         let active = TargetRecoveryImport {
             request: input.request,
             snapshot: input.snapshot,
@@ -210,12 +225,17 @@ impl Store {
             approved_at: None,
             historical_completion: None,
             next_page: 0,
+            saved_page_count,
+            saved_page_hash,
             complete: false,
             state: TargetImportState::Reading(importer),
         };
         let response = active.progress()?;
         let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
         active.record_binding(&mut usage)?;
+        if let Some(frontier) = &frontier {
+            usage.record_page_binding(frontier)?;
+        }
         if let TargetImportState::Reading(importer) = &active.state {
             importer.record_proof_usage_into(&mut usage);
         }
@@ -277,6 +297,8 @@ impl Store {
             approved_at: Some(at),
             historical_completion: Some(ObjectHash::body(&input.committed)?),
             next_page: 0,
+            saved_page_count: 0,
+            saved_page_hash: None,
             complete: false,
             state: TargetImportState::Reading(importer),
         };
@@ -316,6 +338,13 @@ impl Store {
         struct CachedInput {
             context: RecoveryContextReference,
         }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LiveCachedInput {
+            snapshot_id: Nonce,
+            request_hash: ObjectHash,
+            snapshot_hash: ObjectHash,
+        }
         let active = self
             .target_recovery_import
             .as_ref()
@@ -327,12 +356,30 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_claim_in(&tx, &active.request.payload.target_claim, &local)?;
         let page = if cached {
-            let input: CachedInput = serde_json::from_value(params.clone())?;
-            active.check(principal, &input.context)?;
+            if active.approved_at.is_some() {
+                let input: CachedInput = serde_json::from_value(params.clone())?;
+                active.check(principal, &input.context)?;
+            } else {
+                let input: LiveCachedInput = serde_json::from_value(params.clone())?;
+                active.check_snapshot(
+                    principal,
+                    &input.snapshot_id,
+                    &input.request_hash,
+                    &input.snapshot_hash,
+                )?;
+                ensure!(
+                    active.next_page < active.saved_page_count,
+                    "target recovery has reached its saved live frontier"
+                );
+            }
             cache
                 .load_page(&tx, active.next_page)?
                 .context("cached recovery page is missing")?
         } else {
+            ensure!(
+                active.next_page >= active.saved_page_count,
+                "target recovery must rebuild its saved live pages first"
+            );
             let input: PageInput = serde_json::from_value(params.clone())?;
             active.check_snapshot(
                 principal,
@@ -368,8 +415,25 @@ impl Store {
         } else {
             active.next_page
         };
-        let response =
-            json!({"state":"reading","page_count":next_page,"complete":page.payload.complete});
+        if cached && active.approved_at.is_none() && next_page == active.saved_page_count {
+            ensure!(
+                active.saved_page_hash.as_ref() == Some(&page.hash()?),
+                "target recovery rebuilt another saved live frontier"
+            );
+        }
+        let saved_page_count = if cached {
+            active.saved_page_count
+        } else {
+            cache.store_live_frontier(&tx, &page)?;
+            next_page
+        };
+        let saved_page_hash = if cached {
+            active.saved_page_hash.clone()
+        } else {
+            Some(page.hash()?)
+        };
+        let response = json!({"state":"reading","page_count":next_page,
+            "saved_page_count":saved_page_count,"complete":page.payload.complete});
         let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
         active.record_binding(&mut usage)?;
         if let Some(previous) = previous {
@@ -383,6 +447,8 @@ impl Store {
             .as_mut()
             .context("target recovery import is missing")?;
         active.next_page = next_page;
+        active.saved_page_count = saved_page_count;
+        active.saved_page_hash = saved_page_hash;
         active.complete = page.payload.complete;
         active.state = TargetImportState::Reading(importer);
         Ok(response)

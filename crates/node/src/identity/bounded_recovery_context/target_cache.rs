@@ -116,6 +116,69 @@ impl UntrustedTargetRecoveryCache {
         self.read_page(connection, &header, index)
     }
 
+    pub(crate) fn load_live_frontier(
+        &self,
+        connection: &Connection,
+    ) -> Result<Option<Signed<RecoveryContextPage>>> {
+        let header = self.required_header(connection)?;
+        let frontier: Option<Signed<RecoveryContextPage>> =
+            read_json(connection, &self.live_frontier_key())?;
+        if let Some(frontier) = &frontier {
+            let index = frontier.payload.page_index;
+            self.check_page(&header, frontier, index)?;
+            ensure!(
+                self.read_page(connection, &header, index)?.as_ref() == Some(frontier),
+                "target recovery frontier changed its stored page"
+            );
+        }
+        Ok(frontier)
+    }
+
+    pub(crate) fn store_live_frontier(
+        &self,
+        connection: &Connection,
+        page: &Signed<RecoveryContextPage>,
+    ) -> Result<()> {
+        let header = self.required_header(connection)?;
+        self.check_page(&header, page, page.payload.page_index)?;
+        ensure!(
+            self.read_page(connection, &header, page.payload.page_index)?
+                .as_ref()
+                == Some(page),
+            "target recovery frontier has no exact stored page"
+        );
+        if let Some(previous) = self.load_live_frontier(connection)? {
+            if previous.payload.page_index == page.payload.page_index {
+                ensure!(
+                    previous == *page,
+                    "target recovery frontier changed its retry"
+                );
+                return Ok(());
+            }
+            ensure!(
+                !previous.payload.complete
+                    && previous.payload.page_index.checked_add(1) == Some(page.payload.page_index)
+                    && page.payload.previous_page_hash == previous.hash()?,
+                "target recovery frontier skipped or rewound a page"
+            );
+        } else {
+            ensure!(
+                page.payload.page_index == 0,
+                "target recovery frontier has no first page"
+            );
+        }
+        let encoded = serde_json::to_string(page)?;
+        ensure!(
+            encoded.len() <= MAX_CACHE_ROW_BYTES,
+            "target recovery frontier exceeds 64 KiB"
+        );
+        connection.execute(
+            "INSERT INTO identity_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![self.live_frontier_key(), encoded],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn store_witness(
         &self,
         connection: &Connection,
@@ -188,6 +251,10 @@ impl UntrustedTargetRecoveryCache {
 
     fn witness_key(&self) -> String {
         format!("{}:witness", self.scope_key)
+    }
+
+    fn live_frontier_key(&self) -> String {
+        format!("{}:live-frontier", self.scope_key)
     }
 
     fn approval_key(&self) -> String {
@@ -761,17 +828,22 @@ mod tests {
         let final_page = fixture.page(1, first.hash()?, true)?;
         cache.store_page(&transaction, &first)?;
         cache.store_page(&transaction, &first)?;
+        cache.store_live_frontier(&transaction, &first)?;
+        cache.store_live_frontier(&transaction, &first)?;
         cache.store_page(&transaction, &final_page)?;
+        cache.store_live_frontier(&transaction, &final_page)?;
+        assert!(cache.store_live_frontier(&transaction, &first).is_err());
         let witness = fixture.witness(&final_page)?;
         cache.store_witness(&transaction, &witness)?;
         cache.store_witness(&transaction, &witness)?;
         transaction.commit()?;
         assert_eq!(cache.load_page(&connection, 0)?, Some(first.clone()));
-        assert_eq!(cache.load_page(&connection, 1)?, Some(final_page));
+        assert_eq!(cache.load_page(&connection, 1)?, Some(final_page.clone()));
+        assert_eq!(cache.load_live_frontier(&connection)?, Some(final_page));
         assert_eq!(cache.load_witness(&connection)?, Some(witness));
         let rows: u64 =
             connection.query_row("SELECT count(*) FROM identity_meta", [], |row| row.get(0))?;
-        assert_eq!(rows, 4);
+        assert_eq!(rows, 5);
         let mut changed = first.payload.clone();
         changed.next_cursor = Some(ObjectHash::body(&"different cursor")?);
         let changed = Signed::sign(changed, &fixture.source)?;

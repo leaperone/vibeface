@@ -575,6 +575,48 @@ pub(crate) mod tests {
         }
 
         fn imported(&mut self) -> Result<VerifiedRecoveryPolicyContext> {
+            self.imported_restarting_target(None)
+        }
+
+        fn rebuild_live_target(&mut self, binding: &Value) -> Result<()> {
+            let saved = binding["saved_page_count"]
+                .as_u64()
+                .context("saved recovery frontier missing")?;
+            assert_eq!(binding["page_count"], 0);
+            let input = json!({
+                "snapshot_id":binding["snapshot_id"],
+                "request_hash":binding["request_hash"],
+                "snapshot_hash":binding["snapshot_hash"],
+            });
+            for index in 0..saved {
+                let result = self.target.cross_node_recovery_command(
+                    &self.target_node,
+                    &self.next_client.public_key_hex(),
+                    "cross_node_recovery_import_cached_page",
+                    &input,
+                    now(),
+                )?;
+                assert_eq!(result["page_count"], index + 1);
+                assert_eq!(result["saved_page_count"], saved);
+            }
+            assert!(
+                self.target
+                    .cross_node_recovery_command(
+                        &self.target_node,
+                        &self.next_client.public_key_hex(),
+                        "cross_node_recovery_import_cached_page",
+                        &input,
+                        now(),
+                    )
+                    .is_err()
+            );
+            Ok(())
+        }
+
+        fn imported_restarting_target(
+            &mut self,
+            restart_after: Option<u64>,
+        ) -> Result<VerifiedRecoveryPolicyContext> {
             let principal = self.next_client.public_key_hex();
             let response = self.source.cross_node_recovery_command(
                 &self.network.node,
@@ -605,6 +647,7 @@ pub(crate) mod tests {
                 json!(snapshot.payload.request_hash)
             );
             assert_eq!(binding["snapshot_hash"], json!(snapshot.hash()?));
+            self.rebuild_live_target(&binding)?;
             let mut cursor = None;
             loop {
                 let response = self.source.cross_node_recovery_command(
@@ -614,20 +657,133 @@ pub(crate) mod tests {
                 let page: Signed<RecoveryContextPage> =
                     serde_json::from_value(response["page"].clone())?;
                 importer.append(page.clone(), now())?;
+                let input = json!({
+                    "snapshot_id":binding["snapshot_id"],
+                    "request_hash":binding["request_hash"],
+                    "snapshot_hash":binding["snapshot_hash"],
+                    "page":page,
+                });
                 let imported = self.target.cross_node_recovery_command(
                     &self.target_node,
                     &principal,
                     "cross_node_recovery_import_page",
-                    &json!({
-                        "snapshot_id":binding["snapshot_id"],
-                        "request_hash":binding["request_hash"],
-                        "snapshot_hash":binding["snapshot_hash"],
-                        "page":page,
-                    }),
+                    &input,
                     now(),
                 )?;
                 assert_eq!(imported["page_count"], page.payload.page_index + 1);
+                assert_eq!(imported["saved_page_count"], page.payload.page_index + 1);
                 assert_eq!(imported["complete"], page.payload.complete);
+                if restart_after == Some(page.payload.page_index + 1) {
+                    assert!(!page.payload.complete);
+                    assert!(
+                        self.source
+                            .cross_node_recovery_command(
+                                &self.network.node,
+                                &principal,
+                                "cross_node_recovery_context_witness",
+                                &json!({"snapshot_id":snapshot.payload.snapshot_id,"request_hash":snapshot.payload.request_hash,"cursor":null}),
+                                now(),
+                            )
+                            .is_err()
+                    );
+                    assert!(
+                        self.source
+                            .cross_node_recovery_command(
+                                &self.network.node,
+                                &principal,
+                                "cross_node_recovery_context_page",
+                                &json!({"snapshot_id":snapshot.payload.snapshot_id,"request_hash":snapshot.payload.request_hash,"cursor":null}),
+                                now(),
+                            )
+                            .is_err()
+                    );
+                    self.target = Store::open(self.network.directory.join("target.sqlite3"))?;
+                    let begin = json!({"request":self.request,"snapshot":snapshot});
+                    assert!(
+                        self.target
+                            .cross_node_recovery_command(
+                                &self.target_node,
+                                &principal,
+                                "cross_node_recovery_import_begin",
+                                &begin,
+                                now() + 200_000,
+                            )
+                            .is_err()
+                    );
+                    let resumed = self.target.cross_node_recovery_command(
+                        &self.target_node,
+                        &principal,
+                        "cross_node_recovery_import_begin",
+                        &begin,
+                        now(),
+                    )?;
+                    assert_eq!(resumed["saved_page_count"], page.payload.page_index + 1);
+                    assert_eq!(resumed["complete"], false);
+                    let cached = json!({
+                        "snapshot_id":resumed["snapshot_id"],
+                        "request_hash":resumed["request_hash"],
+                        "snapshot_hash":resumed["snapshot_hash"],
+                    });
+                    for (reader, at) in [
+                        (self.network.client.public_key_hex(), now()),
+                        (principal.clone(), now() + 200_000),
+                    ] {
+                        assert!(
+                            self.target
+                                .cross_node_recovery_command(
+                                    &self.target_node,
+                                    &reader,
+                                    "cross_node_recovery_import_cached_page",
+                                    &cached,
+                                    at,
+                                )
+                                .is_err()
+                        );
+                    }
+                    let mut wrong = cached.clone();
+                    wrong["snapshot_hash"] = json!(ObjectHash::body(&"another snapshot")?);
+                    assert!(
+                        self.target
+                            .cross_node_recovery_command(
+                                &self.target_node,
+                                &principal,
+                                "cross_node_recovery_import_cached_page",
+                                &wrong,
+                                now(),
+                            )
+                            .is_err()
+                    );
+                    assert!(
+                        self.target
+                            .cross_node_recovery_command(
+                                &self.target_node,
+                                &principal,
+                                "cross_node_recovery_import_page",
+                                &input,
+                                now(),
+                            )
+                            .is_err()
+                    );
+                    self.rebuild_live_target(&resumed)?;
+                    let retry = self.source.cross_node_recovery_command(
+                        &self.network.node,
+                        &principal,
+                        "cross_node_recovery_context_page",
+                        &json!({"snapshot_id":snapshot.payload.snapshot_id,"request_hash":snapshot.payload.request_hash,"cursor":cursor}),
+                        now(),
+                    )?;
+                    assert_eq!(retry["page"], json!(page));
+                    assert_eq!(
+                        self.target.cross_node_recovery_command(
+                            &self.target_node,
+                            &principal,
+                            "cross_node_recovery_import_page",
+                            &input,
+                            now(),
+                        )?,
+                        imported
+                    );
+                }
                 cursor = page.payload.next_cursor.clone();
                 let complete = page.payload.complete;
                 if complete {
@@ -681,6 +837,13 @@ pub(crate) mod tests {
             &mut self,
         ) -> Result<(cross_node::PreparedCrossNodeRecoveryCommit, Value)> {
             let prepared = self.prepared()?;
+            self.commit_prepared(prepared)
+        }
+
+        fn commit_prepared(
+            &mut self,
+            prepared: cross_node::PreparedCrossNodeAccountRecovery,
+        ) -> Result<(cross_node::PreparedCrossNodeRecoveryCommit, Value)> {
             let request: Value = serde_json::from_str(
                 &prepared
                     .possession_request_json()
@@ -1102,6 +1265,29 @@ pub(crate) mod tests {
                 .authorize_request(&write, &facts, &transport, now())
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn live_import_rebuilds_one_cached_page_per_rpc_before_source_witness_exists() -> Result<()> {
+        let mut f = Fixture::new()?;
+        let before = journal_count(&f.source)?;
+        let context = f.imported_restarting_target(Some(2))?;
+        assert_eq!(context.witness().payload.entry_count, before);
+        let prepared = cross_node::prepare_cross_node_account_recovery(
+            &f.material,
+            &context,
+            &f.next_root,
+            &f.next_client,
+            (now() + 1_000_000) as f64,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let (_, request) = f.commit_prepared(prepared)?;
+        let response = f.source_commit(&request, now())?;
+        assert_eq!(f.install(&response["committed"], now())?["installed"], true);
+        assert_eq!(journal_count(&f.target)?, journal_count(&f.source)?);
+        assert_eq!(f.source_commit(&request, now() + 200_000)?, response);
         Ok(())
     }
 
