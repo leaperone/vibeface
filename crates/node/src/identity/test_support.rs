@@ -733,7 +733,13 @@ impl TestNetwork {
             self.space.as_str(),
             &request.operation_id,
             state.clone(),
-            result.clone(),
+            result,
+        )?;
+        let result = store.seal_local_execution_result(
+            &self.node,
+            self.space.as_str(),
+            &request.operation_id,
+            now() + 2,
         )?;
         let dispatch = store
             .operation_dispatch(self.space.as_str(), &request.operation_id)?
@@ -751,7 +757,7 @@ impl TestNetwork {
                     .as_str()
                     .context("invalid operation state")?
                     .into(),
-                detail: result,
+                detail: serde_json::to_value(result)?,
             },
             vec![],
             (now() + 2) as i64,

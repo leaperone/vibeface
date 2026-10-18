@@ -4202,7 +4202,13 @@ mod tests {
             network.space.as_str(),
             id,
             OperationState::Succeeded,
-            result.clone(),
+            result,
+        )?;
+        let result = store.seal_local_execution_result(
+            &network.node,
+            network.space.as_str(),
+            id,
+            now() + 2,
         )?;
         let content = serde_json::to_vec(&result)?;
         let blob = BlobRef {
