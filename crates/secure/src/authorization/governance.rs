@@ -533,6 +533,44 @@ impl PreparedSpaceGovernanceChange {
     }
 }
 
+pub fn issue_space_governance_challenge_in_state(
+    state: &VerifiedPolicySet,
+    request: &SpaceGovernanceRequest,
+    authority: &Identity,
+    now: u64,
+) -> Result<Signed<PolicyCommit>> {
+    let _signature_scope = ScopedSignatureVerification::new();
+    let verified = verify_space_governance_request(state, request, now)?;
+    let space = state
+        .space(&request.proposal.payload.space)
+        .ok_or(AuthorizationError::PolicyConflict)?;
+    require(
+        space.authority.public_key == PublicKey::of(authority),
+        "space challenge requires its current authority",
+    )?;
+    let challenge = Signed::sign(
+        PolicyCommit {
+            version: AUTH_VERSION,
+            previous: state
+                .head(&PolicyDomain::Space(space.space.clone()))
+                .cloned()
+                .ok_or(AuthorizationError::PolicyConflict)?,
+            proposal_hash: request.proposal.hash()?,
+            accepted_at_ms: 0,
+            issued_at_ms: now,
+            expires_at_ms: now.saturating_add(EXECUTION_LEASE_MS).min(verified.expires),
+            nonce: request.nonce.clone(),
+            dependencies: verified.dependencies.clone(),
+        },
+        authority,
+    )?;
+    let mut usage = execution_handoff::ExecutionProofUsage::default();
+    record_governance_usage(&mut usage, &verified)?;
+    usage.record_signed(&challenge)?;
+    finish_usage(&mut usage)?;
+    Ok(challenge)
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = issueSpaceGovernanceChallenge))]
 pub fn issue_space_governance_challenge(
     request_json: &str,
@@ -551,34 +589,71 @@ pub fn issue_space_governance_challenge(
             .public_key
             .clone();
         let (snapshot, _) = load(authorization, &signer, now)?;
-        let state = snapshot.state();
         let request: SpaceGovernanceRequest = parse(request_json)?;
-        let verified = verify_space_governance_request(&state, &request, now)?;
-        let space = state
-            .space(&request.proposal.payload.space)
-            .ok_or(AuthorizationError::PolicyConflict)?;
-        require(
-            space.authority.public_key == PublicKey::of(authority),
-            "space challenge requires its current authority",
-        )?;
-        Signed::sign(
-            PolicyCommit {
-                version: AUTH_VERSION,
-                previous: state
-                    .head(&PolicyDomain::Space(space.space.clone()))
-                    .cloned()
-                    .ok_or(AuthorizationError::PolicyConflict)?,
-                proposal_hash: request.proposal.hash()?,
-                accepted_at_ms: 0,
-                issued_at_ms: now,
-                expires_at_ms: now.saturating_add(EXECUTION_LEASE_MS).min(verified.expires),
-                nonce: request.nonce,
-                dependencies: verified.dependencies,
-            },
-            authority,
-        )
+        issue_space_governance_challenge_in_state(snapshot.state(), &request, authority, now)
     };
     json(&issue().map_err(|error| error.to_string())?)
+}
+
+pub fn accept_space_governance_change_in_state(
+    state: &VerifiedPolicySet,
+    request: &SpaceGovernanceRequest,
+    challenge: &Signed<PolicyCommit>,
+    receipts: &[Signed<FreshnessReceipt>],
+    authority: &Identity,
+    now: u64,
+) -> Result<Committed<SpaceDocument>> {
+    let _signature_scope = ScopedSignatureVerification::new();
+    require(
+        canonical(&(request, challenge, receipts))?.len() <= MAX_PROOF_BYTES,
+        "governance commit input too large",
+    )?;
+    let verified = verify_space_governance_request(state, request, now)?;
+    challenge.verify_signature()?;
+    let space = state
+        .space(&request.proposal.payload.space)
+        .ok_or(AuthorizationError::PolicyConflict)?;
+    require(
+        challenge.issuer == PublicKey::of(authority)
+            && challenge.issuer == space.authority.public_key
+            && challenge.payload.version == AUTH_VERSION
+            && challenge.payload.accepted_at_ms == 0
+            && Some(&challenge.payload.previous)
+                == state.head(&PolicyDomain::Space(space.space.clone()))
+            && challenge.payload.proposal_hash == request.proposal.hash()?
+            && challenge.payload.nonce == request.nonce
+            && challenge.payload.dependencies == verified.dependencies,
+        "space challenge differs from current governance request",
+    )?;
+    validate_window(
+        challenge.payload.issued_at_ms,
+        challenge.payload.expires_at_ms,
+        now,
+    )?;
+    require(
+        challenge.payload.expires_at_ms <= verified.expires,
+        "space challenge exceeds signer capability",
+    )?;
+    let mut candidate = state.clone();
+    install_objects(&mut candidate, request, now)?;
+    let mut commit = challenge.payload.clone();
+    commit.accepted_at_ms = now;
+    let change = Committed {
+        proposal: request.proposal.clone(),
+        commit: Signed::sign(commit, authority)?,
+        receipts: receipts.to_vec(),
+    };
+    candidate.install_space_committed(change.clone(), now)?;
+    let mut usage = execution_handoff::ExecutionProofUsage::default();
+    record_governance_usage(&mut usage, &verified)?;
+    usage.record_signed(challenge)?;
+    usage.record_signed(&change.commit)?;
+    for receipt in receipts {
+        usage.record_signed(receipt)?;
+    }
+    usage.record_metadata(&change)?;
+    finish_usage(&mut usage)?;
+    Ok(change)
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = acceptSpaceGovernanceChange))]
@@ -601,45 +676,17 @@ pub fn accept_space_governance_change(
             .public_key
             .clone();
         let (snapshot, _) = load(authorization, &signer, now)?;
-        let mut state = snapshot.state().clone();
         let request: SpaceGovernanceRequest = parse(request_json)?;
-        let verified = verify_space_governance_request(&state, &request, now)?;
-        let challenge: Signed<PolicyCommit> = decode_signed(challenge_json.as_bytes())?;
-        challenge.verify_signature()?;
-        let space = state
-            .space(&request.proposal.payload.space)
-            .ok_or(AuthorizationError::PolicyConflict)?;
-        require(
-            challenge.issuer == PublicKey::of(authority)
-                && challenge.issuer == space.authority.public_key
-                && challenge.payload.version == AUTH_VERSION
-                && challenge.payload.accepted_at_ms == 0
-                && Some(&challenge.payload.previous)
-                    == state.head(&PolicyDomain::Space(space.space.clone()))
-                && challenge.payload.proposal_hash == request.proposal.hash()?
-                && challenge.payload.nonce == request.nonce
-                && challenge.payload.dependencies == verified.dependencies,
-            "space challenge differs from current governance request",
-        )?;
-        validate_window(
-            challenge.payload.issued_at_ms,
-            challenge.payload.expires_at_ms,
+        let challenge: Signed<PolicyCommit> = parse(challenge_json)?;
+        let receipts: Vec<Signed<FreshnessReceipt>> = parse(receipts_json)?;
+        accept_space_governance_change_in_state(
+            snapshot.state(),
+            &request,
+            &challenge,
+            &receipts,
+            authority,
             now,
-        )?;
-        require(
-            challenge.payload.expires_at_ms <= verified.expires,
-            "space challenge exceeds signer capability",
-        )?;
-        install_objects(&mut state, &request, now)?;
-        let mut commit = challenge.payload;
-        commit.accepted_at_ms = now;
-        let change = Committed {
-            proposal: request.proposal,
-            commit: Signed::sign(commit, authority)?,
-            receipts: parse(receipts_json)?,
-        };
-        state.install_space_committed(change.clone(), now)?;
-        Ok(change)
+        )
     };
     json(&accept().map_err(|error| error.to_string())?)
 }
@@ -1374,6 +1421,41 @@ impl PreparedTeamCreation {
     }
 }
 
+pub fn accept_team_creation_in_state(
+    state: &VerifiedPolicySet,
+    source_grant: &ObjectHash,
+    pins: &[PolicyPin],
+    request: &Signed<TeamCreationRequest>,
+    node: &Identity,
+    now: u64,
+) -> Result<Signed<TeamCreationAcceptance>> {
+    let _signature_scope = ScopedSignatureVerification::new();
+    let verified = verify_team_creation_request(state, source_grant, pins, request, now)?;
+    require(
+        verified.request().target_node_public_key == PublicKey::of(node),
+        "team creation reached another physical node",
+    )?;
+    let acceptance = Signed::sign(
+        TeamCreationAcceptance {
+            version: AUTH_VERSION,
+            request_hash: verified.request_hash.clone(),
+            space: request.payload.team_project.space.clone(),
+            owner_account: request.payload.owner_account.clone(),
+            target_node_public_key: PublicKey::of(node),
+            account_head: verified.account_head.clone(),
+            nonce: request.payload.nonce.clone(),
+            accepted_at_ms: now,
+            expires_at_ms: request.payload.expires_at_ms,
+        },
+        node,
+    )?;
+    let mut usage = execution_handoff::ExecutionProofUsage::default();
+    record_team_usage(&mut usage, request, &verified)?;
+    usage.record_signed(&acceptance)?;
+    finish_usage(&mut usage)?;
+    Ok(acceptance)
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = acceptTeamCreation))]
 pub fn accept_team_creation(
     request_json: &str,
@@ -1392,31 +1474,14 @@ pub fn accept_team_creation(
             .public_key
             .clone();
         let (snapshot, current) = load(authorization, &signer, now)?;
-        let request: Signed<TeamCreationRequest> = decode_signed(request_json.as_bytes())?;
-        let verified = verify_team_creation_request(
+        let request: Signed<TeamCreationRequest> = parse(request_json)?;
+        accept_team_creation_in_state(
             snapshot.state(),
             &current.grant_leaf,
             snapshot.pins(),
             &request,
-            now,
-        )?;
-        require(
-            verified.request().target_node_public_key == PublicKey::of(node),
-            "team creation reached another physical node",
-        )?;
-        Signed::sign(
-            TeamCreationAcceptance {
-                version: AUTH_VERSION,
-                request_hash: verified.request_hash,
-                space: request.payload.team_project.space,
-                owner_account: request.payload.owner_account,
-                target_node_public_key: PublicKey::of(node),
-                account_head: verified.account_head,
-                nonce: request.payload.nonce,
-                accepted_at_ms: now,
-                expires_at_ms: request.payload.expires_at_ms,
-            },
             node,
+            now,
         )
     };
     json(&accept().map_err(|error| error.to_string())?)
@@ -2173,6 +2238,19 @@ pub(crate) mod tests {
                 NOW as f64,
             )
             .unwrap();
+            let raw_acceptance = accept_team_creation_in_state(
+                &self.state(),
+                &self.bundle.grant_leaf,
+                &self.pins,
+                &prepared.request,
+                &key(4),
+                NOW,
+            )
+            .unwrap();
+            assert_eq!(
+                parse::<Signed<TeamCreationAcceptance>>(&acceptance).unwrap(),
+                raw_acceptance
+            );
             let pending = prepared.recovery_material_json().unwrap();
             let pending_value: serde_json::Value = parse(&pending).unwrap();
             assert_eq!(pending_value["status"], "pending");
@@ -2306,6 +2384,16 @@ pub(crate) mod tests {
             )
             .unwrap();
             let challenge: Signed<PolicyCommit> = parse(&challenge_json).unwrap();
+            assert_eq!(
+                issue_space_governance_challenge_in_state(
+                    &self.state(),
+                    &prepared.request,
+                    &key(4),
+                    NOW
+                )
+                .unwrap(),
+                challenge
+            );
             let receipts: Vec<_> = challenge
                 .payload
                 .dependencies
@@ -2344,6 +2432,19 @@ pub(crate) mod tests {
                 NOW as f64,
             )
             .unwrap();
+            let raw_committed = accept_space_governance_change_in_state(
+                &self.state(),
+                &prepared.request,
+                &challenge,
+                &receipts,
+                &key(4),
+                NOW,
+            )
+            .unwrap();
+            assert_eq!(
+                parse::<Committed<SpaceDocument>>(&committed).unwrap(),
+                raw_committed
+            );
             let result = finish_space_governance_change(prepared, &committed, NOW as f64).unwrap();
             let delayed = finish_space_governance_change(
                 prepared,
