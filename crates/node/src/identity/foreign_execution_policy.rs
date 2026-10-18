@@ -1,4 +1,6 @@
-use super::{client_policy_read::check_heads_in, remote_execution_policy::check_source_task};
+use super::{
+    client_policy_read::check_heads_in, remote_execution_policy::checked_source_task_binding_in,
+};
 use crate::{binding::SignedBinding, crypto::LocalIdentity, store::Store};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -80,40 +82,6 @@ fn save_exact_in<T: Serialize>(connection: &Connection, key: &str, value: &T) ->
         )?;
     }
     Ok(())
-}
-
-fn current_binding_in(
-    connection: &Connection,
-    intent: &Signed<RemoteExecutionPolicyReadIntent>,
-) -> Result<Option<SignedBinding>> {
-    let scope = &intent.payload.source_selection.resource;
-    let task = intent
-        .payload
-        .context
-        .context
-        .task
-        .as_ref()
-        .context("policy approval has no Task")?;
-    let current: Option<String> = connection.query_row(
-        "SELECT value FROM local_values WHERE space_id=? AND key=? AND length(CAST(value AS BLOB))<=?",
-        params![scope.space.as_str(), format!("task-binding-current:{task}"), MAX_PROOF_BYTES],
-        |row| row.get(0),
-    ).optional()?;
-    let Some(current) = current else {
-        return Ok(None);
-    };
-    let hash: String = serde_json::from_str(&current)?;
-    let encoded: String = connection.query_row(
-        "SELECT value FROM local_values WHERE space_id=? AND key=? AND length(CAST(value AS BLOB))<=?",
-        params![scope.space.as_str(), format!("task-binding-record:{hash}"), MAX_PROOF_BYTES],
-        |row| row.get(0),
-    )?;
-    let binding: SignedBinding = serde_json::from_str(&encoded)?;
-    ensure!(
-        crate::binding::binding_hash(&binding.binding)? == hash,
-        "policy approval binding changed its original hash"
-    );
-    Ok(Some(binding))
 }
 
 pub(crate) fn load_task_execution_trust_in(
@@ -220,8 +188,7 @@ impl Store {
         check_heads_in(&tx, &self.policy, source.source_heads())?;
         self.policy.accepted_journal_snapshot(&tx)?;
         let mut usage = source.proof_usage().clone();
-        check_source_task(&tx, intent, &local, &mut usage)?;
-        let current = current_binding_in(&tx, intent)?;
+        let current = checked_source_task_binding_in(&tx, intent, &local, &mut usage)?;
         let choice = task_execution_policy_choice_key(intent)?;
         let nonce_key = format!("{PREFIX}:nonce:{}:{}", intent.issuer, intent.payload.nonce);
         let envelope_hash = ObjectHash::body(intent)?;

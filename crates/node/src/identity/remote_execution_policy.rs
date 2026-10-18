@@ -124,12 +124,12 @@ fn local_value(connection: &Connection, space: &str, key: &str) -> Result<Option
         .optional()?)
 }
 
-pub(super) fn check_source_task(
+pub(super) fn checked_source_task_binding_in(
     connection: &Connection,
     intent: &Signed<RemoteExecutionPolicyReadIntent>,
     local: &PublicKey,
     usage: &mut ExecutionProofUsage,
-) -> Result<()> {
+) -> Result<Option<crate::binding::SignedBinding>> {
     let value = &intent.payload;
     let project = &value.source_selection.resource;
     let context = &value.context.context;
@@ -161,24 +161,13 @@ pub(super) fn check_source_task(
     };
     super::event_authorization::validate_retained_event_dependencies_in(connection, &creation)?;
     usage.record_retained_event(&creation)?;
-    let session = context
-        .execution_session
-        .as_ref()
-        .context("policy read has no execution session")?;
     let current = local_value(
         connection,
         project.space.as_str(),
         &format!("task-binding-current:{}", task.as_str()),
     )?;
     let Some(current) = current else {
-        ensure!(
-            value.expected_action == Action::ExecutionOpen
-                && value.purpose
-                    == vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPurpose::Execution
-                && value.context.binding_generation == Some(1),
-            "only the first execution open may read policy for an unbound Task"
-        );
-        return Ok(());
+        return Ok(None);
     };
     let current: String = serde_json::from_str(&current)?;
     let record = local_value(
@@ -198,6 +187,32 @@ pub(super) fn check_source_task(
             && prior.conversation_id == event.scope_id,
         "policy read Task binding changed its retained identity"
     );
+    usage.record_binding(&binding)?;
+    Ok(Some(binding))
+}
+
+pub(super) fn check_source_task(
+    connection: &Connection,
+    intent: &Signed<RemoteExecutionPolicyReadIntent>,
+    local: &PublicKey,
+    usage: &mut ExecutionProofUsage,
+) -> Result<()> {
+    let value = &intent.payload;
+    let context = &value.context.context;
+    let session = context
+        .execution_session
+        .as_ref()
+        .context("policy read has no execution session")?;
+    let Some(binding) = checked_source_task_binding_in(connection, intent, local, usage)? else {
+        ensure!(
+            value.expected_action == Action::ExecutionOpen
+                && value.purpose == RemoteExecutionPolicyPurpose::Execution
+                && value.context.binding_generation == Some(1),
+            "only the first execution open may read policy for an unbound Task"
+        );
+        return Ok(());
+    };
+    let prior = &binding.binding;
     if value.expected_action == Action::ExecutionRebind {
         ensure!(
             prior.generation.checked_add(1) == value.context.binding_generation,
@@ -215,7 +230,6 @@ pub(super) fn check_source_task(
             "policy read changed the current binding target, session, executor or cwd"
         );
     }
-    usage.record_binding(&binding)?;
     Ok(())
 }
 
