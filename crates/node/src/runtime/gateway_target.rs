@@ -68,15 +68,7 @@ impl Runtime {
                     if matches!(&original, GatewayOriginal::Status { .. }) {
                         ensure!(
                             invocation.payload.action == Action::OperationStatusRead
-                                && matches!(
-                                    body["method"].as_str(),
-                                    Some(
-                                        "operation"
-                                            | "session"
-                                            | "nodes"
-                                            | "remote_execution_seal_status"
-                                    )
-                                ),
+                                && body["method"] == "operation",
                             "gateway status requires a read-only status method"
                         );
                     }

@@ -1,5 +1,9 @@
 mod handoff;
 mod observation;
+mod task_business;
+mod gateway_forward;
+mod gateway_target;
+pub(crate) use gateway_forward::GatewaySourceRequest;
 
 mod dispatch;
 
@@ -222,7 +226,7 @@ pub(crate) mod tests {
             conversation_id: body["conversation_id"].as_str().map(str::to_owned),
             authorization: TaskScopedAuthorization::from_primary(authorization),
             freshness,
-            transport,
+            transport: RequestTransport::Existing(transport),
             body: body.clone(),
             verification: SignatureVerification::new(),
         })
@@ -342,7 +346,7 @@ pub(crate) mod tests {
             body["sdk_session"] = json!(manager.sdk_session);
             body["parent_invocation"] = json!(manager.parent_invocation);
             let access = node.authorize_agent(manager, body).await?;
-            node.store.lock().await.accept_authorized_operation(
+            node.store.lock().await.accept_request_authorized_operation(
                 &node.identity,
                 &access.authorization,
                 &access.freshness,
@@ -366,7 +370,7 @@ pub(crate) mod tests {
         body["authorization_id"] = json!(request.operation_id);
         body["request"] = json!(request);
         let access = access(network, node, &body).await?;
-        node.store.lock().await.accept_authorized_operation(
+        node.store.lock().await.accept_request_authorized_operation(
             &node.identity,
             &access.authorization,
             &access.freshness,
@@ -1084,7 +1088,7 @@ pub(crate) mod tests {
             let mut store = node.store.lock().await;
             assert!(
                 store
-                    .append_authorized_events(
+                    .append_request_authorized_events(
                         &node.identity,
                         &access.authorization,
                         &access.freshness,
@@ -2088,7 +2092,7 @@ pub(crate) mod tests {
                         access.authorization.audience(),
                         now_ms() as u64,
                     )?;
-                    store.accept_execution_dispatch(
+                    store.accept_execution_request_dispatch(
                         &self.project.node,
                         &dispatch,
                         &access.authorization,
@@ -4240,9 +4244,10 @@ impl Runtime {
                         &access.transport,
                         now_ms() as u64,
                     )?;
-                    store.execution_share_request(
+                    store.execution_share_request_for_transport(
                         &self.identity,
                         &access.authorization,
+                        &access.transport,
                         &input,
                         now_ms() as u64,
                     )

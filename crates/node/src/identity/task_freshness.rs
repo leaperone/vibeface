@@ -1,5 +1,5 @@
 use super::{
-    admission::check_manager_tool_in, journal::PolicyState,
+    admission::check_request_manager_tool_in, journal::PolicyState, policy::RequestTransport,
     task_execution_context::TaskScopedAuthorization,
 };
 use crate::{crypto::LocalIdentity, store::Store};
@@ -8,7 +8,7 @@ use rusqlite::params;
 use vibeface_secure::{
     authorization::{
         AUTH_VERSION, DeviceId, FreshnessChallenge, Nonce, PublicKey, RequestFacts, ServiceId,
-        Signed, TransportEvidence,
+        Signed,
         node_execution_policy::{
             NodeExecutionFreshnessRead, NodeExecutionPolicyReadIntent, VerifiedTaskExecutionTrust,
         },
@@ -26,7 +26,7 @@ impl Store {
         &self,
         identity: &LocalIdentity,
         scoped: &TaskScopedAuthorization,
-        transport: &TransportEvidence,
+        transport: &RequestTransport,
         challenge: &FreshnessChallenge,
         now: u64,
     ) -> Result<TaskFreshnessRead> {
@@ -54,7 +54,7 @@ impl Store {
         let tx = self.connection.unchecked_transaction()?;
         let primary = PolicyState::reload_verified(&tx, &self.policy)?;
         scoped.check_current_in(&tx, primary.verified(), &facts, now)?;
-        check_manager_tool_in(&tx, &primary, scoped.authorization(), transport, now)?;
+        check_request_manager_tool_in(&tx, &primary, scoped.authorization(), transport, now)?;
         let encoded: String = tx.query_row(
             "SELECT challenge FROM authorization_challenges WHERE space_id=? AND nonce=?",
             params![facts.resource.space.as_str(), challenge.nonce.as_str()],

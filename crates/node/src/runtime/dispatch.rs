@@ -515,7 +515,7 @@ impl Runtime {
                     access.authorization.audience(),
                     now_ms() as u64,
                 )?;
-                store.accept_execution_dispatch(
+                store.accept_execution_request_dispatch(
                     &self.identity,
                     &facts,
                     &access.authorization,
@@ -906,7 +906,7 @@ impl Runtime {
                     access.authorization.audience(),
                     now_ms() as u64,
                 )?;
-                let (wire, fresh) = store.prepare_execution_dispatch_resolution(
+                let (wire, fresh) = store.prepare_execution_request_dispatch_resolution(
                     &self.identity,
                     &dispatch,
                     &access.authorization,
@@ -989,7 +989,7 @@ impl Runtime {
         {
             let store = self.store.lock().await;
             access.verification.run(|| {
-                store.authorize_read(
+                store.authorize_request_read(
                     &access.authorization,
                     &access.freshness,
                     &access.transport,
@@ -1023,7 +1023,7 @@ impl Runtime {
         {
             let store = self.store.lock().await;
             access.verification.run(|| {
-                store.authorize_read(
+                store.authorize_request_read(
                     &access.authorization,
                     &access.freshness,
                     &access.transport,

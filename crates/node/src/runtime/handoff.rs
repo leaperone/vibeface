@@ -306,7 +306,7 @@ impl Runtime {
         let preflight = {
             let store = self.store.lock().await;
             access.verification.run(|| {
-                store.authorize_remote_execution_seal_fence(
+                store.authorize_remote_execution_seal_request_fence(
                     &self.identity,
                     &access.authorization,
                     &access.freshness,
@@ -327,7 +327,7 @@ impl Runtime {
         let seal = {
             let mut store = self.store.lock().await;
             access.verification.run(|| {
-                store.seal_remote_execution_authorized(
+                store.seal_remote_execution_request_authorized(
                     &self.identity,
                     &access.authorization,
                     &access.freshness,
