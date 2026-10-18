@@ -159,6 +159,20 @@ impl Runtime {
         Ok(remote)
     }
 
+    pub(super) fn authorization_facts_in_scope(
+        &self,
+        store: &Store,
+        authorization: &crate::identity::task_execution_context::TaskScopedAuthorization,
+        body: &Value,
+        audience: &Audience,
+        now: u64,
+    ) -> Result<RequestFacts> {
+        if self.is_execution_resolution(body)? || self.is_execution_dispatch(body)? {
+            return Ok(store.execution_dispatch_facts_in_scope(authorization, body, audience, now)?.facts().clone());
+        }
+        self.authorization_facts(store, body, audience, now)
+    }
+
     pub(super) fn authorization_facts(
         &self,
         store: &Store,
@@ -488,7 +502,8 @@ impl Runtime {
         {
             let mut store = self.store.lock().await;
             access.verification.run(|| -> Result<()> {
-                let facts = store.execution_dispatch_facts(
+                let facts = store.execution_dispatch_facts_in_scope(
+                    &access.authorization,
                     &access.body,
                     access.authorization.audience(),
                     now_ms() as u64,

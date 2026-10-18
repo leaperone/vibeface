@@ -3,7 +3,7 @@ mod observation;
 
 mod dispatch;
 
-use crate::identity::policy::FreshnessProof;
+use crate::identity::{policy::FreshnessProof, task_execution_context::TaskScopedAuthorization};
 use crate::{
     config::{self, Config},
     crypto::{self, LocalIdentity},
@@ -37,7 +37,7 @@ use vibeface_secure::signature_verification::SignatureVerification;
 pub struct Access {
     pub network_id: String,
     pub conversation_id: Option<String>,
-    authorization: VerifiedAuthorization,
+    authorization: TaskScopedAuthorization,
     freshness: FreshnessProof,
     transport: TransportEvidence,
     body: Value,
@@ -129,7 +129,7 @@ pub(crate) mod tests {
         Ok(Access {
             network_id: network.space.to_string(),
             conversation_id: body["conversation_id"].as_str().map(str::to_owned),
-            authorization,
+            authorization: TaskScopedAuthorization::from_primary(authorization),
             freshness,
             transport,
             body: body.clone(),
@@ -2757,6 +2757,22 @@ impl Runtime {
         .await
     }
 
+    async fn freshness_scoped_with_verification(
+        &self,
+        authorization: &TaskScopedAuthorization,
+        stage: CheckStage,
+        verification: &SignatureVerification,
+    ) -> Result<FreshnessProof> {
+        let now = now_ms() as u64;
+        let challenge = {
+            let mut store = self.store.lock().await;
+            verification.run(|| store.issue_scoped_freshness(authorization, stage, now))?
+        };
+        self.collect_freshness_challenge_in_scope_with_verification(
+            authorization.resource().space.as_str(), &challenge, Some(authorization), verification,
+        ).await
+    }
+
     pub(crate) async fn collect_freshness_challenge(
         &self,
         space: &str,
@@ -2776,10 +2792,21 @@ impl Runtime {
         challenge: &FreshnessChallenge,
         verification: &SignatureVerification,
     ) -> Result<FreshnessProof> {
+        self.collect_freshness_challenge_in_scope_with_verification(space, challenge, None, verification).await
+    }
+
+    async fn collect_freshness_challenge_in_scope_with_verification(
+        &self,
+        space: &str,
+        challenge: &FreshnessChallenge,
+        authorization: Option<&TaskScopedAuthorization>,
+        verification: &SignatureVerification,
+    ) -> Result<FreshnessProof> {
         let (mut receipts, authorities) = {
             let store = self.store.lock().await;
             let receipts = verification
                 .run(|| store.sign_current_receipts(challenge, &self.identity, now_ms() as u64))?;
+            let policies = authorization.map_or(store.authorization_state(), |scope| scope.state(store.authorization_state()));
             let mut authorities = BTreeSet::new();
             for stamp in &challenge.policies {
                 if receipts
@@ -2790,16 +2817,12 @@ impl Runtime {
                 }
                 let authority = match &stamp.domain {
                     PolicyDomain::Account(id) => {
-                        &store
-                            .authorization_state()
-                            .account(id)
+                        &policies.account(id)
                             .context("account policy missing")?
                             .authority
                     }
                     PolicyDomain::Space(id) => {
-                        &store
-                            .authorization_state()
-                            .space(id)
+                        &policies.space(id)
                             .context("space policy missing")?
                             .authority
                     }
@@ -2878,7 +2901,8 @@ impl Runtime {
                     body_hash: ObjectHash::body(&body)?,
                     context: invocation.payload.context.clone(),
                 };
-                store.authorize_request_for_body(
+                let raw_authorization = store.authorize_scoped_request_for_body(
+                    &self.identity,
                     &invocation,
                     &raw,
                     &transport,
@@ -2886,9 +2910,10 @@ impl Runtime {
                     now_ms() as u64,
                 )?;
                 let facts = self
-                    .authorization_facts(&store, &body, &audience, now_ms() as u64)
+                    .authorization_facts_in_scope(&store, &raw_authorization, &body, &audience, now_ms() as u64)
                     .map_err(|_| anyhow::anyhow!("request facts do not match authorization"))?;
-                store.authorize_request_for_body(
+                store.authorize_scoped_request_for_body(
+                    &self.identity,
                     &invocation,
                     &facts,
                     &transport,
@@ -2907,7 +2932,7 @@ impl Runtime {
             CheckStage::Admit
         };
         let freshness = self
-            .freshness_with_verification(&authorization, stage, &verification)
+            .freshness_scoped_with_verification(&authorization, stage, &verification)
             .await?;
         Ok(Access {
             network_id: space.to_string(),
@@ -3354,9 +3379,13 @@ impl Runtime {
         }
         let store = self.store.lock().await;
         let _verification = access.verification.enter();
-        store
-            .authorization_state()
-            .check_current(&access.authorization, now_ms() as u64)?;
+        let invocation = &access.authorization.signed_invocation().payload;
+        let facts = vibeface_secure::authorization::RequestFacts {
+            resource: invocation.resource.clone(), action: invocation.action,
+            audience: invocation.audience.clone(), operation_id: invocation.operation_id.clone(),
+            body_hash: invocation.body_hash.clone(), context: invocation.context.clone(),
+        };
+        access.authorization.check_current_in(&store.connection, store.authorization_state(), &facts, now_ms() as u64)?;
         ensure!(
             store
                 .authorized_conversation_ids(&access.authorization)?
@@ -3617,8 +3646,9 @@ impl Runtime {
             let store = self.store.lock().await;
             let _verification = access.verification.enter();
             let facts =
-                self.authorization_facts(&store, &input, &self.audience()?, now_ms() as u64)?;
-            store.authorize_request_for_body(
+                self.authorization_facts_in_scope(&store, &access.authorization, &input, &self.audience()?, now_ms() as u64)?;
+            store.authorize_scoped_request_for_body(
+                &self.identity,
                 access.authorization.signed_invocation(),
                 &facts,
                 &access.transport,
@@ -4077,7 +4107,8 @@ impl Runtime {
                 let mut store = self.store.lock().await;
                 let _verification = access.verification.enter();
                 let binding = if self.is_execution_dispatch(&input)? {
-                    let dispatch = store.execution_dispatch_facts(
+                    let dispatch = store.execution_dispatch_facts_in_scope(
+                        &access.authorization,
                         &input,
                         access.authorization.audience(),
                         now_ms() as u64,

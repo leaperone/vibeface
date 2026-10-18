@@ -155,7 +155,7 @@ impl TaskScopedAuthorization {
         self.task_policy.as_ref()
     }
 
-    pub(super) fn state<'a>(&'a self, primary: &'a VerifiedPolicySet) -> &'a VerifiedPolicySet {
+    pub(crate) fn state<'a>(&'a self, primary: &'a VerifiedPolicySet) -> &'a VerifiedPolicySet {
         self.task_policy
             .as_ref()
             .map_or(primary, |task| task.state())
