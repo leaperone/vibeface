@@ -86,6 +86,54 @@ fn check_current(
     Ok(usage)
 }
 
+pub(super) fn completed_witness_in(
+    connection: &Connection,
+    header: &Signed<TaskBusinessPolicyHeader>,
+) -> Result<Signed<TaskBusinessPolicyWitness>> {
+    let reference = require_header(connection, header)?;
+    let complete: CompletedImport = read(connection, &key("import-complete", &reference))?
+        .context("NeedPolicySync: Task business source has no durable completion")?;
+    ensure!(
+        complete.header_hash == reference && complete.witness.payload.header_hash == reference,
+        "Task business source completion changed its original header"
+    );
+    let progress: ImportProgress = read(connection, &key("import-progress", &reference))?
+        .context("NeedPolicySync: Task business source lost its durable final page")?;
+    ensure!(
+        progress.header_hash == reference
+            && progress.ready_for_finish
+            && progress.next_page_index == complete.witness.payload.page_count,
+        "Task business source completion changed its original page cursor"
+    );
+    Ok(complete.witness)
+}
+
+pub(super) fn check_import_originals_in(
+    connection: &Connection,
+    header: &Signed<TaskBusinessPolicyHeader>,
+    witness: &Signed<TaskBusinessPolicyWitness>,
+    page_hashes: &[ObjectHash],
+) -> Result<()> {
+    let saved = completed_witness_in(connection, header)?;
+    ensure!(
+        saved == *witness && page_hashes.len() as u64 == witness.payload.page_count,
+        "Task business source completion differs from its verified originals"
+    );
+    let reference = header.hash()?;
+    for (index, expected) in page_hashes.iter().enumerate() {
+        let page: Signed<TaskBusinessPolicyPage> = read(
+            connection,
+            &format!("{}:{index}", key("import-page", &reference)),
+        )?
+        .context("NeedPolicySync: Task business source original page is missing")?;
+        ensure!(
+            ObjectHash::body(&page)? == *expected,
+            "Task business source original signed page changed"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn check_task_business_policy_view_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
@@ -105,34 +153,12 @@ pub(crate) fn check_task_business_policy_view_in(
     );
     super::super::client_policy_read::check_heads_in(connection, primary, &heads)?;
     source.verify_current_grant(primary.verified(), local_c, now)?;
-    let reference = require_header(connection, source.header())?;
-    let complete: CompletedImport = read(connection, &key("import-complete", &reference))?
-        .context("NeedPolicySync: Task business source has no durable completion")?;
-    ensure!(
-        complete.header_hash == reference && complete.witness == *source.witness(),
-        "Task business source completion differs from its verified originals"
-    );
-    let progress: ImportProgress = read(connection, &key("import-progress", &reference))?
-        .context("NeedPolicySync: Task business source lost its durable final page")?;
-    let page_hashes = source.original_page_envelope_hashes();
-    ensure!(
-        progress.header_hash == reference
-            && progress.ready_for_finish
-            && progress.next_page_index == complete.witness.payload.page_count
-            && page_hashes.len() as u64 == complete.witness.payload.page_count,
-        "Task business source completion changed its original page cursor"
-    );
-    for (index, expected) in page_hashes.iter().enumerate() {
-        let page: Signed<TaskBusinessPolicyPage> = read(
-            connection,
-            &format!("{}:{index}", key("import-page", &reference)),
-        )?
-        .context("NeedPolicySync: Task business source original page is missing")?;
-        ensure!(
-            ObjectHash::body(&page)? == *expected,
-            "Task business source original signed page changed"
-        );
-    }
+    check_import_originals_in(
+        connection,
+        source.header(),
+        source.witness(),
+        source.original_page_envelope_hashes(),
+    )?;
     source.check_saved_floors(&floors(connection, source.pins())?)?;
     usage.merge(view.proof_usage());
     if let Some(counts) = SignatureVerification::current_counts() {
