@@ -369,6 +369,55 @@ pub(super) fn material_proof_usage(
     Ok(usage)
 }
 
+/// Counts the private backup produced from genuine state without revalidating it.
+pub(crate) fn recovery_material_usage(
+    material: &RecoveryMaterial,
+) -> Result<crate::authorization::execution_handoff::ExecutionProofUsage> {
+    use crate::authorization::policy_proof::policy_entry_payload_usage;
+    let mut usage = crate::authorization::execution_handoff::ExecutionProofUsage::default();
+    usage.record_metadata(&(&material.scope, &material.pins, &material.entry))?;
+    if let Some(checkpoint) = &material.policy_checkpoint {
+        usage.record_signed(&checkpoint.snapshot)?;
+        let value = &checkpoint.snapshot.payload;
+        let mut raw = Budget::default();
+        raw.signatures.insert((
+            checkpoint.recovery_approval.key.clone(),
+            APPROVAL_DOMAIN.to_owned(),
+            ObjectHash(format!(
+                "h2_{}",
+                digest(APPROVAL_DOMAIN, &canonical(&checkpoint.snapshot)?)
+            )),
+            checkpoint.recovery_approval.signature.clone(),
+        ));
+        usage.record_budget(&raw)?;
+        for account in [&value.account_genesis, &value.account]
+            .into_iter()
+            .chain(value.authority_changes.iter())
+        {
+            usage.merge(&policy_entry_payload_usage(&JournalEntry::Account(
+                account.clone(),
+            ))?);
+        }
+        for space in [&value.space_genesis, &value.space] {
+            usage.merge(&policy_entry_payload_usage(&JournalEntry::Space(
+                space.clone(),
+            ))?);
+        }
+        for witness in &value.policy_witnesses {
+            let entry = match witness {
+                PolicyWitness::Account(value) => JournalEntry::Account(value.clone()),
+                PolicyWitness::Space(value) => JournalEntry::Space(value.clone()),
+            };
+            usage.merge(&policy_entry_payload_usage(&entry)?);
+        }
+    }
+    for entry in &material.bundle.journal {
+        usage.merge(&policy_entry_payload_usage(entry)?);
+    }
+    usage.enforce_limits()?;
+    Ok(usage)
+}
+
 fn material_state_with_budget(
     material: &RecoveryMaterial,
     budget: &mut Budget,
@@ -705,6 +754,28 @@ mod tests {
             "proof_signatures": budget.signatures.len(),
             "crypto": signatures.counts(),
         })
+    }
+
+    #[test]
+    fn generated_checkpoint_meter_counts_nested_proof_without_crypto() {
+        let created = super::super::tests::account_with_enrolled_nodes(12);
+        let encoded = build_account_recovery_material(
+            &created,
+            &key(1),
+            &key(2),
+            "https://node.example",
+            10_000.0,
+        )
+        .unwrap();
+        let material = read_material(&encoded).unwrap();
+        assert!(material.policy_checkpoint.is_some());
+        let signatures = crate::signature_verification::SignatureVerification::new();
+        let usage = signatures
+            .run(|| recovery_material_usage(&material))
+            .unwrap();
+        assert_eq!(signatures.counts().actual_verifications, 0);
+        assert!(usage.counts().unique_signed_objects > material.bundle.journal.len());
+        usage.enforce_limits().unwrap();
     }
 
     fn recover(

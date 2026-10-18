@@ -11,6 +11,7 @@ use super::*;
 pub use checkpoint::RecoveryPolicyCheckpoint;
 pub(crate) use checkpoint::{
     compact_recovery_material, compact_recovery_material_in_state, material_state,
+    recovery_material_usage,
 };
 use zeroize::Zeroize;
 
