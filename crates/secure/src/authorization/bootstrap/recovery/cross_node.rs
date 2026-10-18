@@ -1069,11 +1069,7 @@ pub fn build_cross_node_recovery_request(
             },
             &recovery,
         )?;
-        verify_request_identity(
-            &replay_policies(&material.pins, &material.bundle.journal)?,
-            &request,
-            now,
-        )?;
+        verify_request_identity(&material_state(&material)?, &request, now)?;
         Ok(request)
     };
     encode(&build().map_err(|e| e.to_string())?)
@@ -1229,8 +1225,7 @@ pub fn inspect_cross_node_recovery_sources(
     timestamp(now_ms).map_err(|e| e.to_string())?;
     let material = read_material(material_json).map_err(|e| e.to_string())?;
     validate_material(&material).map_err(|e| e.to_string())?;
-    let state =
-        replay_policies(&material.pins, &material.bundle.journal).map_err(|e| e.to_string())?;
+    let state = material_state(&material).map_err(|e| e.to_string())?;
     let space = state
         .space(&material.scope.space_id)
         .ok_or("missing recovery personal space")?;
@@ -1282,7 +1277,7 @@ pub fn restore_prepared_cross_node_recovery_commit(
             && pending.version == AUTH_VERSION
             && prepared_at <= now
             && pending.material.pins == request.pins
-            && pending.material.bundle == bundle
+            && pending.material.bundle.grant_leaf == bundle.grant_leaf
             && pending.material.scope.account_id == r.account
             && pending.material.scope.space_id == r.space
             && pending.material.entry.node_public_key == r.target_claim.payload.node_public_key
@@ -1293,6 +1288,28 @@ pub fn restore_prepared_cross_node_recovery_commit(
     )
     .map_err(|e| e.to_string())?;
     verify_completed(request, prepared_at).map_err(|e| e.to_string())?;
+    if pending.material.policy_checkpoint.is_some() {
+        let private = material_state(&pending.material).map_err(|e| e.to_string())?;
+        let public = replay_policies(&request.pins, &bundle.journal).map_err(|e| e.to_string())?;
+        require(
+            private.account(&r.account) == public.account(&r.account)
+                && private.space(&r.space) == public.space(&r.space)
+                && pending
+                    .material
+                    .bundle
+                    .journal
+                    .iter()
+                    .all(|object| bundle.journal.contains(object)),
+            "pending checkpoint differs from original committed request",
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        require(
+            pending.material.bundle == bundle,
+            "pending recovery history differs from original committed request",
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let authorization = verify_client_authorization(
         &encode(&bundle)?,
         &encode(&request.pins)?,

@@ -136,8 +136,11 @@ pub fn build_recovery_context_request(
             },
             &recovery,
         )?;
-        replay_policies(&material.pins, &material.bundle.journal)?
-            .verify_recovery_context_request(&request, &node, timestamp(now_ms)?)?;
+        material_state(&material)?.verify_recovery_context_request(
+            &request,
+            &node,
+            timestamp(now_ms)?,
+        )?;
         Ok(request)
     };
     encode(&build().map_err(|e| e.to_string())?)

@@ -1,11 +1,14 @@
 //! Account recovery preserves identity and replaces device authorization atomically.
 
+mod checkpoint;
 pub mod context;
 pub mod cross_node;
 pub mod node_enrollment;
 pub mod registration;
 
 use super::*;
+pub use checkpoint::RecoveryPolicyCheckpoint;
+pub(crate) use checkpoint::{compact_recovery_material, material_state};
 use zeroize::Zeroize;
 
 const MAX_RECOVERY_MATERIAL_BYTES: usize = 65_536;
@@ -22,6 +25,8 @@ pub struct RecoveryMaterial {
     pub pins: Vec<PolicyPin>,
     pub bundle: ClientAuthorizationBundle,
     pub entry: RecoveryEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_checkpoint: Option<RecoveryPolicyCheckpoint>,
 }
 impl Drop for RecoveryMaterial {
     fn drop(&mut self) {
@@ -118,7 +123,7 @@ fn validate_material(material: &RecoveryMaterial) -> Result<Identity> {
         .map_err(|_| AuthorizationError::InvalidProof("invalid recovery root material"))?;
     let recovery = Identity::from_secret_hex(&material.recovery_secret_hex)
         .map_err(|_| AuthorizationError::InvalidProof("invalid recovery key material"))?;
-    let state = replay_policies(&material.pins, &material.bundle.journal)?;
+    let state = material_state(material)?;
     let account = state
         .account(&material.scope.account_id)
         .ok_or(AuthorizationError::InvalidProof("missing recovery account"))?;
@@ -130,21 +135,11 @@ fn validate_material(material: &RecoveryMaterial) -> Result<Identity> {
         "recovery material policy mismatch",
     )?;
     let certificate = state.find_device(&material.scope.device_id)?;
-    let auth = verify_client_authorization(
-        &serde_json::to_string(&material.bundle)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid recovery bundle"))?,
-        &serde_json::to_string(&material.pins)
-            .map_err(|_| AuthorizationError::InvalidProof("invalid recovery pins"))?,
-        material.scope.account_id.as_str(),
-        material.scope.space_id.as_str(),
-        certificate.payload.public_key.as_str(),
-        certificate.payload.not_before_ms as f64,
-    )
-    .map_err(|_| AuthorizationError::InvalidProof("recovery backup authorization mismatch"))?;
-    require(
-        auth.scope() == &material.scope
-            && auth.audience_public_key() == &material.entry.node_public_key,
-        "recovery entry pin mismatch",
+    checkpoint::scope_budget(
+        &state,
+        material,
+        certificate.payload.not_before_ms,
+        &mut Budget::default(),
     )?;
     Ok(recovery)
 }
@@ -237,7 +232,7 @@ pub fn build_account_recovery_material(
             now_ms,
         )
         .map_err(|_| AuthorizationError::InvalidProof("created account authorization expired"))?;
-        let material = RecoveryMaterial {
+        let mut material = RecoveryMaterial {
             format: "vibeface-account-recovery".to_owned(),
             version: 2,
             root_secret_hex: root.secret_hex(),
@@ -249,7 +244,10 @@ pub fn build_account_recovery_material(
                 endpoint: endpoint.to_owned(),
                 node_public_key: auth.audience_public_key().clone(),
             },
+            policy_checkpoint: None,
         };
+        validate_material(&material)?;
+        compact_recovery_material(&mut material, timestamp(now_ms)?)?;
         validate_material(&material)?;
         Ok(material)
     };
@@ -844,6 +842,62 @@ mod tests {
 
     fn material(account: &CreatedAccount) -> String {
         build_account_recovery_material(account, &key(1), &key(2), ENDPOINT, NOW).unwrap()
+    }
+
+    pub(super) fn account_with_enrolled_nodes(count: u8) -> CreatedAccount {
+        enroll_nodes(account(), count)
+    }
+
+    fn enroll_nodes(mut created: CreatedAccount, count: u8) -> CreatedAccount {
+        use node_enrollment::*;
+        let backup = material(&created);
+        for index in 0..count {
+            let pins = created.pins_json().unwrap();
+            let bundle = created.bundle_json().unwrap();
+            let node = 20 + index;
+            let claim_nonce = 100 + index;
+            let prepared = prepare_account_node_enrollment(
+                &backup,
+                &pins,
+                &bundle,
+                &key(3),
+                &claim(node, claim_nonce, NOW),
+                END,
+                NOW,
+            )
+            .unwrap();
+            let possession = sign_account_node_enrollment_possession(
+                &prepared.request_json().unwrap(),
+                &key(node),
+                &nonce(claim_nonce),
+                NOW,
+            )
+            .unwrap();
+            let prepared =
+                prepare_account_node_enrollment_commit(&prepared, &backup, &possession, NOW)
+                    .unwrap();
+            let delta = commit_account_node_enrollment(
+                &prepared.request_json().unwrap(),
+                &key(4),
+                &pins,
+                &bundle,
+                NOW,
+            )
+            .unwrap();
+            let installed = finish_account_node_enrollment(&prepared, &delta, NOW).unwrap();
+            created.pins = installed.pins().to_vec();
+            created.bundle = installed.bundle().clone();
+        }
+        created.authorization = verify_client_authorization(
+            &created.bundle_json().unwrap(),
+            &created.pins_json().unwrap(),
+            created.authorization.scope.account_id.as_str(),
+            created.authorization.scope.space_id.as_str(),
+            &key(3).public_key_hex(),
+            NOW,
+        )
+        .unwrap();
+        created
     }
 
     fn prepared(account: &CreatedAccount, node: u8) -> PreparedAccountRecovery {
@@ -1449,6 +1503,73 @@ mod tests {
                 &prepared,
                 &prepared.completion_journal_json().unwrap(),
                 NOW
+            )
+            .is_err()
+        );
+        let registered = enroll_nodes(
+            CreatedAccount {
+                pins: updated_pins.clone(),
+                bundle: updated_bundle.clone(),
+                authorization: created.authorization.clone(),
+            },
+            12,
+        );
+        let registered_material = material(&registered);
+        let private = material_state(&read_material(&registered_material).unwrap()).unwrap();
+        assert_eq!(
+            private
+                .verify_authenticator(&record, NOW as u64)
+                .unwrap()
+                .state_floor(),
+            state
+                .verify_authenticator(&record, NOW as u64)
+                .unwrap()
+                .state_floor(),
+        );
+        let state = replay_policies(&registered.pins, &registered.bundle.journal).unwrap();
+        let mut removed = registered;
+        let mut document = state.account(&intent.payload.account).unwrap().clone();
+        document.previous = state
+            .head(&PolicyDomain::Account(intent.payload.account.clone()))
+            .cloned();
+        document.sequence += 1;
+        document.authenticators.clear();
+        let document = Signed::sign(document, &key(1)).unwrap();
+        let mut removed_state = state.clone();
+        let head = removed_state.install_account(document.clone()).unwrap();
+        removed.bundle.journal.push(JournalEntry::Account(document));
+        removed
+            .pins
+            .iter_mut()
+            .find(|pin| pin.domain == head.domain)
+            .unwrap()
+            .minimum_head = Some(head.clone());
+        let removed_material = material(&removed);
+        let private = material_state(&read_material(&removed_material).unwrap()).unwrap();
+        assert!(
+            private
+                .account(&intent.payload.account)
+                .unwrap()
+                .authenticators
+                .is_empty()
+        );
+        assert!(
+            private
+                .account_history(&intent.payload.account)
+                .unwrap()
+                .iter()
+                .any(|doc| {
+                    doc.payload.root_generation == 0 && !doc.payload.authenticators.is_empty()
+                })
+        );
+        assert!(
+            build_first_authenticator_enrollment_intent(
+                &removed_material,
+                &removed.pins_json().unwrap(),
+                &removed.bundle_json().unwrap(),
+                &key(3),
+                NOW,
+                END,
             )
             .is_err()
         );
