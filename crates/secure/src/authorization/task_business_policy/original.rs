@@ -481,6 +481,9 @@ impl VerifiedTaskBusinessOriginalSource {
 mod tests {
     use super::super::super::{
         client_policy_import::require_confirmed_client_policy,
+        execution_handoff::{
+            ExecutionHandoffAdmissionReceipt, ExecutionHandoffChallenge, ExecutionHandoffFreshness,
+        },
         execution_observation::tests::retained_history_fixture_with_execution_source,
     };
     use super::super::tests::{current_policy, noise_peer, original_authorization};
@@ -500,6 +503,70 @@ mod tests {
             .state()
             .verify_execution_handoff(&fixture.actual.handoff, &original, &transport, None, now)
             .unwrap();
+        let challenge = ExecutionHandoffChallenge::new(
+            &verified,
+            CheckStage::Admit,
+            Nonce::random().unwrap(),
+            now,
+            now + 1_000,
+        )
+        .unwrap();
+        let freshness = ExecutionHandoffFreshness {
+            receipts: verified
+                .dependencies()
+                .iter()
+                .map(|head| {
+                    let authority = match &head.domain {
+                        PolicyDomain::Account(id) => {
+                            &current.state().account(id).unwrap().authority
+                        }
+                        PolicyDomain::Space(id) => &current.state().space(id).unwrap().authority,
+                    };
+                    let signer = [&fixture.project_node, &fixture.executor]
+                        .into_iter()
+                        .find(|identity| PublicKey::of(identity) == authority.public_key)
+                        .unwrap();
+                    Signed::sign(
+                        FreshnessReceipt {
+                            version: AUTH_VERSION,
+                            current: head.clone(),
+                            challenge_hash: challenge.hash().unwrap(),
+                            issued_at_ms: now,
+                            expires_at_ms: now + 1_000,
+                        },
+                        signer,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+            challenge,
+        };
+        let fresh = current
+            .state()
+            .verify_execution_handoff_freshness(&verified, &freshness, now)
+            .unwrap();
+        current
+            .state()
+            .admit_execution_handoff(&verified, &fresh, now)
+            .unwrap();
+        let stored_transport = StoredTransport::VerifiedPeer {
+            origin: fixture.actual.handoff.invocation.payload.presenter.clone(),
+        };
+        fixture.acceptance = RemoteExecutionHistoryAcceptance::ExecutionResult {
+            receipt: Signed::sign(
+                ExecutionHandoffAdmissionReceipt::new(
+                    &fixture.actual.handoff,
+                    &freshness,
+                    &stored_transport,
+                    now,
+                )
+                .unwrap(),
+                &fixture.executor,
+            )
+            .unwrap(),
+            freshness,
+            transport: stored_transport,
+        };
         let mut export = build_task_business_policy_export(
             &current,
             TaskBusinessAuthorization::Submit(&verified),
