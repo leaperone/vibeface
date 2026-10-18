@@ -15,6 +15,7 @@ pub mod remote_share;
 pub mod remote_resolution_history;
 pub mod passkey_node;
 mod policy_import;
+pub mod policy_proof;
 pub mod projection;
 pub mod services;
 use crate::{Identity, membership::canonical_json};
