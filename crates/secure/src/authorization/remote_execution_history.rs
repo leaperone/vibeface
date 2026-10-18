@@ -355,12 +355,31 @@ pub fn validate_remote_execution_history_reference(
     let _scope = ScopedSignatureVerification::new();
     check_reference(reference)?;
     let mut usage = ExecutionProofUsage::default();
+    record_history_reference_metadata(reference, &mut usage)?;
+    if let Some(counts) = SignatureVerification::current_counts() {
+        usage.record_actual_signature_counts(counts);
+    }
+    usage.enforce_limits()
+}
+
+pub(crate) fn record_history_reference_metadata(
+    reference: &RemoteExecutionHistoryReference,
+    usage: &mut ExecutionProofUsage,
+) -> Result<()> {
     usage.record_signed(&reference.source)?;
     usage.record_signed(&reference.old_submission)?;
     usage.record_signed(&reference.observation_receipt)?;
     usage.record_metadata(reference)?;
-    if let Some(counts) = SignatureVerification::current_counts() {
-        usage.record_actual_signature_counts(counts);
+    if let Some(proof) = &reference.terminal_freshness {
+        require(
+            proof.receipts.len() <= MAX_POLICY_DOMAINS
+                && proof.challenge.policies.len() <= MAX_POLICY_DOMAINS,
+            "historical reference has too many freshness items",
+        )?;
+        usage.record_metadata(&proof.challenge)?;
+        for receipt in &proof.receipts {
+            usage.record_signed(receipt)?;
+        }
     }
     usage.enforce_limits()
 }

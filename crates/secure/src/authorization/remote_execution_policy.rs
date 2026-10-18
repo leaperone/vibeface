@@ -543,9 +543,7 @@ pub fn build_remote_execution_history_policy_read_intent(
             .history
             .as_ref()
             .ok_or(AuthorizationError::PolicyConflict)?;
-        usage.record_signed(&reference.source)?;
-        usage.record_signed(&reference.old_submission)?;
-        usage.record_signed(&reference.observation_receipt)?;
+        super::remote_execution_history::record_history_reference_metadata(reference, &mut usage)?;
         finish_usage(&mut usage)?;
         encode(&intent)
             .map_err(|_| AuthorizationError::InvalidProof("history intent encoding failed"))
@@ -619,6 +617,10 @@ pub fn verify_remote_execution_policy_delegation_source(
     let mut usage = ExecutionProofUsage::default();
     usage.record_signed(intent)?;
     usage.record_budget(&current.budget)?;
+    if let Some(reference) = &intent.payload.history {
+        super::remote_execution_history::validate_remote_execution_history_reference(reference)?;
+        super::remote_execution_history::record_history_reference_metadata(reference, &mut usage)?;
+    }
     finish_usage(&mut usage)?;
     Ok(VerifiedRemoteExecutionPolicySourceIntent {
         intent: intent.clone(),
