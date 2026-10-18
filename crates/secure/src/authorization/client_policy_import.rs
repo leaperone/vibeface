@@ -1025,8 +1025,27 @@ pub(crate) fn require_confirmed_client_policy(
             .ok_or(AuthorizationError::InvalidProof(
                 "bounded client authentication and confirmation are required",
             ))?;
+    let confirmation = provenance
+        .confirmation
+        .as_ref()
+        .ok_or(AuthorizationError::InvalidProof(
+            "bounded client authorization has not been confirmed",
+        ))?;
     require(
-        provenance.confirmation.is_some()
+        confirmation.payload.context == provenance_reference(provenance)?
+            && confirmation.payload.selection == provenance.snapshot.payload.selection
+            && confirmation.payload.target_heads == authorization.heads
+            && provenance.snapshot.payload.target_heads == authorization.heads
+            && provenance.snapshot.payload.selection.grant_leaf == authorization.grant_leaf
+            && provenance.snapshot.payload.selection.audience == authorization.audience
+            && confirmation.payload.device_public_key == provenance.request.issuer
+            && confirmation.issuer == provenance.request.payload.node_public_key
+            && confirmation.payload.source_node_public_key == confirmation.issuer
+            && authorization.resources.len() == 1
+            && authorization.resources[0].payload.space
+                == provenance.snapshot.payload.selection.resource.space
+            && authorization.resources[0].payload.resource
+                == provenance.snapshot.payload.selection.resource.resource
             && provenance.request.payload.account == authorization.scope.account_id
             && provenance.request.payload.space == authorization.scope.space_id
             && provenance.request.issuer == provenance.request.payload.device_public_key
