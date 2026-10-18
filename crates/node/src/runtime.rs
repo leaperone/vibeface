@@ -1021,7 +1021,7 @@ mod tests {
         assert!(triggers.contains(duplicate["trigger"].as_str().context("trigger missing")?));
         let changed = node.rpc(access.clone(), json!({"method":"message","conversation_id":"chat","message_id":"same-message","text":"changed goal"})).await.unwrap_err();
         assert!(changed.to_string().contains("different content"));
-        let changed_intent = node.rpc(access.clone(), json!({"method":"message","conversation_id":"chat","message_id":"same-message","text":"same goal","report_results":true})).await.unwrap_err();
+        let changed_intent = node.rpc(access.clone(), json!({"method":"message","conversation_id":"chat","message_id":"same-message","text":"same goal","report_results":false})).await.unwrap_err();
         assert!(
             changed_intent
                 .to_string()
@@ -1324,6 +1324,7 @@ mod tests {
     #[tokio::test]
     async fn retrying_an_undelivered_message_reuses_its_event_and_pending_delivery() -> Result<()> {
         let dir = fixture()?;
+        configure_manager(&dir)?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = conversation(&node).await?;
         let access = Access {
@@ -1362,7 +1363,7 @@ mod tests {
         assert_eq!(retry["receipt"], first["receipt"]);
         assert_eq!(retry["trigger"], first["trigger"]);
         request["scheduler_node"] = json!(other.node_id()?);
-        let changed = node.rpc(access, request).await.unwrap_err();
+        let changed = node.rpc(access.clone(), request).await.unwrap_err();
         assert!(changed.to_string().contains("different content or target"));
         let store = node.store.lock().await;
         assert_eq!(store.messages(&network, "chat")?.len(), 1);
@@ -1372,6 +1373,9 @@ mod tests {
         assert_eq!(pending[0].trigger, first["trigger"].as_str().unwrap());
         assert!(!pending[0].delivered);
         drop(store);
+        let fresh = node.rpc(access, json!({"method":"message","conversation_id":"chat","message_id":"fresh-message","text":"new request"})).await?;
+        assert_eq!(fresh["scheduler_node"], node.identity.node_id()?);
+        assert_ne!(fresh["scheduler_node"], first["scheduler_node"]);
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())
@@ -2668,7 +2672,6 @@ impl Runtime {
 
     async fn prepare_operation_binding(
         self: &Arc<Self>,
-        access: &Access,
         request: &mut OperationRequest,
     ) -> Result<()> {
         self.cache_context_bindings(&request.network_id, &request.conversation_id)
@@ -2899,8 +2902,7 @@ impl Runtime {
                     trigger: manager.trigger.clone(),
                     followup_version: manager.followup_version.unwrap_or(0),
                 });
-        self.prepare_operation_binding(&access, &mut request)
-            .await?;
+        self.prepare_operation_binding(&mut request).await?;
         Self::record_manager_operation(&mut *self.store.lock().await, &access, &request)?;
         let context = self.store.lock().await.context(
             &access.network_id,

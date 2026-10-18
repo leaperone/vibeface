@@ -646,9 +646,9 @@ impl Runtime {
 
     async fn select_chat_scheduler(&self, network: &str, scope: &str) -> Result<String> {
         let local = self.identity.node_id()?;
-        let candidates = {
+        let (preferred, local_available, mut candidates) = {
             let store = self.store.lock().await;
-            if let Some(target) = store
+            let preferred = store
                 .context(network, scope, &[])?
                 .events
                 .iter()
@@ -660,24 +660,18 @@ impl Runtime {
                         ..
                     } if role == "user" => Some(target.clone()),
                     _ => None,
-                })
-            {
-                store.authorize_node(network, &target, Some(NodeRole::Scheduler))?;
-                return Ok(target);
-            }
-            if self.config.manager.is_some()
+                });
+            let local_available = self.config.manager.is_some()
                 && self.config.roles.contains(&NodeRole::Scheduler)
                 && store
                     .authorize_node(network, &local, Some(NodeRole::Scheduler))
-                    .is_ok()
-            {
-                return Ok(local);
-            }
+                    .is_ok();
             let view = store
                 .trust_bundle(network)?
                 .context("unknown network")?
                 .project()?;
-            view.members
+            let candidates = view
+                .members
                 .into_iter()
                 .filter(|member| {
                     member.kind == IdentityKind::Node
@@ -686,13 +680,26 @@ impl Runtime {
                         && member.node_roles.contains(&NodeRole::Scheduler)
                 })
                 .map(|member| member.subject_id)
-                .collect::<BTreeSet<_>>()
+                .collect::<Vec<_>>();
+            (preferred, local_available, candidates)
         };
+        if local_available && preferred.as_deref() == Some(local.as_str()) {
+            return Ok(local);
+        }
+        candidates.sort_by_key(|candidate| {
+            (
+                Some(candidate.as_str()) != preferred.as_deref(),
+                candidate.clone(),
+            )
+        });
         let online = self.hub.online(network).await;
         for candidate in candidates
             .into_iter()
             .filter(|candidate| online.contains(candidate))
         {
+            if local_available && Some(candidate.as_str()) != preferred.as_deref() {
+                return Ok(local);
+            }
             let capabilities = tokio::time::timeout(
                 Duration::from_secs(3),
                 self.peer_request(network, &candidate, json!({"type":"capabilities"})),
@@ -708,6 +715,9 @@ impl Runtime {
             }) {
                 return Ok(candidate);
             }
+        }
+        if local_available {
+            return Ok(local);
         }
         bail!(
             "no authorized configured assistant is available; connect one of your assistant devices"
@@ -742,7 +752,7 @@ impl Runtime {
             if let Some(requested) = input["scheduler_node"].as_str() {
                 ensure!(
                     requested == target,
-                    "message retry cannot change its original assistant"
+                    "message ID reused with different content or target; retry must use its original assistant"
                 );
             }
             target.clone()

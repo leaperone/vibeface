@@ -24,7 +24,7 @@ fn execution_cache_key(target: &str, operation: &str) -> String {
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ExecutionControlAction {
-    Interrupt,
+    Interrupt {},
     Steer {
         text: String,
     },
@@ -37,7 +37,7 @@ enum ExecutionControlAction {
 impl ExecutionControlAction {
     fn name(&self) -> &'static str {
         match self {
-            Self::Interrupt => "interrupt",
+            Self::Interrupt {} => "interrupt",
             Self::Steer { .. } => "steer",
             Self::RespondRequest { .. } => "respond_request",
         }
