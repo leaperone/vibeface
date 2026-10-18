@@ -417,8 +417,9 @@ mod tests {
 
     #[test]
     fn confirmed_unlink_sync_failure_does_not_leave_unrecoverable_maintenance() -> Result<()> {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.artifacts")
+        let dir = std::env::var_os("VIBEFACE_TEST_ARTIFACT_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.artifacts"))
             .join(format!("commit-sync-{}", uuid::Uuid::new_v4()));
         crate::config::private_dir(&dir)?;
         let pending = dir.join("update-pending.json");

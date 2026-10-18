@@ -8,7 +8,7 @@ use vibeface_secure::authorization::AccountId;
 use vibeface_secure::authorization::bootstrap::{self, NodeClaim};
 use vibeface_secure::authorization::gateway_forward::{GatewayOriginal, VerifiedDirectedGateway};
 use vibeface_secure::authorization::{
-    Actor, Audience, CheckStage, ClientAuthorizationBundle, DeviceId, FreshnessChallenge,
+    Action, Actor, Audience, CheckStage, ClientAuthorizationBundle, DeviceId, FreshnessChallenge,
     FreshnessReceipt, Invocation, InvocationContext, JournalEntry, ObjectHash, PolicyDomain,
     PolicyPin, PublicKey, RequestFacts, ResourceId, ResourceKind, ResourceRef, ServiceId,
     SessionRef, Signed, SpaceId, TransportEvidence, VerifiedAuthorization, VerifiedPolicySet,
@@ -463,7 +463,7 @@ fn request_facts_impl(
     } else {
         None
     };
-    if conversation.is_some() && method != "create_conversation" {
+    if conversation.is_some() && action != Action::ConversationCreate {
         ensure!(stored_resource.is_some(), "unknown conversation resource");
     }
     let claimed_resource = ResourceId::parse(text("resource_id")?)?;
@@ -480,7 +480,7 @@ fn request_facts_impl(
     let record = policies
         .resource(&space, &resource)
         .context("resource is not registered by current space policy")?;
-    if method == "create_conversation" {
+    if action == Action::ConversationCreate {
         ensure!(
             record.payload.kind == ResourceKind::Project,
             "conversations require a project resource"
