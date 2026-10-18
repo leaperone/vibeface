@@ -2249,40 +2249,6 @@ pub(crate) mod tests {
         resolver_bundle.grant_leaf = resolver_grant.clone();
         let resolver_selection = json!({"execution_resource":f.execution,"execution_grant":resolver_grant,
             "target_public_key":f.executor.node.public_key_hex()?});
-        let execution_share = verify_directional_grant_snapshot(
-            &serde_json::to_string(&cb)?,
-            &serde_json::to_string(&f.executor.pins)?,
-            (now() + 3) as f64,
-        )
-        .map_err(anyhow::Error::msg)?
-        .share_json();
-        let resolution_share = verify_directional_grant_snapshot(
-            &serde_json::to_string(&resolver_bundle)?,
-            &serde_json::to_string(&f.executor.pins)?,
-            (now() + 3) as f64,
-        )
-        .map_err(anyhow::Error::msg)?
-        .share_json();
-        let candidate: Value = serde_json::from_str(
-            &inspect_remote_execution_share(&execution_share).map_err(anyhow::Error::msg)?,
-        )?;
-        assert_eq!(
-            candidate["actions"],
-            json!([
-                "execution_open",
-                "execution_send",
-                "execution_submit",
-                "operation_status_read"
-            ])
-        );
-        assert_eq!(candidate["trust"], "unverified");
-        let candidate: Value = serde_json::from_str(
-            &inspect_remote_execution_share(&resolution_share).map_err(anyhow::Error::msg)?,
-        )?;
-        assert_eq!(
-            candidate["actions"],
-            json!(["execution_resolve", "operation_resolve"])
-        );
         let resolver = verify_remote_execution(
             &client,
             &serde_json::to_string(&f.project.bundle)?,
@@ -2354,20 +2320,44 @@ pub(crate) mod tests {
         let mut share_body = f.project.body("execution_share_request", "conversation");
         share_body["task_id"] = json!("remote-task");
         share_body["task_ref"] = json!(f.task.hash);
-        share_body["share_request"] = json!({"session_id":"second-session","executor_kind":"codex",
+        share_body["share_request"] = json!({"purpose":"execution","session_id":"second-session","executor_kind":"codex",
             "expires_at_ms":now()+60_000});
         let (share_auth, _) = f.project.authorization(&f.store, &share_body, now() + 3)?;
-        let signed_share = f.store.execution_share_request(
+        let share_input = f.store.execution_share_request(
             &f.project.node,
             &share_auth,
             &share_body,
             now() + 3,
         )?;
+        let task_event: crate::model::Event = serde_json::from_str(&f.task.canonical_body)?;
+        let compact: remote_share::RemoteShareIntent = serde_json::from_value(share_input.clone())?;
+        compact.task_creation.verify_signature()?;
+        assert_eq!(compact.task_creation.issuer, compact.source_node_public_key);
         assert_eq!(
-            signed_share["request"]["payload"]["task_creation"],
-            serde_json::to_value(&f.task)?
+            compact.task_creation.payload.task,
+            EventRef::parse(&f.task.hash)?
         );
-        assert!(signed_share.get("pins").is_none());
+        assert_eq!(compact.task_creation.payload.project, compact.project);
+        assert_eq!(compact.task_creation.payload.task_id, "remote-task");
+        assert_eq!(
+            compact.task_creation.payload.conversation_id,
+            task_event.scope_id
+        );
+        assert_eq!(compact.task_creation.payload.author, task_event.author);
+        assert_eq!(compact.task_creation.payload.sequence, task_event.sequence);
+        assert_eq!(compact.requester, f.project.account);
+        assert_eq!(
+            compact.requester_device,
+            share_auth.signed_invocation().payload.device
+        );
+        assert_eq!(
+            compact.source_node_public_key.as_str(),
+            f.project.node.public_key_hex()?
+        );
+        assert!(serde_json::to_vec(&share_input)?.len() <= MAX_PROOF_BYTES);
+        assert!(share_input.get("request").is_none());
+        assert!(share_input.get("bundle").is_none());
+        assert!(share_input.get("pins").is_none());
         if std::env::var_os("VIBEFACE_EXPORT_REMOTE_FIXTURE").is_some() {
             use std::os::unix::fs::OpenOptionsExt;
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2386,9 +2376,7 @@ pub(crate) mod tests {
                 "executionBundle":cb,"executionPins":f.executor.pins,"selection":selection,"context":raw,"binding":binding,
                 "browserBody":body,"browserInvocation":auth.signed_invocation(),"actual":result,"receipt":receipt,
                 "resolverBundle":resolver_bundle,"resolverSelection":resolver_selection,"resolverIntent":intent,
-                "resolverPrepare":signed_prepare,"shareRequest":signed_share,
-                "executionShare":serde_json::from_str::<Value>(&execution_share)?,
-                "resolutionShare":serde_json::from_str::<Value>(&resolution_share)?}),
+                "resolverPrepare":signed_prepare,"shareIntentInput":share_input}),
             )?;
         }
         let snapshot: Value = serde_json::from_str(
@@ -2461,6 +2449,131 @@ pub(crate) mod tests {
             f.store
                 .execution_dispatch_metadata_facts(&forged, &f.audience, now() + 3)
                 .is_err()
+        );
+        let mut share_store = f.project.memory()?;
+        f.executor.install(&mut share_store)?;
+        f.project.conversation(&mut share_store, "conversation")?;
+        let large_goal = "g".repeat(MAX_PROOF_BYTES + 1);
+        let mut large_body = f.project.body("create_task", "conversation");
+        large_body["task_id"] = json!("large-share-task");
+        large_body["title"] = json!("large-share-task");
+        large_body["goal"] = json!(large_goal);
+        large_body["acceptance"] = json!("review result");
+        large_body["auto_followup"] = json!(false);
+        let large_task = f.project.append(
+            &mut share_store,
+            &large_body,
+            crate::model::EventBody::TaskCreated {
+                task_id: "large-share-task".into(),
+                title: "large-share-task".into(),
+                goal: large_goal,
+                acceptance: "review result".into(),
+            },
+            now() + 4,
+        )?;
+        assert!(large_task.canonical_body.len() > MAX_PROOF_BYTES);
+        let stamp = share_store
+            .policy
+            .verified()
+            .head(&PolicyDomain::Space(f.project.space.clone()))
+            .unwrap()
+            .clone();
+        let read_grant = Signed::sign(
+            Grant {
+                version: AUTH_VERSION,
+                owner_space: f.project.space.clone(),
+                scope: ResourceScope::Exact(compact.project),
+                grantee: Grantee::Actor(Actor::Account(f.executor.account.clone())),
+                actions: vec![Action::ConversationRead],
+                audience: f.audience.clone(),
+                constraints: Default::default(),
+                parent: None,
+                remaining_delegations: 0,
+                issued_under: stamp.clone(),
+                not_before_ms: now(),
+                expires_at_ms: now() + 60_000,
+                nonce: Nonce::random()?,
+            },
+            &f.project.root,
+        )?;
+        let leaf = read_grant.hash()?;
+        let mut document = share_store
+            .policy
+            .verified()
+            .space(&f.project.space)
+            .unwrap()
+            .clone();
+        document.previous = Some(stamp);
+        document.sequence += 1;
+        document.grants.push(leaf.clone());
+        document.grants.sort();
+        share_store.install_policy_journal(
+            &[
+                JournalEntry::Grant(read_grant),
+                JournalEntry::Space(Signed::sign(document, &f.project.root)?),
+            ],
+            now() + 4,
+        )?;
+        share_body["authorization_id"] = json!("large-task-share-input");
+        share_body["task_id"] = json!("large-share-task");
+        share_body["task_ref"] = json!(large_task.hash);
+        let facts = share_store.request_facts(&share_body, &f.audience)?;
+        let device = DeviceId::from_key(&PublicKey::of(&f.executor.client));
+        let mut heads = [
+            PolicyDomain::Account(f.project.account.clone()),
+            PolicyDomain::Account(f.executor.account.clone()),
+            PolicyDomain::Space(f.project.space.clone()),
+        ]
+        .iter()
+        .map(|domain| share_store.policy.verified().head(domain).unwrap().clone())
+        .collect::<Vec<_>>();
+        heads.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let invocation = Signed::sign(
+            Invocation {
+                version: AUTH_VERSION,
+                actor: Actor::Account(f.executor.account.clone()),
+                device: device.clone(),
+                initiator: Actor::Account(f.executor.account.clone()),
+                initiating_grant: None,
+                resource: facts.resource.clone(),
+                action: facts.action,
+                audience: f.audience.clone(),
+                presenter: device.clone(),
+                operation_id: facts.operation_id.clone(),
+                body_hash: facts.body_hash.clone(),
+                grant_leaf: leaf,
+                expected_policies: heads,
+                context: facts.context.clone(),
+                nonce: Nonce::random()?,
+                not_before_ms: now() + 4,
+                expires_at_ms: now() + 60_000,
+            },
+            &f.executor.client,
+        )?;
+        let auth = share_store.authorize_request(
+            &invocation,
+            &facts,
+            &TransportEvidence::DirectNoise { device },
+            now() + 4,
+        )?;
+        let large_input =
+            share_store.execution_share_request(&f.project.node, &auth, &share_body, now() + 4)?;
+        assert!(serde_json::to_vec(&large_input)?.len() <= MAX_PROOF_BYTES);
+        let compact: remote_share::RemoteShareIntent = serde_json::from_value(large_input)?;
+        compact.task_creation.verify_signature()?;
+        assert_eq!(compact.task_creation.issuer, compact.source_node_public_key);
+        assert_eq!(
+            compact.task_creation.payload.task,
+            EventRef::parse(&large_task.hash)?
+        );
+        assert_eq!(compact.task_creation.payload.task_id, "large-share-task");
+        assert_eq!(compact.task_creation.payload.conversation_id, "conversation");
+        assert_eq!(compact.requester, f.executor.account);
+        assert_ne!(compact.requester, f.project.account);
+        assert_eq!(compact.requester_device, invocation.payload.device);
+        assert_eq!(
+            compact.source_node_public_key.as_str(),
+            f.project.node.public_key_hex()?
         );
         Ok(())
     }
