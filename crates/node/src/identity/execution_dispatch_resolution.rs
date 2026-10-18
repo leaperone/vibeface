@@ -297,6 +297,15 @@ impl Store {
                         .payload
                         .operation_id,
                 )?;
+            } else {
+                let (stored, _) =
+                    check_original_in(&tx, identity, &saved.wire.resolution.observation)?;
+                ensure!(
+                    stored.state == OperationState::Unknown,
+                    "pending resolution no longer has an unknown Project operation"
+                );
+                validate_operation_binding_from(&tx, &stored.request)?;
+                check_operation_reservations_in(&tx, &stored)?;
             }
             tx.commit()?;
             self.policy = current;
