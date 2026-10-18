@@ -14,6 +14,9 @@ const keys = new Map(['client', 'root', 'recovery'].map(name => [name, crypto.Id
 const connections = new Map();
 const authorizations = new Map();
 const verifiedBindings = new Map();
+const trusts = new Map();
+const preparations = new Map();
+const remoteAuthorizations = new Map();
 let creation;
 let trust;
 let openedRecoveryMaterial;
@@ -39,6 +42,8 @@ const actions = {
   bind_execution: 'execution_open', seal_execution: 'execution_rebind', rebind_execution: 'execution_rebind', notifications: 'notification_read',
   ack: 'notification_ack', export: 'export', reconcile: 'operation_reconcile', resolve_unknown: 'operation_resolve',
   replica_inventory: 'replica_read', replica_event: 'replica_read', replica_blob: 'replica_read',
+  execution_share_request: 'conversation_read', seal_remote_execution: 'execution_rebind',
+  remote_execution_seal_status: 'operation_status_read',
 };
 const operationActions = {
   open: 'execution_open', read: 'operation_status_read', send: 'execution_send', steer: 'execution_steer',
@@ -181,7 +186,8 @@ async function connect(input) {
     finally { channel.free(); }
   })();
   return {
-    events, frames, nodePublicKey: input.node_public_key,
+    events, frames, nodePublicKey: input.node_public_key, identityName: input.identity || 'client',
+    trustRef: input.trust_ref || 'primary',
     request(method, params, invocation) {
       if (closed) throw new Error('channel closed');
       const id = String(++sequence);
@@ -225,26 +231,47 @@ async function identityRequest(connection, method, params) {
   return response.result;
 }
 
-function checkedAuthorization(verified, expectedHostPublicKey) {
+function savedTrust(ref = 'primary') {
+  const value = ref === 'primary' ? trust : trusts.get(ref);
+  assert(value, 'authorization requires independently saved pins');
+  return value;
+}
+
+function saveTrust(ref, value) {
+  const previous = ref === 'primary' ? trust : trusts.get(ref);
+  if (previous) {
+    assert.deepEqual(value.scope, previous.scope, 'trust update changed its account or space');
+    for (const pin of previous.pins) {
+      const next = value.pins.find(item => JSON.stringify(item.domain) === JSON.stringify(pin.domain));
+      assert(next && next.genesis_root === pin.genesis_root, 'trust update changed an independently pinned root');
+    }
+  }
+  if (ref === 'primary') trust = structuredClone(value);
+  else trusts.set(ref, structuredClone(value));
+}
+
+function checkedAuthorization(verified, expectedHostPublicKey, selectedTrust) {
   const scope = JSON.parse(verified.scopeJson());
   const policy = JSON.parse(verified.policyJson());
-  assert.deepEqual(scope, trust.scope, 'authorization changed the independently saved scope');
+  assert.deepEqual(scope, selectedTrust.scope, 'authorization changed the independently saved scope');
   assert.equal(policy.audience_public_key, expectedHostPublicKey, 'authorization changed the selected Project host');
   assert(Array.isArray(policy.resources) && policy.resources.length === 1, 'authorization must select one Project');
   return { scope, policy, resources: policy.resources };
 }
 
 async function authenticate(input, connectionName) {
-  assert(trust, 'authorization requires independently saved pins');
   authorizations.get(connectionName)?.verified.free();
   authorizations.delete(connectionName);
   const connection = connections.get(connectionName);
+  const trustRef = input.trust_ref || connection.trustRef;
+  const selectedTrust = savedTrust(trustRef);
+  const signer = identity(connection.identityName);
   const source = connection.nodePublicKey;
   const expectedHost = input.expected_host_public_key || source;
   assert.match(expectedHost, /^[a-f0-9]{64}$/);
-  const pins = JSON.stringify(trust.pins);
+  const pins = JSON.stringify(selectedTrust.pins);
   const buildRequest = selection => JSON.parse(crypto.buildClientPolicyReadRequest(
-    trust.scope.account_id, trust.scope.space_id, identity(), source, pins,
+    selectedTrust.scope.account_id, selectedTrust.scope.space_id, signer, source, pins,
     JSON.stringify(selection), Date.now(), Date.now() + 60_000,
   ));
   const catalogRequest = buildRequest(null);
@@ -254,7 +281,7 @@ async function authenticate(input, connectionName) {
   let catalogContext;
   for (;;) {
     const page = JSON.parse(crypto.verifyClientPolicySelections(
-      pins, JSON.stringify(catalogRequest), JSON.stringify(catalog.selections), identity(), source, Date.now(),
+      pins, JSON.stringify(catalogRequest), JSON.stringify(catalog.selections), signer, source, Date.now(),
     ));
     const context = JSON.stringify([page.snapshot_id, page.request_hash]);
     if (catalogContext === undefined) catalogContext = context;
@@ -264,6 +291,7 @@ async function authenticate(input, connectionName) {
         && choice.audience.service === crypto.deriveAuthorizationId('service', expectedHost)
         && choice.audience.device === crypto.deriveAuthorizationId('device', expectedHost)
         && (!input.audience || (choice.audience.service === input.audience.service && choice.audience.device === input.audience.device));
+      if (input.grant_leaf && choice.grant_leaf !== input.grant_leaf) continue;
       if (matches && !selection) selection = choice;
     }
     if (selection || page.next_cursor === null) break;
@@ -276,7 +304,7 @@ async function authenticate(input, connectionName) {
   assert(selection, 'no verified selection matches the independently selected Project host');
   const request = buildRequest(selection);
   const begin = await identityRequest(connection, 'begin_client_policy_read', request);
-  let importer = crypto.beginClientPolicyImport(pins, JSON.stringify(request), JSON.stringify(begin.snapshot), identity(), source, Date.now());
+  let importer = crypto.beginClientPolicyImport(pins, JSON.stringify(request), JSON.stringify(begin.snapshot), signer, source, Date.now());
   let imported;
   let confirmed;
   try {
@@ -293,11 +321,12 @@ async function authenticate(input, connectionName) {
     importer = undefined;
     imported = completed.finish(JSON.stringify(witness.witness), JSON.stringify(selection), Date.now());
     const confirmRequest = JSON.parse(crypto.buildClientPolicyAuthConfirmRequest(
-      imported, identity(), Date.now(), Math.min(request.payload.expires_at_ms, begin.snapshot.payload.expires_at_ms, witness.witness.payload.expires_at_ms),
+      imported, signer, Date.now(), Math.min(request.payload.expires_at_ms, begin.snapshot.payload.expires_at_ms, witness.witness.payload.expires_at_ms),
     ));
     const receipt = await identityRequest(connection, 'confirm_client_policy_auth', confirmRequest);
     confirmed = crypto.confirmClientPolicyAuthorization(imported, JSON.stringify(confirmRequest), JSON.stringify(receipt.confirmation), source, Date.now());
-    const checked = checkedAuthorization(confirmed, expectedHost);
+    const checked = checkedAuthorization(confirmed, expectedHost, selectedTrust);
+    if (input.resource_kind) assert.equal(checked.resources[0].payload.kind, input.resource_kind);
     const session = JSON.parse(confirmed.clientPolicyContextJson());
     const response = await connection.request('authenticate', session);
     boundedCarrier(session, response);
@@ -309,20 +338,132 @@ async function authenticate(input, connectionName) {
     assert.deepEqual(response.result.scope, checked.scope, 'session changed the verified scope');
     assert.deepEqual(response.result.policy, checked.policy, 'session changed the verified policy');
     assert.deepEqual(response.result.resources, checked.resources, 'session changed the verified Project');
-    authorizations.set(connectionName, { verified: confirmed, ...checked, selection,
+    authorizations.set(connectionName, { verified: confirmed, ...checked, selection, trustRef,
       forwarded: checked.policy.audience_public_key !== source });
     confirmed = undefined;
-    trust.pins = trust.pins.map(pin => ({ ...pin,
+    saveTrust(trustRef, { ...selectedTrust, pins: selectedTrust.pins.map(pin => ({ ...pin,
       minimum_head: checked.policy.heads.find(head => head.domain.kind === pin.domain.kind && head.domain.id === pin.domain.id) || pin.minimum_head,
-    }));
+    })) });
     return { ...checked, selection };
   } finally { importer?.free(); imported?.free(); confirmed?.free(); }
+}
+
+function retainPreparation(input, kind, prepared, trustRef) {
+  assert.equal(typeof input.handle, 'string', 'native preparation needs an explicit handle');
+  assert(!preparations.has(input.handle), 'retain the original preparation until its receipt is verified');
+  preparations.set(input.handle, { kind, prepared, trustRef });
+  return { handle: input.handle, request: JSON.parse(prepared.requestJson()) };
+}
+
+async function readRemotePolicy(input, connectionName) {
+  const source = authorizations.get(connectionName);
+  assert(source, 'remote policy needs a confirmed source authorization');
+  assert(!remoteAuthorizations.has(input.handle), 'release the previous remote authorization explicitly');
+  const b = connections.get(input.source_connection || connectionName);
+  const c = connections.get(input.execution_connection);
+  assert(b && c, 'remote policy needs separate pinned source and execution connections');
+  assert.equal(b.nodePublicKey, source.policy.audience_public_key, 'source policy connection must reach B');
+  assert.equal(c.nodePublicKey, input.selection.target_public_key, 'execution policy connection must reach C');
+  const executionTrust = savedTrust(input.execution_trust_ref);
+  assert.equal(executionTrust.scope.space_id, input.selection.execution_resource.space);
+  const signer = identity(connections.get(connectionName).identityName);
+  const intent = JSON.parse(crypto.buildRemoteExecutionPolicyReadIntent(source.verified, JSON.stringify({
+    selection: input.selection, context: input.raw_context, expected_action: input.action,
+    purpose: input.purpose || 'execution', execution_pins: executionTrust.pins,
+  }), signer, Date.now(), Date.now() + 60_000));
+  const selected = await identityRequest(b, 'foreign_execution_policy_selection', intent);
+  let approvalRef = selected.approval_ref;
+  if (input.approve) {
+    const approved = await identityRequest(b, 'foreign_execution_policy_approve', intent);
+    approvalRef = approved.approval_ref;
+  }
+  assert(approvalRef || input.candidate, 'task requires an independently approved execution root');
+  const delegated = await identityRequest(b, 'remote_execution_policy_delegate', intent);
+  const request = { intent, delegation: delegated.delegation };
+  const begun = await identityRequest(c, 'remote_execution_policy_prepare', request);
+  let importer = crypto.beginRemoteExecutionPolicyImport(source.verified, JSON.stringify(request),
+    JSON.stringify(begun.snapshot), JSON.stringify(executionTrust.pins), c.nodePublicKey, Date.now());
+  let policy;
+  try {
+    let progress = input.candidate ? null : await identityRequest(b, 'foreign_execution_policy_begin', {
+      request, snapshot: begun.snapshot, ...(approvalRef ? { approval_ref: approvalRef } : {}),
+    });
+    const importRef = progress?.import_ref;
+    for (;;) {
+      const pageRequest = importer.pageRequestJson();
+      const paged = await identityRequest(c, 'remote_execution_policy_page', JSON.parse(pageRequest));
+      importer.appendPage(JSON.stringify(paged.page), Date.now());
+      if (progress) {
+        const next = await identityRequest(b, 'foreign_execution_policy_page', { import_ref: importRef, page: paged.page });
+        assert.equal(next.import_ref, importRef);
+        assert(next.next_page_index > paged.page.payload.page_index && next.next_page_index >= progress.next_page_index);
+        progress = next;
+      }
+      if (paged.page.payload.complete) break;
+      assert.notEqual(importer.pageRequestJson(), pageRequest, 'remote policy page must advance');
+    }
+    const finished = await identityRequest(c, 'remote_execution_policy_finish', { ...JSON.parse(importer.pageRequestJson()), cursor: null });
+    const complete = importer; importer = undefined;
+    policy = complete.finish(JSON.stringify(finished.witness), Date.now());
+    const current = policy.revalidatePins(JSON.stringify(savedTrust(input.execution_trust_ref).pins), Date.now());
+    policy.free(); policy = current;
+    if (progress) {
+      assert(progress.ready_for_finish, 'B has not accepted the complete transcript');
+      const accepted = await identityRequest(b, 'foreign_execution_policy_finish', { import_ref: importRef, witness: finished.witness });
+      assert.equal(accepted.approval_ref, approvalRef);
+      assert.equal(accepted.purpose, input.purpose || 'execution');
+    }
+    const remote = crypto.verifyRemoteExecution(source.verified, policy, Date.now());
+    remoteAuthorizations.set(input.handle, { remote, source: source.verified, connectionName });
+    return { handle: input.handle, metadata: JSON.parse(remote.metadataJson()), approval_ref: approvalRef };
+  } finally { importer?.free(); policy?.free(); }
+}
+
+async function readSharePolicy(input, connectionName) {
+  const connection = connections.get(connectionName);
+  const sourceTrust = savedTrust(input.source_trust_ref);
+  const original = input.intent.intent;
+  assert.equal(original.project.space, sourceTrust.scope.space_id);
+  assert.equal(original.source_node_public_key, connection.nodePublicKey);
+  const request = JSON.parse(crypto.buildRemoteSharePolicyReadRequest(JSON.stringify(input.intent),
+    identity(connection.identityName), JSON.stringify(sourceTrust.pins), connection.nodePublicKey, Date.now(),
+    Math.min(Date.now() + 60_000, original.expires_at_ms)));
+  const begun = await identityRequest(connection, 'execution_share_policy_prepare', request);
+  let importer = crypto.beginRemoteSharePolicyImport(JSON.stringify(request), JSON.stringify(begun.snapshot),
+    JSON.stringify(sourceTrust.pins), connection.nodePublicKey, Date.now());
+  let verified;
+  try {
+    for (;;) {
+      const page = await identityRequest(connection, 'execution_share_policy_page', JSON.parse(importer.pageRequestJson()));
+      importer.appendPage(JSON.stringify(page.page), Date.now());
+      if (page.page.payload.complete) break;
+    }
+    const finished = await identityRequest(connection, 'execution_share_policy_finish', { ...JSON.parse(importer.pageRequestJson()), cursor: null });
+    const completed = importer; importer = undefined;
+    verified = completed.finish(JSON.stringify(finished.witness), Date.now());
+    assert(!preparations.has(input.handle));
+    preparations.set(input.handle, { kind: 'share_source', prepared: verified, trustRef: input.source_trust_ref });
+    const result = { handle: input.handle, summary: JSON.parse(verified.summaryJson()) };
+    verified = undefined;
+    return result;
+  } finally { importer?.free(); verified?.free(); }
 }
 
 async function command(input) {
   const connectionName = input.connection || 'main';
   if (input.op === 'identity') return exposed(identity(input.identity));
+  if (input.op === 'get_trust') return structuredClone(savedTrust(input.trust_ref));
+  if (input.op === 'save_trust') { saveTrust(input.trust_ref, input.trust); return { saved: true }; }
+  if (input.op === 'release_remote') {
+    remoteAuthorizations.get(input.handle)?.remote.free();
+    remoteAuthorizations.delete(input.handle);
+    return { released: true };
+  }
+  if (input.op === 'verify_remote_seal') return JSON.parse(crypto.verifyRemoteExecutionSeal(
+    JSON.stringify(input.binding), JSON.stringify(input.seal), input.project_public_key,
+    input.execution_public_key, JSON.stringify(input.revision)));
   if (input.op === 'derive_authorization_id') return crypto.deriveAuthorizationId(input.kind, input.value);
+  if (input.op === 'signed_invocation_hash') return crypto.signedInvocationHash(JSON.stringify(input.invocation));
   if (input.op === 'sign') return identity(input.identity).sign(input.domain, encoder.encode(typeof input.payload === 'string' ? input.payload : JSON.stringify(input.payload)));
   if (input.op === 'verify_space_fixture') {
     const { payload, issuer, signature } = input.signed;
@@ -467,7 +608,96 @@ async function command(input) {
   if (input.op === 'check_authorization_host') {
     const auth = authorizations.get(connectionName);
     assert(auth, 'no confirmed authorization');
-    return checkedAuthorization(auth.verified, input.expected_host_public_key);
+    return checkedAuthorization(auth.verified, input.expected_host_public_key, savedTrust(auth.trustRef));
+  }
+  if (input.op === 'read_remote_policy') return readRemotePolicy(input, connectionName);
+  if (input.op === 'verify_remote_result') {
+    const remote = remoteAuthorizations.get(input.handle);
+    assert(remote, 'result verification requires its original remote authorization');
+    return JSON.parse(remote.remote.resultJson(JSON.stringify(input.actual), JSON.stringify(input.original.body),
+      JSON.stringify(input.original.invocation), JSON.stringify(input.binding), Date.now()));
+  }
+  if (input.op === 'verify_remote_session') {
+    const remote = remoteAuthorizations.get(input.handle);
+    assert(remote, 'session verification requires its original remote authorization');
+    return JSON.parse(remote.remote.sessionJson(JSON.stringify(input.receipt), JSON.stringify(input.binding), Date.now()));
+  }
+  if (input.op === 'read_share_policy') return readSharePolicy(input, connectionName);
+  if (input.op === 'build_share_intent') {
+    const auth = authorizations.get(connectionName);
+    assert(auth, 'source request needs a confirmed Project authorization');
+    return JSON.parse(crypto.buildRemoteShareIntent(JSON.stringify(input.intent), auth.verified,
+      identity(connection.identityName), Date.now()));
+  }
+  if (input.op === 'prepare_governance') {
+    const auth = authorizations.get(connectionName);
+    assert(auth, 'governance needs a confirmed source authorization');
+    const signer = identity(connection.identityName);
+    const builders = { resource: 'prepareSpaceResourceRegistration', membership: 'prepareSpaceMembershipChange',
+      grant: 'prepareDirectionalGrant' };
+    assert(builders[input.kind], 'unknown governance intent');
+    return retainPreparation(input, 'governance', crypto[builders[input.kind]](JSON.stringify(input.intent), signer, auth.verified, Date.now()), auth.trustRef);
+  }
+  if (input.op === 'prepare_team') {
+    const auth = authorizations.get(connectionName);
+    assert(auth, 'Team creation needs a confirmed personal Project authorization');
+    if (!keys.has(input.handle)) keys.set(input.handle, crypto.Identity.generate());
+    return retainPreparation(input, 'team', crypto.prepareTeamCreation(identity(input.handle), identity(connection.identityName),
+      auth.scope.account_id, connection.nodePublicKey, identity('recovery').publicKeyHex(), input.source_project,
+      auth.verified, Date.now() + 86_400_000, Date.now()), input.trust_ref);
+  }
+  if (input.op === 'prepare_execution_service') {
+    const auth = authorizations.get(connectionName);
+    const owner = authorizations.get(input.owner_connection || connectionName);
+    assert(auth && owner && openedRecoveryMaterial, 'registration needs current Project and owner authorizations plus private recovery material');
+    let cursor = null;
+    for (;;) {
+      const page = crypto.selectExecutionServiceManagement(auth.verified, JSON.stringify(input.source_project), connection.nodePublicKey, JSON.stringify(cursor), Date.now());
+      try {
+        const metadata = JSON.parse(page.metadataJson());
+        const management = page.selection();
+        if (management) {
+          try {
+            return retainPreparation(input, 'execution_service', crypto.prepareExecutionServiceRegistration(auth.verified,
+              management, owner.verified, openedRecoveryMaterial, identity(connection.identityName), connection.nodePublicKey,
+              Date.now(), Date.now() + 86_400_000), input.trust_ref);
+          } finally { management.free(); }
+        }
+        assert(metadata.next_cursor && metadata.next_cursor !== cursor, 'Project has no execution management grant');
+        cursor = metadata.next_cursor;
+      } finally { page.free(); }
+    }
+  }
+  if (input.op === 'prepare_share') {
+    const auth = authorizations.get(connectionName);
+    const source = preparations.get(input.source_handle);
+    assert(auth && source?.kind === 'share_source', 'share needs a confirmed execution owner and native source import');
+    return retainPreparation(input, 'share', crypto.prepareRemoteExecutionShare(JSON.stringify(input.intent),
+      identity(connection.identityName), auth.verified, source.prepared, Date.now()), auth.trustRef);
+  }
+  if (input.op === 'finish_preparation') {
+    const pending = preparations.get(input.handle);
+    assert(pending && pending.kind !== 'share_source', 'retain the original native preparation');
+    const finish = { governance: 'finishSpaceGovernanceChange', team: 'finishTeamCreation',
+      execution_service: 'finishExecutionServiceRegistration', share: 'finishRemoteExecutionShare' }[pending.kind];
+    const verified = crypto[finish](pending.prepared, JSON.stringify(input.receipt), Date.now());
+    try {
+      const scope = JSON.parse(verified.scopeJson());
+      assert(scope, 'committed policy removed this verification actor');
+      const pins = JSON.parse(verified.pinsJson());
+      saveTrust(pending.trustRef, { scope, pins });
+      const result = { trust_ref: pending.trustRef, scope, pins };
+      if (pending.kind === 'team') result.resource_id = verified.projectResourceId();
+      if (pending.kind === 'execution_service') {
+        result.resource_id = verified.resourceId();
+        const auth = verified.authorization();
+        try { result.grant_leaf = JSON.parse(auth.policyJson()).grant_leaf; } finally { auth.free(); }
+      }
+      if (pending.kind === 'share') result.share = JSON.parse(verified.referenceJson());
+      if (input.password && typeof verified.recoveryMaterialJson === 'function') result.recovery_envelope = sealedRecovery(verified.recoveryMaterialJson(), input.password);
+      pending.prepared.free(); preparations.delete(input.handle);
+      return result;
+    } finally { verified.free(); }
   }
   if (input.op === 'request') return connection.request(input.method, input.params || {}, input.invocation);
   if (input.op === 'signed_request' || input.op === 'prepare_signed') {
@@ -485,18 +715,24 @@ async function command(input) {
     };
     assert(input.raw_context || (!input.body.task_id && input.body.method !== 'operate'), 'task calls require independently verified execution context');
     const body = JSON.stringify(input.body);
-    const intent = JSON.parse(crypto.signClientPrepareIntent(
+    const remote = input.remote_handle ? remoteAuthorizations.get(input.remote_handle) : null;
+    assert(!input.remote_handle || remote && remote.connectionName === connectionName && remote.source === auth.verified,
+      'remote authorization belongs to this exact confirmed source session');
+    const signer = identity(connection.identityName);
+    const intent = JSON.parse(remote ? remote.remote.prepare(auth.verified, body, JSON.stringify(rawContext), action,
+      input.body.authorization_id, connection.nodePublicKey, signer, Date.now()) : crypto.signClientPrepareIntent(
       auth.verified, body, JSON.stringify(rawContext), action,
-      input.body.authorization_id, connection.nodePublicKey, identity(), Date.now(),
+      input.body.authorization_id, connection.nodePublicKey, signer, Date.now(),
     ));
     const prepared = await connection.request('prepare_invocation', { body: input.body, intent });
     if (prepared.error) return prepared;
     const checked = checkedPreparation(input, rawContext, prepared.result);
     const template = JSON.stringify(prepared.result.invocation);
     const finalBody = JSON.stringify(checked.body);
-    const invocation = JSON.parse(auth.forwarded
-      ? crypto.signForwardedClientInvocation(auth.verified, template, finalBody, action, input.body.authorization_id, connection.nodePublicKey, identity(), Date.now())
-      : crypto.signClientInvocation(auth.verified, template, finalBody, action, input.body.authorization_id, identity(), Date.now()));
+    const invocation = JSON.parse(remote ? remote.remote.sign(auth.verified, template, finalBody, action,
+      input.body.authorization_id, connection.nodePublicKey, signer, Date.now()) : auth.forwarded
+      ? crypto.signForwardedClientInvocation(auth.verified, template, finalBody, action, input.body.authorization_id, connection.nodePublicKey, signer, Date.now())
+      : crypto.signClientInvocation(auth.verified, template, finalBody, action, input.body.authorization_id, signer, Date.now()));
     if (input.op === 'prepare_signed') return { body: checked.body, invocation };
     return connection.request(input.method || 'rpc', checked.body, invocation);
   }
@@ -513,6 +749,8 @@ for await (const line of createInterface({ input: process.stdin })) {
 }
 for (const connection of connections.values()) connection.close();
 for (const auth of authorizations.values()) auth.verified.free();
+for (const pending of preparations.values()) pending.prepared.free();
+for (const remote of remoteAuthorizations.values()) remote.remote.free();
 creation?.free();
 recoveryPreparation?.free();
 nodeEnrollment?.free();

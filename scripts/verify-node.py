@@ -398,6 +398,8 @@ class Client:
         self.scope = None
         self.policy = None
         self.connection_policies = {}
+        self.connection_scopes = {}
+        self.connection_resources = {}
         self.resource_id = None
         self.process = None
         self.node_id = None
@@ -408,6 +410,7 @@ class Client:
         self.bindings = {}
         self.target_public_keys = {}
         self.operations = {}
+        self.signed_requests = {}
 
     def command(self, op, *, check=True, **arguments):
         if op in {"connect", "close", "authenticate"}:
@@ -456,34 +459,39 @@ class Client:
         return self.call("identity", {"method": method, "params": params or {}},
                          status=status, connection=connection)
 
-    def authenticate(self, *, resource_id=None, audience=None, host_public_key=None, connection="main"):
+    def authenticate(self, *, resource_id=None, audience=None, host_public_key=None, connection="main",
+                     trust_ref="primary", resource_kind="project", grant_leaf=None, activate=True):
         selected_resource = resource_id or self.resource_id
-        selected_audience = audience or self.audience
         expected_host = host_public_key or self.host_public_key or self.node_public_key
+        selected_audience = audience or (self.audience if expected_host == self.host_public_key else None)
         verified = self.command("authenticate", resource_id=selected_resource, audience=selected_audience,
-                                expected_host_public_key=expected_host, connection=connection)
-        require(verified["scope"] == self.scope, "client authenticates the pinned account, space and device")
-        self.policy = verified["policy"]
-        require(self.policy["audience_public_key"] == expected_host,
+                                expected_host_public_key=expected_host, connection=connection,
+                                trust_ref=trust_ref, resource_kind=resource_kind, grant_leaf=grant_leaf)
+        expected_scope = self.command("get_trust", trust_ref=trust_ref)["scope"]
+        require(verified["scope"] == expected_scope, "client authenticates the pinned account, space and device")
+        policy = verified["policy"]
+        require(policy["audience_public_key"] == expected_host,
                 "verified authorization targets the independently pinned resource host")
-        self.host_public_key = expected_host
         self.target_public_keys[hashlib.sha256(bytes.fromhex(expected_host)).hexdigest()] = expected_host
-        self.audience = self.policy["audience"]
-        if resource_id is not None:
-            self.resource_id = resource_id
-        resources = self.policy["resources"]
-        require(resources and all(item["payload"]["kind"] == "project" for item in resources),
-                "signed authorization exposes explicit Project resources")
-        if self.resource_id is None:
-            self.resource_id = resources[0]["payload"]["resource"]
-        require(self.resource_id in {item["payload"]["resource"] for item in resources},
-                "selected Project belongs to the verified resource projection")
-        self.connection_policies[connection] = self.policy
+        resources = policy["resources"]
+        require(resources and all(item["payload"]["kind"] == resource_kind for item in resources),
+                "signed authorization exposes the selected resource kind")
+        selected_resource = selected_resource or resources[0]["payload"]["resource"]
+        require(selected_resource in {item["payload"]["resource"] for item in resources},
+                "selected resource belongs to the verified projection")
+        self.connection_policies[connection] = policy
+        self.connection_scopes[connection] = verified["scope"]
+        self.connection_resources[connection] = selected_resource
+        if activate:
+            self.scope, self.policy = verified["scope"], policy
+            self.host_public_key, self.audience, self.resource_id = expected_host, policy["audience"], selected_resource
         return verified
 
-    def rpc(self, method, *, status=200, connection="main", **arguments):
-        body = {"method": method, "space_id": self.scope["space_id"],
-                "resource_id": self.resource_id, **arguments}
+    def rpc(self, method, *, status=200, connection="main", remote=None, **arguments):
+        scope = self.scope if connection == "main" else self.connection_scopes.get(connection, self.scope)
+        body = {"method": method, "space_id": scope["space_id"],
+                "resource_id": self.resource_id if connection == "main" else self.connection_resources.get(connection, self.resource_id),
+                **arguments}
         connection_policy = self.connection_policies.get(connection)
         if connection_policy is None or body["resource_id"] not in {
                 item["payload"]["resource"] for item in connection_policy["resources"]}:
@@ -503,7 +511,9 @@ class Client:
                                      == (matching[0]["conversation_id"], matching[0]["task_id"], matching[0]["binding"])
                                      for request in matching),
                     "session read uses independently saved matching task and binding intent")
-            original = matching[0]
+            original = matching[-1] if remote else matching[0]
+            if remote:
+                body.setdefault("operation_id", original["operation_id"])
         if original:
             for field in ("conversation_id", "task_id", "target_node", "session_id", "binding"):
                 body.setdefault(field, copy.deepcopy(original[field]))
@@ -525,7 +535,7 @@ class Client:
             body.setdefault("detail", "")
         if method == "message":
             body.setdefault("scheduler_node", hashlib.sha256(bytes.fromhex(self.host_public_key)).hexdigest())
-        if method in {"operate", "bind_execution"} or original:
+        if method in {"operate", "bind_execution", "rebind_execution"} or original:
             target = request["target_node"]
             target_key = self.target_public_keys.get(target)
             require(target_key is not None, "execution target has an independently verified public key")
@@ -540,12 +550,50 @@ class Client:
             raw_context["execution_target_public_key"] = target_key
             if binding:
                 raw_context["canonical_cwd"] = binding["binding"]["open_spec"]["cwd"]
-            if method == "bind_execution":
+            if method in {"bind_execution", "rebind_execution"}:
                 raw_context["canonical_cwd"] = body["cwd"]
             elif method == "operate" and request["action"]["type"] == "open":
                 raw_context["canonical_cwd"] = request["action"]["cwd"]
+        if remote:
+            body.update(remote["share"]["selection"])
+            if method == "operate" and request["action"]["type"] != "open":
+                body["execution_session_receipt"] = remote["receipt"]
+            if method in {"bind_execution", "rebind_execution"}:
+                raw_context["binding_generation"] = remote["generation"]
+            handle = "remote-" + uuid.uuid4().hex
+            self.command("read_remote_policy", handle=handle, connection=connection,
+                         source_connection=remote["source_connection"],
+                         execution_connection=remote["execution_connection"],
+                         execution_trust_ref=remote["trust_ref"], selection=remote["share"]["selection"],
+                         action={"bind_execution": "execution_open", "rebind_execution": "execution_rebind"}.get(method)
+                                or ({"open": "execution_open", "send": "execution_send"}.get(request.get("action", {}).get("type"))
+                                    if method == "operate" else "operation_status_read"),
+                         raw_context=raw_context, approve=remote.get("approve", False))
+            remote["approve"] = False
         signing = {"raw_context": raw_context}
-        response = self.command("signed_request", body=body, connection=connection, **signing)
+        if remote:
+            signing["remote_handle"] = handle
+        try:
+            proof = self.command("prepare_signed", body=body, connection=connection, **signing)
+            if "error" in proof:
+                response = proof
+            else:
+                self.signed_requests.setdefault(body["authorization_id"], copy.deepcopy(proof))
+                response = self.command("request", method="rpc", params=proof["body"],
+                                        invocation=proof["invocation"], connection=connection)
+            result = response.get("result", {})
+            if remote and result.get("actual"):
+                actual = result["actual"]
+                original_proof = self.signed_requests[actual["receipt"]["payload"]["operation_id"]]
+                self.command("verify_remote_result", handle=handle, actual=actual,
+                             original=original_proof, binding=original["binding"] if original else request["binding"])
+            if remote and method == "session" and result.get("receipt"):
+                result["session"] = self.command("verify_remote_session", handle=handle,
+                                                 receipt=result["receipt"], binding=original["binding"])
+                remote["receipt"] = result["receipt"]
+        finally:
+            if remote:
+                self.command("release_remote", handle=handle)
         error = response.get("error")
         require(not error if status == 200 else bool(error),
                 f"encrypted {method}: expected {'success' if status == 200 else 'rejection'}, received {error}")
@@ -554,37 +602,21 @@ class Client:
         return response.get("result") if status == 200 else response
 
     def add_project_fixture(self, authority):
-        stamp = next(head for head in self.policy["heads"]
-                     if head["domain"] == {"kind": "space", "id": self.scope["space_id"]})
-        with sqlite3.connect(f"file:{authority.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
-            row = database.execute("SELECT entry FROM policy_journal WHERE entry_hash=?", (stamp["head"],)).fetchone()
-        require(row is not None, "fixture reads the exact independently verified current space head")
-        entry = json.loads(row[0])
-        document = entry["value"]["payload"]
-        require(entry["kind"] in {"space", "space_genesis"}
-                and document["space"] == self.scope["space_id"]
-                and document["sequence"] == stamp["sequence"],
-                "fixture space document matches the verified selected policy")
-        document = self.command("verify_space_fixture", signed=entry["value"], head=stamp)
         resource_id = "res2_" + os.urandom(32).hex()
-        resource = self.command("sign_resource_fixture", kind="resource", payload={
-            "version": 2, "space": self.scope["space_id"], "resource": resource_id,
-            "kind": "project", "host": self.policy["audience"]["service"],
-            "issued_under": stamp, "nonce": os.urandom(32).hex()})
-        updated = copy.deepcopy(document)
-        updated["previous"] = stamp
-        updated["sequence"] += 1
-        updated["resources"] = sorted(set(updated["resources"] + [resource["hash"]]))
-        signed = self.command("sign_resource_fixture", kind="space_document", payload=updated)
-        self.identity_call("policy_commit", {"journal": [
-            {"kind": "resource", "value": resource["signed"]},
-            {"kind": "space", "value": signed["signed"]}]})
+        self.governance("resource", {"space": self.scope["space_id"], "resource": resource_id,
+                                     "kind": "project", "host_node_public_key": authority.node_public_key})
         default_resource = self.resource_id
         self.authenticate(resource_id=resource_id)
         require(resource_id in {item["payload"]["resource"] for item in self.policy["resources"]},
                 "root-signed Project is visible only after its signed space policy is installed")
         self.authenticate(resource_id=default_resource)
         return resource_id
+
+    def governance(self, kind, intent, *, connection="main"):
+        handle = "governance-" + uuid.uuid4().hex
+        prepared = self.command("prepare_governance", handle=handle, kind=kind, intent=intent, connection=connection)
+        committed = self.identity_call("space_policy_commit", {"request": prepared["request"]}, connection=connection)
+        return self.command("finish_preparation", handle=handle, receipt=committed["committed"])
 
     def create_task(self, authority, conversation, task_id, *, title, goal, acceptance):
         intended = {"type": "task_created", "task_id": task_id, "title": title,
@@ -605,7 +637,7 @@ class Client:
             "authority_node": authority.node_id, "authority_public_key": authority.node_public_key}
         return response
 
-    def bind_execution(self, conversation, task_id, target, session_id, open_spec):
+    def bind_execution(self, conversation, task_id, target, session_id, open_spec, *, remote=None):
         task = self.tasks[(self.scope["space_id"], self.resource_id, conversation, task_id)]
         self.target_public_keys[target.node_id] = target.node_public_key
         require(open_spec["type"] == "open" and Path(open_spec["cwd"]).resolve() == Path(open_spec["cwd"]),
@@ -613,7 +645,7 @@ class Client:
         response = self.rpc("bind_execution", conversation_id=conversation, task_id=task_id,
                             task_ref=task["task_ref"],
                             target_node=target.node_id, session_id=session_id,
-                            executor=open_spec["executor"], cwd=open_spec["cwd"])
+                            executor=open_spec["executor"], cwd=open_spec["cwd"], remote=remote)
         expected = {"space_id": self.scope["space_id"], "conversation_id": conversation,
                     "task_ref": task["task_ref"], "task_id": task_id,
                     "authority_node": task["authority_node"], "generation": 1,
@@ -1281,6 +1313,230 @@ def verify_browser_origins(node, origins):
     node.client.request("/api/info", headers={"Host": "unconfigured.invalid"}, origin=False, status=403)
 
 
+def finish_native_change(client, prepared, method, *, connection="main", team=False, password=None):
+    params = {"request": prepared["request"]} if method != "execution_service_register" else prepared["request"]
+    response = client.identity_call(method, params, connection=connection)
+    return client.command("finish_preparation", handle=prepared["handle"],
+                          receipt=response["acceptance" if team else "committed"], password=password)
+
+
+def register_execution_service(node):
+    client = node.client
+    client.command("open_recovery", envelope=node.backup, password=node.backup_password)
+    prepared = client.command("prepare_execution_service", handle="execution-service", trust_ref="execution",
+                              source_project={"space": client.scope["space_id"], "resource": client.resource_id})
+    registered = finish_native_change(client, prepared, "execution_service_register", password=node.backup_password)
+    client.command("connect", url=node.url, node_id=node.node_id, node_public_key=node.node_public_key,
+                   connection="execution", trust_ref="execution")
+    client.authenticate(resource_id=registered["resource_id"], host_public_key=node.node_public_key,
+                        connection="execution", trust_ref="execution", resource_kind="execution_service",
+                        grant_leaf=registered["grant_leaf"], activate=False)
+    return registered
+
+
+def create_execution_share(project, executor, registered, conversation, task, session, *, purpose="execution", previous=None):
+    source, owner = project.client, executor.client
+    params = {"session_id": session, "executor_kind": "claude_code",
+              "expires_at_ms": int(time.time() * 1000) + 120_000, "purpose": purpose}
+    if previous:
+        params.update(previous)
+    produced = source.rpc("execution_share_request", conversation_id=conversation, task_id=task,
+                          task_ref=source.tasks[(source.scope["space_id"], source.resource_id, conversation, task)]["task_ref"],
+                          share_request=params)
+    require(produced["source_node_public_key"] == project.node_public_key
+            and produced["session_id"] == session and produced["purpose"] == purpose,
+            "compact share request retains the independently selected Project, session and purpose")
+    intent = source.command("build_share_intent", intent=produced)
+    source_ref = "source-" + uuid.uuid4().hex
+    owner.command("save_trust", trust_ref=source_ref, trust=source.command("get_trust"))
+    owner.command("connect", url=project.url, node_id=project.node_id, node_public_key=project.node_public_key,
+                  connection=source_ref, trust_ref=source_ref)
+    source_handle = "source-policy-" + uuid.uuid4().hex
+    owner.command("read_share_policy", handle=source_handle, connection=source_ref,
+                  source_trust_ref=source_ref, intent=intent)
+    actions = (["execution_open", "execution_send", "operation_status_read"] if purpose == "execution"
+               else ["execution_rebind", "operation_status_read"])
+    prepared = owner.command("prepare_share", handle="share-" + uuid.uuid4().hex,
+                             connection="execution", source_handle=source_handle,
+                             intent={"executionResourceId": registered["resource_id"], "actions": actions,
+                                     "expiresAt": params["expires_at_ms"]})
+    finished = finish_native_change(owner, prepared, "space_policy_commit", connection="execution")
+    owner.authenticate(resource_id=registered["resource_id"], host_public_key=executor.node_public_key,
+                       connection="execution", trust_ref="execution", resource_kind="execution_service",
+                       grant_leaf=registered["grant_leaf"], activate=False)
+    return finished["share"]
+
+
+def primary_policy_domains(node):
+    with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+        return set(database.execute("SELECT domain_kind,domain_id FROM current_policy_heads"))
+
+
+def seal_remote_execution(project, executor, registered, remote, conversation, task, session):
+    source, owner = project.client, executor.client
+    current = source.rpc("session", target_node=executor.node_id, session_id=session, remote=remote)
+    receipt = current["receipt"]
+    binding = source.bindings[(source.scope["space_id"], source.resource_id, conversation, task, session)]
+    share = create_execution_share(project, executor, registered, conversation, task, session, purpose="rebind",
+                                   previous={"execution_resource": remote["share"]["selection"]["execution_resource"],
+                                             "target_public_key": executor.node_public_key, "old_binding": binding,
+                                             "old_execution_receipt": receipt})
+    execution_trust = owner.command("get_trust", trust_ref="execution")
+    account_pin = next(pin for pin in source.command("get_trust")["pins"]
+                       if pin["domain"] == {"kind": "account", "id": source.scope["account_id"]})
+    require(not any(pin["domain"] == account_pin["domain"] for pin in execution_trust["pins"]),
+            "independent executor account differs from the Project Account")
+    seal_trust = {"scope": {**source.scope, "space_id": share["selection"]["execution_resource"]["space"]},
+                  "pins": sorted(execution_trust["pins"] + [account_pin],
+                                 key=lambda pin: (pin["domain"]["kind"], pin["domain"]["id"]))}
+    source.command("save_trust", trust_ref="remote-seal", trust=seal_trust)
+    source.command("connect", connection="remote-seal", url=executor.url, node_id=executor.node_id,
+                   node_public_key=executor.node_public_key, trust_ref="remote-seal")
+    source.authenticate(connection="remote-seal", trust_ref="remote-seal", resource_kind="execution_service",
+                        resource_id=share["selection"]["execution_resource"]["resource"],
+                        grant_leaf=share["selection"]["execution_grant"], host_public_key=executor.node_public_key, activate=False)
+    body = {"method": "seal_remote_execution", "space_id": share["selection"]["execution_resource"]["space"],
+            "resource_id": share["selection"]["execution_resource"]["resource"], "authorization_id": "remote-seal",
+            "original_space_id": source.scope["space_id"], "operation_id": receipt["payload"]["operation_id"],
+            "binding": binding, "execution_receipt": receipt}
+    raw = {"context": {"conversation": conversation, "task": binding["binding"]["task_ref"], "sdk_session": None,
+                       "execution_session": {"target": share["context"]["execution_session"]["target"], "session_id": session},
+                       "executor_kind": binding["binding"]["open_spec"]["executor"], "workspace_resource": body["resource_id"]},
+           "binding_generation": binding["binding"]["generation"], "canonical_cwd": None,
+           "execution_target_public_key": executor.node_public_key}
+    proof = source.command("prepare_signed", connection="remote-seal", body=body, raw_context=raw)
+    private_json(project.directory.parent / "remote-original-seal-request.json", proof)
+    sealed = source.call("rpc", proof["body"], invocation=proof["invocation"], connection="remote-seal")
+    seal = source.command("verify_remote_seal", binding=binding, seal=sealed["seal"],
+                          project_public_key=project.node_public_key, execution_public_key=executor.node_public_key,
+                          revision=current["session"]["revision"])
+    status_body = {**body, "method": "remote_execution_seal_status", "authorization_id": "remote-seal-status",
+                   "seal_invocation_hash": source.command("signed_invocation_hash", invocation=proof["invocation"])}
+    status = source.command("signed_request", connection="remote-seal", body=status_body, raw_context=raw)
+    require(status.get("result", {}).get("seal") == seal, "seal status identifies the exact saved signed seal request")
+    return seal
+
+
+def verify_remote_topology(run, binary, workspace, fixture, helper, module, nodes):
+    group = []
+    for name in ("REMOTE_A", "REMOTE_B", "REMOTE_C"):
+        node = Node(run, name, binary, workspace, fixture, helper, module)
+        nodes.append(node)
+        node.configure(network={"bootstrap_urls": [], "advertise_urls": [node.url.replace("http://", "ws://") + "/api/network/ws"],
+                                "mdns": False, "relay_enabled": True})
+        node.start()
+        node.bootstrap()
+        group.append(node)
+    outsider, project, executor = group
+    require(len({node.client.scope["account_id"] for node in group}) == 3,
+            "remote acceptance starts three independently claimed empty databases")
+    source, owner = project.client, executor.client
+    outsider.client.command("connect", connection="foreign-project", url=project.url, node_id=project.node_id,
+                            node_public_key=project.node_public_key)
+    denied = outsider.client.command("authenticate", connection="foreign-project", check=False,
+                                     expected_host_public_key=project.node_public_key, resource_id=source.resource_id)
+    require(denied.get("ok") is False and denied.get("rpc_method") == "begin_client_policy_read",
+            "B refuses to authenticate an independent Account absent from its Project policy")
+    source_domains, executor_domains = primary_policy_domains(project), primary_policy_domains(executor)
+    registered = register_execution_service(executor)
+    conversation, task, session = "remote-project", "remote-task", "remote-session"
+    source.rpc("create_conversation", conversation_id=conversation, title="Remote task")
+    source.create_task(project, conversation, task, title="Remote execution", goal="Execute on an independent Node",
+                       acceptance="The signed result survives restart without replay")
+    share = create_execution_share(project, executor, registered, conversation, task, session)
+    require(primary_policy_domains(project) == source_domains,
+            "B received no C primary policy while C issued the precise Task share")
+    require(not {("account", source.scope["account_id"]), ("space", source.scope["space_id"])}
+            & primary_policy_domains(executor), "C share creation did not seed B business policy")
+    source.command("save_trust", trust_ref="remote-execution", trust=owner.command("get_trust", trust_ref="execution"))
+    source.command("connect", url=executor.url, node_id=executor.node_id, node_public_key=executor.node_public_key,
+                   connection="remote-execution", trust_ref="remote-execution")
+    remote = {"share": share, "trust_ref": "remote-execution", "source_connection": "main",
+              "execution_connection": "remote-execution", "generation": 1, "approve": True}
+    open_spec = {"type": "open", "executor": "claude_code", "cwd": str(workspace)}
+    source.bind_execution(conversation, task, executor, session, open_spec, remote=remote)
+    opened = request(source.scope["space_id"], conversation, executor, "remote-open", session, open_spec, task=task)
+    opened["binding"] = source.bindings[(source.scope["space_id"], source.resource_id, conversation, task, session)]
+    source.rpc("operate", request=opened, remote=remote)
+
+    def remote_operation(operation_id):
+        return source.rpc("operation", target_node=executor.node_id, operation_id=operation_id, remote=remote)["operation"]
+
+    wait_for("independent C completes remote open", lambda: remote_operation("remote-open")["state"] == "succeeded")
+    current = source.rpc("session", target_node=executor.node_id, session_id=session, remote=remote)["session"]
+    require(current["target_node"] == executor.node_id and current["binding_generation"] == 1,
+            "native WASM verifies the C session receipt against the exact B binding")
+    outsider.client.rpc("conversation", conversation_id=conversation, status=400)
+    gate = run / "remote-complete"
+    sent = request(source.scope["space_id"], conversation, executor, "remote-send", session,
+                   {"type": "send", "text": json.dumps({"label": "remote-result", "gate": str(gate), "result_size": 128})},
+                   revision=current["revision"], task=task)
+    sent.update(binding=opened["binding"], resources=[str(workspace)])
+    source.rpc("operate", request=sent, remote=remote)
+    original = copy.deepcopy(source.signed_requests["remote-send"])
+    private_json(run / "remote-original-request.json", original)
+    wait_for("C starts one accepted remote send", lambda: len(invocations(run, "remote-result")) == 1)
+    gate.touch(mode=0o600)
+    wait_for("C commits the remote result", lambda: remote_operation("remote-send")["state"] == "succeeded")
+    for node in (project, executor):
+        node.stop()
+        node.start()
+    source.connect()
+    source.authenticate()
+    source.command("connect", url=executor.url, node_id=executor.node_id, node_public_key=executor.node_public_key,
+                   connection="remote-execution", trust_ref="remote-execution")
+    require(remote_operation("remote-send")["state"] == "succeeded" and len(invocations(run, "remote-result")) == 1,
+            "B and C restart preserve the admitted remote result without replay")
+    source.call("rpc", original["body"], invocation=original["invocation"])
+    require(len(invocations(run, "remote-result")) == 1, "exact signed remote retry does not rerun C")
+    changed = copy.deepcopy(original["body"])
+    changed["request"]["session_id"] = "unapproved-session"
+    source.call("rpc", changed, invocation=original["invocation"], status=400)
+    require(len(invocations(run, "remote-result")) == 1, "a changed signed remote session cannot execute C")
+    require(primary_policy_domains(project) == source_domains,
+            "completed foreign import remains outside B primary policy")
+
+    seal = seal_remote_execution(project, executor, registered, remote, conversation, task, session)
+    next_session = "remote-session-2"
+    next_share = create_execution_share(project, executor, registered, conversation, task, next_session)
+    source.command("save_trust", trust_ref="remote-execution", trust=owner.command("get_trust", trust_ref="execution"))
+    replacement = {**remote, "share": next_share, "generation": 2, "approve": True}
+    rebound = source.rpc("rebind_execution", conversation_id=conversation, task_id=task,
+                         task_ref=opened["binding"]["binding"]["task_ref"], binding=opened["binding"],
+                         previous_seal=seal, previous_target_public_key=executor.node_public_key,
+                         target_node=executor.node_id, session_id=next_session, executor="claude_code", cwd=str(workspace),
+                         remote=replacement)
+    expected = {**opened["binding"]["binding"], "generation": 2, "session_id": next_session,
+                "previous_binding_hash": seal["seal"]["binding_hash"], "previous_seal": seal}
+    next_binding = source.command("verify_task_binding", binding=rebound["binding"],
+                                  authority_public_key=project.node_public_key, expected={"binding": expected})
+    source.bindings[(source.scope["space_id"], source.resource_id, conversation, task, next_session)] = next_binding
+    next_open = request(source.scope["space_id"], conversation, executor, "remote-rebound-open", next_session, open_spec, task=task)
+    next_open["binding"] = next_binding
+    source.rpc("operate", request=next_open, remote=replacement)
+    wait_for("sealed Task opens only its next binding", lambda: source.rpc("operation", target_node=executor.node_id,
+              operation_id="remote-rebound-open", remote=replacement)["operation"]["state"] == "succeeded")
+
+    team_prepared = source.command("prepare_team", handle="remote-team", trust_ref="remote-team",
+                                   source_project=source.resource_id)
+    team = finish_native_change(source, team_prepared, "team_create", team=True, password=project.backup_password)
+    source.command("connect", url=project.url, node_id=project.node_id, node_public_key=project.node_public_key,
+                   connection="team", trust_ref="remote-team")
+    source.authenticate(resource_id=team["resource_id"], connection="team", trust_ref="remote-team",
+                        host_public_key=project.node_public_key, activate=False)
+    source.rpc("create_conversation", connection="team", conversation_id="team-only", title="Team isolation")
+    source.rpc("conversation", conversation_id="team-only", status=400)
+    return {"accounts": [node.client.scope["account_id"] for node in group],
+            "nodes": [node.node_id for node in group], "execution_resource": registered["resource_id"],
+            "source_domains_before": sorted(source_domains), "executor_domains_before": sorted(executor_domains),
+            "team_space": team["scope"]["space_id"], "original_request": "remote-original-request.json",
+            "checks": ["B has no C primary policy", "C has no B account seed", "native bounded source and foreign policy imports",
+                       "remote open/send receipts", "exact duplicate after B/C restart", "native seal and exact seal status",
+                       "generation-2 rebind and new session open", "independent account rejection", "Team isolation"],
+            "not_checked": ["cross-account authenticated A Gateway", "replacement on a different C node",
+                            "SDK continuation without browser", "remote Unknown and revocation"]}
+
+
 def acceptance(options):
     binary = options.binary.resolve(strict=True)
     module = options.crypto_module.resolve(strict=True)
@@ -1512,6 +1768,11 @@ def acceptance(options):
                 "recovery does not replay accepted execution")
         report["not_checked"].remove("recovery on real Node wire")
         passed("encrypted typed recovery preserves account, resources and history and rejects the old device")
+        if options.remote_topology:
+            report["remote_topology"] = verify_remote_topology(run, binary, workspace, fixture, helper, module, nodes)
+            report["not_checked"].extend(report["remote_topology"]["not_checked"])
+            passed("three independent accounts, native foreign policy import, B/C execution restart and Team isolation",
+                   "real_nodes_with_stream_json_fixture")
         verify_no_model_budget(nodes)
         require(file_sha256(binary) == report["binary_sha256"], "binary stays unchanged throughout acceptance")
         require(file_sha256(module) == report["crypto_module_sha256"]
@@ -1548,6 +1809,7 @@ if __name__ == "__main__":
         parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "crates/node/web/generated/vibeface_secure.js")
         parser.add_argument("--codex-bin", default="codex")
         parser.add_argument("--skip-codex", action="store_true", help="omit real Codex transport checks and report that omission")
+        parser.add_argument("--remote-topology", action="store_true", help="also run independent-account B/C execution and Team isolation checks")
         arguments = parser.parse_args()
         try:
             acceptance(arguments)
