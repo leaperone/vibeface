@@ -330,7 +330,9 @@ impl Store {
         action: Action,
         now_ms: u64,
     ) -> Result<Vec<Value>> {
-        use vibeface_secure::authorization::{Actor, EventRef, InvocationContext};
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        use vibeface_secure::authorization::{Actor, EventRef};
         ensure!(
             matches!(
                 action,
@@ -399,72 +401,52 @@ impl Store {
             service: session.service.clone(),
             device: session.device.clone(),
         };
+        let primary = self.policy.verified();
+        let source = primary.verify_service_device(&project.space, &audience.device, now_ms)?;
+        let record = primary.resource(&project.space, &project.resource)
+            .context("target discovery has no Project resource")?;
+        ensure!(
+            source.payload.subject == Actor::Service(session.service.clone())
+                && record.payload.kind == vibeface_secure::authorization::ResourceKind::Project
+                && record.payload.host == session.service,
+            "target discovery changed the current Project host"
+        );
+        let candidates = super::foreign_execution_policy::task_policy_candidates_in(
+            &self.connection, &self.policy, &source.payload.public_key, &project, &task_ref,
+            &session.conversation_id, executor, action, binding.as_ref(), now_ms,
+        )?;
         let mut targets = Vec::new();
-        for pin in self.policy.pins() {
-            let PolicyDomain::Space(space) = &pin.domain else {
-                continue;
-            };
-            let Some(document) = self.policy.verified().space(space) else {
-                continue;
-            };
-            for grant in &document.grants {
-                let Some(leaf) = self.policy.verified().grant(grant) else {
-                    continue;
-                };
-                let vibeface_secure::authorization::ResourceScope::Exact(resource) =
-                    &leaf.payload.scope
-                else {
-                    continue;
-                };
-                let constraints = &leaf.payload.constraints.context;
-                let Some(selected_session) = &constraints.execution_session else {
-                    continue;
-                };
-                if constraints.task.as_ref() != Some(&task_ref)
-                    || constraints.conversation.as_deref() != Some(session.conversation_id.as_str())
-                    || constraints.executor_kind.as_deref() != Some(executor)
-                {
-                    continue;
-                }
-                let Ok(certificate) = self.policy.verified().verify_service_device(
-                    space,
-                    &selected_session.target,
-                    now_ms,
-                ) else {
-                    continue;
-                };
-                let context = InvocationContext {
-                    conversation: Some(session.conversation_id.clone()),
-                    task: Some(task_ref.clone()),
-                    sdk_session: None,
-                    execution_session: Some(selected_session.clone()),
-                    executor_kind: Some(executor.into()),
-                    workspace_resource: Some(project.resource.clone()),
-                };
-                let Ok(destination) = self.policy.verified().verify_execution_destination(
-                    &project,
-                    &audience,
-                    resource,
-                    &certificate.payload.public_key,
-                    grant,
-                    &context,
-                    action,
-                    now_ms,
-                ) else {
-                    continue;
-                };
-                let target = crate::crypto::fingerprint(destination.public_key().as_str())?;
-                if binding.as_ref().is_some_and(|binding| {
-                    binding.binding.target_node != target
-                        || binding.binding.session_id != selected_session.session_id
-                }) {
-                    continue;
-                }
-                targets.push(json!({"execution_resource":resource,"target_public_key":destination.public_key(),
-                    "execution_grant":grant,"target_node":target,"session_id":selected_session.session_id,
-                    "executor":executor,"task_id":task_id,"task_ref":task_ref,
-                    "cwd":binding.as_ref().and_then(|binding|binding.binding.open_spec["cwd"].as_str())}));
-            }
+        for candidate in candidates {
+            let selection = candidate.selection();
+            let context = &candidate.context().context;
+            let selected_session = context.execution_session.as_ref()
+                .context("approved execution policy has no selected session")?;
+            ensure!(
+                context.task.as_ref() == Some(&task_ref)
+                    && context.conversation.as_deref() == Some(session.conversation_id.as_str())
+                    && context.executor_kind.as_deref() == Some(executor)
+                    && context.workspace_resource.as_ref() == Some(&project.resource),
+                "approved execution policy escaped the current SDK task"
+            );
+            let destination = candidate.state().verify_execution_destination(
+                &project, &audience, &selection.execution_resource, &selection.target_public_key,
+                &selection.execution_grant, context, action, now_ms,
+            )?;
+            super::foreign_execution_policy::check_task_policy_heads_in(&self.connection, &candidate)?;
+            let target = crate::crypto::fingerprint(destination.public_key().as_str())?;
+            ensure!(
+                binding.as_ref().is_none_or(|binding| {
+                    binding.binding.target_node == target
+                        && binding.binding.session_id == selected_session.session_id
+                }),
+                "approved execution policy changed the confirmed SDK binding"
+            );
+            let cwd = binding.as_ref().and_then(|binding|binding.binding.open_spec["cwd"].as_str())
+                .or(candidate.context().canonical_cwd.as_deref());
+            targets.push(json!({"execution_resource":selection.execution_resource,
+                "target_public_key":destination.public_key(),"execution_grant":selection.execution_grant,
+                "target_node":target,"session_id":selected_session.session_id,
+                "executor":executor,"task_id":task_id,"task_ref":task_ref,"cwd":cwd}));
         }
         targets.sort_by_key(|value| value.to_string());
         targets.dedup();
