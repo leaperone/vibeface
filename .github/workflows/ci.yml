@@ -266,6 +266,10 @@ jobs:
             .artifacts/ci-chat-agent/chat-agent-process-*/A/process.log
             .artifacts/ci-chat-agent/chat-agent-process-*/B/process.log
             .artifacts/ci-chat-agent/chat-agent-process-*/C/process.log
+            .artifacts/ci-chat-agent/chat-agent-process-*/fixture-manager-*.stderr.log
+            .artifacts/ci-chat-agent/chat-agent-process-*/command-target-readiness.json
+            .artifacts/ci-chat-agent/chat-agent-process-*/manager-tool-starts.jsonl
+            .artifacts/ci-chat-agent/chat-agent-process-*/manager-tool-errors.jsonl
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7

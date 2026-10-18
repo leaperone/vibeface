@@ -949,7 +949,13 @@ def invocations(run, label=None):
 
 def fixture_wrapper(run, name, mode):
     path = run / name
-    path.write_text(f"#!{sys.executable}\nimport os\nos.execv({sys.executable!r}, "
+    diagnostic = ""
+    if mode == "--fixture-manager":
+        diagnostic = ("import tempfile\n"
+                      "diagnostic_fd, _ = tempfile.mkstemp(prefix='fixture-manager-' + str(os.getpid()) + '-', "
+                      f"suffix='.stderr.log', dir={str(run)!r})\n"
+                      "os.dup2(diagnostic_fd, 2)\nos.close(diagnostic_fd)\n")
+    path.write_text(f"#!{sys.executable}\nimport os\n" + diagnostic + f"os.execv({sys.executable!r}, "
                     f"[{sys.executable!r}, {str(Path(__file__).resolve())!r}, "
                     f"{mode!r}, '--fixture-root', {str(run)!r}] + __import__('sys').argv[1:])\n")
     path.chmod(0o700)
@@ -2135,6 +2141,32 @@ def local_events(node, network, conversation):
     return [json.loads(json.loads(row[0])["canonical_body"]) for row in rows]
 
 
+def wait_for_command_target(run, observer, target, cwd, *, reason):
+    cwd = Path(cwd)
+    deadline = time.monotonic() + 35
+    path = run / "command-target-readiness.json"
+    observations = json.loads(path.read_text()) if path.exists() else []
+
+    def ready():
+        response = observer.client.command("request", method="rpc", params={"method": "nodes"},
+                                           _wait_timeout=min(30, deadline - time.monotonic()))
+        require(not response.get("error"), "authorized readiness query succeeds")
+        row = next((value for value in response["result"]["nodes"] if value["node_id"] == target.node_id), None)
+        capabilities = row.get("capabilities") if row else None
+        roots = capabilities.get("roots", []) if isinstance(capabilities, dict) else []
+        matched = bool(row and row["online"] is True and row["revoked"] is False and "executor" in row["roles"]
+                       and cwd.is_absolute() and any(isinstance(root, str) and
+                           (cwd == Path(root) or Path(root) in cwd.parents) for root in roots))
+        observations.append({"reason": reason, "observed_monotonic": time.monotonic(), "target_node": target.node_id,
+                             "node": {key: row.get(key) for key in ("node_id", "online", "revoked", "roles")} if row else None,
+                             "capabilities_null": capabilities is None, "roots": roots, "cwd": str(cwd), "ready": matched})
+        private_json(path, observations)
+        return row if matched else None
+
+    return wait_for("fixed command target advertises authorized capability roots", ready,
+                    timeout=max(0, deadline - time.monotonic()))
+
+
 def chat_agent_checks(run, workspace, a, b, c, network, passed):
     def calls(name, autonomous=None):
         return [record for record in fixture_records(run) if record["conversation_id"] == name
@@ -2175,6 +2207,7 @@ def chat_agent_checks(run, workspace, a, b, c, network, passed):
     name = "chat-command-dedup"
     directory = prepare(name)
     marker = directory / "count.txt"
+    wait_for_command_target(run, a, b, directory, reason="before first command")
     with sqlite3.connect(f"file:{b.directory / 'node.sqlite3'}?mode=ro", uri=True) as connection:
         before_sessions = connection.execute("SELECT COUNT(*) FROM execution_sessions").fetchone()[0]
     before_sdk = len(invocations(run))
@@ -2278,9 +2311,7 @@ def chat_agent_checks(run, workspace, a, b, c, network, passed):
     require_quiet("restart never reruns the unknown command", lambda: marker.read_text() == "once")
     require(local_operation(b, network, operation_id)["request"]["session_id"] is None,
             "unknown command recovery does not create an SDK session")
-    wait_for("restarted executor reconnects before subsequent work", lambda:
-        any(row["node_id"] == b.node_id and row["online"] and row.get("capabilities")
-            for row in a.client.rpc("nodes")["nodes"]))
+    wait_for_command_target(run, a, b, directory, reason="after executor restart")
     passed("running command restart preserves Unknown and its original file effect without replay", operation_id=operation_id)
 
 
@@ -2488,7 +2519,8 @@ def chat_agent_acceptance(options):
             node.configure(timeout_secs=600, codex_bin=str(codex) if name == "B" else sys.executable)
             nodes.append(node)
         a, b, c, outsider = nodes
-        a.configure(manager=fixture_manager_settings(run, workspace), daily_decision_limit=100)
+        a.configure(manager=fixture_manager_settings(run, workspace), daily_decision_limit=100,
+                    network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False, "relay_enabled": True})
         a.start()
         network = a.bootstrap()
         outsider.start()
