@@ -398,10 +398,15 @@ fn authorize_inner(
     now: u64,
     mut usage: ExecutionProofUsage,
 ) -> Result<VerifiedTaskBusinessReceiptAuthority> {
-    let mut current_usage = current.proof_usage().clone();
-    current_usage.enforce_limits()?;
-    current_usage.normalize_completed_task_policy_transport(current)?;
-    usage.merge(&current_usage);
+    current.proof_usage().enforce_limits()?;
+    // Accepted operations already carry current authority; their earlier SDK read is provenance.
+    if !matches!(authorization, TaskBusinessAuthorization::Submit(value)
+        if value.submission().phase == AuthorizationPhase::Operation)
+    {
+        let mut current_usage = current.proof_usage().clone();
+        current_usage.normalize_completed_task_policy_transport(current)?;
+        usage.merge(&current_usage);
+    }
     usage.enforce_limits()?;
     let scope = wire.scope()?;
     require(
@@ -1077,6 +1082,7 @@ mod tests {
                 now,
             )
             .unwrap();
+        assert_eq!(operation.submission().phase, AuthorizationPhase::Operation);
         let renew = TaskBusinessChallenge::Submit(
             ExecutionHandoffChallenge::new(
                 &operation,
