@@ -865,6 +865,57 @@ impl PolicyState {
         self.prepare(pins, journal, now_ms, true)
     }
 
+    pub(crate) fn prepare_cross_recovery_install(
+        &self,
+        verified: vibeface_secure::authorization::bootstrap::recovery::stream::VerifiedCrossNodeRecoveryInstallation,
+        now_ms: u64,
+    ) -> Result<PreparedPolicyUpdate> {
+        ensure!(
+            self.accepted.is_empty() && self.order.is_empty() && self.pins.is_empty(),
+            "cross-node recovery installation requires an unclaimed Node"
+        );
+        let prefix_len = verified.accepted_prefix_len();
+        let (state, mut pins, journal) = verified.into_store_parts();
+        ensure!(
+            prefix_len != 0 && prefix_len < journal.len(),
+            "cross-node recovery installation has no accepted prefix or delta"
+        );
+        pins.sort_by(|left, right| left.domain.cmp(&right.domain));
+        ensure!(
+            pins.windows(2).all(|pair| pair[0].domain != pair[1].domain),
+            "cross-node recovery installation has duplicate pins"
+        );
+        let mut after = Self {
+            state,
+            pins,
+            accepted: BTreeMap::new(),
+            order: Vec::new(),
+        };
+        let mut additions = Vec::with_capacity(journal.len());
+        for entry in journal {
+            let hash = entry_hash(&entry)?;
+            let accepted = AcceptedEntry {
+                encoded: serde_json::to_string(&entry)?,
+                entry,
+                received_at_ms: now_ms,
+            };
+            ensure!(
+                !after.accepted.contains_key(&hash),
+                "cross-node recovery installation repeats a journal object"
+            );
+            after.order.push(hash.clone());
+            after.accepted.insert(hash.clone(), accepted.clone());
+            additions.push((hash, accepted));
+        }
+        after.check_minimum_heads()?;
+        after.nonce_bindings()?;
+        Ok(PreparedPolicyUpdate {
+            before: self.clone(),
+            after,
+            additions,
+        })
+    }
+
     pub(crate) fn prepare_team_creation(
         &self,
         verified: &vibeface_secure::authorization::governance::VerifiedTeamCreationRequest,
