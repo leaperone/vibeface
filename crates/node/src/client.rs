@@ -1436,6 +1436,7 @@ mod tests {
                 context: original.context.clone(),
                 expected_action: original.expected_action,
                 purpose: original.purpose,
+                source_provenance: None,
                 execution_pins: original.execution_pins.clone(),
                 nonce: Nonce::random()?,
                 issued_at_ms: now(),

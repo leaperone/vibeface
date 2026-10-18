@@ -1176,6 +1176,7 @@ mod tests {
                 context: original.payload.context.clone(),
                 expected_action: original.payload.expected_action,
                 purpose: original.payload.purpose,
+                source_provenance: None,
                 execution_pins: original.payload.execution_pins.clone(),
                 nonce: Nonce::random()?,
                 issued_at_ms: now(),

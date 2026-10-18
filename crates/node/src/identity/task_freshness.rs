@@ -84,6 +84,7 @@ impl Store {
             context,
             expected_action: invocation.action,
             purpose: task.request().purpose(),
+            source_provenance: None,
             execution_pins: task.trust().pins().to_vec(),
             nonce: Nonce::random()?,
             issued_at_ms: now,
