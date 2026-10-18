@@ -413,3 +413,268 @@ impl VerifiedTaskBusinessReceiptAuthority {
         Ok(receipts)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{current_policy, noise_peer, original_authorization};
+    use super::*;
+    use crate::authorization::{
+        client_policy_import::require_confirmed_client_policy,
+        execution_handoff::{
+            ExecutionHandoffFreshness, verify_execution_handoff_admission_checkpoint,
+        },
+        execution_observation::tests::retained_history_fixture_with_execution_source,
+        remote_execution_history::RemoteExecutionHistoryAcceptance,
+    };
+
+    #[test]
+    fn task_business_receipts_keep_typed_anchors_and_require_current_writer() {
+        let fixture = retained_history_fixture_with_execution_source();
+        let now = fixture.invocation.payload.not_before_ms;
+        let current = current_policy(&fixture);
+        let source = require_confirmed_client_policy(&fixture.source).unwrap();
+        let original = original_authorization(current.state(), &fixture.actual.handoff, now);
+        let transport = TransportEvidence::VerifiedPeer {
+            origin: DeviceId::from_key(&PublicKey::of(&fixture.project_node)),
+        };
+        let business = current
+            .state()
+            .verify_execution_handoff(&fixture.actual.handoff, &original, &transport, None, now)
+            .unwrap();
+        let wire = TaskBusinessWire::Submit(fixture.actual.handoff.clone());
+        let challenge = ExecutionHandoffChallenge::new(
+            &business,
+            CheckStage::Admit,
+            Nonce::random().unwrap(),
+            now,
+            now + 500,
+        )
+        .unwrap();
+        let typed = TaskBusinessChallenge::Submit(challenge.clone());
+        assert_eq!(typed.hash().unwrap(), challenge.hash().unwrap());
+        assert_ne!(typed.hash().unwrap(), ObjectHash::body(&typed).unwrap());
+        let b_key = PublicKey::of(&fixture.project_node);
+        let authority = authorize_task_business_challenge(
+            source.state(),
+            &current,
+            TaskBusinessAuthorization::Submit(&business),
+            &wire,
+            &typed,
+            &b_key,
+            now,
+        )
+        .unwrap();
+        let mut receipts = authority.sign_receipts(&fixture.project_node, now).unwrap();
+        assert!(!receipts.is_empty());
+        assert!(receipts.iter().all(|receipt| receipt.issuer == b_key
+            && receipt.payload.challenge_hash == challenge.hash().unwrap()));
+        assert!(authority.sign_receipts(&fixture.executor, now).is_err());
+        assert!(
+            authority
+                .sign_receipts(&fixture.project_node, now + 1)
+                .is_err()
+        );
+        for head in &challenge.policies {
+            if !authority.signing_heads().contains(head) {
+                let node = match &head.domain {
+                    PolicyDomain::Account(id) => &current.state().account(id).unwrap().authority,
+                    PolicyDomain::Space(id) => &current.state().space(id).unwrap().authority,
+                };
+                assert_eq!(node.public_key, PublicKey::of(&fixture.executor));
+                receipts.push(
+                    Signed::sign(
+                        FreshnessReceipt {
+                            version: AUTH_VERSION,
+                            current: head.clone(),
+                            challenge_hash: challenge.hash().unwrap(),
+                            issued_at_ms: now,
+                            expires_at_ms: authority.expires_at_ms(),
+                        },
+                        &fixture.executor,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        current
+            .state()
+            .verify_execution_handoff_freshness(
+                &business,
+                &ExecutionHandoffFreshness {
+                    challenge: challenge.clone(),
+                    receipts,
+                },
+                now,
+            )
+            .unwrap();
+        let mut changed = challenge.clone();
+        changed.original_body_hash = ObjectHash::body(&"another original body").unwrap();
+        assert!(
+            authorize_task_business_challenge(
+                source.state(),
+                &current,
+                TaskBusinessAuthorization::Submit(&business),
+                &wire,
+                &TaskBusinessChallenge::Submit(changed),
+                &b_key,
+                now
+            )
+            .is_err()
+        );
+        let wrong_type = TaskBusinessChallenge::Observe(ExecutionObservationChallenge {
+            version: AUTH_VERSION,
+            stage: CheckStage::RemoteRead,
+            observation_hash: challenge.handoff_hash.clone(),
+            request_hash: challenge.original_request_hash.clone(),
+            submission_invocation_hash: challenge.submission_invocation_hash.clone(),
+            policies: challenge.policies.clone(),
+            nonce: challenge.nonce.clone(),
+            issued_at_ms: now,
+            expires_at_ms: now + 500,
+        });
+        assert!(
+            authorize_task_business_challenge(
+                source.state(),
+                &current,
+                TaskBusinessAuthorization::Submit(&business),
+                &wire,
+                &wrong_type,
+                &b_key,
+                now
+            )
+            .is_err()
+        );
+        let export = build_task_business_policy_export(
+            &current,
+            TaskBusinessAuthorization::Submit(&business),
+            &wire,
+            &fixture.project_node,
+            now,
+        )
+        .unwrap();
+        let mut expired_header = export.header().payload.clone();
+        expired_header.expires_at_ms = now + 1;
+        let expired_header = Signed::sign(expired_header, &fixture.project_node).unwrap();
+        let RemoteExecutionHistoryAcceptance::ExecutionResult {
+            receipt,
+            freshness,
+            transport: accepted_transport,
+        } = &fixture.acceptance
+        else {
+            panic!("fixture has no accepted handoff")
+        };
+        let admitted = verify_execution_handoff_admission_checkpoint(
+            &fixture.actual.handoff,
+            receipt,
+            freshness,
+            accepted_transport,
+            receipt.payload.admitted_at_ms,
+        )
+        .unwrap();
+        let operation = current
+            .state()
+            .verify_execution_handoff(
+                &fixture.actual.handoff,
+                &original,
+                &transport,
+                Some(&admitted),
+                now,
+            )
+            .unwrap();
+        let renew = TaskBusinessChallenge::Submit(
+            ExecutionHandoffChallenge::new(
+                &operation,
+                CheckStage::Renew,
+                Nonce::random().unwrap(),
+                now + 5,
+                now + 500,
+            )
+            .unwrap(),
+        );
+        let read = Signed::sign(
+            TaskBusinessReceiptRead {
+                version: AUTH_VERSION,
+                source_header_hash: expired_header.hash().unwrap(),
+                business_wire_hash: wire.hash().unwrap(),
+                challenge: renew.clone(),
+                nonce: Nonce::random().unwrap(),
+                issued_at_ms: now + 6,
+                expires_at_ms: now + 400,
+            },
+            &fixture.executor,
+        )
+        .unwrap();
+        let actual_c = noise_peer(&fixture.executor, &fixture.project_node);
+        let renewed = verify_task_business_receipt_read(
+            source.state(),
+            &current,
+            TaskBusinessAuthorization::Submit(&operation),
+            &expired_header,
+            &wire,
+            &actual_c,
+            &read,
+            &b_key,
+            now + 10,
+        )
+        .unwrap();
+        assert!(expired_header.payload.expires_at_ms < now + 10);
+        assert_eq!(renewed.challenge_hash(), &renew.hash().unwrap());
+        assert!(
+            !renewed
+                .sign_receipts(&fixture.project_node, now + 10)
+                .unwrap()
+                .is_empty()
+        );
+        let wrong_peer = noise_peer(&fixture.client, &fixture.project_node);
+        assert!(
+            verify_task_business_receipt_read(
+                source.state(),
+                &current,
+                TaskBusinessAuthorization::Submit(&operation),
+                &expired_header,
+                &wire,
+                &wrong_peer,
+                &read,
+                &b_key,
+                now + 10
+            )
+            .is_err()
+        );
+        let mut wrong_read = read.payload.clone();
+        wrong_read.business_wire_hash = ObjectHash::body(&"other wire").unwrap();
+        let wrong_read = Signed::sign(wrong_read, &fixture.executor).unwrap();
+        assert!(
+            verify_task_business_receipt_read(
+                source.state(),
+                &current,
+                TaskBusinessAuthorization::Submit(&operation),
+                &expired_header,
+                &wire,
+                &actual_c,
+                &wrong_read,
+                &b_key,
+                now + 10
+            )
+            .is_err()
+        );
+        let mut old_heads = read.payload.clone();
+        if let TaskBusinessChallenge::Submit(challenge) = &mut old_heads.challenge {
+            challenge.policies[0].sequence += 1;
+        }
+        let old_heads = Signed::sign(old_heads, &fixture.executor).unwrap();
+        assert!(matches!(
+            verify_task_business_receipt_read(
+                source.state(),
+                &current,
+                TaskBusinessAuthorization::Submit(&operation),
+                &expired_header,
+                &wire,
+                &actual_c,
+                &old_heads,
+                &b_key,
+                now + 10
+            ),
+            Err(AuthorizationError::NeedPolicySync(_))
+        ));
+    }
+}

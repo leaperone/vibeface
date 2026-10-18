@@ -1223,8 +1223,14 @@ mod tests {
     };
     use super::*;
 
-    fn current_policy(fixture: &RetainedHistoryFixture) -> VerifiedTaskCurrentPolicy {
-        let now = fixture.invocation.payload.not_before_ms;
+    pub(super) fn current_policy(fixture: &RetainedHistoryFixture) -> VerifiedTaskCurrentPolicy {
+        current_policy_at(fixture, fixture.invocation.payload.not_before_ms)
+    }
+
+    pub(super) fn current_policy_at(
+        fixture: &RetainedHistoryFixture,
+        now: u64,
+    ) -> VerifiedTaskCurrentPolicy {
         let retained = require_confirmed_client_policy(&fixture.source).unwrap();
         let project = fixture
             .actual
@@ -1319,7 +1325,7 @@ mod tests {
         import.finish_current(&stream.witness, now).unwrap()
     }
 
-    fn noise_peer(source: &Identity, target: &Identity) -> ActualPolicyNoisePeer {
+    pub(super) fn noise_peer(source: &Identity, target: &Identity) -> ActualPolicyNoisePeer {
         let mut source_handshake = crate::Handshake::new(
             true,
             &source.secret_hex(),
@@ -1346,7 +1352,7 @@ mod tests {
         ActualPolicyNoisePeer::from_finished_handshake(&target_handshake).unwrap()
     }
 
-    fn original_authorization(
+    pub(super) fn original_authorization(
         state: &VerifiedPolicySet,
         wire: &SignedExecutionHandoff,
         now: u64,
