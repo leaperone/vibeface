@@ -1418,6 +1418,7 @@ mod tests {
         )
         .unwrap();
         let mut previous = snapshot.hash().unwrap();
+        let mut request_cursor = None;
         for (index, entry) in bundle.journal.iter().enumerate() {
             let complete = index + 1 == bundle.journal.len();
             let page = Signed::sign(
@@ -1427,6 +1428,7 @@ mod tests {
                     snapshot_id: snapshot.payload.snapshot_id.clone(),
                     target_heads_hash: client_policy_target_heads_hash(current.heads()).unwrap(),
                     page_index: index as u64,
+                    request_cursor: request_cursor.clone(),
                     previous_page_hash: previous,
                     entry: Some(entry.clone()),
                     next_cursor: if complete {
@@ -1440,6 +1442,7 @@ mod tests {
             )
             .unwrap();
             previous = page.hash().unwrap();
+            request_cursor = page.payload.next_cursor.clone();
             import.append_page(&json(&page).unwrap(), NOW).unwrap();
         }
         let witness = Signed::sign(
