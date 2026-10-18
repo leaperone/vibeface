@@ -8,6 +8,7 @@ pub use authenticator_management::{
 pub mod bootstrap;
 pub mod client_policy_import;
 pub mod gateway_forward;
+pub mod gateway_client;
 pub mod directory;
 pub mod enrollment;
 pub mod enrollment_policy_import;
