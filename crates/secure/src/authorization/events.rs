@@ -85,6 +85,9 @@ pub enum StoredTransport {
         device: super::DeviceId,
         gateway: super::DeviceId,
     },
+    DirectedGateway {
+        header: super::Signed<super::gateway_forward::GatewayForwardHeader>,
+    },
     VerifiedPeer {
         origin: super::DeviceId,
     },
@@ -117,18 +120,29 @@ impl From<&super::TransportEvidence> for StoredTransport {
 }
 
 impl StoredTransport {
-    pub fn into_evidence(self) -> super::TransportEvidence {
+    pub fn existing_evidence(&self) -> super::Result<super::TransportEvidence> {
         use super::TransportEvidence;
-        match self {
-            Self::DirectNoise { device } => TransportEvidence::DirectNoise { device },
-            Self::GatewayNoise { device, gateway } => {
-                TransportEvidence::GatewayNoise { device, gateway }
+        Ok(match self {
+            Self::DirectNoise { device } => TransportEvidence::DirectNoise {
+                device: device.clone(),
+            },
+            Self::GatewayNoise { device, gateway } => TransportEvidence::GatewayNoise {
+                device: device.clone(),
+                gateway: gateway.clone(),
+            },
+            Self::DirectedGateway { .. } => {
+                return Err(super::AuthorizationError::InvalidProof(
+                    "stored Gateway provenance cannot become live transport evidence",
+                ));
             }
-            Self::VerifiedPeer { origin } => TransportEvidence::VerifiedPeer { origin },
-            Self::LocalAgentAdapter { service, session } => {
-                TransportEvidence::LocalAgentAdapter { service, session }
-            }
-        }
+            Self::VerifiedPeer { origin } => TransportEvidence::VerifiedPeer {
+                origin: origin.clone(),
+            },
+            Self::LocalAgentAdapter { service, session } => TransportEvidence::LocalAgentAdapter {
+                service: service.clone(),
+                session: session.clone(),
+            },
+        })
     }
 }
 
