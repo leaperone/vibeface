@@ -1912,16 +1912,12 @@ mod tests {
         assert!(require_confirmed_client_policy(&next).is_err());
         let current = f.after(&result);
         let next_intent = encode(&current.intent(6, vec![])).unwrap();
-        assert!(
-            sign_device_enrollment_intent(&next_intent, &key(3), &next, NOW as f64)
-                .is_err()
-        );
+        assert!(sign_device_enrollment_intent(&next_intent, &key(3), &next, NOW as f64).is_err());
         let confirmed = current.authorization();
         assert_eq!(confirmed.heads, next.heads);
         assert!(require_confirmed_client_policy(&confirmed).is_ok());
         assert!(
-            sign_device_enrollment_intent(&next_intent, &key(3), &confirmed, NOW as f64)
-                .is_ok()
+            sign_device_enrollment_intent(&next_intent, &key(3), &confirmed, NOW as f64).is_ok()
         );
         assert_eq!(
             parse::<Vec<JournalEntry>>(&result.journal_delta_json().unwrap())

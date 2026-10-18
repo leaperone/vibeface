@@ -241,7 +241,7 @@ jobs:
           [[ "${#databases[@]}" == 1 ]]
           bash scripts/verify-schema.sh --database "${databases[0]}"
       - name: Verify bot tools and startup event recovery
-        if: matrix.target == 'aarch64-apple-darwin'
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-chat-agent --chat-agent
@@ -276,6 +276,8 @@ jobs:
             .artifacts/ci-chat-agent/chat-agent-process-*/A/process.log
             .artifacts/ci-chat-agent/chat-agent-process-*/B/process.log
             .artifacts/ci-chat-agent/chat-agent-process-*/C/process.log
+            .artifacts/process-fixture-image-*/base.log
+            .artifacts/process-fixture-image-*/fixture.log
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7

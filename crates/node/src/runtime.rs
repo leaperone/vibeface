@@ -2516,8 +2516,9 @@ pub(crate) mod tests {
                     let mut store = self.node.store.lock().await;
                     checked("manual C TaskBusiness source", || {
                         let business_wire = TaskBusinessWire::Submit(wire.clone());
-                        let (scoped, authorization) =
-                            store.current_task_business_submit(&self.project.node, wire, now)?;
+                        let (scoped, authorization) = store
+                            .current_task_business_submit(&self.project.node, wire, now)
+                            .context("manual C current Submit authorization")?;
                         let current = scoped
                             .task_policy()
                             .context("SDK fixture Submit has no genuine Task Current")?;
@@ -2544,21 +2545,24 @@ pub(crate) mod tests {
                                         TaskBusinessAuthorization::Submit(&authorization),
                                         &business_wire,
                                         now,
-                                    )?
+                                    )
+                                    .context("manual C source header authorization")?
                                     .header()
                                     .clone()
                             }
                         };
                         let receipts = if stage == CheckStage::Admit {
-                            store.task_business_challenge_receipts(
-                                &self.project.node,
-                                current,
-                                TaskBusinessAuthorization::Submit(&authorization),
-                                &business_wire,
-                                &header.hash()?,
-                                &TaskBusinessChallenge::Submit(challenge.clone()),
-                                now,
-                            )?
+                            store
+                                .task_business_challenge_receipts(
+                                    &self.project.node,
+                                    current,
+                                    TaskBusinessAuthorization::Submit(&authorization),
+                                    &business_wire,
+                                    &header.hash()?,
+                                    &TaskBusinessChallenge::Submit(challenge.clone()),
+                                    now,
+                                )
+                                .context("manual C Admit receipt authorization")?
                         } else {
                             Vec::new()
                         };
