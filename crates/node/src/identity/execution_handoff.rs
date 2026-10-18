@@ -5287,6 +5287,222 @@ pub(crate) mod tests {
         }
 
         fn verify_builder_and_isolate_executor(&mut self) -> Result<()> {
+            use vibeface_secure::authorization::{
+                client_policy_import::AuthorizationSelection,
+                prepare::{PrepareContext, PrepareIntent},
+                remote_execution_policy::{
+                    RemoteExecutionPolicyPurpose, RemoteExecutionPolicyReadIntent,
+                    build_remote_execution_policy_read_intent,
+                },
+            };
+            let original: Event =
+                serde_json::from_str(&self.wire.handoff.project_dispatch.canonical_body)?;
+            let original = capsule_admission(&original)?;
+            let operation: OperationRequest =
+                serde_json::from_value(original.source_body["request"].clone())?;
+            let mut context = original.invocation.payload.context.clone();
+            context.sdk_session = None;
+            let context = PrepareContext {
+                context,
+                binding_generation: Some(1),
+                canonical_cwd: Some(self.executor.project.to_string_lossy().into_owned()),
+                execution_target_public_key: Some(self.wire.handoff.target_public_key.clone()),
+            };
+            let source = super::super::client_policy_read::verified_client_policy_for_test(
+                &mut self.store,
+                &self.project.node,
+                &self.project.client,
+                &self.project.account,
+                AuthorizationSelection {
+                    resource: original.invocation.payload.resource.clone(),
+                    audience: original.invocation.payload.audience.clone(),
+                    grant_leaf: self.project.bundle.grant_leaf.clone(),
+                },
+                &self.project.pins,
+                now(),
+            )?;
+            let intent = build_remote_execution_policy_read_intent(
+                &source,
+                &json!({
+                    "work":self.wire.handoff.source_statement()?.work.intent(),
+                    "selection":{
+                        "execution_resource":self.wire.handoff.execution_resource,
+                        "target_public_key":self.wire.handoff.target_public_key,
+                        "execution_grant":original.source_body["execution_grant"],
+                    },
+                    "context":context,
+                    "expected_action":Action::ExecutionOpen,
+                    "purpose":RemoteExecutionPolicyPurpose::Execution,
+                    "execution_pins":self.executor.pins,
+                })
+                .to_string(),
+                &self.project.client,
+                now() as f64,
+                (now() + 60_000) as f64,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let intent: Signed<RemoteExecutionPolicyReadIntent> = serde_json::from_str(&intent)?;
+            let snapshot = self
+                .store
+                .policy
+                .accepted_journal_snapshot(&self.store.connection)?;
+            let domains = std::collections::BTreeSet::from([
+                PolicyDomain::Account(self.executor.account.clone()),
+                PolicyDomain::Space(self.executor.space.clone()),
+            ]);
+            let mut cursor = None;
+            let mut journal = vec![];
+            loop {
+                let page = self.store.policy.accepted_journal_page(
+                    &self.store.connection,
+                    &snapshot,
+                    cursor.as_ref(),
+                    &domains,
+                )?;
+                if let Some(entry) = page.entry {
+                    journal.push(entry.entry);
+                }
+                if page.complete {
+                    break;
+                }
+                cursor = Some(page.next_cursor);
+            }
+            let mut target = self.executor.memory()?;
+            target.install_policy_journal(&journal, now())?;
+            let remote = super::super::foreign_execution_policy::tests::import_current_policy_in(
+                &self.project,
+                &self.executor,
+                &mut self.store,
+                &mut target,
+                &source,
+                &intent,
+                None,
+            )?;
+            let bind = json!({
+                "method":"bind_execution","space_id":self.project.space,
+                "resource_id":self.project.resource,"authorization_id":"handoff-bind",
+                "binding_generation":1,"conversation_id":operation.conversation_id,
+                "task_id":operation.task_id,"task_ref":context.context.task,
+                "target_node":operation.target_node,"session_id":operation.session_id,
+                "executor":context.context.executor_kind,"cwd":self.executor.project,
+                "execution_resource":self.wire.handoff.execution_resource,
+                "target_public_key":self.wire.handoff.target_public_key,
+                "execution_grant":original.source_body["execution_grant"],
+            });
+            for binding in [true, false] {
+                let body = if binding {
+                    &bind
+                } else {
+                    &original.source_body
+                };
+                let invocation = if binding {
+                    let prepared = remote
+                        .prepare(
+                            &source,
+                            &body.to_string(),
+                            &serde_json::to_string(&context)?,
+                            "execution_open",
+                            "handoff-bind",
+                            &self.project.node.public_key_hex()?,
+                            &self.project.client,
+                            now() as f64,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                    let prepared: Signed<PrepareIntent> = serde_json::from_str(&prepared)?;
+                    let invocation = remote
+                        .sign(
+                            &source,
+                            &serde_json::to_string(&prepared.payload.request)?,
+                            &body.to_string(),
+                            "execution_open",
+                            "handoff-bind",
+                            &self.project.node.public_key_hex()?,
+                            &self.project.client,
+                            now() as f64,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                    serde_json::from_str(&invocation)?
+                } else {
+                    original.invocation.clone()
+                };
+                let value = &invocation.payload;
+                let facts = RequestFacts {
+                    resource: value.resource.clone(),
+                    action: value.action,
+                    audience: value.audience.clone(),
+                    operation_id: value.operation_id.clone(),
+                    body_hash: value.body_hash.clone(),
+                    context: value.context.clone(),
+                };
+                let transport = if binding {
+                    TransportEvidence::DirectNoise {
+                        device: DeviceId::from_key(&PublicKey::of(&self.project.client)),
+                    }
+                } else {
+                    original.transport.existing_evidence()?
+                };
+                let scoped = self.store.authorize_scoped_request_for_body(
+                    &self.project.node,
+                    &invocation,
+                    &facts,
+                    &transport,
+                    body,
+                    now(),
+                )?;
+                let dispatch = self.store.execution_dispatch_facts_in_scope(
+                    &scoped,
+                    body,
+                    scoped.audience(),
+                    now(),
+                )?;
+                let challenge =
+                    self.store
+                        .issue_scoped_freshness(&scoped, CheckStage::Admit, now())?;
+                let mut receipts =
+                    self.store
+                        .sign_current_receipts(&challenge, &self.project.node, now())?;
+                receipts.extend(target.sign_current_receipts(
+                    &challenge,
+                    &self.executor.node,
+                    now(),
+                )?);
+                let proof = super::super::policy::FreshnessProof {
+                    challenge,
+                    receipts,
+                };
+                if binding {
+                    let bound = self.store.bind_execution_dispatch(
+                        &self.project.node,
+                        &dispatch,
+                        &scoped,
+                        &proof,
+                        &transport,
+                        body,
+                        now(),
+                    )?;
+                    assert_eq!(Some(&bound), operation.binding.as_ref());
+                } else {
+                    self.store.accept_execution_dispatch(
+                        &self.project.node,
+                        &dispatch,
+                        &scoped,
+                        &proof,
+                        &transport,
+                        body,
+                        &operation,
+                        now(),
+                    )?;
+                }
+            }
+            self.wire = self
+                .store
+                .prepare_execution_dispatch_handoff(
+                    &self.project.node,
+                    self.project.space.as_str(),
+                    "original-operation",
+                    now(),
+                )?
+                .0;
             let outcome = self.store.ingest_event(
                 self.project.space.as_str(),
                 &self.wire.handoff.project_dispatch,
