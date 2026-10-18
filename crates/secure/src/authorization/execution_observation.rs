@@ -1159,7 +1159,18 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn retained_history_fixture() -> RetainedHistoryFixture {
-        let fixture = Fixture::new();
+        retained_history_fixture_from(Fixture::new())
+    }
+
+    pub(crate) fn retained_history_fixture_with_execution_source() -> RetainedHistoryFixture {
+        retained_history_fixture_from(Fixture::with_authorization_resources_and_execution_source(
+            "task",
+            &[],
+            true,
+        ))
+    }
+
+    fn retained_history_fixture_from(fixture: Fixture) -> RetainedHistoryFixture {
         let event: Event =
             serde_json::from_str(&fixture.original.handoff.project_dispatch.canonical_body)
                 .unwrap();
@@ -1509,6 +1520,14 @@ pub(crate) mod tests {
         }
 
         fn with_authorization_resources(task_title: &str, resources: &[String]) -> Self {
+            Self::with_authorization_resources_and_execution_source(task_title, resources, false)
+        }
+
+        fn with_authorization_resources_and_execution_source(
+            task_title: &str,
+            resources: &[String],
+            execution_source: bool,
+        ) -> Self {
             let mut project = Network::new(0);
             let mut executor = Network::new(20);
             let mut state = project.state.clone();
@@ -1581,7 +1600,19 @@ pub(crate) mod tests {
                 .push(JournalEntry::Resource(record.clone()));
             let pair = Signed::sign(
                 Grant {
-                    execution_source: None,
+                    execution_source: execution_source.then(|| ExecutionSourcePolicy {
+                        project: project.project.clone(),
+                        node_public_key: PublicKey::of(&project.node),
+                        pins: project
+                            .pins
+                            .iter()
+                            .cloned()
+                            .map(|mut pin| {
+                                pin.minimum_head = Some(state.head(&pin.domain).unwrap().clone());
+                                pin
+                            })
+                            .collect(),
+                    }),
                     version: AUTH_VERSION,
                     owner_space: execution_resource.space.clone(),
                     scope: ResourceScope::Exact(execution_resource.clone()),
