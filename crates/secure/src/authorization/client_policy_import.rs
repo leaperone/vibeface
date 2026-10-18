@@ -567,7 +567,7 @@ fn finish_usage(usage: &mut ExecutionProofUsage) -> Result<()> {
 fn verify_read_binding(
     independent: &[PolicyPin],
     request: &Signed<ClientPolicyReadRequest>,
-    own: &Identity,
+    client: &PublicKey,
     node: &PublicKey,
     now: u64,
 ) -> Result<()> {
@@ -581,8 +581,8 @@ fn verify_read_binding(
     require(
         request.payload.version == AUTH_VERSION
             && request.payload.saved_pins == independent
-            && request.issuer == PublicKey::of(own)
-            && request.payload.device_public_key == PublicKey::of(own)
+            && request.issuer == *client
+            && request.payload.device_public_key == *client
             && request.payload.node_public_key == *node,
         "client policy request changed its independent trust, client or Noise node",
     )
@@ -646,7 +646,7 @@ pub fn verify_client_policy_selections(
         verify_read_binding(
             &parse::<Vec<PolicyPin>>(independent_pins_json)?,
             &request,
-            own,
+            &PublicKey::of(own),
             &node,
             now,
         )?;
@@ -703,75 +703,88 @@ pub fn begin_client_policy_import(
 ) -> crate::Result<ClientPolicyImport> {
     let _signature_scope = ScopedSignatureVerification::new();
     let begin = || -> Result<_> {
-        let independent: Vec<PolicyPin> = parse(independent_pins_json)?;
-        let request: Signed<ClientPolicyReadRequest> = parse(request_json)?;
-        let snapshot: Signed<ClientPolicySnapshot> = parse(snapshot_json)?;
-        require(
-            canonical(&(&request, &snapshot))?.len() <= MAX_PROOF_BYTES,
-            "client policy begin carrier exceeds byte limit",
-        )?;
-        let node = PublicKey::parse(noise_node_public_key)?;
-        let now = bootstrap::timestamp(now_ms)?;
-        verify_read_binding(&independent, &request, own, &node, now)?;
-        snapshot.verify_signature()?;
-        window(
-            snapshot.payload.issued_at_ms,
-            snapshot.payload.expires_at_ms,
-            now,
-        )?;
-        let header = &snapshot.payload;
-        require(
-            snapshot.issuer == node
-                && header.source_node_public_key == node
-                && header.version == AUTH_VERSION
-                && header.request_hash == request.hash()?
-                && header.saved_pins_hash == client_policy_saved_pins_hash(&independent)?
-                && request.payload.selection.as_ref() == Some(&header.selection)
-                && header.selection.resource.space == request.payload.space
-                && header.expires_at_ms <= request.payload.expires_at_ms
-                && !header.target_heads.is_empty()
-                && header
-                    .target_heads
-                    .windows(2)
-                    .all(|pair| pair[0].domain < pair[1].domain),
-            "client policy snapshot changed its exact request, selection or Noise source",
-        )?;
-        let pins: Vec<_> = independent
-            .into_iter()
-            .filter(|pin| {
-                header
-                    .target_heads
-                    .iter()
-                    .any(|head| head.domain == pin.domain)
-            })
-            .collect();
-        require(
-            pins.len() == header.target_heads.len(),
-            "client policy snapshot introduced an untrusted domain",
-        )?;
-        let required = pins
-            .iter()
-            .filter_map(|pin| pin.minimum_head.clone())
-            .collect();
-        let import = BoundedPolicyImport::new(pins, required)?;
-        let mut usage = ExecutionProofUsage::default();
-        usage.record_signed(&request)?;
-        usage.record_signed(&snapshot)?;
-        finish_usage(&mut usage)?;
-        Ok(ClientPolicyImport {
-            request,
-            previous_page_hash: snapshot.hash()?,
-            snapshot,
-            import,
-            page_count: 0,
-            entry_count: 0,
-            next_cursor: None,
-            last_page: None,
-            complete: false,
-            usage,
-        })
+        begin_client_policy_transcript(
+            parse(independent_pins_json)?,
+            parse(request_json)?,
+            parse(snapshot_json)?,
+            &PublicKey::of(own),
+            PublicKey::parse(noise_node_public_key)?,
+            bootstrap::timestamp(now_ms)?,
+        )
     };
     begin().map_err(|error| error.to_string())
+}
+
+pub(super) fn begin_client_policy_transcript(
+    independent: Vec<PolicyPin>,
+    request: Signed<ClientPolicyReadRequest>,
+    snapshot: Signed<ClientPolicySnapshot>,
+    client: &PublicKey,
+    node: PublicKey,
+    now: u64,
+) -> Result<ClientPolicyImport> {
+    require(
+        canonical(&(&request, &snapshot))?.len() <= MAX_PROOF_BYTES,
+        "client policy begin carrier exceeds byte limit",
+    )?;
+    verify_read_binding(&independent, &request, client, &node, now)?;
+    snapshot.verify_signature()?;
+    window(
+        snapshot.payload.issued_at_ms,
+        snapshot.payload.expires_at_ms,
+        now,
+    )?;
+    let header = &snapshot.payload;
+    require(
+        snapshot.issuer == node
+            && header.source_node_public_key == node
+            && header.version == AUTH_VERSION
+            && header.request_hash == request.hash()?
+            && header.saved_pins_hash == client_policy_saved_pins_hash(&independent)?
+            && request.payload.selection.as_ref() == Some(&header.selection)
+            && header.selection.resource.space == request.payload.space
+            && header.expires_at_ms <= request.payload.expires_at_ms
+            && !header.target_heads.is_empty()
+            && header
+                .target_heads
+                .windows(2)
+                .all(|pair| pair[0].domain < pair[1].domain),
+        "client policy snapshot changed its exact request, selection or Noise source",
+    )?;
+    let pins: Vec<_> = independent
+        .into_iter()
+        .filter(|pin| {
+            header
+                .target_heads
+                .iter()
+                .any(|head| head.domain == pin.domain)
+        })
+        .collect();
+    require(
+        pins.len() == header.target_heads.len(),
+        "client policy snapshot introduced an untrusted domain",
+    )?;
+    let required = pins
+        .iter()
+        .filter_map(|pin| pin.minimum_head.clone())
+        .collect();
+    let import = BoundedPolicyImport::new(pins, required)?;
+    let mut usage = ExecutionProofUsage::default();
+    usage.record_signed(&request)?;
+    usage.record_signed(&snapshot)?;
+    finish_usage(&mut usage)?;
+    Ok(ClientPolicyImport {
+        request,
+        previous_page_hash: snapshot.hash()?,
+        snapshot,
+        import,
+        page_count: 0,
+        entry_count: 0,
+        next_cursor: None,
+        last_page: None,
+        complete: false,
+        usage,
+    })
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
@@ -793,63 +806,13 @@ impl ClientPolicyImport {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = appendPage))]
     pub fn append_page(&mut self, page_json: &str, now_ms: f64) -> crate::Result<()> {
         let _signature_scope = ScopedSignatureVerification::new();
-        let mut append = || -> Result<()> {
-            let now = bootstrap::timestamp(now_ms)?;
-            window(
-                self.snapshot.payload.issued_at_ms,
-                self.snapshot.payload.expires_at_ms,
-                now,
-            )?;
-            let page: Signed<ClientPolicyPage> = parse(page_json)?;
-            page.verify_signature()?;
-            require(
-                page.issuer == self.snapshot.issuer
-                    && page.payload.version == AUTH_VERSION
-                    && page.payload.request_hash == self.request.hash()?
-                    && page.payload.snapshot_id == self.snapshot.payload.snapshot_id
-                    && page.payload.target_heads_hash
-                        == client_policy_target_heads_hash(&self.snapshot.payload.target_heads)?,
-                "client policy page changed source or snapshot",
-            )?;
-            if self.last_page.as_ref() == Some(&page) {
-                let mut usage = ExecutionProofUsage::default();
-                usage.record_signed(&page)?;
-                finish_usage(&mut usage)?;
-                self.usage = usage;
-                return Ok(());
-            }
-            require(
-                !self.complete
-                    && page.payload.page_index == self.page_count
-                    && page.payload.request_cursor == self.next_cursor
-                    && page.payload.previous_page_hash == self.previous_page_hash
-                    && page.payload.complete == page.payload.next_cursor.is_none(),
-                "client policy page is missing, duplicated or out of order",
-            )?;
-            let mut usage = ExecutionProofUsage::default();
-            usage.record_signed(&page)?;
-            if let Some(entry) = &page.payload.entry {
-                usage.merge(&policy_proof::policy_entry_usage(
-                    self.import.state(),
-                    entry,
-                )?);
-            }
-            usage.enforce_limits()?;
-            if let Some(entry) = &page.payload.entry {
-                self.import.apply_entry(entry.clone())?;
-            }
-            finish_usage(&mut usage)?;
-            self.previous_page_hash = page.hash()?;
-            self.next_cursor = page.payload.next_cursor.clone();
-            self.page_count += 1;
-            self.entry_count += u64::from(page.payload.entry.is_some());
-            self.complete = page.payload.complete;
-            self.last_page = Some(page);
-            self.usage = usage;
-            Ok(())
-        };
-        append().map_err(|error| error.to_string())
+        self.append_transcript_page(
+            parse(page_json).map_err(|error| error.to_string())?,
+            bootstrap::timestamp(now_ms).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())
     }
+
     pub fn finish(
         self,
         witness_json: &str,
@@ -857,70 +820,137 @@ impl ClientPolicyImport {
         now_ms: f64,
     ) -> crate::Result<VerifiedClientAuthorization> {
         let _signature_scope = ScopedSignatureVerification::new();
-        let finish = || -> Result<_> {
-            let now = bootstrap::timestamp(now_ms)?;
-            let witness: Signed<ClientPolicyWitness> = parse(witness_json)?;
-            let selection: AuthorizationSelection = parse(selection_json)?;
-            witness.verify_signature()?;
-            window(
-                witness.payload.issued_at_ms,
-                witness.payload.expires_at_ms,
-                now,
-            )?;
-            require(
-                self.complete
-                    && witness.issuer == self.snapshot.issuer
-                    && witness.payload.version == AUTH_VERSION
-                    && witness.payload.source_node_public_key == self.snapshot.issuer
-                    && witness.payload.request_hash == self.request.hash()?
-                    && witness.payload.snapshot_id == self.snapshot.payload.snapshot_id
-                    && witness.payload.snapshot_hash == self.snapshot.hash()?
-                    && witness.payload.target_heads == self.snapshot.payload.target_heads
-                    && witness.payload.final_page_hash == self.previous_page_hash
-                    && witness.payload.page_count == self.page_count
-                    && witness.payload.entry_count == self.entry_count
-                    && witness.payload.expires_at_ms <= self.snapshot.payload.expires_at_ms
-                    && selection == self.snapshot.payload.selection,
-                "client policy witness changed its completed stream or selection",
-            )?;
-            let snapshot = self.import.finish(&self.snapshot.payload.target_heads)?;
-            let (state, pins, journal) = snapshot.clone().into_parts();
-            let bundle = ClientAuthorizationBundle {
-                journal,
-                grant_leaf: selection.grant_leaf.clone(),
-            };
-            let mut auth = verify_client_policy_state_selected(
-                state,
-                &bundle,
-                &pins,
-                self.request.payload.account.clone(),
-                self.request.payload.space.clone(),
-                self.request.issuer.clone(),
-                Some(&selection.resource),
-                now,
-            )?;
-            bind_client_policy_source_node(&mut auth, &self.snapshot.issuer, now)?;
-            require(
-                auth.heads == self.snapshot.payload.target_heads
-                    && auth.audience == selection.audience,
-                "client policy imported authorization differs from the exact snapshot",
-            )?;
+        self.finish_transcript(
+            parse(witness_json).map_err(|error| error.to_string())?,
+            parse(selection_json).map_err(|error| error.to_string())?,
+            bootstrap::timestamp(now_ms).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
+impl ClientPolicyImport {
+    pub(super) fn append_transcript_page(
+        &mut self,
+        page: Signed<ClientPolicyPage>,
+        now: u64,
+    ) -> Result<()> {
+        window(
+            self.snapshot.payload.issued_at_ms,
+            self.snapshot.payload.expires_at_ms,
+            now,
+        )?;
+        page.verify_signature()?;
+        require(
+            page.issuer == self.snapshot.issuer
+                && page.payload.version == AUTH_VERSION
+                && page.payload.request_hash == self.request.hash()?
+                && page.payload.snapshot_id == self.snapshot.payload.snapshot_id
+                && page.payload.target_heads_hash
+                    == client_policy_target_heads_hash(&self.snapshot.payload.target_heads)?,
+            "client policy page changed source or snapshot",
+        )?;
+        if self.last_page.as_ref() == Some(&page) {
             let mut usage = ExecutionProofUsage::default();
-            usage.record_signed(&witness)?;
-            usage.record_budget(&auth.budget)?;
-            usage.record_chain_depth(snapshot.state().grant_chain(Some(&auth.grant_leaf))?.len());
+            usage.record_signed(&page)?;
             finish_usage(&mut usage)?;
-            auth.imported_snapshot = Some(snapshot);
-            auth.client_policy_context = Some(ClientPolicyProvenance {
-                request: self.request,
-                snapshot: self.snapshot,
-                witness,
-                confirmation: None,
-            });
-            auth.client_policy_usage = Some(usage);
-            Ok(auth)
+            self.usage = usage;
+            return Ok(());
+        }
+        require(
+            !self.complete
+                && page.payload.page_index == self.page_count
+                && page.payload.request_cursor == self.next_cursor
+                && page.payload.previous_page_hash == self.previous_page_hash
+                && page.payload.complete == page.payload.next_cursor.is_none(),
+            "client policy page is missing, duplicated or out of order",
+        )?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_signed(&page)?;
+        if let Some(entry) = &page.payload.entry {
+            usage.merge(&policy_proof::policy_entry_usage(
+                self.import.state(),
+                entry,
+            )?);
+        }
+        usage.enforce_limits()?;
+        if let Some(entry) = &page.payload.entry {
+            self.import.apply_entry(entry.clone())?;
+        }
+        finish_usage(&mut usage)?;
+        self.previous_page_hash = page.hash()?;
+        self.next_cursor = page.payload.next_cursor.clone();
+        self.page_count += 1;
+        self.entry_count += u64::from(page.payload.entry.is_some());
+        self.complete = page.payload.complete;
+        self.last_page = Some(page);
+        self.usage = usage;
+        Ok(())
+    }
+
+    pub(super) fn finish_transcript(
+        self,
+        witness: Signed<ClientPolicyWitness>,
+        selection: AuthorizationSelection,
+        now: u64,
+    ) -> Result<VerifiedClientAuthorization> {
+        witness.verify_signature()?;
+        window(
+            witness.payload.issued_at_ms,
+            witness.payload.expires_at_ms,
+            now,
+        )?;
+        require(
+            self.complete
+                && witness.issuer == self.snapshot.issuer
+                && witness.payload.version == AUTH_VERSION
+                && witness.payload.source_node_public_key == self.snapshot.issuer
+                && witness.payload.request_hash == self.request.hash()?
+                && witness.payload.snapshot_id == self.snapshot.payload.snapshot_id
+                && witness.payload.snapshot_hash == self.snapshot.hash()?
+                && witness.payload.target_heads == self.snapshot.payload.target_heads
+                && witness.payload.final_page_hash == self.previous_page_hash
+                && witness.payload.page_count == self.page_count
+                && witness.payload.entry_count == self.entry_count
+                && witness.payload.expires_at_ms <= self.snapshot.payload.expires_at_ms
+                && selection == self.snapshot.payload.selection,
+            "client policy witness changed its completed stream or selection",
+        )?;
+        let snapshot = self.import.finish(&self.snapshot.payload.target_heads)?;
+        let (state, pins, journal) = snapshot.clone().into_parts();
+        let bundle = ClientAuthorizationBundle {
+            journal,
+            grant_leaf: selection.grant_leaf.clone(),
         };
-        finish().map_err(|error| error.to_string())
+        let mut auth = verify_client_policy_state_selected(
+            state,
+            &bundle,
+            &pins,
+            self.request.payload.account.clone(),
+            self.request.payload.space.clone(),
+            self.request.issuer.clone(),
+            Some(&selection.resource),
+            now,
+        )?;
+        bind_client_policy_source_node(&mut auth, &self.snapshot.issuer, now)?;
+        require(
+            auth.heads == self.snapshot.payload.target_heads && auth.audience == selection.audience,
+            "client policy imported authorization differs from the exact snapshot",
+        )?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_signed(&witness)?;
+        usage.record_budget(&auth.budget)?;
+        usage.record_chain_depth(snapshot.state().grant_chain(Some(&auth.grant_leaf))?.len());
+        finish_usage(&mut usage)?;
+        auth.imported_snapshot = Some(snapshot);
+        auth.client_policy_context = Some(ClientPolicyProvenance {
+            request: self.request,
+            snapshot: self.snapshot,
+            witness,
+            confirmation: None,
+        });
+        auth.client_policy_usage = Some(usage);
+        Ok(auth)
     }
 }
 
@@ -1008,71 +1038,86 @@ pub fn confirm_client_policy_authorization(
     now_ms: f64,
 ) -> crate::Result<VerifiedClientAuthorization> {
     let _signature_scope = ScopedSignatureVerification::new();
-    let confirm =
-        || -> Result<_> {
-            let provenance = authorization.client_policy_context.as_ref().ok_or(
-                AuthorizationError::InvalidProof(
-                    "client policy confirmation requires completed bounded import",
-                ),
-            )?;
-            let snapshot = authorization.imported_snapshot.as_ref().ok_or(
-                AuthorizationError::InvalidProof(
-                    "client policy confirmation requires a genuine imported snapshot",
-                ),
-            )?;
-            let request: Signed<ClientPolicyAuthConfirmRequest> = parse(confirmation_request_json)?;
-            let confirmation: Signed<ClientPolicyAuthConfirmation> = parse(confirmation_json)?;
-            let now = bootstrap::timestamp(now_ms)?;
-            let node = PublicKey::parse(noise_node_public_key)?;
-            verify_client_policy_auth_confirm(
-                snapshot.state(),
-                &provenance.request,
-                &provenance.snapshot,
-                &provenance.witness,
-                &request,
-                &node,
-                &provenance.request.issuer,
-                now,
-            )?;
-            confirmation.verify_signature()?;
-            let receipt = &confirmation.payload;
-            require(
-                confirmation.issuer == node
-                    && node == provenance.request.payload.node_public_key
-                    && receipt.version == AUTH_VERSION
-                    && receipt.source_node_public_key == node
-                    && receipt.context == provenance_reference(provenance)?
-                    && receipt.confirmation_request_hash == request.hash()?
-                    && receipt.selection == provenance.snapshot.payload.selection
-                    && receipt.target_heads == authorization.heads
-                    && receipt.device_public_key == provenance.request.issuer
-                    && request.payload.issued_at_ms <= receipt.accepted_at_ms
-                    && receipt.accepted_at_ms < request.payload.expires_at_ms
-                    && receipt.accepted_at_ms <= now,
-                "client policy confirmation belongs to another source, snapshot or device",
-            )?;
-            let current = verify_client_policy_read(
-                snapshot.state(),
-                &provenance.request,
-                &node,
-                &provenance.request.issuer,
-                receipt.accepted_at_ms,
-            )?;
-            let mut usage = current.proof_usage().clone();
-            usage.record_signed(&provenance.snapshot)?;
-            usage.record_signed(&provenance.witness)?;
-            usage.record_signed(&request)?;
-            usage.record_signed(&confirmation)?;
-            finish_usage(&mut usage)?;
-            let mut auth = authorization.clone();
-            auth.client_policy_context
-                .as_mut()
-                .ok_or(AuthorizationError::PolicyConflict)?
-                .confirmation = Some(confirmation);
-            auth.client_policy_usage = Some(usage);
-            Ok(auth)
-        };
+    let confirm = || -> Result<_> {
+        confirm_client_policy_transcript(
+            authorization,
+            parse(confirmation_request_json)?,
+            parse(confirmation_json)?,
+            PublicKey::parse(noise_node_public_key)?,
+            bootstrap::timestamp(now_ms)?,
+        )
+    };
     confirm().map_err(|error| error.to_string())
+}
+
+pub(super) fn confirm_client_policy_transcript(
+    authorization: &VerifiedClientAuthorization,
+    request: Signed<ClientPolicyAuthConfirmRequest>,
+    confirmation: Signed<ClientPolicyAuthConfirmation>,
+    node: PublicKey,
+    now: u64,
+) -> Result<VerifiedClientAuthorization> {
+    let provenance =
+        authorization
+            .client_policy_context
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "client policy confirmation requires completed bounded import",
+            ))?;
+    let snapshot =
+        authorization
+            .imported_snapshot
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "client policy confirmation requires a genuine imported snapshot",
+            ))?;
+    verify_client_policy_auth_confirm(
+        snapshot.state(),
+        &provenance.request,
+        &provenance.snapshot,
+        &provenance.witness,
+        &request,
+        &node,
+        &provenance.request.issuer,
+        now,
+    )?;
+    confirmation.verify_signature()?;
+    let receipt = &confirmation.payload;
+    require(
+        confirmation.issuer == node
+            && node == provenance.request.payload.node_public_key
+            && receipt.version == AUTH_VERSION
+            && receipt.source_node_public_key == node
+            && receipt.context == provenance_reference(provenance)?
+            && receipt.confirmation_request_hash == request.hash()?
+            && receipt.selection == provenance.snapshot.payload.selection
+            && receipt.target_heads == authorization.heads
+            && receipt.device_public_key == provenance.request.issuer
+            && request.payload.issued_at_ms <= receipt.accepted_at_ms
+            && receipt.accepted_at_ms < request.payload.expires_at_ms
+            && receipt.accepted_at_ms <= now,
+        "client policy confirmation belongs to another source, snapshot or device",
+    )?;
+    let current = verify_client_policy_read(
+        snapshot.state(),
+        &provenance.request,
+        &node,
+        &provenance.request.issuer,
+        receipt.accepted_at_ms,
+    )?;
+    let mut usage = current.proof_usage().clone();
+    usage.record_signed(&provenance.snapshot)?;
+    usage.record_signed(&provenance.witness)?;
+    usage.record_signed(&request)?;
+    usage.record_signed(&confirmation)?;
+    finish_usage(&mut usage)?;
+    let mut auth = authorization.clone();
+    auth.client_policy_context
+        .as_mut()
+        .ok_or(AuthorizationError::PolicyConflict)?
+        .confirmation = Some(confirmation);
+    auth.client_policy_usage = Some(usage);
+    Ok(auth)
 }
 
 pub(crate) fn require_confirmed_client_policy(

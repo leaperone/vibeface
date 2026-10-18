@@ -7,6 +7,7 @@ pub use authenticator_management::{
 };
 pub mod bootstrap;
 pub mod client_policy_import;
+pub mod gateway_forward;
 pub mod directory;
 pub mod enrollment;
 pub mod enrollment_policy_import;
@@ -2694,6 +2695,15 @@ impl VerifiedPolicySet {
         device: &DeviceId,
         now_ms: u64,
     ) -> Result<&Signed<DeviceCertificate>> {
+        self.verify_service_device_with_budget(space, device, now_ms)
+            .map(|(certificate, _)| certificate)
+    }
+    pub(super) fn verify_service_device_with_budget(
+        &self,
+        space: &SpaceId,
+        device: &DeviceId,
+        now_ms: u64,
+    ) -> Result<(&Signed<DeviceCertificate>, Budget)> {
         let document = self
             .space(space)
             .ok_or(AuthorizationError::InvalidProof("missing service space"))?;
@@ -2716,7 +2726,7 @@ impl VerifiedPolicySet {
             &mut BTreeSet::new(),
         )?;
         self.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
-        Ok(certificate)
+        Ok((certificate, budget))
     }
     fn validate_service_reference(
         &self,
@@ -6493,6 +6503,28 @@ fn sign_client_invocation_inner(
         .map_err(|_| AuthorizationError::InvalidProof("unknown expected action"))?;
     let request: serde_json::Value = serde_json::from_str(body)
         .map_err(|_| AuthorizationError::InvalidProof("invalid request JSON"))?;
+    validate_client_invocation_fields(
+        auth, &invocation, &request, action, operation, &PublicKey::of(key), presenter, now as u64,
+    )?;
+    require(
+        invocation.expected_policies == auth.heads,
+        "invocation template changed exact client policy heads",
+    )?;
+    invocation.nonce = Nonce::random()?;
+    serde_json::to_string(&Signed::sign(invocation, key)?)
+        .map_err(|_| AuthorizationError::InvalidProof("client invocation encoding failed"))
+}
+
+pub(super) fn validate_client_invocation_fields(
+    auth: &VerifiedClientAuthorization,
+    invocation: &Invocation,
+    request: &serde_json::Value,
+    action: Action,
+    operation: &str,
+    key: &PublicKey,
+    presenter: &DeviceId,
+    now: u64,
+) -> Result<()> {
     let actor = Actor::Account(auth.scope.account_id.clone());
     require(
         invocation.version == AUTH_VERSION
@@ -6500,10 +6532,9 @@ fn sign_client_invocation_inner(
             && invocation.initiator == actor
             && invocation.initiating_grant.is_none()
             && invocation.device == auth.scope.device_id
-            && invocation.device == DeviceId::from_key(&PublicKey::of(key))
+            && invocation.device == DeviceId::from_key(key)
             && invocation.presenter == *presenter
             && invocation.grant_leaf == auth.grant_leaf
-            && invocation.expected_policies == auth.heads
             && invocation.audience == auth.audience
             && invocation.resource.space == auth.scope.space_id
             && scope_covers(&auth.grant_scope, &invocation.resource)
@@ -6511,7 +6542,7 @@ fn sign_client_invocation_inner(
             && auth.actions.contains(&action)
             && invocation.operation_id == operation
             && valid_operation_id(operation)
-            && invocation.body_hash == ObjectHash::body(&request)?
+            && invocation.body_hash == ObjectHash::body(request)?
             && context_tighter(&auth.constraints.context, &invocation.context),
         "invocation template does not match client request",
     )?;
@@ -6521,15 +6552,13 @@ fn sign_client_invocation_inner(
     validate_window(
         invocation.not_before_ms,
         invocation.expires_at_ms,
-        now as u64,
+        now,
     )?;
     require(
         invocation.expires_at_ms - invocation.not_before_ms <= INVOCATION_MAX_AGE_MS,
         "invocation lifetime too long",
     )?;
-    invocation.nonce = Nonce::random()?;
-    serde_json::to_string(&Signed::sign(invocation, key)?)
-        .map_err(|_| AuthorizationError::InvalidProof("client invocation encoding failed"))
+    Ok(())
 }
 
 impl VerifiedClientAuthorization {
