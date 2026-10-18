@@ -782,6 +782,336 @@ mod tests {
     }
 
     #[test]
+    fn sdk_node_import_preserves_real_child_facts_and_verifies_the_signed_body() {
+        use node_execution_policy::*;
+        use remote_execution_policy::{
+            RemoteExecutionPolicyPage, RemoteExecutionPolicyPurpose, RemoteExecutionPolicySnapshot,
+            RemoteExecutionPolicyWitness,
+        };
+        let fixture = Fixture::new();
+        let mut remote = Fixture::with_keys(20, NOW + 1_000);
+        let target = PublicKey::of(&remote.node);
+        let resource = ResourceRef {
+            space: remote.space.clone(),
+            resource: ResourceId::from_bytes([91; 32]),
+        };
+        let issued_under = remote
+            .state
+            .head(&PolicyDomain::Space(remote.space.clone()))
+            .unwrap()
+            .clone();
+        let record = Signed::sign(
+            ResourceRecord {
+                version: AUTH_VERSION,
+                space: remote.space.clone(),
+                resource: resource.resource.clone(),
+                kind: ResourceKind::ExecutionService,
+                host: remote.audience().service,
+                issued_under: issued_under.clone(),
+                nonce: Nonce::random().unwrap(),
+            },
+            &remote.root,
+        )
+        .unwrap();
+        remote.state.install_resource(record.clone()).unwrap();
+        let execution_context = InvocationContext {
+            conversation: Some("chat".into()),
+            task: Some(EventRef::parse(&"aa".repeat(32)).unwrap()),
+            execution_session: Some(SessionRef {
+                target: DeviceId::from_key(&target),
+                session_id: "foreign-execution".into(),
+            }),
+            executor_kind: Some("codex".into()),
+            workspace_resource: Some(resource.resource.clone()),
+            ..Default::default()
+        };
+        let grant = Signed::sign(
+            Grant {
+                version: AUTH_VERSION,
+                owner_space: remote.space.clone(),
+                scope: ResourceScope::Exact(resource.clone()),
+                grantee: Grantee::Actor(Actor::Service(fixture.audience().service)),
+                actions: vec![Action::ExecutionOpen, Action::ExecutionSubmit],
+                audience: remote.audience(),
+                constraints: GrantConstraints {
+                    context: execution_context,
+                    ..Default::default()
+                },
+                execution_source: None,
+                parent: None,
+                remaining_delegations: 0,
+                issued_under,
+                not_before_ms: NOW,
+                expires_at_ms: NOW + 300,
+                nonce: Nonce::random().unwrap(),
+            },
+            &remote.root,
+        )
+        .unwrap();
+        let leaf = remote.state.install_grant(grant.clone(), NOW).unwrap();
+        remote.journal.extend([
+            JournalEntry::Resource(record.clone()),
+            JournalEntry::Grant(grant),
+        ]);
+        remote.update_space(|document| {
+            document.resources.push(record.hash().unwrap());
+            document.grants.push(leaf.clone());
+        });
+        remote.journal.push(JournalEntry::Space(
+            remote
+                .state
+                .space_history(&remote.space)
+                .unwrap()
+                .last()
+                .unwrap()
+                .clone(),
+        ));
+        remote.resource = resource;
+        remote.service_grant = leaf;
+        let (trust, selection, context, mut facts) = fixture.task_policy_source(&remote);
+        let binding = task_binding::TaskBinding {
+            network_id: fixture.space.to_string(),
+            conversation_id: "chat".into(),
+            task_ref: "aa".repeat(32),
+            task_id: "task".into(),
+            authority_node: fixture.node.node_id(),
+            generation: 1,
+            target_node: remote.node.node_id(),
+            session_id: "foreign-execution".into(),
+            open_spec: serde_json::json!({"type":"open","executor":"codex","cwd":"/workspace"}),
+            previous_binding_hash: None,
+            previous_seal: None,
+        };
+        let binding = task_binding::SignedBinding {
+            signature: fixture
+                .node
+                .sign(
+                    task_binding::BINDING_DOMAIN,
+                    &serde_json::to_vec(&binding).unwrap(),
+                )
+                .unwrap(),
+            binding,
+        };
+        let body = serde_json::json!({"method":"operate","space_id":fixture.space,
+            "resource_id":fixture.resource.resource,"authorization_id":facts.operation_id,
+            "execution_resource":selection.execution_resource,"target_public_key":selection.target_public_key,
+            "execution_grant":selection.execution_grant,"request":{"space_id":fixture.space,
+                "conversation_id":"chat","operation_id":facts.operation_id,"task_id":"task",
+                "target_node":remote.node.node_id(),"session_id":"foreign-execution","binding":binding,
+                "action":{"type":"open"},"resources":[]}});
+        facts.body_hash = ObjectHash::body(&body).unwrap();
+        let parent = fixture.parent(&fixture.owner_grant, NOW);
+        let (source, request) = verify_node_service_policy_source(
+            &fixture.state,
+            &fixture.pins,
+            &trust,
+            &parent,
+            &fixture.audience().service,
+            &fixture.service_grant,
+            &facts,
+            &selection,
+            &context,
+            None,
+            NOW + 250,
+            &fixture.node,
+            RemoteExecutionPolicyPurpose::Execution,
+            NOW,
+            NOW + 200,
+        )
+        .unwrap();
+        let checked = verify_node_execution_policy_read(
+            &remote.state,
+            &request,
+            &target,
+            &PublicKey::of(&fixture.node),
+            None,
+            NOW,
+        )
+        .unwrap();
+        let header = Signed::sign(
+            RemoteExecutionPolicySnapshot {
+                version: AUTH_VERSION,
+                request_hash: ObjectHash::body(&request).unwrap(),
+                snapshot_id: Nonce::random().unwrap(),
+                saved_pins_hash: ObjectHash::body(&remote.pins).unwrap(),
+                target_heads: checked.target_heads().to_vec(),
+                source_node_public_key: target,
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + 200,
+                history: None,
+            },
+            &remote.node,
+        )
+        .unwrap();
+        let mut initiator = crate::Handshake::new(
+            true,
+            &fixture.node.secret_hex(),
+            Some(remote.node.node_id()),
+            b"sdk-policy-test",
+        )
+        .unwrap();
+        let mut responder = crate::Handshake::new(
+            false,
+            &remote.node.secret_hex(),
+            Some(fixture.node.node_id()),
+            b"sdk-policy-test",
+        )
+        .unwrap();
+        responder.read(&initiator.write(&[]).unwrap()).unwrap();
+        initiator.read(&responder.write(&[]).unwrap()).unwrap();
+        responder.read(&initiator.write(&[]).unwrap()).unwrap();
+        let peer = ActualPolicyNoisePeer::from_finished_handshake(&initiator).unwrap();
+        let mut import =
+            begin_node_task_policy_import(&trust, &source, &request, &header, &[], &peer, NOW)
+                .unwrap();
+        let entries: Vec<_> = remote
+            .journal
+            .iter()
+            .filter(|entry| checked.allows_entry(entry).unwrap())
+            .cloned()
+            .collect();
+        let mut previous = header.hash().unwrap();
+        for (index, entry) in entries.iter().enumerate() {
+            let page_request = import.page_request();
+            let next_cursor =
+                (index + 1 < entries.len()).then(|| policy_import::entry_hash(entry).unwrap());
+            let page = Signed::sign(
+                RemoteExecutionPolicyPage {
+                    version: AUTH_VERSION,
+                    request_hash: header.payload.request_hash.clone(),
+                    snapshot_id: header.payload.snapshot_id.clone(),
+                    target_heads_hash: ObjectHash::body(&header.payload.target_heads).unwrap(),
+                    page_index: index as u64,
+                    request_cursor: page_request.cursor,
+                    previous_page_hash: previous,
+                    entry: Some(entry.clone()),
+                    complete: next_cursor.is_none(),
+                    next_cursor,
+                },
+                &remote.node,
+            )
+            .unwrap();
+            import.append_page(&page, NOW).unwrap();
+            previous = page.hash().unwrap();
+        }
+        let witness = Signed::sign(
+            RemoteExecutionPolicyWitness {
+                version: AUTH_VERSION,
+                request_hash: header.payload.request_hash.clone(),
+                snapshot_id: header.payload.snapshot_id.clone(),
+                target_heads: header.payload.target_heads.clone(),
+                final_page_hash: previous,
+                page_count: entries.len() as u64,
+                entry_count: entries.len() as u64,
+                snapshot_hash: header.hash().unwrap(),
+                source_node_public_key: PublicKey::of(&remote.node),
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + 200,
+            },
+            &remote.node,
+        )
+        .unwrap();
+        let policy = import.finish_current(&witness, NOW).unwrap();
+        policy
+            .check_scope(&facts, &selection, &context, NOW)
+            .unwrap();
+        let delegated = policy
+            .state()
+            .verify_service_delegation(
+                &parent,
+                &fixture.audience().service,
+                &fixture.service_grant,
+                &facts,
+                NOW,
+            )
+            .unwrap();
+        let invocation = Signed::sign(
+            Invocation {
+                version: AUTH_VERSION,
+                actor: Actor::Service(delegated.service().clone()),
+                device: delegated.device().clone(),
+                initiator: delegated.initiator().clone(),
+                initiating_grant: delegated.initiating_grant().cloned(),
+                resource: facts.resource.clone(),
+                action: facts.action,
+                audience: facts.audience.clone(),
+                presenter: delegated.device().clone(),
+                operation_id: facts.operation_id.clone(),
+                body_hash: facts.body_hash.clone(),
+                grant_leaf: delegated.grant_leaf().clone(),
+                expected_policies: {
+                    let mut heads: Vec<_> = policy.primary_heads().iter()
+                        .chain(policy.foreign_heads()).cloned().collect();
+                    heads.sort_by(|left, right| left.domain.cmp(&right.domain));
+                    heads
+                },
+                context: facts.context.clone(),
+                nonce: Nonce::random().unwrap(),
+                not_before_ms: NOW,
+                expires_at_ms: NOW + 200,
+            },
+            &fixture.node,
+        )
+        .unwrap();
+        policy
+            .check_body_scope(&invocation, &facts, &body, NOW)
+            .unwrap();
+        let prepared = Signed::sign(
+            prepare::PrepareIntent {
+                request: invocation.payload.clone(),
+                binding_generation: context.binding_generation,
+                canonical_cwd: context.canonical_cwd.clone(),
+                execution_target_public_key: context.execution_target_public_key.clone(),
+            },
+            &fixture.node,
+        )
+        .unwrap();
+        policy.check_prepare_scope(&prepared, &body, NOW).unwrap();
+        let destination = policy
+            .state()
+            .verify_execution_destination(
+                &facts.resource,
+                &facts.audience,
+                &selection.execution_resource,
+                &selection.target_public_key,
+                &selection.execution_grant,
+                &facts.context,
+                facts.action,
+                NOW,
+            )
+            .unwrap();
+        policy
+            .state()
+            .verify_invocation_with_execution_destination(
+                &invocation,
+                &facts,
+                &TransportEvidence::LocalAgentAdapter {
+                    service: fixture.audience().service,
+                    session: facts.context.sdk_session.clone().unwrap(),
+                },
+                &destination,
+                NOW,
+            )
+            .unwrap();
+        let mut wrong = facts.clone();
+        wrong.context.sdk_session.as_mut().unwrap().session_id = "another-sdk-session".into();
+        assert!(
+            policy
+                .check_scope(&wrong, &selection, &context, NOW)
+                .is_err()
+        );
+        let mut wrong = context.clone();
+        wrong.binding_generation = Some(2);
+        assert!(policy.check_scope(&facts, &selection, &wrong, NOW).is_err());
+        assert!(
+            fixture
+                .state
+                .find_device(&DeviceId::from_key(&PublicKey::of(&remote.node)))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn sdk_policy_source_rejects_wrong_adapter_expired_lease_and_revoked_grant() {
         use node_execution_policy::service::verify_node_service_policy_source;
         let mut fixture = Fixture::new();
