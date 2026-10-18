@@ -137,6 +137,61 @@ fn current_trust_in(
 }
 
 impl Store {
+    pub(crate) fn bound_node_task_policy_selection(
+        &self,
+        identity: &LocalIdentity,
+        binding: &SignedBinding,
+    ) -> Result<(
+        vibeface_secure::authorization::ResourceRef,
+        RemoteExecutionPolicySelection,
+        PrepareContext,
+    )> {
+        let _carrier = ScopedSignatureVerification::new();
+        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        let tx = self.connection.unchecked_transaction()?;
+        let mut usage = ExecutionProofUsage::default();
+        let association = binding_association_in(&tx, &self.policy, binding, &mut usage)?;
+        let trust = load_task_execution_trust_in(&tx, &local, &association.approval_ref)?;
+        let original = trust.original_intent();
+        let current = checked_source_task_binding_in(&tx, original, &local, &mut usage)?
+            .context("bound SDK selection has no current Task binding")?;
+        let project = original.payload.source_selection.resource.clone();
+        let selection = original.payload.selection.clone();
+        let context = original.payload.context.clone();
+        let scope = &context.context;
+        let session = scope
+            .execution_session
+            .as_ref()
+            .context("bound SDK selection has no execution session")?;
+        ensure!(
+            current == *binding
+                && binding.binding.network_id == project.space.as_str()
+                && scope.workspace_resource.as_ref() == Some(&project.resource)
+                && scope.task.as_ref().map(|task| task.as_str())
+                    == Some(binding.binding.task_ref.as_str())
+                && scope.conversation.as_deref() == Some(binding.binding.conversation_id.as_str())
+                && scope.sdk_session.is_none()
+                && context.binding_generation == Some(binding.binding.generation)
+                && session.session_id == binding.binding.session_id
+                && session.target
+                    == vibeface_secure::authorization::DeviceId::from_key(
+                        &selection.target_public_key
+                    )
+                && binding.binding.target_node
+                    == crate::crypto::fingerprint(selection.target_public_key.as_str())?
+                && scope.executor_kind.as_deref() == binding.binding.open_spec["executor"].as_str()
+                && context.canonical_cwd.as_deref() == binding.binding.open_spec["cwd"].as_str()
+                && context.execution_target_public_key.as_ref()
+                    == Some(&selection.target_public_key),
+            "bound SDK selection differs from its immutable approved Task binding"
+        );
+        usage.record_signed(original)?;
+        usage.record_signed(trust.approval())?;
+        usage.enforce_limits()?;
+        tx.commit()?;
+        Ok((project, selection, context))
+    }
+
     pub(crate) fn prepare_node_task_policy_read(
         &mut self,
         identity: &LocalIdentity,
