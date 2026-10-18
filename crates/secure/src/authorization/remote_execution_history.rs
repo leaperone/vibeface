@@ -349,6 +349,22 @@ fn check_reference(reference: &RemoteExecutionHistoryReference) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_remote_execution_history_reference(
+    reference: &RemoteExecutionHistoryReference,
+) -> Result<()> {
+    let _scope = ScopedSignatureVerification::new();
+    check_reference(reference)?;
+    let mut usage = ExecutionProofUsage::default();
+    usage.record_signed(&reference.source)?;
+    usage.record_signed(&reference.old_submission)?;
+    usage.record_signed(&reference.observation_receipt)?;
+    usage.record_metadata(reference)?;
+    if let Some(counts) = SignatureVerification::current_counts() {
+        usage.record_actual_signature_counts(counts);
+    }
+    usage.enforce_limits()
+}
+
 pub struct VerifiedHistoryAcceptance {
     decision_at_ms: u64,
     heads: Vec<PolicyStamp>,
