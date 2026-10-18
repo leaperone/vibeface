@@ -43,7 +43,7 @@ export function PromptInput({
           maxLength={100000}
           value={value}
           placeholder="描述目标，或询问某个任务的进展…"
-          aria-label="给调度 Agent 发消息"
+          aria-label="给机器人发消息"
           aria-describedby={hint ? 'manager-hint' : undefined}
           title="Enter 发送，Shift+Enter 换行"
           className="min-h-14 max-h-[min(12rem,30dvh)] overflow-y-auto p-3"

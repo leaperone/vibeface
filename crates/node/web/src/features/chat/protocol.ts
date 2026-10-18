@@ -6,30 +6,26 @@ export type SendGate = {
   hasConversation: boolean
   loaded: boolean
   missing: boolean
-  schedulerOnline: boolean
-  schedulerAllowed: boolean
-  schedulerNodeId: string | null
   busy: boolean
 }
 export function roleLabel(role: string): string {
   if (role === 'user') return '你'
-  if (role === 'assistant') return '调度 Agent'
+  if (role === 'assistant') return '助手'
   return role
 }
 export function canSend(input: SendGate): boolean {
-  return Boolean(input.hasConversation && input.loaded && !input.missing && input.schedulerAllowed && input.schedulerNodeId && !input.busy)
+  return Boolean(input.hasConversation && input.loaded && !input.missing && !input.busy)
 }
 export function composerHint(input: Omit<SendGate, 'busy'>): string {
-  if (!input.hasConversation || !input.loaded) return '先创建或选择一个会话。'
+  if (!input.hasConversation) return ''
+  if (!input.loaded) return '正在读取对话。'
   if (input.missing) return '等待上下文补齐后再发送。'
-  if (!input.schedulerAllowed || !input.schedulerNodeId) return '所选设备当前不能接收调度消息，请核对授权与管理配置。'
-  if (!input.schedulerOnline) return '调度设备当前离线，管理能力待原设备核对；入口可先保存原消息，目标确认入队前会保留待核对。'
   return ''
 }
 export function prepareSend(input: {
   conversationId: string
   text: string
-  schedulerNodeId: string
+  schedulerNodeId: string | null
   entryNode: string
   pending: PendingMessage | null
   heads: string[]
@@ -39,7 +35,7 @@ export function prepareSend(input: {
   try { text = inputText(input.text, '消息内容', 65536) }
   catch (caught) { return { ok: false, error: caught instanceof Error ? caught.message : '消息内容无效。' } }
   if (input.pending && (input.pending.text !== text || input.pending.conversation_id !== input.conversationId)) {
-    return { ok: false, error: '此会话有一条消息尚未确认，请先核对原消息，再发送新内容。' }
+    return { ok: false, error: '此对话有一条消息尚未确认，请先核对原消息，再发送新内容。' }
   }
   if (input.pending && input.pending.entry_node !== input.entryNode) {
     return { ok: false, error: '原消息尚未确认，请回原入口核对或重试；切换入口只能查看原消息，不能重新提交。' }
@@ -57,7 +53,7 @@ export function prepareSend(input: {
   } }
 }
 export function isQueuedReceipt(value: unknown, pending: PendingMessage): boolean {
-  return value !== null && typeof value === 'object' && 'accepted' in value && value.accepted === true && 'queued' in value && value.queued === true && 'message_id' in value && value.message_id === pending.message_id && 'scheduler_node' in value && value.scheduler_node === pending.scheduler_node
+  return value !== null && typeof value === 'object' && 'accepted' in value && value.accepted === true && 'queued' in value && value.queued === true && 'message_id' in value && value.message_id === pending.message_id && 'scheduler_node' in value && typeof value.scheduler_node === 'string' && value.scheduler_node.length > 0 && (pending.scheduler_node === null || value.scheduler_node === pending.scheduler_node)
 }
 export function messageKey(message: TranscriptMessage): string { return message.event_hash }
 

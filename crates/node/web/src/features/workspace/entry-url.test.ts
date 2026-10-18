@@ -7,8 +7,8 @@ import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import type { ReadyConnection } from "../../lib/node.ts"
 import { conversationHref } from "./entry-url.ts"
-import { isIncomplete, mergeBasis, nodeName, stateNames } from "./labels.ts"
-import { hasQueuedMessage, inputText, parseArtifactPage, parseConversation, parseNodes, parsePending, parsePendingTasks } from "./model.ts"
+import { isIncomplete, mergeBasis } from "./labels.ts"
+import { hasQueuedMessage, inputText, parseArtifactPage, parseConversation, parseNodes, parsePending } from "./model.ts"
 import { parseReconcile, reconcileDecision } from "./reconcile.ts"
 
 const context = {
@@ -50,12 +50,6 @@ test("stored operations retain request contents and enforce the personal network
   assert.deepEqual(parsePending([pending], "network")[0]?.request, full)
   assert.throws(() => parsePending([pending], "other-network"))
   assert.throws(() => parsePending([{ ...pending, target_node: "other" }], "network"))
-})
-test("manual task retries keep the original task identity without replaying legacy followup authorization", () => {
-  const original = { conversation_id: "chat", task_id: "task", title: "title", goal: "goal", acceptance: "done" }
-  assert.deepEqual(parsePendingTasks([original]), [original])
-  assert.deepEqual(parsePendingTasks([{ ...original, auto_followup: true }]), [original])
-  assert.deepEqual(parsePendingTasks([{ ...original, auto_followup: false }]), [original])
 })
 test("only the original scheduler durable job settles a pending human message", () => {
   const pending = { message_id: "human-message", conversation_id: "chat", text: "work", scheduler_node: "scheduler", entry_node: "gateway", basis_heads: [] }
@@ -114,7 +108,7 @@ test("creation fields use the server UTF-8 byte limits and reject whitespace", (
   assert.throws(() => inputText("中".repeat(21846), "验收条件", 65536), /65536/)
 })
 
-test("workspace callers retain offline message identity and defer reused session task ownership", async () => {
+test("workspace persists exact bot creation, routed messages and execution approvals before submission", async () => {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   let cursor = 0
   const afterRender: (() => void)[] = []
@@ -171,35 +165,40 @@ test("workspace callers retain offline message identity and defer reused session
   const workspaceModule = load(fileURLToPath(new URL("./context.tsx", import.meta.url)))
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
   const { useWorkspaceState } = workspaceModule as { useWorkspaceState(connection: ReadyConnection): Workspace }
-  const configured = { manager: "cursor_agent", executors: [], roots: [] }
-  const node = (node_id: string, changes: Record<string, unknown> = {}) => ({ node_id, local: false, online: true, revoked: false, roles: ["scheduler"], capabilities: configured, ...changes })
-  let rawNodes = [node("revoked", { revoked: true }), node("executor", { roles: ["executor"] }), node("unconfigured", { capabilities: { ...configured, manager: null } }), node("offline", { online: false, capabilities: null }), node("other")]
+  const bot = { bot_id: "bot", conversation_id: "chat", name: "助手", instructions: "处理项目", event_hash: "bot-event" }
+  const execution = { operation_id: "execution", target_node: "executor", session_id: "session", revision: 4, title: "工作", state: "running", session_state: "running", capabilities: ["respond_request"], pending_requests: [], freshness: "local_ledger", detail: "", blobs: [] }
   let scheduler: Record<string, unknown> | null = null
-  const session = { target_node: "executor", session_id: "session", executor: "cursor_agent", state: "idle", cwd: "/project", revision: 4 }
-  const task = { task_id: "a-old", title: "work", goal: "goal", acceptance: "done", detail: "ready", status: "working", binding: { target_node: session.target_node, session_id: session.session_id, operation_id: "execution", revision: session.revision, state: "idle", capabilities: ["send"], pending_requests: [] } }
-  const tasks = [task, { ...task, task_id: "b-new", binding: { ...task.binding, operation_id: "new-execution" } }]
-  const messages: Record<string, unknown>[] = [], operations: Record<string, unknown>[] = []
+  const messages: Record<string, unknown>[] = [], controls: Record<string, unknown>[] = [], creations: Record<string, unknown>[] = []
+  let failControl = true, failCreate = true
   const connection: ReadyConnection = {
     generation: 1, entry: { node_id: "gateway", address: "https://node.example", relay: false },
     principal: { network_id: "network", subject_id: "client", epoch: 1, can_manage: true },
     info: { node_id: "gateway", public_key: "key", version: "test", roles: ["gateway"], initialized: true },
     isCurrent: () => true, subscribe: () => () => {}, request: async () => { throw new Error("unexpected request") },
     async rpc(method, body = {}) {
-      if (method === "nodes") return { nodes: rawNodes }
+      if (method === "nodes") return { nodes: [] }
+      if (method === "bots") return { bots: [bot] }
       if (method === "conversations") return { conversations: [context.conversation] }
       if (method === "notifications") return { notifications: [] }
-      if (method === "conversation") return { ...context, tasks, sessions: [session], scheduler }
-      if (method === "operate") {
-        operations.push(JSON.parse(JSON.stringify(body.request)))
-        const storedPending = parsePending(JSON.parse(stored.get("vibeface.pending.client.network") ?? "null"), "network")
-        assert.equal(storedPending.length, 1)
-        assert.deepEqual(storedPending[0].request, operations.at(-1))
-        return { operation: { state: "accepted", request: body.request } }
+      if (method === "conversation") return { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, executions: [execution] }
+      if (method === "execution_status") return {}
+      if (method === "create_bot") {
+        creations.push(JSON.parse(JSON.stringify(body)))
+        assert.deepEqual(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null"), creations.at(-1))
+        if (failCreate) throw new Error("connection lost")
+        return { bot: { ...body, event_hash: "new-bot-event" } }
+      }
+      if (method === "execution_control") {
+        controls.push(JSON.parse(JSON.stringify(body)))
+        const pending = parsePending(JSON.parse(stored.get("vibeface.pending.client.network") ?? "null"), "network")
+        assert.deepEqual(JSON.parse(JSON.stringify(pending[0].execution_control)), controls.at(-1))
+        if (failControl) throw new Error("connection lost")
+        return { operation: { state: "accepted", request: { operation_id: body.operation_id, target_node: "executor", conversation_id: "chat", session_id: "session" } } }
       }
       assert.equal(method, "message")
       messages.push(JSON.parse(JSON.stringify(body)))
-      scheduler = { jobs: [{ trigger: `message:${body.message_id}`, kind: "human", state: "pending_delivery", sequence: 0, message_id: body.message_id, target_node: body.scheduler_node }] }
-      return { accepted: true, queued: false, message_id: body.message_id, scheduler_node: body.scheduler_node }
+      scheduler = { jobs: [{ trigger: `message:${body.message_id}`, kind: "human", state: "pending_delivery", sequence: 0, message_id: body.message_id, target_node: "chosen" }] }
+      return { accepted: true, queued: false, message_id: body.message_id, scheduler_node: "chosen" }
     },
   }
   const render = () => {
@@ -213,147 +212,64 @@ test("workspace callers retain offline message identity and defer reused session
     await new Promise(setImmediate)
     let state = render()
     assert.equal(state.writable, true)
-    assert.equal(state.schedulerNodeId, "offline")
     await state.refresh()
     state = render()
-    assert.equal(state.schedulerNodeId, "offline")
-    assert.equal(state.chatSlot.schedulerNodeId, "offline")
-    assert.equal(state.chatSlot.schedulerOnline, false)
-    assert.equal(state.chatSlot.schedulerAllowed, true)
+    assert.equal(state.selectedBot?.bot_id, "bot")
     await state.sendMessage("work")
     state = render()
     assert.ok(state.messagePending)
     const pending = JSON.parse(JSON.stringify(state.messagePending))
-    assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, text: "work", basis_heads: ["head"], scheduler_node: "offline", entry_node: "gateway", report_results: false })
-    assert.equal(pending.scheduler_node, "offline")
-    assert.equal(pending.entry_node, "gateway")
-    assert.deepEqual(JSON.parse(stored.get("vibeface.pending-messages.client.network") ?? "null"), [pending])
-    state.setSchedulerNodeId("other")
-    state = render()
-    await state.refresh()
-    state = render()
-    assert.equal(state.schedulerNodeId, "other")
-    assert.equal(state.chatSlot.schedulerNodeId, "offline")
+    assert.deepEqual(messages[0], { conversation_id: "chat", message_id: pending.message_id, text: "work", basis_heads: ["head"], scheduler_node: null, entry_node: "gateway", report_results: true })
+    assert.equal(pending.scheduler_node, "chosen")
     await state.sendMessage("work")
-    state = render()
-    assert.deepEqual(messages, [messages[0], messages[0]])
-    assert.deepEqual(JSON.parse(JSON.stringify(state.messagePending)), pending)
-    await assert.rejects(state.sendMessage("different work"), /原消息/)
+    assert.deepEqual(messages[1], { ...messages[0], scheduler_node: "chosen" })
+    await assert.rejects(render().sendMessage("different work"), /原消息/)
     connection.entry.node_id = "other-gateway"
-    await assert.rejects(state.sendMessage("work"), /原入口/)
+    await assert.rejects(render().sendMessage("work"), /原入口/)
     connection.entry.node_id = "gateway"
-    for (const unavailable of [{ revoked: true }, { roles: ["executor"] }, { capabilities: { ...configured, manager: null } }]) {
-      rawNodes = [node("offline", unavailable), node("other")]
-      await state.refresh()
-      state = render()
-      assert.equal(state.chatSlot.schedulerAllowed, false)
-      await assert.rejects(state.sendMessage("work"), /授权|配置/)
-    }
-    assert.equal(messages.length, 2)
-    assert.deepEqual(JSON.parse(stored.get("vibeface.pending-messages.client.network") ?? "null"), [pending])
-    assert.deepEqual(JSON.parse(JSON.stringify(state.data?.tasks.map((item) => item.task_id))), ["a-old", "b-new"])
-    await state.operate(session, { type: "send", text: "next" }, "chat")
-    assert.equal(operations.length, 1)
-    assert.equal(typeof operations[0].operation_id, "string")
-    assert.deepEqual(operations[0], { operation_id: operations[0].operation_id, network_id: "network", conversation_id: "chat", task_id: null, target_node: "executor", session_id: "session", expected_revision: 4, basis_heads: ["head"], resources: [], action: { type: "send", text: "next" } })
+    await assert.rejects(state.executionControl("execution", { type: "respond_request", request_id: 7, response: { decision: "decline" } }), /connection lost/)
+    state = render()
+    assert.equal(state.pending.length, 1)
+    assert.deepEqual(controls[0], { conversation_id: "chat", operation_id: state.pending[0].operation_id, expected_operation_id: "execution", expected_revision: 4, action: { type: "respond_request", request_id: 7, response: { decision: "decline" } } })
+    await assert.rejects(state.executionControl("execution", { type: "interrupt" }), /原操作待核对/)
+    execution.revision = 9
+    failControl = false
+    await state.retryExecutionControl(state.pending[0])
+    assert.deepEqual(controls[1], controls[0])
     assert.equal(render().pending.length, 0)
+    await assert.rejects(render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /connection lost/)
+    const originalCreation = creations[0]
+    assert.equal(typeof originalCreation.bot_id, "string")
+    assert.notEqual(originalCreation.bot_id, originalCreation.conversation_id)
+    assert.deepEqual(JSON.parse(JSON.stringify(render().pendingBot)), originalCreation)
+    for (const effect of effects.values()) effect.cleanup?.()
+    effects.clear(); values.length = 0; afterRender.length = 0
+    render(); render()
+    await new Promise(setImmediate)
+    assert.deepEqual(JSON.parse(JSON.stringify(render().pendingBot)), originalCreation)
+    await assert.rejects(render().createBot({ name: "改名", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /原配置/)
+    failCreate = false
+    await render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } })
+    assert.deepEqual(creations[1], originalCreation)
+    assert.equal(render().pendingBot, null)
+    state = render()
+    state.selectConversation("legacy")
+    await assert.rejects(render().sendMessage("do not send"), /先选择机器人/)
+    assert.equal(messages.length, 2)
   } finally {
     for (const effect of effects.values()) effect.cleanup?.()
   }
 })
 
-test("task pending controls stay inside their conversation and retain task and resource locks", async () => {
-  const task = parseConversation({ ...context, tasks: [{ task_id: "task", title: "work", goal: "goal", acceptance: "done", detail: "running", status: "working", binding: { target_node: "executor", session_id: "session", operation_id: "execution", revision: 4, state: "running", freshness: "local_ledger", capabilities: ["interrupt"], pending_requests: [] } }] }).tasks[0]
-  const operation = (kind: "request" | "control", changes: Record<string, unknown> = {}) => {
-    const identity = { operation_id: kind, network_id: "network", conversation_id: "chat", task_id: "task", target_node: "executor", session_id: "session", expected_revision: 4, ...changes }
-    const payload = kind === "request" ? { ...identity, basis_heads: ["head"], resources: [], action: { type: "send", text: "work" } } : { ...identity, expected_operation_id: "execution", action: "interrupt" }
-    return { operation_id: identity.operation_id, conversation_id: identity.conversation_id, target_node: identity.target_node, session_id: identity.session_id, [kind]: payload }
-  }
-  let pending: ReturnType<typeof parsePending> = []
-  const reconciled: ReturnType<typeof parsePending> = [], retried: ReturnType<typeof parsePending> = []
-  const elements: { type: unknown; props: Record<string, unknown> }[] = []
-  const jsx = (type: unknown, props: Record<string, unknown>) => { const element = { type, props }; elements.push(element); return element }
-  const ui = new Proxy({}, { get: (_target, name) => String(name) })
-  const module: { exports: Record<string, unknown> } = { exports: {} }
-  const require = (specifier: string) => {
-    if (specifier === "react") return { useId: () => "task", useState: (initial: unknown) => [initial, () => {}] }
-    if (specifier === "react/jsx-runtime") return { jsx, jsxs: jsx }
-    if (specifier === "./context") return { useWorkspace: () => ({ pending, nodes: [{ node_id: "executor", online: true, revoked: false }], writable: true, connectionOnline: true, canAutoFollowup: true, run: (action: () => Promise<void>) => action(), reconcile: async (operation: typeof pending[number]) => { reconciled.push(operation) }, retryTaskControl: async (operation: typeof pending[number]) => { retried.push(operation) } }) }
-    if (specifier === "./labels") return { nodeName, stateNames }
-    return ui
-  }
-  const filename = fileURLToPath(new URL("./task-activity.tsx", import.meta.url))
-  const compiled = transpileModule(readFileSync(filename, "utf8"), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
-  new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext()(module.exports, require, module)
-  const TaskActivity = module.exports.TaskActivity
-  assert.ok(typeof TaskActivity === "function")
-  for (const scenario of [
-    { name: "foreign conversation with the same task and binding", pending: [operation("request", { conversation_id: "foreign" }), operation("control", { conversation_id: "foreign" })], visible: [], locked: false },
-    { name: "current conversation with the original task request and control", pending: [operation("request"), operation("control")], visible: ["request", "control"], locked: true },
-    { name: "another task and resource in the current conversation", pending: [operation("request", { task_id: "other-task", target_node: "other-executor", session_id: "other-session" })], visible: [], locked: false },
-    { name: "unbound request on the current execution resource", pending: [operation("request", { task_id: null })], visible: ["request"], locked: true },
-    { name: "original task request on its old execution binding", pending: [operation("request", { target_node: "old-executor", session_id: "old-session" })], visible: ["request"], locked: true },
-  ]) {
-    pending = parsePending(scenario.pending, "network")
-    elements.length = 0
-    TaskActivity({ task, conversationId: "chat" })
-    assert.deepEqual(elements.filter(({ props }) => props.operation !== undefined).map(({ props }) => props.operation), pending.filter((item) => scenario.visible.includes(item.operation_id)), scenario.name)
-    const interrupt = elements.filter(({ props }) => props.children === "停止当前执行")
-    assert.equal(interrupt.length, 1, scenario.name)
-    assert.equal(interrupt[0].props.disabled, scenario.locked, scenario.name)
-  }
-  for (const kind of ["request", "control"] as const) {
-    pending = parsePending([operation(kind)], "network")
-    elements.length = 0
-    TaskActivity({ task, conversationId: "chat" })
-    const card = elements.find(({ props }) => props.operation === pending[0])
-    assert.ok(card && typeof card.type === "function")
-    elements.length = 0
-    card.type(card.props)
-    const reconcile = elements.find(({ props }) => props.children === "核对原操作")
-    assert.ok(reconcile && typeof reconcile.props.action === "function")
-    assert.equal(reconcile.props.disabled, false)
-    await reconcile.props.action()
-    assert.equal(reconciled.at(-1), pending[0])
-    const retry = elements.find(({ props }) => props.children === "重试原请求")
-    assert.equal(Boolean(retry), kind === "control")
-    assert.equal(elements.some(({ props }) => props.children === "重试会保留原操作编号与内容，不会新建请求。"), kind === "control")
-    if (kind === "control") {
-      assert.ok(retry && typeof retry.props.action === "function")
-      await retry.props.action()
-      assert.equal(retried.at(-1), pending[0])
-    }
-  }
-  assert.equal(retried.length, 1)
-})
-
-test("a reused execution session shows every bound task and one send form", () => {
-  const session = { target_node: "executor", session_id: "session", executor: "cursor_agent", state: "idle", cwd: "/project", revision: 4 }
-  const task = { task_id: "a-old", title: "work", goal: "goal", acceptance: "done", detail: "ready", status: "working", binding: { target_node: session.target_node, session_id: session.session_id, operation_id: "old-execution", revision: 4, state: "idle", capabilities: ["send"], pending_requests: [] } }
-  const data = parseConversation({ ...context, sessions: [session], tasks: [task, { ...task, task_id: "b-new", binding: { ...task.binding, operation_id: "new-execution" } }, { ...task, task_id: "other-session-task", binding: { ...task.binding, session_id: "other-session" } }] })
-  const elements: { type: unknown; props: Record<string, unknown> }[] = []
-  const jsx = (type: unknown, props: Record<string, unknown>) => { const element = { type, props }; elements.push(element); return element }
-  const ui = new Proxy({}, { get: (_target, name) => String(name) })
-  const module: { exports: Record<string, unknown> } = { exports: {} }
-  const require = (specifier: string) => {
-    if (specifier === "react") return { useState: (initial: unknown) => [initial, () => {}] }
-    if (specifier === "react/jsx-runtime") return { jsx, jsxs: jsx }
-    if (specifier === "./context") return { useWorkspace: () => ({ actual: {}, data }) }
-    if (specifier === "./labels") return { nodeName }
-    return ui
-  }
-  const filename = fileURLToPath(new URL("./sessions-screen.tsx", import.meta.url))
-  const source = readFileSync(filename, "utf8") + "\nexport { SessionCard }\n"
-  const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
-  new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext()(module.exports, require, module)
-  const SessionCard = module.exports.SessionCard
-  assert.ok(typeof SessionCard === "function")
-  SessionCard({ session: data.sessions[0], conversationId: "chat" })
-  const activities = elements.filter(({ type }) => type === "TaskActivity")
-  assert.deepEqual(activities.map(({ props }) => props.task), data.tasks.slice(0, 2))
-  assert.deepEqual(activities.map(({ props }) => props.conversationId), ["chat", "chat"])
-  const sendForms = elements.filter(({ type }) => typeof type === "function" && type.name === "CommandForm")
-  assert.equal(sendForms.length, 1)
-  assert.equal(sendForms[0].props.session, data.sessions[0])
-  assert.equal(sendForms[0].props.conversationId, "chat")
+test("taskless execution projection and persisted approval actions retain nullable session identity", () => {
+  const execution = { operation_id: "command", target_node: "executor", session_id: null, revision: 0, title: "查询状态", state: "succeeded", session_state: "none", capabilities: [], pending_requests: [], freshness: "local_ledger", detail: "退出码 0\nclean", blobs: [] }
+  const payload = parseConversation({ ...context, executions: [execution], operations: [{ state: "succeeded", request: { ...request, session_id: null } }] })
+  assert.deepEqual(JSON.parse(JSON.stringify(payload.executions[0])), execution)
+  assert.equal(payload.operations[0].request.session_id, null)
+  assert.throws(() => parseConversation({ ...context, executions: [{ ...execution, state: "idle" }] }))
+  const execution_control = { conversation_id: "chat", operation_id: "approval", expected_operation_id: "execution", expected_revision: 4, action: { type: "respond_request", request_id: 1, response: { decision: "decline" } } }
+  const pending = { operation_id: "approval", target_node: "executor", conversation_id: "chat", session_id: "session", execution_control }
+  assert.deepEqual(parsePending([pending], "network")[0], pending)
+  assert.throws(() => parsePending([{ ...pending, execution_control: { ...execution_control, conversation_id: "other" } }], "network"))
+  assert.throws(() => parsePending([{ ...pending, execution_control: { ...execution_control, action: { type: "respond_request", request_id: 1 } } }], "network"))
 })

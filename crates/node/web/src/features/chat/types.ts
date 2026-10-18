@@ -10,7 +10,7 @@ export type PendingMessage = {
   message_id: string
   conversation_id: string
   text: string
-  scheduler_node: string
+  scheduler_node: string | null
   entry_node: string
   basis_heads: string[]
   report_results?: boolean

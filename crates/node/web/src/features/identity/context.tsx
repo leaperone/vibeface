@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { connectDevice, initClient, readInvitation, signClient } from '../../../transport.js'
+import { connectDevice, initClient, readInvitation, signClient, validTarget } from '../../../transport.js'
 import type { DeviceChannel } from '../../../transport.js'
 import {
   array, boolean, deviceName, digest, entryKey, integer, messageOf, parseEntry, parseInfo, parseInvitation,
@@ -17,6 +17,7 @@ type Review = { kind: 'bootstrap'; networkId: string } | { kind: 'recovery'; net
 type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (members: Member[]) => Promise<void> }
 type Session = { channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number; networkId?: string }
 type Reconnect = { entry: ConnectionEntry; networkId: string; attempt: number }
+type AuthenticatedEntry = Pick<Reconnect, 'entry' | 'networkId'>
 type DeviceContextValue = {
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; pairs: PairReceipt[]; waiting: WaitingPair | null; review: Review | null; initialInvitation: string
@@ -36,6 +37,14 @@ function savedEntries(): ConnectionEntry[] {
   const value = load('connections')
   if (!Array.isArray(value)) return []
   return value.flatMap(item => { try { return [parseEntry(item)] } catch { return [] } })
+}
+function loadAuthenticated(): AuthenticatedEntry | null {
+  try {
+    const value = load('last-authenticated')
+    if (!value) return null
+    const v = record(value)
+    return { entry: parseEntry(v.entry), networkId: validTarget(v.networkId) }
+  } catch { return null }
 }
 function loadWaiting(): WaitingPair | null {
   try {
@@ -77,7 +86,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const waitingRef = useRef<WaitingPair | null>(null)
 
   const cancelSensitive = useCallback(() => { sensitive.current?.cancel(); sensitive.current = null; setReview(null) }, [])
-  const disconnect = useCallback(() => {
+  const resetConnection = useCallback(() => {
     reconnect.current = null
     if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current)
     reconnectTimer.current = null
@@ -89,6 +98,10 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     listeners.current.clear(); setReady(null); setDirectory(null); setPairs([]); setInfo(null); setEntry(null)
     waitingRef.current = null; setWaiting(null); setPhase('disconnected'); setError('')
   }, [cancelSensitive])
+  const disconnect = useCallback(() => {
+    resetConnection()
+    try { store('last-authenticated', null); store('waiting-pair', null) } catch (cause) { setError(messageOf(cause)) }
+  }, [resetConnection])
   const saveEntry = useCallback((candidate: ConnectionEntry) => {
     const parsed = parseEntry(candidate)
     const next = [...savedEntries().filter(item => entryKey(item) !== entryKey(parsed)), parsed]
@@ -96,7 +109,10 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }, [])
   const removeEntry = useCallback((candidate: ConnectionEntry) => {
     const next = savedEntries().filter(item => entryKey(item) !== entryKey(candidate))
-    store('connections', next); setEntries(next)
+    store('connections', next)
+    const previous = loadAuthenticated()
+    if (previous && entryKey(previous.entry) === entryKey(candidate)) store('last-authenticated', null)
+    setEntries(next)
   }, [])
   function current() { const value = session.current; if (!value) throw new Error('先连接并核对自己的设备。'); return value }
   async function callSession(active: Session, method: string, params: Record<string, unknown> = {}) {
@@ -117,6 +133,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       if (pinnedNetwork && pinnedNetwork !== verified.principal.network_id) throw new Error('此设备返回了不同的个人网络。请先核对原授权。')
       store(`network-for.${active.entry.node_id}`, verified.principal.network_id)
       saveEntry(active.entry)
+      store('last-authenticated', { entry: active.entry, networkId: verified.principal.network_id } satisfies AuthenticatedEntry)
     } catch (cause) { throw new AuthenticationError(messageOf(cause)) }
     if (session.current !== active) throw changed()
     const { principal, view } = verified
@@ -132,7 +149,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     }
     setDirectory(view); setReady(connection); setPhase('ready'); setError(''); waitingRef.current = null; setWaiting(null); store('waiting-pair', null)
   }
-  function scheduleReconnect() {
+  function scheduleReconnect(immediate = false) {
     const target = reconnect.current
     if (!target || reconnectTimer.current !== null) return
     reconnectTimer.current = setTimeout(async () => {
@@ -145,19 +162,22 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         await authenticate(auth, active, { kind: 'network', networkId: target.networkId })
       } catch (cause) {
         if (reconnect.current !== target) return
-        if (active && session.current === active) {
-          if (isResponseError(cause) || cause instanceof AuthenticationError) {
-            reconnect.current = null
-            setReady(null); setDirectory(null); setPairs([]); setPhase('unpaired')
-            setError(`无法恢复原网络授权，请核对设备。${messageOf(cause)}`)
-          } else active.channel.close()
-        } else scheduleReconnect()
+        if (isResponseError(cause) || cause instanceof AuthenticationError) {
+          reconnect.current = null
+          if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current)
+          reconnectTimer.current = null
+          setReady(null); setDirectory(null); setPairs([]); setPhase('unpaired')
+          let detail = messageOf(cause)
+          try { store('last-authenticated', null) } catch (storageError) { detail += ` ${messageOf(storageError)}` }
+          setError(`无法恢复原网络授权。请核对设备后重新连接，或使用邀请配对。${detail}`)
+        } else if (active && session.current === active) active.channel.close()
+        else scheduleReconnect()
       }
-    }, Math.min(1000 * 2 ** target.attempt++, 10000))
+    }, immediate ? 0 : Math.min(1000 * 2 ** target.attempt++, 10000))
   }
   async function open(entryValue: ConnectionEntry, resuming = false) {
     const parsed = parseEntry(entryValue)
-    if (!resuming) { disconnect(); setPhase('connecting'); setEntry(parsed) }
+    if (!resuming) { resetConnection(); setPhase('connecting'); setEntry(parsed) }
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
     try {
@@ -183,9 +203,13 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         },
       })
       if (version !== generation.current) { channel.close(); throw changed() }
-      const details = parseInfo(await channel.request('info'))
+      const infoValue = await channel.request('info')
       if (version !== generation.current) { channel.close(); throw changed() }
-      if (details.node_id !== parsed.node_id || details.public_key !== channel.publicKey) { channel.close(); throw new Error('入口报告的设备与已核验指纹不一致。') }
+      let details: EntryInfo
+      try {
+        details = parseInfo(infoValue)
+        if (details.node_id !== parsed.node_id || details.public_key !== channel.publicKey) throw new Error('入口报告的设备与已核验指纹不一致。')
+      } catch (cause) { channel.close(); throw new AuthenticationError(messageOf(cause)) }
       const active = { channel, entry: parsed, info: details, generation: version }
       session.current = active; setInfo(details); if (!resuming) setPhase('unpaired'); return active
     } catch (cause) {
@@ -194,7 +218,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           generation.current += 1
           const previous = session.current; session.current = null; controller.abort(); previous?.channel.close()
           setPhase('reconnecting'); scheduleReconnect()
-        } else { disconnect(); setError(messageOf(cause)) }
+        } else { resetConnection(); setError(messageOf(cause)) }
       }
       throw cause
     }
@@ -430,6 +454,14 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         await open(pending.entry)
         if (!mounted) return
         waitingRef.current = pending; setWaiting(pending)
+      } else if (!invitation && !pending) {
+        const previous = loadAuthenticated()
+        if (previous) {
+          setEntry(previous.entry); setPhase('reconnecting')
+          setError('正在恢复已授权的设备连接。')
+          reconnect.current = { ...previous, attempt: 0 }
+          scheduleReconnect(true)
+        }
       }
     }).catch(cause => { if (mounted) { setPhase(cause instanceof Error && 'code' in cause && cause.code === 'key_lost' ? 'key_lost' : 'blocked'); setError(messageOf(cause)) } })
     return () => { mounted = false; generation.current += 1; reconnect.current = null; if (reconnectTimer.current !== null) clearTimeout(reconnectTimer.current); reconnectTimer.current = null; sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); const previous = session.current; session.current = null; previous?.channel.close(); listeners.current.clear() }

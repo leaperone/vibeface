@@ -71,7 +71,7 @@ export type SessionRecord = {
 }
 export type OperationRecord = {
   state: string
-  request: { operation_id: string; target_node: string; conversation_id: string; session_id: string }
+  request: { operation_id: string; target_node: string; conversation_id: string; session_id: string | null }
   raw: unknown
 }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
@@ -82,6 +82,7 @@ export type ConversationPayload = {
   heads: string[]
   missing: MissingContext
   tasks: TaskRecord[]
+  executions: ExecutionActivityRecord[]
   sessions: SessionRecord[]
   operations: OperationRecord[]
   scheduler: SchedulerSnapshot | null
@@ -120,15 +121,49 @@ export type TaskControlRequest = {
   request_id?: string | number
   response?: unknown
 }
-export type PendingOperation = Pick<OperationRequest, "operation_id" | "target_node" | "session_id" | "conversation_id"> & ({ request: OperationRequest; control?: never } | { request?: never; control: TaskControlRequest })
-export type PendingConversation = { conversation_id: string; title: string }
-export type PendingTask = { conversation_id: string; task_id: string; title: string; goal: string; acceptance: string }
-export type WorkspaceView = "chat" | "tasks" | "sessions" | "devices" | "notifications"
-export type ChatSlotState = {
-  conversationId: string | null
-  schedulerNodeId: string | null
-  missing: boolean
-  schedulerOnline: boolean
-  schedulerAllowed: boolean
+export type ExecutionControlAction =
+  | { type: "interrupt" }
+  | { type: "steer"; text: string }
+  | { type: "respond_request"; request_id: string | number; response: unknown }
+export type ExecutionControlRequest = {
+  conversation_id: string
+  operation_id: string
+  expected_operation_id: string
+  expected_revision: number
+  action: ExecutionControlAction
 }
+export type ExecutionActivityRecord = {
+  operation_id: string
+  target_node: string
+  session_id: string | null
+  revision: number
+  title: string
+  state: string
+  session_state: string
+  capabilities: string[]
+  pending_requests: HumanRequest[]
+  freshness: "local_ledger" | "cached" | "unknown"
+  checked_at_ms?: number
+  latest_progress?: string
+  detail: string
+  blobs: { hash: string; size: number }[]
+  source_trigger?: string
+  source_message_id?: string
+  goal?: { title: string; acceptance: string; status: string }
+}
+export type PendingOperation = {
+  operation_id: string
+  target_node: string
+  session_id: string | null
+  conversation_id: string
+} & (
+  | { request: OperationRequest; control?: never; execution_control?: never }
+  | { request?: never; control: TaskControlRequest; execution_control?: never }
+  | { request?: never; control?: never; execution_control: ExecutionControlRequest }
+)
+export type WorkspaceView = "chat" | "settings"
 export type { PendingMessage }
+
+export type BotProject = { target_node: string; cwd: string }
+export type CreateBotRequest = { bot_id: string; conversation_id: string; name: string; instructions: string; project?: BotProject }
+export type BotRecord = CreateBotRequest & { event_hash: string }
