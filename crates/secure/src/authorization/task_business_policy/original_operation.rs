@@ -471,6 +471,10 @@ impl VerifiedTaskBusinessOperationCurrent {
         now: u64,
     ) -> Result<ExecutionProofUsage> {
         let _signatures = ScopedSignatureVerification::new();
+        require(
+            now >= self.checked_at_ms,
+            "Task operation recheck clock moved backwards",
+        )?;
         let candidate = begin_task_business_operation_current(
             primary,
             &self.original,
@@ -802,6 +806,12 @@ mod tests {
             missing.receipts.pop();
             assert!(check.clone().finish(&missing, now).is_err());
             let cap = check.clone().finish(&proof, now).unwrap();
+            let later_cap = check.clone().finish(&proof, now + 1).unwrap();
+            assert!(
+                later_cap
+                    .check_current(&fixture.state, &c_key, &[], now)
+                    .is_err()
+            );
             cap.check_current(&fixture.state, &c_key, &[], now).unwrap();
             assert!(
                 cap.check_current(&fixture.state, &c_key, &[], now + 500)
