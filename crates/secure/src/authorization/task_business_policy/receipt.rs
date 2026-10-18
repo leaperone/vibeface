@@ -90,6 +90,7 @@ impl TaskBusinessChallenge {
                     challenge.issued_at_ms,
                     challenge.expires_at_ms,
                 )?;
+                value.proof_usage().enforce_limits()?;
                 usage.merge(value.proof_usage());
                 (
                     value.dependencies(),
@@ -115,6 +116,7 @@ impl TaskBusinessChallenge {
                     challenge.issued_at_ms,
                     challenge.expires_at_ms,
                 )?;
+                value.proof_usage().enforce_limits()?;
                 usage.merge(value.proof_usage());
                 (
                     value.heads(),
@@ -139,6 +141,7 @@ impl TaskBusinessChallenge {
                     challenge.issued_at_ms,
                     challenge.expires_at_ms,
                 )?;
+                value.proof_usage().enforce_limits()?;
                 usage.merge(value.proof_usage());
                 (
                     value.dependencies(),
@@ -452,6 +455,7 @@ fn authorize_inner(
             signing_heads.push(head.clone());
         }
     }
+    usage.normalize_completed_task_policy_transport(current)?;
     finish_usage(&mut usage)?;
     Ok(VerifiedTaskBusinessReceiptAuthority {
         scope,
@@ -742,7 +746,10 @@ mod tests {
             completed_current.counts().unique_signatures,
             normalized.unique_signatures
         );
-        merged.merge(&completed_current);
+        merged.merge(readonly.proof_usage());
+        merged
+            .normalize_completed_task_policy_transport(&readonly)
+            .unwrap();
         assert_eq!(
             merged.counts().authorization_bytes,
             counts.authorization_bytes

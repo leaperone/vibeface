@@ -509,88 +509,85 @@ fn task_business_resolution_receipts_reject_combined_current_policy_budget() {
     baseline.proof_usage().enforce_limits().unwrap();
     readonly.proof_usage().enforce_limits().unwrap();
     let baseline_bytes = baseline.proof_usage().counts().authorization_bytes;
-    let mut combined = baseline.proof_usage().clone();
-    combined.merge(readonly.proof_usage());
-    let current_unique_bytes = combined.counts().authorization_bytes - baseline_bytes;
-    let mut direct_usage = baseline.proof_usage().clone();
-    direct_usage
-        .record_metadata(&baseline_read.payload.challenge)
-        .unwrap();
-    let mut read_usage = baseline.proof_usage().clone();
-    read_usage.record_signed(&baseline_header).unwrap();
-    read_usage.record_signed(&baseline_read).unwrap();
-    let entry_overhead = direct_usage
-        .counts()
-        .authorization_bytes
-        .max(read_usage.counts().authorization_bytes)
-        - baseline_bytes;
-    assert!(
-        current_unique_bytes > entry_overhead + 1,
-        "current unique bytes {current_unique_bytes} must exceed receipt entry overhead {entry_overhead}"
-    );
-    let headroom = (current_unique_bytes + entry_overhead) / 2;
-    let added_evidence_bytes = MAX_PROOF_BYTES
-        .checked_sub(baseline_bytes + headroom)
-        .expect("baseline and measured receipt headroom must leave room for evidence");
-    let evidence = "e".repeat(BASELINE_EVIDENCE.len() + added_evidence_bytes);
-    assert!(evidence.len() <= 65_536);
-    let resolution = resolution_authorization(&fixture, &readonly, &evidence, now);
-    let (wire, header, read) = request_for(&resolution);
-    resolution.proof_usage().enforce_limits().unwrap();
-    assert_eq!(
-        resolution.proof_usage().counts().authorization_bytes,
-        baseline_bytes + added_evidence_bytes
-    );
-    let mut direct_usage = resolution.proof_usage().clone();
-    direct_usage
-        .record_metadata(&read.payload.challenge)
-        .unwrap();
-    direct_usage.enforce_limits().unwrap();
-    let mut read_usage = resolution.proof_usage().clone();
-    read_usage.record_signed(&header).unwrap();
-    read_usage.record_signed(&read).unwrap();
-    read_usage.enforce_limits().unwrap();
-    let mut combined = resolution.proof_usage().clone();
-    combined.merge(readonly.proof_usage());
-    assert!(combined.counts().authorization_bytes > MAX_PROOF_BYTES);
-    assert!(matches!(
-        combined.enforce_limits(),
-        Err(AuthorizationError::BudgetExceeded)
-    ));
-    println!(
-        "resolution_receipt_budget current={} business={} direct_without_current={} read_without_current={} combined={} current_unique={} evidence={}",
-        readonly.proof_usage().counts().authorization_bytes,
-        resolution.proof_usage().counts().authorization_bytes,
-        direct_usage.counts().authorization_bytes,
-        read_usage.counts().authorization_bytes,
-        combined.counts().authorization_bytes,
-        current_unique_bytes,
-        evidence.len(),
-    );
-    assert!(matches!(
-        authorize_task_business_challenge(
-            source.state(),
-            &readonly,
-            TaskBusinessAuthorization::Resolve(&resolution),
-            &wire,
-            &read.payload.challenge,
-            &b_key,
-            now,
-        ),
-        Err(AuthorizationError::BudgetExceeded)
-    ));
-    assert!(matches!(
-        verify_task_business_receipt_read(
-            source.state(),
-            &readonly,
-            TaskBusinessAuthorization::Resolve(&resolution),
-            &header,
-            &wire,
-            &actual_c,
-            &read,
-            &b_key,
-            now,
-        ),
-        Err(AuthorizationError::BudgetExceeded)
-    ));
+    for signed_read in [false, true] {
+        let entry_usage = |resolution: &VerifiedExecutionResolution,
+                           header: &Signed<TaskBusinessPolicyHeader>,
+                           read: &Signed<TaskBusinessReceiptRead>| {
+            let mut usage = resolution.proof_usage().clone();
+            if signed_read {
+                usage.record_signed(header).unwrap();
+                usage.record_signed(read).unwrap();
+            } else {
+                usage.record_metadata(&read.payload.challenge).unwrap();
+            }
+            usage
+        };
+        let without_current = entry_usage(&baseline, &baseline_header, &baseline_read);
+        let without_current_bytes = without_current.counts().authorization_bytes;
+        let mut combined = without_current.clone();
+        combined.merge(readonly.proof_usage());
+        combined
+            .normalize_completed_task_policy_transport(&readonly)
+            .unwrap();
+        let combined_bytes = combined.counts().authorization_bytes;
+        assert!(combined_bytes > without_current_bytes + 1);
+        let headroom = (without_current_bytes + combined_bytes) / 2;
+        let added_evidence_bytes = MAX_PROOF_BYTES
+            .checked_sub(headroom)
+            .expect("baseline receipt must leave room for signed live evidence");
+        let evidence = "e".repeat(BASELINE_EVIDENCE.len() + added_evidence_bytes);
+        assert!(evidence.len() <= MAX_PROOF_BYTES);
+        let resolution = resolution_authorization(&fixture, &readonly, &evidence, now);
+        let (wire, header, read) = request_for(&resolution);
+        resolution.proof_usage().enforce_limits().unwrap();
+        assert_eq!(
+            resolution.proof_usage().counts().authorization_bytes,
+            baseline_bytes + added_evidence_bytes
+        );
+        let without_current = entry_usage(&resolution, &header, &read);
+        without_current.enforce_limits().unwrap();
+        let mut combined = without_current.clone();
+        combined.merge(readonly.proof_usage());
+        combined
+            .normalize_completed_task_policy_transport(&readonly)
+            .unwrap();
+        assert!(combined.counts().authorization_bytes > MAX_PROOF_BYTES);
+        assert!(matches!(
+            combined.enforce_limits(),
+            Err(AuthorizationError::BudgetExceeded)
+        ));
+        println!(
+            "resolution_receipt_budget signed_read={} current={} business={} without_current={} normalized_combined={} evidence={}",
+            signed_read,
+            readonly.proof_usage().counts().authorization_bytes,
+            resolution.proof_usage().counts().authorization_bytes,
+            without_current.counts().authorization_bytes,
+            combined.counts().authorization_bytes,
+            evidence.len(),
+        );
+        let result = if signed_read {
+            verify_task_business_receipt_read(
+                source.state(),
+                &readonly,
+                TaskBusinessAuthorization::Resolve(&resolution),
+                &header,
+                &wire,
+                &actual_c,
+                &read,
+                &b_key,
+                now,
+            )
+        } else {
+            authorize_task_business_challenge(
+                source.state(),
+                &readonly,
+                TaskBusinessAuthorization::Resolve(&resolution),
+                &wire,
+                &read.payload.challenge,
+                &b_key,
+                now,
+            )
+        };
+        assert!(matches!(result, Err(AuthorizationError::BudgetExceeded)));
+    }
 }
