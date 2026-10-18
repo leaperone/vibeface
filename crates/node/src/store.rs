@@ -16,8 +16,6 @@ use std::{
 pub(crate) mod bots;
 pub(crate) mod followup;
 
-const SESSIONLESS_SCHEMA: &str =
-    include_str!("../migrations/202610180001_sessionless_operations.sql");
 const INITIAL_SCHEMA: &str = include_str!("../migrations/202610160001_initial.sql");
 
 pub struct Store {
@@ -58,11 +56,10 @@ impl Store {
                 ensure!(tables == 0, "unversioned database is not supported");
                 connection.execute_batch(&format!("BEGIN IMMEDIATE;{INITIAL_SCHEMA}COMMIT;"))?;
             }
-            2 | 3 => {}
-            _ => bail!("unsupported database schema version {version}"),
-        }
-        if version < 3 {
-            connection.execute_batch(&format!("BEGIN IMMEDIATE;{SESSIONLESS_SCHEMA}COMMIT;"))?;
+            3 => {}
+            _ => bail!(
+                "unsupported database schema version {version}; initialize a fresh Node data directory"
+            ),
         }
         let mut store = Self { connection };
         // Reject incompatible membership before recovery changes operations or rebuilds projections.

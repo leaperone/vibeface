@@ -253,36 +253,19 @@ impl Store {
         );
         let events = load_events_from(&tx, network)?;
         let heads = heads_from_events(&events, conversation);
-        if heads.is_empty() {
-            append_event_from(
-                &tx,
-                identity,
-                network,
-                conversation,
-                EventBody::ConversationCreated { title: name.into() },
-                vec![],
-                created_at_ms,
-            )?;
-        } else {
-            let history = closure_hashes(&events, &heads);
-            ensure!(
-                history
-                    .iter()
-                    .all(|hash| events.get(hash).is_some_and(|stored| {
-                        stored.status == "ready" && stored.event.scope_id == conversation
-                    })),
-                "conversation has incomplete or conflicting history"
-            );
-            ensure!(
-                history.iter().any(|hash| {
-                    matches!(
-                        events[hash].event.body,
-                        EventBody::ConversationCreated { .. }
-                    )
-                }),
-                "conversation does not exist"
-            );
-        }
+        ensure!(
+            heads.is_empty(),
+            "a new Bot requires a new conversation scope"
+        );
+        append_event_from(
+            &tx,
+            identity,
+            network,
+            conversation,
+            EventBody::ConversationCreated { title: name.into() },
+            vec![],
+            created_at_ms,
+        )?;
         let event = append_event_from(
             &tx,
             identity,
@@ -584,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_adoption_keeps_the_original_history() -> Result<()> {
+    fn bot_creation_rejects_an_existing_conversation_scope() -> Result<()> {
         let owner = LocalIdentity::generate();
         let network = owner.fixture_network_id()?;
         let mut store = memory(&owner)?;
@@ -611,17 +594,23 @@ mod tests {
             vec![],
             2,
         )?;
-        let bot = store.create_bot(
-            &owner,
-            &network,
-            "existing-history",
-            "adopted-bot",
-            "New assistant",
-            "Continue this discussion",
-            None,
-            3,
-        )?;
-        assert_eq!(bot.conversation_id, "existing-history");
+        assert!(
+            store
+                .create_bot(
+                    &owner,
+                    &network,
+                    "existing-history",
+                    "adopted-bot",
+                    "New assistant",
+                    "Continue this discussion",
+                    None,
+                    3,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("new conversation scope")
+        );
+        assert!(store.bots(&network)?.is_empty());
         let messages = store.messages(&network, "existing-history")?;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].event_hash, message.hash);

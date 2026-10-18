@@ -79,7 +79,7 @@ CREATE TABLE operations (
   network_id TEXT NOT NULL,
   operation_id TEXT NOT NULL,
   target_node TEXT NOT NULL,
-  session_id TEXT NOT NULL,
+  session_id TEXT,
   request TEXT NOT NULL,
   state TEXT NOT NULL,
   control INTEGER NOT NULL DEFAULT 0,
@@ -122,7 +122,7 @@ CREATE TABLE budget_days (
   used INTEGER NOT NULL,
   PRIMARY KEY(network_id,day)
 );
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 CREATE TABLE local_values (
   network_id TEXT NOT NULL,
   key TEXT NOT NULL,

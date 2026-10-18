@@ -1385,22 +1385,6 @@ impl Runtime {
             "operation does not belong to this task binding"
         );
         let operation_id = id(input, "operation_id")?;
-        let legacy_intent = json!({"conversation_id":scope,"task_id":task,"action":action,"expected_operation_id":input["expected_operation_id"],"expected_revision":input["expected_revision"],"text":input["text"],"request_id":input["request_id"],"response":input["response"]});
-        let legacy = self
-            .store
-            .lock()
-            .await
-            .local_value(&access.network_id, &control_key(&operation_id))?;
-        if let Some(prepared) = legacy
-            && prepared["intent"].get("task_id").is_some()
-        {
-            ensure!(
-                prepared["intent"] == legacy_intent,
-                "operation ID reused with different task control"
-            );
-            let request: OperationRequest = serde_json::from_value(prepared["request"].clone())?;
-            return self.dispatch(access.clone(), request).await;
-        }
         let action = match action {
             "interrupt" => json!({"type":"interrupt"}),
             "steer" => json!({"type":"steer","text":field(input,"text")?}),
