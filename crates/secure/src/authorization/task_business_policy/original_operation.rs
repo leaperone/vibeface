@@ -758,15 +758,44 @@ mod tests {
                 source.acceptance_envelope_hash(),
                 &ObjectHash::body(&fixture.acceptance).unwrap()
             );
+            assert!(
+                check
+                    .sign_receipts(&fixture.project_node, &challenge, now)
+                    .is_err()
+            );
+            assert!(
+                check
+                    .sign_receipts(&fixture.executor, &challenge, now + 1)
+                    .is_err()
+            );
+            let mut changed = challenge.clone();
+            changed.binding_generation += 1;
+            assert!(
+                check
+                    .sign_receipts(&fixture.executor, &changed, now)
+                    .is_err()
+            );
+            let local = check
+                .sign_receipts(&fixture.executor, &challenge, now)
+                .unwrap();
+            assert!(!local.is_empty());
+            assert!(local.iter().all(|receipt| {
+                receipt.issuer == c_key && check.primary_heads().contains(&receipt.payload.current)
+            }));
+            let mut all = receipts(
+                state.state(),
+                check.dependencies(),
+                &challenge.hash().unwrap(),
+                &fixture,
+                now,
+                now + 500,
+            )
+            .into_iter()
+            .filter(|receipt| receipt.issuer != c_key)
+            .collect::<Vec<_>>();
+            all.extend(local);
             let proof = ExecutionHandoffFreshness {
-                receipts: receipts(
-                    state.state(),
-                    check.dependencies(),
-                    &challenge.hash().unwrap(),
-                    &fixture,
-                    now,
-                    now + 500,
-                ),
+                receipts: all,
                 challenge,
             };
             let mut missing = proof.clone();
