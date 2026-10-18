@@ -261,7 +261,7 @@ impl Store {
             "Node policy pending source changed its signed request"
         );
         let floors = ingress::floors_in(&tx, pending.request.execution_pins())?;
-        let importer = TaskPolicyImport::Node(begin_node_task_policy_import(
+        let importer = TaskPolicyImport::Node(Box::new(begin_node_task_policy_import(
             &pending.trust,
             &pending.source,
             &pending.request,
@@ -269,7 +269,7 @@ impl Store {
             &floors,
             peer,
             now,
-        )?);
+        )?));
         let approval_ref = pending.trust.approval().hash()?;
         let snapshot_ref = ObjectHash::body(snapshot)?;
         let reference = ObjectHash::body(&(
@@ -455,8 +455,8 @@ impl Store {
 
 #[derive(Clone)]
 pub(super) enum TaskPolicyImport {
-    Account(TaskExecutionPolicyImport),
-    Node(NodeTaskExecutionPolicyImport),
+    Account(Box<TaskExecutionPolicyImport>),
+    Node(Box<NodeTaskExecutionPolicyImport>),
 }
 
 impl TaskPolicyImport {
@@ -489,8 +489,8 @@ impl TaskPolicyImport {
         now: u64,
     ) -> Result<VerifiedTaskCurrentPolicy> {
         Ok(match self {
-            Self::Account(value) => value.finish_current(witness, now)?,
-            Self::Node(value) => value.finish_current(witness, now)?,
+            Self::Account(value) => (*value).finish_current(witness, now)?,
+            Self::Node(value) => (*value).finish_current(witness, now)?,
         })
     }
     pub(super) fn finish_history(
@@ -499,8 +499,8 @@ impl TaskPolicyImport {
         now: u64,
     ) -> Result<VerifiedTaskHistoryPolicy> {
         Ok(match self {
-            Self::Account(value) => value.finish_history(witness, now)?,
-            Self::Node(value) => value.finish_history(witness, now)?,
+            Self::Account(value) => (*value).finish_history(witness, now)?,
+            Self::Node(value) => (*value).finish_history(witness, now)?,
         })
     }
     pub(super) fn finish_original_admission(
@@ -509,8 +509,8 @@ impl TaskPolicyImport {
         proof: &crate::model::AdmissionProof,
     ) -> Result<VerifiedTaskOriginalAdmissionPolicy> {
         Ok(match self {
-            Self::Account(value) => value.finish_original_admission(witness, proof)?,
-            Self::Node(value) => value.finish_original_admission(witness, proof)?,
+            Self::Account(value) => (*value).finish_original_admission(witness, proof)?,
+            Self::Node(value) => (*value).finish_original_admission(witness, proof)?,
         })
     }
     pub(super) fn finish_retained_floors(
@@ -519,8 +519,8 @@ impl TaskPolicyImport {
         clock: u64,
     ) -> Result<Vec<vibeface_secure::authorization::PolicyPin>> {
         Ok(match self {
-            Self::Account(value) => value.finish_retained_floors(witness, clock)?,
-            Self::Node(value) => value.finish_retained_floors(witness, clock)?,
+            Self::Account(value) => (*value).finish_retained_floors(witness, clock)?,
+            Self::Node(value) => (*value).finish_retained_floors(witness, clock)?,
         })
     }
 }

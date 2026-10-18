@@ -288,7 +288,7 @@ impl Store {
             &snapshot_ref,
         ))?;
         let floors = floors_in(&tx, &input.request.intent.payload.execution_pins)?;
-        let importer = super::node::TaskPolicyImport::Account(begin_task_policy_import(
+        let importer = super::node::TaskPolicyImport::Account(Box::new(begin_task_policy_import(
             &trust,
             &source,
             &input.request,
@@ -296,7 +296,7 @@ impl Store {
             &floors,
             PolicyCarrierOrigin::SignedTranscript,
             now,
-        )?);
+        )?));
         usage.merge(importer.proof_usage());
         let fresh = CachedImport {
             importer,

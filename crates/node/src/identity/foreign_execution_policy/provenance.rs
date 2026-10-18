@@ -1213,8 +1213,8 @@ fn rebuild_retained_import_in(
     let mut importer = {
         let _carrier = ScopedSignatureVerification::new();
         let importer=match request {
-            TaskExecutionPolicyRequest::Account(value)=>super::node::TaskPolicyImport::Account(begin_task_policy_import(&trust,&retained,value,snapshot,&[],PolicyCarrierOrigin::SignedTranscript,clock)?),
-            TaskExecutionPolicyRequest::Node(value)=>super::node::TaskPolicyImport::Node(vibeface_secure::authorization::node_execution_policy::begin_retained_node_task_policy_import(&trust,&retained,value,snapshot,clock)?),
+            TaskExecutionPolicyRequest::Account(value)=>super::node::TaskPolicyImport::Account(Box::new(begin_task_policy_import(&trust,&retained,value,snapshot,&[],PolicyCarrierOrigin::SignedTranscript,clock)?)),
+            TaskExecutionPolicyRequest::Node(value)=>super::node::TaskPolicyImport::Node(Box::new(vibeface_secure::authorization::node_execution_policy::begin_retained_node_task_policy_import(&trust,&retained,value,snapshot,clock)?)),
         };
         importer.proof_usage().enforce_limits()?;
         ensure_actual_budget()?;
