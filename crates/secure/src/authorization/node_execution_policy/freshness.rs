@@ -141,21 +141,16 @@ pub fn record_node_freshness_receipts(
         canonical(&(capability.request(), receipts))?.len() <= MAX_PROOF_BYTES,
         "node freshness request and receipts exceed 64 KiB",
     )?;
-    require(
-        receipts.len() == capability.allowed_heads.len(),
-        "node freshness receipts differ from this authority's exact subset",
-    )?;
     let challenge = capability.challenge();
     let challenge_hash = challenge.hash()?;
     let mut seen = BTreeSet::new();
     let mut usage = capability.usage.clone();
     for receipt in receipts {
         let value = &receipt.payload;
+        value.validate_currents()?;
         require(
             receipt.issuer == capability.local_c
                 && value.version == AUTH_VERSION
-                && capability.allows_head(&value.current)
-                && seen.insert(value.current.domain.clone())
                 && value.challenge_hash == challenge_hash
                 && value.issued_at_ms >= challenge.issued_at_ms
                 && value.issued_at_ms >= capability.verified_at_ms
@@ -163,8 +158,18 @@ pub fn record_node_freshness_receipts(
             "node freshness receipt changed its authority, challenge or window",
         )?;
         validate_window(value.issued_at_ms, value.expires_at_ms, now)?;
+        for current in &value.currents {
+            require(
+                capability.allows_head(current) && seen.insert(current.domain.clone()),
+                "node freshness receipts differ from this authority's exact subset",
+            )?;
+        }
         usage.record_signed(receipt)?;
     }
+    require(
+        seen.len() == capability.allowed_heads.len(),
+        "node freshness receipts differ from this authority's exact subset",
+    )?;
     finish_freshness_usage(&mut usage)?;
     Ok(usage)
 }
@@ -294,25 +299,21 @@ mod tests {
                 .iter()
                 .any(|head| !capability.allows_head(head))
         );
-        let receipts: Vec<_> = capability
-            .target_heads()
-            .iter()
-            .filter(|head| capability.allows_head(head))
-            .map(|head| {
-                Signed::sign(
-                    FreshnessReceipt {
-                        version: AUTH_VERSION,
-                        current: head.clone(),
-                        challenge_hash: request.payload.challenge.hash().unwrap(),
-                        issued_at_ms: now,
-                        expires_at_ms: capability.expires_at_ms(),
-                    },
-                    &fixture.executor,
-                )
-                .unwrap()
-            })
-            .collect();
+        let receipts = vec![
+            Signed::sign(
+                FreshnessReceipt {
+                    version: AUTH_VERSION,
+                    currents: capability.allowed_heads.iter().cloned().collect(),
+                    challenge_hash: request.payload.challenge.hash().unwrap(),
+                    issued_at_ms: now,
+                    expires_at_ms: capability.expires_at_ms(),
+                },
+                &fixture.executor,
+            )
+            .unwrap(),
+        ];
         assert!(!receipts.is_empty());
+        assert!(receipts[0].payload.currents.len() > 1);
         for receipt in &receipts {
             receipt.verify_signature().unwrap();
             assert_eq!(receipt.issuer, target);
@@ -338,6 +339,55 @@ mod tests {
         );
         assert!(record_node_freshness_receipts(&capability, &[], now).is_err());
         let mut changed = receipts.clone();
+        changed[0].payload.currents.clear();
+        assert!(record_node_freshness_receipts(&capability, &changed, now).is_err());
+        let split: Vec<_> = receipts[0]
+            .payload
+            .currents
+            .iter()
+            .map(|current| {
+                let mut value = receipts[0].payload.clone();
+                value.currents = vec![current.clone()];
+                Signed::sign(value, &fixture.executor).unwrap()
+            })
+            .collect();
+        let split_usage = record_node_freshness_receipts(&capability, &split, now).unwrap();
+        assert_eq!(
+            split_usage.counts().unique_signed_objects,
+            capability.proof_usage().counts().unique_signed_objects + split.len()
+        );
+        let mut changed = receipts.clone();
+        changed.push(receipts[0].clone());
+        assert!(record_node_freshness_receipts(&capability, &changed, now).is_err());
+        let mut changed = receipts.clone();
+        let duplicate = changed[0].payload.currents[0].clone();
+        changed[0].payload.currents.insert(1, duplicate);
+        assert!(record_node_freshness_receipts(&capability, &changed, now).is_err());
+        let mut changed = receipts.clone();
+        changed[0].payload.currents.reverse();
+        assert!(record_node_freshness_receipts(&capability, &changed, now).is_err());
+        let mut changed = receipts.clone();
+        changed[0].payload.currents.pop();
+        assert!(record_node_freshness_receipts(&capability, &changed, now).is_err());
+        let mut changed = receipts.clone();
+        changed[0].payload.currents.push(
+            capability
+                .challenge()
+                .policies
+                .iter()
+                .find(|head| !capability.allows_head(head))
+                .unwrap()
+                .clone(),
+        );
+        changed[0]
+            .payload
+            .currents
+            .sort_by(|left, right| left.domain.cmp(&right.domain));
+        assert!(record_node_freshness_receipts(&capability, &changed, now).is_err());
+        let mut changed = receipts.clone();
+        changed[0].payload.currents[0].sequence += 1;
+        assert!(record_node_freshness_receipts(&capability, &changed, now).is_err());
+        let mut changed = receipts.clone();
         changed[0].payload.challenge_hash = ObjectHash::body(&"another challenge").unwrap();
         assert!(record_node_freshness_receipts(&capability, &changed, now).is_err());
         let mut changed = receipts.clone();
@@ -346,6 +396,18 @@ mod tests {
         let mut changed = receipts.clone();
         changed[0].issuer = source.clone();
         assert!(record_node_freshness_receipts(&capability, &changed, now).is_err());
+        let mut changed = receipts.clone();
+        changed[0] = Signed::sign(changed[0].payload.clone(), &fixture.project_node).unwrap();
+        assert!(record_node_freshness_receipts(&capability, &changed, now).is_err());
+        let mut changed = receipts.clone();
+        changed[0].signature = Signature("00".repeat(64));
+        let metered = record_node_freshness_receipts(&capability, &changed, now).unwrap();
+        let metered = metered.counts().actual.unwrap();
+        let retained = capability.proof_usage().counts().actual.unwrap();
+        assert_eq!(
+            (metered.actual_verifications, metered.cache_hits),
+            (retained.actual_verifications, retained.cache_hits)
+        );
         let mut changed = receipts.clone();
         changed[0].signature = Signature("00".repeat(MAX_PROOF_BYTES));
         assert!(record_node_freshness_receipts(&capability, &changed, now).is_err());

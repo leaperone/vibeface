@@ -439,7 +439,10 @@ fn check_entry_dependencies(
         JournalEntry::AccountCommit(value) => {
             account_transition(state, pins, &value.proposal.payload)?;
             for receipt in &value.receipts {
-                witness(state, pins, &receipt.payload.current)?;
+                receipt.payload.validate_currents()?;
+                for head in &receipt.payload.currents {
+                    witness(state, pins, head)?;
+                }
             }
         }
         JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => {
@@ -448,7 +451,10 @@ fn check_entry_dependencies(
         JournalEntry::SpaceCommit(value) => {
             space_transition(state, pins, &value.proposal.payload)?;
             for receipt in &value.receipts {
-                witness(state, pins, &receipt.payload.current)?;
+                receipt.payload.validate_currents()?;
+                for head in &receipt.payload.currents {
+                    witness(state, pins, head)?;
+                }
             }
         }
         JournalEntry::Device(value) => {

@@ -1187,10 +1187,6 @@ impl VerifiedPolicySet {
             "execution handoff challenge mismatch",
         )?;
         validate_window(challenge.issued_at_ms, challenge.expires_at_ms, now_ms)?;
-        require(
-            proof.receipts.len() == handoff.dependencies.len(),
-            "handoff requires fresh receipts from both authority closures",
-        )?;
         let hash = challenge.hash()?;
         let mut seen = BTreeSet::new();
         let mut budget = Budget::default();
@@ -1198,36 +1194,55 @@ impl VerifiedPolicySet {
         for signed in &proof.receipts {
             budget.verify(signed)?;
             let receipt = &signed.payload;
+            receipt.validate_currents()?;
             require(
                 receipt.version == AUTH_VERSION
                     && receipt.challenge_hash == hash
-                    && handoff.dependencies.contains(&receipt.current)
-                    && seen.insert(receipt.current.domain.clone()),
-                "handoff freshness receipt mismatch",
-            )?;
-            let authority = match &receipt.current.domain {
-                PolicyDomain::Account(id) => self.account(id).map(|document| &document.authority),
-                PolicyDomain::Space(id) => self.space(id).map(|document| &document.authority),
-            }
-            .ok_or(AuthorizationError::InvalidProof(
-                "missing handoff freshness authority",
-            ))?;
-            if self
-                .devices
-                .values()
-                .any(|certificate| certificate.payload.device == authority.device)
-            {
-                self.find_device(&authority.device)?;
-            }
-            require(
-                signed.issuer == authority.public_key
                     && receipt.issued_at_ms >= challenge.issued_at_ms
                     && receipt.expires_at_ms <= challenge.expires_at_ms,
-                "handoff receipt is not from its current authority",
+                "handoff freshness receipt mismatch",
             )?;
             validate_window(receipt.issued_at_ms, receipt.expires_at_ms, now_ms)?;
+            for current in &receipt.currents {
+                require(
+                    handoff.dependencies.contains(current)
+                        && self.head(&current.domain) == Some(current)
+                        && seen.insert(current.domain.clone()),
+                    "handoff freshness receipt mismatch",
+                )?;
+                let authority = match &current.domain {
+                    PolicyDomain::Account(id) => self.account(id).map(|d| &d.authority),
+                    PolicyDomain::Space(id) => self.space(id).map(|d| &d.authority),
+                }
+                .ok_or(AuthorizationError::InvalidProof(
+                    "missing handoff freshness authority",
+                ))?;
+                if self
+                    .devices
+                    .values()
+                    .any(|certificate| certificate.payload.device == authority.device)
+                {
+                    let certificate = self.find_device(&authority.device)?;
+                    require(
+                        certificate.payload.public_key == signed.issuer
+                            && certificate.payload.subject
+                                == Actor::Service(authority.service.clone()),
+                        "handoff receipt is not from its current authority",
+                    )?;
+                }
+                require(
+                    signed.issuer == authority.public_key
+                        && DeviceId::from_key(&signed.issuer) == authority.device
+                        && ServiceId::from_key(&signed.issuer) == authority.service,
+                    "handoff receipt is not from its current authority",
+                )?;
+            }
             expires_at_ms = expires_at_ms.min(receipt.expires_at_ms);
         }
+        require(
+            seen.len() == handoff.dependencies.len(),
+            "handoff requires fresh receipts from both authority closures",
+        )?;
         let mut usage = handoff.usage.clone();
         usage.record_budget(&budget)?;
         usage.record_metadata(challenge)?;
@@ -2289,10 +2304,6 @@ impl VerifiedPolicySet {
             "execution resolution challenge mismatch",
         )?;
         validate_window(challenge.issued_at_ms, challenge.expires_at_ms, now_ms)?;
-        require(
-            proof.receipts.len() == value.dependencies.len(),
-            "resolution requires both current authority closures",
-        )?;
         let hash = challenge.hash()?;
         let mut seen = BTreeSet::new();
         let mut budget = Budget::default();
@@ -2300,36 +2311,55 @@ impl VerifiedPolicySet {
         for signed in &proof.receipts {
             budget.verify(signed)?;
             let receipt = &signed.payload;
+            receipt.validate_currents()?;
             require(
                 receipt.version == AUTH_VERSION
                     && receipt.challenge_hash == hash
-                    && value.dependencies.contains(&receipt.current)
-                    && seen.insert(receipt.current.domain.clone()),
-                "resolution freshness receipt mismatch",
-            )?;
-            let authority = match &receipt.current.domain {
-                PolicyDomain::Account(id) => self.account(id).map(|d| &d.authority),
-                PolicyDomain::Space(id) => self.space(id).map(|d| &d.authority),
-            }
-            .ok_or(AuthorizationError::InvalidProof(
-                "missing resolution authority",
-            ))?;
-            if self
-                .devices
-                .values()
-                .any(|cert| cert.payload.device == authority.device)
-            {
-                self.find_device(&authority.device)?;
-            }
-            require(
-                signed.issuer == authority.public_key
                     && receipt.issued_at_ms >= challenge.issued_at_ms
                     && receipt.expires_at_ms <= challenge.expires_at_ms,
-                "resolution receipt is not from its current authority",
+                "resolution freshness receipt mismatch",
             )?;
             validate_window(receipt.issued_at_ms, receipt.expires_at_ms, now_ms)?;
+            for current in &receipt.currents {
+                require(
+                    value.dependencies.contains(current)
+                        && self.head(&current.domain) == Some(current)
+                        && seen.insert(current.domain.clone()),
+                    "resolution freshness receipt mismatch",
+                )?;
+                let authority = match &current.domain {
+                    PolicyDomain::Account(id) => self.account(id).map(|d| &d.authority),
+                    PolicyDomain::Space(id) => self.space(id).map(|d| &d.authority),
+                }
+                .ok_or(AuthorizationError::InvalidProof(
+                    "missing resolution authority",
+                ))?;
+                if self
+                    .devices
+                    .values()
+                    .any(|certificate| certificate.payload.device == authority.device)
+                {
+                    let certificate = self.find_device(&authority.device)?;
+                    require(
+                        certificate.payload.public_key == signed.issuer
+                            && certificate.payload.subject
+                                == Actor::Service(authority.service.clone()),
+                        "resolution receipt is not from its current authority",
+                    )?;
+                }
+                require(
+                    signed.issuer == authority.public_key
+                        && DeviceId::from_key(&signed.issuer) == authority.device
+                        && ServiceId::from_key(&signed.issuer) == authority.service,
+                    "resolution receipt is not from its current authority",
+                )?;
+            }
             expiry = expiry.min(receipt.expires_at_ms);
         }
+        require(
+            seen.len() == value.dependencies.len(),
+            "resolution requires both current authority closures",
+        )?;
         let mut usage = value.usage.clone();
         usage.record_budget(&budget)?;
         usage.record_metadata(challenge)?;

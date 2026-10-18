@@ -609,8 +609,7 @@ pub fn verify_remote_execution_history_acceptance(
             && reference.account_admitted_at_ms <= decision_at_ms
             && !heads.is_empty()
             && heads.len() <= MAX_POLICY_DOMAINS
-            && heads.windows(2).all(|pair| pair[0].domain < pair[1].domain)
-            && receipts.len() == heads.len(),
+            && heads.windows(2).all(|pair| pair[0].domain < pair[1].domain),
         "historical policy proof changed its exact heads or decision time",
     )?;
     validate_window(issued, expires, decision_at_ms)?;
@@ -630,31 +629,51 @@ pub fn verify_remote_execution_history_acceptance(
         .collect();
     let historical = remote_resolution_history::at_heads(state, &known)?;
     let mut seen = BTreeSet::new();
+    let mut budget = Budget::default();
     for signed in receipts {
-        signed.verify_signature()?;
+        budget.verify(signed)?;
         let receipt = &signed.payload;
+        receipt.validate_currents()?;
         require(
             receipt.version == AUTH_VERSION
                 && receipt.challenge_hash == challenge_hash
-                && heads.contains(&receipt.current)
-                && seen.insert(receipt.current.domain.clone())
                 && receipt.issued_at_ms >= issued
                 && receipt.expires_at_ms <= expires,
             "historical freshness changed its exact policy proof",
         )?;
         validate_window(receipt.issued_at_ms, receipt.expires_at_ms, decision_at_ms)?;
-        if historical.head(&receipt.current.domain).is_some() {
-            let authority = match &receipt.current.domain {
-                PolicyDomain::Account(account) => &historical.account(account).unwrap().authority,
-                PolicyDomain::Space(space) => &historical.space(space).unwrap().authority,
-            };
+        for head in &receipt.currents {
             require(
-                signed.issuer == authority.public_key,
-                "historical freshness changed its known authority",
+                heads.contains(head) && seen.insert(head.domain.clone()),
+                "historical freshness changed its exact policy proof",
             )?;
+            if historical.head(&head.domain).is_some() {
+                require(
+                    historical.head(&head.domain) == Some(head)
+                        && historical.roots.contains_key(head),
+                    "historical freshness is missing its exact policy witness",
+                )?;
+                let authority = match &head.domain {
+                    PolicyDomain::Account(account) => {
+                        &historical.account(account).unwrap().authority
+                    }
+                    PolicyDomain::Space(space) => &historical.space(space).unwrap().authority,
+                };
+                require(
+                    signed.issuer == authority.public_key
+                        && DeviceId::from_key(&signed.issuer) == authority.device
+                        && ServiceId::from_key(&signed.issuer) == authority.service,
+                    "historical freshness changed its known authority",
+                )?;
+            }
         }
         usage.record_signed(signed)?;
     }
+    require(
+        seen.len() == heads.len(),
+        "historical freshness changed its exact policy proof",
+    )?;
+    usage.record_budget(&budget)?;
     if let Some(counts) = SignatureVerification::current_counts() {
         usage.record_actual_signature_counts(counts);
     }
@@ -941,6 +960,121 @@ mod tests {
         let mut wrong_binding = fixture.binding.clone();
         wrong_binding.binding.generation += 1;
         assert!(derive_reference(&actual, &body, &invocation, &wire(&wrong_binding)).is_err());
+    }
+
+    #[test]
+    fn retained_acceptance_requires_exact_canonical_freshness_batches() {
+        let fixture = retained_history_fixture();
+        let reference = derive_reference(
+            &wire(&fixture.actual),
+            &wire(&fixture.body),
+            &wire(&fixture.invocation),
+            &wire(&fixture.binding),
+        )
+        .unwrap();
+        let target = PublicKey::of(&fixture.executor);
+        verify_remote_execution_history_acceptance(
+            &fixture.state,
+            &reference,
+            &fixture.acceptance,
+            &target,
+            NOW + 20,
+        )
+        .unwrap();
+        let RemoteExecutionHistoryAcceptance::ExecutionResult { freshness, .. } =
+            &fixture.acceptance
+        else {
+            panic!("fixture must retain an original executor admission")
+        };
+        let receipts = &freshness.receipts;
+        let batch = receipts
+            .iter()
+            .position(|receipt| {
+                receipt.payload.currents.len() > 1
+                    && receipt
+                        .payload
+                        .currents
+                        .iter()
+                        .all(|head| fixture.state.head(&head.domain).is_some())
+            })
+            .expect("fixture must batch known heads under one authority");
+        let assert_rejected = |receipts: Vec<Signed<FreshnessReceipt>>| {
+            let mut acceptance = fixture.acceptance.clone();
+            let RemoteExecutionHistoryAcceptance::ExecutionResult {
+                receipt, freshness, ..
+            } = &mut acceptance
+            else {
+                unreachable!()
+            };
+            freshness.receipts = receipts;
+            receipt.payload.admission_hash = ObjectHash::body(freshness).unwrap();
+            *receipt = Signed::sign(receipt.payload.clone(), &fixture.executor).unwrap();
+            assert!(
+                verify_remote_execution_history_acceptance(
+                    &fixture.state,
+                    &reference,
+                    &acceptance,
+                    &target,
+                    NOW + 20,
+                )
+                .is_err()
+            );
+        };
+        let mut changed = receipts.clone();
+        changed.push(receipts[batch].clone());
+        assert_rejected(changed);
+        let mut changed = receipts.clone();
+        changed.remove(batch);
+        assert_rejected(changed);
+        let mut changed = receipts.clone();
+        let mut payload = changed[batch].payload.clone();
+        payload.currents.swap(0, 1);
+        changed[batch] = Signed::sign(payload, &fixture.executor).unwrap();
+        assert_rejected(changed);
+        let mut changed = receipts.clone();
+        let mut payload = changed[batch].payload.clone();
+        payload.currents.push(payload.currents[0].clone());
+        payload
+            .currents
+            .sort_by(|left, right| left.domain.cmp(&right.domain));
+        changed[batch] = Signed::sign(payload, &fixture.executor).unwrap();
+        assert_rejected(changed);
+        let mut changed = receipts.clone();
+        let mut payload = changed[batch].payload.clone();
+        let mut extra = payload.currents[0].clone();
+        extra.domain =
+            PolicyDomain::Account(AccountId::from_root(&PublicKey::of(&Identity::generate())));
+        payload.currents.push(extra);
+        payload
+            .currents
+            .sort_by(|left, right| left.domain.cmp(&right.domain));
+        changed[batch] = Signed::sign(payload, &fixture.executor).unwrap();
+        assert_rejected(changed);
+        let mut changed = receipts.clone();
+        changed[batch] =
+            Signed::sign(changed[batch].payload.clone(), &fixture.project_node).unwrap();
+        assert_rejected(changed);
+        let mut changed = receipts.clone();
+        let unknown = changed
+            .iter()
+            .position(|receipt| {
+                receipt
+                    .payload
+                    .currents
+                    .iter()
+                    .all(|head| fixture.state.head(&head.domain).is_none())
+            })
+            .expect("fixture must retain the source authority's unknown domains");
+        let mut payload = changed[unknown].payload.clone();
+        payload
+            .currents
+            .extend(changed[batch].payload.currents.clone());
+        payload
+            .currents
+            .sort_by(|left, right| left.domain.cmp(&right.domain));
+        changed[unknown] = Signed::sign(payload, &fixture.project_node).unwrap();
+        changed.remove(batch);
+        assert_rejected(changed);
     }
 
     #[test]

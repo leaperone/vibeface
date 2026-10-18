@@ -727,10 +727,6 @@ fn check_registration_freshness(
         "execution registration freshness belongs to another root-approved request",
     )?;
     validate_window(challenge.issued_at_ms, challenge.expires_at_ms, now)?;
-    require(
-        receipts.len() == challenge.policies.len(),
-        "execution registration is missing authority freshness",
-    )?;
     let hash = challenge.hash()?;
     if verified.budget.objects.insert(hash.clone()) {
         let bytes = canonical(challenge)?.len();
@@ -746,25 +742,37 @@ fn check_registration_freshness(
     for receipt in receipts {
         verified.budget.verify(receipt)?;
         let value = &receipt.payload;
-        let authority = match &value.current.domain {
-            PolicyDomain::Account(id) => state.account(id).map(|account| &account.authority),
-            PolicyDomain::Space(id) => state.space(id).map(|space| &space.authority),
-        }
-        .ok_or(AuthorizationError::PolicyConflict)?;
+        value.validate_currents()?;
         require(
-            receipt.issuer == authority.public_key
-                && value.version == AUTH_VERSION
+            value.version == AUTH_VERSION
                 && value.challenge_hash == hash
-                && challenge.policies.contains(&value.current)
-                && seen.insert(value.current.domain.clone())
                 && value.issued_at_ms >= challenge.issued_at_ms
                 && value.issued_at_ms <= now
                 && value.expires_at_ms <= challenge.expires_at_ms,
             "execution registration authority receipt changed",
         )?;
         validate_window(value.issued_at_ms, value.expires_at_ms, now)?;
+        for current in &value.currents {
+            let authority = match &current.domain {
+                PolicyDomain::Account(id) => state.account(id).map(|account| &account.authority),
+                PolicyDomain::Space(id) => state.space(id).map(|space| &space.authority),
+            }
+            .ok_or(AuthorizationError::PolicyConflict)?;
+            require(
+                receipt.issuer == authority.public_key
+                    && authority.device == DeviceId::from_key(&receipt.issuer)
+                    && authority.service == ServiceId::from_key(&receipt.issuer)
+                    && state.head(&current.domain) == Some(current)
+                    && challenge.policies.contains(current)
+                    && seen.insert(current.domain.clone()),
+                "execution registration authority receipt changed",
+            )?;
+        }
     }
-    Ok(())
+    require(
+        seen.len() == challenge.policies.len(),
+        "execution registration is missing authority freshness",
+    )
 }
 
 pub fn verify_execution_service_registration_commit(
@@ -2038,24 +2046,19 @@ mod tests {
             &key(4),
         )
         .unwrap();
-        let receipts = challenge
-            .payload
-            .dependencies
-            .iter()
-            .map(|head| {
-                Signed::sign(
-                    FreshnessReceipt {
-                        version: AUTH_VERSION,
-                        current: head.clone(),
-                        challenge_hash: challenge.challenge_hash().unwrap(),
-                        issued_at_ms: NOW as u64,
-                        expires_at_ms: challenge.payload.expires_at_ms,
-                    },
-                    &key(4),
-                )
-                .unwrap()
-            })
-            .collect();
+        let receipts = vec![
+            Signed::sign(
+                FreshnessReceipt {
+                    version: AUTH_VERSION,
+                    currents: challenge.payload.dependencies.clone(),
+                    challenge_hash: challenge.challenge_hash().unwrap(),
+                    issued_at_ms: NOW as u64,
+                    expires_at_ms: challenge.payload.expires_at_ms,
+                },
+                &key(4),
+            )
+            .unwrap(),
+        ];
         let mut accepted = challenge.payload;
         accepted.accepted_at_ms = NOW as u64;
         Committed {
@@ -2250,6 +2253,81 @@ mod tests {
             NOW + 60_000.0,
         );
         assert!(matches!(result,Err(error) if error.contains("genuine policy snapshot")));
+    }
+
+    #[test]
+    fn registration_freshness_batches_require_exact_current_authority_coverage() {
+        let (state, prepared, _) = registration();
+        let local_node = PublicKey::of(&key(4));
+        let main = verify_execution_service_registration(
+            &state,
+            &prepared.request,
+            &local_node,
+            NOW as u64,
+        )
+        .unwrap();
+        let challenge = execution_service_registration_challenge(
+            &state,
+            &prepared.request,
+            &local_node,
+            NOW as u64,
+        )
+        .unwrap();
+        assert!(challenge.policies.len() > 1);
+        let sign = |currents: Vec<PolicyStamp>| {
+            Signed::sign(
+                FreshnessReceipt {
+                    version: AUTH_VERSION,
+                    currents,
+                    challenge_hash: challenge.hash().unwrap(),
+                    issued_at_ms: NOW as u64,
+                    expires_at_ms: challenge.expires_at_ms,
+                },
+                &key(4),
+            )
+            .unwrap()
+        };
+        let verify = |receipts: &[Signed<FreshnessReceipt>]| {
+            verify_execution_service_registration_freshness(
+                &state,
+                &prepared.request,
+                &challenge,
+                receipts,
+                &local_node,
+                NOW as u64,
+            )
+        };
+        let receipt = sign(challenge.policies.clone());
+        let verified = verify(std::slice::from_ref(&receipt)).unwrap();
+        assert_eq!(
+            verified.proof_counts().objects,
+            main.proof_counts().objects + 2
+        );
+        assert_eq!(
+            verified.proof_counts().signatures,
+            main.proof_counts().signatures + 1
+        );
+
+        let mut duplicate = challenge.policies.clone();
+        duplicate.insert(1, duplicate[0].clone());
+        let mut unsorted = challenge.policies.clone();
+        unsorted.reverse();
+        let mut missing = challenge.policies.clone();
+        missing.pop();
+        let mut extra = challenge.policies.clone();
+        let mut foreign = extra[0].clone();
+        foreign.domain = PolicyDomain::Account(AccountId::from_root(&PublicKey::of(&key(9))));
+        extra.push(foreign);
+        extra.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let mut stale = challenge.policies.clone();
+        stale[0].sequence += 1;
+        for currents in [vec![], duplicate, unsorted, missing, extra, stale] {
+            assert!(verify(&[sign(currents)]).is_err());
+        }
+        assert!(verify(&[]).is_err());
+        assert!(verify(&[receipt.clone(), sign(vec![challenge.policies[0].clone()]),]).is_err());
+        let foreign_authority = Signed::sign(receipt.payload, &key(9)).unwrap();
+        assert!(verify(&[foreign_authority]).is_err());
     }
 
     #[test]

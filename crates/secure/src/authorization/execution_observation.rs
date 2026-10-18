@@ -886,10 +886,6 @@ impl VerifiedPolicySet {
             "observation challenge mismatch",
         )?;
         validate_window(challenge.issued_at_ms, challenge.expires_at_ms, now_ms)?;
-        require(
-            proof.receipts.len() == value.heads.len(),
-            "observation requires both current authority closures",
-        )?;
         let challenge_hash = challenge.hash()?;
         let mut seen = BTreeSet::new();
         let mut budget = Budget::default();
@@ -900,37 +896,55 @@ impl VerifiedPolicySet {
             budget.verify(signed)?;
             usage.record_signed(signed)?;
             let receipt = &signed.payload;
+            receipt.validate_currents()?;
             require(
                 receipt.version == AUTH_VERSION
                     && receipt.challenge_hash == challenge_hash
-                    && value.heads.contains(&receipt.current)
-                    && self.head(&receipt.current.domain) == Some(&receipt.current)
-                    && seen.insert(receipt.current.domain.clone()),
-                "observation freshness receipt mismatch",
-            )?;
-            let authority = match &receipt.current.domain {
-                PolicyDomain::Account(id) => self.account(id).map(|d| &d.authority),
-                PolicyDomain::Space(id) => self.space(id).map(|d| &d.authority),
-            }
-            .ok_or(AuthorizationError::InvalidProof(
-                "missing observation freshness authority",
-            ))?;
-            if self
-                .devices
-                .values()
-                .any(|certificate| certificate.payload.device == authority.device)
-            {
-                self.find_device(&authority.device)?;
-            }
-            require(
-                signed.issuer == authority.public_key
                     && receipt.issued_at_ms >= challenge.issued_at_ms
                     && receipt.expires_at_ms <= challenge.expires_at_ms,
-                "observation receipt is not from its current authority",
+                "observation freshness receipt mismatch",
             )?;
             validate_window(receipt.issued_at_ms, receipt.expires_at_ms, now_ms)?;
+            for current in &receipt.currents {
+                require(
+                    value.heads.contains(current)
+                        && self.head(&current.domain) == Some(current)
+                        && seen.insert(current.domain.clone()),
+                    "observation freshness receipt mismatch",
+                )?;
+                let authority = match &current.domain {
+                    PolicyDomain::Account(id) => self.account(id).map(|d| &d.authority),
+                    PolicyDomain::Space(id) => self.space(id).map(|d| &d.authority),
+                }
+                .ok_or(AuthorizationError::InvalidProof(
+                    "missing observation freshness authority",
+                ))?;
+                if self
+                    .devices
+                    .values()
+                    .any(|certificate| certificate.payload.device == authority.device)
+                {
+                    let certificate = self.find_device(&authority.device)?;
+                    require(
+                        certificate.payload.public_key == signed.issuer
+                            && certificate.payload.subject
+                                == Actor::Service(authority.service.clone()),
+                        "observation receipt is not from its current authority",
+                    )?;
+                }
+                require(
+                    signed.issuer == authority.public_key
+                        && DeviceId::from_key(&signed.issuer) == authority.device
+                        && ServiceId::from_key(&signed.issuer) == authority.service,
+                    "observation receipt is not from its current authority",
+                )?;
+            }
             expiry = expiry.min(receipt.expires_at_ms);
         }
+        require(
+            seen.len() == value.heads.len(),
+            "observation requires both current authority closures",
+        )?;
         if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts()
         {
             usage.record_actual_signature_counts(counts);
@@ -1601,21 +1615,29 @@ pub(crate) mod tests {
         at: u64,
         nodes: &[&Identity],
     ) -> Vec<Signed<FreshnessReceipt>> {
-        heads
-            .iter()
-            .map(|current| {
-                let authority = match &current.domain {
-                    PolicyDomain::Account(id) => &state.account(id).unwrap().authority,
-                    PolicyDomain::Space(id) => &state.space(id).unwrap().authority,
-                };
+        let mut batches = BTreeMap::<PublicKey, Vec<PolicyStamp>>::new();
+        for current in heads {
+            let authority = match &current.domain {
+                PolicyDomain::Account(id) => &state.account(id).unwrap().authority,
+                PolicyDomain::Space(id) => &state.space(id).unwrap().authority,
+            };
+            batches
+                .entry(authority.public_key.clone())
+                .or_default()
+                .push(current.clone());
+        }
+        batches
+            .into_iter()
+            .map(|(issuer, mut currents)| {
+                currents.sort_by(|left, right| left.domain.cmp(&right.domain));
                 let signer = nodes
                     .iter()
-                    .find(|identity| PublicKey::of(identity) == authority.public_key)
+                    .find(|identity| PublicKey::of(identity) == issuer)
                     .unwrap();
                 Signed::sign(
                     FreshnessReceipt {
                         version: AUTH_VERSION,
-                        current: current.clone(),
+                        currents,
                         challenge_hash: challenge_hash.clone(),
                         issued_at_ms: at,
                         expires_at_ms: at + 1_000,
@@ -2375,9 +2397,13 @@ pub(crate) mod tests {
         assert_eq!(read.target().source.operation_id, "original-open");
         assert!(verification.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
         let mut missing = proof.clone();
-        missing
-            .receipts
-            .retain(|receipt| receipt.payload.current.domain != gateway_domain);
+        missing.receipts.retain(|receipt| {
+            !receipt
+                .payload
+                .currents
+                .iter()
+                .any(|current| current.domain == gateway_domain)
+        });
         let full = fixture
             .state
             .verify_execution_observation(&wire, &fixture.original, &fixture.transport(), NOW)
@@ -2832,36 +2858,109 @@ pub(crate) mod tests {
     #[test]
     fn observation_rejects_missing_authority_receipts_stage_changes_and_revoked_pair() {
         let mut fixture = Fixture::new();
+        let (gateway, _) = add_gateway(&mut fixture);
         let wire = fixture.observe(NOW);
         let full = fixture
             .state
             .verify_execution_observation(&wire, &fixture.original, &fixture.transport(), NOW)
             .unwrap();
         let proof = fixture.freshness(full.current(), NOW);
+        assert!(proof.receipts.len() < full.heads().len());
+        fixture
+            .state
+            .verify_execution_observation_freshness(&full, &proof, NOW)
+            .unwrap();
+        fixture
+            .state
+            .verify_execution_observation_current_freshness(full.current(), &proof, NOW)
+            .unwrap();
+        let assert_rejected = |proof: &ExecutionObservationFreshness| {
+            assert!(
+                fixture
+                    .state
+                    .verify_execution_observation_freshness(&full, proof, NOW)
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .state
+                    .verify_execution_observation_current_freshness(full.current(), proof, NOW)
+                    .is_err()
+            );
+        };
         let mut missing = proof.clone();
         missing.receipts.pop();
-        assert!(
-            fixture
-                .state
-                .verify_execution_observation_freshness(&full, &missing, NOW)
-                .is_err()
-        );
+        assert_rejected(&missing);
         let mut wrong = proof.clone();
         wrong.challenge.stage = CheckStage::Start;
-        assert!(
-            fixture
-                .state
-                .verify_execution_observation_freshness(&full, &wrong, NOW)
-                .is_err()
-        );
+        assert_rejected(&wrong);
         let mut duplicate = proof.clone();
-        duplicate.receipts[1] = duplicate.receipts[0].clone();
-        assert!(
-            fixture
+        duplicate.receipts.push(duplicate.receipts[0].clone());
+        assert_rejected(&duplicate);
+        let index = proof
+            .receipts
+            .iter()
+            .position(|receipt| receipt.payload.currents.len() > 1)
+            .unwrap();
+        let signed = &proof.receipts[index];
+        let signer = [&fixture.project.node, &fixture.executor.node]
+            .into_iter()
+            .find(|identity| PublicKey::of(identity) == signed.issuer)
+            .unwrap();
+        let mut duplicate = signed.payload.clone();
+        duplicate.currents.insert(0, duplicate.currents[0].clone());
+        let mut unsorted = signed.payload.clone();
+        unsorted.currents.swap(0, 1);
+        let mut missing_current = signed.payload.clone();
+        missing_current.currents.pop();
+        let mut empty = signed.payload.clone();
+        empty.currents.clear();
+        let mut changed_head = signed.payload.clone();
+        changed_head.currents[0].sequence += 1;
+        for receipt in [duplicate, unsorted, missing_current, empty, changed_head] {
+            let mut malformed = proof.clone();
+            malformed.receipts[index] = Signed::sign(receipt, signer).unwrap();
+            malformed.receipts[index].verify_signature().unwrap();
+            assert_rejected(&malformed);
+        }
+        let mut foreign = proof.clone();
+        foreign.receipts[index] =
+            Signed::sign(signed.payload.clone(), &fixture.project.client).unwrap();
+        foreign.receipts[index].verify_signature().unwrap();
+        assert_rejected(&foreign);
+        let mut mixed_authority = proof.clone();
+        let other = proof
+            .receipts
+            .iter()
+            .find(|receipt| receipt.issuer != signed.issuer)
+            .unwrap();
+        let mut mixed = signed.payload.clone();
+        mixed
+            .currents
+            .extend(other.payload.currents.iter().cloned());
+        mixed
+            .currents
+            .sort_by(|left, right| left.domain.cmp(&right.domain));
+        mixed.validate_currents().unwrap();
+        mixed_authority.receipts[index] = Signed::sign(mixed, signer).unwrap();
+        mixed_authority.receipts[index].verify_signature().unwrap();
+        mixed_authority
+            .receipts
+            .retain(|receipt| receipt.issuer == signed.issuer);
+        assert_rejected(&mixed_authority);
+        let mut extra = proof.clone();
+        extra.receipts.extend(receipts(
+            &fixture.state,
+            &[fixture
                 .state
-                .verify_execution_observation_freshness(&full, &duplicate, NOW)
-                .is_err()
-        );
+                .head(&PolicyDomain::Account(gateway.account.clone()))
+                .unwrap()
+                .clone()],
+            &proof.challenge.hash().unwrap(),
+            NOW,
+            &[&gateway.node],
+        ));
+        assert_rejected(&extra);
         let revoked = fixture.execution_grant.clone();
         update_space(&mut fixture.state, &mut fixture.executor, |doc| {
             doc.grants.retain(|hash| hash != &revoked)
