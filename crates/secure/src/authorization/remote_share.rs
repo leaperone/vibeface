@@ -75,6 +75,7 @@ pub fn prepare_remote_execution_share(
         require(
             owner.scope.device_id == DeviceId::from_key(&PublicKey::of(signer))
                 && *source.reader_public_key() == PublicKey::of(signer)
+                && resource.space == SpaceId::personal(&owner.scope.account_id)
                 && scope_covers(&owner.grant_scope, &resource)
                 && owner.actions.contains(&Action::ResourceManage)
                 && owner.resources.len() == 1
@@ -101,6 +102,8 @@ pub fn prepare_remote_execution_share(
                 && owner.audience.service == record.payload.host
                 && owner.audience.device == certificate.payload.device
                 && certificate.payload.public_key == target
+                && certificate.payload.owner
+                    == PolicyDomain::Account(owner.scope.account_id.clone())
                 && target != original.source_node_public_key,
             "execution sharing changed the selected service or current owner audience",
         )?;
