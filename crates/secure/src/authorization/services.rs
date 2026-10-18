@@ -474,7 +474,10 @@ mod tests {
                 workspace_resource: Some(self.resource.resource.clone()),
                 ..Default::default()
             };
-            let body_hash = ObjectHash::body(&serde_json::json!({"message":"run this"})).unwrap();
+            let source_body = serde_json::json!({"method":"message","space_id":self.space,
+                "resource_id":self.resource.resource,"conversation_id":"chat","authorization_id":"parent",
+                "text":"run this"});
+            let body_hash = ObjectHash::body(&source_body).unwrap();
             let facts = RequestFacts {
                 resource: self.resource.clone(),
                 action: Action::MessageAppend,
@@ -551,22 +554,24 @@ mod tests {
                 .state
                 .verify_freshness(&auth, &challenge, &receipts, NOW)
                 .unwrap();
-            let admitted = self.state.admit_operation(&auth, &freshness, NOW).unwrap();
+            self.state.admit_operation(&auth, &freshness, NOW).unwrap();
+            let proof = events::AdmissionProof {
+                invocation,
+                source_body,
+                challenge,
+                receipts,
+                admitted_at_ms: NOW,
+                transport: events::StoredTransport::from(&transport),
+            };
+            let admitted = self
+                .state
+                .verify_original_admission(&proof, &facts)
+                .unwrap();
             let current = self
                 .state
-                .verify_operation_authorization(&admitted, &facts, &transport, now_ms)
+                .verify_admitted_operation_authorization(&admitted, &facts, now_ms)
                 .unwrap();
-            (
-                current,
-                events::AdmissionProof {
-                    invocation,
-                    source_body: serde_json::json!({"message":"run this"}),
-                    challenge,
-                    receipts,
-                    admitted_at_ms: NOW,
-                    transport: events::StoredTransport::from(&transport),
-                },
-            )
+            (current, proof)
         }
 
         fn sdk_source_provenance(
@@ -693,6 +698,7 @@ mod tests {
                     message_event: trigger.clone(),
                     sdk_trigger: trigger,
                     invocation: origin.invocation,
+                    source_body: origin.source_body,
                     challenge: origin.challenge,
                     receipts: origin.receipts,
                     admitted_at_ms: origin.admitted_at_ms,

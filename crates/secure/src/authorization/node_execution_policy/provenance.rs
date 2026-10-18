@@ -168,32 +168,20 @@ fn origin_parent(
         "SDK source has no original Account message admission",
     )?;
     let facts = invocation_facts(value);
-    let transport = origin.transport.clone().into_evidence();
-    let historical = remote_resolution_history::at_heads(primary, &origin.challenge.policies)?;
-    let authorization = historical.verify_invocation(
-        &origin.invocation,
-        &facts,
-        &transport,
-        origin.admitted_at_ms,
-    )?;
-    let fresh = historical.verify_freshness(
-        &authorization,
-        &origin.challenge,
-        &origin.receipts,
-        origin.admitted_at_ms,
-    )?;
-    let admission = historical.admit_operation(&authorization, &fresh, origin.admitted_at_ms)?;
-    usage.record_authorization(&authorization)?;
-    usage.record_signed(&origin.invocation)?;
-    for receipt in &origin.receipts {
-        usage.record_signed(receipt)?;
-    }
+    let proof = events::AdmissionProof {
+        invocation: origin.invocation.clone(),
+        source_body: origin.source_body.clone(),
+        challenge: origin.challenge.clone(),
+        receipts: origin.receipts.clone(),
+        admitted_at_ms: origin.admitted_at_ms,
+        transport: origin.transport.clone(),
+    };
+    let admission = primary.verify_original_admission(&proof, &facts)?;
+    usage.merge(admission.proof_usage());
     usage.record_metadata(&serde_json::json!({
         "message_event":origin.message_event, "sdk_trigger":origin.sdk_trigger,
-        "challenge":origin.challenge, "admitted_at_ms":origin.admitted_at_ms,
-        "transport":origin.transport,
     }))?;
-    primary.verify_operation_authorization(&admission, &facts, &transport, now)
+    primary.verify_admitted_operation_authorization(&admission, &facts, now)
 }
 
 fn manager_shape(
@@ -238,7 +226,7 @@ fn manager_shape(
             && sdk == session.sdk_session
             && sdk.target == session.device
             && sdk.session_id == trigger
-            && proof.transport.clone().into_evidence()
+            && proof.transport.existing_evidence()?
                 == TransportEvidence::LocalAgentAdapter {
                     service: session.service.clone(),
                     session: session.sdk_session.clone(),
@@ -272,7 +260,7 @@ fn verify_lease(
         "SDK manager lease is outside its original interval",
     )?;
     let view = remote_resolution_history::at_heads(primary, &lease.challenge.policies)?;
-    let transport = proof.transport.clone().into_evidence();
+    let transport = proof.transport.existing_evidence()?;
     let authorization = if lease.challenge.stage == CheckStage::Admit {
         require(
             lease.checked_at_ms == proof.admitted_at_ms
@@ -287,12 +275,7 @@ fn verify_lease(
             lease.checked_at_ms,
         )?
     } else {
-        view.verify_operation_authorization(
-            admission,
-            manager_facts,
-            &transport,
-            lease.checked_at_ms,
-        )?
+        view.verify_admitted_operation_authorization(admission, manager_facts, lease.checked_at_ms)?
     };
     let fresh = view.verify_freshness(
         &authorization,
@@ -320,21 +303,9 @@ fn manager_admission(
     facts: &RequestFacts,
     usage: &mut ExecutionProofUsage,
 ) -> Result<VerifiedAdmission> {
-    let historical = remote_resolution_history::at_heads(primary, &proof.challenge.policies)?;
-    let authorization = historical.verify_invocation(
-        &proof.invocation,
-        facts,
-        &proof.transport.clone().into_evidence(),
-        proof.admitted_at_ms,
-    )?;
-    let freshness = historical.verify_freshness(
-        &authorization,
-        &proof.challenge,
-        &proof.receipts,
-        proof.admitted_at_ms,
-    )?;
-    usage.record_authorization(&authorization)?;
-    historical.admit_operation(&authorization, &freshness, proof.admitted_at_ms)
+    let admission = primary.verify_original_admission(proof, facts)?;
+    usage.merge(admission.proof_usage());
+    Ok(admission)
 }
 
 fn verify_source(
@@ -364,12 +335,8 @@ fn verify_source(
         "SDK manager admission clock moved backwards",
     )?;
     let admitted = manager_admission(primary, proof, &manager_facts, &mut usage)?;
-    let manager = primary.verify_operation_authorization(
-        &admitted,
-        &manager_facts,
-        &proof.transport.clone().into_evidence(),
-        now,
-    )?;
+    let manager =
+        primary.verify_admitted_operation_authorization(&admitted, &manager_facts, now)?;
     let delegation = primary.verify_service_delegation(
         &parent,
         &record.session.service,
@@ -656,23 +623,22 @@ mod tests {
         let freshness = state
             .verify_freshness(&authorization, &challenge, &receipts, NOW)
             .unwrap();
-        let admitted = state
+        state
             .admit_operation(&authorization, &freshness, NOW)
             .unwrap();
+        let proof = events::AdmissionProof {
+            invocation,
+            source_body,
+            challenge,
+            receipts,
+            admitted_at_ms: NOW,
+            transport: events::StoredTransport::from(&transport),
+        };
+        let admitted = state.verify_original_admission(&proof, &facts).unwrap();
         let current = state
-            .verify_operation_authorization(&admitted, &facts, &transport, NOW + 20)
+            .verify_admitted_operation_authorization(&admitted, &facts, NOW + 20)
             .unwrap();
-        (
-            events::AdmissionProof {
-                invocation,
-                source_body,
-                challenge,
-                receipts,
-                admitted_at_ms: NOW,
-                transport: events::StoredTransport::from(&transport),
-            },
-            current,
-        )
+        (proof, current)
     }
 
     fn fixture() -> (
@@ -761,7 +727,9 @@ mod tests {
         ];
         heads.sort_by(|a, b| a.domain.cmp(&b.domain));
         let device = DeviceId::from_key(&PublicKey::of(&user));
-        let source_body = json!({"message":"run this"});
+        let source_body = json!({"method":"message","space_id":resource.space,
+            "resource_id":resource.resource,"conversation_id":"chat","authorization_id":"parent",
+            "text":"run this"});
         let invocation = Signed::sign(
             Invocation {
                 version: AUTH_VERSION,
@@ -880,6 +848,7 @@ mod tests {
                 message_event: trigger.clone(),
                 sdk_trigger: trigger,
                 invocation: origin.invocation,
+                source_body: origin.source_body,
                 challenge: origin.challenge,
                 receipts: origin.receipts,
                 admitted_at_ms: origin.admitted_at_ms,
@@ -988,6 +957,21 @@ mod tests {
             .is_err()
         );
         let mut changed = record.clone();
+        changed.origin.source_body["text"] = json!("changed account message");
+        assert!(
+            verify_sdk_source_provenance(
+                &state,
+                &parent,
+                &changed,
+                &record.session.service,
+                &record.service_grant,
+                &facts,
+                None,
+                NOW + 20,
+            )
+            .is_err()
+        );
+        let mut changed = record.clone();
         changed.lease.deadline += 1;
         assert!(
             verify_sdk_source_provenance(
@@ -1046,12 +1030,7 @@ mod tests {
         let checked = NOW + 1_500;
         assert!(record.manager_admission.invocation.payload.expires_at_ms < checked);
         let manager = state
-            .verify_operation_authorization(
-                &admitted,
-                &facts,
-                &record.manager_admission.transport.clone().into_evidence(),
-                checked,
-            )
+            .verify_admitted_operation_authorization(&admitted, &facts, checked)
             .unwrap();
         let challenge = FreshnessChallenge::new(
             &manager,
