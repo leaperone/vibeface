@@ -1,13 +1,16 @@
 use super::{
-    admission::{consume_authorization_in, validate_persisted_admission},
-    policy::FreshnessProof,
+    admission::{
+        consume_request_authorization_in, load_admission_in, persisted_admission_facts,
+        reconstruct_stored_admission, validate_persisted_admission,
+    },
+    policy::{FreshnessProof, RequestTransport},
 };
 use crate::{
     binding::{self, BindingSeal, SignedBinding, SignedSeal, TaskBinding},
     crypto::LocalIdentity,
     model::{
         AdmissionProof, EventBody, ExecutionSession, OperationRecord, OperationRequest,
-        OperationState, StoredTransport,
+        OperationState,
     },
     store::{Store, canonical_resource},
 };
@@ -55,6 +58,32 @@ fn local_account_action(
     Ok(())
 }
 
+fn check_current_request_in(
+    connection: &Connection,
+    policy: &super::journal::PolicyState,
+    auth: &VerifiedAuthorization,
+    transport: &RequestTransport,
+    body: &Value,
+    now_ms: u64,
+) -> Result<()> {
+    let facts =
+        super::policy::request_facts_from(connection, policy.verified(), body, auth.audience())?;
+    let checked = super::policy::authorize_request_invocation_for_body(
+        policy.verified(),
+        auth.signed_invocation(),
+        &facts,
+        transport,
+        body,
+        now_ms,
+    )?;
+    ensure!(
+        checked.invocation_hash() == auth.invocation_hash(),
+        "operation control authorization changed"
+    );
+    super::admission::check_policy_heads_in(connection, policy.verified(), &checked, now_ms)?;
+    super::admission::check_request_manager_tool_in(connection, policy, &checked, transport, now_ms)
+}
+
 pub(super) fn accepted_before(
     connection: &Connection,
     auth: &VerifiedAuthorization,
@@ -77,9 +106,61 @@ pub(super) fn accepted_before(
             challenge: proof.challenge.clone(),
             receipts: proof.receipts.clone(),
             admitted_at_ms,
-            transport: StoredTransport::from(transport),
+            transport: crate::model::StoredTransport::from(transport),
         },
     )?;
+    Ok(true)
+}
+
+pub(super) fn accepted_request_before(
+    connection: &Connection,
+    policy: &super::journal::PolicyState,
+    auth: &VerifiedAuthorization,
+    proof: &FreshnessProof,
+    transport: &RequestTransport,
+    body: &Value,
+    now_ms: u64,
+) -> Result<bool> {
+    if let RequestTransport::Existing(existing) = transport {
+        return accepted_before(connection, auth, proof, existing, body);
+    }
+    transport.check_current(auth, now_ms)?;
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM accepted_authorizations WHERE space_id=? AND authorization_id=?)",
+        params![auth.resource().space.as_str(), auth.operation_id()], |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(false);
+    }
+    let saved = load_admission_in(
+        connection,
+        auth.resource().space.as_str(),
+        auth.operation_id(),
+    )?;
+    ensure!(
+        saved.invocation == *auth.signed_invocation()
+            && saved.source_body == *body
+            && saved.challenge == proof.challenge
+            && saved.receipts == proof.receipts,
+        "gateway retry changed its original Account request or admission freshness"
+    );
+    let (
+        RequestTransport::DirectedGateway { verified, .. },
+        crate::model::StoredTransport::DirectedGateway { header },
+    ) = (transport, &saved.transport)
+    else {
+        anyhow::bail!("gateway retry changed its accepted transport kind");
+    };
+    let mut retried = verified.header().payload.clone();
+    retried.nonce = header.payload.nonce.clone();
+    retried.issued_at_ms = header.payload.issued_at_ms;
+    retried.expires_at_ms = header.payload.expires_at_ms;
+    ensure!(
+        verified.header().issuer == header.issuer && retried == header.payload,
+        "gateway retry changed its accepted route, source, target or original"
+    );
+    let facts = persisted_admission_facts(connection, policy, &saved)?;
+    reconstruct_stored_admission(connection, policy, &saved, &facts)?;
     Ok(true)
 }
 
@@ -173,6 +254,26 @@ impl Store {
         body: &Value,
         now_ms: u64,
     ) -> Result<OperationRecord> {
+        self.resolve_request_authorized_operation(
+            identity,
+            auth,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            body,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn resolve_request_authorized_operation(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<OperationRecord> {
+        transport.check_current(auth, now_ms)?;
         local_account_action(
             identity,
             auth,
@@ -229,7 +330,10 @@ impl Store {
             "operation differs from its original admission"
         );
         validate_persisted_admission(&tx, &original)?;
-        if accepted_before(&tx, auth, proof, transport, body)? {
+        let original_facts = persisted_admission_facts(&tx, &self.policy, &original)?;
+        reconstruct_stored_admission(&tx, &self.policy, &original, &original_facts)?;
+        check_current_request_in(&tx, &self.policy, auth, transport, body, now_ms)?;
+        if accepted_request_before(&tx, &self.policy, auth, proof, transport, body, now_ms)? {
             ensure!(
                 operation.state == state && operation.result == result,
                 "accepted resolution differs from the terminal ledger"
@@ -240,7 +344,7 @@ impl Store {
             operation.state == OperationState::Unknown,
             "only an unknown operation can be resolved"
         );
-        let admission = consume_authorization_in(
+        let admission = consume_request_authorization_in(
             &tx,
             &self.policy,
             auth,
@@ -322,6 +426,26 @@ impl Store {
         body: &Value,
         now_ms: u64,
     ) -> Result<SignedSeal> {
+        self.seal_task_request_authorized(
+            identity,
+            auth,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            body,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn seal_task_request_authorized(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<SignedSeal> {
+        transport.check_current(auth, now_ms)?;
         local_account_action(
             identity,
             auth,
@@ -348,7 +472,8 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if accepted_before(&tx, auth, proof, transport, body)? {
+        check_current_request_in(&tx, &self.policy, auth, transport, body, now_ms)?;
+        if accepted_request_before(&tx, &self.policy, auth, proof, transport, body, now_ms)? {
             let prior: SignedSeal = serde_json::from_value(
                 value_from(&tx, &binding.binding.network_id, &key)?
                     .context("accepted seal is missing")?,
@@ -413,7 +538,7 @@ impl Store {
         } else {
             0
         };
-        consume_authorization_in(
+        consume_request_authorization_in(
             &tx,
             &self.policy,
             auth,
@@ -460,6 +585,26 @@ impl Store {
         body: &Value,
         now_ms: u64,
     ) -> Result<SignedBinding> {
+        self.rebind_task_request_authorized(
+            identity,
+            auth,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            body,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn rebind_task_request_authorized(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<SignedBinding> {
+        transport.check_current(auth, now_ms)?;
         local_account_action(
             identity,
             auth,
@@ -524,7 +669,8 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if accepted_before(&tx, auth, proof, transport, body)? {
+        check_current_request_in(&tx, &self.policy, auth, transport, body, now_ms)?;
+        if accepted_request_before(&tx, &self.policy, auth, proof, transport, body, now_ms)? {
             let stored: SignedBinding = serde_json::from_value(
                 value_from(
                     &tx,
@@ -540,7 +686,7 @@ impl Store {
             return Ok(stored);
         }
         current_binding_in(&tx, &old)?;
-        consume_authorization_in(
+        consume_request_authorization_in(
             &tx,
             &self.policy,
             auth,

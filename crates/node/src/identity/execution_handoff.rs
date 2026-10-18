@@ -921,6 +921,7 @@ pub(super) fn compact_sdk_from_events(
         "SDK source is not the original Account message"
     );
     Ok(Some(CompactSdkOrigin {
+        source_body: original.source_body,
         message_event: vibeface_secure::authorization::EventRef::parse(&parent.envelope.hash)?,
         sdk_trigger: vibeface_secure::authorization::EventRef::parse(&session.session_id)?,
         invocation: original.invocation,

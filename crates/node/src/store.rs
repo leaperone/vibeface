@@ -1017,6 +1017,26 @@ impl Store {
         source_body: &Value,
         now_ms: u64,
     ) -> Result<crate::binding::SignedBinding> {
+        self.bind_task_request_authorized(
+            identity,
+            auth,
+            proof,
+            &crate::identity::policy::RequestTransport::Existing(transport.clone()),
+            source_body,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn bind_task_request_authorized(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &vibeface_secure::authorization::VerifiedAuthorization,
+        proof: &crate::identity::policy::FreshnessProof,
+        transport: &crate::identity::policy::RequestTransport,
+        source_body: &Value,
+        now_ms: u64,
+    ) -> Result<crate::binding::SignedBinding> {
+        transport.check_current(auth, now_ms)?;
         use vibeface_secure::authorization::Action;
         ensure!(
             auth.action() == Action::ExecutionOpen && source_body["method"] == "bind_execution",
@@ -1055,10 +1075,12 @@ impl Store {
         };
         self.verify_binding_task(&binding, true)?;
         let facts = self.request_facts(source_body, auth.audience())?;
-        let checked = self.policy.verified().verify_invocation(
+        let checked = crate::identity::policy::authorize_request_invocation_for_body(
+            self.policy.verified(),
             auth.signed_invocation(),
             &facts,
             transport,
+            source_body,
             now_ms,
         )?;
         ensure!(
@@ -1073,6 +1095,19 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::identity::admission::check_policy_heads_in(
+            &tx,
+            self.policy.verified(),
+            &checked,
+            now_ms,
+        )?;
+        crate::identity::admission::check_request_manager_tool_in(
+            &tx,
+            &self.policy,
+            &checked,
+            transport,
+            now_ms,
+        )?;
         let current_key = format!("task-binding-current:{}", binding.task_ref);
         let current: Option<String> = tx
             .query_row(
@@ -1092,7 +1127,7 @@ impl Store {
         let ready: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND hash=? AND resource_id=? AND status='ready')",
             params![space,binding.task_ref,auth.resource().resource.as_str()], |row| row.get(0))?;
         ensure!(ready, "task creation changed before binding");
-        crate::identity::admission::consume_authorization_in(
+        crate::identity::admission::consume_request_authorization_in(
             &tx,
             &self.policy,
             auth,

@@ -1,7 +1,7 @@
 use super::{
     event_authorization::append_admitted_dispatch_in,
     journal::PolicyState,
-    policy::{FreshnessProof, request_facts_from},
+    policy::{FreshnessProof, RequestTransport, request_facts_from},
     task_execution_context::{OriginalAdmissionView, TaskScopedAuthorization},
 };
 use crate::{
@@ -175,7 +175,6 @@ impl AdmissionCheckpoints {
         policy: &PolicyState,
         proof: &AdmissionProof,
         facts: &RequestFacts,
-        transport: &TransportEvidence,
     ) -> Result<Option<(VerifiedAdmission, u64)>> {
         let invocation = &proof.invocation.payload;
         let Some(checkpoint) = self.entries.get(&(
@@ -198,7 +197,6 @@ impl AdmissionCheckpoints {
             checkpoint.proof == *proof
                 && checkpoint.facts == *facts
                 && checkpoint.facts_hash == admission_facts_hash(facts)?
-                && checkpoint.proof.transport.clone().into_evidence() == *transport
                 && checkpoint.operation_id == admission_operation_index_in(connection, proof)?
                 && checkpoint.admitted.signed_invocation() == &proof.invocation
                 && checkpoint.admitted.admitted_at_ms() == proof.admitted_at_ms,
@@ -252,23 +250,9 @@ fn checkpoint_from_verified_in(
     if !all_ready {
         return Ok(None);
     }
-    let original = OriginalAdmissionView::load(connection, policy, proof)?;
-    let state = original.state();
-    let authorization = super::policy::authorize_invocation_for_body(
-        state,
-        &proof.invocation,
-        &facts,
-        &proof.transport.clone().into_evidence(),
-        &proof.source_body,
-        proof.admitted_at_ms,
-    )?;
-    let freshness = state.verify_freshness(
-        &authorization, &proof.challenge, &proof.receipts, proof.admitted_at_ms,
-    )?;
-    let mut proof_usage =
-        vibeface_secure::authorization::execution_handoff::ExecutionProofUsage::default();
-    proof_usage.record_cached_admission(&authorization, proof)?;
+    let proof_usage = admitted.proof_usage().clone();
     proof_usage.enforce_limits()?;
+    let admission_expires_at_ms = admitted.admission_expires_at_ms();
     Ok(Some(LocalAdmissionCheckpoint {
         proof: proof.clone(),
         facts_hash: admission_facts_hash(&facts)?,
@@ -276,7 +260,7 @@ fn checkpoint_from_verified_in(
         operation_id,
         anchors,
         admitted,
-        admission_expires_at_ms: freshness.expires_at_ms().min(authorization.expires_at_ms()),
+        admission_expires_at_ms,
         proof_usage,
     }))
 }
@@ -287,13 +271,7 @@ pub(super) fn prepare_local_admission_checkpoint_in(
     proof: &AdmissionProof,
 ) -> Result<LocalAdmissionCheckpoint> {
     let facts = persisted_admission_facts(connection, policy, proof)?;
-    let admitted = reconstruct_admission_uncached(
-        connection,
-        policy,
-        proof,
-        &facts,
-        &proof.transport.clone().into_evidence(),
-    )?;
+    let admitted = reconstruct_stored_admission_uncached(connection, policy, proof, &facts)?;
     checkpoint_from_verified_in(connection, policy, proof, facts, admitted, false)?
         .context("local admission has no retained event checkpoint")
 }
@@ -415,6 +393,28 @@ pub(crate) fn consume_authorization_in(
     operation_id: Option<&str>,
     now_ms: u64,
 ) -> Result<AdmissionProof> {
+    consume_request_authorization_in(
+        tx,
+        policy,
+        auth,
+        proof,
+        &RequestTransport::Existing(transport.clone()),
+        source_body,
+        operation_id,
+        now_ms,
+    )
+}
+
+pub(crate) fn consume_request_authorization_in(
+    tx: &Transaction<'_>,
+    policy: &PolicyState,
+    auth: &VerifiedAuthorization,
+    proof: &FreshnessProof,
+    transport: &RequestTransport,
+    source_body: &Value,
+    operation_id: Option<&str>,
+    now_ms: u64,
+) -> Result<AdmissionProof> {
     let facts = request_facts_from(tx, policy.verified(), source_body, auth.audience())?;
     consume_authorization_with_facts_in(
         tx,
@@ -441,6 +441,30 @@ pub(crate) fn consume_execution_dispatch_in(
     now_ms: u64,
     dispatch: &super::execution_dispatch::VerifiedDispatchFacts,
 ) -> Result<AdmissionProof> {
+    consume_execution_request_dispatch_in(
+        tx,
+        policy,
+        scoped,
+        proof,
+        &RequestTransport::Existing(transport.clone()),
+        source_body,
+        operation_id,
+        now_ms,
+        dispatch,
+    )
+}
+
+pub(crate) fn consume_execution_request_dispatch_in(
+    tx: &Transaction<'_>,
+    policy: &PolicyState,
+    scoped: &TaskScopedAuthorization,
+    proof: &FreshnessProof,
+    transport: &RequestTransport,
+    source_body: &Value,
+    operation_id: Option<&str>,
+    now_ms: u64,
+    dispatch: &super::execution_dispatch::VerifiedDispatchFacts,
+) -> Result<AdmissionProof> {
     let auth = scoped.authorization();
     let facts = dispatch.revalidate(tx, policy, scoped, source_body, auth.audience(), now_ms)?;
     consume_authorization_with_facts_in(
@@ -462,7 +486,7 @@ fn consume_authorization_with_facts_in(
     policy: &PolicyState,
     auth: &VerifiedAuthorization,
     proof: &FreshnessProof,
-    transport: &TransportEvidence,
+    transport: &RequestTransport,
     source_body: &Value,
     operation_id: Option<&str>,
     now_ms: u64,
@@ -472,11 +496,16 @@ fn consume_authorization_with_facts_in(
     let state = scoped.map_or(policy.verified(), |scope| scope.state(policy.verified()));
     source_matches(auth, source_body)?;
     if source_body["method"] != "agent_start" {
-        check_manager_tool_in(tx, policy, auth, transport, now_ms)?;
+        check_request_manager_tool_in(tx, policy, auth, transport, now_ms)?;
     }
     let signed = auth.signed_invocation();
-    let checked = super::policy::authorize_invocation_for_body(
-        state, signed, facts, transport, source_body, now_ms,
+    let checked = super::policy::authorize_request_invocation_for_body(
+        state,
+        signed,
+        facts,
+        transport,
+        source_body,
+        now_ms,
     )?;
     ensure!(
         checked.invocation_hash() == auth.invocation_hash(),
@@ -505,7 +534,7 @@ fn consume_authorization_with_facts_in(
             auth.body_hash().as_str(), actor_kind, actor_id, auth.device().as_str(),
             auth.resource().resource.as_str(), action.as_str().context("invalid action")?,
             signed.payload.grant_leaf.as_str(), serde_json::to_string(signed)?,
-            serde_json::to_string(source_body)?, serde_json::to_string(&StoredTransport::from(transport))?,
+            serde_json::to_string(source_body)?, serde_json::to_string(&transport.stored())?,
             serde_json::to_string(&proof.challenge)?, serde_json::to_string(&proof.receipts)?,
             now_ms, operation_id],
     )?;
@@ -515,7 +544,7 @@ fn consume_authorization_with_facts_in(
             auth.operation_id(), auth.body_hash().as_str()],
     )?;
     Ok(AdmissionProof {
-        transport: StoredTransport::from(transport),
+        transport: transport.stored(),
         invocation: signed.clone(),
         source_body: source_body.clone(),
         challenge: proof.challenge.clone(),
@@ -531,13 +560,23 @@ pub(crate) fn reconstruct_admission(
     facts: &RequestFacts,
     transport: &TransportEvidence,
 ) -> Result<VerifiedAdmission> {
+    validate_admission_evidence(proof, transport)?;
+    reconstruct_stored_admission(connection, policy, proof, facts)
+}
+
+pub(crate) fn reconstruct_stored_admission(
+    connection: &Connection,
+    policy: &PolicyState,
+    proof: &AdmissionProof,
+    facts: &RequestFacts,
+) -> Result<VerifiedAdmission> {
     if let Some((admitted, _)) = policy
         .local_admissions
-        .admitted_in(connection, policy, proof, facts, transport)?
+        .admitted_in(connection, policy, proof, facts)?
     {
         return Ok(admitted);
     }
-    reconstruct_admission_uncached(connection, policy, proof, facts, transport)
+    reconstruct_stored_admission_uncached(connection, policy, proof, facts)
 }
 
 pub(crate) fn reconstruct_admission_uncached(
@@ -548,6 +587,15 @@ pub(crate) fn reconstruct_admission_uncached(
     transport: &TransportEvidence,
 ) -> Result<VerifiedAdmission> {
     validate_admission_evidence(proof, transport)?;
+    reconstruct_stored_admission_uncached(connection, policy, proof, facts)
+}
+
+pub(crate) fn reconstruct_stored_admission_uncached(
+    connection: &Connection,
+    policy: &PolicyState,
+    proof: &AdmissionProof,
+    facts: &RequestFacts,
+) -> Result<VerifiedAdmission> {
     let original = OriginalAdmissionView::load(connection, policy, proof)?;
     if let Some(task) = original.task_policy() {
         let invocation = &proof.invocation.payload;
@@ -563,7 +611,7 @@ pub(crate) fn reconstruct_admission_uncached(
         );
         return Ok(task.admission().clone());
     }
-    reconstruct_admission_in_state(original.state(), proof, facts, transport)
+    Ok(original.state().verify_original_admission(proof, facts)?)
 }
 
 pub(super) fn reconstruct_admission_at_current_heads(
@@ -576,12 +624,9 @@ pub(super) fn reconstruct_admission_at_current_heads(
     if !policy.current_heads_at(&proof.challenge.policies, proof.admitted_at_ms)? {
         return Ok(None);
     }
-    Ok(Some(reconstruct_admission_in_state(
-        policy.verified(),
-        proof,
-        facts,
-        transport,
-    )?))
+    Ok(Some(
+        policy.verified().verify_original_admission(proof, facts)?,
+    ))
 }
 
 fn validate_admission_evidence(
@@ -593,34 +638,15 @@ fn validate_admission_evidence(
         "stored admission has incorrect freshness stage"
     );
     ensure!(
-        proof.transport.clone().into_evidence() == *transport,
+        proof.transport.existing_evidence()? == *transport,
         "admission transport differs from captured evidence"
     );
     Ok(())
 }
 
-fn reconstruct_admission_in_state(
-    state: &VerifiedPolicySet,
-    proof: &AdmissionProof,
-    facts: &RequestFacts,
-    transport: &TransportEvidence,
-) -> Result<VerifiedAdmission> {
-    let auth = super::policy::authorize_invocation_for_body(
-        state, &proof.invocation, facts, transport, &proof.source_body, proof.admitted_at_ms,
-    )?;
-    source_matches(&auth, &proof.source_body)?;
-    let freshness = state.verify_freshness(
-        &auth,
-        &proof.challenge,
-        &proof.receipts,
-        proof.admitted_at_ms,
-    )?;
-    Ok(state.admit_operation(&auth, &freshness, proof.admitted_at_ms)?)
-}
-
 struct StoredAdmission {
     proof: AdmissionProof,
-    transport: TransportEvidence,
+    transport: StoredTransport,
 }
 
 fn load_admission_from(
@@ -756,10 +782,7 @@ fn load_authorization_from(
             && challenge_row.4,
         "stored admission challenge does not match consumed challenge"
     );
-    Ok(StoredAdmission {
-        proof,
-        transport: transport.into_evidence(),
-    })
+    Ok(StoredAdmission { proof, transport })
 }
 
 pub(crate) fn validate_persisted_admission(
@@ -778,7 +801,7 @@ pub(crate) fn validate_persisted_admission(
     Ok(())
 }
 
-fn persisted_admission_facts(
+pub(super) fn persisted_admission_facts(
     connection: &Connection,
     policy: &PolicyState,
     proof: &AdmissionProof,
@@ -1034,13 +1057,8 @@ pub(crate) fn verified_admission_checkpoints_from(
     for (space, id, operation_id) in rows {
         let stored = load_authorization_from(connection, &space, &id)?;
         let facts = persisted_admission_facts(connection, policy, &stored.proof)?;
-        let admitted = reconstruct_admission_uncached(
-            connection,
-            policy,
-            &stored.proof,
-            &facts,
-            &stored.transport,
-        )?;
+        let admitted =
+            reconstruct_stored_admission_uncached(connection, policy, &stored.proof, &facts)?;
         if let Some(checkpoint) =
             checkpoint_from_verified_in(connection, policy, &stored.proof, facts, admitted, true)?
         {
@@ -1419,17 +1437,26 @@ fn verify_lease_record(
                 && lease.proof.receipts == stored.proof.receipts,
             "initial manager lease differs from its original admission"
         );
-        if let Some((_, deadline)) = policy.local_admissions.admitted_in(
-            connection,
-            policy,
-            &stored.proof,
-            &facts,
-            &stored.transport,
-        )? {
-            ensure!(lease.deadline == deadline,
-                "persisted lease deadline differs from verified local admission");
+        if let Some((_, deadline)) =
+            policy
+                .local_admissions
+                .admitted_in(connection, policy, &stored.proof, &facts)?
+        {
+            ensure!(
+                lease.deadline == deadline,
+                "persisted lease deadline differs from verified local admission"
+            );
             return Ok(deadline);
         }
+    }
+    let admission = reconstruct_stored_admission(connection, policy, &stored.proof, &facts)?;
+    if lease.proof.challenge.stage == CheckStage::Admit {
+        let deadline = admission.admission_expires_at_ms();
+        ensure!(
+            lease.deadline == deadline,
+            "persisted lease deadline differs from its original admission"
+        );
+        return Ok(deadline);
     }
     let current = policy.verified();
     let retained =
@@ -1439,23 +1466,11 @@ fn verify_lease_record(
             Some(policy.historical(&lease.proof.challenge.policies, lease.checked_at_ms)?)
         };
     let historical = retained.as_ref().unwrap_or(current);
-    let auth = if lease.proof.challenge.stage == CheckStage::Admit {
-        historical.verify_invocation(
-            &stored.proof.invocation,
-            &facts,
-            &stored.transport,
-            lease.checked_at_ms,
-        )?
-    } else {
-        let admission =
-            reconstruct_admission(connection, policy, &stored.proof, &facts, &stored.transport)?;
-        historical.verify_operation_authorization(
-            &admission,
-            &facts,
-            &stored.transport,
-            lease.checked_at_ms,
-        )?
-    };
+    let auth = historical.verify_admitted_operation_authorization(
+        &admission,
+        &facts,
+        lease.checked_at_ms,
+    )?;
     let freshness = historical.verify_freshness(
         &auth,
         &lease.proof.challenge,
@@ -1677,14 +1692,10 @@ fn manager_authorization_from(
         &stored.proof.source_body,
         &stored.proof.invocation.payload.audience,
     )?;
-    let admitted =
-        reconstruct_admission(connection, policy, &stored.proof, &facts, &stored.transport)?;
-    let auth = policy.verified().verify_operation_authorization(
-        &admitted,
-        &facts,
-        &stored.transport,
-        now_ms,
-    )?;
+    let admitted = reconstruct_stored_admission(connection, policy, &stored.proof, &facts)?;
+    let auth = policy
+        .verified()
+        .verify_admitted_operation_authorization(&admitted, &facts, now_ms)?;
     check_policy_heads_in(connection, policy.verified(), &auth, now_ms)?;
     check_manager_parent(connection, policy, &auth, &stored.proof.source_body, now_ms)?;
     Ok(auth)
@@ -1766,6 +1777,57 @@ pub(super) fn check_manager_tool_in(
         );
     }
     Ok(())
+}
+
+pub(crate) fn check_request_manager_tool_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    auth: &VerifiedAuthorization,
+    transport: &RequestTransport,
+    now_ms: u64,
+) -> Result<()> {
+    transport.check_current(auth, now_ms)?;
+    match transport.existing() {
+        Some(existing) => check_manager_tool_in(connection, policy, auth, existing, now_ms),
+        None => {
+            ensure!(
+                matches!(auth.actor(), Actor::Account(_))
+                    && auth
+                        .signed_invocation()
+                        .payload
+                        .context
+                        .sdk_session
+                        .is_none(),
+                "directed gateway cannot authorize a Manager service"
+            );
+            Ok(())
+        }
+    }
+}
+
+pub(super) fn check_stored_manager_tool_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    auth: &VerifiedAuthorization,
+    transport: &StoredTransport,
+    now_ms: u64,
+) -> Result<()> {
+    match transport {
+        StoredTransport::DirectedGateway { .. } => {
+            ensure!(
+                matches!(auth.actor(), Actor::Account(_)),
+                "directed gateway cannot authorize a Manager service"
+            );
+            Ok(())
+        }
+        _ => check_manager_tool_in(
+            connection,
+            policy,
+            auth,
+            &transport.existing_evidence()?,
+            now_ms,
+        ),
+    }
 }
 
 pub(crate) fn sdk_policy_source_provenance_in(
@@ -2027,7 +2089,8 @@ impl Store {
         if local_from::<ManagerClaim>(&tx, space, &manager_key)?.is_some() {
             let (claim, stored, mut previous) = load_manager_from(&tx, space, auth.operation_id())?;
             ensure!(
-                stored.proof.source_body == *source_body && stored.transport == *transport,
+                stored.proof.source_body == *source_body
+                    && stored.transport == StoredTransport::from(transport),
                 "manager trigger was reused with a different request"
             );
             check_challenge_record(&tx, auth, proof, stored.proof.challenge == proof.challenge)?;
@@ -2246,12 +2309,27 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<()> {
+        self.authorize_request_read(
+            auth,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            now_ms,
+        )
+    }
+
+    pub(crate) fn authorize_request_read(
+        &self,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        now_ms: u64,
+    ) -> Result<()> {
         ensure!(
             proof.challenge.stage == CheckStage::RemoteRead && auth.action().is_read(),
             "read requires remote-read freshness"
         );
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
-        check_manager_tool_in(&tx, &self.policy, auth, transport, now_ms)?;
+        check_request_manager_tool_in(&tx, &self.policy, auth, transport, now_ms)?;
         check_policy_heads_in(&tx, self.policy.verified(), auth, now_ms)?;
         self.policy
             .verified()
@@ -2267,6 +2345,27 @@ impl Store {
         auth: &VerifiedAuthorization,
         proof: &FreshnessProof,
         transport: &TransportEvidence,
+        source_body: &Value,
+        request: &OperationRequest,
+        now_ms: u64,
+    ) -> Result<OperationRecord> {
+        self.accept_request_authorized_operation(
+            identity,
+            auth,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            source_body,
+            request,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn accept_request_authorized_operation(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
         source_body: &Value,
         request: &OperationRequest,
         now_ms: u64,
@@ -2300,10 +2399,12 @@ impl Store {
         );
         self.validate_operation_binding(request)?;
         let facts = self.request_facts(source_body, auth.audience())?;
-        let checked = self.policy.verified().verify_invocation(
+        let checked = super::policy::authorize_request_invocation_for_body(
+            self.policy.verified(),
             auth.signed_invocation(),
             &facts,
             transport,
+            source_body,
             now_ms,
         )?;
         ensure!(
@@ -2415,7 +2516,7 @@ impl Store {
             control,
         )?;
         crate::store::check_execution_resources_in(&tx, &request.target_node, &resources)?;
-        let admission = consume_authorization_in(
+        let admission = consume_request_authorization_in(
             &tx,
             &self.policy,
             auth,
@@ -2467,19 +2568,12 @@ impl Store {
             &stored.proof.source_body,
             &stored.proof.invocation.payload.audience,
         )?;
-        let admission = reconstruct_admission(
-            &self.connection,
-            &self.policy,
-            &stored.proof,
-            &facts,
-            &stored.transport,
-        )?;
-        Ok(self.policy.verified().verify_operation_authorization(
-            &admission,
-            &facts,
-            &stored.transport,
-            now_ms,
-        )?)
+        let admission =
+            reconstruct_stored_admission(&self.connection, &self.policy, &stored.proof, &facts)?;
+        Ok(self
+            .policy
+            .verified()
+            .verify_admitted_operation_authorization(&admission, &facts, now_ms)?)
     }
 
     pub fn operation_admission_proof(
@@ -2950,7 +3044,7 @@ pub(crate) mod tests {
                 &store.policy,
                 proof,
                 facts,
-                &proof.transport.clone().into_evidence(),
+                &proof.transport.clone().existing_evidence()?,
             )
         })?;
         assert_eq!(signatures.counts().actual_verifications, 0);
@@ -2969,7 +3063,7 @@ pub(crate) mod tests {
                 &store.policy,
                 &proof,
                 &facts,
-                &proof.transport.clone().into_evidence(),
+                &proof.transport.clone().existing_evidence()?,
             )
         })?;
         assert!(signatures.counts().actual_verifications > 0);
@@ -3034,7 +3128,7 @@ pub(crate) mod tests {
                     &store.policy,
                     &proof,
                     &facts,
-                    &proof.transport.clone().into_evidence()
+                    &proof.transport.clone().existing_evidence()?
                 )
                 .is_err(),
                 "{sql}"
@@ -3065,7 +3159,7 @@ pub(crate) mod tests {
                     &store.policy,
                     &proof,
                     &facts,
-                    &proof.transport.clone().into_evidence()
+                    &proof.transport.clone().existing_evidence()?
                 )
                 .is_err()
             );
@@ -3097,7 +3191,7 @@ pub(crate) mod tests {
                 &store.policy,
                 &proof,
                 &facts,
-                &proof.transport.clone().into_evidence()
+                &proof.transport.clone().existing_evidence()?
             )
             .is_err()
         );
@@ -3110,7 +3204,7 @@ pub(crate) mod tests {
                 &store.policy,
                 &changed,
                 &facts,
-                &proof.transport.clone().into_evidence()
+                &proof.transport.clone().existing_evidence()?
             )
             .is_err()
         );
@@ -3122,7 +3216,7 @@ pub(crate) mod tests {
                 &store.policy,
                 &proof,
                 &changed_facts,
-                &proof.transport.clone().into_evidence()
+                &proof.transport.clone().existing_evidence()?
             )
             .is_err()
         );
@@ -3147,7 +3241,7 @@ pub(crate) mod tests {
                 &store.policy,
                 &proof,
                 &changed_facts,
-                &proof.transport.clone().into_evidence()
+                &proof.transport.clone().existing_evidence()?
             )
             .is_err()
         );
@@ -3246,17 +3340,39 @@ pub(crate) mod tests {
         let event: crate::model::Event = serde_json::from_str(&anchor.canonical_body)?;
         let EventCause::Invocation { admission: proof } = event.cause else { unreachable!() };
         let facts = persisted_admission_facts(&store.connection, &store.policy, &proof)?;
-        let transport = proof.transport.clone().into_evidence();
+        let transport = proof.transport.clone().existing_evidence()?;
         let admitted = cached_without_crypto(&store, &proof, &facts)?;
         let mut earlier = proof.clone();
-        let accepted_at = network.bundle.journal.iter().filter_map(|entry| match entry {
-            vibeface_secure::authorization::JournalEntry::AccountCommit(value) => Some(value.commit.payload.accepted_at_ms),
-            _ => None,
-        }).max().context("fixture has no accepted policy commit")?;
-        earlier.admitted_at_ms = accepted_at.checked_sub(1).context("fixture policy predates the clock")?;
-        assert!(store.policy.historical(&proof.challenge.policies, earlier.admitted_at_ms).is_err());
+        let accepted_at = network
+            .bundle
+            .journal
+            .iter()
+            .filter_map(|entry| match entry {
+                vibeface_secure::authorization::JournalEntry::AccountCommit(value) => {
+                    Some(value.commit.payload.accepted_at_ms)
+                }
+                _ => None,
+            })
+            .max()
+            .context("fixture has no accepted policy commit")?;
+        earlier.admitted_at_ms = accepted_at
+            .checked_sub(1)
+            .context("fixture policy predates the clock")?;
         assert!(
-            reconstruct_admission_uncached(&store.connection, &store.policy, &earlier, &facts, &transport).is_err()
+            store
+                .policy
+                .historical(&proof.challenge.policies, earlier.admitted_at_ms)
+                .is_err()
+        );
+        assert!(
+            reconstruct_admission_uncached(
+                &store.connection,
+                &store.policy,
+                &earlier,
+                &facts,
+                &transport
+            )
+            .is_err()
         );
         assert!(
             reconstruct_admission(
@@ -3374,8 +3490,14 @@ pub(crate) mod tests {
             let tx = store.connection.unchecked_transaction()?;
             assert_eq!(tx.execute(sql, [&request.operation_id])?, 1);
             assert!(
-                reconstruct_admission(&tx, &store.policy, &stored.proof, &facts, &stored.transport)
-                    .is_err()
+                reconstruct_admission(
+                    &tx,
+                    &store.policy,
+                    &stored.proof,
+                    &facts,
+                    &stored.transport.existing_evidence()?
+                )
+                .is_err()
             );
             tx.rollback()?;
             cached_without_crypto(&store, &stored.proof, &facts)?;
@@ -3970,7 +4092,7 @@ mod manager_tests {
                     &fixture.store.policy,
                     &stored.proof,
                     &facts,
-                    &stored.transport
+                    &stored.transport.existing_evidence()?
                 )
                 .is_err()
             );
@@ -3991,7 +4113,7 @@ mod manager_tests {
                 &fixture.store.policy,
                 &stored.proof,
                 &facts,
-                &stored.transport
+                &stored.transport.existing_evidence()?
             )
             .is_err()
         );
@@ -4004,7 +4126,7 @@ mod manager_tests {
                 &fixture.store.policy,
                 &changed,
                 &facts,
-                &stored.transport
+                &stored.transport.existing_evidence()?
             )
             .is_err()
         );
@@ -4203,13 +4325,17 @@ mod manager_tests {
         )?;
         let mut uncached = fixture.store.policy.clone();
         uncached.local_admissions = AdmissionCheckpoints::default();
-        let facts = persisted_admission_facts(
-            &fixture.store.connection, &uncached, &stored.proof,
-        )?;
-        assert!(reconstruct_admission(
-            &fixture.store.connection, &fixture.store.policy, &stored.proof,
-            &facts, &stored.transport,
-        ).is_err());
+        let facts = persisted_admission_facts(&fixture.store.connection, &uncached, &stored.proof)?;
+        assert!(
+            reconstruct_admission(
+                &fixture.store.connection,
+                &fixture.store.policy,
+                &stored.proof,
+                &facts,
+                &stored.transport.existing_evidence()?,
+            )
+            .is_err()
+        );
         let (hash, original): (String, String) = fixture.store.connection.query_row(
             "SELECT hash,envelope FROM events ORDER BY hash LIMIT 1", [],
             |row| Ok((row.get(0)?, row.get(1)?)),

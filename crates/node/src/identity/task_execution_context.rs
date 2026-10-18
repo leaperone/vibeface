@@ -1,7 +1,7 @@
 use super::{
     admission::{
-        admission_for_operation_from, check_manager_tool_in, check_policy_heads_in,
-        load_admission_in, reconstruct_admission,
+        admission_for_operation_from, check_policy_heads_in, check_stored_manager_tool_in,
+        load_admission_in, reconstruct_stored_admission,
     },
     foreign_execution_policy::{
         bind_task_execution_policy_in, check_task_policy_heads_in,
@@ -9,7 +9,7 @@ use super::{
         task_policy_for_binding_in,
     },
     journal::PolicyState,
-    policy::authorize_invocation_for_body,
+    policy::{RequestTransport, authorize_request_invocation_for_body},
 };
 use crate::{
     binding::SignedBinding,
@@ -92,10 +92,8 @@ impl TaskScopedAuthorization {
                 )? == request,
             "resolution scope differs from its original persisted operation"
         );
-        let captured_transport = proof.transport.clone().into_evidence();
         let original = OriginalAdmissionView::load(connection, policy, proof)?;
-        let admitted =
-            reconstruct_admission(connection, policy, proof, facts, &captured_transport)?;
+        let admitted = reconstruct_stored_admission(connection, policy, proof, facts)?;
         let source = PublicKey::parse(&identity.public_key_hex()?)?;
         ensure!(
             invocation.audience.device == DeviceId::from_key(&source)
@@ -138,14 +136,8 @@ impl TaskScopedAuthorization {
             .as_ref()
             .map_or(policy.verified(), |task| task.state());
         let authorization =
-            state.verify_operation_authorization(&admitted, facts, &captured_transport, now_ms)?;
-        check_manager_tool_in(
-            connection,
-            policy,
-            &authorization,
-            &captured_transport,
-            now_ms,
-        )?;
+            state.verify_admitted_operation_authorization(&admitted, facts, now_ms)?;
+        check_stored_manager_tool_in(connection, policy, &authorization, &proof.transport, now_ms)?;
         let scoped = Self {
             authorization,
             task_policy,
@@ -188,10 +180,8 @@ impl TaskScopedAuthorization {
                 && serde_json::from_str::<OperationRequest>(&encoded)? == request,
             "operation scope differs from its persisted request"
         );
-        let captured_transport = proof.transport.clone().into_evidence();
         let original = OriginalAdmissionView::load(connection, policy, proof)?;
-        let admitted =
-            reconstruct_admission(connection, policy, proof, facts, &captured_transport)?;
+        let admitted = reconstruct_stored_admission(connection, policy, proof, facts)?;
         let source = PublicKey::parse(&identity.public_key_hex()?)?;
         ensure!(
             invocation.audience.device == DeviceId::from_key(&source)
@@ -234,14 +224,8 @@ impl TaskScopedAuthorization {
             .as_ref()
             .map_or(policy.verified(), |task| task.state());
         let authorization =
-            state.verify_operation_authorization(&admitted, facts, &captured_transport, now_ms)?;
-        check_manager_tool_in(
-            connection,
-            policy,
-            &authorization,
-            &captured_transport,
-            now_ms,
-        )?;
+            state.verify_admitted_operation_authorization(&admitted, facts, now_ms)?;
+        check_stored_manager_tool_in(connection, policy, &authorization, &proof.transport, now_ms)?;
         let scoped = Self {
             authorization,
             task_policy,
@@ -385,6 +369,25 @@ impl Store {
         body: &Value,
         now_ms: u64,
     ) -> Result<TaskScopedAuthorization> {
+        self.authorize_scoped_request_for_transport(
+            identity,
+            invocation,
+            facts,
+            &RequestTransport::Existing(transport.clone()),
+            body,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn authorize_scoped_request_for_transport(
+        &self,
+        identity: &LocalIdentity,
+        invocation: &Signed<Invocation>,
+        facts: &RequestFacts,
+        transport: &RequestTransport,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<TaskScopedAuthorization> {
         let snapshot = self.connection.unchecked_transaction()?;
         let current = PolicyState::reload_verified(&snapshot, &self.policy)?;
         let task_policy = current_task_execution_policy_in(
@@ -393,8 +396,9 @@ impl Store {
         let state = task_policy
             .as_ref()
             .map_or(current.verified(), |task| task.state());
-        let authorization =
-            authorize_invocation_for_body(state, invocation, facts, transport, body, now_ms)?;
+        let authorization = authorize_request_invocation_for_body(
+            state, invocation, facts, transport, body, now_ms,
+        )?;
         let scoped = TaskScopedAuthorization {
             authorization,
             task_policy,
@@ -410,9 +414,32 @@ impl Store {
         stage: CheckStage,
         now_ms: u64,
     ) -> Result<FreshnessChallenge> {
+        self.issue_scoped_freshness_with_transport(scoped, None, stage, now_ms)
+    }
+
+    pub(crate) fn issue_scoped_freshness_for_transport(
+        &mut self,
+        scoped: &TaskScopedAuthorization,
+        transport: &RequestTransport,
+        stage: CheckStage,
+        now_ms: u64,
+    ) -> Result<FreshnessChallenge> {
+        self.issue_scoped_freshness_with_transport(scoped, Some(transport), stage, now_ms)
+    }
+
+    fn issue_scoped_freshness_with_transport(
+        &mut self,
+        scoped: &TaskScopedAuthorization,
+        transport: Option<&RequestTransport>,
+        stage: CheckStage,
+        now_ms: u64,
+    ) -> Result<FreshnessChallenge> {
         let snapshot = self.connection.unchecked_transaction()?;
         let current = PolicyState::reload_verified(&snapshot, &self.policy)?;
         let auth = scoped.authorization();
+        if let Some(transport) = transport {
+            transport.check_current(auth, now_ms)?;
+        }
         let invocation = &auth.signed_invocation().payload;
         let facts = RequestFacts {
             resource: invocation.resource.clone(),
@@ -431,7 +458,8 @@ impl Store {
         let expires_at_ms = now_ms
             .checked_add(lifetime)
             .context("challenge expiry overflow")?
-            .min(scoped.expires_at_ms());
+            .min(scoped.expires_at_ms())
+            .min(transport.map_or(u64::MAX, RequestTransport::expires_at_ms));
         let challenge =
             FreshnessChallenge::new(auth, stage, Nonce::random()?, now_ms, expires_at_ms)?;
         let encoded = serde_json::to_string(&challenge)?;

@@ -4,6 +4,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use vibeface_secure::authorization::bootstrap::{self, NodeClaim};
+use vibeface_secure::authorization::gateway_forward::{GatewayOriginal, VerifiedDirectedGateway};
 use vibeface_secure::authorization::{
     AccountId, Actor, Audience, CheckStage, ClientAuthorizationBundle, DeviceId,
     FreshnessChallenge, FreshnessReceipt, Invocation, InvocationContext, JournalEntry, ObjectHash,
@@ -11,6 +12,63 @@ use vibeface_secure::authorization::{
     ServiceId, SessionRef, Signed, SpaceId, TransportEvidence, VerifiedAuthorization,
     VerifiedPolicySet,
 };
+
+#[derive(Clone, Debug)]
+pub(crate) enum RequestTransport {
+    Existing(TransportEvidence),
+    DirectedGateway {
+        verified: VerifiedDirectedGateway,
+        original: GatewayOriginal,
+    },
+}
+
+impl RequestTransport {
+    pub(crate) fn stored(&self) -> crate::model::StoredTransport {
+        match self {
+            Self::Existing(evidence) => crate::model::StoredTransport::from(evidence),
+            Self::DirectedGateway { verified, .. } => {
+                crate::model::StoredTransport::DirectedGateway {
+                    header: verified.header().clone(),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn existing(&self) -> Option<&TransportEvidence> {
+        match self {
+            Self::Existing(evidence) => Some(evidence),
+            Self::DirectedGateway { .. } => None,
+        }
+    }
+
+    pub(crate) fn expires_at_ms(&self) -> u64 {
+        match self {
+            Self::Existing(_) => u64::MAX,
+            Self::DirectedGateway { verified, .. } => verified.header().payload.expires_at_ms,
+        }
+    }
+
+    pub(crate) fn check_current(&self, auth: &VerifiedAuthorization, now_ms: u64) -> Result<()> {
+        let Self::DirectedGateway { verified, original } = self else {
+            return Ok(());
+        };
+        verified.check_original(original, &verified.header().payload.target_key, now_ms)?;
+        let (invocation, body) = match original {
+            GatewayOriginal::Invoke { invocation, body }
+            | GatewayOriginal::Status { invocation, body } => (invocation, body),
+            GatewayOriginal::Prepare { .. } => {
+                anyhow::bail!("prepare transport cannot authorize an invocation")
+            }
+        };
+        ensure!(
+            invocation == auth.signed_invocation()
+                && ObjectHash::body(body)? == *auth.body_hash()
+                && matches!(auth.actor(), Actor::Account(_)),
+            "directed gateway transport changed its original Account authorization"
+        );
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +123,24 @@ pub(crate) fn authorize_invocation_for_body(
     body: &Value,
     now_ms: u64,
 ) -> Result<VerifiedAuthorization> {
+    authorize_request_invocation_for_body(
+        state,
+        invocation,
+        facts,
+        &RequestTransport::Existing(transport.clone()),
+        body,
+        now_ms,
+    )
+}
+
+pub(crate) fn authorize_request_invocation_for_body(
+    state: &VerifiedPolicySet,
+    invocation: &Signed<Invocation>,
+    facts: &RequestFacts,
+    transport: &RequestTransport,
+    body: &Value,
+    now_ms: u64,
+) -> Result<VerifiedAuthorization> {
     let _verification = vibeface_secure::signature_verification::ScopedSignatureVerification::new();
     invocation.verify_signature()?;
     ensure!(
@@ -75,16 +151,40 @@ pub(crate) fn authorize_invocation_for_body(
             && crate::model::authorization_action(body)? == facts.action,
         "request body differs from its parsed authorization facts"
     );
-    match execution_destination_for_body(state, facts, body, now_ms)? {
-        Some(destination) => Ok(state.verify_invocation_with_execution_destination(
-            invocation,
-            facts,
-            transport,
-            &destination,
-            now_ms,
-        )?),
-        None => Ok(state.verify_invocation(invocation, facts, transport, now_ms)?),
-    }
+    let destination = execution_destination_for_body(state, facts, body, now_ms)?;
+    let authorization = match transport {
+        RequestTransport::Existing(evidence) => match destination {
+            Some(destination) => state.verify_invocation_with_execution_destination(
+                invocation,
+                facts,
+                evidence,
+                &destination,
+                now_ms,
+            )?,
+            None => state.verify_invocation(invocation, facts, evidence, now_ms)?,
+        },
+        RequestTransport::DirectedGateway { verified, original } => {
+            ensure!(
+                original.body() == body,
+                "directed gateway changed its raw business body"
+            );
+            match destination {
+                Some(destination) => state.verify_gateway_invocation_with_execution_destination(
+                    invocation,
+                    body,
+                    facts,
+                    verified,
+                    &destination,
+                    now_ms,
+                )?,
+                None => {
+                    state.verify_gateway_invocation(invocation, body, facts, verified, now_ms)?
+                }
+            }
+        }
+    };
+    transport.check_current(&authorization, now_ms)?;
+    Ok(authorization)
 }
 
 pub(crate) fn request_facts_from(
@@ -1523,15 +1623,15 @@ impl crate::runtime::Runtime {
             | "account_device_commit" => {
                 store.enrollment_command(&self.identity, noise_public_key, method, params, now_ms)
             }
-            "enrollment_policy_read_begin" => store.begin_enrollment_policy_read(
-                &self.identity, noise_public_key, params, now_ms,
-            ),
-            "enrollment_policy_read_page" => store.enrollment_policy_page(
-                &self.identity, noise_public_key, params, now_ms,
-            ),
-            "enrollment_policy_read_witness" => store.enrollment_policy_witness(
-                &self.identity, noise_public_key, params, now_ms,
-            ),
+            "enrollment_policy_read_begin" => {
+                store.begin_enrollment_policy_read(&self.identity, noise_public_key, params, now_ms)
+            }
+            "enrollment_policy_read_page" => {
+                store.enrollment_policy_page(&self.identity, noise_public_key, params, now_ms)
+            }
+            "enrollment_policy_read_witness" => {
+                store.enrollment_policy_witness(&self.identity, noise_public_key, params, now_ms)
+            }
             "foreign_execution_policy_selection" => store.foreign_execution_policy_selection(
                 &self.identity, noise_public_key, params, now_ms,
             ),
@@ -1553,25 +1653,38 @@ impl crate::runtime::Runtime {
             "remote_execution_policy_prepare" => store.remote_execution_policy_prepare(
                 &self.identity, noise_public_key, params, now_ms,
             ),
-            "remote_execution_policy_page" => store.remote_execution_policy_page(
-                &self.identity, noise_public_key, params, now_ms,
-            ),
+            "remote_execution_policy_page" => {
+                store.remote_execution_policy_page(&self.identity, noise_public_key, params, now_ms)
+            }
             "remote_execution_policy_finish" => store.remote_execution_policy_finish(
                 &self.identity, noise_public_key, params, now_ms,
             ),
             "execution_share_policy_prepare" => store.execution_share_policy_prepare(
                 &self.identity, noise_public_key, params, now_ms,
             ),
-            "execution_share_policy_page" => store.execution_share_policy_page(
-                &self.identity, noise_public_key, params, now_ms,
-            ),
+            "execution_share_policy_page" => {
+                store.execution_share_policy_page(&self.identity, noise_public_key, params, now_ms)
+            }
             "execution_share_policy_finish" => store.execution_share_policy_finish(
-                &self.identity, noise_public_key, params, now_ms,
+                &self.identity,
+                noise_public_key,
+                params,
+                now_ms,
             ),
-            "account_node_import_begin" | "account_node_import_page"
-            | "account_node_import_finish" | "account_node_import_resume"
-            | "account_node_commit" | "account_node_install" | "account_node_install_status" | "account_node_status" => store
-                .node_enrollment_command(&self.identity, noise_public_key, method, params, now_ms),
+            "account_node_import_begin"
+            | "account_node_import_page"
+            | "account_node_import_finish"
+            | "account_node_import_resume"
+            | "account_node_commit"
+            | "account_node_install"
+            | "account_node_install_status"
+            | "account_node_status" => store.node_enrollment_command(
+                &self.identity,
+                noise_public_key,
+                method,
+                params,
+                now_ms,
+            ),
             "team_create" | "space_policy_commit" => {
                 store.governance_command(&self.identity, noise_public_key, method, params, now_ms)
             }

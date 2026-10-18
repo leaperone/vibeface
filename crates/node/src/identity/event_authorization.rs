@@ -1,12 +1,14 @@
 use super::{
-    admission::reconstruct_admission, journal::PolicyState, policy::FreshnessProof,
+    admission::reconstruct_stored_admission,
+    journal::PolicyState,
+    policy::{FreshnessProof, RequestTransport},
     task_execution_context::OriginalAdmissionView,
 };
 use crate::{
     crypto::{self, LocalIdentity},
     model::{
         AdmissionProof, BlobRef, Event, EventBody, EventCause, OperationRequest, OperationState,
-        SignedEvent, WIRE_VERSION,
+        SignedEvent, StoredTransport, WIRE_VERSION,
     },
     store::{
         Store, StoredEvent, closure_hashes, has_blob_from, heads_from_events, load_events_from,
@@ -138,7 +140,7 @@ fn source_scope(body: &Value) -> Result<&str> {
 fn expected_events(
     body: &Value,
     invocation: &Signed<Invocation>,
-    transport: &TransportEvidence,
+    transport: &StoredTransport,
 ) -> Result<Vec<(EventBody, Vec<BlobRef>)>> {
     let actor = &invocation.payload.actor;
     let plain = |event| (event, Vec::new());
@@ -217,7 +219,7 @@ fn expected_events(
         }
         "agent_result" => {
             ensure!(
-                matches!((actor, transport), (Actor::Service(actor), TransportEvidence::LocalAgentAdapter { service, .. }) if actor == service),
+                matches!((actor, transport), (Actor::Service(actor), StoredTransport::LocalAgentAdapter { service, .. }) if actor == service),
                 "manager output requires a service adapter admission"
             );
             text(body, "parent_invocation")?;
@@ -250,7 +252,7 @@ fn expected_events(
         }
         "agent_notification" => {
             ensure!(
-                matches!((actor, transport), (Actor::Service(actor), TransportEvidence::LocalAgentAdapter { service, .. }) if actor == service),
+                matches!((actor, transport), (Actor::Service(actor), StoredTransport::LocalAgentAdapter { service, .. }) if actor == service),
                 "manager notification requires a service adapter admission"
             );
             text(body, "parent_invocation")?;
@@ -521,11 +523,13 @@ fn historical_facts(
             "SDK session targets another invocation device"
         );
         ensure!(
-            proof.transport.clone().into_evidence()
-                == TransportEvidence::LocalAgentAdapter {
-                    service: service.clone(),
-                    session: session.clone()
-                },
+            matches!(
+                &proof.transport,
+                StoredTransport::LocalAgentAdapter {
+                    service: observed_service,
+                    session: observed_session,
+                } if observed_service == service && observed_session == &session
+            ),
             "SDK session does not have an observed service adapter"
         );
         let parent_hash = ObjectHash::parse(text(body, "parent_invocation")?)?;
@@ -822,8 +826,7 @@ fn validate_event_evidence_in_state(
     let Some(facts) = historical_facts(state, event, events, &ancestors)? else {
         return Ok(EventEvidenceStatus::Pending);
     };
-    let transport = proof.transport.clone().into_evidence();
-    reconstruct_admission(connection, policy, proof, &facts, &transport)?;
+    reconstruct_stored_admission(connection, policy, proof, &facts)?;
     validate_sdk_parent(policy, connection, state, event, events, &facts)?;
     match &event.cause {
         EventCause::Invocation { .. } => {
@@ -832,7 +835,7 @@ fn validate_event_evidence_in_state(
                 "invocation event time differs from admission"
             );
             ensure!(
-                expected_events(&proof.source_body, &proof.invocation, &transport)?
+                expected_events(&proof.source_body, &proof.invocation, &proof.transport)?
                     .iter()
                     .any(|(body, blobs)| body == &event.body && blobs == &event.blobs),
                 "event business content differs from signed request"
@@ -919,9 +922,8 @@ pub(crate) fn event_authorization_in_view(
     let ancestors = dependency_closure(event, events)?.context("event history is incomplete")?;
     let facts = historical_facts(historical, event, events, &ancestors)?
         .context("event resource history is incomplete")?;
-    let transport = proof.transport.clone().into_evidence();
-    let admitted = reconstruct_admission(connection, policy, proof, &facts, &transport)?;
-    Ok(state.verify_operation_authorization(&admitted, &facts, &transport, now_ms)?)
+    let admitted = reconstruct_stored_admission(connection, policy, proof, &facts)?;
+    Ok(state.verify_admitted_operation_authorization(&admitted, &facts, now_ms)?)
 }
 
 pub(super) fn retained_operation_dispatch_in(
@@ -1026,11 +1028,7 @@ pub(crate) fn persisted_admission_facts(
             )? == stored.event,
             "accepted event evidence differs from signed envelope"
         );
-        let expected = expected_events(
-            &proof.source_body,
-            &proof.invocation,
-            &proof.transport.clone().into_evidence(),
-        )?;
+        let expected = expected_events(&proof.source_body, &proof.invocation, &proof.transport)?;
         ensure!(
             expected
                 .iter()
@@ -1168,8 +1166,7 @@ fn append_admitted_events_in(
     now_ms: u64,
 ) -> Result<Vec<SignedEvent>> {
     super::admission::validate_persisted_admission(connection, proof)?;
-    let transport = proof.transport.clone().into_evidence();
-    let mut expected = expected_events(&proof.source_body, &proof.invocation, &transport)?;
+    let mut expected = expected_events(&proof.source_body, &proof.invocation, &proof.transport)?;
     ensure!(
         !batch.is_empty(),
         "empty event batch has no authorized mutation"
@@ -1388,12 +1385,7 @@ pub(crate) fn append_admitted_dispatch_in(
         serde_json::from_str::<OperationRequest>(&persisted)? == *request,
         "dispatch differs from durable operation"
     );
-    let body = expected_events(
-        &proof.source_body,
-        &proof.invocation,
-        &proof.transport.clone().into_evidence(),
-    )?
-    .remove(0);
+    let body = expected_events(&proof.source_body, &proof.invocation, &proof.transport)?.remove(0);
     Ok(append_admitted_events_in(
         tx,
         &policy,
@@ -1419,12 +1411,8 @@ pub(crate) fn append_admitted_resolution_in(
         text(&proof.source_body, "method")? == "resolve_unknown",
         "resolution requires a resolver admission"
     );
-    let expected = expected_events(
-        &proof.source_body,
-        &proof.invocation,
-        &proof.transport.clone().into_evidence(),
-    )?
-    .remove(0);
+    let expected =
+        expected_events(&proof.source_body, &proof.invocation, &proof.transport)?.remove(0);
     let EventBody::ExecutionObserved {
         operation_id,
         task_id,
@@ -2005,6 +1993,28 @@ impl Store {
         events: Vec<(String, EventBody, Vec<BlobRef>)>,
         now: i64,
     ) -> Result<Vec<SignedEvent>> {
+        self.append_request_authorized_events(
+            identity,
+            auth,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            source_body,
+            events,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_request_authorized_events(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        source_body: &Value,
+        events: Vec<(String, EventBody, Vec<BlobRef>)>,
+        now: i64,
+    ) -> Result<Vec<SignedEvent>> {
         let now_ms = u64::try_from(now).context("event creation time is negative")?;
         ensure!(
             !matches!(text(source_body, "method")?, "operate" | "resolve_unknown"),
@@ -2013,7 +2023,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let admitted = super::admission::consume_authorization_in(
+        let admitted = super::admission::consume_request_authorization_in(
             &tx,
             &self.policy,
             auth,
@@ -2045,8 +2055,34 @@ impl Store {
         blobs: Vec<BlobRef>,
         now: i64,
     ) -> Result<SignedEvent> {
+        self.append_request_authorized_event(
+            identity,
+            auth,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            source_body,
+            scope,
+            body,
+            blobs,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_request_authorized_event(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &VerifiedAuthorization,
+        proof: &FreshnessProof,
+        transport: &RequestTransport,
+        source_body: &Value,
+        scope: &str,
+        body: EventBody,
+        blobs: Vec<BlobRef>,
+        now: i64,
+    ) -> Result<SignedEvent> {
         Ok(self
-            .append_authorized_events(
+            .append_request_authorized_events(
                 identity,
                 auth,
                 proof,
@@ -2296,7 +2332,7 @@ mod tests {
         let batch = expected_events(
             &fixture.body,
             fixture.auth.signed_invocation(),
-            &fixture.transport,
+            &StoredTransport::from(&fixture.transport),
         )?
         .into_iter()
         .map(|(body, blobs)| (scope.clone(), body, blobs))
