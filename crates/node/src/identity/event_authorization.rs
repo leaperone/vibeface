@@ -986,7 +986,7 @@ pub(crate) fn persisted_admission_facts(
     Ok(facts)
 }
 
-fn retained_scope_events_in(
+pub(super) fn retained_scope_events_in(
     connection: &Connection,
     space: &str,
     resource: &ResourceId,

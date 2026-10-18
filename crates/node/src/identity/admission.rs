@@ -1173,7 +1173,9 @@ fn check_manager_parent(
             && now_ms < descriptor.expires_at_ms,
         "manager invocation differs from its persisted delegation"
     );
-    let events = load_events_from(connection, space)?;
+    let events = super::event_authorization::retained_scope_events_in(
+        connection, space, &auth.resource().resource, conversation,
+    )?;
     let origin = super::services::resolve_current_agent_origin(
         policy, connection, &events, trigger, now_ms,
     )?;
