@@ -5230,8 +5230,10 @@ impl Runtime {
         let mut session = {
             let mut store = self.store.lock().await;
             verification.run(|| -> Result<_> {
-            let session = store.refresh_agent_session(session, now)?;
-            let origin = store.agent_origin(&session, now)?;
+            let session = store.refresh_agent_session(session, now)
+                .context("SDK authorize session refresh")?;
+            let origin = store.agent_origin(&session, now)
+                .context("SDK authorize initial origin")?;
             if let Some((task, reference)) = origin.task {
                 ensure!(
                     body["method"] != "create_task",
@@ -5262,75 +5264,93 @@ impl Runtime {
                 body["basis_heads"] = match saved {
                     Some(saved) => serde_json::from_str::<Value>(&saved)?["basis_heads"].clone(),
                     None => {
-                        json!(store.retained_resource_heads(session.space_id.as_str(), &session.resource_id, &session.conversation_id)?)
+                        json!(store.retained_resource_heads(session.space_id.as_str(), &session.resource_id, &session.conversation_id)
+                            .context("SDK authorize retained conversation heads")?)
                     }
                 };
             }
             Ok(session)
-            })?
+            }).with_context(|| format!("SDK authorize source refresh; actual={:?}", verification.counts()))?
         };
         let task_policy = self
             .ensure_sdk_execution_task_policy(&session, &body)
-            .await?;
+            .await
+            .context("SDK execution Task policy refresh")?;
         let now = now_ms() as u64;
         let facts = {
             let store = self.store.lock().await;
-            verification.run(|| -> Result<_> {
-                let origin = store.agent_origin(&session, now)?;
-                let facts = if let Some(task) = &task_policy {
-                    store
-                        .execution_dispatch_facts_with_task_policy(
-                            task,
-                            &body,
-                            &self.audience()?,
+            verification
+                .run(|| -> Result<_> {
+                    let origin = store
+                        .agent_origin(&session, now)
+                        .context("SDK authorize current origin")?;
+                    let facts = if let Some(task) = &task_policy {
+                        store
+                            .execution_dispatch_facts_with_task_policy(
+                                task,
+                                &body,
+                                &self.audience()?,
+                                now,
+                            )
+                            .context("SDK authorize current execution facts")?
+                            .facts()
+                            .clone()
+                    } else {
+                        self.authorization_facts(&store, &body, &self.audience()?, now)
+                            .context("SDK authorize primary facts")?
+                    };
+                    let policies = task_policy
+                        .as_ref()
+                        .map_or(store.authorization_state(), |task| task.state());
+                    let delegated = policies
+                        .verify_service_delegation(
+                            &origin.parent,
+                            &session.service,
+                            &session.grant_leaf,
+                            &facts,
                             now,
-                        )?
-                        .facts()
-                        .clone()
-                } else {
-                    self.authorization_facts(&store, &body, &self.audience()?, now)?
-                };
-                let policies = task_policy
-                    .as_ref()
-                    .map_or(store.authorization_state(), |task| task.state());
-                let delegated = policies.verify_service_delegation(
-                    &origin.parent,
-                    &session.service,
-                    &session.grant_leaf,
-                    &facts,
-                    now,
-                )?;
-                ensure!(
-                    delegated.device() == &session.device
-                        && delegated.initiator() == &session.initiator
-                        && delegated.initiating_grant() == session.initiating_grant.as_ref(),
-                    "SDK request differs from its current admitted delegation"
-                );
-                let mut expected: BTreeMap<_, _> = delegated
-                    .heads()
-                    .iter()
-                    .cloned()
-                    .map(|head| (head.domain.clone(), head))
-                    .collect();
-                if let Some(destination) = crate::identity::policy::execution_destination_for_body(
-                    policies, &facts, &body, now,
-                )? {
-                    for head in destination.heads() {
-                        ensure!(
-                            expected
-                                .insert(head.domain.clone(), head.clone())
-                                .is_none_or(|previous| previous == *head),
-                            "SDK execution destination has conflicting policy heads"
-                        );
+                        )
+                        .context("SDK authorize current service delegation")?;
+                    ensure!(
+                        delegated.device() == &session.device
+                            && delegated.initiator() == &session.initiator
+                            && delegated.initiating_grant() == session.initiating_grant.as_ref(),
+                        "SDK request differs from its current admitted delegation"
+                    );
+                    let mut expected: BTreeMap<_, _> = delegated
+                        .heads()
+                        .iter()
+                        .cloned()
+                        .map(|head| (head.domain.clone(), head))
+                        .collect();
+                    if let Some(destination) =
+                        crate::identity::policy::execution_destination_for_body(
+                            policies, &facts, &body, now,
+                        )
+                        .context("SDK authorize current execution destination")?
+                    {
+                        for head in destination.heads() {
+                            ensure!(
+                                expected
+                                    .insert(head.domain.clone(), head.clone())
+                                    .is_none_or(|previous| previous == *head),
+                                "SDK execution destination has conflicting policy heads"
+                            );
+                        }
                     }
-                }
-                session.expected_policies = expected.into_values().collect();
-                session.expires_at_ms = session.expires_at_ms.min(delegated.expires_at_ms());
-                if let Some(task) = &task_policy {
-                    session.expires_at_ms = session.expires_at_ms.min(task.expires_at_ms());
-                }
-                Ok(facts)
-            })?
+                    session.expected_policies = expected.into_values().collect();
+                    session.expires_at_ms = session.expires_at_ms.min(delegated.expires_at_ms());
+                    if let Some(task) = &task_policy {
+                        session.expires_at_ms = session.expires_at_ms.min(task.expires_at_ms());
+                    }
+                    Ok(facts)
+                })
+                .with_context(|| {
+                    format!(
+                        "SDK authorize current source and facts; actual={:?}",
+                        verification.counts()
+                    )
+                })?
         };
         let identity = vibeface_secure::Identity::from_secret_hex(&self.identity.secret_key_hex)
             .map_err(anyhow::Error::msg)?;
@@ -5375,6 +5395,7 @@ impl Runtime {
             verification,
         )
         .await
+        .context("SDK authorize final RPC access")
     }
 
     pub(crate) async fn claim_manager(

@@ -408,30 +408,47 @@ impl Runtime {
             let mut store = self.store.lock().await;
             SignatureVerification::new().run(|| -> Result<_> {
                 let now = now_ms() as u64;
-                let input = self.sdk_task_policy_input(&store, session, body, now)?;
+                let input = self
+                    .sdk_task_policy_input(&store, session, body, now)
+                    .with_context(|| {
+                        format!(
+                            "SDK Task policy input; actual={:?}",
+                            SignatureVerification::current_counts()
+                        )
+                    })?;
                 if store
                     .execution_dispatch_facts(body, &input.facts.audience, now)
                     .is_ok()
                 {
                     return Ok((input, SdkTaskPolicyRead::Primary));
                 }
-                if let Some(current) = self.cached_sdk_task_policy(&store, &input, now)? {
+                if let Some(current) = self
+                    .cached_sdk_task_policy(&store, &input, now)
+                    .with_context(|| {
+                        format!(
+                            "SDK Task policy cached selection; actual={:?}",
+                            SignatureVerification::current_counts()
+                        )
+                    })?
+                {
                     return Ok((input, SdkTaskPolicyRead::Cached(current)));
                 }
-                let pending = store.prepare_node_task_policy_read(
-                    &self.identity,
-                    &input.parent,
-                    &session.service,
-                    &session.grant_leaf,
-                    &input.facts,
-                    &input.selection,
-                    &input.context,
-                    RemoteExecutionPolicyPurpose::Execution,
-                    now,
-                    now.checked_add(INVOCATION_MAX_AGE_MS)
-                        .context("SDK policy read deadline overflow")?
-                        .min(session.expires_at_ms),
-                )?;
+                let pending = store
+                    .prepare_node_task_policy_read(
+                        &self.identity,
+                        &input.parent,
+                        &session.service,
+                        &session.grant_leaf,
+                        &input.facts,
+                        &input.selection,
+                        &input.context,
+                        RemoteExecutionPolicyPurpose::Execution,
+                        now,
+                        now.checked_add(INVOCATION_MAX_AGE_MS)
+                            .context("SDK policy read deadline overflow")?
+                            .min(session.expires_at_ms),
+                    )
+                    .context("SDK Task policy signed Node read preparation")?;
                 Ok((input, SdkTaskPolicyRead::Pending(pending)))
             })?
         };
@@ -445,22 +462,31 @@ impl Runtime {
             &self.identity,
             pending.trust(),
         )
-        .await?;
+        .await
+        .context("SDK Node policy Noise connection")?;
         let NodeReadResponse::Snapshot(snapshot) = client
             .read(&NodeReadRequest::Prepare(pending.request().clone()))
-            .await?
+            .await
+            .context("SDK Node policy remote prepare")?
         else {
             bail!("SDK policy prepare returned another read stage");
         };
         let reference = {
             let mut store = self.store.lock().await;
             SignatureVerification::new().run(|| {
-                store.begin_node_task_policy_read(
-                    pending,
-                    &snapshot,
-                    client.actual_noise_peer(),
-                    now_ms() as u64,
-                )
+                store
+                    .begin_node_task_policy_read(
+                        pending,
+                        &snapshot,
+                        client.actual_noise_peer(),
+                        now_ms() as u64,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "SDK Node policy import begin; actual={:?}",
+                            SignatureVerification::current_counts()
+                        )
+                    })
             })?
         };
         let mut cursor = None;
@@ -470,14 +496,25 @@ impl Runtime {
                 request_hash: snapshot.payload.request_hash.clone(),
                 cursor: cursor.clone(),
             };
-            let NodeReadResponse::Page(page) = client.read(&NodeReadRequest::Page(request)).await?
+            let NodeReadResponse::Page(page) = client
+                .read(&NodeReadRequest::Page(request))
+                .await
+                .context("SDK Node policy remote page")?
             else {
                 bail!("SDK policy page returned another read stage");
             };
             {
                 let mut store = self.store.lock().await;
                 SignatureVerification::new().run(|| {
-                    store.append_node_task_policy_page(&reference, &page, now_ms() as u64)
+                    store
+                        .append_node_task_policy_page(&reference, &page, now_ms() as u64)
+                        .with_context(|| {
+                            format!(
+                                "SDK Node policy import page {}; actual={:?}",
+                                page.payload.page_index,
+                                SignatureVerification::current_counts()
+                            )
+                        })
                 })?;
             }
             if page.payload.complete {
@@ -495,14 +532,28 @@ impl Runtime {
                 request_hash: snapshot.payload.request_hash.clone(),
                 cursor: None,
             }))
-            .await?
+            .await
+            .context("SDK Node policy remote finish")?
         else {
             bail!("SDK policy finish returned another read stage");
         };
         let mut store = self.store.lock().await;
         SignatureVerification::new().run(|| {
-            store.finish_node_task_policy_read(&reference, &witness, now_ms() as u64)?;
-            self.cached_sdk_task_policy(&store, &input, now_ms() as u64)?
+            store
+                .finish_node_task_policy_read(&reference, &witness, now_ms() as u64)
+                .with_context(|| {
+                    format!(
+                        "SDK Node policy import finish; actual={:?}",
+                        SignatureVerification::current_counts()
+                    )
+                })?;
+            self.cached_sdk_task_policy(&store, &input, now_ms() as u64)
+                .with_context(|| {
+                    format!(
+                        "SDK Node policy completed selection; actual={:?}",
+                        SignatureVerification::current_counts()
+                    )
+                })?
                 .map(Some)
                 .context(
                     "NeedPolicySync: completed SDK policy no longer matches its current source",

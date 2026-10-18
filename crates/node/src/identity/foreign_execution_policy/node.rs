@@ -100,7 +100,9 @@ fn current_trust_in(
     usage: &mut ExecutionProofUsage,
 ) -> Result<VerifiedTaskExecutionTrust> {
     let reference = if let Some(binding) = raw.current_binding.as_ref() {
-        binding_association_in(connection, primary, binding, usage)?.approval_ref
+        binding_association_in(connection, primary, binding, usage)
+            .context("SDK Node policy source original binding association")?
+            .approval_ref
     } else {
         let task = context
             .context
@@ -219,7 +221,13 @@ impl Store {
             service_grant,
             facts,
             now,
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "SDK Node policy source collection; actual={:?}",
+                SignatureVerification::current_counts()
+            )
+        })?;
         let verified = verify_sdk_source_provenance(
             self.policy.verified(),
             parent,
@@ -229,7 +237,13 @@ impl Store {
             facts,
             raw.current_binding.as_ref(),
             now,
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "SDK Node policy source verification; actual={:?}",
+                SignatureVerification::current_counts()
+            )
+        })?;
         let mut usage = verified.proof_usage().clone();
         let trust = current_trust_in(
             &tx,
@@ -239,7 +253,14 @@ impl Store {
             selection,
             context,
             &mut usage,
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "SDK Node policy approved roots; proof={:?}; actual={:?}",
+                usage.counts(),
+                SignatureVerification::current_counts()
+            )
+        })?;
         let pins: Vec<_> = self
             .policy
             .pins()
@@ -267,7 +288,14 @@ impl Store {
             purpose,
             now,
             expires.min(verified.expires_at_ms()),
-        )?;
+        )
+        .with_context(|| {
+            format!(
+                "SDK Node policy native source factory; proof={:?}; actual={:?}",
+                usage.counts(),
+                SignatureVerification::current_counts()
+            )
+        })?;
         match &request {
             NodeExecutionPolicyReadRequest::Current(value) => usage.record_signed(value)?,
             NodeExecutionPolicyReadRequest::History(value) => usage.record_signed(value)?,
@@ -283,7 +311,12 @@ impl Store {
         if let Some(counts) = SignatureVerification::current_counts() {
             usage.record_actual_signature_counts(counts);
         }
-        usage.enforce_limits()?;
+        usage.enforce_limits().with_context(|| {
+            format!(
+                "SDK Node policy request proof budget; proof={:?}",
+                usage.counts()
+            )
+        })?;
         save_exact_in(&tx, &key("sdk-source", digest), &raw)?;
         let typed = TaskExecutionPolicyRequest::Node(request.clone());
         save_exact_in(&tx, &key("request", &typed.request_hash()?), &typed)?;
