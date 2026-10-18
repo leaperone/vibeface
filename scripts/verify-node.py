@@ -413,6 +413,7 @@ class Client:
         self.target_public_keys = {}
         self.operations = {}
         self.signed_requests = {}
+        self.execution_sources = {}
 
     def command(self, op, *, check=True, **arguments):
         if op in {"connect", "close", "authenticate"}:
@@ -587,11 +588,20 @@ class Client:
             elif method == "operate" and request["action"]["type"] == "open":
                 raw_context["canonical_cwd"] = request["action"]["cwd"]
         if remote:
-            body.update(remote["share"]["selection"])
-            if method == "operate" and request["action"]["type"] != "open":
-                body["execution_session_receipt"] = remote["receipt"]
+            remote_metadata = method in {"operation", "session", "reconcile"}
             if method in {"bind_execution", "rebind_execution"}:
                 raw_context["binding_generation"] = remote["generation"]
+            remote_context = copy.deepcopy(raw_context)
+            if remote_metadata:
+                source_proof = self.execution_sources.get((body["space_id"], body["resource_id"], body["operation_id"]))
+                require(source_proof is not None, "remote metadata uses the original verified Project source")
+                body["execution_source"] = copy.deepcopy(source_proof)
+                raw_context = self.command("verify_project_metadata", source=source_proof,
+                                           binding=original["binding"], connection=connection)
+            if not remote_metadata:
+                body.update(remote["share"]["selection"])
+            if method == "operate" and request["action"]["type"] != "open":
+                body["execution_session_receipt"] = remote["receipt"]
             handle = "remote-" + uuid.uuid4().hex
             self.command("read_remote_policy", handle=handle, connection=connection,
                          source_connection=remote["source_connection"],
@@ -600,10 +610,10 @@ class Client:
                          action={"bind_execution": "execution_open", "rebind_execution": "execution_rebind"}.get(method)
                                 or ({"open": "execution_open", "send": "execution_send"}.get(request.get("action", {}).get("type"))
                                     if method == "operate" else "operation_status_read"),
-                         raw_context=raw_context, approve=remote.get("approve", False))
+                         raw_context=remote_context, approve=remote.get("approve", False))
             remote["approve"] = False
         signing = {"raw_context": raw_context}
-        if remote:
+        if remote and not remote_metadata:
             signing["remote_handle"] = handle
         try:
             proof = self.command("prepare_signed", body=body, connection=connection, **signing)
@@ -618,6 +628,14 @@ class Client:
                 response = self.command("request", method="rpc", params=proof["body"],
                                         invocation=proof["invocation"], connection=connection)
             result = response.get("result", {})
+            if remote and method == "operate" and result.get("execution_source"):
+                source_proof = result["execution_source"]
+                self.command("verify_project_metadata", source=source_proof, binding=request["binding"], connection=connection)
+                require(source_proof["payload"]["operation_id"] == request["operation_id"],
+                        "signed Project source identifies this exact submitted operation")
+                source_key = (body["space_id"], body["resource_id"], request["operation_id"])
+                previous = self.execution_sources.setdefault(source_key, copy.deepcopy(source_proof))
+                require(previous == source_proof, "the original signed Project source never changes")
             if remote and result.get("actual"):
                 actual = result["actual"]
                 original_proof = self.signed_requests[actual["receipt"]["payload"]["operation_id"]]
@@ -1391,8 +1409,9 @@ def create_execution_share(project, executor, registered, conversation, task, se
     source_handle = "source-policy-" + uuid.uuid4().hex
     owner.command("read_share_policy", handle=source_handle, connection=source_ref,
                   source_trust_ref=source_ref, intent=intent)
-    actions = (["execution_open", "execution_send", "operation_status_read"] if purpose == "execution"
-               else ["execution_rebind", "operation_status_read"])
+    actions = {"execution": ["execution_open", "execution_send", "operation_status_read"],
+               "resolution": ["execution_resolve", "operation_resolve"],
+               "rebind": ["execution_rebind", "operation_status_read"]}[purpose]
     prepared = owner.command("prepare_share", handle="share-" + uuid.uuid4().hex,
                              connection="execution", source_handle=source_handle,
                              intent={"executionResourceId": registered["resource_id"], "actions": actions,
@@ -1536,6 +1555,201 @@ def finish_independent_gateway(gateway, project, executor, card, original_domain
                        "A restart restores source", "owner revocation refuses forwarding without fallback"]}
 
 
+def readonly_context(source, binding, target_key, *, resolver=False):
+    value = binding["binding"]
+    return {"context": {"conversation": value["conversation_id"], "task": value["task_ref"],
+                        "sdk_session": None,
+                        "execution_session": {"target": source.command("derive_authorization_id", kind="device", value=target_key),
+                                              "session_id": value["session_id"]},
+                        "executor_kind": value["open_spec"]["executor"], "workspace_resource": source.resource_id},
+            "binding_generation": value["generation"],
+            "canonical_cwd": value["open_spec"]["cwd"] if resolver else None,
+            "execution_target_public_key": target_key}
+
+
+def read_resolution_policy(source, remote, binding, *, resolver=False, check=True):
+    context = readonly_context(source, binding, remote["share"]["selection"]["target_public_key"], resolver=resolver)
+    handle = "readonly-" + uuid.uuid4().hex
+    result = source.command("read_remote_policy", handle=handle, connection="main", source_connection="main",
+                            execution_connection=remote["execution_connection"],
+                            execution_trust_ref=remote["trust_ref"], selection=remote["share"]["selection"],
+                            purpose="resolver" if resolver else "observation_read", action="operation_resolve",
+                            raw_context=context, check=check)
+    return handle, result
+
+
+def executor_original(node, space, operation_id):
+    with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+        row = database.execute(
+            "SELECT original_request,handoff,handoff_hash,invocation_hash,body_hash,admission_transport,"
+            "admission_challenge,admission_receipts,admission_receipt,admitted_at_ms "
+            "FROM execution_handoffs WHERE original_space_id=? AND operation_id=?", (space, operation_id)).fetchone()
+    require(row is not None, "C retained the original signed handoff and admission")
+    return row
+
+
+def persisted_operation_state(node, space, operation_id, *, executor=False):
+    table, column = ("execution_handoffs", "original_space_id") if executor else ("operations", "space_id")
+    with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+        row = database.execute(f"SELECT state FROM {table} WHERE {column}=? AND operation_id=?",
+                               (space, operation_id)).fetchone()
+    raw = row[0] if row else None
+    return json.loads(raw) if raw is not None and not executor else raw
+
+
+def revoke_execution_share(executor, registered, share):
+    owner = executor.client
+    prepared = owner.command("prepare_revoke_grant", handle="revoke-" + uuid.uuid4().hex,
+                             connection="execution", grant=share["selection"]["execution_grant"])
+    finish_native_change(owner, prepared, "space_policy_commit", connection="execution")
+    owner.authenticate(resource_id=registered["resource_id"], host_public_key=executor.node_public_key,
+                       connection="execution", trust_ref="execution", resource_kind="execution_service",
+                       grant_leaf=registered["grant_leaf"], activate=False)
+
+
+def verify_remote_readonly(run, project, executor, registered, *, connection="main"):
+    source, owner = project.client, executor.client
+    records = []
+    for terminal in (False, True):
+        label = "readonly-terminal" if terminal else "readonly-unknown"
+        conversation, task, session = label, label + "-task", label + "-session"
+        source.rpc("create_conversation", conversation_id=conversation, title=label)
+        source.create_task(project, conversation, task, title=label, goal="Read and reconcile the original remote operation",
+                           acceptance="Revocation and reconciliation never repeat the provider")
+        share = create_execution_share(project, executor, registered, conversation, task, session)
+        source.command("save_trust", trust_ref="remote-execution", trust=owner.command("get_trust", trust_ref="execution"))
+        writer = {"share": share, "trust_ref": "remote-execution", "source_connection": "main",
+                  "execution_connection": "remote-execution", "generation": 1, "approve": True}
+        open_spec = {"type": "open", "executor": "claude_code", "cwd": str(project.directory.parent / "workspace")}
+        binding = source.bind_execution(conversation, task, executor, session, open_spec, remote=writer, connection=connection)
+        opened = request(source.scope["space_id"], conversation, executor, label + "-open", session, open_spec, task=task)
+        opened["binding"] = binding
+        source.rpc("operate", request=opened, remote=writer, connection=connection)
+        wait_for("readonly fixture session opens", lambda: source.rpc("operation", target_node=executor.node_id,
+                 operation_id=opened["operation_id"], remote=writer, connection=connection)["operation"]["state"] == "succeeded")
+        current = source.rpc("session", target_node=executor.node_id, session_id=session, remote=writer,
+                             connection=connection)["session"]
+        reader_share = create_execution_share(project, executor, registered, conversation, task, session, purpose="resolution")
+        reader = {**writer, "share": reader_share, "approve": False}
+        source.command("save_trust", trust_ref="remote-execution", trust=owner.command("get_trust", trust_ref="execution"))
+        gate = run / (label + "-complete")
+        sent = request(source.scope["space_id"], conversation, executor, label + "-send", session,
+                       {"type": "send", "text": json.dumps({"label": label, "gate": str(gate)})},
+                       revision=current["revision"], task=task)
+        sent.update(binding=binding, resources=[open_spec["cwd"]])
+        source.rpc("operate", request=sent, remote=writer, connection=connection)
+        wait_for("readonly fixture starts exactly once", lambda: len(invocations(run, label)) == 1)
+        initial = wait_for("original C receipt is available", lambda: source.rpc("operation", target_node=executor.node_id,
+                           operation_id=sent["operation_id"], remote=writer, connection=connection).get("actual"))
+        original = initial["handoff"]
+        original_request = copy.deepcopy(source.signed_requests[sent["operation_id"]])
+        admission = admitted_scope(project, source, sent["operation_id"])
+        accepted = executor_original(executor, source.scope["space_id"], sent["operation_id"])
+        project.stop()
+        if terminal:
+            gate.touch(mode=0o600)
+            wait_for("C commits terminal while B is stopped", lambda: persisted_operation_state(
+                executor, source.scope["space_id"], sent["operation_id"], executor=True) == "succeeded")
+        else:
+            executor.stop()
+            executor.start()
+            owner.connect()
+            owner.authenticate()
+            owner.command("connect", url=executor.url, node_id=executor.node_id, node_public_key=executor.node_public_key,
+                          connection="execution", trust_ref="execution")
+            owner.authenticate(resource_id=registered["resource_id"], host_public_key=executor.node_public_key,
+                               connection="execution", trust_ref="execution", resource_kind="execution_service",
+                               grant_leaf=registered["grant_leaf"], activate=False)
+        project.start()
+        source.connect()
+        source.authenticate()
+        if connection != "main":
+            source.attach_gateway(source.gateways[connection]["card"], connection=connection, refresh=False)
+        source.command("connect", url=executor.url, node_id=executor.node_id, node_public_key=executor.node_public_key,
+                       connection="remote-execution", trust_ref="remote-execution")
+        require(persisted_operation_state(project, source.scope["space_id"], sent["operation_id"]) == "unknown",
+                "B restart retains Unknown before an explicit account decision")
+        revoke_execution_share(executor, registered, share)
+        source.command("save_trust", trust_ref="remote-execution", trust=owner.command("get_trust", trust_ref="execution"))
+        denied_writer = source.command("read_remote_policy", handle=label + "-revoked-writer", connection="main",
+                                       source_connection="main", execution_connection="remote-execution",
+                                       execution_trust_ref="remote-execution", selection=share["selection"],
+                                       action="execution_send", raw_context=readonly_context(
+                                           source, binding, executor.node_public_key, resolver=True), check=False)
+        require(not denied_writer["ok"], "revoked C writer no longer yields a current execution policy")
+        observer, _ = read_resolution_policy(source, reader, binding)
+        try:
+            signed = source.command("sign_observation_request", handle=observer, original=original,
+                                    authorization_id=label + "-observe")
+            observation_body = {"method": "execution_observation", "observation_request": signed}
+            observed = source.call("rpc", observation_body)
+            require(observed.get("remote_verified") and observed["original_handoff"] == original,
+                    "direct B observation retains the exact original handoff after writer revocation")
+            actual = source.command("verify_observation", handle=observer, actual=observed["actual"], binding=binding)
+            expected_state = "succeeded" if terminal else "unknown"
+            require(actual["handoff"] == original and actual["receipt"]["payload"]["state"] == expected_state,
+                    "WASM verifies the C receipt for the exact original operation")
+            repeated = source.call("rpc", observation_body)
+            repeated_actual = source.command("verify_observation", handle=observer, actual=repeated["actual"], binding=binding)
+            require(repeated_actual["handoff"] == original and repeated_actual["receipt"]["payload"]["state"] == expected_state,
+                    "retrying the same signed observation only reads the original operation")
+        finally:
+            source.command("release_remote", handle=observer)
+        require(persisted_operation_state(project, source.scope["space_id"], sent["operation_id"]) == "unknown",
+                "Observation does not resolve B or release its original reservation")
+        resolver, _ = read_resolution_policy(source, reader, binding, resolver=True)
+        try:
+            resolution = source.command("resolution_body", handle=resolver, actual=actual,
+                                        authorization_id=label + "-resolve", outcome="succeeded" if terminal else "failed",
+                                        evidence="The isolated executor receipt and process state were independently verified.")
+            expected_purpose = "reconcile_terminal" if terminal else "resolve_unknown"
+            require(resolution["body"]["resolution_purpose"] == expected_purpose,
+                    "native resolution chooses the purpose from the signed C state")
+            proof = source.command("prepare_signed", body=resolution["body"], raw_context=resolution["context"],
+                                   remote_handle=resolver)
+            require("error" not in proof, "B prepares the current independent resolver authorization")
+            final = source.call("rpc", proof["body"], invocation=proof["invocation"])
+            verified = source.command("verify_resolution_result", handle=resolver, actual=final["operation"]["result"], original=proof)
+            require(verified["purpose"] == expected_purpose and verified["state"] == ("succeeded" if terminal else "failed"),
+                    "WASM verifies C's signed final resolution against the original account decision")
+            duplicate = source.call("rpc", proof["body"], invocation=proof["invocation"])
+            require(duplicate == final, "the exact signed resolution retry returns the same terminal operation")
+        finally:
+            source.command("release_remote", handle=resolver)
+        source.call("rpc", original_request["body"], invocation=original_request["invocation"], connection=connection)
+        require(admitted_scope(project, source, sent["operation_id"]) == admission
+                and executor_original(executor, source.scope["space_id"], sent["operation_id"]) == accepted
+                and len(invocations(run, label)) == 1,
+                "Observation, resolution and both exact retries preserve the original admission and one execution")
+        for node, table, column in ((project, "resource_reservations", "space_id"),
+                                    (executor, "execution_handoff_reservations", "original_space_id")):
+            with sqlite3.connect(f"file:{node.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+                require(database.execute(f"SELECT COUNT(*) FROM {table} WHERE {column}=? AND operation_id=?",
+                                         (source.scope["space_id"], sent["operation_id"])).fetchone()[0] == 0,
+                        "confirmed resolution releases the original B and C reservations")
+        audit = resolution_audit(project, source, sent["operation_id"])
+        observer, _ = read_resolution_policy(source, reader, binding)
+        try:
+            retained = {"method": "execution_observation", "observation_request": source.command(
+                "sign_observation_request", handle=observer, original=original, authorization_id=label + "-revoked-reader")}
+        finally:
+            source.command("release_remote", handle=observer)
+        revoke_execution_share(executor, registered, reader_share)
+        source.call("rpc", retained, status=400)
+        source.command("save_trust", trust_ref="remote-execution", trust=owner.command("get_trust", trust_ref="execution"))
+        _, denied_reader = read_resolution_policy(source, reader, binding, check=False)
+        require(not denied_reader["ok"] and len(invocations(run, label)) == 1,
+                "revoked C reader rejects both its retained signature and a fresh observation policy")
+        private_json(run / (label + "-resolution.json"), {"original": original_request, "observation": observation_body,
+                     "resolution": proof, "final": final, "resolution_admission": audit})
+        records.append({"operation_id": sent["operation_id"], "purpose": expected_purpose,
+                        "writer_grant": share["selection"]["execution_grant"],
+                        "reader_grant": reader_share["selection"]["execution_grant"],
+                        "executor_state": verified["state"], "provider_invocations": len(invocations(run, label)),
+                        "evidence": label + "-resolution.json"})
+    return records
+
+
 def verify_remote_topology(run, binary, workspace, fixture, helper, module, nodes, *, gateway=False):
     group = [Node(run, name, binary, workspace, fixture, helper, module)
              for name in ("REMOTE_A", "REMOTE_B", "REMOTE_C")]
@@ -1651,6 +1865,8 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
     wait_for("sealed Task opens only its next binding", lambda: source.rpc("operation", target_node=executor.node_id,
               operation_id="remote-rebound-open", remote=replacement, connection=connection)["operation"]["state"] == "succeeded")
 
+    readonly = verify_remote_readonly(run, project, executor, registered, connection=connection)
+
     team_prepared = source.command("prepare_team", handle="remote-team", trust_ref="remote-team",
                                    source_project=source.resource_id)
     team = finish_native_change(source, team_prepared, "team_create", team=True, password=project.backup_password)
@@ -1664,12 +1880,14 @@ def verify_remote_topology(run, binary, workspace, fixture, helper, module, node
     return {"gateway": gateway_report, "accounts": [node.client.scope["account_id"] for node in group],
             "nodes": [node.node_id for node in group], "execution_resource": registered["resource_id"],
             "source_domains_before": sorted(source_domains), "executor_domains_before": sorted(executor_domains),
-            "team_space": team["scope"]["space_id"], "original_request": "remote-original-request.json",
+            "team_space": team["scope"]["space_id"], "original_request": "remote-original-request.json", "readonly": readonly,
             "checks": ["B has no C primary policy", "C has no B account seed", "native bounded source and foreign policy imports",
                        "remote open/send receipts", "exact duplicate after B/C restart", "native seal and exact seal status",
-                       "generation-2 rebind and new session open", "independent account rejection", "Team isolation"],
+                       "generation-2 rebind and new session open", "independent account rejection", "Team isolation",
+                       "independent ObservationRead and Resolver grants", "writer and reader revocation",
+                       "Unknown resolution and C-signed terminal reconciliation without replay"],
             "not_checked": ([] if gateway else ["cross-account authenticated A Gateway"]) + ["replacement on a different C node",
-                            "SDK continuation without browser", "remote Unknown and revocation"]}
+                            "SDK continuation without browser"]}
 
 
 def acceptance(options):

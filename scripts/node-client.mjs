@@ -549,6 +549,14 @@ async function readRemotePolicy(input, connectionName) {
   } finally { importer?.free(); policy?.free(); }
 }
 
+function currentRemote(input, connectionName) {
+  const auth = gateways.has(connectionName) ? gatewayBinding(connectionName).authorization : authorizations.get(connectionName);
+  const remote = remoteAuthorizations.get(input.handle);
+  assert(auth && remote && remote.connectionName === connectionName && remote.source === auth.verified,
+    'remote authorization belongs to this exact confirmed source session');
+  return remote.remote;
+}
+
 async function readSharePolicy(input, connectionName) {
   const connection = connections.get(connectionName);
   const sourceTrust = savedTrust(input.source_trust_ref);
@@ -757,6 +765,24 @@ async function command(input) {
     return checkedAuthorization(auth.verified, input.expected_host_public_key, savedTrust(auth.trustRef));
   }
   if (input.op === 'read_remote_policy') return readRemotePolicy(input, connectionName);
+  if (input.op === 'verify_project_metadata') {
+    const auth = gateways.has(connectionName) ? gatewayBinding(connectionName).authorization : authorizations.get(connectionName);
+    assert(auth, 'Project metadata requires a confirmed source authorization');
+    return JSON.parse(crypto.verifyProjectExecutionMetadata(auth.verified, JSON.stringify(input.source), JSON.stringify(input.binding)));
+  }
+  if (input.op === 'sign_observation_request') {
+    assert(!gateways.has(connectionName), 'observations use the explicitly selected direct B connection');
+    assert.equal(connection.nodePublicKey, authorizations.get(connectionName)?.policy.audience_public_key,
+      'observation connection must reach the confirmed Project host');
+    return JSON.parse(currentRemote(input, connectionName).signObservationRequest(JSON.stringify(input.original),
+      input.authorization_id, connection.nodePublicKey, identity(connection.identityName), Date.now()));
+  }
+  if (input.op === 'verify_observation') return JSON.parse(currentRemote(input, connectionName).observationJson(
+    JSON.stringify(input.actual), JSON.stringify(input.binding), Date.now()));
+  if (input.op === 'resolution_body') return JSON.parse(currentRemote(input, connectionName).resolutionBodyJson(
+    JSON.stringify(input.actual), input.authorization_id, input.outcome, input.evidence, Date.now()));
+  if (input.op === 'verify_resolution_result') return JSON.parse(currentRemote(input, connectionName).resolutionResultJson(
+    JSON.stringify(input.actual), JSON.stringify(input.original.body), JSON.stringify(input.original.invocation), Date.now()));
   if (input.op === 'verify_remote_result') {
     const remote = remoteAuthorizations.get(input.handle);
     assert(remote, 'result verification requires its original remote authorization');
@@ -783,6 +809,12 @@ async function command(input) {
       grant: 'prepareDirectionalGrant' };
     assert(builders[input.kind], 'unknown governance intent');
     return retainPreparation(input, 'governance', crypto[builders[input.kind]](JSON.stringify(input.intent), signer, auth.verified, Date.now()), auth.trustRef);
+  }
+  if (input.op === 'prepare_revoke_grant') {
+    const auth = authorizations.get(connectionName);
+    assert(auth, 'grant revocation needs a confirmed owner authorization');
+    return retainPreparation(input, 'governance', crypto.prepareSpaceGrantRevocation(auth.scope.space_id,
+      input.grant, identity(connection.identityName), auth.verified, Date.now()), auth.trustRef);
   }
   if (input.op === 'prepare_team') {
     const auth = authorizations.get(connectionName);
