@@ -2108,6 +2108,7 @@ mod tests {
         let mut store = Store {
             connection: fixture.connection,
             policy: fixture.policy,
+            target_recovery_import: None,
         };
         assert!(
             store
@@ -2540,6 +2541,7 @@ mod tests {
         let mut store = Store {
             connection: fixture.connection,
             policy: fixture.policy,
+            target_recovery_import: None,
         };
         assert!(
             store
