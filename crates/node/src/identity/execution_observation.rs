@@ -1,6 +1,6 @@
 use super::{
-    StoredHandoff, lease_checkpoint_key, public_execution_result, session_from, signed_receipt,
-    stored_from, verify_local_handoff_checkpoint,
+    HandoffPolicy, StoredHandoff, lease_checkpoint_key, public_execution_result, session_from,
+    signed_receipt, stored_from, verify_local_handoff_checkpoint,
 };
 use crate::{crypto::LocalIdentity, model::Event, store::Store};
 use anyhow::{Context, Result, ensure};
@@ -20,11 +20,12 @@ use vibeface_secure::{
             ExecutionObservationChallenge, ExecutionObservationFreshness,
             ExecutionObservationTarget, SignedExecutionObservation,
         },
+        task_business_policy::{TaskBusinessScopedView, TaskBusinessWire},
     },
     signature_verification::ScopedSignatureVerification,
 };
 
-fn check_heads_in(
+pub(super) fn check_heads_in(
     connection: &Connection,
     policy: &VerifiedPolicySet,
     heads: &[PolicyStamp],
@@ -160,10 +161,49 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<ExecutionObservationChallenge> {
+        self.issue_execution_observation_challenge_with_policy(
+            HandoffPolicy::Primary,
+            identity,
+            wire,
+            transport,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn issue_execution_observation_challenge_scoped(
+        &mut self,
+        view: &TaskBusinessScopedView,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionObservation,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<ExecutionObservationChallenge> {
+        self.issue_execution_observation_challenge_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            identity,
+            wire,
+            transport,
+            now_ms,
+        )
+    }
+
+    fn issue_execution_observation_challenge_with_policy(
+        &mut self,
+        policy: HandoffPolicy<'_>,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionObservation,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<ExecutionObservationChallenge> {
         let signature_scope = ScopedSignatureVerification::new();
-        let current = self
-            .policy
-            .verified()
+        policy.check_business_wire_in(
+            &self.connection,
+            &self.policy,
+            &TaskBusinessWire::Observe(wire.clone()),
+            now_ms,
+        )?;
+        let current = policy
+            .state(&self.policy)
             .verify_execution_observation_current(wire, transport, now_ms)?;
         let challenge = ExecutionObservationChallenge::new(
             &current,
@@ -177,12 +217,19 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_heads_in(&tx, self.policy.verified(), current.heads())?;
+        policy.check_heads_in(
+            &tx,
+            &self.policy,
+            &TaskBusinessWire::Observe(wire.clone()),
+            current.heads(),
+            now_ms,
+        )?;
         check_local_route_in(&tx, self.policy.verified(), identity, current.target())?;
         let mut usage = current.proof_usage().clone();
         usage.record_metadata(&challenge)?;
         usage.record_actual_signature_counts(signature_scope.counts());
         usage.enforce_limits()?;
+        policy.check_usage(usage)?;
         tx.execute(
             "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
             params![
@@ -197,6 +244,41 @@ impl Store {
 
     pub fn sign_execution_observation_receipts(
         &self,
+        challenge: &ExecutionObservationChallenge,
+        identity: &LocalIdentity,
+        now_ms: u64,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        self.sign_execution_observation_receipts_with_policy(
+            HandoffPolicy::Primary,
+            None,
+            challenge,
+            identity,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn sign_execution_observation_receipts_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        wire: &SignedExecutionObservation,
+        transport: &TransportEvidence,
+        challenge: &ExecutionObservationChallenge,
+        identity: &LocalIdentity,
+        now_ms: u64,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        self.sign_execution_observation_receipts_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            Some((wire, transport)),
+            challenge,
+            identity,
+            now_ms,
+        )
+    }
+
+    fn sign_execution_observation_receipts_with_policy(
+        &self,
+        policy: HandoffPolicy<'_>,
+        source: Option<(&SignedExecutionObservation, &TransportEvidence)>,
         challenge: &ExecutionObservationChallenge,
         identity: &LocalIdentity,
         now_ms: u64,
@@ -220,6 +302,40 @@ impl Store {
         let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
             .map_err(anyhow::Error::msg)?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let mut usage =
+            vibeface_secure::authorization::execution_handoff::ExecutionProofUsage::default();
+        if let HandoffPolicy::TaskBusiness(_) = policy {
+            let (wire, transport) =
+                source.context("scoped observation receipt has no exact source wire")?;
+            let business = TaskBusinessWire::Observe(wire.clone());
+            policy.check_business_wire_in(&tx, &self.policy, &business, now_ms)?;
+            let current = policy
+                .state(&self.policy)
+                .verify_execution_observation_current(wire, transport, now_ms)?;
+            policy.check_heads_in(&tx, &self.policy, &business, current.heads(), now_ms)?;
+            check_local_route_in(&tx, self.policy.verified(), identity, current.target())?;
+            let encoded: String = tx
+                .query_row(
+                    "SELECT value FROM local_values WHERE space_id=? AND key=?",
+                    params![
+                        current.target().execution_resource.space.as_str(),
+                        challenge_key(challenge)
+                    ],
+                    |row| row.get(0),
+                )
+                .context("observation challenge was not issued by this executor")?;
+            ensure!(
+                serde_json::from_str::<ExecutionObservationChallenge>(&encoded)? == *challenge
+                    && challenge.observation_hash == wire.hash()?
+                    && challenge.request_hash
+                        == vibeface_secure::authorization::ObjectHash::body(&wire.request)?
+                    && challenge.submission_invocation_hash == wire.invocation.hash()?
+                    && challenge.policies.as_slice() == current.heads(),
+                "observation challenge changed its current exact source"
+            );
+            usage.merge(current.proof_usage());
+            usage.record_metadata(challenge)?;
+        }
         let mut receipts = Vec::new();
         for stamp in &challenge.policies {
             let authority = match &stamp.domain {
@@ -254,6 +370,10 @@ impl Store {
                 &signer,
             )?);
         }
+        for receipt in &receipts {
+            usage.record_signed(receipt)?;
+        }
+        policy.check_usage(usage)?;
         tx.commit()?;
         Ok(receipts)
     }
@@ -266,16 +386,65 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<Option<ExecutionHandoffResult>> {
+        self.observe_execution_handoff_with_policy(
+            HandoffPolicy::Primary,
+            identity,
+            wire,
+            proof,
+            transport,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn observe_execution_handoff_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionObservation,
+        proof: &ExecutionObservationFreshness,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<Option<ExecutionHandoffResult>> {
+        self.observe_execution_handoff_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            identity,
+            wire,
+            proof,
+            transport,
+            now_ms,
+        )
+    }
+
+    fn observe_execution_handoff_with_policy(
+        &self,
+        policy: HandoffPolicy<'_>,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionObservation,
+        proof: &ExecutionObservationFreshness,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<Option<ExecutionHandoffResult>> {
         let signature_scope = ScopedSignatureVerification::new();
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
-        let current = self
-            .policy
-            .verified()
+        policy.check_business_wire_in(
+            &tx,
+            &self.policy,
+            &TaskBusinessWire::Observe(wire.clone()),
+            now_ms,
+        )?;
+        let current = policy
+            .state(&self.policy)
             .verify_execution_observation_current(wire, transport, now_ms)?;
-        check_heads_in(&tx, self.policy.verified(), current.heads())?;
+        policy.check_heads_in(
+            &tx,
+            &self.policy,
+            &TaskBusinessWire::Observe(wire.clone()),
+            current.heads(),
+            now_ms,
+        )?;
         check_local_route_in(&tx, self.policy.verified(), identity, current.target())?;
-        self.policy
-            .verified()
+        let current_freshness = policy
+            .state(&self.policy)
             .verify_execution_observation_current_freshness(&current, proof, now_ms)?;
         let encoded: String = tx
             .query_row(
@@ -299,6 +468,7 @@ impl Store {
             &target.source.operation_id,
         )?
         else {
+            policy.check_usage(current_freshness.proof_usage().clone())?;
             tx.commit()?;
             return Ok(None);
         };
@@ -310,16 +480,15 @@ impl Store {
             &StoredTransport::from(&stored.transport),
             stored.admitted_at_ms,
         )?;
-        let full = self.policy.verified().verify_execution_observation(
+        let full = policy.state(&self.policy).verify_execution_observation(
             wire,
             &stored.wire,
             transport,
             now_ms,
         )?;
         let receipt = signed_receipt(&tx, identity, &stored, now_ms)?;
-        let fresh = self
-            .policy
-            .verified()
+        let fresh = policy
+            .state(&self.policy)
             .verify_execution_observation_freshness(&full, proof, now_ms)?;
         let mut usage = fresh.proof_usage().clone();
         usage.merge(checkpoint.proof_usage());
@@ -350,6 +519,7 @@ impl Store {
         usage.record_signed(&receipt)?;
         usage.record_actual_signature_counts(signature_scope.counts());
         usage.enforce_limits()?;
+        let _usage = policy.check_usage(usage)?;
         #[cfg(test)]
         println!(
             "OBSERVATION_PROOF_USAGE {}",
@@ -357,7 +527,7 @@ impl Store {
                 "case":if stored.wire.handoff.sdk_origin.is_some() {"sdk_original"} else {"account_original"},
                 "observation_wire_json_bytes":serde_json::to_vec(wire)?.len(),
                 "freshness_json_bytes":serde_json::to_vec(proof)?.len(),
-                "proof":usage.counts(),
+                "proof":_usage.counts(),
             })
         );
         let observation = ExecutionHandoffResult {

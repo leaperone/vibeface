@@ -15,8 +15,11 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use vibeface_secure::authorization::{
     AUTH_VERSION, CheckStage, DeviceId, FreshnessReceipt, Nonce, ObjectHash, PolicyDomain,
-    PublicKey, ResourceId, ResourceRef, ServiceId, Signed, SpaceId, TransportEvidence,
-    VerifiedAuthorization, VerifiedPolicySet, events::StoredTransport, execution_handoff::*,
+    PolicyStamp, PublicKey, ResourceId, ResourceRef, ServiceId, Signed, SpaceId, TransportEvidence,
+    VerifiedAuthorization, VerifiedPolicySet,
+    events::StoredTransport,
+    execution_handoff::*,
+    remote_execution_history::RemoteExecutionHistoryAcceptance,
     task_binding::SignedBinding,
     task_business_policy::{TaskBusinessScopedView, TaskBusinessWire},
 };
@@ -74,6 +77,21 @@ impl HandoffPolicy<'_> {
         }
     }
 
+    fn check_business_wire_in(
+        &self,
+        connection: &Connection,
+        primary: &PolicyState,
+        wire: &TaskBusinessWire,
+        now_ms: u64,
+    ) -> Result<()> {
+        if let Self::TaskBusiness(view) = self {
+            super::task_business_policy::check_task_business_policy_view_in(
+                connection, primary, view, wire, now_ms,
+            )?;
+        }
+        Ok(())
+    }
+
     fn check_wire_in(
         &self,
         connection: &Connection,
@@ -81,14 +99,92 @@ impl HandoffPolicy<'_> {
         wire: &SignedExecutionHandoff,
         now_ms: u64,
     ) -> Result<()> {
+        self.check_business_wire_in(
+            connection,
+            primary,
+            &TaskBusinessWire::Submit(wire.clone()),
+            now_ms,
+        )
+    }
+
+    fn check_heads_in(
+        &self,
+        connection: &Connection,
+        primary: &PolicyState,
+        wire: &TaskBusinessWire,
+        heads: &[PolicyStamp],
+        now_ms: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Primary => observation::check_heads_in(connection, primary.verified(), heads),
+            Self::TaskBusiness(view) => {
+                self.check_business_wire_in(connection, primary, wire, now_ms)?;
+                ensure!(
+                    heads
+                        .iter()
+                        .all(
+                            |expected| view.state().head(&expected.domain) == Some(expected)
+                                && (view.primary_heads().contains(expected)
+                                    || view.foreign_heads().contains(expected))
+                        ),
+                    "Task business authorization escaped its exact source policy heads"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn bind_original_in(
+        &self,
+        connection: &Connection,
+        primary: &PolicyState,
+        wire: &TaskBusinessWire,
+        acceptance: &RemoteExecutionHistoryAcceptance,
+        now_ms: u64,
+    ) -> Result<()> {
         if let Self::TaskBusiness(view) = self {
-            super::task_business_policy::check_task_business_policy_view_in(
-                connection,
-                primary,
-                view,
-                &TaskBusinessWire::Submit(wire.clone()),
-                now_ms,
+            super::task_business_policy::bind_task_business_original_in(
+                connection, primary, view, wire, acceptance, now_ms,
             )?;
+        }
+        Ok(())
+    }
+
+    fn check_resolution_authorizations_in(
+        &self,
+        connection: &Connection,
+        primary: &PolicyState,
+        resolution: &VerifiedExecutionResolution,
+        now_ms: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Primary => {
+                check_policy_heads_in(
+                    connection,
+                    primary.verified(),
+                    resolution.resolver(),
+                    now_ms,
+                )?;
+                check_policy_heads_in(
+                    connection,
+                    primary.verified(),
+                    resolution.submission(),
+                    now_ms,
+                )?;
+            }
+            Self::TaskBusiness(_) => {
+                self.state(primary)
+                    .check_current(resolution.resolver(), now_ms)?;
+                self.state(primary)
+                    .check_current(resolution.submission(), now_ms)?;
+                self.check_heads_in(
+                    connection,
+                    primary,
+                    &TaskBusinessWire::Resolve(resolution.wire().clone()),
+                    resolution.dependencies(),
+                    now_ms,
+                )?;
+            }
         }
         Ok(())
     }
@@ -125,6 +221,19 @@ impl HandoffPolicy<'_> {
             }
         }
         Ok(())
+    }
+
+    fn resolution_usage(
+        &self,
+        auth: &VerifiedExecutionResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+    ) -> Result<ExecutionProofUsage> {
+        let mut usage = auth.proof_usage().clone();
+        usage.record_metadata(&proof.challenge)?;
+        for receipt in &proof.receipts {
+            usage.record_signed(receipt)?;
+        }
+        self.check_usage(usage)
     }
 
     fn check_response_usage(
@@ -1294,13 +1403,49 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<ExecutionProofUsage> {
+        self.execution_handoff_resolution_proof_usage_with_policy(
+            HandoffPolicy::Primary,
+            wire,
+            freshness,
+            transport,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn execution_handoff_resolution_proof_usage_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        wire: &SignedExecutionHandoffResolution,
+        freshness: Option<&ExecutionHandoffResolutionFreshness>,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<ExecutionProofUsage> {
+        self.execution_handoff_resolution_proof_usage_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            wire,
+            freshness,
+            transport,
+            now_ms,
+        )
+    }
+
+    fn execution_handoff_resolution_proof_usage_with_policy(
+        &self,
+        current: HandoffPolicy<'_>,
+        wire: &SignedExecutionHandoffResolution,
+        freshness: Option<&ExecutionHandoffResolutionFreshness>,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<ExecutionProofUsage> {
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
-        let auth = self.execution_handoff_resolution_authorization(wire, transport, now_ms)?;
+        let auth = self.execution_handoff_resolution_authorization_with_policy(
+            current, wire, transport, now_ms,
+        )?;
         let mut usage = auth.proof_usage().clone();
         if let Some(proof) = freshness {
-            self.policy
-                .verified()
+            current
+                .state(&self.policy)
                 .verify_execution_resolution_freshness(&auth, proof, now_ms)?;
             usage.record_metadata(&proof.challenge)?;
             for receipt in &proof.receipts {
@@ -1309,7 +1454,7 @@ impl Store {
         }
         usage.enforce_limits()?;
         usage.record_actual_signature_counts(_signature_scope.counts());
-        Ok(usage)
+        current.check_usage(usage)
     }
 }
 
@@ -1556,6 +1701,27 @@ impl Store {
             target_public_key,
             now_ms,
         )
+    }
+
+    pub(crate) fn execution_handoff_original_acceptance(
+        &self,
+        execution_space: &str,
+        original_space: &str,
+        operation_id: &str,
+    ) -> Result<(SignedExecutionHandoff, RemoteExecutionHistoryAcceptance)> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let tx = self.connection.unchecked_transaction()?;
+        let stored = stored_from(&tx, execution_space, original_space, operation_id)?
+            .context("unknown execution handoff")?;
+        verify_local_handoff_checkpoint(&tx, &stored)?;
+        let acceptance = RemoteExecutionHistoryAcceptance::ExecutionResult {
+            receipt: stored.admission_receipt,
+            freshness: stored.admission,
+            transport: StoredTransport::from(&stored.transport),
+        };
+        tx.commit()?;
+        Ok((stored.wire, acceptance))
     }
 
     pub fn execution_handoff_authorization(
@@ -1824,17 +1990,29 @@ impl Store {
                 current.state(&self.policy).head(&stamp.domain) == Some(stamp),
                 "handoff freshness policy changed"
             );
+            if let HandoffPolicy::TaskBusiness(view) = current {
+                if !view.primary_heads().contains(stamp) {
+                    continue;
+                }
+                observation::check_heads_in(
+                    &self.connection,
+                    self.policy.verified(),
+                    std::slice::from_ref(stamp),
+                )?;
+            }
+            let signer_policy = match current {
+                HandoffPolicy::Primary => current.state(&self.policy),
+                HandoffPolicy::TaskBusiness(_) => self.policy.verified(),
+            };
             let authority = match &stamp.domain {
                 PolicyDomain::Account(account) => {
-                    &current
-                        .state(&self.policy)
+                    &signer_policy
                         .account(account)
                         .context("missing account authority")?
                         .authority
                 }
                 PolicyDomain::Space(space) => {
-                    &current
-                        .state(&self.policy)
+                    &signer_policy
                         .space(space)
                         .context("missing space authority")?
                         .authority
@@ -2013,6 +2191,17 @@ impl Store {
                     serde_json::to_string(verified.binding())?, serde_json::to_string(&session)?])?;
         }
         if matches!(current, HandoffPolicy::TaskBusiness(_)) {
+            current.bind_original_in(
+                &tx,
+                &self.policy,
+                &TaskBusinessWire::Submit(wire.clone()),
+                &RemoteExecutionHistoryAcceptance::ExecutionResult {
+                    receipt: admission_receipt.clone(),
+                    freshness: proof.clone(),
+                    transport: StoredTransport::from(transport),
+                },
+                now_ms,
+            )?;
             let stored = stored_from(&tx, &execution, &original_space, &operation_id)?
                 .context("accepted handoff was not persisted")?;
             let result = dto(&tx, identity, &stored, now_ms)?;
@@ -2858,11 +3047,46 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<VerifiedExecutionResolution> {
+        self.execution_handoff_resolution_authorization_with_policy(
+            HandoffPolicy::Primary,
+            wire,
+            transport,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn execution_handoff_resolution_authorization_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionResolution> {
+        self.execution_handoff_resolution_authorization_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            wire,
+            transport,
+            now_ms,
+        )
+    }
+
+    fn execution_handoff_resolution_authorization_with_policy(
+        &self,
+        current: HandoffPolicy<'_>,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionResolution> {
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
-        let resolver = self
-            .policy
-            .verified()
+        current.check_business_wire_in(
+            &self.connection,
+            &self.policy,
+            &TaskBusinessWire::Resolve(wire.clone()),
+            now_ms,
+        )?;
+        let resolver = current
+            .state(&self.policy)
             .verify_execution_resolution_account_checkpoint(wire, transport, now_ms)?;
         let admission = if wire.resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal
         {
@@ -2882,7 +3106,7 @@ impl Store {
             resolution_original_observation_from(&self.connection, &self.policy, wire)?;
             None
         };
-        let verified = self.policy.verified().verify_execution_resolution(
+        let verified = current.state(&self.policy).verify_execution_resolution(
             wire,
             &resolver,
             transport,
@@ -2892,12 +3116,22 @@ impl Store {
         let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
         let stored = stored_from(&self.connection, &execution, &original, &operation)?
             .context("resolution acceptance checkpoint disappeared")?;
-        Ok(verified.with_admission_checkpoint(
+        let verified = verified.with_admission_checkpoint(
             &stored.admission_receipt,
             &stored.admission,
             &StoredTransport::from(&stored.transport),
             stored.admitted_at_ms,
-        )?)
+        )?;
+        if matches!(current, HandoffPolicy::TaskBusiness(_)) {
+            current.check_resolution_authorizations_in(
+                &self.connection,
+                &self.policy,
+                &verified,
+                now_ms,
+            )?;
+            current.check_usage(verified.proof_usage().clone())?;
+        }
+        Ok(verified)
     }
 
     pub fn execution_handoff_resolution_status(
@@ -2906,41 +3140,123 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<Option<ExecutionHandoffResolutionResult>> {
+        self.execution_handoff_resolution_status_with_policy(
+            HandoffPolicy::Primary,
+            wire,
+            transport,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn execution_handoff_resolution_status_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<Option<ExecutionHandoffResolutionResult>> {
+        self.execution_handoff_resolution_status_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            wire,
+            transport,
+            now_ms,
+        )
+    }
+
+    fn execution_handoff_resolution_status_with_policy(
+        &self,
+        current: HandoffPolicy<'_>,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<Option<ExecutionHandoffResolutionResult>> {
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
-        if wire.resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal {
-            return Ok(None);
-        }
-        let Some(saved) = stored_resolution_from(&self.connection, wire)? else {
-            return Ok(None);
+        let read_tx = if matches!(current, HandoffPolicy::TaskBusiness(_)) {
+            Some(self.connection.unchecked_transaction()?)
+        } else {
+            None
         };
-        let auth = self.execution_handoff_resolution_authorization(wire, transport, now_ms)?;
-        check_policy_heads_in(
-            &self.connection,
-            self.policy.verified(),
-            auth.resolver(),
-            now_ms,
-        )?;
-        check_policy_heads_in(
-            &self.connection,
-            self.policy.verified(),
-            auth.submission(),
-            now_ms,
-        )?;
-        let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
-        let original = stored_from(&self.connection, &execution, &original, &operation)?
-            .context("resolved handoff disappeared")?;
-        ensure!(
-            original.state.terminal()
-                && original.result == saved.result.result
-                && original.receipt.as_ref() == Some(&saved.result.handoff_receipt),
-            "resolved handoff differs from its immutable resolution receipt"
-        );
-        Ok(Some(saved.result))
+        let result = (|| -> Result<Option<ExecutionHandoffResolutionResult>> {
+            current.check_business_wire_in(
+                &self.connection,
+                &self.policy,
+                &TaskBusinessWire::Resolve(wire.clone()),
+                now_ms,
+            )?;
+            if wire.resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal {
+                return Ok(None);
+            }
+            let Some(saved) = stored_resolution_from(&self.connection, wire)? else {
+                if matches!(current, HandoffPolicy::TaskBusiness(_)) {
+                    self.execution_handoff_resolution_authorization_with_policy(
+                        current, wire, transport, now_ms,
+                    )?;
+                }
+                return Ok(None);
+            };
+            let auth = self.execution_handoff_resolution_authorization_with_policy(
+                current, wire, transport, now_ms,
+            )?;
+            current.check_resolution_authorizations_in(
+                &self.connection,
+                &self.policy,
+                &auth,
+                now_ms,
+            )?;
+            let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
+            let original = stored_from(&self.connection, &execution, &original, &operation)?
+                .context("resolved handoff disappeared")?;
+            ensure!(
+                original.state.terminal()
+                    && original.result == saved.result.result
+                    && original.receipt.as_ref() == Some(&saved.result.handoff_receipt),
+                "resolved handoff differs from its immutable resolution receipt"
+            );
+            let mut usage = current.resolution_usage(&auth, &saved.freshness)?;
+            usage.record_signed(&saved.result.receipt)?;
+            usage.record_signed(&saved.result.handoff_receipt)?;
+            current.check_usage(usage)?;
+            Ok(Some(saved.result))
+        })()?;
+        if let Some(tx) = read_tx {
+            tx.commit()?;
+        }
+        Ok(result)
     }
 
     pub fn issue_execution_handoff_resolution_challenge(
         &mut self,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<ExecutionHandoffResolutionChallenge> {
+        self.issue_execution_handoff_resolution_challenge_with_policy(
+            HandoffPolicy::Primary,
+            wire,
+            transport,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn issue_execution_handoff_resolution_challenge_scoped(
+        &mut self,
+        view: &TaskBusinessScopedView,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<ExecutionHandoffResolutionChallenge> {
+        self.issue_execution_handoff_resolution_challenge_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            wire,
+            transport,
+            now_ms,
+        )
+    }
+
+    fn issue_execution_handoff_resolution_challenge_with_policy(
+        &mut self,
+        current: HandoffPolicy<'_>,
         wire: &SignedExecutionHandoffResolution,
         transport: &TransportEvidence,
         now_ms: u64,
@@ -2952,7 +3268,9 @@ impl Store {
                 || stored_resolution_from(&self.connection, wire)?.is_none(),
             "resolution is already committed"
         );
-        let auth = self.execution_handoff_resolution_authorization(wire, transport, now_ms)?;
+        let auth = self.execution_handoff_resolution_authorization_with_policy(
+            current, wire, transport, now_ms,
+        )?;
         let challenge = ExecutionHandoffResolutionChallenge::new(
             &auth,
             Nonce::random()?,
@@ -2966,9 +3284,11 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_policy_heads_in(&tx, self.policy.verified(), auth.resolver(), now_ms)?;
-        check_policy_heads_in(&tx, self.policy.verified(), auth.submission(), now_ms)?;
+        current.check_resolution_authorizations_in(&tx, &self.policy, &auth, now_ms)?;
         resolution_original_observation_from(&tx, &self.policy, wire)?;
+        let mut usage = auth.proof_usage().clone();
+        usage.record_metadata(&challenge)?;
+        current.check_usage(usage)?;
         tx.execute("INSERT INTO execution_handoff_resolution_challenges(execution_space_id,nonce,original_space_id,operation_id,resolution_id,resolution_hash,challenge,expires_at_ms) VALUES(?,?,?,?,?,?,?,?)",
             params![execution,challenge.nonce.as_str(),original,operation,auth.resolver().operation_id(),auth.hash().as_str(),serde_json::to_string(&challenge)?,challenge.expires_at_ms])?;
         tx.commit()?;
@@ -2977,6 +3297,71 @@ impl Store {
 
     pub fn sign_execution_handoff_resolution_receipts(
         &self,
+        challenge: &ExecutionHandoffResolutionChallenge,
+        identity: &LocalIdentity,
+        now_ms: u64,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        self.sign_execution_handoff_resolution_receipts_with_policy(
+            HandoffPolicy::Primary,
+            challenge,
+            identity,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn sign_execution_handoff_resolution_receipts_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        wire: &SignedExecutionHandoffResolution,
+        transport: &TransportEvidence,
+        challenge: &ExecutionHandoffResolutionChallenge,
+        identity: &LocalIdentity,
+        now_ms: u64,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let current = HandoffPolicy::TaskBusiness(view);
+        let tx = self.connection.unchecked_transaction()?;
+        let auth = self.execution_handoff_resolution_authorization_with_policy(
+            current, wire, transport, now_ms,
+        )?;
+        ensure!(
+            identity.public_key_hex()?
+                == wire
+                    .resolution
+                    .observation
+                    .handoff
+                    .handoff
+                    .target_public_key
+                    .as_str(),
+            "resolution receipt signer is not this executor"
+        );
+        current.check_resolution_authorizations_in(&tx, &self.policy, &auth, now_ms)?;
+        verify_resolution_challenge_record(
+            &tx,
+            wire,
+            &ExecutionHandoffResolutionFreshness {
+                challenge: challenge.clone(),
+                receipts: Vec::new(),
+            },
+            false,
+        )?;
+        let receipts = self.sign_execution_handoff_resolution_receipts_with_policy(
+            current, challenge, identity, now_ms,
+        )?;
+        let mut usage = auth.proof_usage().clone();
+        usage.record_metadata(challenge)?;
+        for receipt in &receipts {
+            usage.record_signed(receipt)?;
+        }
+        current.check_usage(usage)?;
+        tx.commit()?;
+        Ok(receipts)
+    }
+
+    fn sign_execution_handoff_resolution_receipts_with_policy(
+        &self,
+        current: HandoffPolicy<'_>,
         challenge: &ExecutionHandoffResolutionChallenge,
         identity: &LocalIdentity,
         now_ms: u64,
@@ -3001,22 +3386,32 @@ impl Store {
         let mut receipts = Vec::new();
         for stamp in &challenge.policies {
             ensure!(
-                self.policy.verified().head(&stamp.domain) == Some(stamp),
+                current.state(&self.policy).head(&stamp.domain) == Some(stamp),
                 "resolution freshness policy changed"
             );
+            if let HandoffPolicy::TaskBusiness(view) = current {
+                if !view.primary_heads().contains(stamp) {
+                    continue;
+                }
+                observation::check_heads_in(
+                    &self.connection,
+                    self.policy.verified(),
+                    std::slice::from_ref(stamp),
+                )?;
+            }
+            let signer_policy = match current {
+                HandoffPolicy::Primary => current.state(&self.policy),
+                HandoffPolicy::TaskBusiness(_) => self.policy.verified(),
+            };
             let authority = match &stamp.domain {
                 PolicyDomain::Account(id) => {
-                    &self
-                        .policy
-                        .verified()
+                    &signer_policy
                         .account(id)
                         .context("missing resolution account")?
                         .authority
                 }
                 PolicyDomain::Space(id) => {
-                    &self
-                        .policy
-                        .verified()
+                    &signer_policy
                         .space(id)
                         .context("missing resolution space")?
                         .authority
@@ -3049,6 +3444,36 @@ impl Store {
         proof: &ExecutionHandoffResolutionFreshness,
         now_ms: u64,
     ) -> Result<()> {
+        self.authorize_execution_handoff_resolution_fence_with_policy(
+            HandoffPolicy::Primary,
+            auth,
+            proof,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn authorize_execution_handoff_resolution_fence_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        auth: &VerifiedExecutionResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.authorize_execution_handoff_resolution_fence_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            auth,
+            proof,
+            now_ms,
+        )
+    }
+
+    fn authorize_execution_handoff_resolution_fence_with_policy(
+        &self,
+        current: HandoffPolicy<'_>,
+        auth: &VerifiedExecutionResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+        now_ms: u64,
+    ) -> Result<()> {
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         ensure!(
@@ -3056,26 +3481,51 @@ impl Store {
             "only an explicit unknown resolution can fence execution"
         );
         resolution_original_observation_from(&self.connection, &self.policy, auth.wire())?;
-        check_policy_heads_in(
+        current.check_resolution_authorizations_in(
             &self.connection,
-            self.policy.verified(),
-            auth.resolver(),
+            &self.policy,
+            &auth,
             now_ms,
         )?;
-        check_policy_heads_in(
-            &self.connection,
-            self.policy.verified(),
-            auth.submission(),
-            now_ms,
-        )?;
-        self.policy
-            .verified()
+        current
+            .state(&self.policy)
             .verify_execution_resolution_freshness(auth, proof, now_ms)?;
+        current.resolution_usage(auth, proof)?;
         verify_resolution_challenge_record(&self.connection, auth.wire(), proof, false)
     }
 
     pub fn authorize_execution_handoff_terminal_reconciliation(
         &self,
+        auth: &VerifiedExecutionResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+        now_ms: u64,
+    ) -> Result<ExecutionHandoffTerminalReconciliationResult> {
+        self.authorize_execution_handoff_terminal_reconciliation_with_policy(
+            HandoffPolicy::Primary,
+            auth,
+            proof,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn authorize_execution_handoff_terminal_reconciliation_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        auth: &VerifiedExecutionResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+        now_ms: u64,
+    ) -> Result<ExecutionHandoffTerminalReconciliationResult> {
+        self.authorize_execution_handoff_terminal_reconciliation_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            auth,
+            proof,
+            now_ms,
+        )
+    }
+
+    fn authorize_execution_handoff_terminal_reconciliation_with_policy(
+        &self,
+        current: HandoffPolicy<'_>,
         auth: &VerifiedExecutionResolution,
         proof: &ExecutionHandoffResolutionFreshness,
         now_ms: u64,
@@ -3087,21 +3537,16 @@ impl Store {
             "terminal reconciliation cannot resolve an unknown executor operation"
         );
         resolution_original_observation_from(&self.connection, &self.policy, auth.wire())?;
-        check_policy_heads_in(
+        current.check_resolution_authorizations_in(
             &self.connection,
-            self.policy.verified(),
-            auth.resolver(),
+            &self.policy,
+            &auth,
             now_ms,
         )?;
-        check_policy_heads_in(
-            &self.connection,
-            self.policy.verified(),
-            auth.submission(),
-            now_ms,
-        )?;
-        self.policy
-            .verified()
+        current
+            .state(&self.policy)
             .verify_execution_resolution_freshness(auth, proof, now_ms)?;
+        current.resolution_usage(auth, proof)?;
         verify_resolution_challenge_record(&self.connection, auth.wire(), proof, false)?;
         Ok(ExecutionHandoffTerminalReconciliationResult {
             reconciliation: auth.wire().clone(),
@@ -3118,18 +3563,64 @@ impl Store {
         stopped: &crate::engine::StoppedExecution,
         now_ms: u64,
     ) -> Result<ExecutionHandoffResolutionResult> {
+        self.resolve_execution_handoff_with_policy(
+            HandoffPolicy::Primary,
+            identity,
+            wire,
+            proof,
+            transport,
+            stopped,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn resolve_execution_handoff_scoped(
+        &mut self,
+        view: &TaskBusinessScopedView,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionHandoffResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+        transport: &TransportEvidence,
+        stopped: &crate::engine::StoppedExecution,
+        now_ms: u64,
+    ) -> Result<ExecutionHandoffResolutionResult> {
+        self.resolve_execution_handoff_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            identity,
+            wire,
+            proof,
+            transport,
+            stopped,
+            now_ms,
+        )
+    }
+
+    fn resolve_execution_handoff_with_policy(
+        &mut self,
+        current: HandoffPolicy<'_>,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionHandoffResolution,
+        proof: &ExecutionHandoffResolutionFreshness,
+        transport: &TransportEvidence,
+        stopped: &crate::engine::StoppedExecution,
+        now_ms: u64,
+    ) -> Result<ExecutionHandoffResolutionResult> {
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         ensure!(
             wire.resolution.purpose == ExecutionResolutionPurpose::ResolveUnknown,
             "terminal reconciliation cannot mutate executor state"
         );
-        if let Some(result) = self.execution_handoff_resolution_status(wire, transport, now_ms)? {
+        if let Some(result) =
+            self.execution_handoff_resolution_status_with_policy(current, wire, transport, now_ms)?
+        {
             return Ok(result);
         }
-        let auth = self.execution_handoff_resolution_authorization(wire, transport, now_ms)?;
-        self.policy
-            .verified()
+        let auth = self.execution_handoff_resolution_authorization_with_policy(
+            current, wire, transport, now_ms,
+        )?;
+        current
+            .state(&self.policy)
             .admit_execution_resolution(&auth, proof, now_ms)?;
         let (execution, original, operation) = scope(&wire.resolution.observation.handoff)?;
         let tx = self
@@ -3152,10 +3643,9 @@ impl Store {
             }),
             "resolution has no matching confirmed execution fence"
         );
-        check_policy_heads_in(&tx, self.policy.verified(), auth.resolver(), now_ms)?;
-        check_policy_heads_in(&tx, self.policy.verified(), auth.submission(), now_ms)?;
-        self.policy
-            .verified()
+        current.check_resolution_authorizations_in(&tx, &self.policy, &auth, now_ms)?;
+        current
+            .state(&self.policy)
             .verify_execution_resolution_freshness(&auth, proof, now_ms)?;
         verify_resolution_challenge_record(&tx, wire, proof, false)?;
         ensure!(tx.execute("UPDATE execution_handoff_resolution_challenges SET consumed=1 WHERE execution_space_id=? AND nonce=? AND consumed=0",
@@ -3226,6 +3716,22 @@ impl Store {
         tx.execute("UPDATE execution_handoffs SET result_receipt=? WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",
             params![serde_json::to_string(&result.handoff_receipt)?,execution,original,operation])?;
         tx.execute("DELETE FROM execution_handoff_reservations WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",params![execution,original,operation])?;
+        if matches!(current, HandoffPolicy::TaskBusiness(_)) {
+            current.bind_original_in(
+                &tx,
+                &self.policy,
+                &TaskBusinessWire::Resolve(wire.clone()),
+                &RemoteExecutionHistoryAcceptance::UnknownResolution {
+                    receipt: result.receipt.clone(),
+                    freshness: proof.clone(),
+                },
+                now_ms,
+            )?;
+            let mut usage = current.resolution_usage(&auth, proof)?;
+            usage.record_signed(&result.receipt)?;
+            usage.record_signed(&result.handoff_receipt)?;
+            current.check_usage(usage)?;
+        }
         tx.commit()?;
         Ok(result)
     }
