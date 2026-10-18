@@ -524,6 +524,11 @@ pub(crate) fn authenticate_account_from(
         .cloned()
         .map(serde_json::from_value)
         .transpose()?;
+    let requested_grant: Option<ObjectHash> = params
+        .get("grant_leaf")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?;
     let mut statement = connection.prepare("SELECT entry FROM policy_journal ORDER BY ordinal")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let journal: Vec<JournalEntry> = rows
@@ -531,6 +536,12 @@ pub(crate) fn authenticate_account_from(
         .collect::<Result<_>>()?;
     let current = policy.verified().space(&space).context("unknown space")?;
     for leaf in &current.grants {
+        if requested_grant
+            .as_ref()
+            .is_some_and(|expected| expected != leaf)
+        {
+            continue;
+        }
         let grant = policy
             .verified()
             .grant(leaf)

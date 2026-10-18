@@ -987,7 +987,8 @@ mod tests {
             &store.policy,
             &network.client.public_key_hex(),
             &json!({"account_id":network.account,"space_id":network.space,
-                "device_public_key":network.client.public_key_hex(),"resource_id":network.resource}),
+                "device_public_key":network.client.public_key_hex(),"resource_id":network.resource,
+                "grant_leaf":network.bundle.grant_leaf}),
             now(),
         )?;
         execution_service::prepare_execution_service_registration(
@@ -1285,6 +1286,11 @@ mod tests {
                 .unwrap()
                 .clone();
             let other = Signed::sign(other, &network.root)?;
+            let mut project_grant = other.payload.clone();
+            project_grant.scope = ResourceScope::Exact(source.clone());
+            project_grant.actions = vec![Action::MessageRead];
+            project_grant.nonce = Nonce::random()?;
+            let project_grant = Signed::sign(project_grant, &network.root)?;
             let mut document = store
                 .policy
                 .verified()
@@ -1294,10 +1300,12 @@ mod tests {
             document.previous = Some(other.payload.issued_under.clone());
             document.sequence += 1;
             document.grants.push(other.hash()?);
+            document.grants.push(project_grant.hash()?);
             document.grants.sort();
             store.install_policy_journal(
                 &[
                     JournalEntry::Grant(other.clone()),
+                    JournalEntry::Grant(project_grant.clone()),
                     JournalEntry::Space(Signed::sign(document, &network.root)?),
                 ],
                 now() + 1,
@@ -1310,6 +1318,41 @@ mod tests {
             drop(store);
             let mut store = Store::open(&path)?;
             let before = row_counts(&store)?;
+            let mut owner_params = json!({
+                "account_id":network.account,"space_id":network.space,
+                "device_public_key":network.client.public_key_hex(),"resource_id":source.resource,
+                "grant_leaf":network.bundle.grant_leaf,
+            });
+            let original_owner = store.authenticate_account(
+                &network.client.public_key_hex(),
+                &owner_params,
+                now() + 2,
+            )?;
+            assert_eq!(
+                original_owner["authorization"]["grant_leaf"],
+                serde_json::to_value(&network.bundle.grant_leaf)?
+            );
+            owner_params["grant_leaf"] = serde_json::to_value(project_grant.hash()?)?;
+            let other_owner = store.authenticate_account(
+                &network.client.public_key_hex(),
+                &owner_params,
+                now() + 2,
+            )?;
+            assert_eq!(
+                other_owner["authorization"]["grant_leaf"],
+                owner_params["grant_leaf"]
+            );
+            owner_params["grant_leaf"] =
+                serde_json::to_value(ObjectHash::body(&"unregistered owner grant")?)?;
+            assert!(
+                store
+                    .authenticate_account(
+                        &network.client.public_key_hex(),
+                        &owner_params,
+                        now() + 2,
+                    )
+                    .is_err()
+            );
             let selected = store.execution_service_select(
                 &network.node,
                 &network.client.public_key_hex(),
