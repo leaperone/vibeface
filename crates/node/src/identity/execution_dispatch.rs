@@ -1932,7 +1932,7 @@ pub(crate) mod tests {
             Ok(hash)
         }
 
-        fn authorize(
+        pub(crate) fn authorize(
             &mut self,
             body: &Value,
         ) -> Result<(
@@ -2077,7 +2077,7 @@ pub(crate) mod tests {
             )
         }
 
-        fn operation(&self, binding: SignedBinding, id: &str) -> Result<(Value, OperationRequest)> {
+        pub(crate) fn operation(&self, binding: SignedBinding, id: &str) -> Result<(Value, OperationRequest)> {
             let request = OperationRequest {
                 operation_id: id.into(),
                 network_id: self.project.space.to_string(),
