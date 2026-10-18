@@ -2,7 +2,8 @@
 
 use crate::{
     crypto::LocalIdentity,
-    network::{NetworkSocket, Service},
+    identity::node_execution_policy::{NodeReadRequest, NodeReadResponse},
+    network::{NetworkHub, NetworkSocket, Service},
     runtime::{Access, Runtime},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -19,8 +20,9 @@ use std::{
     time::{Duration, Instant},
 };
 use vibeface_secure::authorization::{
-    Actor, DeviceId, Invocation, PublicKey, Signed, TransportEvidence, VerifiedClientAuthorization,
-    execution_observation::ExecutionObservationRequest,
+    Actor, DeviceId, Invocation, MAX_PROOF_BYTES, PublicKey, Signed, TransportEvidence,
+    VerifiedClientAuthorization, execution_observation::ExecutionObservationRequest,
+    node_execution_policy::VerifiedTaskExecutionTrust,
 };
 use vibeface_secure::{Channel, Handshake};
 
@@ -28,6 +30,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const HEARTBEAT: Duration = Duration::from_secs(20);
+const NODE_POLICY_READ_METHOD: &str = "node_policy_read";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,9 +51,29 @@ struct Response {
 }
 struct Session {
     public_key: String,
+    node_policy_read_only: bool,
     authorization: Option<VerifiedClientAuthorization>,
     subscription: Option<Access>,
     remote_subscription: Option<RemoteSubscription>,
+}
+impl Session {
+    fn select_method(&mut self, method: &str) -> Result<()> {
+        if method == NODE_POLICY_READ_METHOD {
+            ensure!(
+                self.authorization.is_none()
+                    && self.subscription.is_none()
+                    && self.remote_subscription.is_none(),
+                "node policy reads require an independent unauthenticated session"
+            );
+            self.node_policy_read_only = true;
+        } else {
+            ensure!(
+                !self.node_policy_read_only,
+                "node policy reader sessions cannot change purpose"
+            );
+        }
+        Ok(())
+    }
 }
 struct RemoteSubscription {
     body: Value,
@@ -62,6 +85,83 @@ pub struct Client {
     socket: NetworkSocket,
     channel: Channel,
 }
+
+pub(crate) struct NodePolicyReadClient {
+    client: Client,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodePolicyReadReply {
+    id: String,
+    result: Option<NodeReadResponse>,
+    error: Option<String>,
+}
+
+impl NodePolicyReadClient {
+    pub(crate) async fn connect(
+        network: &NetworkHub,
+        identity: &LocalIdentity,
+        trust: &VerifiedTaskExecutionTrust,
+    ) -> Result<Self> {
+        let target = &trust.selection().target_public_key;
+        let target_node_id = crate::crypto::fingerprint(target.as_str())?;
+        let socket = network.dial(&target_node_id, Service::Client).await?;
+        Ok(Self {
+            client: Client::from_socket(socket, identity, target.as_str()).await?,
+        })
+    }
+
+    pub(crate) async fn read(&mut self, request: &NodeReadRequest) -> Result<NodeReadResponse> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let wire = serde_json::to_vec(&Request {
+            id: id.clone(),
+            method: NODE_POLICY_READ_METHOD.to_owned(),
+            params: serde_json::to_value(request)?,
+            invocation: None,
+        })?;
+        require_node_policy_carrier(wire.len(), 0)?;
+        tokio::time::timeout(CALL_TIMEOUT, async {
+            for record in secure(self.client.channel.seal_message(&wire))? {
+                send_frame(&mut self.client.socket, record).await?;
+            }
+            let bytes = receive_value(&mut self.client.socket, &mut self.client.channel).await?;
+            require_node_policy_carrier(wire.len(), bytes.len())?;
+            serde_json::from_slice::<UniqueJsonKeys>(&bytes)?;
+            let response: NodePolicyReadReply = serde_json::from_slice(&bytes)?;
+            ensure!(
+                response.id == id,
+                "node policy response changed its request ID"
+            );
+            let response = match (response.result, response.error) {
+                (Some(response), None) => response,
+                (None, Some(error)) => bail!("{error}"),
+                _ => bail!("invalid node policy response"),
+            };
+            ensure!(
+                matches!(
+                    (request, &response),
+                    (NodeReadRequest::Prepare(_), NodeReadResponse::Snapshot(_))
+                        | (NodeReadRequest::Page(_), NodeReadResponse::Page(_))
+                        | (NodeReadRequest::Finish(_), NodeReadResponse::Witness(_))
+                ),
+                "node policy response changed its read stage"
+            );
+            Ok(response)
+        })
+        .await
+        .context("node policy read timed out")?
+    }
+}
+
+fn require_node_policy_carrier(request_bytes: usize, response_bytes: usize) -> Result<()> {
+    ensure!(
+        request_bytes.saturating_add(response_bytes) <= MAX_PROOF_BYTES,
+        "node policy request and response exceed 64 KiB"
+    );
+    Ok(())
+}
+
 impl Client {
     pub async fn connect(
         url: &str,
@@ -156,6 +256,7 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
     .context("client handshake timed out")??;
     let mut session = Session {
         public_key,
+        node_policy_read_only: false,
         authorization: None,
         subscription: None,
         remote_subscription: None,
@@ -177,12 +278,18 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                             partial_started = None;
                             let request = parse_request(&plaintext).context("invalid client request")?;
                             validate_request(&request)?;
+                            if request.method == NODE_POLICY_READ_METHOD {
+                                require_node_policy_carrier(plaintext.len(), 0)?;
+                            }
                             let result = dispatch(&node, &mut session, request).await;
                             let (id, result) = result;
                             let response = match result {
                                 Ok(result) => Response { id, result, error: None },
                                 Err(error) => Response { id, result: Value::Null, error: Some(error.to_string()) },
                             };
+                            if session.node_policy_read_only {
+                                require_node_policy_carrier(plaintext.len(), serde_json::to_vec(&response)?.len())?;
+                            }
                             send_value(&mut socket, &mut channel, &response).await?;
                         } else { partial_started.get_or_insert_with(Instant::now); }
                     }
@@ -265,7 +372,19 @@ async fn dispatch_request(
     params: Value,
     invocation: Option<Signed<Invocation>>,
 ) -> Result<Value> {
+    session.select_method(method)?;
     match method {
+        NODE_POLICY_READ_METHOD => {
+            ensure!(
+                invocation.is_none(),
+                "node policy reads do not accept an Invocation"
+            );
+            let request: NodeReadRequest = serde_json::from_value(params)?;
+            let response = node
+                .node_execution_policy_read(&session.public_key, request)
+                .await?;
+            Ok(serde_json::to_value(response)?)
+        }
         "info" => Ok(node.info()),
         "authenticate" => {
             let (verified, response) = {
@@ -542,6 +661,35 @@ async fn receive_value(socket: &mut NetworkSocket, channel: &mut Channel) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_policy_reader_sessions_cannot_upgrade_to_other_methods() -> Result<()> {
+        let mut session = Session {
+            public_key: String::new(),
+            node_policy_read_only: false,
+            authorization: None,
+            subscription: None,
+            remote_subscription: None,
+        };
+        session.select_method("info")?;
+        session.select_method(NODE_POLICY_READ_METHOD)?;
+        session.select_method(NODE_POLICY_READ_METHOD)?;
+        for method in [
+            "info",
+            "authenticate",
+            "prepare_invocation",
+            "rpc",
+            "subscribe",
+            "identity",
+            "unknown",
+        ] {
+            assert!(session.select_method(method).is_err(), "{method}");
+        }
+        assert!(session.authorization.is_none());
+        assert!(session.subscription.is_none());
+        assert!(session.remote_subscription.is_none());
+        Ok(())
+    }
 
     #[test]
     fn raw_requests_reject_duplicate_keys_at_every_depth() -> Result<()> {
