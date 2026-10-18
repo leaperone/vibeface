@@ -272,7 +272,7 @@ where
     let mut reader = BufReader::new(stdout);
     let operation = async {
         write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":native,"cwd":config.workspace,"model":config.model,"codex_path":codex,
-            "tool_cli":tool_cli,"tool_env":config.tool_env})).await?;
+            "tool_cli":tool_cli,"tool_env":config.tool_env,"custom_tools":config.custom_tools})).await?;
         let ready = read_message(&mut reader).await?;
         ensure!(
             ready["type"] == "ready" && ready["session_id"].as_str() == native.as_deref(),

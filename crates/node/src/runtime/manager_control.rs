@@ -217,6 +217,9 @@ impl Runtime {
                 task_id: Some(task),
                 ..
             } => Ok(store.followup_policy(network, scope, task)?.target_node),
+            EventBody::ExecutionObserved { task_id: None, .. } => Ok(store
+                .execution_result_policy(network, scope, trigger)?
+                .target_node),
             _ => anyhow::bail!("event is not a management trigger"),
         }
     }
@@ -373,7 +376,7 @@ impl Runtime {
                 && original.conversation_id == scope
                 && reference["operation_id"] == original.operation_id
                 && reference["target_node"] == original.target_node
-                && reference["session_id"] == original.session_id
+                && reference["session_id"] == serde_json::to_value(&original.session_id)?
                 && reference["task_id"] == serde_json::to_value(&original.task_id)?,
             "management operation reference does not match its original dispatch"
         );

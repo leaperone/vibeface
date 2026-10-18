@@ -2242,6 +2242,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "libc",
  "mdns-sd",
  "rand 0.8.8",
  "reqwest",

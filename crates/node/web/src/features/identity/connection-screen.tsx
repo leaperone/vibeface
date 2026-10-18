@@ -49,8 +49,8 @@ export function ConnectionScreen() {
         <h1 className="text-2xl font-semibold tracking-tight">连接设备</h1>
         <p className="text-sm text-muted-foreground">选择已保存的入口，或使用邀请加入网络。</p>
       </header>
-      {['initializing', 'connecting', 'unpaired'].includes(device.phase) && <p role="status" className="text-sm text-muted-foreground">{device.phase === 'initializing' ? '正在读取设备密钥…' : device.phase === 'connecting' ? '正在建立加密连接并核对设备…' : '等待此浏览器授权。'}</p>}
-      {(error || device.error) && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error || device.error}</p>}
+      {['initializing', 'connecting', 'reconnecting', 'unpaired'].includes(device.phase) && <p role="status" className="text-sm text-muted-foreground">{device.phase === 'initializing' ? '正在读取设备密钥…' : device.phase === 'connecting' ? '正在建立加密连接并核对设备…' : device.phase === 'reconnecting' ? '正在恢复已授权的设备连接…' : '等待此浏览器授权。'}</p>}
+      {(error || device.error && device.phase !== 'reconnecting') && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error || device.error}</p>}
       {device.phase === 'blocked' && <Card className={panel} aria-labelledby="secure-page-title"><h2 id="secure-page-title" className="font-semibold">需要可信的安全页面</h2><p className="text-sm text-muted-foreground">请在节点本机打开 http://localhost:4790，或使用你信任的 HTTPS 客户端。普通局域网 HTTP 页面不能安全保存设备密钥。可信页面仍可连接允许的局域网节点。</p></Card>}
       {device.phase === 'key_lost' && <Card className={panel} aria-labelledby="lost-key-title"><h2 id="lost-key-title" className="font-semibold">设备密钥已丢失</h2><p className="text-sm text-muted-foreground">原设备授权不会自动迁移到新密钥。生成新设备密钥后，请在管理设备上重新配对，或导入恢复包。</p><Button variant="outline" className={`${button} self-start`} type="button" disabled={busy} onClick={() => void run(device.replaceLostKey)}>生成新设备密钥</Button></Card>}
       {device.review && <RecoveryReview />}

@@ -69,7 +69,7 @@ fn operation(access: &Access) -> OperationRequest {
         conversation_id: "chat".into(),
         task_id: Some("original-task".into()),
         target_node: access.manager.as_ref().unwrap().target_node.clone(),
-        session_id: "original-session".into(),
+        session_id: Some("original-session".into()),
         expected_revision: 3,
         basis_heads: vec!["original-basis".into()],
         action: json!({"type":"send","text":"continue"}),
@@ -216,7 +216,7 @@ async fn management_operation_identity_is_immutable_across_retries() -> Result<(
         let mut changed = request.clone();
         match field {
             "target" => changed.target_node = "different-executor".into(),
-            "session" => changed.session_id = "different-session".into(),
+            "session" => changed.session_id = Some("different-session".into()),
             "task" => changed.task_id = Some("different-task".into()),
             _ => unreachable!(),
         }

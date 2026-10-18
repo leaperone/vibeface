@@ -2,7 +2,6 @@ use super::*;
 use crate::scheduling::{
     AdmissionReceipt, JobOutcome, JobState, OutboxEntry, SCHEDULING_VERSION, SchedulerJob,
 };
-use crate::store::followup::FollowupMode;
 use futures_util::FutureExt;
 
 const MAX_WATCH_SCOPES: usize = 32;
@@ -42,17 +41,25 @@ fn observation_entries(
                 ..
             } if role == "user" => target.clone(),
             EventBody::ExecutionObserved {
-                task_id: Some(task),
+                task_id,
                 target_node,
                 status,
                 ..
             } if event.author == *target_node
                 && matches!(status.as_str(), "succeeded" | "failed" | "rejected") =>
             {
-                let Ok(policy) = store.historical_followup_policy(network, scope, task) else {
-                    continue;
+                let target = if let Some(task) = task_id {
+                    store
+                        .historical_followup_policy(network, scope, task)
+                        .map(|policy| policy.target_node)
+                } else {
+                    let trigger = crypto::digest(&serde_json::to_vec(&event)?);
+                    store
+                        .execution_result_policy(network, scope, &trigger)
+                        .map(|policy| policy.target_node)
                 };
-                policy.target_node
+                let Ok(target) = target else { continue };
+                target
             }
             _ => continue,
         };
@@ -228,7 +235,7 @@ fn observed_job_value(store: &Store, entry: &OutboxEntry, job: &SchedulerJob) ->
             );
         }
         EventBody::ExecutionObserved {
-            task_id: Some(task),
+            task_id,
             target_node,
             status,
             ..
@@ -239,12 +246,23 @@ fn observed_job_value(store: &Store, entry: &OutboxEntry, job: &SchedulerJob) ->
                 job.kind == crate::scheduling::TriggerKind::Autonomous,
                 "observed job trigger kind mismatch"
             );
-            ensure!(
+            let target = if let Some(task) = task_id {
                 store
                     .historical_followup_policy(&entry.network_id, &entry.conversation_id, task)?
                     .target_node
-                    == entry.target_node,
-                "observed job belongs to another task scheduler"
+            } else {
+                store
+                    .validate_followup_result(
+                        &entry.network_id,
+                        &entry.conversation_id,
+                        &job.trigger,
+                        &entry.target_node,
+                    )?
+                    .target_node
+            };
+            ensure!(
+                target == entry.target_node,
+                "observed job belongs to another scheduler"
             );
         }
         _ => bail!("observed job has no verified scheduling identity"),
@@ -626,6 +644,86 @@ impl Runtime {
         Ok(())
     }
 
+    async fn select_chat_scheduler(&self, network: &str, scope: &str) -> Result<String> {
+        let local = self.identity.node_id()?;
+        let (preferred, local_available, mut candidates) = {
+            let store = self.store.lock().await;
+            let preferred = store
+                .context(network, scope, &[])?
+                .events
+                .iter()
+                .rev()
+                .find_map(|event| match &event.body {
+                    EventBody::MessagePosted {
+                        role,
+                        scheduler_node: Some(target),
+                        ..
+                    } if role == "user" => Some(target.clone()),
+                    _ => None,
+                });
+            let local_available = self.config.manager.is_some()
+                && self.config.roles.contains(&NodeRole::Scheduler)
+                && store
+                    .authorize_node(network, &local, Some(NodeRole::Scheduler))
+                    .is_ok();
+            let view = store
+                .trust_bundle(network)?
+                .context("unknown network")?
+                .project()?;
+            let candidates = view
+                .members
+                .into_iter()
+                .filter(|member| {
+                    member.kind == IdentityKind::Node
+                        && member.subject_id != local
+                        && !view.revoked.contains(&member.subject_id)
+                        && member.node_roles.contains(&NodeRole::Scheduler)
+                })
+                .map(|member| member.subject_id)
+                .collect::<Vec<_>>();
+            (preferred, local_available, candidates)
+        };
+        if local_available && preferred.as_deref() == Some(local.as_str()) {
+            return Ok(local);
+        }
+        candidates.sort_by_key(|candidate| {
+            (
+                Some(candidate.as_str()) != preferred.as_deref(),
+                candidate.clone(),
+            )
+        });
+        let online = self.hub.online(network).await;
+        for candidate in candidates
+            .into_iter()
+            .filter(|candidate| online.contains(candidate))
+        {
+            if local_available && Some(candidate.as_str()) != preferred.as_deref() {
+                return Ok(local);
+            }
+            let capabilities = tokio::time::timeout(
+                Duration::from_secs(3),
+                self.peer_request(network, &candidate, json!({"type":"capabilities"})),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            if capabilities.is_some_and(|value| {
+                matches!(value["manager"].as_str(), Some("cursor_sdk" | "codex_sdk"))
+                    && value["manager_capabilities"].is_object()
+                    && value["reliable_schedule"]["version"].as_u64()
+                        == Some(u64::from(SCHEDULING_VERSION))
+            }) {
+                return Ok(candidate);
+            }
+        }
+        if local_available {
+            return Ok(local);
+        }
+        bail!(
+            "no authorized configured assistant is available; connect one of your assistant devices"
+        )
+    }
+
     pub(super) async fn accept_chat_message(
         self: &Arc<Self>,
         access: &Access,
@@ -645,17 +743,35 @@ impl Runtime {
                 "retry this message through its original gateway; do not resubmit it at another entry"
             );
         }
-        let target = input["scheduler_node"]
-            .as_str()
-            .unwrap_or(&local)
-            .to_owned();
-        if target == local {
+        let previous =
+            self.store
+                .lock()
+                .await
+                .original_message_route(network, &scope, &message_id)?;
+        let target = if let Some((target, _)) = &previous {
+            if let Some(requested) = input["scheduler_node"].as_str() {
+                ensure!(
+                    requested == target,
+                    "message ID reused with different content or target; retry must use its original assistant"
+                );
+            }
+            target.clone()
+        } else if let Some(target) = input["scheduler_node"].as_str() {
+            ensure!(!target.is_empty(), "assistant target cannot be empty");
+            target.to_owned()
+        } else {
+            self.select_chat_scheduler(network, &scope).await?
+        };
+        if target == local && previous.is_none() {
             self.require_role(network, NodeRole::Scheduler).await?;
             ensure!(
                 self.config.manager.is_some(),
                 "this Node has no configured management SDK"
             );
         }
+        let report_results = input["report_results"]
+            .as_bool()
+            .unwrap_or_else(|| previous.as_ref().is_none_or(|(_, report)| *report));
         let text = field(input, "text")?.to_owned();
         let (event, receipt) = {
             let mut store = self.store.lock().await;
@@ -686,7 +802,7 @@ impl Runtime {
                 now_ms(),
                 &local,
                 &target,
-                input["report_results"].as_bool().unwrap_or(false),
+                report_results,
             )?
         };
         self.publish_changed(network, &scope, &event.hash);
@@ -1109,7 +1225,17 @@ impl Runtime {
         result_hash: &str,
     ) -> Result<bool> {
         let _work = self.maintenance.enter()?;
-        if request.task_id.is_none() || request.target_node != self.identity.node_id()? {
+        if request.target_node != self.identity.node_id()?
+            || (request.task_id.is_none() && request.manager_authority.is_none())
+            || (request.task_id.is_none()
+                && request.action["type"] == "open"
+                && self
+                    .store
+                    .lock()
+                    .await
+                    .operation(&request.network_id, &request.operation_id)?
+                    .is_some_and(|operation| operation.state == OperationState::Succeeded))
+        {
             return Ok(true);
         }
         let key = format!("followup-wait:v1:{}", request.operation_id);
@@ -1163,17 +1289,14 @@ impl Runtime {
         request: &OperationRequest,
         result_hash: &str,
     ) -> Result<()> {
-        let Some(task) = request.task_id.as_deref() else {
-            return Ok(());
-        };
         let local = self.identity.node_id()?;
         {
             let mut store = self.store.lock().await;
-            let policy =
-                match store.followup_policy(&request.network_id, &request.conversation_id, task) {
-                    Ok(policy) if policy.mode != FollowupMode::Off => policy,
-                    _ => return Ok(()),
-                };
+            let policy = store.execution_result_policy(
+                &request.network_id,
+                &request.conversation_id,
+                result_hash,
+            )?;
             store.validate_followup_result(
                 &request.network_id,
                 &request.conversation_id,

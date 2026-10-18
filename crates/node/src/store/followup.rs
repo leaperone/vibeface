@@ -69,6 +69,27 @@ pub struct FollowupPolicy {
     pub proof_heads: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResultFollowupPolicy {
+    pub task_id: Option<String>,
+    pub target_node: String,
+    pub mode: FollowupMode,
+    pub version: u64,
+    pub proof_heads: Vec<String>,
+}
+
+impl From<FollowupPolicy> for ResultFollowupPolicy {
+    fn from(policy: FollowupPolicy) -> Self {
+        Self {
+            task_id: Some(policy.task_id),
+            target_node: policy.target_node,
+            mode: policy.mode,
+            version: policy.version,
+            proof_heads: policy.proof_heads,
+        }
+    }
+}
+
 fn grant_id(network: &str, scope: &str, task_ref: &str) -> String {
     format!(
         "task-followup:v1:{}",
@@ -441,7 +462,7 @@ fn policy_from(
     Ok(policy)
 }
 
-pub(super) fn validate_followup_result_from(
+fn validate_task_result_from(
     connection: &Connection,
     network: &str,
     scope: &str,
@@ -530,7 +551,7 @@ pub(super) fn validate_followup_result_from(
                 && binding.binding.task_ref == policy.task_ref
                 && binding.binding.authority_node == creation.event.author
                 && binding.binding.target_node == *target_node
-                && binding.binding.session_id == *session_id,
+                && Some(binding.binding.session_id.as_str()) == session_id.as_deref(),
             "follow-up dispatch task binding mismatch"
         );
         let key: String = connection.query_row(
@@ -552,6 +573,188 @@ pub(super) fn validate_followup_result_from(
     Ok(policy)
 }
 
+fn human_dispatch_source_from(
+    connection: &Connection,
+    network: &str,
+    scope: &str,
+    events: &BTreeMap<String, StoredEvent>,
+    request: &OperationRequest,
+) -> Result<()> {
+    let authority = request
+        .manager_authority
+        .as_ref()
+        .context("execution dispatch has no original manager invocation")?;
+    ensure!(
+        authority.followup_version == 0,
+        "ordinary execution must originate in a human invocation"
+    );
+    let source = events
+        .get(&authority.trigger)
+        .context("execution origin message is missing")?;
+    ensure!(
+        source.status == "ready"
+            && source.event.scope_id == scope
+            && matches!(&source.event.body,
+                EventBody::MessagePosted { role, scheduler_node: Some(target), .. }
+                if role == "user" && target == &authority.scheduler_node),
+        "execution origin is not its fixed scheduler's user message"
+    );
+    authorize_node_from(
+        connection,
+        network,
+        &source.event.author,
+        Some(NodeRole::Gateway),
+    )?;
+    authorize_node_from(
+        connection,
+        network,
+        &authority.scheduler_node,
+        Some(NodeRole::Scheduler),
+    )?;
+    ensure!(
+        request.basis_heads.iter().any(|head| {
+            head == &authority.trigger || ancestor(events, head, &authority.trigger)
+        }),
+        "execution dispatch did not consume its original human message"
+    );
+    let intent = intent_from(connection, network, scope, events, &authority.trigger, true)?;
+    if let Some((head, _)) = &intent {
+        ensure!(
+            request
+                .basis_heads
+                .iter()
+                .any(|basis| basis == head || ancestor(events, basis, head)),
+            "execution dispatch did not consume its result-report intent"
+        );
+    }
+    Ok(())
+}
+
+fn ordinary_result_policy_from(
+    connection: &Connection,
+    network: &str,
+    scope: &str,
+    events: &BTreeMap<String, StoredEvent>,
+    trigger: &str,
+) -> Result<ResultFollowupPolicy> {
+    let result = events.get(trigger).context("execution result is missing")?;
+    let EventBody::ExecutionObserved {
+        operation_id,
+        task_id: None,
+        target_node,
+        session_id,
+        status,
+        ..
+    } = &result.event.body
+    else {
+        bail!("ordinary result requires an execution without a task")
+    };
+    ensure!(
+        result.status == "ready"
+            && result.event.scope_id == scope
+            && result.event.author == *target_node
+            && matches!(status.as_str(), "succeeded" | "failed" | "rejected"),
+        "ordinary result requires its executor's known terminal result"
+    );
+    authorize_node_from(connection, network, target_node, Some(NodeRole::Executor))?;
+    let mut original = None;
+    for hash in closure_hashes(events, &[trigger.into()]) {
+        let Some(dispatch) = events.get(&hash) else {
+            continue;
+        };
+        let EventBody::DispatchRecorded {
+            operation_id: id,
+            task_id,
+            target_node: target,
+            session_id: session,
+            action,
+        } = &dispatch.event.body
+        else {
+            continue;
+        };
+        if id != operation_id {
+            continue;
+        }
+        let request: OperationRequest = serde_json::from_value(action.clone())?;
+        let authority = request
+            .manager_authority
+            .as_ref()
+            .context("ordinary result has no original manager invocation")?;
+        ensure!(
+            dispatch.status == "ready"
+                && dispatch.event.scope_id == scope
+                && dispatch.event.author == authority.scheduler_node
+                && task_id.is_none()
+                && request.task_id.is_none()
+                && request.binding.is_none()
+                && target == target_node
+                && session == session_id
+                && request.network_id == network
+                && request.conversation_id == scope
+                && request.operation_id == *operation_id
+                && request.target_node == *target_node
+                && request.session_id == *session_id
+                && (matches!(
+                    request.action["type"].as_str(),
+                    Some("command" | "send" | "steer" | "interrupt" | "respond_request")
+                ) || (request.action["type"] == "open" && status != "succeeded")),
+            "ordinary result does not match its original signed dispatch"
+        );
+        human_dispatch_source_from(connection, network, scope, events, &request)?;
+        if let Some(original) = &original {
+            ensure!(
+                original == &request,
+                "execution result has conflicting dispatch bodies"
+            );
+        } else {
+            original = Some(request);
+        }
+    }
+    let request = original.context("ordinary result dispatch is missing")?;
+    let authority = request
+        .manager_authority
+        .as_ref()
+        .context("manager invocation missing")?;
+    let (head, intent) = intent_from(connection, network, scope, events, &authority.trigger, true)?
+        .context("ordinary result reporting intent is missing")?;
+    ensure!(
+        intent.mode == FollowupMode::Report,
+        "ordinary result reporting is disabled"
+    );
+    Ok(ResultFollowupPolicy {
+        task_id: None,
+        target_node: authority.scheduler_node.clone(),
+        mode: FollowupMode::Report,
+        version: intent.version,
+        proof_heads: vec![trigger.into(), authority.trigger.clone(), head.into()],
+    })
+}
+
+pub(super) fn validate_followup_result_from(
+    connection: &Connection,
+    network: &str,
+    scope: &str,
+    trigger: &str,
+    scheduler: &str,
+) -> Result<ResultFollowupPolicy> {
+    let events = scope_events(connection, network, scope)?;
+    let result = events.get(trigger).context("follow-up result is missing")?;
+    let policy = match &result.event.body {
+        EventBody::ExecutionObserved {
+            task_id: Some(_), ..
+        } => validate_task_result_from(connection, network, scope, trigger, scheduler)?.into(),
+        EventBody::ExecutionObserved { task_id: None, .. } => {
+            ordinary_result_policy_from(connection, network, scope, &events, trigger)?
+        }
+        _ => bail!("follow-up requires an execution result"),
+    };
+    ensure!(
+        policy.target_node == scheduler,
+        "execution result belongs to another scheduler"
+    );
+    Ok(policy)
+}
+
 pub(super) fn validate_manager_dispatch_from(
     connection: &Connection,
     network: &str,
@@ -560,6 +763,19 @@ pub(super) fn validate_manager_dispatch_from(
     let Some(authority) = &request.manager_authority else {
         return Ok(());
     };
+    let events = scope_events(connection, network, &request.conversation_id)?;
+    if matches!(events.get(&authority.trigger).map(|source| &source.event.body),
+        Some(EventBody::MessagePosted { role, .. }) if role == "user")
+    {
+        human_dispatch_source_from(
+            connection,
+            network,
+            &request.conversation_id,
+            &events,
+            request,
+        )?;
+        return Ok(());
+    }
     let policy = validate_followup_result_from(
         connection,
         network,
@@ -570,7 +786,8 @@ pub(super) fn validate_manager_dispatch_from(
     ensure!(
         policy.version == authority.followup_version
             && policy.mode == FollowupMode::Continue
-            && request.task_id.as_deref() == Some(policy.task_id.as_str()),
+            && request.task_id.is_some()
+            && request.task_id == policy.task_id,
         "autonomous dispatch permission was revoked or changed"
     );
     Ok(())
@@ -610,8 +827,66 @@ impl Store {
         scope: &str,
         trigger: &str,
         scheduler: &str,
-    ) -> Result<FollowupPolicy> {
+    ) -> Result<ResultFollowupPolicy> {
         validate_followup_result_from(&self.connection, network, scope, trigger, scheduler)
+    }
+
+    pub fn execution_result_policy(
+        &self,
+        network: &str,
+        scope: &str,
+        trigger: &str,
+    ) -> Result<ResultFollowupPolicy> {
+        let events = scope_events(&self.connection, network, scope)?;
+        let result = events.get(trigger).context("execution result is missing")?;
+        match &result.event.body {
+            EventBody::ExecutionObserved {
+                task_id: Some(task),
+                ..
+            } => {
+                let policy = self.followup_policy(network, scope, task)?;
+                self.validate_followup_result(network, scope, trigger, &policy.target_node)
+            }
+            EventBody::ExecutionObserved { task_id: None, .. } => {
+                ordinary_result_policy_from(&self.connection, network, scope, &events, trigger)
+            }
+            _ => bail!("follow-up requires an execution result"),
+        }
+    }
+
+    pub fn original_message_route(
+        &self,
+        network: &str,
+        scope: &str,
+        message_id: &str,
+    ) -> Result<Option<(String, bool)>> {
+        let events = load_events_from(&self.connection, network)?;
+        let mut found = None;
+        for (hash, source) in &events {
+            let EventBody::MessagePosted {
+                message_id: id,
+                role,
+                scheduler_node,
+                ..
+            } = &source.event.body
+            else {
+                continue;
+            };
+            if source.event.scope_id != scope || role != "user" || id != message_id {
+                continue;
+            }
+            ensure!(
+                source.status == "ready" && found.is_none(),
+                "original message is unavailable or ambiguous"
+            );
+            let target = scheduler_node
+                .as_ref()
+                .context("original message has no fixed scheduler")?;
+            let report = intent_from(&self.connection, network, scope, &events, hash, false)?
+                .is_some_and(|(_, intent)| intent.mode == FollowupMode::Report);
+            found = Some((target.clone(), report));
+        }
+        Ok(found)
     }
 
     pub fn require_followup_version(
@@ -650,7 +925,7 @@ impl Store {
         );
         if let Some(task) = write_task {
             ensure!(
-                current.mode == FollowupMode::Continue && current.task_id == task,
+                current.mode == FollowupMode::Continue && current.task_id.as_deref() == Some(task),
                 "follow-up permits no business writes outside its authorized task"
             );
         }
@@ -960,7 +1235,7 @@ mod tests {
             conversation_id: "chat".into(),
             task_id: Some(task.into()),
             target_node: node.into(),
-            session_id: "execution".into(),
+            session_id: Some("execution".into()),
             expected_revision: 1,
             basis_heads: store.heads(network, "chat")?,
             action: json!({"type":"send","text":"work"}),
@@ -976,7 +1251,7 @@ mod tests {
                 operation_id: "send".into(),
                 task_id: Some(task.into()),
                 target_node: node.into(),
-                session_id: "execution".into(),
+                session_id: Some("execution".into()),
                 action: serde_json::to_value(request)?,
             },
             vec![],
@@ -990,13 +1265,274 @@ mod tests {
                 operation_id: "send".into(),
                 task_id: Some(task.into()),
                 target_node: node.into(),
-                session_id: "execution".into(),
+                session_id: Some("execution".into()),
                 status: "succeeded".into(),
                 detail: json!({"text":"done"}),
             },
             vec![],
             5,
         )
+    }
+
+    fn ordinary_request(
+        store: &Store,
+        network: &str,
+        node: &str,
+        message: &SignedEvent,
+        operation: &str,
+    ) -> Result<OperationRequest> {
+        Ok(OperationRequest {
+            operation_id: operation.into(),
+            network_id: network.into(),
+            conversation_id: "chat".into(),
+            task_id: None,
+            target_node: node.into(),
+            session_id: None,
+            expected_revision: 0,
+            basis_heads: store.heads(network, "chat")?,
+            action: json!({"type":"command","argv":["pwd"],"cwd":"/tmp","timeout_secs":1}),
+            resources: vec![],
+            binding: None,
+            manager_authority: Some(ManagerDispatchAuthority {
+                scheduler_node: node.into(),
+                trigger: message.hash.clone(),
+                followup_version: 0,
+            }),
+        })
+    }
+
+    fn ordinary_result(
+        store: &mut Store,
+        identity: &LocalIdentity,
+        request: &OperationRequest,
+        result_session: Option<String>,
+    ) -> Result<SignedEvent> {
+        store.append_event(
+            identity,
+            &request.network_id,
+            &request.conversation_id,
+            EventBody::DispatchRecorded {
+                operation_id: request.operation_id.clone(),
+                task_id: None,
+                target_node: request.target_node.clone(),
+                session_id: request.session_id.clone(),
+                action: serde_json::to_value(request)?,
+            },
+            vec![],
+            4,
+        )?;
+        store.append_event(
+            identity,
+            &request.network_id,
+            &request.conversation_id,
+            EventBody::ExecutionObserved {
+                operation_id: request.operation_id.clone(),
+                task_id: None,
+                target_node: request.target_node.clone(),
+                session_id: result_session,
+                status: "succeeded".into(),
+                detail: json!({"exit_code":0,"stdout":"/tmp"}),
+            },
+            vec![],
+            5,
+        )
+    }
+
+    #[test]
+    fn ordinary_results_are_read_only_durable_jobs_without_task_creation() -> Result<()> {
+        let (mut store, identity, network, node) = fixture()?;
+        let (message, _) = store.accept_message(
+            &identity,
+            &network,
+            "chat",
+            EventBody::MessagePosted {
+                message_id: "ordinary".into(),
+                role: "user".into(),
+                text: "where am I".into(),
+                scheduler_node: Some(node.clone()),
+            },
+            vec![],
+            2,
+            &node,
+            &node,
+            true,
+        )?;
+        let human = store
+            .claim_next(&network, "chat", &node, "test", "sdk")?
+            .context("human invocation missing")?;
+        let attempt = human.job.state.attempt().context("human attempt missing")?;
+        let request = ordinary_request(&store, &network, &node, &message, "ordinary-command")?;
+        validate_manager_dispatch_from(&store.connection, &network, &request)?;
+        let result = ordinary_result(&mut store, &identity, &request, None)?;
+        store.finish_job(
+            &identity,
+            &network,
+            "chat",
+            &node,
+            &message.hash,
+            &attempt.id,
+            crate::scheduling::JobOutcome::Failed("fixture manager has returned".into()),
+            vec![],
+            6,
+        )?;
+        let policy = store.validate_followup_result(&network, "chat", &result.hash, &node)?;
+        assert_eq!(policy.task_id, None);
+        assert_eq!(policy.mode, FollowupMode::Report);
+        let first = store.enqueue_trigger(&network, "chat", &result.hash, &node)?;
+        assert_eq!(
+            store.enqueue_trigger(&network, "chat", &result.hash, &node)?,
+            first
+        );
+        let followup = store
+            .claim_next(&network, "chat", &node, "test", "sdk")?
+            .context("read-only result report missing")?;
+        assert!(
+            followup
+                .job
+                .state
+                .attempt()
+                .context("report attempt missing")?
+                .read_only
+        );
+        assert!(followup.previous_native_id.is_none());
+        assert!(
+            store
+                .claim_next(&network, "chat", &node, "test", "sdk")?
+                .is_none()
+        );
+        assert!(store.tasks(&network, "chat")?.is_empty());
+        assert!(
+            store
+                .context(&network, "chat", &[])?
+                .events
+                .iter()
+                .all(|event| !matches!(event.body, EventBody::TaskCreated { .. }))
+        );
+        store.validate_latest_manager_policy(&network, "chat", &result.hash, &node, 1, None)?;
+        assert!(
+            store
+                .validate_latest_manager_policy(
+                    &network,
+                    "chat",
+                    &result.hash,
+                    &node,
+                    1,
+                    Some("anything")
+                )
+                .is_err()
+        );
+        let mut forged = request;
+        forged.operation_id = "report-cannot-continue".into();
+        forged.basis_heads = store.heads(&network, "chat")?;
+        forged.manager_authority = Some(ManagerDispatchAuthority {
+            scheduler_node: node,
+            trigger: result.hash,
+            followup_version: 1,
+        });
+        assert!(validate_manager_dispatch_from(&store.connection, &network, &forged).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_results_require_the_original_human_dispatch_scope_and_report_intent() -> Result<()>
+    {
+        let (mut store, identity, network, node) = fixture()?;
+        let message = intent(&mut store, &identity, &network, &node, "ordinary", true)?;
+        let request = ordinary_request(&store, &network, &node, &message, "mismatched-session")?;
+        let mismatch = ordinary_result(
+            &mut store,
+            &identity,
+            &request,
+            Some("injected-session".into()),
+        )?;
+        assert!(
+            store
+                .validate_followup_result(&network, "chat", &mismatch.hash, &node)
+                .is_err()
+        );
+        let mut wrong_source = ordinary_request(&store, &network, &node, &message, "wrong-origin")?;
+        wrong_source
+            .manager_authority
+            .as_mut()
+            .context("authority missing")?
+            .trigger = mismatch.hash;
+        let mismatch = ordinary_result(&mut store, &identity, &wrong_source, None)?;
+        assert!(
+            store
+                .validate_followup_result(&network, "chat", &mismatch.hash, &node)
+                .is_err()
+        );
+        let off = intent(&mut store, &identity, &network, &node, "off", false)?;
+        let request = ordinary_request(&store, &network, &node, &off, "report-disabled")?;
+        let disabled = ordinary_result(&mut store, &identity, &request, None)?;
+        assert!(
+            store
+                .validate_followup_result(&network, "chat", &disabled.hash, &node)
+                .is_err()
+        );
+        let mut request =
+            ordinary_request(&store, &network, &node, &message, "missing-origin-proof")?;
+        request.basis_heads.clear();
+        let missing = ordinary_result(&mut store, &identity, &request, None)?;
+        assert!(
+            store
+                .validate_followup_result(&network, "chat", &missing.hash, &node)
+                .is_err()
+        );
+        let other = LocalIdentity::generate();
+        store.install_trust_bundle(
+            &network,
+            &identity.sign_network_fixture(
+                2,
+                vec![
+                    identity.certificate(vec![
+                        NodeRole::Gateway,
+                        NodeRole::Replica,
+                        NodeRole::Scheduler,
+                        NodeRole::Executor,
+                    ])?,
+                    other.certificate(vec![
+                        NodeRole::Gateway,
+                        NodeRole::Replica,
+                        NodeRole::Executor,
+                    ])?,
+                ],
+            )?,
+        )?;
+        let mut borrowed = ordinary_request(&store, &network, &node, &message, "borrowed-manager")?;
+        borrowed.target_node = other.node_id()?;
+        let forged = ordinary_result(&mut store, &other, &borrowed, None)?;
+        assert!(
+            store
+                .validate_followup_result(&network, "chat", &forged.hash, &node)
+                .is_err()
+        );
+        assert!(store.tasks(&network, "chat")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn message_retries_recover_the_original_route_and_report_mode() -> Result<()> {
+        let (mut store, identity, network, node) = fixture()?;
+        intent(&mut store, &identity, &network, &node, "report", true)?;
+        intent(&mut store, &identity, &network, &node, "off", false)?;
+        assert_eq!(
+            store.original_message_route(&network, "chat", "report")?,
+            Some((node.clone(), true))
+        );
+        assert_eq!(
+            store.original_message_route(&network, "chat", "off")?,
+            Some((node, false))
+        );
+        assert_eq!(
+            store.original_message_route(&network, "chat", "missing")?,
+            None
+        );
+        assert_eq!(
+            store.original_message_route(&network, "another-chat", "report")?,
+            None
+        );
+        Ok(())
     }
 
     #[test]
@@ -1319,7 +1855,7 @@ mod tests {
                 operation_id: "forged".into(),
                 task_id: Some("task".into()),
                 target_node: node.clone(),
-                session_id: "wrong".into(),
+                session_id: Some("wrong".into()),
                 status: "succeeded".into(),
                 detail: json!({}),
             },

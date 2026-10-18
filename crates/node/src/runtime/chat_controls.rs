@@ -14,6 +14,233 @@ fn control_key(operation: &str) -> String {
     format!("chat-control:v1:{operation}")
 }
 
+fn execution_cache_key(target: &str, operation: &str) -> String {
+    format!(
+        "chat-execution:v1:{}",
+        crypto::digest(&serde_json::to_vec(&(target, operation)).expect("string tuple serializes"))
+    )
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ExecutionControlAction {
+    Interrupt {},
+    Steer {
+        text: String,
+    },
+    RespondRequest {
+        request_id: vibeface_protocol::RpcId,
+        response: Value,
+    },
+}
+
+impl ExecutionControlAction {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Interrupt {} => "interrupt",
+            Self::Steer { .. } => "steer",
+            Self::RespondRequest { .. } => "respond_request",
+        }
+    }
+}
+
+fn conversation_dispatches(context: &Context) -> Result<Vec<OperationRequest>> {
+    let mut requests = Vec::new();
+    for event in &context.events {
+        if event.network_id != context.network_id || event.scope_id != context.scope_id {
+            continue;
+        }
+        let EventBody::DispatchRecorded {
+            operation_id,
+            task_id,
+            target_node,
+            session_id,
+            action,
+        } = &event.body
+        else {
+            continue;
+        };
+        let request: OperationRequest = serde_json::from_value(action.clone())?;
+        ensure!(
+            request.network_id == event.network_id
+                && request.conversation_id == event.scope_id
+                && request.operation_id == *operation_id
+                && request.task_id == *task_id
+                && request.target_node == *target_node
+                && request.session_id == *session_id,
+            "dispatch metadata does not match its execution request"
+        );
+        if let Some(previous) = requests
+            .iter()
+            .find(|previous: &&OperationRequest| previous.operation_id == request.operation_id)
+        {
+            ensure!(
+                previous == &request,
+                "operation ID reused with different dispatched body"
+            );
+        } else {
+            requests.push(request);
+        }
+    }
+    Ok(requests)
+}
+
+fn execution_requests<'a>(
+    requests: &'a [OperationRequest],
+    original: &OperationRequest,
+) -> impl Iterator<Item = &'a OperationRequest> {
+    let target = original.target_node.clone();
+    let session = original.session_id.clone();
+    let operation = original.operation_id.clone();
+    requests.iter().filter(move |request| {
+        request.target_node == target
+            && request.session_id == session
+            && (session.is_some() || request.operation_id == operation)
+    })
+}
+
+fn execution_observations<'a>(
+    context: &'a Context,
+    request: &'a OperationRequest,
+) -> impl Iterator<Item = &'a Event> {
+    context.events.iter().filter(move |event| {
+        event.network_id == request.network_id
+            && event.scope_id == request.conversation_id
+            && event.author == request.target_node
+            && matches!(&event.body, EventBody::ExecutionObserved {
+                operation_id, task_id, target_node, session_id, ..
+            } if operation_id == &request.operation_id
+                && task_id == &request.task_id
+                && target_node == &request.target_node
+                && session_id == &request.session_id)
+    })
+}
+
+fn observed_operation(
+    context: &Context,
+    request: &OperationRequest,
+) -> Result<Option<OperationRecord>> {
+    let mut observed: Option<OperationRecord> = None;
+    for event in execution_observations(context, request) {
+        let EventBody::ExecutionObserved { status, detail, .. } = &event.body else {
+            continue;
+        };
+        let state: OperationState = match status.as_str() {
+            "completed" => OperationState::Succeeded,
+            "interrupted" => OperationState::Failed,
+            "accepted" | "running" | "unknown" | "succeeded" | "failed" | "rejected" => {
+                serde_json::from_value(json!(status))?
+            }
+            _ => continue,
+        };
+        if let Some(previous) = observed
+            .as_ref()
+            .filter(|previous| previous.state.terminal())
+        {
+            if !state.terminal() {
+                continue;
+            }
+            ensure!(
+                previous.state == state && previous.result == *detail,
+                "executor published conflicting terminal results"
+            );
+            continue;
+        }
+        observed = Some(OperationRecord {
+            request: request.clone(),
+            state,
+            result: detail.clone(),
+        });
+    }
+    Ok(observed)
+}
+
+fn validate_execution_status(
+    requests: &[OperationRequest],
+    original: &OperationRequest,
+    status: &Value,
+) -> Result<(
+    Option<ExecutionSession>,
+    OperationRecord,
+    Vec<OperationRecord>,
+)> {
+    let operation: OperationRecord = serde_json::from_value(status["operation"].clone())?;
+    ensure!(
+        same_business_request(&operation.request, original),
+        "executor status does not match the original signed dispatch"
+    );
+    let session = match original.session_id.as_deref() {
+        Some(id) => {
+            let session: ExecutionSession = serde_json::from_value(status["session"].clone())?;
+            ensure!(
+                session.network_id == original.network_id
+                    && session.target_node == original.target_node
+                    && session.session_id == id,
+                "executor session does not match its dispatched operation"
+            );
+            Some(session)
+        }
+        None => {
+            ensure!(status["session"].is_null(), "command has no SDK session");
+            None
+        }
+    };
+    let related = execution_requests(requests, original)
+        .cloned()
+        .collect::<Vec<_>>();
+    let records = status_records(status)?;
+    for record in &records {
+        ensure!(
+            matches_dispatch(&related, record)?,
+            "executor status contains an operation outside this conversation execution"
+        );
+    }
+    Ok((session, operation, records))
+}
+
+fn execution_detail(result: &Value) -> String {
+    if let Some(text) = result.as_str() {
+        return text.into();
+    }
+    let mut lines = Vec::new();
+    if let Some(code) = result["exit_code"].as_i64() {
+        lines.push(format!("退出码 {code}"));
+    }
+    for key in [
+        "text", "output", "stdout", "stderr", "error", "result", "message",
+    ] {
+        if let Some(text) = result[key].as_str().filter(|text| !text.is_empty()) {
+            lines.push(text.to_owned());
+        }
+    }
+    if result["truncated"] == true {
+        lines.push("输出超过限制，已截断。".into());
+    }
+    if lines.is_empty() {
+        if let Some(text) = result["params"]["item"]["text"].as_str() {
+            lines.push(text.into());
+        }
+        for turn in [&result["turn"], &result["params"]["turn"]] {
+            for item in turn["items"].as_array().into_iter().flatten() {
+                if matches!(
+                    item["type"].as_str(),
+                    Some("agentMessage" | "agent_message")
+                ) && let Some(text) = item["text"].as_str()
+                {
+                    lines.push(text.into());
+                }
+            }
+            if let Some(error) = turn["error"]["message"].as_str() {
+                lines.push(error.into());
+            }
+        }
+    }
+    if lines.is_empty() && result["result_blob"].is_object() {
+        lines.push("结果已保存，可查看附件。".into());
+    }
+    lines.join("\n")
+}
+
 fn same_business_request(observed: &OperationRequest, original: &OperationRequest) -> bool {
     let mut admitted = original.clone();
     // Admission expands resource locks without changing the dispatched business request.
@@ -64,7 +291,7 @@ fn bound_dispatches(context: &Context, proof: &SignedBinding) -> Result<Vec<Oper
             || request.conversation_id != binding.conversation_id
             || request.task_id.as_deref() != Some(binding.task_id.as_str())
             || request.target_node != binding.target_node
-            || request.session_id != binding.session_id
+            || request.session_id.as_deref() != Some(binding.session_id.as_str())
             || request.binding.as_ref() != Some(proof)
         {
             continue;
@@ -127,11 +354,26 @@ fn bound_operations(
 }
 
 fn status_records(status: &Value) -> Result<Vec<OperationRecord>> {
-    let mut records: Vec<OperationRecord> = status
+    let records: Vec<OperationRecord> = status
         .get("operations")
         .map(|value| serde_json::from_value(value.clone()))
         .transpose()?
         .unwrap_or_default();
+    let mut unique = Vec::new();
+    for record in records {
+        if let Some(duplicate) = unique
+            .iter()
+            .find(|old: &&OperationRecord| old.request.operation_id == record.request.operation_id)
+        {
+            ensure!(
+                duplicate == &record,
+                "executor status has conflicting operation records"
+            );
+        } else {
+            unique.push(record);
+        }
+    }
+    let mut records = unique;
     if let Some(operation) = status.get("operation") {
         let operation: OperationRecord = serde_json::from_value(operation.clone())?;
         if let Some(duplicate) = records
@@ -167,7 +409,7 @@ fn bound_request(
             } else {
                 false
             };
-        let observed = context.events.iter().any(|event|event.network_id == binding.network_id && event.scope_id == binding.conversation_id && event.author == binding.target_node && matches!(&event.body,EventBody::ExecutionObserved { operation_id,task_id:Some(task),target_node,session_id,status,.. } if operation_id == &request.operation_id && task == &binding.task_id && target_node == &binding.target_node && session_id == &binding.session_id && status != "rejected"));
+        let observed = context.events.iter().any(|event|event.network_id == binding.network_id && event.scope_id == binding.conversation_id && event.author == binding.target_node && matches!(&event.body,EventBody::ExecutionObserved { operation_id,task_id:Some(task),target_node,session_id,status,.. } if operation_id == &request.operation_id && task == &binding.task_id && target_node == &binding.target_node && session_id.as_deref() == Some(binding.session_id.as_str()) && status != "rejected"));
         if admitted || observed {
             proven.push(request);
         }
@@ -472,6 +714,213 @@ impl Runtime {
             }
             tasks.push(value);
         }
+        let requests = conversation_dispatches(&context)?;
+        operations.extend(
+            bound_operations(&requests, local_operations.iter().cloned())?
+                .into_iter()
+                .map(|record| json!(record)),
+        );
+        for request in &requests {
+            if let Some(record) = observed_operation(&context, request)? {
+                operations.push(json!(record));
+            }
+        }
+        let mut executions = Vec::new();
+        for request in requests.iter().filter(|request| {
+            matches!(request.action["type"].as_str(), Some("send" | "command"))
+                || (request.action["type"] == "open"
+                    && !requests.iter().any(|other| {
+                        other.target_node == request.target_node
+                            && other.session_id == request.session_id
+                            && other.action["type"] == "send"
+                    }))
+        }) {
+            let local_target = request.target_node == local;
+            targets.insert(request.target_node.clone());
+            let cached = store.local_value(
+                network,
+                &execution_cache_key(&request.target_node, &request.operation_id),
+            )?;
+            let validated = cached
+                .as_ref()
+                .map(|value| validate_execution_status(&requests, request, value))
+                .transpose()?;
+            let mut operation = if local_target {
+                let record = local_operations
+                    .iter()
+                    .find(|record| record.request.operation_id == request.operation_id)
+                    .cloned();
+                if let Some(record) = &record {
+                    ensure!(
+                        same_business_request(&record.request, request),
+                        "operation ledger does not match its dispatched body"
+                    );
+                }
+                record
+            } else {
+                validated
+                    .as_ref()
+                    .map(|(_, operation, _)| operation.clone())
+            };
+            if let Some(observed) = observed_operation(&context, request)?
+                && (operation.is_none() || (!local_target && observed.state.terminal()))
+            {
+                operation = Some(observed);
+            }
+            let stored_session = request
+                .session_id
+                .as_deref()
+                .map(|id| store.session(network, &request.target_node, id))
+                .transpose()?
+                .flatten();
+            let cached_session = validated
+                .as_ref()
+                .and_then(|(session, _, _)| session.clone());
+            let session = if local_target {
+                stored_session.or(cached_session)
+            } else {
+                cached_session.or(stored_session)
+            };
+            let actual = if local_target {
+                engine.clone()
+            } else {
+                cached
+                    .as_ref()
+                    .map(|value| value["snapshot"].clone())
+                    .unwrap_or(Value::Null)
+            };
+            let turn = if local_target {
+                store.local_value(network, &format!("turn:{}", request.operation_id))?
+            } else {
+                cached.as_ref().map(|value| value["turn"].clone())
+            };
+            let native = session
+                .as_ref()
+                .and_then(|session| session.native_session_id.as_deref());
+            let turn_id = turn.as_ref().and_then(|value| value["turn"]["id"].as_str());
+            let active_turn = native.zip(turn_id).is_some_and(|(native, turn)| {
+                let current = &actual["threads"][native]["last_turn"];
+                current["id"].as_str() == Some(turn)
+                    && matches!(
+                        current["status"].as_str(),
+                        Some("inProgress" | "in_progress" | "running")
+                    )
+            });
+            let reachable = if local_target {
+                actual["connection"]["state"] == "connected"
+            } else {
+                cached
+                    .as_ref()
+                    .is_some_and(|value| value["reachable"] == true)
+            };
+            let authorized = store
+                .authorize_node(network, &request.target_node, Some(NodeRole::Executor))
+                .is_ok();
+            let capabilities = session
+                .as_ref()
+                .map(|session| {
+                    executor_capabilities(&session.executor, reachable && active_turn && authorized)
+                        .into_iter()
+                        .filter(|capability| !matches!(*capability, "open" | "send"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let blobs = execution_observations(&context, request)
+                .flat_map(|event| event.blobs.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            let latest_progress = execution_observations(&context, request)
+                .filter_map(|event| {
+                    let EventBody::ExecutionObserved { status, detail, .. } = &event.body else {
+                        return None;
+                    };
+                    if status != "progress" {
+                        return None;
+                    }
+                    let text = execution_detail(detail);
+                    (!text.is_empty()).then_some(text)
+                })
+                .last();
+            let text = request.action["text"]
+                .as_str()
+                .or_else(|| request.action["command"].as_str())
+                .unwrap_or(if request.session_id.is_none() {
+                    "运行命令"
+                } else {
+                    "后台工作"
+                });
+            let title = text
+                .lines()
+                .next()
+                .unwrap_or(text)
+                .chars()
+                .take(80)
+                .collect::<String>();
+            let mut projected = json!({
+                "operation_id":request.operation_id,"target_node":request.target_node,
+                "session_id":request.session_id,"revision":session.as_ref().map(|session|session.revision).unwrap_or(request.expected_revision),
+                "title":title,"state":operation.as_ref().map(|operation|operation.state.clone()).unwrap_or(OperationState::Unknown),
+                "session_state":session.as_ref().map(|session|session.state.as_str()).unwrap_or("none"),
+                "capabilities":capabilities,"pending_requests":if active_turn {pending_requests(&actual,native,turn_id)} else {Vec::new()},
+                "freshness":if local_target {"local_ledger"} else if cached.is_some() {"cached"} else {"unknown"},
+                "detail":operation.as_ref().map(|operation|execution_detail(&operation.result)).filter(|detail|!detail.is_empty()).or_else(||latest_progress.clone()).unwrap_or_default(),"blobs":blobs
+            });
+            if let Some(progress) = latest_progress {
+                projected["latest_progress"] = json!(progress);
+            }
+            if let Some(cached) = &cached {
+                projected["checked_at_ms"] = cached["checked_at_ms"].clone();
+            }
+            if let Some(authority) = &request.manager_authority {
+                projected["source_trigger"] = json!(authority.trigger);
+                if let Some(event) = store.event(network, &authority.trigger)? {
+                    let event = store.verify_event(network, &event)?;
+                    if event.scope_id == scope
+                        && let EventBody::MessagePosted {
+                            message_id, role, ..
+                        } = event.body
+                        && role == "user"
+                    {
+                        projected["source_message_id"] = json!(message_id);
+                    }
+                }
+            }
+            if let Some(task) = tasks
+                .iter()
+                .find(|task| task["task_id"].as_str() == request.task_id.as_deref())
+            {
+                projected["goal"] = json!({"task_id":task["task_id"],"title":task["title"],"acceptance":task["acceptance"],"status":task["status"],"followup_mode":task["followup_mode"],"followup_version":task["followup_version"],"followup_scheduler_node":task["followup_scheduler_node"]});
+            }
+            if let Some(session) = session
+                && session_ids.insert((session.target_node.clone(), session.session_id.clone()))
+            {
+                sessions.push(json!(session));
+            }
+            if let Some(operation) = operation {
+                operations.push(json!(operation));
+            }
+            if let Some((_, _, records)) = validated {
+                operations.extend(records.into_iter().map(|record| json!(record)));
+            }
+            executions.push(projected);
+        }
+        let mut records: Vec<OperationRecord> = Vec::new();
+        for value in operations {
+            let record: OperationRecord = serde_json::from_value(value)?;
+            if let Some(existing) = records
+                .iter_mut()
+                .find(|existing| existing.request.operation_id == record.request.operation_id)
+            {
+                if !existing.state.terminal() && record.state.terminal() {
+                    *existing = record;
+                }
+            } else {
+                records.push(record);
+            }
+        }
+        let operations = records
+            .into_iter()
+            .map(|record| json!(record))
+            .collect::<Vec<_>>();
         targets.retain(|target| store.authorize_node(network, target, None).is_ok());
         let frozen = targets.iter().any(|target| {
             store
@@ -505,7 +954,7 @@ impl Runtime {
             .map(|job| job["manager"].clone());
         let metadata = remote_manager.unwrap_or_else(||json!({"provider":manager.map(|manager|&manager.provider),"model":manager.map(|manager|&manager.model),"capabilities":capabilities}));
         Ok(
-            json!({"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),"messages":messages,"tasks":tasks,"heads":context.heads,"missing":context.missing,"sessions":sessions,"operations":operations,"facts_freshness":"local_known_history","scheduler":{"jobs":jobs,"provider":metadata["provider"],"model":metadata["model"],"capabilities":metadata["capabilities"],"write_frozen":frozen},"observation_targets":targets}),
+            json!({"bot":store.bot_for_conversation(network,scope)?,"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),"messages":messages,"tasks":tasks,"executions":executions,"heads":context.heads,"missing":context.missing,"sessions":sessions,"operations":operations,"facts_freshness":"local_known_history","scheduler":{"jobs":jobs,"provider":metadata["provider"],"model":metadata["model"],"capabilities":metadata["capabilities"],"write_frozen":frozen},"observation_targets":targets}),
         )
     }
 
@@ -574,28 +1023,67 @@ impl Runtime {
         task: &str,
     ) -> Result<Value> {
         let (proof, context) = self.chat_binding(network, scope, task).await?;
-        ensure!(
-            proof.binding.target_node == self.identity.node_id()?,
-            "task is bound to another executor"
-        );
+        let request = bound_request(&*self.store.lock().await, &context, &proof)?
+            .context("task has no admitted execution")?;
+        self.chat_execution_status(network, scope, &request.operation_id)
+            .await
+    }
+
+    pub(super) async fn chat_execution_status(
+        &self,
+        network: &str,
+        scope: &str,
+        operation_id: &str,
+    ) -> Result<Value> {
         let (session, operation, operations, turn) = {
             let store = self.store.lock().await;
-            let requests = bound_dispatches(&context, &proof)?;
-            let request = bound_request(&store, &context, &proof)?
-                .context("task has no admitted execution")?;
-            let operations = bound_operations(&requests, store.operations(network)?)?;
+            let context = store.context(network, scope, &[])?;
+            ensure!(
+                context.missing.is_complete(),
+                "execution history is incomplete or conflicting"
+            );
+            let requests = conversation_dispatches(&context)?;
+            let original = requests
+                .iter()
+                .find(|request| request.operation_id == operation_id)
+                .context("operation was not dispatched by this conversation")?;
+            ensure!(
+                original.target_node == self.identity.node_id()?,
+                "operation belongs to another executor"
+            );
+            store.authorize_node(network, &original.target_node, Some(NodeRole::Executor))?;
+            let operation = store
+                .operation(network, operation_id)?
+                .context("original operation not found")?;
+            ensure!(
+                same_business_request(&operation.request, original),
+                "operation ledger does not match its dispatched body"
+            );
+            let related = execution_requests(&requests, original)
+                .cloned()
+                .collect::<Vec<_>>();
+            let operations = bound_operations(&related, store.operations(network)?)?;
+            let session = original
+                .session_id
+                .as_deref()
+                .map(|id| store.session(network, &original.target_node, id))
+                .transpose()?
+                .flatten();
+            ensure!(
+                original.session_id.is_none() || session.is_some(),
+                "execution session not found"
+            );
             (
-                store
-                    .session(network, &request.target_node, &request.session_id)?
-                    .context("execution session not found")?,
-                store
-                    .operation(network, &request.operation_id)?
-                    .context("original operation not found")?,
+                session,
+                operation,
                 operations,
-                store.local_value(network, &format!("turn:{}", request.operation_id))?,
+                store.local_value(network, &format!("turn:{operation_id}"))?,
             )
         };
-        let read_error = if session.executor == "codex" && session.native_session_id.is_some() {
+        let read_error = if let Some(session) = session
+            .as_ref()
+            .filter(|session| session.executor == "codex" && session.native_session_id.is_some())
+        {
             let native = ExecutorSession {
                 executor: ExecutorKind::Codex,
                 cwd: session.cwd.clone().into(),
@@ -617,15 +1105,246 @@ impl Runtime {
         } else {
             None
         };
-        let snapshot = self.engine.snapshot().await;
-        let native = session.native_session_id.as_deref();
+        let snapshot = if session.is_some() {
+            self.engine.snapshot().await
+        } else {
+            Value::Null
+        };
+        let native = session
+            .as_ref()
+            .and_then(|session| session.native_session_id.as_deref());
         let mut filtered = json!({"connection":snapshot["connection"],"threads":{},"pending_requests":snapshot["pending_requests"].as_array().into_iter().flatten().filter(|value| native.is_some_and(|native|value["params"]["threadId"].as_str()==Some(native))).cloned().collect::<Vec<_>>()});
         if let Some(native) = native {
             filtered["threads"][native] = snapshot["threads"][native].clone();
         }
         Ok(
-            json!({"session":session,"operation":operation,"operations":operations,"turn":turn,"snapshot":filtered,"reachable":read_error.is_none() && snapshot["connection"]["state"]=="connected","read_error":read_error,"checked_at_ms":now_ms()}),
+            json!({"session":session,"operation":operation,"operations":operations,"turn":turn,"snapshot":filtered,"reachable":session.is_some() && read_error.is_none() && snapshot["connection"]["state"]=="connected","read_error":read_error,"checked_at_ms":now_ms()}),
         )
+    }
+
+    pub(super) async fn execution_status(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "execution status requires the user");
+        let scope = field(input, "conversation_id")?;
+        let expected = field(input, "expected_operation_id")?;
+        self.require_scope(access, scope).await?;
+        let original = {
+            let store = self.store.lock().await;
+            let context = store.context(&access.network_id, scope, &[])?;
+            ensure!(
+                context.missing.is_complete(),
+                "execution history is incomplete or conflicting"
+            );
+            conversation_dispatches(&context)?
+                .into_iter()
+                .find(|request| request.operation_id == expected)
+                .context("operation was not dispatched by this conversation")?
+        };
+        self.read_execution_status(&access.network_id, scope, &original)
+            .await
+    }
+
+    async fn read_execution_status(
+        &self,
+        network: &str,
+        scope: &str,
+        original: &OperationRequest,
+    ) -> Result<Value> {
+        self.store.lock().await.authorize_node(
+            network,
+            &original.target_node,
+            Some(NodeRole::Executor),
+        )?;
+        let status = if original.target_node == self.identity.node_id()? {
+            self.chat_execution_status(network, scope, &original.operation_id)
+                .await?
+        } else {
+            self.read_peer(network,&original.target_node,json!({"type":"chat_execution_status","conversation_id":scope,"operation_id":original.operation_id})).await?
+        };
+        let mut store = self.store.lock().await;
+        let context = store.context(network, scope, &[])?;
+        let requests = conversation_dispatches(&context)?;
+        let (session, _, _) = validate_execution_status(&requests, original, &status)?;
+        store.local_set(
+            network,
+            &execution_cache_key(&original.target_node, &original.operation_id),
+            &status,
+        )?;
+        if let Some(session) = session {
+            store.local_set(
+                network,
+                &session_cache_key(&session.target_node, &session.session_id),
+                &status,
+            )?;
+        }
+        Ok(status)
+    }
+
+    pub(super) async fn execution_control(
+        self: &Arc<Self>,
+        access: &Access,
+        input: &Value,
+    ) -> Result<Value> {
+        ensure!(access.human, "execution controls require the user");
+        let scope = field(input, "conversation_id")?;
+        self.require_scope(access, scope).await?;
+        let operation_id = id(input, "operation_id")?;
+        let expected = field(input, "expected_operation_id")?;
+        let revision = input["expected_revision"]
+            .as_u64()
+            .context("expected_revision is required")?;
+        let action: ExecutionControlAction = serde_json::from_value(input["action"].clone())?;
+        let intent = json!({"conversation_id":scope,"expected_operation_id":expected,"expected_revision":revision,"action":action});
+        let original = {
+            let store = self.store.lock().await;
+            let context = store.context(&access.network_id, scope, &[])?;
+            ensure!(
+                context.missing.is_complete(),
+                "execution history is incomplete or conflicting"
+            );
+            conversation_dispatches(&context)?
+                .into_iter()
+                .find(|request| request.operation_id == expected)
+                .context("operation was not dispatched by this conversation")?
+        };
+        for (key, expected) in [
+            ("network_id", Some(access.network_id.as_str())),
+            ("target_node", Some(original.target_node.as_str())),
+            ("session_id", original.session_id.as_deref()),
+        ] {
+            if let Some(value) = input.get(key) {
+                ensure!(
+                    value.as_str() == expected,
+                    "execution control {key} does not match its original dispatch"
+                );
+            }
+        }
+        self.cache_context_bindings(&access.network_id, scope)
+            .await?;
+        {
+            let store = self.store.lock().await;
+            store.validate_operation_binding(&original)?;
+            store.authorize_node(
+                &access.network_id,
+                &original.target_node,
+                Some(NodeRole::Executor),
+            )?;
+        }
+        let prepared = prepared_request(
+            &*self.store.lock().await,
+            &access.network_id,
+            Some(&operation_id),
+            &intent,
+        )?;
+        if let Some(request) = prepared {
+            return self.dispatch(access.clone(), request).await;
+        }
+        ensure!(
+            original.session_id.is_some(),
+            "this command has no SDK session controls"
+        );
+        ensure!(
+            matches!(original.action["type"].as_str(), Some("open" | "send")),
+            "controls require an original execution operation"
+        );
+        let status = self
+            .read_execution_status(&access.network_id, scope, &original)
+            .await?;
+        let mut request = {
+            let store = self.store.lock().await;
+            if let Some(request) =
+                prepared_request(&store, &access.network_id, Some(&operation_id), &intent)?
+            {
+                drop(store);
+                return self.dispatch(access.clone(), request).await;
+            }
+            let context = store.context(&access.network_id, scope, &[])?;
+            let requests = conversation_dispatches(&context)?;
+            let (session, operation, records) =
+                validate_execution_status(&requests, &original, &status)?;
+            let session = session.context("execution has no SDK session")?;
+            ensure!(
+                operation.state != OperationState::Rejected,
+                "original operation was rejected"
+            );
+            ensure!(
+                !records
+                    .iter()
+                    .any(|record| record.state == OperationState::Unknown),
+                "execution has an unknown operation; reconcile it before controlling"
+            );
+            let primary_revision = records
+                .iter()
+                .filter(|record| {
+                    record.state != OperationState::Rejected
+                        && matches!(
+                            record.request.action["type"].as_str(),
+                            Some("open" | "send")
+                        )
+                })
+                .map(|record| record.request.expected_revision)
+                .max()
+                .context("execution has no admitted primary operation")?;
+            let current = records
+                .iter()
+                .filter(|record| {
+                    record.state != OperationState::Rejected
+                        && matches!(
+                            record.request.action["type"].as_str(),
+                            Some("open" | "send")
+                        )
+                        && record.request.expected_revision == primary_revision
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                current.len() == 1 && current[0].request.operation_id == original.operation_id,
+                "execution operation changed; refresh its status"
+            );
+            ensure!(
+                revision == session.revision,
+                "execution revision changed; refresh its status"
+            );
+            ensure!(
+                executor_capabilities(&session.executor, status["reachable"] == true)
+                    .contains(&action.name()),
+                "this executor does not provide the requested live control"
+            );
+            let native_action = resolve_control(
+                action.name(),
+                &serde_json::to_value(&action)?,
+                &status,
+                &session,
+            )?;
+            self.engine_action(&native_action)?.validate()?;
+            OperationRequest {
+                operation_id: operation_id.clone(),
+                network_id: access.network_id.clone(),
+                conversation_id: scope.into(),
+                task_id: original.task_id.clone(),
+                target_node: original.target_node.clone(),
+                session_id: original.session_id.clone(),
+                expected_revision: revision,
+                basis_heads: store.heads(&access.network_id, scope)?,
+                action: native_action,
+                resources: vec![],
+                binding: original.binding.clone(),
+                manager_authority: None,
+            }
+        };
+        {
+            let mut store = self.store.lock().await;
+            if let Some(old) =
+                prepared_request(&store, &access.network_id, Some(&operation_id), &intent)?
+            {
+                request = old;
+            } else {
+                store.local_set(
+                    &access.network_id,
+                    &control_key(&operation_id),
+                    &json!({"intent":intent,"request":request}),
+                )?;
+            }
+        }
+        self.dispatch(access.clone(), request).await
     }
 
     pub(super) async fn task_control(
@@ -638,10 +1357,6 @@ impl Runtime {
         self.require_scope(access, scope).await?;
         let task = field(input, "task_id")?;
         let action = field(input, "action")?;
-        ensure!(
-            matches!(action, "status" | "steer" | "interrupt" | "respond_request"),
-            "unknown task control"
-        );
         let (proof, context) = self.chat_binding(&access.network_id, scope, task).await?;
         for (key, expected) in [
             ("network_id", access.network_id.as_str()),
@@ -655,121 +1370,30 @@ impl Runtime {
                 );
             }
         }
-        let intent = json!({"conversation_id":scope,"task_id":task,"action":action,"expected_operation_id":input["expected_operation_id"],"expected_revision":input["expected_revision"],"text":input["text"],"request_id":input["request_id"],"response":input["response"]});
-        let operation_id = if action == "status" {
-            None
-        } else {
-            Some(id(input, "operation_id")?)
-        };
-        let prepared = prepared_request(
-            &*self.store.lock().await,
-            &access.network_id,
-            operation_id.as_deref(),
-            &intent,
-        )?;
-        if let Some(request) = prepared {
-            return self.dispatch(access.clone(), request).await;
-        }
-        let status = if proof.binding.target_node == self.identity.node_id()? {
-            self.chat_task_status(&access.network_id, scope, task)
-                .await?
-        } else {
-            self.read_peer(
-                &access.network_id,
-                &proof.binding.target_node,
-                json!({"type":"chat_task_status","conversation_id":scope,"task_id":task}),
-            )
-            .await?
-        };
-        let prepared = prepared_request(
-            &*self.store.lock().await,
-            &access.network_id,
-            operation_id.as_deref(),
-            &intent,
-        )?;
-        if let Some(request) = prepared {
-            return self.dispatch(access.clone(), request).await;
-        }
-        let session: ExecutionSession = serde_json::from_value(status["session"].clone())?;
-        let operation: OperationRecord = serde_json::from_value(status["operation"].clone())?;
-        let requests = bound_dispatches(&context, &proof)?;
-        let original = requests
-            .iter()
-            .find(|request| request.operation_id == operation.request.operation_id)
-            .context("executor status has no dispatched task operation")?;
-        ensure!(
-            session.network_id == access.network_id
-                && session.target_node == proof.binding.target_node
-                && session.session_id == proof.binding.session_id
-                && operation.state != OperationState::Rejected
-                && matches!(original.action["type"].as_str(), Some("open" | "send"))
-                && same_business_request(&operation.request, original),
-            "executor status does not match the original task binding"
-        );
-        for record in status_records(&status)? {
-            ensure!(
-                matches_dispatch(&requests, &record)?,
-                "executor status contains an operation outside this task binding"
-            );
-        }
-        self.store.lock().await.local_set(
-            &access.network_id,
-            &session_cache_key(&session.target_node, &session.session_id),
-            &status,
-        )?;
         if action == "status" {
-            return Ok(status);
+            let original = bound_request(&*self.store.lock().await, &context, &proof)?
+                .context("task has no admitted execution")?;
+            return self
+                .read_execution_status(&access.network_id, scope, &original)
+                .await;
         }
+        let expected = field(input, "expected_operation_id")?;
         ensure!(
-            field(input, "expected_operation_id")? == original.operation_id,
-            "task operation changed; refresh its status"
+            bound_dispatches(&context, &proof)?
+                .iter()
+                .any(|request| request.operation_id == expected),
+            "operation does not belong to this task binding"
         );
-        let revision = input["expected_revision"]
-            .as_u64()
-            .context("expected_revision is required")?;
-        ensure!(
-            revision == session.revision,
-            "execution revision changed; refresh its status"
-        );
-        ensure!(
-            session.executor == "codex" && status["reachable"] == true,
-            "this executor does not provide live task controls"
-        );
-        let native_action = resolve_control(action, input, &status, &session)?;
-        self.engine_action(&native_action)?.validate()?;
-        let mut request = OperationRequest {
-            operation_id: operation_id.context("operation_id required")?,
-            network_id: access.network_id.clone(),
-            conversation_id: scope.into(),
-            task_id: Some(task.into()),
-            target_node: session.target_node.clone(),
-            session_id: session.session_id.clone(),
-            expected_revision: revision,
-            basis_heads: self.store.lock().await.heads(&access.network_id, scope)?,
-            action: native_action,
-            resources: vec![],
-            binding: Some(proof),
-            manager_authority: None,
-        };
-        {
-            let mut store = self.store.lock().await;
-            if let Some(old) =
-                store.local_value(&access.network_id, &control_key(&request.operation_id))?
-            {
-                ensure!(
-                    old["intent"] == intent,
-                    "operation ID already prepared with different control data"
-                );
-                request = serde_json::from_value(old["request"].clone())?;
-            } else {
-                store.local_set(
-                    &access.network_id,
-                    &control_key(&request.operation_id),
-                    &json!({"intent":intent,"request":request}),
-                )?;
+        let operation_id = id(input, "operation_id")?;
+        let action = match action {
+            "interrupt" => json!({"type":"interrupt"}),
+            "steer" => json!({"type":"steer","text":field(input,"text")?}),
+            "respond_request" => {
+                json!({"type":"respond_request","request_id":input["request_id"],"response":input["response"]})
             }
-        }
-        self.dispatch(access.clone(), request).await
+            _ => bail!("unknown task control"),
+        };
+        self.execution_control(access,&json!({"conversation_id":scope,"operation_id":operation_id,"expected_operation_id":expected,"expected_revision":input["expected_revision"],"action":action})).await
     }
 }
 
@@ -829,6 +1453,143 @@ fn resolve_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn command_result_is_projected_without_a_task_or_native_session() -> Result<()> {
+        let dir = super::super::tests::fixture()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let network = super::super::tests::conversation(&node).await?;
+        let target = node.identity.node_id()?;
+        let trigger = node
+            .append(
+                &network,
+                "chat",
+                EventBody::MessagePosted {
+                    message_id: "message".into(),
+                    role: "user".into(),
+                    text: "查询状态".into(),
+                    scheduler_node: Some(target.clone()),
+                },
+            )
+            .await?
+            .hash;
+        let request: OperationRequest = serde_json::from_value(json!({
+            "operation_id":"command","network_id":network,"conversation_id":"chat","task_id":null,
+            "target_node":target,"session_id":null,"expected_revision":0,"basis_heads":[],
+            "action":{"type":"command","command":"printf hello"},"resources":[],
+            "manager_authority":{"scheduler_node":target,"trigger":trigger,"followup_version":0}
+        }))?;
+        node.append(
+            &network,
+            "chat",
+            EventBody::DispatchRecorded {
+                operation_id: request.operation_id.clone(),
+                task_id: None,
+                target_node: target.clone(),
+                session_id: None,
+                action: json!(request),
+            },
+        )
+        .await?;
+        for status in ["progress", "needs_input"] {
+            node.append(&network,"chat",EventBody::ExecutionObserved {
+                operation_id:request.operation_id.clone(),task_id:None,target_node:target.clone(),session_id:None,status:status.into(),
+                detail:json!({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"正在查询"}}}),
+            }).await?;
+        }
+        node.append(
+            &network,
+            "chat",
+            EventBody::ExecutionObserved {
+                operation_id: request.operation_id.clone(),
+                task_id: None,
+                target_node: target,
+                session_id: None,
+                status: "succeeded".into(),
+                detail: json!({"exit_code":0,"stdout":"hello\n","stderr":"","truncated":false}),
+            },
+        )
+        .await?;
+        node.append(
+            &network,
+            "chat",
+            EventBody::ExecutionObserved {
+                operation_id: request.operation_id.clone(),
+                task_id: None,
+                target_node: request.target_node.clone(),
+                session_id: None,
+                status: "running".into(),
+                detail: json!({}),
+            },
+        )
+        .await?;
+        let snapshot = node
+            .conversation_snapshot(
+                &Access {
+                    network_id: network,
+                    human: true,
+                    conversation_id: None,
+                    manager: None,
+                },
+                &json!({"conversation_id":"chat"}),
+            )
+            .await?;
+        assert_eq!(snapshot["tasks"], json!([]));
+        assert_eq!(snapshot["sessions"], json!([]));
+        let executions = snapshot["executions"]
+            .as_array()
+            .context("executions missing")?;
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0]["session_id"], Value::Null);
+        assert_eq!(executions[0]["state"], "succeeded");
+        assert_eq!(executions[0]["detail"], "退出码 0\nhello\n");
+        assert_eq!(executions[0]["latest_progress"], "正在查询");
+        assert_eq!(executions[0]["source_message_id"], "message");
+        assert_eq!(executions[0]["capabilities"], json!([]));
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn command_status_rejects_an_invented_session_or_foreign_receipt() -> Result<()> {
+        let request: OperationRequest = serde_json::from_value(json!({
+            "operation_id":"command","network_id":"network","conversation_id":"chat","task_id":null,
+            "target_node":"executor","session_id":null,"expected_revision":0,"basis_heads":[],
+            "action":{"type":"command","command":"printf hello"},"resources":[]
+        }))?;
+        let record = OperationRecord {
+            request: request.clone(),
+            state: OperationState::Succeeded,
+            result: json!({"exit_code":0,"stdout":"hello"}),
+        };
+        let status = json!({"session":null,"operation":record,"operations":[record]});
+        let (session, observed, _) =
+            validate_execution_status(std::slice::from_ref(&request), &request, &status)?;
+        assert!(session.is_none());
+        assert_eq!(observed.result, json!({"exit_code":0,"stdout":"hello"}));
+        let mut wrong_session = status.clone();
+        wrong_session["session"] = json!({"session_id":"invented"});
+        assert!(
+            validate_execution_status(std::slice::from_ref(&request), &request, &wrong_session)
+                .is_err()
+        );
+        let mut foreign = status.clone();
+        foreign["operation"]["request"]["conversation_id"] = json!("other-chat");
+        assert!(
+            validate_execution_status(std::slice::from_ref(&request), &request, &foreign).is_err()
+        );
+        let mut conflicting = record.clone();
+        conflicting.result = json!({"exit_code":1});
+        assert!(status_records(&json!({"operations":[record,conflicting]})).is_err());
+        assert!(
+            serde_json::from_value::<ExecutionControlAction>(
+                json!({"type":"interrupt","text":"also steer"})
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn prepared_control_reuses_frozen_body_and_is_network_scoped() -> Result<()> {
@@ -900,7 +1661,7 @@ mod tests {
                     operation_id: operation.into(),
                     task_id: Some("task".into()),
                     target_node: "executor".into(),
-                    session_id: "session".into(),
+                    session_id: Some("session".into()),
                     action: json!(request),
                 },
             ));
@@ -910,7 +1671,7 @@ mod tests {
             operation_id: "winner".into(),
             task_id: Some("task".into()),
             target_node: "executor".into(),
-            session_id: "session".into(),
+            session_id: Some("session".into()),
             status: "running".into(),
             detail: json!({}),
         };
@@ -948,7 +1709,7 @@ mod tests {
                 operation_id: "rejected".into(),
                 task_id: Some("task".into()),
                 target_node: "executor".into(),
-                session_id: "session".into(),
+                session_id: Some("session".into()),
                 status: "running".into(),
                 detail: json!({}),
             },

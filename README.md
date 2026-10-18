@@ -1,6 +1,6 @@
 # Vibeface
 
-在自己的 Mac 或 Linux 设备上运行 `vibeface`，通过网页与管理 Agent 聊天，让它把任务交给指定设备上的编码 Agent。会话、工单和执行记录在本人授权的节点间同步，换一个入口也能查询原来的工作。
+在自己的 Mac 或 Linux 设备上运行 `vibeface`，创建有名称、职责和项目配置的机器人，直接在它的聊天中提出要求。机器人可以回答问题、运行受管命令，或按需委派编码 Agent。机器人定义、聊天历史和执行结果在本人授权的节点间同步，换一个入口也能查询原来的工作。
 
 ```mermaid
 flowchart LR
@@ -17,11 +17,13 @@ flowchart LR
     C <-->|出站 WebSocket| G
 ```
 
-所有设备运行同一种 Node。公网 Server 是 Node 的一种部署方式，可以同时调度和执行。每个人拥有独立的设备网络，不做团队共享设备池，也没有固定的工单调度负责人。
+所有设备运行同一种 Node。公网 Server 是 Node 的一种部署方式，可以同时调度和执行。每个人拥有独立的设备网络，程序为每次请求选择已授权的可用节点，并固定已派发操作的目标。
 
 网页使用 React 和 TanStack Start 构建静态 SPA，随 Rust 程序内嵌分发，生产运行不需要 Node.js Web 服务。可信网页通过设备密钥和 Noise 通道连接指定 Node。
 
-Rust 核心负责认证、路由、DAG 同步、SQLite 存储、执行去重和通知。Cursor SDK 管理 Agent 通过原生自定义工具回调操作 Node，不需要 MCP。Codex 执行器通过 App Server 协议接收指令并上报事件。
+Rust 核心负责认证、路由、DAG 同步、SQLite 存储、执行去重和通知。Cursor SDK 聊天 Agent 通过原生自定义工具回调操作 Node，不需要 MCP。Codex 执行器通过 App Server 协议接收指令并上报事件。机器人定义和共享聊天历史独立于本机 SDK 缓存，创建机器人不会启动模型。
+
+本版本使用新的机器人和数据库结构，部署时使用全新的数据目录重新初始化。旧数据库不自动升级，个人网络中的节点使用同一新版本。
 
 ## 安装与开始
 
@@ -43,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh 
 vibeface
 ```
 
-首次运行仅在不存在或为空的数据目录中初始化，默认使用 `~/.vibeface` 并监听 `127.0.0.1:4790`，不授予执行目录或启用管理 Agent。已有节点使用原身份和配置启动。安装和 CLI 管理见 [安装说明](docs/install.md)。受管安装使用 `vibeface update apply`；包协议 1 的旧预览版需按 [手动更换程序](docs/releasing.md#手动建立受管安装或更换程序) 一次性切换，不重新初始化身份。
+首次运行仅在不存在或为空的数据目录中初始化，默认使用 `~/.vibeface` 并监听 `127.0.0.1:4790`，不授予执行目录或启用管理 Agent。同一数据格式的节点重启保留原身份和配置。安装和 CLI 管理见 [安装说明](docs/install.md)。本数据格式内的受管更新使用 `vibeface update apply`；从旧版本部署此版本时，使用新的数据目录重新初始化。
 
 ## 从源码开始
 
@@ -60,13 +62,13 @@ cargo build --release -p vibeface --locked
 ./target/release/vibeface serve --data-dir "$HOME/.vibeface"
 ```
 
-`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、`identity.sqlite3`、一次性 `bootstrap.json` 和 `data-epoch.json`（当前数据格式 epoch 为 2），不注册网站账号，也不保存个人根私钥。业务历史在进程打开后写入同目录的 `node.sqlite3`。`serve` 和 `pair` 用目录锁独占该目录。
+`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、`identity.sqlite3`、一次性 `bootstrap.json` 和 `data-epoch.json`（当前数据格式 epoch 为 3），不注册网站账号，也不保存个人根私钥。业务历史在进程打开后写入同目录的 `node.sqlite3`。`serve` 和 `pair` 用目录锁独占该目录。
 
 ```sh
 ./target/release/vibeface access --data-dir "$HOME/.vibeface"
 ```
 
-在自己信任的浏览器打开 `access` 打印的链接，填写此浏览器的设备名称，核对个人网络指纹，并保存加密恢复包。保存密钥的页面需要安全上下文，推荐 `http://localhost:4790`。之后自动核验设备指纹和成员授权，不使用账号密码。可以创建会话、工单，查看设备和执行记录。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。Node 默认尝试启动私有 Codex App Server；未安装 Codex 时，网页可用不代表执行器可用。
+在自己信任的浏览器打开 `access` 打印的链接，填写此浏览器的设备名称，核对个人网络指纹，并保存加密恢复包。保存密钥的页面需要安全上下文，推荐 `http://localhost:4790`。之后自动核验设备指纹和成员授权，不使用账号密码。创建机器人后进入它的长期聊天，设备、连接和恢复放在设置中。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。Node 默认尝试启动私有 Codex App Server；未安装 Codex 时，网页可用不代表执行器可用。
 
 另一台 Node 使用独立的空数据目录先 `init`。管理客户端复制的 base64url 配对信息传给 `pair --invite`。`pair --invite-file` 读取解码后的 JSON 邀请，不是这段原文。不要用新建个人网络代替配对。操作步骤见 [添加自己的设备](docs/node.md#添加自己的设备)。
 
@@ -76,7 +78,7 @@ A 把任务派发到 B 后，B 在接单前取得所需上下文。A 离线时�
 
 普通进度和通知不调用管理模型。B 完成后保存结果和通知，通过可达节点同步到当前入口；客户端离线时保留未读通知，重连后补发。浏览器关闭后的系统推送不在当前范围内。
 
-一次 Codex turn 结束不等于工单通过验收。审批和工单验收仍由本人决定。写操作结果未知时，先核对原操作和执行会话，不换一个 ID 重新派发。
+一次 Codex turn 结束不等于用户目标已经达成。审批仍由本人决定。写操作结果未知时，在原聊天中核查实际结果，不换一个 ID 或设备重新派发。
 
 ## 安装、协议与验证
 

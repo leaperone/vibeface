@@ -22,6 +22,14 @@ pub enum EventBody {
     ConversationCreated {
         title: String,
     },
+    BotCreated {
+        bot_id: String,
+        name: String,
+        instructions: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<BotProject>,
+        membership_role_proof: Box<crate::identity::NetworkState>,
+    },
     MessagePosted {
         message_id: String,
         role: String,
@@ -44,14 +52,14 @@ pub enum EventBody {
         operation_id: String,
         task_id: Option<String>,
         target_node: NodeId,
-        session_id: String,
+        session_id: Option<String>,
         action: Value,
     },
     ExecutionObserved {
         operation_id: String,
         task_id: Option<String>,
         target_node: NodeId,
-        session_id: String,
+        session_id: Option<String>,
         status: String,
         detail: Value,
     },
@@ -131,6 +139,34 @@ pub struct Context {
     pub missing: MissingDependencies,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BotProject {
+    pub target_node: NodeId,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BotCreateSpec {
+    pub bot_id: String,
+    pub conversation_id: ScopeId,
+    pub name: String,
+    pub instructions: String,
+    pub project: Option<BotProject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Bot {
+    pub bot_id: String,
+    pub conversation_id: ScopeId,
+    pub name: String,
+    pub instructions: String,
+    pub project: Option<BotProject>,
+    pub event_hash: EventHash,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Conversation {
     pub conversation_id: ScopeId,
@@ -173,7 +209,7 @@ pub struct OperationRequest {
     pub conversation_id: ScopeId,
     pub task_id: Option<String>,
     pub target_node: NodeId,
-    pub session_id: String,
+    pub session_id: Option<String>,
     pub expected_revision: u64,
     pub basis_heads: Vec<EventHash>,
     pub action: Value,

@@ -155,6 +155,13 @@ impl Engine {
         }
     }
 
+    pub(crate) fn set_observed_threads(&self, ids: Vec<String>) -> Result<()> {
+        if let Some(codex) = &self.codex {
+            codex.set_observed_threads(ids)?;
+        }
+        Ok(())
+    }
+
     pub async fn snapshot(&self) -> Value {
         match &self.codex {
             Some(codex) => codex.snapshot().await,
