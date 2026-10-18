@@ -2410,6 +2410,15 @@ impl ExecutionProofUsage {
         self.record_admission_kind(admission, true)?;
         self.record_event_signature(envelope, &event, admission)
     }
+    pub fn record_retained_event(&mut self, envelope: &SignedEvent) -> Result<()> {
+        let event: Event = serde_json::from_str(&envelope.canonical_body).map_err(invalid_shape)?;
+        let EventCause::Invocation { admission } = &event.cause else {
+            return Err(AuthorizationError::InvalidProof(
+                "retained event has no original admission",
+            ));
+        };
+        self.record_event_signature(envelope, &event, admission)
+    }
     fn record_event_signature(
         &mut self,
         envelope: &SignedEvent,
