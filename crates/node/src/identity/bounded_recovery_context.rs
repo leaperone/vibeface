@@ -51,10 +51,36 @@ pub(crate) struct CompletedRecoveryRead {
     pub(crate) request: RecoveryReadRequest,
     pub(crate) snapshot: Signed<RecoveryContextSnapshot>,
     pub(crate) witness: Signed<RecoveryContextWitness>,
+    journal_snapshot: AcceptedJournalSnapshot,
     last_page: Option<Signed<RecoveryContextPage>>,
 }
 
 impl CompletedRecoveryRead {
+    pub(crate) fn source_proof_in(
+        &self,
+        connection: &Connection,
+        policy: &PolicyState,
+        local: &PublicKey,
+        now: u64,
+    ) -> Result<VerifiedRecoverySourceProof> {
+        policy.accepted_journal_page(
+            connection,
+            &self.journal_snapshot,
+            None,
+            &Default::default(),
+        )?;
+        let prefix = policy.accepted_journal_prefix(&self.journal_snapshot)?;
+        Ok(verify_recovery_source_proof_prefix(
+            &self.request,
+            &self.snapshot,
+            &self.witness,
+            policy.verified(),
+            &prefix,
+            local,
+            now,
+        )?)
+    }
+
     pub(crate) fn record_current_usage(
         &self,
         state: &VerifiedPolicySet,
@@ -134,6 +160,7 @@ pub(crate) fn recovery_read_reference_in(
         request: record.request,
         snapshot: record.snapshot,
         witness: record.witness.context("recovery import is not complete")?,
+        journal_snapshot: record.journal_snapshot,
         last_page: None,
     })
 }
@@ -159,6 +186,7 @@ pub(crate) fn completed_recovery_read_in(
         request: record.request,
         snapshot: record.snapshot,
         witness: record.witness.context("recovery import is not complete")?,
+        journal_snapshot: record.journal_snapshot,
         last_page: cached.map(|cached| cached.page),
     })
 }

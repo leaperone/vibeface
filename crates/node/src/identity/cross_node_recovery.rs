@@ -1,4 +1,12 @@
-use super::{journal, policy::project_policy_in};
+mod target_import;
+
+pub(crate) use target_import::TargetRecoveryImport;
+
+use super::{
+    bounded_recovery_context::{completed_recovery_read_in, recovery_read_reference_in},
+    journal,
+    policy::project_policy_in,
+};
 use crate::{crypto::LocalIdentity, store::Store};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -7,57 +15,88 @@ use serde_json::{Value, json};
 use vibeface_secure::{
     Identity,
     authorization::{
-        DeviceId, JournalEntry, ObjectHash, PolicyDomain, PublicKey, Signature, Signed,
+        AUTH_VERSION, DeviceId, JournalEntry, Nonce, ObjectHash, PolicyDomain, PublicKey,
+        Signature, Signed,
         bootstrap::{
             NodeClaim,
-            recovery::cross_node::{
-                self, CrossNodeRecoveryCommitRequest, CrossNodeRecoveryCommitted,
-                CrossNodeRecoveryContext, CrossNodeRecoveryPossessionRequest,
-                CrossNodeRecoveryRequest,
-            },
+            recovery::cross_node::{self, CrossNodeRecoveryRequest},
+            recovery::stream::{self, *},
         },
     },
+    signature_verification::ScopedSignatureVerification,
 };
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SourceContext {
-    context: CrossNodeRecoveryContext,
-    source_possession: Option<SourcePossession>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SourcePossession {
-    possession_hash: ObjectHash,
-    proof: Signature,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TargetPossession {
-    request_hash: ObjectHash,
-    possession_hash: ObjectHash,
-    principal: String,
-    request: CrossNodeRecoveryPossessionRequest,
+    request: StreamedCrossNodeRecoveryPossessionRequest,
     proof: Signature,
 }
 
 fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
-    Ok(connection
+    let row: Option<(usize, Option<String>)> = connection
         .query_row(
-            "SELECT value FROM identity_meta WHERE key=?",
+            "SELECT length(CAST(value AS BLOB)),CASE WHEN length(CAST(value AS BLOB))<=65536 THEN value END FROM identity_meta WHERE key=?",
             [key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()?)
+        .optional()?;
+    let Some((length, value)) = row else {
+        return Ok(None);
+    };
+    ensure!(length <= 65_536, "stored recovery record is too large");
+    Ok(Some(value.context("stored recovery record is missing")?))
 }
 
-fn context_key(request: &Signed<CrossNodeRecoveryRequest>) -> String {
-    format!(
-        "cross-node-recovery-context:{}:{}",
-        request.payload.account, request.payload.nonce
-    )
+fn possession_key(snapshot: &Nonce) -> String {
+    format!("cross-node-recovery-possession:{snapshot}")
+}
+
+fn completion_key(snapshot: &Nonce) -> String {
+    format!("cross-node-recovery-completed:{snapshot}")
+}
+
+fn bounded(value: Value) -> Result<Value> {
+    ensure!(
+        serde_json::to_vec(&value)?.len() <= 65_536,
+        "recovery carrier exceeds 64 KiB"
+    );
+    Ok(value)
+}
+
+fn carrier_bytes(input: &Value, output: &Value) -> Result<usize> {
+    Ok(serde_json::to_vec(input)?
+        .len()
+        .max(serde_json::to_vec(output)?.len()))
+}
+
+fn completed_in(
+    connection: &Connection,
+    local: &PublicKey,
+    principal: &str,
+    request: &RecoveryCompletionStatusRequest,
+) -> Result<Option<StreamedCrossNodeRecoveryCommitted>> {
+    let Some(encoded) = metadata(connection, &completion_key(&request.context.snapshot_id))? else {
+        return Ok(None);
+    };
+    let committed: StreamedCrossNodeRecoveryCommitted = serde_json::from_str(&encoded)?;
+    let receipt = &committed.receipt;
+    let original = &committed.request.possession.request;
+    ensure!(
+        receipt.issuer == *local
+            && receipt.payload.version == AUTH_VERSION
+            && receipt.payload.context == request.context
+            && receipt.payload.input_hash == request.input_hash
+            && receipt.payload.input_hash == ObjectHash::body(&committed.request)?
+            && receipt.payload.request_hash == original.hash()?
+            && receipt.payload.request_hash == request.context.request_hash
+            && receipt.payload.new_device_public_key.as_str() == principal
+            && original.payload.new_device_public_key.as_str() == principal
+            && original.payload.source_node_public_key == *local,
+        "cross-node completion changed its original input or Noise device"
+    );
+    receipt.verify_signature()?;
+    Ok(Some(committed))
 }
 
 fn require_principal(request: &Signed<CrossNodeRecoveryRequest>, principal: &str) -> Result<()> {
@@ -105,10 +144,8 @@ impl Store {
         params: &Value,
         now: u64,
     ) -> Result<Value> {
-        ensure!(
-            serde_json::to_vec(params)?.len() <= 64 * 1024,
-            "recovery input is too large"
-        );
+        let _verification = ScopedSignatureVerification::new();
+        bounded(params.clone())?;
         PublicKey::parse(principal)?;
         match method {
             "cross_node_recovery_context" => {
@@ -119,6 +156,24 @@ impl Store {
             }
             "cross_node_recovery_context_witness" => {
                 self.recovery_context_witness(identity, principal, params, now)
+            }
+            "cross_node_recovery_status" => {
+                self.cross_node_recovery_status(identity, principal, params)
+            }
+            "cross_node_recovery_import_begin" => {
+                self.cross_node_recovery_import_begin(identity, principal, params, now)
+            }
+            "cross_node_recovery_import_page" => {
+                self.cross_node_recovery_import_page(identity, principal, params, now, false)
+            }
+            "cross_node_recovery_import_cached_page" => {
+                self.cross_node_recovery_import_page(identity, principal, params, now, true)
+            }
+            "cross_node_recovery_import_finish" => {
+                self.cross_node_recovery_import_finish(identity, principal, params, now)
+            }
+            "cross_node_recovery_import_resume" => {
+                self.cross_node_recovery_import_resume(identity, principal, params, now)
             }
             "cross_node_recovery_source_possession" => {
                 self.cross_node_recovery_source_possession(identity, principal, params, now)
@@ -164,97 +219,96 @@ impl Store {
         params: &Value,
         now: u64,
     ) -> Result<Value> {
-        let request: CrossNodeRecoveryPossessionRequest = serde_json::from_value(params.clone())?;
-        require_principal(&request.context.request, principal)?;
+        let request: StreamedCrossNodeRecoveryPossessionRequest =
+            serde_json::from_value(params.clone())?;
+        require_principal(&request.request, principal)?;
         let signer =
             Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = journal::PolicyState::load(&tx)?;
-        let key = context_key(&request.context.request);
-        let encoded = metadata(&tx, &key)?.context("source recovery witness is missing")?;
-        let mut record: SourceContext = serde_json::from_str(&encoded)?;
+        let context = completed_recovery_read_in(
+            &tx,
+            &self.policy,
+            identity,
+            principal,
+            &request.context,
+            now,
+        )?;
         ensure!(
-            ObjectHash::body(&record.context)? == ObjectHash::body(&request.context)?,
-            "recovery witness differs from the source's approved context"
+            context.request == RecoveryReadRequest::CrossNode(request.request.clone()),
+            "cross-node possession changed its source request"
         );
-        let proof = cross_node::sign_cross_node_recovery_source_possession(
-            current.verified(),
+        let source_proof =
+            context.source_proof_in(&tx, &self.policy, &PublicKey::of(&signer), now)?;
+        let proof = stream::sign_cross_node_recovery_source_possession_with_source_proof(
             &request,
+            &context.request,
+            &context.snapshot,
+            &context.witness,
+            self.policy.verified(),
+            &source_proof,
             &signer,
             now,
         )?;
-        let possession_hash = ObjectHash::body(&request)?;
-        if let Some(previous) = &record.source_possession {
+        let key = possession_key(&request.context.snapshot_id);
+        if let Some(previous) = metadata(&tx, &key)? {
+            let previous: SourcePossession = serde_json::from_str(&previous)?;
             ensure!(
-                previous.possession_hash == possession_hash && previous.proof == proof,
-                "source recovery witness was already bound to another proposal"
+                previous.request == request && previous.proof == proof,
+                "source recovery was already bound to another proposal"
             );
         } else {
-            record.source_possession = Some(SourcePossession {
-                possession_hash,
+            let encoded = serde_json::to_string(&SourcePossession {
+                request: request.clone(),
                 proof: proof.clone(),
-            });
+            })?;
+            ensure!(encoded.len() <= 65_536, "source possession is too large");
             tx.execute(
-                "UPDATE identity_meta SET value=? WHERE key=?",
-                params![serde_json::to_string(&record)?, key],
+                "INSERT INTO identity_meta(key,value) VALUES(?,?)",
+                params![key, encoded],
             )?;
         }
+        let response = bounded(json!({"proof":proof}))?;
+        let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+        context.record_current_usage(self.policy.verified(), &mut usage)?;
+        source_proof.record_proof_usage_into(&mut usage);
+        usage.record_cross_possession_with_source_proof(
+            &request,
+            self.policy.verified(),
+            &source_proof,
+        )?;
+        usage.finish()?;
         tx.commit()?;
-        self.policy = current;
-        Ok(json!({"proof":proof}))
+        Ok(response)
     }
 
-    fn cross_node_recovery_possession(
+    fn cross_node_recovery_status(
         &mut self,
         identity: &LocalIdentity,
         principal: &str,
         params: &Value,
-        now: u64,
     ) -> Result<Value> {
-        let request: CrossNodeRecoveryPossessionRequest = serde_json::from_value(params.clone())?;
-        let signed = &request.context.request;
-        require_principal(signed, principal)?;
+        let request: RecoveryCompletionStatusRequest = serde_json::from_value(params.clone())?;
         let local = PublicKey::parse(&identity.public_key_hex()?)?;
-        let request_hash = ObjectHash::body(signed)?;
-        let possession_hash = ObjectHash::body(&request)?;
-        let claim = &signed.payload.target_claim;
-        let signer =
-            Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_claim_in(&tx, claim, &local)?;
-        if let Some(previous) = metadata(&tx, "node_possession")? {
-            let previous: TargetPossession = serde_json::from_str(&previous)?;
-            ensure!(
-                previous.request_hash == request_hash
-                    && previous.possession_hash == possession_hash
-                    && previous.principal == principal,
-                "bootstrap capability was already bound to another recovery"
-            );
-            return Ok(json!({"proof":previous.proof}));
+        let tx = self.connection.transaction()?;
+        if let Some(committed) = completed_in(&tx, &local, principal, &request)? {
+            let response = bounded(json!({"state":"committed","committed":committed}))?;
+            let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+            usage.record_cross_committed_carrier(&committed)?;
+            usage.finish()?;
+            return Ok(response);
         }
-        let proof = cross_node::sign_cross_node_recovery_possession(
-            &request,
-            &signer,
-            &claim.payload.claim_nonce,
-            now,
-        )?;
-        let record = TargetPossession {
-            request_hash,
-            possession_hash,
-            principal: principal.to_owned(),
-            request,
-            proof: proof.clone(),
-        };
-        tx.execute(
-            "INSERT INTO identity_meta(key,value) VALUES('node_possession',?)",
-            [serde_json::to_string(&record)?],
-        )?;
-        tx.commit()?;
-        Ok(json!({"proof":proof}))
+        let context = recovery_read_reference_in(&tx, identity, principal, &request.context)?;
+        ensure!(
+            matches!(context.request, RecoveryReadRequest::CrossNode(_)),
+            "cross-node status belongs to another recovery purpose"
+        );
+        let response = json!({"state":"not_committed"});
+        let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+        context.record_reference_usage(&mut usage)?;
+        usage.finish()?;
+        Ok(response)
     }
 
     fn cross_node_recovery_commit(
@@ -264,141 +318,95 @@ impl Store {
         params: &Value,
         now: u64,
     ) -> Result<Value> {
-        let request: CrossNodeRecoveryCommitRequest = serde_json::from_value(params.clone())?;
-        let signed = &request.possession.context.request;
-        require_principal(signed, principal)?;
-        let local = PublicKey::parse(&identity.public_key_hex()?)?;
-        ensure!(
-            signed.payload.source_node_public_key == local,
-            "recovery commits at another source Node"
-        );
-        let request_hash = ObjectHash::body(signed)?;
-        let input_hash = ObjectHash::body(&request)?;
-        let receipt_key = format!("cross-node-recovery-completed:{request_hash}");
+        let input: StreamedCrossNodeRecoveryCommitRequest = serde_json::from_value(params.clone())?;
+        require_principal(&input.possession.request, principal)?;
         let signer =
             Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
+        let local = PublicKey::of(&signer);
+        let status = RecoveryCompletionStatusRequest {
+            context: input.possession.context.clone(),
+            input_hash: ObjectHash::body(&input)?,
+        };
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(previous) = metadata(&tx, &receipt_key)? {
-            let previous: Value = serde_json::from_str(&previous)?;
-            ensure!(
-                previous["input_hash"] == input_hash.as_str() && previous["principal"] == principal,
-                "recovery completion changed its original signed request"
-            );
-            return Ok(json!({"committed":previous["committed"]}));
+        if let Some(committed) = completed_in(&tx, &local, principal, &status)? {
+            let response = bounded(json!({"committed":committed}))?;
+            let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+            usage.record_cross_committed_carrier(&committed)?;
+            usage.finish()?;
+            return Ok(response);
         }
-        let current = journal::PolicyState::load(&tx)?;
-        let context: SourceContext = serde_json::from_str(
-            &metadata(&tx, &context_key(signed))?.context("source recovery witness is missing")?,
+        let context = completed_recovery_read_in(
+            &tx,
+            &self.policy,
+            identity,
+            principal,
+            &input.possession.context,
+            now,
         )?;
         ensure!(
-            ObjectHash::body(&context.context)? == ObjectHash::body(&request.possession.context)?,
-            "recovery changed its source witness"
+            context.request == RecoveryReadRequest::CrossNode(input.possession.request.clone()),
+            "cross-node commit changed its source request"
         );
-        let possession = context
-            .source_possession
-            .context("source Node possession is missing")?;
+        let approved: SourcePossession = serde_json::from_str(
+            &metadata(&tx, &possession_key(&input.possession.context.snapshot_id))?
+                .context("source Node possession is missing")?,
+        )?;
         ensure!(
-            possession.possession_hash == ObjectHash::body(&request.possession)?,
-            "recovery changed its approved source certificate"
+            approved.request == input.possession
+                && input.journal_delta.iter().any(|entry| matches!(
+                    entry,
+                    JournalEntry::Device(certificate)
+                        if certificate.payload.public_key == local
+                            && certificate.payload.possession.as_ref() == Some(&approved.proof)
+                )),
+            "cross-node commit changed its approved source possession"
         );
-        let verified = cross_node::verify_cross_node_recovery_commit(
-            current.verified(),
-            &request,
+        let source_proof = context.source_proof_in(&tx, &self.policy, &local, now)?;
+        let verified = stream::verify_cross_node_recovery_stream_commit_with_source_proof(
+            &input,
+            &context.request,
+            &context.snapshot,
+            &context.witness,
+            self.policy.verified(),
+            &source_proof,
             &local,
             now,
         )?;
-        let update = current.prepare_network_update(verified.journal_delta(), now)?;
-        let source = update
-            .verified_after()
-            .verify_transport_device(&DeviceId::from_key(&local), now)?;
         ensure!(
-            source.payload.possession.as_ref() == Some(&possession.proof),
-            "recovery changed source Node possession"
+            verified.input_hash() == &status.input_hash,
+            "cross-node commit changed its exact input hash"
         );
+        let update = self
+            .policy
+            .prepare_network_update(&input.journal_delta, now)?;
+        ensure!(
+            verified.committed_heads().len() == 2
+                && verified
+                    .committed_heads()
+                    .iter()
+                    .all(|head| { update.verified_after().head(&head.domain) == Some(head) }),
+            "cross-node update differs from the verified finite delta"
+        );
+        let committed = stream::accept_cross_node_recovery_stream_commit(&verified, &signer, now)?;
+        let response = bounded(json!({"committed":committed}))?;
+        let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
+        context.record_current_usage(self.policy.verified(), &mut usage)?;
+        verified.record_proof_usage_into(&mut usage);
+        usage.record_cross_completion(&committed.receipt)?;
+        usage.finish()?;
         let state = journal::commit_in(&tx, &update)?;
         project_policy_in(&tx, &state)?;
-        let committed = cross_node::accept_cross_node_recovery_commit(&verified, &signer, now)?;
-        tx.execute("INSERT INTO identity_meta(key,value) VALUES(?,?)",params![receipt_key,
-            serde_json::to_string(&json!({"request_hash":request_hash,"input_hash":input_hash,"principal":principal,"committed":committed}))?])?;
-        tx.commit()?;
-        self.policy = state;
-        Ok(json!({"committed":committed}))
-    }
-
-    fn cross_node_recovery_install(
-        &mut self,
-        identity: &LocalIdentity,
-        principal: &str,
-        params: &Value,
-        now: u64,
-    ) -> Result<Value> {
-        let committed: CrossNodeRecoveryCommitted = serde_json::from_value(params.clone())?;
-        let signed = &committed.request.possession.context.request;
-        require_principal(signed, principal)?;
-        let local = PublicKey::parse(&identity.public_key_hex()?)?;
-        let claim = &signed.payload.target_claim;
+        let encoded = serde_json::to_string(&committed)?;
         ensure!(
-            claim.payload.node_public_key == local,
-            "recovery installation targets another Node"
+            encoded.len() <= 65_536,
+            "cross-node completion is too large"
         );
-        let input_hash = ObjectHash::body(&committed.request)?;
-        let completion_hash = ObjectHash::body(&committed)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(previous) = metadata(&tx, "cross_node_recovery_installation")? {
-            let previous: Value = serde_json::from_str(&previous)?;
-            ensure!(
-                previous["completion_hash"] == completion_hash.as_str()
-                    && previous["principal"] == principal,
-                "Node already installed another recovery completion"
-            );
-            return Ok(previous["response"].clone());
-        }
-        check_claim_in(&tx, claim, &local)?;
-        let possession: TargetPossession = serde_json::from_str(
-            &metadata(&tx, "node_possession")?.context("target Node possession is missing")?,
+        tx.execute(
+            "INSERT INTO identity_meta(key,value) VALUES(?,?)",
+            params![completion_key(&status.context.snapshot_id), encoded],
         )?;
-        ensure!(
-            possession.request_hash == ObjectHash::body(signed)?
-                && possession.possession_hash == ObjectHash::body(&committed.request.possession)?
-                && possession.principal == principal,
-            "recovery installation differs from this Node's approved possession"
-        );
-        let verified = cross_node::verify_cross_node_recovery_installation(
-            &committed,
-            &local,
-            &claim.payload.claim_nonce,
-            now,
-        )?;
-        ensure!(
-            verified.input_hash()? == input_hash
-                && verified.possession_hash()? == possession.possession_hash,
-            "recovery installation changed its committed request"
-        );
-        let current = journal::PolicyState::load(&tx)?;
-        let update = current.prepare_bootstrap(verified.pins(), &verified.bundle().journal, now)?;
-        let target = update
-            .verified_after()
-            .verify_transport_device(&DeviceId::from_key(&local), now)?;
-        ensure!(
-            target.payload.possession.as_ref() == Some(&possession.proof),
-            "recovery changed target Node possession"
-        );
-        update.verified_after().verify_account_client_device(
-            verified.account(),
-            &DeviceId::from_key(verified.new_device_public_key()),
-            now,
-        )?;
-        let state = journal::commit_in(&tx, &update)?;
-        project_policy_in(&tx, &state)?;
-        ensure!(tx.execute("UPDATE identity_meta SET value='consumed:'||value WHERE key='bootstrap_capability_hash' AND value=?",
-            [crate::crypto::digest(claim.payload.claim_nonce.as_str().as_bytes())])? == 1, "bootstrap capability was already consumed");
-        let response = json!({"installed":true,"account_id":verified.account(),"node_public_key":verified.target_node_public_key(),"pins":verified.pins()});
-        tx.execute("INSERT INTO identity_meta(key,value) VALUES('cross_node_recovery_installation',?)",
-            [serde_json::to_string(&json!({"request_hash":verified.request_hash()?,"input_hash":input_hash,"completion_hash":completion_hash,"principal":principal,"response":response}))?])?;
         tx.commit()?;
         self.policy = state;
         Ok(response)
@@ -414,9 +422,10 @@ mod tests {
         test_support::{TestNetwork, now},
     };
     use vibeface_secure::authorization::{
-        AUTH_VERSION, Actor, Audience, CheckStage, ClientAuthorizationBundle, Invocation, Nonce,
-        ResourceRef, ServiceId, TransportEvidence,
+        AUTH_VERSION, Actor, Audience, CheckStage, Invocation, Nonce, ResourceRef, ServiceId,
+        TransportEvidence,
         bootstrap::{self, VerifiedNodeClaim, recovery},
+        client_policy_import::AuthorizationSelection,
     };
 
     struct Fixture {
@@ -431,6 +440,10 @@ mod tests {
         material: String,
         request: Signed<CrossNodeRecoveryRequest>,
         original_event: crate::model::SignedEvent,
+        snapshot: Option<Signed<RecoveryContextSnapshot>>,
+        witness: Option<Signed<RecoveryContextWitness>>,
+        reference: Option<RecoveryContextReference>,
+        source_read_grant: Option<ObjectHash>,
     }
 
     impl Fixture {
@@ -486,6 +499,10 @@ mod tests {
                 material,
                 request,
                 original_event,
+                snapshot: None,
+                witness: None,
+                reference: None,
+                source_read_grant: None,
             })
         }
 
@@ -515,29 +532,93 @@ mod tests {
             )?)
         }
 
-        fn prepare(&mut self) -> Result<Value> {
+        fn imported(&mut self) -> Result<VerifiedRecoveryPolicyContext> {
+            let principal = self.next_client.public_key_hex();
             let response = self.source.cross_node_recovery_command(
                 &self.network.node,
-                &self.next_client.public_key_hex(),
+                &principal,
                 "cross_node_recovery_context",
                 &json!({"request":self.request}),
                 now(),
             )?;
-            let verified = cross_node::verify_cross_node_recovery_context(
-                &serde_json::to_string(&response["context"])?,
+            let snapshot: Signed<RecoveryContextSnapshot> =
+                serde_json::from_value(response["snapshot"].clone())?;
+            let mut importer = stream::begin_cross_node_recovery_policy_import(
                 &serde_json::to_string(&self.request)?,
-                now() as f64,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let prepared = cross_node::prepare_cross_node_account_recovery(
+                &serde_json::to_string(&snapshot)?,
+                &self.target_node.public_key_hex()?,
+                &self.capability.capability,
+                now(),
+            )?;
+            let mut cursor = None;
+            let mut pages = Vec::new();
+            loop {
+                let response = self.source.cross_node_recovery_command(
+                    &self.network.node, &principal, "cross_node_recovery_context_page",
+                    &json!({"snapshot_id":snapshot.payload.snapshot_id,"request_hash":snapshot.payload.request_hash,"cursor":cursor}), now(),
+                )?;
+                let page: Signed<RecoveryContextPage> =
+                    serde_json::from_value(response["page"].clone())?;
+                importer.append(page.clone(), now())?;
+                cursor = page.payload.next_cursor.clone();
+                let complete = page.payload.complete;
+                pages.push(page);
+                if complete {
+                    break;
+                }
+            }
+            let response = self.source.cross_node_recovery_command(
+                &self.network.node, &principal, "cross_node_recovery_context_witness",
+                &json!({"snapshot_id":snapshot.payload.snapshot_id,"request_hash":snapshot.payload.request_hash,"cursor":null}), now(),
+            )?;
+            let witness: Signed<RecoveryContextWitness> =
+                serde_json::from_value(response["witness"].clone())?;
+            let context = importer.finish_native(witness.clone(), now())?;
+            let reference = context.reference()?;
+            self.target.cross_node_recovery_command(
+                &self.target_node,
+                &principal,
+                "cross_node_recovery_import_begin",
+                &json!({"request":self.request,"snapshot":snapshot}),
+                now(),
+            )?;
+            for page in pages {
+                self.target.cross_node_recovery_command(
+                    &self.target_node,
+                    &principal,
+                    "cross_node_recovery_import_page",
+                    &json!({"context":reference,"page":page}),
+                    now(),
+                )?;
+            }
+            self.target.cross_node_recovery_command(
+                &self.target_node,
+                &principal,
+                "cross_node_recovery_import_finish",
+                &json!({"context":reference,"witness":witness}),
+                now(),
+            )?;
+            self.snapshot = Some(snapshot);
+            self.witness = Some(witness);
+            self.reference = Some(reference);
+            Ok(context)
+        }
+
+        fn prepared(&mut self) -> Result<cross_node::PreparedCrossNodeAccountRecovery> {
+            let context = self.imported()?;
+            cross_node::prepare_cross_node_account_recovery(
                 &self.material,
-                &verified,
+                &context,
                 &self.next_root,
                 &self.next_client,
                 (now() + 1_000_000) as f64,
                 now() as f64,
             )
-            .map_err(anyhow::Error::msg)?;
+            .map_err(anyhow::Error::msg)
+        }
+
+        fn prepare(&mut self) -> Result<Value> {
+            let prepared = self.prepared()?;
             Ok(serde_json::from_str(
                 &prepared
                     .possession_request_json()
@@ -548,28 +629,7 @@ mod tests {
         fn commit_request(
             &mut self,
         ) -> Result<(cross_node::PreparedCrossNodeRecoveryCommit, Value)> {
-            let response = self.source.cross_node_recovery_command(
-                &self.network.node,
-                &self.next_client.public_key_hex(),
-                "cross_node_recovery_context",
-                &json!({"request":self.request}),
-                now(),
-            )?;
-            let verified = cross_node::verify_cross_node_recovery_context(
-                &serde_json::to_string(&response["context"])?,
-                &serde_json::to_string(&self.request)?,
-                now() as f64,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let prepared = cross_node::prepare_cross_node_account_recovery(
-                &self.material,
-                &verified,
-                &self.next_root,
-                &self.next_client,
-                (now() + 1_000_000) as f64,
-                now() as f64,
-            )
-            .map_err(anyhow::Error::msg)?;
+            let prepared = self.prepared()?;
             let request: Value = serde_json::from_str(
                 &prepared
                     .possession_request_json()
@@ -589,6 +649,14 @@ mod tests {
                 &request,
                 now(),
             )?;
+            let retry = self.target.cross_node_recovery_command(
+                &self.target_node,
+                &self.next_client.public_key_hex(),
+                "cross_node_recovery_possession",
+                &request,
+                now() + 200_000,
+            )?;
+            assert_eq!(retry, target);
             let commit = cross_node::finish_cross_node_account_recovery(
                 &prepared,
                 &self.next_root,
@@ -597,9 +665,55 @@ mod tests {
                 now() as f64,
             )
             .map_err(anyhow::Error::msg)?;
-            let request =
+            let request: Value =
                 serde_json::from_str(&commit.request_json().map_err(anyhow::Error::msg)?)?;
+            let typed: StreamedCrossNodeRecoveryCommitRequest =
+                serde_json::from_value(request.clone())?;
+            let source = PublicKey::parse(&self.network.node.public_key_hex()?)?;
+            self.source_read_grant = typed
+                .journal_delta
+                .iter()
+                .find_map(|entry| match entry {
+                    JournalEntry::Grant(grant)
+                        if grant.payload.audience.device == DeviceId::from_key(&source) =>
+                    {
+                        Some(grant.hash())
+                    }
+                    _ => None,
+                })
+                .transpose()?;
             Ok((commit, request))
+        }
+
+        fn resume_target(&mut self, committed: &Value, at: u64) -> Result<()> {
+            let principal = self.next_client.public_key_hex();
+            let snapshot = self.snapshot.as_ref().context("snapshot missing")?;
+            let reference = self.reference.as_ref().context("reference missing")?;
+            let witness = self.witness.as_ref().context("witness missing")?;
+            self.target.cross_node_recovery_command(
+                &self.target_node,
+                &principal,
+                "cross_node_recovery_import_resume",
+                &json!({"request":self.request,"snapshot":snapshot,"committed":committed}),
+                at,
+            )?;
+            for _ in 0..witness.payload.page_count {
+                self.target.cross_node_recovery_command(
+                    &self.target_node,
+                    &principal,
+                    "cross_node_recovery_import_cached_page",
+                    &json!({"context":reference}),
+                    at,
+                )?;
+            }
+            self.target.cross_node_recovery_command(
+                &self.target_node,
+                &principal,
+                "cross_node_recovery_import_finish",
+                &json!({"context":reference,"witness":witness}),
+                at,
+            )?;
+            Ok(())
         }
 
         fn source_commit(&mut self, request: &Value, at: u64) -> Result<Value> {
@@ -623,23 +737,41 @@ mod tests {
         }
 
         fn read_invocation(
-            &self,
+            &mut self,
             method: &str,
         ) -> Result<(
             Signed<Invocation>,
             vibeface_secure::authorization::RequestFacts,
             TransportEvidence,
         )> {
-            let response = self.source.authenticate_account(&self.next_client.public_key_hex(),
-                &json!({"account_id":self.network.account,"space_id":self.network.space,
-                    "resource_id":self.network.resource,"device_public_key":self.next_client.public_key_hex()}),now())?;
-            let bundle: ClientAuthorizationBundle =
-                serde_json::from_value(response["authorization"].clone())?;
             let source_key = PublicKey::parse(&self.network.node.public_key_hex()?)?;
             let audience = Audience {
                 service: ServiceId::from_key(&source_key),
                 device: DeviceId::from_key(&source_key),
             };
+            let grant_leaf = self
+                .source_read_grant
+                .as_ref()
+                .context("source read grant missing")?
+                .clone();
+            let selection = AuthorizationSelection {
+                resource: ResourceRef {
+                    space: self.network.space.clone(),
+                    resource: self.network.resource.clone(),
+                },
+                audience: audience.clone(),
+                grant_leaf,
+            };
+            let authorization =
+                crate::identity::client_policy_read::verified_client_policy_for_test(
+                    &mut self.source,
+                    &self.network.node,
+                    &self.next_client,
+                    &self.network.account,
+                    selection,
+                    &self.request.payload.saved_pins,
+                    now(),
+                )?;
             let mut body = self.network.body(method, "archive");
             if method == "message" {
                 body["text"] = json!("denied write");
@@ -673,7 +805,7 @@ mod tests {
                     presenter: device.clone(),
                     operation_id: facts.operation_id.clone(),
                     body_hash: facts.body_hash.clone(),
-                    grant_leaf: bundle.grant_leaf,
+                    grant_leaf: authorization.grant_leaf().clone(),
                     expected_policies,
                     context: facts.context.clone(),
                     nonce: Nonce::random()?,
@@ -840,7 +972,14 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(metadata(&f.source.connection, &context_key(&f.request))?.is_none());
+        assert_eq!(
+            f.source.connection.query_row(
+                "SELECT count(*) FROM identity_meta WHERE key GLOB 'recovery-read:*'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            0
+        );
         let request = f.prepare()?;
         assert!(
             f.target
@@ -879,34 +1018,14 @@ mod tests {
             &json!({"request":signed}),
             now(),
         )?;
-        let verified = cross_node::verify_cross_node_recovery_context(
-            &serde_json::to_string(&context["context"])?,
-            &serde_json::to_string(&signed)?,
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let prepared = cross_node::prepare_cross_node_account_recovery(
-            &material,
-            &verified,
-            &f.next_root,
-            &f.next_client,
-            (now() + 1_000_000) as f64,
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let changed = serde_json::from_str(
-            &prepared
-                .possession_request_json()
-                .map_err(anyhow::Error::msg)?,
-        )?;
         assert!(
             f.target
                 .cross_node_recovery_command(
                     &f.target_node,
                     &f.next_client.public_key_hex(),
-                    "cross_node_recovery_possession",
-                    &changed,
-                    now()
+                    "cross_node_recovery_import_begin",
+                    &json!({"request":signed,"snapshot":context["snapshot"]}),
+                    now(),
                 )
                 .is_err()
         );
@@ -954,9 +1073,11 @@ mod tests {
             assert!(
                 metadata(
                     &f.source.connection,
-                    &format!(
-                        "cross-node-recovery-completed:{}",
-                        ObjectHash::body(&f.request)?
+                    &completion_key(
+                        &f.reference
+                            .as_ref()
+                            .context("reference missing")?
+                            .snapshot_id
                     )
                 )?
                 .is_none()
@@ -965,6 +1086,91 @@ mod tests {
             f.target
                 .verify_bootstrap_capability(&f.capability.capability)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn committed_recovery_rebuilds_from_durable_pages_after_target_restart_and_expiry() -> Result<()>
+    {
+        let mut f = Fixture::new()?;
+        let (_, request) = f.commit_request()?;
+        let reference = f.reference.clone().context("reference missing")?;
+        let status = json!({"context":reference,"input_hash":ObjectHash::body(&request)?});
+        let pending = f.source.cross_node_recovery_command(
+            &f.network.node,
+            &f.next_client.public_key_hex(),
+            "cross_node_recovery_status",
+            &status,
+            now(),
+        )?;
+        assert_eq!(pending["state"], "not_committed");
+        let response = f.source_commit(&request, now())?;
+        let committed = &response["committed"];
+        let source_count = journal_count(&f.source)?;
+        f.target = Store::open(f.network.directory.join("target.sqlite3"))?;
+        assert!(f.install(committed, now() + 200_000).is_err());
+        assert_eq!(journal_count(&f.target)?, 0);
+        f.target
+            .verify_bootstrap_capability(&f.capability.capability)?;
+        let resume = json!({"request":f.request,"snapshot":f.snapshot,"committed":committed});
+        assert!(
+            f.target
+                .cross_node_recovery_command(
+                    &f.target_node,
+                    &f.network.client.public_key_hex(),
+                    "cross_node_recovery_import_resume",
+                    &resume,
+                    now() + 200_000,
+                )
+                .is_err()
+        );
+        let mut before_approval: StreamedCrossNodeRecoveryCommitted =
+            serde_json::from_value(committed.clone())?;
+        let mut receipt = before_approval.receipt.payload.clone();
+        receipt.accepted_at_ms = now() - 1;
+        let source_signer = Identity::from_secret_hex(&f.network.node.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        before_approval.receipt = Signed::sign(receipt, &source_signer)?;
+        assert!(
+            f.target
+                .cross_node_recovery_command(
+                    &f.target_node,
+                    &f.next_client.public_key_hex(),
+                    "cross_node_recovery_import_resume",
+                    &json!({"request":f.request,"snapshot":f.snapshot,"committed":before_approval}),
+                    now() + 200_000,
+                )
+                .is_err()
+        );
+        f.target.cross_node_recovery_command(
+            &f.target_node,
+            &f.next_client.public_key_hex(),
+            "cross_node_recovery_import_resume",
+            &resume,
+            now() + 200_000,
+        )?;
+        let first = f.target.cross_node_recovery_command(
+            &f.target_node,
+            &f.next_client.public_key_hex(),
+            "cross_node_recovery_import_cached_page",
+            &json!({"context":reference}),
+            now() + 200_000,
+        )?;
+        assert_eq!(first["page_count"], 1);
+        f.target = Store::open(f.network.directory.join("target.sqlite3"))?;
+        f.resume_target(committed, now() + 200_000)?;
+        assert_eq!(f.install(committed, now() + 200_000)?["installed"], true);
+        let completed = f.source.cross_node_recovery_command(
+            &f.network.node,
+            &f.next_client.public_key_hex(),
+            "cross_node_recovery_status",
+            &status,
+            now() + 200_000,
+        )?;
+        assert_eq!(completed["state"], "committed");
+        assert_eq!(completed["committed"], *committed);
+        assert_eq!(journal_count(&f.source)?, source_count);
+        assert_eq!(f.source_commit(&request, now() + 200_000)?, response);
         Ok(())
     }
 
@@ -1010,6 +1216,7 @@ mod tests {
         f.target
             .connection
             .execute_batch("DROP TRIGGER fail_cross_install")?;
+        f.resume_target(committed, now() + 200_000)?;
         assert_eq!(f.install(committed, now() + 200_000)?["installed"], true);
         assert!(
             f.target

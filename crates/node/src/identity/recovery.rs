@@ -275,11 +275,13 @@ impl Store {
             )),
             "recovery commit changed its approved Node possession"
         );
-        let verified = stream::verify_recovery_stream_commit_in_state(
+        let source_proof = context.source_proof_in(&tx, &self.policy, &local, now_ms)?;
+        let verified = stream::verify_recovery_stream_commit_with_source_proof(
             &input,
             &approved.request,
             &context.request,
             self.policy.verified(),
+            &source_proof,
             now_ms,
         )?;
         ensure!(
@@ -322,8 +324,13 @@ impl Store {
         let response = bounded(json!({"receipt":receipt}))?;
         let mut usage = RecoveryProofUsage::new(carrier_bytes(params, &response)?)?;
         context.record_current_usage(self.policy.verified(), &mut usage)?;
-        usage.record_node_request(&approved.request, self.policy.verified())?;
-        usage.record_commit(&input, self.policy.verified())?;
+        source_proof.record_proof_usage_into(&mut usage);
+        usage.record_node_request_with_source_proof(
+            &approved.request,
+            self.policy.verified(),
+            &source_proof,
+        )?;
+        usage.record_commit_with_source_proof(&input, self.policy.verified(), &source_proof)?;
         usage.record_completion(&receipt)?;
         usage.finish()?;
         let state = journal::commit_in(&tx, &update)?;
