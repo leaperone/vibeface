@@ -4113,7 +4113,7 @@ impl Runtime {
             }
             "seal_remote_execution" => self.seal_remote_execution(&access, &input).await,
             "remote_execution_seal_status" => {
-                let mut store = self.store.lock().await;
+                let store = self.store.lock().await;
                 let seal = access.verification.run(|| {
                     store.remote_execution_seal_status_authorized(
                         &self.identity,
