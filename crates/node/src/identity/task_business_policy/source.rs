@@ -34,6 +34,10 @@ pub(crate) struct TaskBusinessSourceChunk {
 }
 
 impl TaskBusinessPolicySourceContext {
+    pub(crate) fn current_policy(&self) -> &VerifiedTaskCurrentPolicy {
+        &self.current
+    }
+
     pub(crate) fn export(&self) -> &TaskBusinessPolicyExport {
         &self.exporter
     }
