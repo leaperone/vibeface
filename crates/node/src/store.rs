@@ -2338,7 +2338,9 @@ mod tests {
             store.authorize_node(space, &node_id, None)?.node_id,
             node_id
         );
+        let known = store.policy.clone();
         network.revoke_node(&mut store)?;
+        store.policy = known;
         assert!(store.authorize_node(space, &node_id, None).is_err());
         Ok(())
     }
