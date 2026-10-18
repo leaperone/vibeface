@@ -1962,7 +1962,7 @@ pub(crate) mod tests {
             })
         }
 
-        fn foreign_account_task(
+        pub(crate) fn foreign_account_task(
             project: &TestNetwork,
             executor: &TestNetwork,
             store: &mut Store,

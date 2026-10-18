@@ -1538,10 +1538,42 @@ pub(crate) mod tests {
     }
     mod remote_sdk {
         use super::*;
-        use crate::{binding::SignedBinding, identity::execution_dispatch::tests::Fixture};
-        use vibeface_secure::authorization::{
-            Action, EventRef, JournalEntry, execution_handoff::*,
+        use crate::{
+            binding::SignedBinding,
+            identity::{
+                client_policy_read::verified_client_policy_for_test,
+                execution_dispatch::tests::Fixture,
+                foreign_execution_policy::{
+                    current_task_prepare_policy_in,
+                    tests::{
+                        UnseededFixture, import_current_policy, import_current_policy_in,
+                        unseeded_fixture_with_context,
+                    },
+                },
+                test_support::now as fixture_now,
+            },
+            network::{MAX_FRAME_BYTES, Service},
         };
+        use vibeface_secure::authorization::{
+            Action, EventRef, InvocationContext, JournalEntry,
+            client_policy_import::AuthorizationSelection,
+            execution_handoff::*,
+            node_execution_policy::VerifiedTaskExecutionTrust,
+            prepare::{PrepareContext, PrepareIntent, VerifiedRemoteExecution},
+            remote_execution_policy::{
+                RemoteExecutionPolicyPurpose, build_remote_execution_policy_read_intent,
+            },
+        };
+
+        fn checked<T>(phase: &str, action: impl FnOnce() -> Result<T>) -> Result<T> {
+            let signatures = SignatureVerification::new();
+            let result = signatures.run(action).with_context(|| phase.to_owned())?;
+            ensure!(
+                signatures.counts().actual_verifications <= 32,
+                "remote SDK fixture {phase} exceeded its crypto budget"
+            );
+            Ok(result)
+        }
 
         struct Peers(Vec<tokio::task::JoinHandle<()>>);
 
@@ -1557,6 +1589,10 @@ pub(crate) mod tests {
             peers: Peers,
             node: Arc<Runtime>,
             c: Arc<Mutex<Store>>,
+            c_runtime: Arc<Runtime>,
+            context: PrepareContext,
+            trust: VerifiedTaskExecutionTrust,
+            task_creator: Option<TestNetwork>,
             project: TestNetwork,
             executor: TestNetwork,
             execution: ResourceRef,
@@ -1566,79 +1602,336 @@ pub(crate) mod tests {
 
         impl Remote {
             async fn new() -> Result<Self> {
-                let fixture = Fixture::new().context("create the real Project dispatch fixture")?;
-                Self::from_fixture(fixture).await
+                Self::from_fixture(false).await
             }
 
-            async fn from_fixture(mut fixture: Fixture) -> Result<Self> {
-                let binding = fixture.bind_at(
+            async fn from_fixture(foreign_task: bool) -> Result<Self> {
+                let project = TestNetwork::new()?;
+                let executor = TestNetwork::new()?;
+                let mut store = project.at(&project.directory.join("foreign-approval.sqlite3"))?;
+                project.conversation(&mut store, "conversation")?;
+                let task_creator = foreign_task.then(TestNetwork::new).transpose()?;
+                let task = if let Some(creator) = &task_creator {
+                    assert_ne!(creator.account, executor.account);
+                    assert_ne!(creator.account, project.account);
+                    creator.install(&mut store)?;
+                    Fixture::foreign_account_task(&project, creator, &mut store)?.0
+                } else {
+                    project.task(&mut store, "conversation", "remote-task")?
+                };
+                let target_key = PublicKey::parse(&executor.node.public_key_hex()?)?;
+                let context = PrepareContext {
+                    context: InvocationContext {
+                        conversation: Some("conversation".into()),
+                        task: Some(EventRef::parse(&task.hash)?),
+                        execution_session: Some(SessionRef {
+                            target: DeviceId::from_key(&target_key),
+                            session_id: "remote-session".into(),
+                        }),
+                        executor_kind: Some("codex".into()),
+                        workspace_resource: Some(project.resource.clone()),
+                        sdk_session: None,
+                    },
+                    binding_generation: Some(1),
+                    canonical_cwd: Some(executor.project.to_string_lossy().into_owned()),
+                    execution_target_public_key: Some(target_key),
+                };
+                let mut fixture =
+                    unseeded_fixture_with_context(project, executor, store, context.clone(), true)?;
+                let remote = import_current_policy(&mut fixture)?;
+                let trust = checked("load original Task approval", || {
+                    fixture.store.approve_task_execution_policy(
+                        &fixture.project.node,
+                        &fixture.project.client.public_key_hex(),
+                        &fixture.intent,
+                        fixture_now(),
+                    )
+                })?;
+                let binding = Self::bind(&mut fixture, &remote)?;
+                assert!(
                     fixture
-                        .executor
-                        .project
-                        .to_str()
-                        .context("C path is not UTF-8")?
-                        .to_owned(),
-                )?;
-                let Fixture {
+                        .store
+                        .authorization_state()
+                        .account(&fixture.executor.account)
+                        .is_none()
+                );
+                let UnseededFixture {
                     project,
                     executor,
                     store,
-                    execution,
-                    grant,
-                    journal,
+                    mut target,
+                    intent,
                     ..
                 } = fixture;
+                let execution = intent.payload.selection.execution_resource.clone();
+                let grant = intent.payload.selection.execution_grant.clone();
                 store
                     .connection
                     .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
                 drop(store);
                 std::fs::rename(
-                    project.directory.join("project.sqlite3"),
+                    project.directory.join("foreign-approval.sqlite3"),
                     project.directory.join("node.sqlite3"),
                 )?;
-                config::private_write(
-                    &project.directory.join("data-epoch.json"),
-                    &serde_json::to_vec(&config::data_format())?,
+                project.install(&mut target)?;
+                target.local_set(
+                    executor.space.as_str(),
+                    &format!("resource-root:{}", execution.resource),
+                    &json!(executor.project),
                 )?;
-                let mut cfg = Config::local(
-                    "127.0.0.1:4790".parse()?,
-                    vec![project.project.clone()],
-                    false,
-                );
-                cfg.codex_socket = Some(project.directory.join("unavailable.sock"));
-                cfg.claude_bin = project.directory.join("missing-claude");
-                cfg.codex_bin = project.directory.join("missing-codex");
-                cfg.save(&project.directory)?;
-                config::private_write(
-                    &project.directory.join("identity.json"),
-                    &serde_json::to_vec(&project.node)?,
-                )?;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                let url = format!("ws://{}/api/network/ws", listener.local_addr()?);
+                Self::configure(&executor, vec![], vec![url.clone()])?;
+                drop(executor.at(&executor.directory.join("node.sqlite3"))?);
+                let c_runtime = Arc::new(Runtime::open(&executor.directory).await?);
+                *c_runtime.store.lock().await = target;
+                Self::configure(&project, vec![url], vec![])?;
                 let node = Arc::new(
                     Runtime::open(&project.directory)
                         .await
                         .context("reopen the real bound Project database")?,
                 );
-                let mut c = executor.memory()?;
-                project.install(&mut c)?;
-                c.install_policy_journal(&journal, now_ms() as u64)?;
-                c.local_set(
-                    executor.space.as_str(),
-                    &format!("resource-root:{}", execution.resource),
-                    &json!(executor.project),
-                )?;
-                let c = Arc::new(Mutex::new(c));
+                assert!(
+                    node.store
+                        .lock()
+                        .await
+                        .authorization_state()
+                        .account(&executor.account)
+                        .is_none()
+                );
                 let mut value = Self {
                     peers: Peers(vec![]),
                     node,
-                    c,
+                    c: c_runtime.store.clone(),
+                    c_runtime,
+                    context,
+                    trust,
+                    task_creator,
                     project,
                     executor,
                     execution,
                     grant,
                     binding,
                 };
-                value.connect().await?;
+                value.refresh_policies().await?;
+                value.connect(listener).await?;
                 Ok(value)
+            }
+
+            fn bind(
+                fixture: &mut UnseededFixture,
+                remote: &VerifiedRemoteExecution,
+            ) -> Result<SignedBinding> {
+                let context = &fixture.intent.payload.context;
+                let selection = &fixture.intent.payload.selection;
+                let local = PublicKey::parse(&fixture.project.node.public_key_hex()?)?;
+                let body = json!({
+                    "method":"bind_execution",
+                    "space_id":fixture.project.space,
+                    "resource_id":fixture.project.resource,
+                    "authorization_id":"remote-sdk-bind",
+                    "binding_generation":1,
+                    "execution_resource":selection.execution_resource,
+                    "target_public_key":selection.target_public_key,
+                    "execution_grant":selection.execution_grant,
+                    "conversation_id":"conversation",
+                    "task_id":"remote-task",
+                    "task_ref":context.context.task,
+                    "target_node":fixture.executor.node.node_id()?,
+                    "session_id":"remote-session",
+                    "executor":"codex",
+                    "cwd":fixture.executor.project,
+                });
+                let prepared = checked("native bind prepare", || {
+                    remote
+                        .prepare(
+                            &fixture.source,
+                            &body.to_string(),
+                            &serde_json::to_string(context)?,
+                            "execution_open",
+                            "remote-sdk-bind",
+                            local.as_str(),
+                            &fixture.project.client,
+                            fixture_now() as f64,
+                        )
+                        .map_err(anyhow::Error::msg)
+                })?;
+                let prepared: Signed<PrepareIntent> = serde_json::from_str(&prepared)?;
+                checked("current bind prepare policy", || {
+                    current_task_prepare_policy_in(
+                        &fixture.store.connection,
+                        &fixture.store.policy,
+                        &local,
+                        &prepared,
+                        &body,
+                        fixture_now(),
+                    )?
+                    .context("SDK fixture bind has no completed foreign policy")
+                })?;
+                let invocation = checked("native bind sign", || {
+                    remote
+                        .sign(
+                            &fixture.source,
+                            &serde_json::to_string(&prepared.payload.request)?,
+                            &body.to_string(),
+                            "execution_open",
+                            "remote-sdk-bind",
+                            local.as_str(),
+                            &fixture.project.client,
+                            fixture_now() as f64,
+                        )
+                        .map_err(anyhow::Error::msg)
+                })?;
+                let invocation: Signed<Invocation> = serde_json::from_str(&invocation)?;
+                let value = &invocation.payload;
+                let facts = vibeface_secure::authorization::RequestFacts {
+                    resource: value.resource.clone(),
+                    action: value.action,
+                    audience: value.audience.clone(),
+                    operation_id: value.operation_id.clone(),
+                    body_hash: value.body_hash.clone(),
+                    context: value.context.clone(),
+                };
+                let transport = TransportEvidence::DirectNoise {
+                    device: DeviceId::from_key(&PublicKey::of(&fixture.project.client)),
+                };
+                let scoped = checked("scoped bind authorization", || {
+                    fixture.store.authorize_scoped_request_for_body(
+                        &fixture.project.node,
+                        &invocation,
+                        &facts,
+                        &transport,
+                        &body,
+                        fixture_now(),
+                    )
+                })?;
+                let dispatch = checked("scoped bind facts", || {
+                    fixture.store.execution_dispatch_facts_in_scope(
+                        &scoped,
+                        &body,
+                        scoped.audience(),
+                        fixture_now(),
+                    )
+                })?;
+                let challenge = checked("scoped bind challenge", || {
+                    fixture
+                        .store
+                        .issue_scoped_freshness(&scoped, CheckStage::Admit, fixture_now())
+                })?;
+                let mut receipts = checked("B bind receipt", || {
+                    fixture.store.sign_current_receipts(
+                        &challenge,
+                        &fixture.project.node,
+                        fixture_now(),
+                    )
+                })?;
+                receipts.extend(checked("C bind receipt", || {
+                    fixture.target.sign_current_receipts(
+                        &challenge,
+                        &fixture.executor.node,
+                        fixture_now(),
+                    )
+                })?);
+                checked("persist scoped bind", || {
+                    fixture.store.bind_execution_dispatch(
+                        &fixture.project.node,
+                        &dispatch,
+                        &scoped,
+                        &FreshnessProof {
+                            challenge,
+                            receipts,
+                        },
+                        &transport,
+                        &body,
+                        fixture_now(),
+                    )
+                })
+            }
+
+            fn configure(
+                network: &TestNetwork,
+                bootstrap_urls: Vec<String>,
+                advertise_urls: Vec<String>,
+            ) -> Result<()> {
+                config::private_write(
+                    &network.directory.join("data-epoch.json"),
+                    &serde_json::to_vec(&config::data_format())?,
+                )?;
+                let mut cfg = Config::local(
+                    "127.0.0.1:4790".parse()?,
+                    vec![network.project.clone()],
+                    false,
+                );
+                cfg.codex_socket = Some(network.directory.join("unavailable.sock"));
+                cfg.claude_bin = network.directory.join("missing-claude");
+                cfg.codex_bin = network.directory.join("missing-codex");
+                cfg.network.bootstrap_urls = bootstrap_urls;
+                cfg.network.advertise_urls = advertise_urls;
+                cfg.save(&network.directory)?;
+                config::private_write(
+                    &network.directory.join("identity.json"),
+                    &serde_json::to_vec(&network.node)?,
+                )
+            }
+
+            async fn refresh_policies(&self) -> Result<()> {
+                let mut store = self.node.store.lock().await;
+                let source = verified_client_policy_for_test(
+                    &mut store,
+                    &self.project.node,
+                    &self.project.client,
+                    &self.project.account,
+                    AuthorizationSelection {
+                        resource: ResourceRef {
+                            space: self.project.space.clone(),
+                            resource: self.project.resource.clone(),
+                        },
+                        audience: self.node.audience()?,
+                        grant_leaf: self.project.bundle.grant_leaf.clone(),
+                    },
+                    &self.project.pins,
+                    fixture_now(),
+                )?;
+                let mut target = self.c.lock().await;
+                for action in [Action::ExecutionOpen, Action::ExecutionSend] {
+                    let intent = checked("refresh native intent", || {
+                        build_remote_execution_policy_read_intent(
+                            &source,
+                            &json!({
+                                "selection":{
+                                    "execution_resource":self.execution,
+                                    "target_public_key":self.executor.node.public_key_hex()?,
+                                    "execution_grant":self.grant,
+                                },
+                                "context":self.context,
+                                "expected_action":action,
+                                "purpose":RemoteExecutionPolicyPurpose::Execution,
+                                "execution_pins":self.executor.pins,
+                            })
+                            .to_string(),
+                            &self.project.client,
+                            fixture_now() as f64,
+                            (fixture_now() + 60_000) as f64,
+                        )
+                        .map_err(anyhow::Error::msg)
+                    })?;
+                    import_current_policy_in(
+                        &self.project,
+                        &self.executor,
+                        &mut store,
+                        &mut target,
+                        &source,
+                        &serde_json::from_str(&intent)?,
+                        Some(&self.trust),
+                    )?;
+                }
+                assert!(
+                    store
+                        .authorization_state()
+                        .account(&self.executor.account)
+                        .is_none()
+                );
+                Ok(())
             }
 
             async fn close(&mut self) {
@@ -1665,76 +1958,56 @@ pub(crate) mod tests {
                     .install_policy_journal(&journal, now_ms() as u64)
             }
 
-            async fn connect(&mut self) -> Result<()> {
-                use crate::peer::MAX_PACKET_BYTES;
+            async fn connect(&mut self, listener: tokio::net::TcpListener) -> Result<()> {
                 use axum::{
                     Router,
                     extract::{State, WebSocketUpgrade},
                     routing::get,
                 };
                 async fn upgrade(
-                    State(hub): State<Arc<PeerHub>>,
+                    State(hub): State<Arc<NetworkHub>>,
                     ws: WebSocketUpgrade,
                 ) -> impl axum::response::IntoResponse {
-                    ws.max_message_size(MAX_PACKET_BYTES)
-                        .max_frame_size(MAX_PACKET_BYTES)
+                    ws.max_message_size(MAX_FRAME_BYTES)
+                        .max_frame_size(MAX_FRAME_BYTES)
                         .on_upgrade(|socket| async move {
                             let _ = hub.accept(socket).await;
                         })
                 }
-                let (hub, mut receiver) =
-                    PeerHub::new(self.executor.node.clone(), self.c.clone(), &[]);
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-                let url = format!("ws://{}/peer", listener.local_addr()?);
                 let router = Router::new()
-                    .route("/peer", get(upgrade))
-                    .with_state(hub.clone());
+                    .route("/api/network/ws", get(upgrade))
+                    .with_state(self.c_runtime.network.clone());
                 self.peers.0.push(tokio::spawn(async move {
                     let _ = axum::serve(listener, router).await;
                 }));
-                let c = self.c.clone();
-                let signer = self.executor.node.clone();
+                let mut receiver = self
+                    .c_runtime
+                    .network_rx
+                    .lock()
+                    .await
+                    .take()
+                    .context("C fixture network receiver is missing")?;
+                let server = self.c_runtime.clone();
                 self.peers.0.push(tokio::spawn(async move {
-                    while let Some(inbound) = receiver.recv().await {
-                        if inbound.payload["type"] != "freshness_receipt" {
-                            continue;
-                        }
-                        let result: Result<Value> = async {
-                            let challenge: FreshnessChallenge =
-                                serde_json::from_value(inbound.payload["challenge"].clone())?;
-                            let store = c.lock().await;
-                            let receipts = SignatureVerification::new().run(|| {
-                                store.sign_current_receipts(&challenge, &signer, now_ms() as u64)
-                            })?;
-                            Ok(json!({"receipts":receipts}))
-                        }
-                        .await;
-                        let response = match result {
-                            Ok(value) => value,
-                            Err(error) => json!({"error":error.to_string()}),
-                        };
-                        let _ = hub.respond(&inbound, response).await;
+                    let mut clients = tokio::task::JoinSet::new();
+                    while let Some(incoming) = receiver.recv().await {
+                        assert_eq!(incoming.service, Service::Client);
+                        let server = server.clone();
+                        clients.spawn(async move {
+                            let _ = crate::client::serve(server, incoming.socket).await;
+                        });
                     }
                 }));
-                let hub = self.node.hub.clone();
-                let space = self.project.space.to_string();
-                self.peers.0.push(tokio::spawn(async move {
-                    let _ = hub.connect(space, url).await;
-                }));
                 let target = self.executor.node.node_id()?;
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    while !self
-                        .node
+                let records = self.node.network.resolve(&target).await?;
+                assert!(!records.is_empty());
+                assert!(
+                    self.node
                         .hub
                         .online(self.project.space.as_str())
                         .await
-                        .contains(&target)
-                    {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .context("independent C authority did not connect")?;
+                        .is_empty()
+                );
                 Ok(())
             }
 
@@ -1781,10 +2054,12 @@ pub(crate) mod tests {
                     body["execution_session_receipt"] = json!(previous.receipt);
                 }
                 self.sync_policy().await?;
+                self.refresh_policies().await?;
                 let access = self.node.authorize_agent(sdk, body).await?;
                 let mut store = self.node.store.lock().await;
                 access.verification.run(|| {
-                    let dispatch = store.execution_dispatch_facts(
+                    let dispatch = store.execution_dispatch_facts_in_scope(
+                        &access.authorization,
                         &access.body,
                         access.authorization.audience(),
                         now_ms() as u64,
@@ -1945,6 +2220,7 @@ pub(crate) mod tests {
             let mut remote = Remote::new().await?;
             let outcome: Result<()> = async {
                 let sdk = agent(&remote.project, &remote.node).await?;
+                remote.refresh_policies().await?;
                 let mut store = remote.node.store.lock().await;
                 let targets = store.execution_dispatch_targets(
                     &sdk,
@@ -1993,17 +2269,17 @@ pub(crate) mod tests {
 
         #[tokio::test]
         async fn initial_sdk_rejects_a_foreign_accounts_bound_task() -> Result<()> {
-            let mut remote =
-                Remote::from_fixture(Fixture::new_with_foreign_account_task()?).await?;
+            let mut remote = Remote::from_fixture(true).await?;
             let outcome: Result<()> = async {
                 let sdk = agent(&remote.project, &remote.node).await?;
+                remote.refresh_policies().await?;
                 let store = remote.node.store.lock().await;
                 let creation = store.task_creation(remote.project.space.as_str(), "conversation", "remote-task")?;
                 let event = store.verify_event(remote.project.space.as_str(), &creation)?;
                 let EventCause::Invocation { admission } = event.cause else {
                     bail!("foreign Task has no actual Account admission");
                 };
-                assert_eq!(admission.invocation.payload.actor, Actor::Account(remote.executor.account.clone()));
+                assert_eq!(admission.invocation.payload.actor, Actor::Account(remote.task_creator.as_ref().context("foreign Task creator is missing")?.account.clone()));
                 assert_ne!(admission.invocation.payload.actor, sdk.initiator);
                 assert!(store.task_binding(remote.project.space.as_str(), &creation.hash)?.is_some());
                 let error = store.execution_dispatch_targets(&sdk, "remote-task", "codex", Action::ExecutionSend, now_ms() as u64).unwrap_err();

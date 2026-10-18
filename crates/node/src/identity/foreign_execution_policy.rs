@@ -589,6 +589,33 @@ pub(crate) mod tests {
         let mut store = project.at(&project.directory.join("foreign-approval.sqlite3"))?;
         project.conversation(&mut store, "foreign-conversation")?;
         let task = project.task(&mut store, "foreign-conversation", "foreign-task")?;
+        let target_key = PublicKey::parse(&executor.node.public_key_hex()?)?;
+        let context = PrepareContext {
+            context: InvocationContext {
+                conversation: Some("foreign-conversation".into()),
+                task: Some(EventRef::parse(&task.hash)?),
+                execution_session: Some(SessionRef {
+                    target: DeviceId::from_key(&target_key),
+                    session_id: "foreign-session".into(),
+                }),
+                executor_kind: Some("codex".into()),
+                workspace_resource: Some(project.resource.clone()),
+                sdk_session: None,
+            },
+            binding_generation: Some(1),
+            canonical_cwd: Some(project.project.to_string_lossy().into_owned()),
+            execution_target_public_key: Some(target_key),
+        };
+        unseeded_fixture_with_context(project, executor, store, context, false)
+    }
+
+    pub(crate) fn unseeded_fixture_with_context(
+        project: TestNetwork,
+        executor: TestNetwork,
+        mut store: Store,
+        context: PrepareContext,
+        delegate_execution_grant: bool,
+    ) -> Result<UnseededFixture> {
         let local = PublicKey::parse(&project.node.public_key_hex()?)?;
         let audience = Audience {
             service: ServiceId::from_key(&local),
@@ -598,10 +625,6 @@ pub(crate) mod tests {
         let resource = ResourceRef {
             space: executor.space.clone(),
             resource: ResourceId::from_bytes([234; 32]),
-        };
-        let session = SessionRef {
-            target: DeviceId::from_key(&target_key),
-            session_id: "foreign-session".into(),
         };
         let mut target = executor.memory()?;
         let head = target
@@ -628,30 +651,45 @@ pub(crate) mod tests {
                 version: AUTH_VERSION,
                 owner_space: executor.space.clone(),
                 scope: ResourceScope::Exact(resource.clone()),
-                grantee: Grantee::Actor(Actor::Service(audience.service.clone())),
-                actions: vec![
-                    Action::ExecutionOpen,
-                    Action::ExecutionSend,
-                    Action::ExecutionSubmit,
-                    Action::OperationStatusRead,
-                ],
+                grantee: Grantee::Actor(if delegate_execution_grant {
+                    Actor::Account(executor.account.clone())
+                } else {
+                    Actor::Service(audience.service.clone())
+                }),
+                actions: if delegate_execution_grant {
+                    vec![
+                        Action::ExecutionOpen,
+                        Action::ExecutionSend,
+                        Action::ExecutionSubmit,
+                        Action::ExecutionResolve,
+                        Action::OperationStatusRead,
+                        Action::OperationResolve,
+                    ]
+                } else {
+                    vec![
+                        Action::ExecutionOpen,
+                        Action::ExecutionSend,
+                        Action::ExecutionSubmit,
+                        Action::OperationStatusRead,
+                    ]
+                },
                 audience: Audience {
                     service: ServiceId::from_key(&target_key),
                     device: DeviceId::from_key(&target_key),
                 },
                 constraints: GrantConstraints {
                     context: InvocationContext {
-                        conversation: Some("foreign-conversation".into()),
-                        task: Some(EventRef::parse(&task.hash)?),
-                        execution_session: Some(session.clone()),
-                        executor_kind: Some("codex".into()),
+                        conversation: context.context.conversation.clone(),
+                        task: context.context.task.clone(),
+                        execution_session: context.context.execution_session.clone(),
+                        executor_kind: context.context.executor_kind.clone(),
                         workspace_resource: Some(resource.resource.clone()),
                         sdk_session: None,
                     },
                     ..Default::default()
                 },
                 parent: None,
-                remaining_delegations: 0,
+                remaining_delegations: u8::from(delegate_execution_grant),
                 issued_under: head.clone(),
                 not_before_ms: now(),
                 expires_at_ms: now() + 1_000_000,
@@ -679,6 +717,44 @@ pub(crate) mod tests {
             ],
             now(),
         )?;
+        let grant = if delegate_execution_grant {
+            let head = target
+                .policy
+                .verified()
+                .head(&PolicyDomain::Space(executor.space.clone()))
+                .context("executor parent grant policy is missing")?
+                .clone();
+            let mut child = grant.payload.clone();
+            child.grantee = Grantee::Actor(Actor::Service(audience.service.clone()));
+            child.actions.retain(|action| {
+                !matches!(action, Action::ExecutionResolve | Action::OperationResolve)
+            });
+            child.parent = Some(grant.hash()?);
+            child.remaining_delegations = 0;
+            child.issued_under = head.clone();
+            child.nonce = Nonce::random()?;
+            let child = Signed::sign(child, &executor.client)?;
+            let mut space = target
+                .policy
+                .verified()
+                .space(&executor.space)
+                .context("executor parent grant space is missing")?
+                .clone();
+            space.previous = Some(head);
+            space.sequence += 1;
+            space.grants.push(child.hash()?);
+            space.grants.sort();
+            target.install_policy_journal(
+                &[
+                    JournalEntry::Grant(child.clone()),
+                    JournalEntry::Space(Signed::sign(space, &executor.root)?),
+                ],
+                now(),
+            )?;
+            child
+        } else {
+            grant
+        };
         let source = verified_client_policy_for_test(
             &mut store,
             &project.node,
@@ -703,19 +779,7 @@ pub(crate) mod tests {
                     "target_public_key":target_key,
                     "execution_grant":grant.hash()?,
                 },
-                "context":PrepareContext {
-                    context: InvocationContext {
-                        conversation:Some("foreign-conversation".into()),
-                        task:Some(EventRef::parse(&task.hash)?),
-                        execution_session:Some(session),
-                        executor_kind:Some("codex".into()),
-                        workspace_resource:Some(project.resource.clone()),
-                        sdk_session:None,
-                    },
-                    binding_generation:Some(1),
-                    canonical_cwd:Some(project.project.to_string_lossy().into_owned()),
-                    execution_target_public_key:Some(target_key),
-                },
+                "context":context,
                 "expected_action":Action::ExecutionOpen,
                 "purpose":RemoteExecutionPolicyPurpose::Execution,
                 "execution_pins":executor.pins,
@@ -746,31 +810,58 @@ pub(crate) mod tests {
         Ok(result)
     }
 
-    pub(crate) fn import_current_policy(fixture: &mut UnseededFixture) -> Result<VerifiedRemoteExecution> {
-        let principal = fixture.project.client.public_key_hex();
-        let approved = carrier(|| {
-            fixture.store.foreign_execution_policy_approve(
-                &fixture.project.node,
-                &principal,
-                &serde_json::to_value(&fixture.intent)?,
-                now(),
-            )
-        })?;
+    pub(crate) fn import_current_policy(
+        fixture: &mut UnseededFixture,
+    ) -> Result<VerifiedRemoteExecution> {
+        import_current_policy_in(
+            &fixture.project,
+            &fixture.executor,
+            &mut fixture.store,
+            &mut fixture.target,
+            &fixture.source,
+            &fixture.intent,
+            None,
+        )
+    }
+
+    pub(crate) fn import_current_policy_in(
+        project: &TestNetwork,
+        executor: &TestNetwork,
+        store: &mut Store,
+        target: &mut Store,
+        source: &VerifiedClientAuthorization,
+        intent: &Signed<RemoteExecutionPolicyReadIntent>,
+        approval: Option<&VerifiedTaskExecutionTrust>,
+    ) -> Result<VerifiedRemoteExecution> {
+        let principal = project.client.public_key_hex();
+        let approval_ref = if let Some(approval) = approval {
+            approval.approval().hash()?
+        } else {
+            let approved = carrier(|| {
+                store.foreign_execution_policy_approve(
+                    &project.node,
+                    &principal,
+                    &serde_json::to_value(intent)?,
+                    now(),
+                )
+            })?;
+            serde_json::from_value(approved["approval_ref"].clone())?
+        };
         let delegated = carrier(|| {
-            fixture.store.remote_execution_policy_delegate(
-                &fixture.project.node,
+            store.remote_execution_policy_delegate(
+                &project.node,
                 &principal,
-                &serde_json::to_value(&fixture.intent)?,
+                &serde_json::to_value(intent)?,
                 now(),
             )
         })?;
         let request = RemoteExecutionPolicyReadRequest {
-            intent: fixture.intent.clone(),
+            intent: intent.clone(),
             delegation: serde_json::from_value(delegated["delegation"].clone())?,
         };
         let prepared = carrier(|| {
-            fixture.target.remote_execution_policy_prepare(
-                &fixture.executor.node,
+            target.remote_execution_policy_prepare(
+                &executor.node,
                 &principal,
                 &serde_json::to_value(&request)?,
                 now(),
@@ -778,21 +869,21 @@ pub(crate) mod tests {
         })?;
         let mut client_import = carrier(|| {
             begin_remote_execution_policy_import(
-                &fixture.source,
+                source,
                 &serde_json::to_string(&request)?,
                 &prepared["snapshot"].to_string(),
-                &serde_json::to_string(&fixture.executor.pins)?,
-                &fixture.executor.node.public_key_hex()?,
+                &serde_json::to_string(&executor.pins)?,
+                &executor.node.public_key_hex()?,
                 now() as f64,
             )
             .map_err(anyhow::Error::msg)
         })?;
         let begun = carrier(|| {
-            fixture.store.foreign_execution_policy_begin(
-                &fixture.project.node,
+            store.foreign_execution_policy_begin(
+                &project.node,
                 &principal,
                 &json!({"request":request,"snapshot":prepared["snapshot"],
-                    "approval_ref":approved["approval_ref"]}),
+                    "approval_ref":approval_ref}),
                 now(),
             )
         })?;
@@ -809,18 +900,13 @@ pub(crate) mod tests {
                     .map_err(anyhow::Error::msg)?,
             )?;
             let response = carrier(|| {
-                fixture.target.remote_execution_policy_page(
-                    &fixture.executor.node,
-                    &principal,
-                    &params,
-                    now(),
-                )
+                target.remote_execution_policy_page(&executor.node, &principal, &params, now())
             })?;
             let page: Signed<RemoteExecutionPolicyPage> =
                 serde_json::from_value(response["page"].clone())?;
             carrier(|| {
-                fixture.store.foreign_execution_policy_page(
-                    &fixture.project.node,
+                store.foreign_execution_policy_page(
+                    &project.node,
                     &principal,
                     &json!({"import_ref":import_ref,"page":page}),
                     now(),
@@ -842,16 +928,11 @@ pub(crate) mod tests {
                 .map_err(anyhow::Error::msg)?,
         )?;
         let finished = carrier(|| {
-            fixture.target.remote_execution_policy_finish(
-                &fixture.executor.node,
-                &principal,
-                &params,
-                now(),
-            )
+            target.remote_execution_policy_finish(&executor.node, &principal, &params, now())
         })?;
         carrier(|| {
-            fixture.store.foreign_execution_policy_finish(
-                &fixture.project.node,
+            store.foreign_execution_policy_finish(
+                &project.node,
                 &principal,
                 &json!({"import_ref":import_ref,"witness":finished["witness"]}),
                 now(),
@@ -863,8 +944,7 @@ pub(crate) mod tests {
                 .map_err(anyhow::Error::msg)
         })?;
         carrier(|| {
-            verify_remote_execution(&fixture.source, &policy, now() as f64)
-                .map_err(anyhow::Error::msg)
+            verify_remote_execution(source, &policy, now() as f64).map_err(anyhow::Error::msg)
         })
     }
 
