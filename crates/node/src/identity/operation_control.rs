@@ -293,6 +293,7 @@ impl Store {
         }
         super::event_authorization::append_admitted_resolution_in(
             &tx,
+            &self.policy,
             identity,
             &admission,
             &operation.request,

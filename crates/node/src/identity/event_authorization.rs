@@ -1,4 +1,8 @@
-use super::{admission::reconstruct_admission, journal::PolicyState, policy::FreshnessProof};
+use super::{
+    admission::{reconstruct_admission, reconstruct_admission_at_current_heads},
+    journal::PolicyState,
+    policy::FreshnessProof,
+};
 use crate::{
     crypto::{self, LocalIdentity},
     model::{
@@ -7,7 +11,7 @@ use crate::{
     },
     store::{
         Store, StoredEvent, closure_hashes, has_blob_from, heads_from_events, load_events_from,
-        rebuild_projections_from,
+        rebuild_admitted_projections_from,
     },
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -790,9 +794,40 @@ pub(crate) fn validate_event_evidence(
     events: &BTreeMap<String, StoredEvent>,
 ) -> Result<EventEvidenceStatus> {
     let proof = admission(event);
+    let state = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
+    validate_event_evidence_in_state(policy, connection, &state, event, events, false)
+}
+
+fn validate_local_event_evidence(
+    policy: &PolicyState,
+    connection: &Connection,
+    event: &Event,
+    events: &BTreeMap<String, StoredEvent>,
+) -> Result<EventEvidenceStatus> {
+    let state = policy.verified();
+    if admission(event)
+        .challenge
+        .policies
+        .iter()
+        .all(|head| state.head(&head.domain) == Some(head))
+    {
+        validate_event_evidence_in_state(policy, connection, state, event, events, true)
+    } else {
+        validate_event_evidence(policy, connection, event, events)
+    }
+}
+
+fn validate_event_evidence_in_state(
+    policy: &PolicyState,
+    connection: &Connection,
+    state: &VerifiedPolicySet,
+    event: &Event,
+    events: &BTreeMap<String, StoredEvent>,
+    current_heads: bool,
+) -> Result<EventEvidenceStatus> {
+    let proof = admission(event);
     let now = u64::try_from(event.created_at_ms).context("event creation time is negative")?;
     ensure!(now >= proof.admitted_at_ms, "event predates admission");
-    let state = policy.historical(&proof.challenge.policies, proof.admitted_at_ms)?;
     ensure!(
         event.author == crypto::fingerprint(audience_key(&state, proof)?.as_str())?,
         "event author is not the admitted audience"
@@ -804,8 +839,13 @@ pub(crate) fn validate_event_evidence(
         return Ok(EventEvidenceStatus::Pending);
     };
     let transport = proof.transport.clone().into_evidence();
-    reconstruct_admission(policy, proof, &facts, &transport)?;
-    validate_sdk_parent(policy, connection, &state, event, events, &facts)?;
+    if current_heads {
+        reconstruct_admission_at_current_heads(state, proof, &facts, &transport)?
+            .context("local event admission policy changed")?;
+    } else {
+        reconstruct_admission(policy, proof, &facts, &transport)?;
+    }
+    validate_sdk_parent(policy, connection, state, event, events, &facts)?;
     match &event.cause {
         EventCause::Invocation { .. } => {
             ensure!(
@@ -946,6 +986,36 @@ pub(crate) fn persisted_admission_facts(
     Ok(facts)
 }
 
+fn retained_scope_events_in(
+    connection: &Connection,
+    space: &str,
+    resource: &ResourceId,
+    scope: &str,
+) -> Result<BTreeMap<String, StoredEvent>> {
+    let rows = connection.prepare(
+        "SELECT envelope,status FROM events WHERE space_id=? AND resource_id=? AND scope_id=? ORDER BY hash",
+    )?.query_map(params![space, resource.as_str(), scope], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut events = BTreeMap::new();
+    for (encoded, status) in rows {
+        let envelope: SignedEvent = serde_json::from_str(&encoded)?;
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+        events.insert(
+            envelope.hash.clone(),
+            StoredEvent {
+                envelope,
+                event,
+                status,
+            },
+        );
+    }
+    if let Some(source) = events.values().next() {
+        validate_retained_event_scope_in(connection, &source.envelope)?;
+    }
+    Ok(events)
+}
+
 fn append_admitted_events_in(
     connection: &Connection,
     policy: &PolicyState,
@@ -965,7 +1035,7 @@ fn append_admitted_events_in(
         let scope = source_scope(&proof.source_body)?;
         let space = proof.invocation.payload.resource.space.as_str();
         let resource = &proof.invocation.payload.resource.resource;
-        let events = load_events_from(connection, space)?;
+        let events = retained_scope_events_in(connection, space, resource, scope)?;
         let task_id = text(&proof.source_body, "task_id")?;
         let existing=events.values().filter(|stored| stored.status=="ready"
             && stored.event.scope_id==scope && &stored.event.resource_id==resource
@@ -1063,7 +1133,10 @@ fn append_admitted_events_in(
             now_ms,
         )?);
     }
-    rebuild_projections_from(connection, proof.invocation.payload.resource.space.as_str())?;
+    rebuild_admitted_projections_from(
+        connection,
+        proof.invocation.payload.resource.space.as_str(),
+    )?;
     Ok(signed)
 }
 
@@ -1081,7 +1154,12 @@ fn append_event_in(
 ) -> Result<SignedEvent> {
     let space = proof.invocation.payload.resource.space.as_str();
     let author = identity.node_id()?;
-    let events = load_events_from(connection, space)?;
+    let events = retained_scope_events_in(
+        connection,
+        space,
+        &proof.invocation.payload.resource.resource,
+        scope,
+    )?;
     let scoped_events = events
         .iter()
         .filter(|(_, stored)| {
@@ -1135,7 +1213,8 @@ fn append_event_in(
     let envelope = identity.sign_event(event)?;
     let event: Event = serde_json::from_str(&envelope.canonical_body)?;
     ensure!(
-        validate_event_evidence(policy, connection, &event, &events)? == EventEvidenceStatus::Valid,
+        validate_local_event_evidence(policy, connection, &event, &events)?
+            == EventEvidenceStatus::Valid,
         "event has incomplete authorization evidence"
     );
     connection.execute("INSERT INTO events(space_id,resource_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,?,'ready')",
@@ -1145,6 +1224,7 @@ fn append_event_in(
 
 pub(crate) fn append_admitted_dispatch_in(
     tx: &Transaction<'_>,
+    policy: &PolicyState,
     identity: &LocalIdentity,
     proof: &AdmissionProof,
     request: &OperationRequest,
@@ -1164,7 +1244,6 @@ pub(crate) fn append_admitted_dispatch_in(
         serde_json::from_str::<OperationRequest>(&persisted)? == *request,
         "dispatch differs from durable operation"
     );
-    let policy = PolicyState::load(tx)?;
     let body = expected_events(
         &proof.source_body,
         &proof.invocation,
@@ -1184,6 +1263,7 @@ pub(crate) fn append_admitted_dispatch_in(
 
 pub(crate) fn append_admitted_resolution_in(
     tx: &Transaction<'_>,
+    policy: &PolicyState,
     identity: &LocalIdentity,
     proof: &AdmissionProof,
     request: &OperationRequest,
@@ -1234,7 +1314,6 @@ pub(crate) fn append_admitted_resolution_in(
             && serde_json::from_str::<Value>(&persisted.2)? == *result,
         "resolution audit differs from durable operation"
     );
-    let policy = PolicyState::load(tx)?;
     Ok(append_admitted_events_in(
         tx,
         &policy,
@@ -1791,7 +1870,15 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let events = load_events_from(&tx, space)?;
+        let encoded: String = tx.query_row(
+            "SELECT envelope FROM events WHERE space_id=? AND hash=?",
+            params![space, source],
+            |row| row.get(0),
+        )?;
+        let source_envelope: SignedEvent = serde_json::from_str(&encoded)?;
+        let source_body: Event = serde_json::from_str(&source_envelope.canonical_body)?;
+        let events =
+            retained_scope_events_in(&tx, space, &source_body.resource_id, &source_body.scope_id)?;
         let source_event = events.get(source).context("derived source is missing")?;
         ensure!(
             source_event.status == "ready",
@@ -1870,7 +1957,7 @@ impl Store {
             blobs,
             now_ms,
         )?;
-        rebuild_projections_from(&tx, space)?;
+        rebuild_admitted_projections_from(&tx, space)?;
         tx.commit()?;
         Ok(signed)
     }
@@ -2313,7 +2400,14 @@ mod tests {
         )?;
         tx.execute("INSERT INTO operations(space_id,operation_id,target_node,session_id,request,state,control,result) VALUES(?,?,?,?,?,'\"unknown\"',0,'null')",
             params![request.network_id,request.operation_id,request.target_node,request.session_id,serde_json::to_string(&request)?])?;
-        let dispatch = append_admitted_dispatch_in(&tx, &fixture.node, &original, &request, NOW)?;
+        let dispatch = append_admitted_dispatch_in(
+            &tx,
+            &fixture.policy,
+            &fixture.node,
+            &original,
+            &request,
+            NOW,
+        )?;
         tx.commit()?;
         let dispatch_event =
             verify_event_envelope(&fixture.policy, &request.network_id, &dispatch)?;
@@ -2380,6 +2474,7 @@ mod tests {
             assert!(
                 append_admitted_resolution_in(
                     &tx,
+                    &fixture.policy,
                     &fixture.node,
                     &resolution,
                     &request,
@@ -2416,6 +2511,7 @@ mod tests {
         )?;
         let resolved = append_admitted_resolution_in(
             &tx,
+            &fixture.policy,
             &fixture.node,
             &resolution,
             &request,

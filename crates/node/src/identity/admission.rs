@@ -1827,7 +1827,7 @@ impl Store {
             tx.execute("INSERT INTO execution_sessions(space_id,target_node,session_id,revision,record) VALUES(?,?,?,?,?)",
                 params![request.network_id, request.target_node, request.session_id, session.revision, serde_json::to_string(&session)?])?;
         }
-        append_admitted_dispatch_in(&tx, identity, &admission, request, now_ms)?;
+        append_admitted_dispatch_in(&tx, &self.policy, identity, &admission, request, now_ms)?;
         tx.commit()?;
         Ok(OperationRecord {
             request: request.clone(),

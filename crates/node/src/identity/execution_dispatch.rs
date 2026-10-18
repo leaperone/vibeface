@@ -864,7 +864,7 @@ impl Store {
                 params![request.network_id,request.operation_id,request.target_node,resource])?;
         }
         super::event_authorization::append_admitted_dispatch_in(
-            &tx, identity, &admission, request, now_ms,
+            &tx, &self.policy, identity, &admission, request, now_ms,
         )?;
         tx.commit()?;
         Ok(OperationRecord {
