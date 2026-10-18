@@ -340,6 +340,7 @@ impl DockerIsolation {
             control,
             gateway_url,
         };
+        crate::config::private_write(&handle.control.join("container-id"), handle.id.as_bytes())?;
         scopes.insert(
             key,
             IsolatedScope {
@@ -348,6 +349,101 @@ impl DockerIsolation {
                     context.operation_id.clone(),
                     context.lease_expires_at_ms,
                 )]),
+                codex: None,
+                stopped: false,
+            },
+        );
+        Ok(handle)
+    }
+
+    pub async fn restore(
+        &self,
+        context: &ExecutionContext,
+        project: &Path,
+    ) -> Result<IsolatedProcess> {
+        self.config.validate()?;
+        let data_dir = self.data_dir.canonicalize()?;
+        crate::config::verify_private_dir(&data_dir)?;
+        let project = project.canonicalize()?;
+        ensure!(
+            project.is_dir()
+                && project.parent().is_some()
+                && !data_dir.starts_with(&project)
+                && !project.starts_with(&data_dir),
+            "project and private Node data directories must be separate"
+        );
+        let uid = crate::config::effective_uid();
+        ensure!(uid != 0, "shared execution requires a non-root Node user");
+        let key = self.key(context);
+        let node = hash(
+            data_dir
+                .to_str()
+                .context("Node data directory must be UTF-8")?,
+        );
+        let name = format!("vibeface-{}-{}", &node[..16], &key[..32]);
+        let mut scopes = self.scopes.lock().await;
+        if let Some(scope) = scopes.get(&key) {
+            ensure!(
+                !scope.stopped && scope.operations.contains_key(&context.operation_id),
+                "isolated operation generation is no longer active"
+            );
+            ensure!(
+                scope
+                    .operations
+                    .values()
+                    .all(|deadline| *deadline > vibeface_protocol::now_ms()),
+                "execution lease already expired; do not revive an operation"
+            );
+            self.verify_container(&scope.handle.id, &node, &key, &project, uid)
+                .await?;
+            return Ok(scope.handle.clone());
+        }
+        let scope_dir = data_dir.join("execution").join(&key);
+        let home = scope_dir.join("home");
+        let control = scope_dir.join("control");
+        for directory in [&scope_dir, &home, &control] {
+            crate::config::verify_private_dir(directory)?;
+        }
+        let operations: BTreeMap<String, u64> =
+            serde_json::from_slice(&std::fs::read(control.join("operations.json"))?)?;
+        ensure!(
+            operations.contains_key(&context.operation_id),
+            "stale operation cannot observe a different persisted generation"
+        );
+        let deadline = operations
+            .values()
+            .min()
+            .copied()
+            .context("isolated resource has no active operation")?;
+        ensure!(
+            deadline > vibeface_protocol::now_ms()
+                && std::fs::read_to_string(control.join("deadline"))? == deadline.to_string(),
+            "execution lease already expired or changed; do not revive an operation"
+        );
+        let id = std::fs::read_to_string(control.join("container-id"))?;
+        let container = self
+            .inspect(&name)
+            .await?
+            .context("original isolated container is missing")?;
+        ensure!(
+            container["Id"].as_str() == Some(id.as_str()),
+            "persisted execution belongs to a different container generation"
+        );
+        self.verify_container(&id, &node, &key, &project, uid)
+            .await?;
+        let (_, gateway_url) = self.egress_network(&node, &key, false).await?;
+        let handle = IsolatedProcess {
+            config: self.config.clone(),
+            name,
+            id,
+            control,
+            gateway_url,
+        };
+        scopes.insert(
+            key,
+            IsolatedScope {
+                handle: handle.clone(),
+                operations,
                 codex: None,
                 stopped: false,
             },
@@ -371,7 +467,7 @@ impl DockerIsolation {
                 && scope.operations.contains_key(&context.operation_id),
             "isolated operation generation is no longer active"
         );
-        if scope.codex.is_none() {
+        if scope.codex.as_ref().is_none_or(CodexClient::is_stopped) {
             let mut command = scope.handle.command("codex");
             command.args(["app-server", "--listen", "stdio://"]);
             if let Some(egress) = &self.config.egress {
@@ -1129,6 +1225,126 @@ mod tests {
         other.resource_id = ResourceId::parse(&format!("res2_{}", "3".repeat(64))).unwrap();
         assert_ne!(DockerIsolation::scope_key(&other), key);
         assert!(bind_mount(Path::new("/project,src=/"), "/project").is_err());
+    }
+
+    #[tokio::test]
+    async fn observation_restores_only_the_original_live_generation_without_extending_its_lease()
+    -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("vfc-{}", uuid::Uuid::new_v4()));
+        let data = root.join("node");
+        let project = root.join("project");
+        crate::config::private_dir(&data)?;
+        std::fs::create_dir(&project)?;
+        let docker = root.join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}/docker-calls'\n[ \"$1 $2\" = 'container inspect' ] || exit 2\ncat '{}/container.json'\n",
+                root.display(),
+                root.display()
+            ),
+        )?;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700))?;
+        let settings = ExecutionIsolationConfig {
+            image: format!("sha256:{}", "a".repeat(64)),
+            docker_bin: docker,
+            egress: None,
+        };
+        let isolation = DockerIsolation::new(settings.clone(), data.clone());
+        let context = ExecutionContext {
+            space_id: SpaceId::parse(&format!("spc2_{}", "1".repeat(64)))?,
+            resource_id: ResourceId::from_bytes([2; 32]),
+            operation_id: "original-operation".into(),
+            shared: true,
+            lease_expires_at_ms: 0,
+        };
+        let node = hash(data.canonicalize()?.to_str().unwrap());
+        let key = isolation.key(&context);
+        let execution = private_child(&data, "execution")?;
+        let scope = private_child(&execution, &key)?;
+        let home = private_child(&scope, "home")?;
+        let control = private_child(&scope, "control")?;
+        let deadline = vibeface_protocol::now_ms() + 30_000;
+        let operations =
+            serde_json::to_vec(&BTreeMap::from([(context.operation_id.clone(), deadline)]))?;
+        crate::config::private_write(&control.join("operations.json"), &operations)?;
+        crate::config::private_write(&control.join("deadline"), deadline.to_string().as_bytes())?;
+        crate::config::private_write(&control.join("container-id"), b"original-container")?;
+        let container = serde_json::json!([{
+            "Id":"original-container", "State":{"Running":true},
+            "Config":{"Image":settings.image,"User":format!("{}:{}", crate::config::effective_uid(), effective_gid()),
+                "Labels":{"vibeface.node":node,"vibeface.scope":key,"vibeface.project-read-only":"false","vibeface.project":hash(project.canonicalize()?.to_str().unwrap())},
+                "Entrypoint":["/usr/bin/env"],"Cmd":["-i","PATH=/usr/local/bin:/usr/bin:/bin","HOME=/home/vibeface","/usr/bin/python3","-I","-S","-c",WATCHDOG]},
+            "HostConfig":{"ReadonlyRootfs":true,"Privileged":false,"NetworkMode":"none","CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"],"RestartPolicy":{"Name":"no"},"PidMode":"","IpcMode":"private"},
+            "Mounts":[{"Type":"bind","Destination":"/project","Source":project.canonicalize()?,"RW":true},
+                {"Type":"bind","Destination":CONTAINER_HOME,"Source":home.canonicalize()?,"RW":true},
+                {"Type":"bind","Destination":"/run/vibeface-control","Source":control.canonicalize()?,"RW":false}],
+            "NetworkSettings":{"Networks":{"none":{}}}
+        }]);
+        std::fs::write(root.join("container.json"), serde_json::to_vec(&container)?)?;
+        let restored = isolation.restore(&context, &project).await?;
+        assert_eq!(restored.id, "original-container");
+        assert_eq!(std::fs::read(control.join("operations.json"))?, operations);
+        assert_eq!(
+            std::fs::read_to_string(control.join("deadline"))?,
+            deadline.to_string()
+        );
+        let mut unknown = context.clone();
+        unknown.operation_id = "new-operation".into();
+        assert!(isolation.restore(&unknown, &project).await.is_err());
+        isolation.scopes.lock().await.clear();
+        assert!(isolation.restore(&unknown, &project).await.is_err());
+        crate::config::private_write(&control.join("container-id"), b"replacement-container")?;
+        assert!(isolation.restore(&context, &project).await.is_err());
+        crate::config::private_write(&control.join("container-id"), b"original-container")?;
+        let mut stopped = container;
+        stopped[0]["State"]["Running"] = false.into();
+        std::fs::write(root.join("container.json"), serde_json::to_vec(&stopped)?)?;
+        assert!(isolation.restore(&context, &project).await.is_err());
+        crate::config::private_write(&control.join("deadline"), b"0")?;
+        assert!(isolation.restore(&context, &project).await.is_err());
+        crate::config::private_write(
+            &control.join("operations.json"),
+            &serde_json::to_vec(&BTreeMap::from([(context.operation_id.clone(), 0)]))?,
+        )?;
+        assert!(
+            isolation
+                .restore(&context, &project)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("lease already expired")
+        );
+        let (events, _) = mpsc::unbounded_channel();
+        let engine = Engine::new(
+            ExecutorConfig {
+                execution_isolation: Some(settings),
+                data_dir: Some(data),
+                ..ExecutorConfig::default()
+            },
+            events,
+        );
+        engine
+            .fenced_operations
+            .lock()
+            .await
+            .insert(super::super::execution_generation(&context));
+        let error = engine
+            .restore_observed_thread(&context, "original-thread", &project)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("generation was fenced"));
+        let calls = std::fs::read_to_string(root.join("docker-calls"))?;
+        assert!(!calls.is_empty());
+        assert!(
+            calls
+                .lines()
+                .all(|line| line.starts_with("container inspect "))
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[tokio::test]

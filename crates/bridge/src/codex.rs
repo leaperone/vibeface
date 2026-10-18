@@ -126,6 +126,10 @@ impl CodexClient {
     pub async fn snapshot(&self) -> Value {
         self.cache.read().await.snapshot()
     }
+
+    pub fn is_stopped(&self) -> bool {
+        self.commands.is_closed()
+    }
 }
 
 struct Execute {
@@ -1233,7 +1237,7 @@ printf '%s\n' '{"id":"vibeface-2","result":{"thread":{"id":"t","status":{"type":
                     .unwrap_err()
                     .uncertain
             );
-            assert!(client.commands.is_closed());
+            assert!(client.is_stopped());
         })
         .await
         .expect("mock stdio process must finish");
@@ -1252,7 +1256,7 @@ printf '%s\n' '{"id":"vibeface-2","result":{"thread":{"id":"t","status":{"type":
             .unwrap();
         assert_eq!(event["method"], "bridge.codex_disconnected");
         assert_eq!(event["params"]["reason"], "Codex process failed to start");
-        assert!(client.commands.is_closed());
+        assert!(client.is_stopped());
         assert!(
             !client
                 .execute(&Command::StartThread {

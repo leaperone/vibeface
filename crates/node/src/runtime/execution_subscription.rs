@@ -46,6 +46,7 @@ impl Runtime {
                             network.clone(),
                             request.operation_id.clone(),
                             native_id,
+                            session.cwd,
                             context,
                         ));
                     }
@@ -53,10 +54,10 @@ impl Runtime {
             }
             operations
         };
-        for (network, operation, native_id, context) in operations {
+        for (network, operation, native_id, cwd, context) in operations {
             if let Err(error) = self
                 .engine
-                .restore_observed_thread(&context, &native_id)
+                .restore_observed_thread(&context, &native_id, std::path::Path::new(&cwd))
                 .await
             {
                 tracing::debug!(%error, operation_id=%operation, "execution observation pending");

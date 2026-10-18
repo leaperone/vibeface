@@ -241,14 +241,31 @@ impl Engine {
         &self,
         context: &ExecutionContext,
         native_id: &str,
+        project: &std::path::Path,
     ) -> Result<()> {
         vibeface_protocol::validate_id(native_id).map_err(anyhow::Error::msg)?;
+        let fenced = self.fenced_operations.lock().await;
+        ensure!(
+            !fenced.contains(&execution_generation(context)),
+            "execution generation was fenced; reconcile its original operation"
+        );
         let (codex, generation) = if context.shared {
-            let (codex, generation) = self
+            let isolation = self
                 .isolation
                 .as_ref()
-                .context("shared execution isolation is not configured")?
-                .existing_codex(context)
+                .context("shared execution isolation is not configured")?;
+            let prepared = isolation.restore(context, project).await?;
+            let generation = prepared.container_id().to_owned();
+            let codex = isolation
+                .codex(
+                    context,
+                    &prepared,
+                    codex_events(
+                        self.events.clone(),
+                        self.codex_contexts.clone(),
+                        Some(generation.clone()),
+                    ),
+                )
                 .await?;
             (codex, Some(generation))
         } else {
