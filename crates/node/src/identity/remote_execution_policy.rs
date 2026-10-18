@@ -1144,8 +1144,10 @@ mod tests {
             anyhow::bail!("history snapshot has no original acceptance");
         };
         receipt.payload.admitted_at_ms += 1;
+        *receipt = Signed::sign(receipt.payload.clone(), &signer(&fixture.executor.node)?)?;
         poisoned.snapshot =
             Signed::sign(poisoned.snapshot.payload, &signer(&fixture.executor.node)?)?;
+        poisoned.position.previous_page_hash = poisoned.snapshot.hash()?;
         target.connection.execute(
             "UPDATE identity_meta SET value=? WHERE key=?",
             params![encode(&poisoned)?, &key],
