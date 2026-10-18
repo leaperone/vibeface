@@ -1158,13 +1158,13 @@ pub(crate) mod tests {
         unreachable!()
     }
 
-    #[test]
-    fn account_observation_requires_current_readonly_policy_and_exact_original_wire() -> Result<()>
-    {
-        use vibeface_secure::authorization::{
-            execution_observation::ExecutionObservationRequest,
-            remote_execution_policy::RemoteExecutionPolicySelection,
-        };
+    #[inline(never)]
+    fn readonly_observation_fixture() -> Result<(
+        UnseededFixture,
+        ObjectHash,
+        vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicySelection,
+        vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+    )> {
         let project = TestNetwork::new()?;
         let executor = TestNetwork::new()?;
         let local = PublicKey::parse(&project.node.public_key_hex()?)?;
@@ -1295,6 +1295,31 @@ pub(crate) mod tests {
         )?;
         let writer = import_current_policy(&mut fixture)?;
         let original = admit_unseeded_dispatch(&mut fixture, &writer)?;
+        let selection = vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicySelection {
+            execution_grant: readonly_grant.hash()?, ..writer_selection
+        };
+        Ok((fixture, source_grant.hash()?, selection, original))
+    }
+
+    #[test]
+    fn account_observation_requires_current_readonly_policy_and_exact_original_wire() -> Result<()>
+    {
+        let (fixture, source_grant, selection, original) = readonly_observation_fixture()?;
+        check_readonly_observation(fixture, source_grant, selection, original)
+    }
+
+    #[inline(never)]
+    fn check_readonly_observation(
+        mut fixture: UnseededFixture,
+        source_grant: ObjectHash,
+        selection: vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicySelection,
+        original: vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+    ) -> Result<()> {
+        use vibeface_secure::authorization::execution_observation::ExecutionObservationRequest;
+        let local = PublicKey::parse(&fixture.project.node.public_key_hex()?)?;
+        let project_ref = fixture.intent.payload.source_selection.resource.clone();
+        let audience = fixture.intent.payload.source_selection.audience.clone();
+        let writer_selection = fixture.intent.payload.selection.clone();
         assert!(carrier(|| fixture
             .store
             .execution_dispatch_uses_task_policy(
@@ -1327,13 +1352,9 @@ pub(crate) mod tests {
                 &association.approval_ref,
             )
         })?;
-        let selection = RemoteExecutionPolicySelection {
-            execution_grant: readonly_grant.hash()?,
-            ..writer_selection.clone()
-        };
         assert_ne!(selection.execution_grant, writer_selection.execution_grant);
         assert_ne!(
-            source_grant.hash()?,
+            source_grant.clone(),
             fixture.project.bundle.grant_leaf.clone()
         );
         let source = carrier(|| {
@@ -1345,7 +1366,7 @@ pub(crate) mod tests {
                 AuthorizationSelection {
                     resource: project_ref,
                     audience,
-                    grant_leaf: source_grant.hash()?,
+                    grant_leaf: source_grant.clone(),
                 },
                 &fixture.project.pins,
                 now(),
