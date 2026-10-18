@@ -576,12 +576,18 @@ pub fn restore_sdk_source_provenance(
             "original SDK policy read changed its complete child context or action",
         )?;
     } else {
+        let original_context = original_request.context()?;
         require(
             matches!(
                 verified.facts.action,
                 Action::OperationStatusRead | Action::OperationResolve | Action::OperationReconcile
             ) && original_request.expected_action() == verified.facts.action,
             "original SDK History read has no readonly child source",
+        )?;
+        require(
+            verified.facts.context.task == original_context.context.task
+                && verified.facts.context.conversation == original_context.context.conversation,
+            "original SDK History read changed its source Task or conversation",
         )?;
     }
     require(
