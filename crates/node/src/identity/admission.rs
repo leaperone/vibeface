@@ -1936,6 +1936,15 @@ pub(crate) fn sdk_policy_source_provenance_in(
             && compact.sdk_trigger.as_str() == sdk_session.session_id,
         "SDK policy source changed its compact signed origin"
     );
+    let parent_event = super::services::agent_account_message(&events, &sdk_session.session_id)?;
+    let EventCause::Invocation { admission: parent } = &parent_event.event.cause else {
+        anyhow::bail!("SDK policy source Account message has no original admission");
+    };
+    ensure!(
+        parent.invocation == compact.invocation,
+        "SDK policy source changed its original Account body provenance"
+    );
+    let origin_source_body = parent.source_body.clone();
     let task = facts
         .context
         .task
@@ -2000,6 +2009,7 @@ pub(crate) fn sdk_policy_source_provenance_in(
     let provenance = SdkPolicySourceProvenance {
         version: AUTH_VERSION,
         origin: compact,
+        origin_source_body,
         session: SdkPolicySession {
             space_id: descriptor.space_id,
             resource_id: descriptor.resource_id,
