@@ -184,7 +184,7 @@ fn snapshot_id(
     )?)
 }
 
-fn check_heads_in(
+pub(crate) fn check_heads_in(
     connection: &Connection,
     policy: &PolicyState,
     heads: &[PolicyStamp],
