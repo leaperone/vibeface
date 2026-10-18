@@ -3855,7 +3855,7 @@ pub(crate) mod tests {
         cached_without_crypto(&store, &stored.proof, &facts)?;
         for sql in [
             "UPDATE accepted_authorizations SET operation_id=NULL WHERE authorization_id=?",
-            "UPDATE operations SET request=json_set(request,'$.session_id','changed') WHERE operation_id=?",
+            "UPDATE operations SET target_node='changed',request=json_set(request,'$.target_node','changed') WHERE operation_id=?",
         ] {
             let tx = store.connection.unchecked_transaction()?;
             assert_eq!(tx.execute(sql, [&request.operation_id])?, 1);

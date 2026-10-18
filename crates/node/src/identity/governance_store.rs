@@ -2224,10 +2224,20 @@ mod tests {
             service: ServiceId::from_key(&remote_key),
             device: DeviceId::from_key(&remote_key),
         };
-        grant.actions = vec![Action::ResourceManage];
         grant.issued_under = team_head.clone();
         grant.nonce = Nonce::random()?;
         let grant = Signed::sign(grant, &team_root)?;
+        let current_project = local
+            .policy
+            .verified()
+            .resource(&source.space, &source.resource)
+            .context("team source Project missing")?;
+        let previous_project = current_project.hash()?;
+        let mut project = current_project.payload.clone();
+        project.host = ServiceId::from_key(&remote_key);
+        project.issued_under = team_head.clone();
+        project.nonce = Nonce::random()?;
+        let project = Signed::sign(project, &team_root)?;
         let mut team = local
             .policy
             .verified()
@@ -2243,11 +2253,15 @@ mod tests {
         team.devices.sort();
         team.grants.push(grant.hash()?);
         team.grants.sort();
+        team.resources.retain(|hash| hash != &previous_project);
+        team.resources.push(project.hash()?);
+        team.resources.sort();
         local.install_policy_journal(
             &[
                 JournalEntry::Device(certificate),
                 JournalEntry::Account(Signed::sign(account, &network.root)?),
                 JournalEntry::Grant(grant.clone()),
+                JournalEntry::Resource(project),
                 JournalEntry::Space(Signed::sign(team, &team_root)?),
             ],
             now(),
@@ -2262,7 +2276,7 @@ mod tests {
         drop(statement);
         let bundle = ClientAuthorizationBundle {
             journal,
-            grant_leaf: team_bundle.grant_leaf.clone(),
+            grant_leaf: grant.hash()?,
         };
         let remote_journal: Vec<_> = bundle
             .journal
