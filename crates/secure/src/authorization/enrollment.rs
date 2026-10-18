@@ -2194,6 +2194,179 @@ mod tests {
     }
 
     #[test]
+    fn manager_approves_the_fixed_offer_using_its_own_confirmed_client() {
+        let mut f = Fixture::new();
+        let authorization = f.authorization();
+        let offer_json = create_device_enrollment_offer(
+            &key(3),
+            f.account().as_str(),
+            "https://node.example",
+            &key(4).public_key_hex(),
+            "[]",
+            END as f64,
+            &authorization,
+            NOW as f64,
+        )
+        .unwrap();
+        let descriptor = verify_device_enrollment_offer(&offer_json, NOW as f64).unwrap();
+        let offer_hash = descriptor.offer_hash().unwrap();
+        let intent = f.intent(5, vec![]);
+        let intent_json = encode(&intent).unwrap();
+        let expected_key = intent.new_device_public_key.to_string();
+        let verification = crate::signature_verification::SignatureVerification::new();
+        let canonical_json = verification
+            .run(|| {
+                verify_device_enrollment_intent_for_manager(
+                    &authorization,
+                    &descriptor,
+                    &offer_hash,
+                    &intent_json,
+                    &expected_key,
+                    NOW as f64,
+                )
+            })
+            .unwrap();
+        assert!(verification.counts().actual_verifications > 0);
+        assert!(verification.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
+        assert_eq!(canonical_json.as_bytes(), canonical(&intent).unwrap());
+        let signed =
+            sign_device_enrollment_intent(&canonical_json, &key(3), &authorization, NOW as f64)
+                .unwrap();
+        let approved: Signed<DeviceEnrollmentIntent> = parse(&signed).unwrap();
+        assert_eq!(approved.issuer, PublicKey::of(&key(3)));
+        assert_eq!(approved.payload, intent);
+        for field in 0..8 {
+            let mut changed = intent.clone();
+            match field {
+                0 => changed.target = DeviceId::from_key(&PublicKey::of(&key(19))),
+                1 => changed.requested_rights = vec![AccountRight::EnrollDevice],
+                2 => changed.certificate_expires_at_ms = END + 1,
+                3 => changed.certificate_not_before_ms = NOW - 1,
+                4 => changed.certificate_not_before_ms = NOW + 1,
+                5 => changed.account = AccountId::from_root(&PublicKey::of(&key(19))),
+                6 => changed.expected_heads[0].sequence += 1,
+                _ => changed.new_device_public_key = PublicKey::of(&key(19)),
+            }
+            assert!(
+                verify_device_enrollment_intent_for_manager(
+                    &authorization,
+                    &descriptor,
+                    &offer_hash,
+                    &encode(&changed).unwrap(),
+                    &expected_key,
+                    NOW as f64
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            verify_device_enrollment_intent_for_manager(
+                &authorization,
+                &descriptor,
+                &ObjectHash::body(&"another scanned offer")
+                    .unwrap()
+                    .to_string(),
+                &intent_json,
+                &expected_key,
+                NOW as f64
+            )
+            .is_err()
+        );
+        assert!(
+            verify_device_enrollment_intent_for_manager(
+                &authorization,
+                &descriptor,
+                &offer_hash,
+                &intent_json,
+                &key(19).public_key_hex(),
+                NOW as f64
+            )
+            .is_err()
+        );
+        assert!(
+            verify_device_enrollment_intent_for_manager(
+                &authorization,
+                &descriptor,
+                &offer_hash,
+                &intent_json,
+                &expected_key,
+                descriptor.expires_at_ms()
+            )
+            .is_err()
+        );
+        assert!(
+            verify_device_enrollment_intent_for_manager(
+                &authorization,
+                &descriptor,
+                &offer_hash,
+                &format!("{}{}", " ".repeat(MAX_PROOF_BYTES), intent_json),
+                &expected_key,
+                NOW as f64
+            )
+            .is_err()
+        );
+        let unconfirmed = verify_client_authorization(
+            &f.bundle_json(),
+            &f.pins_json(),
+            f.account().as_str(),
+            SpaceId::personal(&f.account()).as_str(),
+            &key(3).public_key_hex(),
+            NOW as f64,
+        )
+        .unwrap();
+        assert!(
+            verify_device_enrollment_intent_for_manager(
+                &unconfirmed,
+                &descriptor,
+                &offer_hash,
+                &intent_json,
+                &expected_key,
+                NOW as f64
+            )
+            .is_err()
+        );
+        let mut wrong_manager: Signed<EnrollmentOffer> = parse(&offer_json).unwrap();
+        wrong_manager = Signed::sign(wrong_manager.payload, &key(2)).unwrap();
+        let wrong_manager_json = encode(&wrong_manager).unwrap();
+        let wrong_descriptor =
+            verify_device_enrollment_offer(&wrong_manager_json, NOW as f64).unwrap();
+        assert!(
+            verify_device_enrollment_intent_for_manager(
+                &authorization,
+                &wrong_descriptor,
+                &wrong_descriptor.offer_hash().unwrap(),
+                &intent_json,
+                &expected_key,
+                NOW as f64
+            )
+            .is_err()
+        );
+        let mut state = f.state();
+        let mut document = next_document(&state, &f.account()).unwrap();
+        document.enrollment.clear();
+        let signed = Signed::sign(document, &key(1)).unwrap();
+        let head = state.install_account(signed.clone()).unwrap();
+        f.bundle.journal.push(JournalEntry::Account(signed));
+        f.pins
+            .iter_mut()
+            .find(|pin| pin.domain == head.domain)
+            .unwrap()
+            .minimum_head = Some(head);
+        let current = f.authorization();
+        assert!(
+            verify_device_enrollment_intent_for_manager(
+                &current,
+                &descriptor,
+                &offer_hash,
+                &intent_json,
+                &expected_key,
+                NOW as f64
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn historical_root_and_recovery_keys_cannot_be_enrolled_as_daily_devices() {
         let f = Fixture::new();
         let mut state = f.state();

@@ -352,11 +352,14 @@ pub fn verify_enrollment_intent_in_state(
     intent: &DeviceEnrollmentIntent,
     expected_new_device: &PublicKey,
     now: u64,
-) -> Result<()> {
+) -> Result<ExecutionProofUsage> {
     let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
-    verify_enrollment_offer_current(state, signed, now)?;
+    let mut usage = verify_enrollment_offer_current(state, signed, now)?;
     verify_intent_descriptor(signed, intent, expected_new_device, now)?;
-    independent_device_key(state, &intent.account, expected_new_device)
+    independent_device_key(state, &intent.account, expected_new_device)?;
+    usage.record_metadata(intent)?;
+    usage.enforce_limits()?;
+    Ok(usage)
 }
 
 pub fn verify_enrollment_record_history(
@@ -763,6 +766,64 @@ fn intent_state_from_offer(
         now,
     )?;
     Ok(offer.snapshot.state().clone())
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyDeviceEnrollmentIntentForManager))]
+pub fn verify_device_enrollment_intent_for_manager(
+    authorization: &VerifiedClientAuthorization,
+    offer: &EnrollmentOfferDescriptor,
+    expected_offer_hash: &str,
+    intent_json: &str,
+    expected_new_device_public_key: &str,
+    now_ms: f64,
+) -> crate::Result<String> {
+    let _signature_scope = crate::signature_verification::ScopedSignatureVerification::new();
+    let verify = || -> Result<String> {
+        let now = time(now_ms)?;
+        let expected_hash = ObjectHash::parse(expected_offer_hash)?;
+        let expected_new_device = PublicKey::parse(expected_new_device_public_key)?;
+        let intent: DeviceEnrollmentIntent = parse(intent_json)?;
+        let canonical_intent = canonical(&intent)?;
+        let input = canonical(&(
+            &offer.signed,
+            expected_offer_hash,
+            intent_json,
+            expected_new_device_public_key,
+            now,
+        ))?;
+        require(
+            input
+                .len()
+                .checked_add(canonical_intent.len())
+                .is_some_and(|bytes| bytes <= MAX_PROOF_BYTES),
+            "manager enrollment verification carrier exceeds 64 KiB",
+        )?;
+        require(
+            enrollment_offer_hash(&offer.signed)? == expected_hash
+                && authorization.scope.account_id == offer.signed.payload.account
+                && authorization.scope.space_id == SpaceId::personal(&offer.signed.payload.account)
+                && authorization.scope.device_id == DeviceId::from_key(&offer.signed.issuer),
+            "manager enrollment approval changed its fixed offer or authenticated manager",
+        )?;
+        let snapshot = confirmed_policy(authorization, now)?;
+        let mut usage = verify_enrollment_intent_in_state(
+            snapshot.state(),
+            &offer.signed,
+            &intent,
+            &expected_new_device,
+            now,
+        )?;
+        usage.record_budget(&authorization.budget)?;
+        usage.record_metadata(&(&intent, &expected_hash, &expected_new_device, now))?;
+        if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts()
+        {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
+        String::from_utf8(canonical_intent)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid enrollment intent UTF-8"))
+    };
+    verify().map_err(|error| error.to_string())
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyDeviceEnrollmentIntentForOffer))]
