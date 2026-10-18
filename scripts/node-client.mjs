@@ -816,21 +816,24 @@ async function command(input) {
   if (input.op === 'create_device_invitation') {
     const auth = authorizations.get(connectionName);
     assert(auth, 'device invitation requires current manager authorization');
+    const selectedTrust = savedTrust(auth.trustRef);
     assert.equal(typeof input.endpoint, 'string', 'device invitation requires an explicit reachable origin');
-    const encoded = crypto.createDeviceEnrollmentOffer(identity(), trust.scope.account_id,
+    const encoded = crypto.createDeviceEnrollmentOffer(identity(connection.identityName), selectedTrust.scope.account_id,
       input.endpoint, connection.nodePublicKey, input.relay === true,
       JSON.stringify(input.rights || []), auth.policy.account_enrollment_expires_at_ms, auth.verified, Date.now());
     const offered = JSON.parse(encoded);
     const published = await identityRequest(connection, 'enrollment_offer_publish', { offer: offered });
     const reference = JSON.parse(crypto.parseDeviceEnrollmentReference(JSON.stringify(published.reference), Date.now()));
     assert.equal(reference.offer_hash, published.offer_hash);
-    assert.equal(reference.account_id, trust.scope.account_id);
+    assert.equal(reference.account_id, selectedTrust.scope.account_id);
     assert.equal(reference.node_public_key, connection.nodePublicKey);
     return reference;
   }
   if (input.op === 'approve_device' || input.op === 'complete_device') {
     const auth = authorizations.get(connectionName);
     assert(auth, 'device approval requires current manager authorization');
+    const selectedTrust = savedTrust(auth.trustRef);
+    const signer = identity(connection.identityName);
     const reference = input.reference;
     const params = { account_id: reference.account_id, offer_hash: reference.offer_hash, request_id: input.request_id };
     const response = await identityRequest(connection, 'enrollment_offer_get', params);
@@ -840,7 +843,7 @@ async function command(input) {
       crypto.verifyDeviceEnrollmentIntentForManager(auth.verified, descriptor, reference.offer_hash,
         JSON.stringify(request.unsigned_intent), request.new_device_public_key, Date.now());
       if (input.op === 'approve_device') {
-        const intent = JSON.parse(crypto.signDeviceEnrollmentIntent(JSON.stringify(request.unsigned_intent), identity(), auth.verified, Date.now()));
+        const intent = JSON.parse(crypto.signDeviceEnrollmentIntent(JSON.stringify(request.unsigned_intent), signer, auth.verified, Date.now()));
         return await identityRequest(connection, 'enrollment_approve', { ...params, intent });
       }
       assert.equal(request.status, 'possessed', 'new device must prove possession before completion');
@@ -848,10 +851,10 @@ async function command(input) {
       let prepared;
       let completed;
       try {
-        prepared = crypto.prepareAccountDeviceEnrollment(qualified, JSON.stringify(request.certificate), identity(), auth.verified, Date.now());
+        prepared = crypto.prepareAccountDeviceEnrollment(qualified, JSON.stringify(request.certificate), signer, auth.verified, Date.now());
         const receipt = await identityRequest(connection, 'account_device_commit', { request: JSON.parse(prepared.requestJson()), request_id: input.request_id });
         completed = crypto.finishAccountDeviceChange(prepared, JSON.stringify(receipt.committed), Date.now());
-        trust.pins = JSON.parse(completed.pinsJson());
+        saveTrust(auth.trustRef, { ...selectedTrust, pins: JSON.parse(completed.pinsJson()) });
         return { completed: true };
       } finally { completed?.free(); prepared?.free(); qualified.free(); }
     } finally { descriptor.free(); }
