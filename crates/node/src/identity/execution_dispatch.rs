@@ -1049,6 +1049,132 @@ fn retained_dispatch_from(
     Ok(RetainedDispatch { source:source.clone(), admission, request })
 }
 
+pub(super) fn retained_execution_history_reference_in(
+    connection: &Connection,
+    identity: &LocalIdentity,
+    reference: &vibeface_secure::authorization::remote_execution_history::RemoteExecutionHistoryReference,
+) -> Result<vibeface_secure::authorization::execution_handoff::ExecutionProofUsage> {
+    use vibeface_secure::authorization::{
+        execution_handoff::{ExecutionProofUsage, SignedExecutionHandoff},
+        remote_execution_history::{
+            RemoteExecutionHistoryKind, RemoteExecutionHistoryReference,
+            derive_remote_execution_history_reference, validate_remote_execution_history_reference,
+        },
+    };
+    validate_remote_execution_history_reference(reference)?;
+    let project = &reference.source.payload.project;
+    let operation = &reference.source.payload.operation_id;
+    let encoded: String = connection.query_row(
+        "SELECT value FROM local_values WHERE space_id=? AND key=?",
+        params![
+            project.space.as_str(),
+            format!("project-execution-handoff:{operation}")
+        ],
+        |row| row.get(0),
+    )?;
+    let original: SignedExecutionHandoff = serde_json::from_str(&encoded)?;
+    let retained = retained_dispatch_from(connection, identity, &original)?;
+    crate::crypto::verify_signed_event(
+        project.space.as_str(),
+        &retained.source,
+        &identity.public_key_hex()?,
+    )?;
+    super::event_authorization::validate_retained_event_dependencies_in(
+        connection,
+        &retained.source,
+    )?;
+    ensure!(
+        original.handoff.source_attestation.as_ref() == Some(&reference.source)
+            && original.hash()? == reference.handoff_hash
+            && original.handoff.target_public_key == *reference.target_public_key()
+            && original.handoff.execution_resource == *reference.execution_resource()
+            && retained.source.hash == reference.dispatch_ref.as_str()
+            && ObjectHash::body(&retained.source)? == reference.dispatch_envelope_hash,
+        "history changed its original durable Project handoff or ready dispatch"
+    );
+    let (actual, account, binding) = match reference.kind {
+        RemoteExecutionHistoryKind::ExecutionResult => {
+            ensure!(
+                original.invocation == reference.old_submission,
+                "execution history changed its original submitted invocation"
+            );
+            let (state, encoded): (String, String) = connection.query_row(
+                "SELECT state,result FROM operations WHERE space_id=? AND operation_id=?",
+                params![project.space.as_str(), operation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let value: Value = serde_json::from_str(&encoded)?;
+            let matching = !value.is_null() && ObjectHash::body(&value)? == reference.actual_hash;
+            let state: OperationState = serde_json::from_str(&state)?;
+            ensure!(
+                matching || !state.terminal(),
+                "history has no matching immutable Project execution result"
+            );
+            (
+                matching.then_some(value),
+                retained.admission.clone(),
+                retained.request.binding.clone(),
+            )
+        }
+        RemoteExecutionHistoryKind::UnknownResolution
+        | RemoteExecutionHistoryKind::TerminalReconciliation => {
+            let (actual, wire) =
+                super::execution_dispatch_resolution::retained_history_resolution_in(
+                    connection, identity, reference,
+                )?;
+            ensure!(
+                wire.resolution.observation.handoff == original,
+                "resolution history changed its original durable execution handoff"
+            );
+            (actual, wire.resolution.account_admission, None)
+        }
+    };
+    account.invocation.verify_signature()?;
+    ensure!(
+        account.invocation.hash()? == reference.account_invocation_hash
+            && ObjectHash::body(&account.invocation)? == reference.expected_invocation_hash
+            && ObjectHash::body(&account.source_body)? == reference.expected_body_hash
+            && account.admitted_at_ms == reference.account_admitted_at_ms
+            && binding.as_ref().map(ObjectHash::body).transpose()?
+                == reference.expected_binding_hash,
+        "history changed its original complete Account request or binding"
+    );
+    if let Some(actual) = actual {
+        let derived: RemoteExecutionHistoryReference = serde_json::from_str(
+            &derive_remote_execution_history_reference(
+                &serde_json::to_string(&actual)?,
+                &serde_json::to_string(&account.source_body)?,
+                &serde_json::to_string(&account.invocation)?,
+                &serde_json::to_string(&binding)?,
+            )
+            .map_err(anyhow::Error::msg)?,
+        )?;
+        ensure!(
+            derived == *reference,
+            "history changed its complete original Project artifact"
+        );
+    }
+    let mut usage = ExecutionProofUsage::default();
+    usage.record_retained_event(&retained.source)?;
+    usage.record_signed(&reference.source)?;
+    usage.record_signed(&reference.old_submission)?;
+    usage.record_signed(&reference.observation_receipt)?;
+    usage.record_signed(&account.invocation)?;
+    if let Some(proof) = &reference.terminal_freshness {
+        usage.record_metadata(&proof.challenge)?;
+        for receipt in &proof.receipts {
+            usage.record_signed(receipt)?;
+        }
+    }
+    if let Some(binding) = &binding {
+        crate::binding::verify_binding(binding, &identity.public_key_hex()?)?;
+        usage.record_binding(binding)?;
+    }
+    usage.record_metadata(reference)?;
+    usage.enforce_limits()?;
+    Ok(usage)
+}
+
 fn retained_dispatch_authorization(
     policy: &VerifiedPolicySet,
     retained: &RetainedDispatch,

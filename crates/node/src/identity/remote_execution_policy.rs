@@ -12,12 +12,14 @@ use vibeface_secure::{
         AUTH_VERSION, Action, DeviceId, MAX_PROOF_BYTES, Nonce, ObjectHash, PublicKey, Signed,
         execution_handoff::ExecutionProofUsage,
         policy_proof::policy_entry_payload_usage,
+        remote_execution_history::RemoteExecutionHistoryAcceptance,
         remote_execution_policy::{
             RemoteExecutionPolicyPage, RemoteExecutionPolicyPageRequest,
-            RemoteExecutionPolicyReadDelegation, RemoteExecutionPolicyReadIntent,
-            RemoteExecutionPolicyReadRequest, RemoteExecutionPolicySnapshot,
-            RemoteExecutionPolicyWitness, VerifiedRemoteExecutionPolicyRead,
-            sign_remote_execution_policy_read_delegation,
+            RemoteExecutionPolicyPurpose, RemoteExecutionPolicyReadDelegation,
+            RemoteExecutionPolicyReadIntent, RemoteExecutionPolicyReadRequest,
+            RemoteExecutionPolicySnapshot, RemoteExecutionPolicyWitness,
+            VerifiedRemoteExecutionPolicyRead, sign_remote_execution_policy_read_delegation,
+            verify_remote_execution_history_policy_read,
             verify_remote_execution_policy_delegation_source, verify_remote_execution_policy_read,
         },
     },
@@ -252,17 +254,47 @@ fn verify_read(
     local: &PublicKey,
     principal: &str,
     now: u64,
-) -> Result<VerifiedRemoteExecutionPolicyRead> {
-    let verified = verify_remote_execution_policy_read(
-        policy.verified(),
-        request,
-        local,
-        &PublicKey::parse(principal)?,
-        now,
-    )?;
+) -> Result<(
+    VerifiedRemoteExecutionPolicyRead,
+    Option<RemoteExecutionHistoryAcceptance>,
+    ExecutionProofUsage,
+)> {
+    let principal = PublicKey::parse(principal)?;
+    let (verified, history, mut usage) = if request.intent.payload.purpose
+        == RemoteExecutionPolicyPurpose::History
+    {
+        let reference = request
+            .intent
+            .payload
+            .history
+            .as_ref()
+            .context("history policy request has no original artifact reference")?;
+        let (acceptance, usage) = super::execution_handoff::remote_execution_history_acceptance_in(
+            connection, local, reference,
+        )?;
+        let verified = verify_remote_execution_history_policy_read(
+            policy.verified(),
+            request,
+            &acceptance,
+            local,
+            &principal,
+            now,
+        )?;
+        (verified, Some(acceptance), usage)
+    } else {
+        let verified = verify_remote_execution_policy_read(
+            policy.verified(),
+            request,
+            local,
+            &principal,
+            now,
+        )?;
+        (verified, None, ExecutionProofUsage::default())
+    };
+    usage.merge(verified.proof_usage());
     check_heads_in(connection, policy, verified.target_heads())?;
     policy.accepted_journal_snapshot(connection)?;
-    Ok(verified)
+    Ok((verified, history, usage))
 }
 
 fn cursor_hash(
@@ -292,7 +324,8 @@ fn verify_record(
     Option<Signed<RemoteExecutionPolicyPage>>,
     ExecutionProofUsage,
 )> {
-    let verified = verify_read(connection, policy, &record.request, local, principal, now)?;
+    let (verified, history, mut usage) =
+        verify_read(connection, policy, &record.request, local, principal, now)?;
     let snapshot = &record.snapshot.payload;
     ensure!(
         record.snapshot.issuer == *local
@@ -308,6 +341,7 @@ fn verify_record(
                 )?
             && snapshot.target_heads == verified.target_heads()
             && snapshot.source_node_public_key == *local
+            && snapshot.history == history
             && record.request.delegation.payload.issued_at_ms <= snapshot.issued_at_ms
             && snapshot.issued_at_ms <= now
             && now < snapshot.expires_at_ms
@@ -324,7 +358,6 @@ fn verify_record(
             && binding.snapshot_id == snapshot.snapshot_id,
         "remote execution policy request binding changed"
     );
-    let mut usage = verified.proof_usage().clone();
     record_request_usage(&mut usage, &record.request)?;
     usage.record_signed(&record.snapshot)?;
     let cached: Option<Signed<RemoteExecutionPolicyPage>> =
@@ -427,7 +460,20 @@ impl Store {
         check_heads_in(&tx, &self.policy, verified.source_heads())?;
         self.policy.accepted_journal_snapshot(&tx)?;
         let mut usage = verified.proof_usage().clone();
-        check_source_task(&tx, &intent, &local, &mut usage)?;
+        if intent.payload.purpose == RemoteExecutionPolicyPurpose::History {
+            let reference = intent
+                .payload
+                .history
+                .as_ref()
+                .context("history policy request has no original artifact reference")?;
+            usage.merge(
+                &super::execution_dispatch::retained_execution_history_reference_in(
+                    &tx, identity, reference,
+                )?,
+            );
+        } else {
+            check_source_task(&tx, &intent, &local, &mut usage)?;
+        }
         let key = delegation_key(&intent);
         if let Some(encoded) = metadata(&tx, &key)? {
             let saved: DelegationRecord = serde_json::from_str(&encoded)?;
@@ -501,7 +547,8 @@ impl Store {
             let (_, _, usage) = verify_record(&tx, &self.policy, &record, &local, principal, now)?;
             return finish_response(params, json!({"snapshot":record.snapshot}), usage);
         }
-        let verified = verify_read(&tx, &self.policy, &request, &local, principal, now)?;
+        let (verified, history, mut usage) =
+            verify_read(&tx, &self.policy, &request, &local, principal, now)?;
         let journal_snapshot = self.policy.accepted_journal_snapshot(&tx)?;
         let snapshot_salt = Nonce::random()?;
         let id = snapshot_id(&hash, &journal_snapshot, &snapshot_salt)?;
@@ -513,6 +560,7 @@ impl Store {
                 saved_pins_hash: ObjectHash::body(&request.intent.payload.execution_pins)?,
                 target_heads: verified.target_heads().to_vec(),
                 source_node_public_key: local,
+                history,
                 issued_at_ms: now,
                 expires_at_ms: request.delegation.payload.expires_at_ms,
             },
@@ -532,7 +580,6 @@ impl Store {
             snapshot: snapshot.clone(),
             witness: None,
         };
-        let mut usage = verified.proof_usage().clone();
         record_request_usage(&mut usage, &request)?;
         usage.record_signed(&snapshot)?;
         let response = finish_response(params, json!({"snapshot":snapshot}), usage)?;

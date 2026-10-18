@@ -152,6 +152,71 @@ fn check_original_in(
     Ok((stored, proof))
 }
 
+pub(super) fn retained_history_resolution_in(
+    connection: &Connection,
+    identity: &LocalIdentity,
+    reference: &vibeface_secure::authorization::remote_execution_history::RemoteExecutionHistoryReference,
+) -> Result<(Option<Value>, SignedExecutionHandoffResolution)> {
+    use vibeface_secure::authorization::remote_execution_history::RemoteExecutionHistoryKind;
+    let saved = pending_from(
+        connection,
+        reference.source.payload.project.space.as_str(),
+        &reference.old_submission.payload.operation_id,
+    )?
+    .context("history has no original prepared Project resolution")?;
+    let account = &saved.wire.resolution.account_admission;
+    let (operation, _) =
+        check_original_in(connection, identity, &saved.wire.resolution.observation)?;
+    ensure!(
+        Some(saved.wire.hash()?) == reference.resolution_hash
+            && saved.wire.invocation == reference.old_submission
+            && account.invocation.hash()? == reference.account_invocation_hash
+            && ObjectHash::body(&account.invocation)? == reference.expected_invocation_hash
+            && ObjectHash::body(&account.source_body)? == reference.expected_body_hash
+            && account.admitted_at_ms == reference.account_admitted_at_ms
+            && match reference.kind {
+                RemoteExecutionHistoryKind::UnknownResolution => {
+                    saved.wire.resolution.purpose == ExecutionResolutionPurpose::ResolveUnknown
+                }
+                RemoteExecutionHistoryKind::TerminalReconciliation => {
+                    saved.wire.resolution.purpose == ExecutionResolutionPurpose::ReconcileTerminal
+                }
+                RemoteExecutionHistoryKind::ExecutionResult => false,
+            },
+        "history changed its original prepared Account decision or purpose"
+    );
+    let actual = if let Some(actual) = saved.result {
+        ensure!(
+            ObjectHash::body(&actual)? == reference.actual_hash
+                && resolution_wire_from(&actual)? == saved.wire,
+            "history changed its original acknowledged Project resolution"
+        );
+        Some(actual)
+    } else if reference.kind == RemoteExecutionHistoryKind::TerminalReconciliation {
+        let actual = serde_json::to_value(ExecutionHandoffTerminalReconciliationResult {
+            reconciliation: saved.wire.clone(),
+            freshness: reference
+                .terminal_freshness
+                .clone()
+                .context("terminal history has no original freshness proof")?,
+        })?;
+        ensure!(
+            ObjectHash::body(&actual)? == reference.actual_hash,
+            "terminal history changed its complete original proof"
+        );
+        Some(actual)
+    } else {
+        ensure!(
+            operation.state == OperationState::Unknown
+                && ObjectHash::body(&vibeface_secure::authorization::execution_handoff::execution_resolution_result(&saved.wire.resolution)?)?
+                    == reference.result_hash,
+            "unapplied resolution history changed its original unknown decision"
+        );
+        None
+    };
+    Ok((actual, saved.wire))
+}
+
 pub(crate) fn persisted_resolution_facts(
     connection: &Connection,
     proof: &AdmissionProof,

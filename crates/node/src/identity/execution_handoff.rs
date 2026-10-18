@@ -2125,6 +2125,145 @@ fn stored_resolution_from(
     }))
 }
 
+pub(super) fn remote_execution_history_acceptance_in(
+    connection: &Connection,
+    local: &PublicKey,
+    reference: &vibeface_secure::authorization::remote_execution_history::RemoteExecutionHistoryReference,
+) -> Result<(
+    vibeface_secure::authorization::remote_execution_history::RemoteExecutionHistoryAcceptance,
+    ExecutionProofUsage,
+)> {
+    use vibeface_secure::authorization::remote_execution_history::{
+        RemoteExecutionHistoryAcceptance, RemoteExecutionHistoryKind,
+        RemoteExecutionHistoryReference, derive_remote_execution_history_reference,
+    };
+    let stored = stored_from(
+        connection,
+        reference.execution_resource().space.as_str(),
+        reference.source.payload.project.space.as_str(),
+        &reference.source.payload.operation_id,
+    )?
+    .context("history has no original executor acceptance")?;
+    verify_local_handoff_checkpoint(connection, &stored)?;
+    ensure!(
+        &stored.wire.handoff.target_public_key == local
+            && reference.target_public_key() == local
+            && stored.wire.hash()? == reference.handoff_hash
+            && stored.wire.handoff.execution_resource == *reference.execution_resource()
+            && stored.wire.handoff.source_attestation.as_ref() == Some(&reference.source)
+            && stored.wire.handoff.source_statement()? == reference.source.payload
+            && stored.wire.handoff.project_dispatch.hash == reference.dispatch_ref.as_str()
+            && ObjectHash::body(&stored.wire.handoff.project_dispatch)?
+                == reference.dispatch_envelope_hash,
+        "history reference changed the executor's original wire or source checkpoint"
+    );
+    let mut usage = verify_execution_handoff_admission_checkpoint(
+        &stored.wire,
+        &stored.admission_receipt,
+        &stored.admission,
+        &StoredTransport::from(&stored.transport),
+        stored.admitted_at_ms,
+    )?
+    .proof_usage()
+    .clone();
+    let acceptance = match reference.kind {
+        RemoteExecutionHistoryKind::ExecutionResult => {
+            verify_execution_handoff_receipt_signature(
+                &stored.wire,
+                &reference.observation_receipt,
+                &stored.result,
+            )?;
+            let actual = ExecutionHandoffResult {
+                handoff: stored.wire.clone(),
+                receipt: reference.observation_receipt.clone(),
+                result: stored.result.clone(),
+            };
+            let dispatch: Event =
+                serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
+            let account = capsule_admission(&dispatch)?;
+            let derived: RemoteExecutionHistoryReference = serde_json::from_str(
+                &derive_remote_execution_history_reference(
+                    &serde_json::to_string(&actual)?,
+                    &serde_json::to_string(&account.source_body)?,
+                    &serde_json::to_string(&account.invocation)?,
+                    &serde_json::to_string(&stored.request.binding)?,
+                )
+                .map_err(anyhow::Error::msg)?,
+            )?;
+            ensure!(
+                derived == *reference,
+                "history changed its original execution result"
+            );
+            usage.record_signed(&reference.observation_receipt)?;
+            RemoteExecutionHistoryAcceptance::ExecutionResult {
+                receipt: stored.admission_receipt,
+                freshness: stored.admission,
+                transport: StoredTransport::from(&stored.transport),
+            }
+        }
+        RemoteExecutionHistoryKind::UnknownResolution => {
+            let encoded: String = connection.query_row(
+                "SELECT request FROM execution_handoff_resolutions WHERE execution_space_id=? AND original_space_id=? AND operation_id=?",
+                params![reference.execution_resource().space.as_str(), reference.source.payload.project.space.as_str(), reference.source.payload.operation_id],
+                |row| row.get(0),
+            )?;
+            let wire: SignedExecutionHandoffResolution = serde_json::from_str(&encoded)?;
+            let saved = stored_resolution_from(connection, &wire)?
+                .context("history has no original executor resolution")?;
+            let account = &saved.wire.resolution.account_admission;
+            let derived: RemoteExecutionHistoryReference = serde_json::from_str(
+                &derive_remote_execution_history_reference(
+                    &serde_json::to_string(&saved.result)?,
+                    &serde_json::to_string(&account.source_body)?,
+                    &serde_json::to_string(&account.invocation)?,
+                    "null",
+                )
+                .map_err(anyhow::Error::msg)?,
+            )?;
+            ensure!(
+                derived == *reference,
+                "history changed its original resolution result"
+            );
+            verify_execution_resolution_admission_checkpoint(
+                &saved.result,
+                &saved.freshness,
+                &StoredTransport::from(&saved.transport),
+                saved.resolved_at_ms,
+            )?;
+            usage.record_signed(&saved.result.receipt)?;
+            usage.record_signed(&saved.result.handoff_receipt)?;
+            usage.record_metadata(&saved.freshness)?;
+            usage.record_metadata(&StoredTransport::from(&saved.transport))?;
+            usage.record_signed(&reference.observation_receipt)?;
+            RemoteExecutionHistoryAcceptance::UnknownResolution {
+                receipt: saved.result.receipt,
+                freshness: saved.freshness,
+            }
+        }
+        RemoteExecutionHistoryKind::TerminalReconciliation => {
+            ensure!(
+                stored.state.terminal(),
+                "history has no terminal executor observation"
+            );
+            verify_execution_handoff_receipt_signature(
+                &stored.wire,
+                &reference.observation_receipt,
+                &stored.result,
+            )?;
+            usage.record_signed(&reference.observation_receipt)?;
+            RemoteExecutionHistoryAcceptance::TerminalReconciliation {
+                freshness: reference
+                    .terminal_freshness
+                    .clone()
+                    .context("terminal history has no original signed freshness proof")?,
+                observation_receipt: reference.observation_receipt.clone(),
+            }
+        }
+    };
+    usage.enforce_limits()?;
+    Ok((acceptance, usage))
+}
+
 fn verify_resolution_challenge_record(
     connection: &Connection,
     wire: &SignedExecutionHandoffResolution,
