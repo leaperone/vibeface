@@ -1538,6 +1538,15 @@ fn ready_observation_scope_in(
 ) -> Result<ObservationScopeCheckpoint> {
     let expected: Event = serde_json::from_str(&source.canonical_body)?;
     let invocation_hash = admission(&expected).invocation.hash()?;
+    let changed_resource_index: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND scope_id=? AND resource_id IS NOT json_extract(json_extract(envelope,'$.canonical_body'),'$.resource_id'))",
+        params![expected.network_id, expected.scope_id],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        !changed_resource_index,
+        "retained scope resource index differs from its signed body"
+    );
     let row_count: u64 = connection.query_row(
         "SELECT COUNT(*) FROM events WHERE space_id=? AND resource_id=? AND scope_id=?",
         params![

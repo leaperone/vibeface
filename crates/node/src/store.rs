@@ -2405,6 +2405,13 @@ mod tests {
                 .task_creation(space, "conversation", "same-task")
                 .is_err()
         );
+        assert!(
+            crate::identity::event_authorization::validate_retained_event_scope_in(
+                &store.connection,
+                &creation,
+            )
+            .is_err()
+        );
         store.connection.execute(
             "UPDATE events SET resource_id=? WHERE space_id=? AND hash=?",
             params![network.resource.as_str(), space, latest.hash],
