@@ -3087,7 +3087,6 @@ pub(crate) mod tests {
                     .unwrap()
                     .clone(),
             ];
-            heads.extend_from_slice(dispatch.destination().heads());
             heads.sort_by(|left, right| left.domain.cmp(&right.domain));
             heads.dedup();
             let invocation = Signed::sign(

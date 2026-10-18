@@ -431,7 +431,7 @@ impl TestNetwork {
             None => store.request_facts(body, &audience)?,
         };
         let device = DeviceId::from_key(&PublicKey::of(&self.client));
-        let mut expected_policies = vec![
+        let expected_policies = vec![
             store
                 .policy
                 .verified()
@@ -445,11 +445,6 @@ impl TestNetwork {
                 .context("space head missing")?
                 .clone(),
         ];
-        if let Some(dispatch) = &dispatch {
-            expected_policies.extend_from_slice(dispatch.destination().heads());
-            expected_policies.sort_by(|left, right| left.domain.cmp(&right.domain));
-            expected_policies.dedup();
-        }
         let invocation = Signed::sign(
             Invocation {
                 version: AUTH_VERSION,

@@ -5460,28 +5460,7 @@ impl Runtime {
                                     == session.initiating_grant.as_ref(),
                             "SDK request differs from its current admitted delegation"
                         );
-                        let mut expected: BTreeMap<_, _> = delegated
-                            .heads()
-                            .iter()
-                            .cloned()
-                            .map(|head| (head.domain.clone(), head))
-                            .collect();
-                        if let Some(destination) =
-                            crate::identity::policy::execution_destination_for_body(
-                                policies, &facts, &body, now,
-                            )
-                            .context("SDK authorize current execution destination")?
-                        {
-                            for head in destination.heads() {
-                                ensure!(
-                                    expected
-                                        .insert(head.domain.clone(), head.clone())
-                                        .is_none_or(|previous| previous == *head),
-                                    "SDK execution destination has conflicting policy heads"
-                                );
-                            }
-                        }
-                        session.expected_policies = expected.into_values().collect();
+                        session.expected_policies = delegated.heads().to_vec();
                         session.expires_at_ms =
                             session.expires_at_ms.min(delegated.expires_at_ms());
                         if let Some(task) = &task_policy {
