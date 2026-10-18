@@ -112,22 +112,14 @@ fn binding_association_in(
             ),
         "foreign policy association differs from its original accepted binding admission"
     );
-    let policy = primary
-        .task_execution_policy
-        .current
-        .get(&association.policy_ref)
-        .context("NeedPolicySync: binding policy has no genuine original provenance")?;
+    let source = provenance::association_source(primary, &association)?;
+    let original =
+        provenance::original_task_execution_policy_in(connection, primary, &source, &proof)?
+            .context("foreign binding association has no original verified admission")?;
     ensure!(
-        policy.trust().approval().hash()? == association.approval_ref,
+        original.trust().approval().hash()? == association.approval_ref,
         "foreign binding association changed its actual approved roots or writer"
     );
-    let original = provenance::original_task_execution_policy_in(
-        connection,
-        primary,
-        policy.request().source_node(),
-        &proof,
-    )?
-    .context("foreign binding association has no original verified admission")?;
     usage.merge(original.proof_usage());
     Ok(association)
 }

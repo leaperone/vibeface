@@ -18,6 +18,40 @@ use vibeface_secure::authorization::{
 pub(crate) struct TaskExecutionPolicyProvenance {
     pub(super) current: BTreeMap<ObjectHash, VerifiedTaskCurrentPolicy>,
     pub(super) history: BTreeMap<ObjectHash, VerifiedTaskHistoryPolicy>,
+    original: BTreeMap<ObjectHash, CachedOriginal>,
+    retained_floors: BTreeMap<String, vibeface_secure::authorization::PolicyPin>,
+}
+
+#[derive(Clone)]
+struct CachedOriginal {
+    policy: VerifiedTaskOriginalAdmissionPolicy,
+    proof_hash: ObjectHash,
+    policy_ref: ObjectHash,
+}
+
+pub(super) fn association_source(
+    primary: &super::super::journal::PolicyState,
+    association: &AdmissionAssociation,
+) -> Result<PublicKey> {
+    if let Some(original) = primary
+        .task_execution_policy
+        .original
+        .get(&association.invocation_hash)
+    {
+        ensure!(
+            original.policy_ref == association.policy_ref,
+            "original Task policy association changed its completion"
+        );
+        return Ok(original.policy.request().source_node().clone());
+    }
+    Ok(primary
+        .task_execution_policy
+        .current
+        .get(&association.policy_ref)
+        .context("NeedPolicySync: original Task policy provenance is missing")?
+        .request()
+        .source_node()
+        .clone())
 }
 
 fn import_reference(policy: &VerifiedTaskCurrentPolicy) -> Result<ObjectHash> {
@@ -67,7 +101,35 @@ fn completion_in(
 }
 
 fn check_originals_in(connection: &Connection, policy: &VerifiedTaskCurrentPolicy) -> Result<()> {
-    let reference = policy_reference(policy)?;
+    check_saved_carriers_in(
+        connection,
+        policy.request(),
+        policy.snapshot(),
+        policy.witness(),
+        policy.trust(),
+        policy.original_page_envelope_hashes(),
+    )
+}
+
+fn check_saved_carriers_in(
+    connection: &Connection,
+    expected_request: &vibeface_secure::authorization::node_execution_policy::TaskExecutionPolicyRequest,
+    expected_snapshot: &Signed<RemoteExecutionPolicySnapshot>,
+    expected_witness: &Signed<RemoteExecutionPolicyWitness>,
+    trust: &VerifiedTaskExecutionTrust,
+    page_hashes: &[ObjectHash],
+) -> Result<()> {
+    let import_ref = ObjectHash::body(&(
+        "task-policy-import-v2",
+        trust.approval().hash()?,
+        expected_request.request_hash()?,
+        ObjectHash::body(expected_snapshot)?,
+    ))?;
+    let reference = ObjectHash::body(&(
+        "task-policy-completion-v2",
+        import_ref,
+        ObjectHash::body(expected_witness)?,
+    ))?;
     let (complete, imported) = completion_in(connection, &reference)?;
     let request: RemoteExecutionPolicyReadRequest =
         read_in(connection, &key("request", &imported.request_ref))?
@@ -79,17 +141,17 @@ fn check_originals_in(connection: &Connection, policy: &VerifiedTaskCurrentPolic
         read_in(connection, &key("witness", &complete.witness_ref))?
             .context("foreign policy original witness is missing")?;
     ensure!(
-        policy.request().account_request() == Some(&request)
-            && policy.snapshot() == &snapshot
-            && policy.witness() == &witness
-            && imported.approval_ref == policy.trust().approval().hash()?,
+        expected_request.account_request() == Some(&request)
+            && expected_snapshot == &snapshot
+            && expected_witness == &witness
+            && imported.approval_ref == trust.approval().hash()?,
         "foreign policy original carrier differs from its verified provenance"
     );
     ensure!(
-        policy.original_page_envelope_hashes().len() as u64 == imported.page_count,
+        page_hashes.len() as u64 == imported.page_count,
         "foreign policy page count differs from its verified provenance"
     );
-    for (index, expected) in policy.original_page_envelope_hashes().iter().enumerate() {
+    for (index, expected) in page_hashes.iter().enumerate() {
         let page: Signed<
             vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPage,
         > = read_in(
@@ -109,7 +171,7 @@ fn check_originals_in(connection: &Connection, policy: &VerifiedTaskCurrentPolic
         read_in(connection, &key("approval", &imported.approval_ref))?
             .context("foreign approval original signature is missing")?;
     ensure!(
-        policy.trust().original_intent() == &original && policy.trust().approval() == &approval,
+        trust.original_intent() == &original && trust.approval() == &approval,
         "foreign policy approval differs from its verified provenance"
     );
     Ok(())
@@ -384,6 +446,52 @@ pub(crate) fn original_task_execution_policy_in(
         saved == *proof,
         "original Task policy differs from its exact persisted admission"
     );
+    if let Some(cached) = primary.task_execution_policy.original.get(&reference) {
+        let original = &cached.policy;
+        ensure!(
+            cached.policy_ref == association.policy_ref
+                && cached.proof_hash == ObjectHash::body(proof)?
+                && original.proof_hash() == &cached.proof_hash
+                && original.request().source_node() == source
+                && original.trust().approval().hash()? == association.approval_ref,
+            "original Task policy changed its exact accepted proof, source or completion"
+        );
+        check_saved_carriers_in(
+            connection,
+            original.request(),
+            original.snapshot(),
+            original.witness(),
+            original.trust(),
+            original.original_page_envelope_hashes(),
+        )?;
+        let binding = retained_binding_in(
+            connection,
+            proof.invocation.payload.resource.space.as_str(),
+            &association.binding_hash,
+            source,
+        )?;
+        ensure!(
+            Some(binding.binding.generation) == original.request().context()?.binding_generation
+                && Some(binding.binding.task_ref.as_str())
+                    == proof
+                        .invocation
+                        .payload
+                        .context
+                        .task
+                        .as_ref()
+                        .map(|task| task.as_str())
+                && Some(binding.binding.session_id.as_str())
+                    == proof
+                        .invocation
+                        .payload
+                        .context
+                        .execution_session
+                        .as_ref()
+                        .map(|session| session.session_id.as_str()),
+            "original Task policy changed its retained binding"
+        );
+        return Ok(Some(original.clone()));
+    }
     let policy = primary
         .task_execution_policy
         .current
@@ -595,6 +703,20 @@ pub(crate) fn rehydrate_task_execution_policy_in(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut restored = TaskExecutionPolicyProvenance::default();
+    let mut association_statement =
+        connection.prepare("SELECT key FROM identity_meta WHERE key LIKE ? ORDER BY key")?;
+    let association_keys = association_statement
+        .query_map([format!("{PREFIX}:admission:%")], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let associations = association_keys
+        .iter()
+        .map(|name| {
+            read_in::<AdmissionAssociation>(connection, name)?
+                .context("foreign policy accepted association is missing")
+        })
+        .collect::<Result<Vec<_>>>()?;
     for name in names {
         let reference = ObjectHash::parse(
             name.strip_prefix(&format!("{PREFIX}:completion:"))
@@ -622,87 +744,79 @@ pub(crate) fn rehydrate_task_execution_policy_in(
                 && ObjectHash::body(&witness)? == complete.witness_ref,
             "foreign policy retained envelope hash changed"
         );
-        let historical = primary.historical(
-            &request.intent.payload.source_heads,
+        let importer = rebuild_retained_import_in(
+            connection,
+            primary,
+            source,
+            &imported,
+            &complete.import_ref,
+            &request,
+            &snapshot,
             complete.completed_at_ms,
         )?;
-        let primary_pins: Vec<_> = primary
-            .pins()
+        {
+            let _carrier = ScopedSignatureVerification::new();
+            let floors = importer
+                .clone()
+                .finish_retained_floors(&witness, complete.completed_at_ms)?;
+            ensure_actual_budget()?;
+            for pin in floors {
+                merge_verified_floor(&mut restored.retained_floors, pin)?;
+            }
+        }
+        for association in associations
             .iter()
-            .filter(|pin| {
+            .filter(|association| association.policy_ref == reference)
+        {
+            let proof = super::super::admission::load_admission_in(
+                connection,
                 request
                     .intent
                     .payload
-                    .source_heads
-                    .iter()
-                    .any(|head| head.domain == pin.domain)
-            })
-            .map(|pin| vibeface_secure::authorization::PolicyPin {
-                domain: pin.domain.clone(),
-                genesis_root: pin.genesis_root.clone(),
-                minimum_head: None,
-            })
-            .collect();
-        let (trust, retained) = {
-            let _carrier = ScopedSignatureVerification::new();
-            let trust = load_task_execution_trust_in(connection, source, &imported.approval_ref)?;
-            let retained = task_policy_source_from_retained(
-                &trust,
-                &historical,
-                &primary_pins,
-                &request,
-                complete.completed_at_ms,
+                    .source_selection
+                    .resource
+                    .space
+                    .as_str(),
+                &association.authorization_id,
             )?;
-            ensure_actual_budget()?;
-            (trust, retained)
-        };
-        let mut importer = {
-            let _carrier = ScopedSignatureVerification::new();
-            let importer = begin_task_policy_import(
-                &trust,
-                &retained,
+            ensure!(
+                proof.invocation.hash()? == association.invocation_hash
+                    && ObjectHash::body(&proof.source_body)? == association.body_hash
+                    && proof.admitted_at_ms == association.admitted_at_ms
+                    && association.approval_ref == imported.approval_ref,
+                "retained foreign policy association changed its accepted admission"
+            );
+            let original_importer = rebuild_retained_import_in(
+                connection,
+                primary,
+                source,
+                &imported,
+                &complete.import_ref,
                 &request,
                 &snapshot,
-                &[],
-                PolicyCarrierOrigin::SignedTranscript,
-                complete.completed_at_ms,
+                proof.admitted_at_ms,
             )?;
-            importer.proof_usage().enforce_limits()?;
-            ensure_actual_budget()?;
-            importer
-        };
-        for index in 0..imported.page_count {
             let _carrier = ScopedSignatureVerification::new();
-            let page: Signed<
-                vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPage,
-            > = read_in(connection, &ingress::page_key(&complete.import_ref, index))?
-                .context("foreign policy retained page is missing")?;
-            importer.append_page(&page, complete.completed_at_ms)?;
-            importer.proof_usage().enforce_limits()?;
-            ensure_actual_budget()?;
-        }
-        let _carrier = ScopedSignatureVerification::new();
-        if request.intent.payload.purpose == RemoteExecutionPolicyPurpose::History {
-            let policy = importer.finish_history(&witness, complete.completed_at_ms)?;
+            let policy = original_importer.finish_original_admission(&witness, &proof)?;
             policy.proof_usage().enforce_limits()?;
             ensure_actual_budget()?;
-            restored.history.insert(reference, policy);
-        } else {
-            let policy = importer.finish_current(&witness, complete.completed_at_ms)?;
-            policy.proof_usage().enforce_limits()?;
-            ensure_actual_budget()?;
-            check_originals_in(connection, &policy)?;
-            restored.current.insert(reference, policy);
+            restored.original.insert(
+                association.invocation_hash.clone(),
+                CachedOriginal {
+                    proof_hash: ObjectHash::body(&proof)?,
+                    policy_ref: reference.clone(),
+                    policy,
+                },
+            );
         }
     }
     primary
         .task_execution_policy
-        .current
-        .extend(restored.current);
-    primary
-        .task_execution_policy
-        .history
-        .extend(restored.history);
+        .original
+        .extend(restored.original);
+    for pin in restored.retained_floors.into_values() {
+        merge_verified_floor(&mut primary.task_execution_policy.retained_floors, pin)?;
+    }
     Ok(())
 }
 
@@ -716,6 +830,74 @@ fn ensure_actual_budget() -> Result<()> {
     Ok(())
 }
 
+fn rebuild_retained_import_in(
+    connection: &Connection,
+    primary: &super::super::journal::PolicyState,
+    source: &PublicKey,
+    imported: &ImportRecord,
+    import_ref: &ObjectHash,
+    request: &RemoteExecutionPolicyReadRequest,
+    snapshot: &Signed<RemoteExecutionPolicySnapshot>,
+    clock: u64,
+) -> Result<vibeface_secure::authorization::node_execution_policy::TaskExecutionPolicyImport> {
+    ensure!(
+        SignatureVerification::current_counts().is_none(),
+        "retained import rebuild must run outside a network carrier"
+    );
+    let historical = primary.historical(&request.intent.payload.source_heads, clock)?;
+    let pins: Vec<_> = primary
+        .pins()
+        .iter()
+        .filter(|pin| {
+            request
+                .intent
+                .payload
+                .source_heads
+                .iter()
+                .any(|head| head.domain == pin.domain)
+        })
+        .map(|pin| vibeface_secure::authorization::PolicyPin {
+            domain: pin.domain.clone(),
+            genesis_root: pin.genesis_root.clone(),
+            minimum_head: None,
+        })
+        .collect();
+    let (trust, retained) = {
+        let _carrier = ScopedSignatureVerification::new();
+        let trust = load_task_execution_trust_in(connection, source, &imported.approval_ref)?;
+        let retained =
+            task_policy_source_from_retained(&trust, &historical, &pins, request, clock)?;
+        ensure_actual_budget()?;
+        (trust, retained)
+    };
+    let mut importer = {
+        let _carrier = ScopedSignatureVerification::new();
+        let importer = begin_task_policy_import(
+            &trust,
+            &retained,
+            request,
+            snapshot,
+            &[],
+            PolicyCarrierOrigin::SignedTranscript,
+            clock,
+        )?;
+        importer.proof_usage().enforce_limits()?;
+        ensure_actual_budget()?;
+        importer
+    };
+    for index in 0..imported.page_count {
+        let _carrier = ScopedSignatureVerification::new();
+        let page: Signed<
+            vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPage,
+        > = read_in(connection, &ingress::page_key(import_ref, index))?
+            .context("retained Task policy original page is missing")?;
+        importer.append_page(&page, clock)?;
+        importer.proof_usage().enforce_limits()?;
+        ensure_actual_budget()?;
+    }
+    Ok(importer)
+}
+
 pub(crate) fn validate_task_execution_policy_links_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
@@ -724,7 +906,7 @@ pub(crate) fn validate_task_execution_policy_links_in(
         SignatureVerification::current_counts().is_none(),
         "Task policy startup validation must run outside a network carrier"
     );
-    let mut floors = BTreeMap::new();
+    let mut floors = primary.task_execution_policy.retained_floors.clone();
     for policy in primary.task_execution_policy.current.values() {
         gather_verified_floors(
             &mut floors,
@@ -764,23 +946,31 @@ pub(crate) fn validate_task_execution_policy_links_in(
             key("admission", &association.invocation_hash) == name,
             "foreign policy admission link changed its key"
         );
-        let policy = primary
+        let source = association_source(primary, &association)?;
+        let space = if let Some(original) = primary
             .task_execution_policy
-            .current
-            .get(&association.policy_ref)
-            .context("accepted foreign policy has no verified local source provenance")?;
+            .original
+            .get(&association.invocation_hash)
+        {
+            original.policy.request().source_project().space.as_str()
+        } else {
+            primary
+                .task_execution_policy
+                .current
+                .get(&association.policy_ref)
+                .context("accepted foreign policy has no verified local source provenance")?
+                .request()
+                .source_project()
+                .space
+                .as_str()
+        };
         let proof = super::super::admission::load_admission_in(
             connection,
-            policy.request().source_project().space.as_str(),
+            space,
             &association.authorization_id,
         )?;
-        original_task_execution_policy_in(
-            connection,
-            primary,
-            policy.request().source_node(),
-            &proof,
-        )?
-        .context("accepted foreign policy link has no original admission")?;
+        original_task_execution_policy_in(connection, primary, &source, &proof)?
+            .context("accepted foreign policy link has no original admission")?;
         ensure_actual_budget()?;
     }
     Ok(())
@@ -818,5 +1008,32 @@ fn gather_verified_floors(
         }
         floors.insert(name, pin);
     }
+    Ok(())
+}
+
+fn merge_verified_floor(
+    floors: &mut BTreeMap<String, vibeface_secure::authorization::PolicyPin>,
+    pin: vibeface_secure::authorization::PolicyPin,
+) -> Result<()> {
+    let head = pin
+        .minimum_head
+        .as_ref()
+        .context("verified retained floor has no exact head")?;
+    ensure!(
+        head.domain == pin.domain,
+        "verified retained floor belongs to another domain"
+    );
+    let name = ingress::floor_key(&pin)?;
+    if let Some(prior) = floors.get(&name).and_then(|pin| pin.minimum_head.as_ref()) {
+        if (prior.authority_epoch, prior.sequence) > (head.authority_epoch, head.sequence) {
+            return Ok(());
+        }
+        ensure!(
+            (prior.authority_epoch, prior.sequence) != (head.authority_epoch, head.sequence)
+                || prior == head,
+            "verified retained floors conflict at the same version"
+        );
+    }
+    floors.insert(name, pin);
     Ok(())
 }
