@@ -5,6 +5,7 @@ pub mod context;
 pub mod cross_node;
 pub mod node_enrollment;
 pub mod registration;
+pub mod stream;
 
 use super::*;
 pub use checkpoint::RecoveryPolicyCheckpoint;

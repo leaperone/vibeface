@@ -98,7 +98,7 @@ fn bounded<T: Serialize>(value: &T) -> Result<()> {
         "cross-node recovery requires a bounded checkpoint",
     )
 }
-fn verify_request_identity(
+pub(super) fn verify_request_identity(
     state: &VerifiedPolicySet,
     signed: &Signed<CrossNodeRecoveryRequest>,
     now: u64,

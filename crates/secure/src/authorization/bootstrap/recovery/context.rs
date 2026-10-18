@@ -10,6 +10,7 @@ pub struct RecoveryContextRequest {
     pub space: SpaceId,
     pub new_device_public_key: PublicKey,
     pub node_public_key: PublicKey,
+    pub saved_pins: Vec<PolicyPin>,
     pub nonce: Nonce,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
@@ -68,6 +69,7 @@ impl VerifiedPolicySet {
         now_ms: u64,
     ) -> Result<VerifiedRecoveryContext> {
         let request = &signed.payload;
+        stream::RecoveryReadRequest::Account(signed.clone()).validate_saved_pins()?;
         let account = self
             .account(&request.account)
             .ok_or(AuthorizationError::Revoked)?;
@@ -77,6 +79,8 @@ impl VerifiedPolicySet {
         require(
             request.version == AUTH_VERSION
                 && request.node_public_key == *local_node
+                && account.authority.public_key == *local_node
+                && space.authority.public_key == *local_node
                 && request.space == SpaceId::personal(&request.account)
                 && space.root
                     == SpaceRoot::Personal {
@@ -94,6 +98,17 @@ impl VerifiedPolicySet {
                     .any(|c| c.payload.public_key == request.new_device_public_key),
             "recovery context is not authorized for this account and node",
         )?;
+        for pin in &request.saved_pins {
+            require(
+                pin.genesis_root == account.genesis_root
+                    && pin
+                        .minimum_head
+                        .as_ref()
+                        .is_some_and(|head| self.roots.contains_key(head)),
+                "recovery context changed saved genesis or exact heads",
+            )?;
+        }
+        self.ensure_personal_current(space)?;
         validate_window(request.issued_at_ms, request.expires_at_ms, now_ms)?;
         require(
             request.expires_at_ms - request.issued_at_ms <= NODE_CLAIM_MAX_AGE_MS,
@@ -130,6 +145,7 @@ pub fn build_recovery_context_request(
                 space: material.scope.space_id.clone(),
                 new_device_public_key: PublicKey::of(new_client),
                 node_public_key: node.clone(),
+                saved_pins: material.pins.clone(),
                 nonce: Nonce::random()?,
                 issued_at_ms: timestamp(now_ms)?,
                 expires_at_ms: timestamp(expires_at_ms)?,
