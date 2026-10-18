@@ -32,6 +32,7 @@ pub struct RemoteExecutionHistoryReference {
     pub dispatch_envelope_hash: ObjectHash,
     pub source: Signed<ProjectExecutionSource>,
     pub old_submission: Signed<Invocation>,
+    pub observation_receipt: Signed<ExecutionHandoffReceipt>,
     pub target_public_key: PublicKey,
     pub handoff_hash: ObjectHash,
     pub resolution_hash: Option<ObjectHash>,
@@ -247,6 +248,7 @@ pub(crate) fn derive_reference(
         dispatch_envelope_hash: ObjectHash::body(&handoff.project_dispatch)?,
         source,
         old_submission,
+        observation_receipt: observation.receipt.clone(),
         target_public_key: handoff.target_public_key.clone(),
         handoff_hash: observation.handoff.hash()?,
         resolution_hash,
@@ -275,12 +277,25 @@ fn check_reference(reference: &RemoteExecutionHistoryReference) -> Result<()> {
     carrier(reference)?;
     reference.source.verify_signature()?;
     reference.old_submission.verify_signature()?;
+    reference.observation_receipt.verify_signature()?;
     let submission = &reference.old_submission.payload;
     let source = &reference.source.payload;
+    let observation = &reference.observation_receipt.payload;
     require(
         reference.version == AUTH_VERSION
             && source.version == AUTH_VERSION
             && submission.version == AUTH_VERSION
+            && reference.observation_receipt.issuer == reference.target_public_key
+            && observation.version == AUTH_VERSION
+            && observation.handoff_hash == reference.handoff_hash
+            && observation.operation_id == source.operation_id
+            && observation.original_space_id == source.project.space
+            && observation.execution_space_id == submission.resource.space
+            && observation.target == DeviceId::from_key(&reference.target_public_key)
+            && observation.session_id == source.execution_session.session_id
+            && observation.binding_generation == source.binding_generation
+            && (reference.kind == RemoteExecutionHistoryKind::UnknownResolution
+                || observation.result_hash == reference.result_hash)
             && submission.actor
                 == Actor::Service(ServiceId::from_key(&reference.old_submission.issuer))
             && submission.device == DeviceId::from_key(&reference.old_submission.issuer)
@@ -406,6 +421,7 @@ pub fn verify_remote_execution_history_acceptance(
     let mut usage = ExecutionProofUsage::default();
     usage.record_signed(&reference.source)?;
     usage.record_signed(&reference.old_submission)?;
+    usage.record_signed(&reference.observation_receipt)?;
     usage.record_metadata(reference)?;
     let (decision_at_ms, heads, challenge_hash, issued, expires, receipts) = match acceptance {
         RemoteExecutionHistoryAcceptance::ExecutionResult {
@@ -491,6 +507,7 @@ pub fn verify_remote_execution_history_acceptance(
             let observation = &observation_receipt.payload;
             require(
                 reference.kind == RemoteExecutionHistoryKind::TerminalReconciliation
+                    && observation_receipt == &reference.observation_receipt
                     && reference.terminal_freshness.as_ref() == Some(freshness)
                     && observation_receipt.issuer == *local_c
                     && observation.version == AUTH_VERSION
