@@ -292,9 +292,13 @@ impl Store {
             .transpose()?
             .filter(|_| importer.completed_context().is_some())
             .map(|value| value.proof);
+        let response = bounded_response(
+            params,
+            json!({"context":context,"page_request":request,"proof":proof}),
+        )?;
         tx.commit()?;
         self.account_node_enrollment_import = Some(importer);
-        Ok(json!({"context":context,"page_request":request,"proof":proof}))
+        Ok(response)
     }
 
     pub(super) fn account_node_import_page(
@@ -328,7 +332,38 @@ impl Store {
                 cached.pages.get(index) == Some(&input.page),
                 "Node enrollment page retry changed its signed input"
             );
+            let snapshot = &cached.begin.snapshot;
+            let page = &input.page.payload;
+            ensure!(
+                input.page.issuer == snapshot.issuer
+                    && page.version == AUTH_VERSION
+                    && page.purpose == snapshot.payload.purpose
+                    && page.credential_hash == cached.begin.request.payload.credential_hash
+                    && page.request_hash == cached.begin.request.hash()?
+                    && page.snapshot_id == snapshot.payload.snapshot_id
+                    && page.snapshot_hash == snapshot.hash()?
+                    && snapshot.payload.issued_at_ms <= page.issued_at_ms
+                    && page.issued_at_ms <= clock
+                    && clock < page.expires_at_ms
+                    && page.expires_at_ms <= snapshot.payload.expires_at_ms,
+                "Node enrollment page retry changed its source, purpose, snapshot or validity"
+            );
             input.page.verify_signature()?;
+            let mut usage = ExecutionProofUsage::default();
+            usage.record_signed(&input.page)?;
+            if let Some(entry) = &input.page.payload.entry {
+                usage.merge(
+                    &vibeface_secure::authorization::policy_proof::policy_entry_payload_usage(
+                        entry,
+                    )?,
+                );
+            }
+            let credential = cached.begin.credential.node();
+            usage.record_signed(&credential.intent)?;
+            usage.record_signed(&credential.intent.payload.claim)?;
+            usage.record_metadata(&credential.descriptor)?;
+            usage.record_metadata(credential)?;
+            usage.enforce_limits()?;
         } else {
             ensure!(
                 index == cached.pages.len() && importer.accepted_page_count() == cached.pages.len(),
@@ -342,9 +377,13 @@ impl Store {
         }
         let request: Value =
             serde_json::from_str(&importer.page_request_json().map_err(anyhow::Error::msg)?)?;
+        let response = bounded_response(
+            params,
+            json!({"context":input.context,"page_request":request}),
+        )?;
         tx.commit()?;
         self.account_node_enrollment_import = Some(importer);
-        Ok(json!({"context":input.context,"page_request":request}))
+        Ok(response)
     }
 
     pub(super) fn account_node_import_finish(
@@ -434,9 +473,10 @@ impl Store {
         }
         cached.witness = Some(input.witness);
         save(&tx, &cached)?;
+        let response = bounded_response(params, json!({"context":input.context,"proof":proof}))?;
         tx.commit()?;
         self.account_node_enrollment_import = Some(importer);
-        Ok(json!({"context":input.context,"proof":proof}))
+        Ok(response)
     }
 
     pub(super) fn account_node_import_resume(
@@ -534,6 +574,7 @@ impl Store {
         }
         usage.record_metadata(params)?;
         usage.enforce_limits()?;
+        let response = bounded_response(params, response)?;
         save(&tx, &cached)?;
         tx.commit()?;
         self.account_node_enrollment_import = Some(importer);

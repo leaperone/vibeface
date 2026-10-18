@@ -76,6 +76,18 @@ fn check_claim_in(tx: &Transaction<'_>, claim: &Signed<NodeClaim>) -> Result<()>
     Ok(())
 }
 
+fn bounded_response(params: &Value, response: Value) -> Result<Value> {
+    let total = serde_json::to_vec(params)?
+        .len()
+        .checked_add(serde_json::to_vec(&response)?.len())
+        .context("Node enrollment carrier size overflow")?;
+    ensure!(
+        total <= vibeface_secure::authorization::MAX_PROOF_BYTES,
+        "Node enrollment request and response exceed the carrier limit"
+    );
+    Ok(response)
+}
+
 impl Store {
     pub(crate) fn node_enrollment_command(
         &mut self,
@@ -147,7 +159,7 @@ impl Store {
                 receipt["input_hash"] == input_hash.as_str() && receipt["principal"] == principal,
                 "node enrollment completion changed its signed request"
             );
-            let response = receipt["response"].clone();
+            let response = bounded_response(params, receipt["response"].clone())?;
             tx.commit()?;
             self.policy = current;
             return Ok(response);
@@ -159,7 +171,7 @@ impl Store {
             now,
         )?;
         let update = current.prepare_network_update(&delta, now)?;
-        let response = json!({"journal_delta":delta});
+        let response = bounded_response(params, json!({"journal_delta":delta}))?;
         let receipt = json!({"request_hash":request_hash,"input_hash":input_hash,"principal":principal,"response":response});
         let state = journal::commit_in(&tx, &update)?;
         project_policy_in(&tx, &state)?;
@@ -214,7 +226,7 @@ impl Store {
                 &DeviceId::from_key(&PublicKey::parse(&identity.public_key_hex()?)?),
                 now,
             )?;
-            let response = receipt["response"].clone();
+            let response = bounded_response(params, receipt["response"].clone())?;
             tx.commit()?;
             self.policy = current;
             return Ok(response);
@@ -281,8 +293,11 @@ impl Store {
         usage.record_signed(&saved.approval)?;
         usage.record_metadata(params)?;
         usage.enforce_limits()?;
-        let response = json!({"installed":true,"account_id":verified.account(),
-            "node_public_key":verified.node_public_key(),"pins":verified.pins()});
+        let response = bounded_response(
+            params,
+            json!({"installed":true,"account_id":verified.account(),
+            "node_public_key":verified.node_public_key(),"pins":verified.pins()}),
+        )?;
         let receipt = json!({"request_hash":verified.request_hash(),"input_hash":input_hash,
             "principal":principal,"response":response});
         let update = current.prepare_account_node_installation(verified, now)?;
@@ -713,6 +728,124 @@ mod tests {
     }
 
     #[test]
+    fn project_host_does_not_replace_the_account_enrollment_authority() -> Result<()> {
+        use vibeface_secure::authorization::{
+            JournalEntry, Nonce, PolicyDomain, ResourceId, ResourceKind, ResourceRecord,
+            ResourceScope,
+        };
+        let mut f = Fixture::new()?;
+        let (prepared, _, response) = committed(&mut f)?;
+        let finished = finish(&prepared, &response, now())?;
+        let installation = f.installation(&finished)?;
+        let principal = f.network.client.public_key_hex();
+        f.fresh.node_enrollment_command(
+            &f.node,
+            &principal,
+            "account_node_install",
+            &installation,
+            now(),
+        )?;
+        let host = PublicKey::parse(&f.node.public_key_hex()?)?;
+        let head = f
+            .authority
+            .authorization_state()
+            .head(&PolicyDomain::Space(f.network.space.clone()))
+            .context("space head missing")?
+            .clone();
+        let resource = ResourceRef {
+            space: f.network.space.clone(),
+            resource: ResourceId::random()?,
+        };
+        let record = Signed::sign(
+            ResourceRecord {
+                version: vibeface_secure::authorization::AUTH_VERSION,
+                space: resource.space.clone(),
+                resource: resource.resource.clone(),
+                kind: ResourceKind::Project,
+                host: ServiceId::from_key(&host),
+                issued_under: head.clone(),
+                nonce: Nonce::random()?,
+            },
+            &f.network.root,
+        )?;
+        let mut grant = f
+            .authority
+            .authorization_state()
+            .grant(&f.network.bundle.grant_leaf)
+            .context("owner grant missing")?
+            .payload
+            .clone();
+        grant.audience = Audience {
+            service: ServiceId::from_key(&host),
+            device: DeviceId::from_key(&host),
+        };
+        grant.scope = ResourceScope::Exact(resource.clone());
+        grant.issued_under = head.clone();
+        grant.nonce = Nonce::random()?;
+        let grant = Signed::sign(grant, &f.network.root)?;
+        let mut space = f
+            .authority
+            .authorization_state()
+            .space(&f.network.space)
+            .context("space missing")?
+            .clone();
+        space.previous = Some(head);
+        space.sequence += 1;
+        space.resources.push(record.hash()?);
+        space.resources.sort();
+        space.grants.push(grant.hash()?);
+        space.grants.sort();
+        let delta = [
+            JournalEntry::Resource(record),
+            JournalEntry::Grant(grant.clone()),
+            JournalEntry::Space(Signed::sign(space, &f.network.root)?),
+        ];
+        f.authority.install_policy_journal(&delta, now())?;
+        f.fresh.install_policy_journal(&delta, now())?;
+        let authorization = crate::identity::client_policy_read::verified_client_policy_for_test(
+            &mut f.fresh,
+            &f.node,
+            &f.network.client,
+            &f.network.account,
+            AuthorizationSelection {
+                resource,
+                audience: Audience {
+                    service: ServiceId::from_key(&host),
+                    device: DeviceId::from_key(&host),
+                },
+                grant_leaf: grant.hash()?,
+            },
+            finished.pins(),
+            now(),
+        )?;
+        let authority = PublicKey::parse(&f.network.node.public_key_hex()?)?;
+        assert_eq!(authorization.audience_public_key(), &host);
+        assert_ne!(host, authority);
+        f.next_target(100)?;
+        let prepared = node_enrollment::prepare_account_node_enrollment(
+            &Fixture::material(&f.network)?,
+            &authorization,
+            &f.network.client,
+            &f.claim,
+            (now() + 1_000_000) as f64,
+            now() as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let request: Value =
+            serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
+        assert_eq!(
+            request["credential"]["credential"]["descriptor"]["source_node_public_key"],
+            authority.as_str()
+        );
+        assert_eq!(
+            request["request"]["payload"]["node_public_key"],
+            authority.as_str()
+        );
+        assert!(f.possession(&prepared)?["proof"].is_string());
+        Ok(())
+    }
+
+    #[test]
     fn first_read_rejects_unconfirmed_handle_noise_target_and_purpose() -> Result<()> {
         let mut f = Fixture::new()?;
         let unconfirmed = vibeface_secure::authorization::verify_client_authorization(
@@ -821,10 +954,62 @@ mod tests {
         );
         assert!(metadata(&f.fresh.connection, "node_possession")?.is_none());
         assert_eq!(count(&f.fresh, "policy_journal")?, 0);
+        let input = json!({"context":started["context"],"page":page["page"]});
+        let accepted = f.fresh.node_enrollment_command(
+            &f.node,
+            &principal,
+            "account_node_import_page",
+            &input,
+            now(),
+        )?;
+        let cached = metadata(&f.fresh.connection, "account_node_import")?;
+        let verification = SignatureVerification::new();
+        let retried = verification.run(|| {
+            f.fresh.node_enrollment_command(
+                &f.node,
+                &principal,
+                "account_node_import_page",
+                &input,
+                now(),
+            )
+        })?;
+        assert_eq!(retried, accepted);
+        assert!((1..=32).contains(&verification.counts().actual_verifications));
+        assert_eq!(
+            metadata(&f.fresh.connection, "account_node_import")?,
+            cached
+        );
+        assert_eq!(
+            f.fresh
+                .account_node_enrollment_import
+                .as_ref()
+                .context("import missing")?
+                .accepted_page_count(),
+            1
+        );
         f.fresh
             .verify_bootstrap_capability(&f.capability.capability)?;
         Ok(())
     }
+    #[test]
+    fn complete_carrier_rejects_two_individually_bounded_messages() -> Result<()> {
+        let half = vibeface_secure::authorization::MAX_PROOF_BYTES / 6 + 1;
+        let request = json!({"value":"界".repeat(half)});
+        let response = json!({"value":"界".repeat(half)});
+        assert!(
+            serde_json::to_vec(&request)?.len() < vibeface_secure::authorization::MAX_PROOF_BYTES
+        );
+        assert!(
+            serde_json::to_vec(&response)?.len() < vibeface_secure::authorization::MAX_PROOF_BYTES
+        );
+        assert!(bounded_response(&request, response).is_err());
+        assert_eq!(
+            bounded_response(&json!({"id":1}), json!({"installed":true}))?,
+            json!({"installed":true})
+        );
+        Ok(())
+    }
+
     #[test]
     fn failed_commit_and_install_roll_back_policy_nonce_receipt_and_claim() -> Result<()> {
         let mut f = Fixture::new()?;

@@ -245,6 +245,7 @@ pub fn verify_account_node_enrollment_read(
     noise: &PublicKey,
     now: u64,
 ) -> Result<ExecutionProofUsage> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
     let mut usage = verify_intent(state, intent, now)?;
     let i = &intent.payload;
     let account = state
@@ -335,6 +336,7 @@ pub fn verify_account_node_enrollment_proposal(
     request: &AccountNodeEnrollmentCommitRequest,
     now_ms: u64,
 ) -> Result<VerifiedAccountNodeEnrollmentProposal> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
     require(
         canonical(request)?.len() <= MAX_PROOF_BYTES,
         "node enrollment proposal too large",
@@ -404,6 +406,12 @@ pub fn prepare_account_node_enrollment(
             "node enrollment requires this account's confirmed requesting client",
         )?;
         let state = snapshot.state();
+        let source = state
+            .account(&account)
+            .ok_or(AuthorizationError::Revoked)?
+            .authority
+            .public_key
+            .clone();
         let head = state
             .head(&PolicyDomain::Account(account.clone()))
             .ok_or(AuthorizationError::Revoked)?
@@ -419,7 +427,7 @@ pub fn prepare_account_node_enrollment(
             purpose: EnrollmentPolicyPurpose::AccountNode,
             account: account.clone(),
             requesting_device: authorization.scope.device_id.clone(),
-            source_node_public_key: authorization.audience_public_key.clone(),
+            source_node_public_key: source.clone(),
             pins: snapshot.pins().to_vec(),
             required_heads: snapshot
                 .pins()
@@ -469,7 +477,7 @@ pub fn prepare_account_node_enrollment(
             state,
             &intent,
             &descriptor,
-            &authorization.audience_public_key,
+            &source,
             &PublicKey::of(requesting_client),
             now,
         )?;
@@ -523,6 +531,7 @@ pub fn sign_account_node_enrollment_possession(
     expected_claim_nonce: &str,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _scope = crate::signature_verification::ScopedSignatureVerification::new();
     let sign = || -> Result<String> {
         let request = &context.credential.intent;
         let now = timestamp(now_ms)?;
