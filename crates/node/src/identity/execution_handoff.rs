@@ -573,12 +573,7 @@ fn original_capsule_authorization(
         handoff.sdk_origin.as_ref(),
     )?;
     let admitted = source.original_admission(&handoff, now_ms)?;
-    let auth = current.verify_operation_authorization(
-        &admitted,
-        &facts,
-        &original.transport.clone().into_evidence(),
-        now_ms,
-    )?;
+    let auth = current.verify_admitted_operation_authorization(&admitted, &facts, now_ms)?;
     Ok(auth)
 }
 
@@ -755,7 +750,7 @@ fn capsule_facts(
             session.target == proof.invocation.payload.device
                 && session.session_id == origin.sdk_trigger.as_str()
                 && body["parent_invocation"].as_str() == Some(origin.invocation.hash()?.as_str())
-                && proof.transport.clone().into_evidence()
+                && proof.transport.existing_evidence()?
                     == TransportEvidence::LocalAgentAdapter {
                         service: service.clone(),
                         session: session.clone()
@@ -782,121 +777,6 @@ fn capsule_facts(
         body_hash: ObjectHash::body(body)?,
         context,
     })
-}
-
-fn compact_parent(
-    policy: &PolicyState,
-    origin: &CompactSdkOrigin,
-    child: &crate::model::AdmissionProof,
-    facts: &vibeface_secure::authorization::RequestFacts,
-) -> Result<(
-    vibeface_secure::authorization::VerifiedAdmission,
-    vibeface_secure::authorization::RequestFacts,
-)> {
-    use vibeface_secure::authorization::{Action, Actor, RequestFacts};
-    let invocation = &origin.invocation.payload;
-    ensure!(
-        origin.challenge.stage == CheckStage::Admit
-            && matches!(invocation.actor, Actor::Account(_))
-            && invocation.initiator == invocation.actor
-            && invocation.initiating_grant.is_none()
-            && invocation.action == Action::MessageAppend
-            && invocation.resource == facts.resource
-            && invocation.audience == facts.audience
-            && invocation.context.conversation == facts.context.conversation
-            && invocation.context.workspace_resource == facts.context.workspace_resource
-            && invocation.context.sdk_session.is_none()
-            && invocation.context.execution_session.is_none()
-            && origin.admitted_at_ms <= child.admitted_at_ms,
-        "invalid opaque Account message origin"
-    );
-    let parent_facts = RequestFacts {
-        resource: facts.resource.clone(),
-        action: Action::MessageAppend,
-        audience: facts.audience.clone(),
-        operation_id: invocation.operation_id.clone(),
-        body_hash: invocation.body_hash.clone(),
-        context: invocation.context.clone(),
-    };
-    let historical = policy.historical(&origin.challenge.policies, origin.admitted_at_ms)?;
-    let auth = historical.verify_invocation(
-        &origin.invocation,
-        &parent_facts,
-        &origin.transport.clone().into_evidence(),
-        origin.admitted_at_ms,
-    )?;
-    let fresh = historical.verify_freshness(
-        &auth,
-        &origin.challenge,
-        &origin.receipts,
-        origin.admitted_at_ms,
-    )?;
-    Ok((
-        historical.admit_operation(&auth, &fresh, origin.admitted_at_ms)?,
-        parent_facts,
-    ))
-}
-
-fn verify_capsule_sdk(
-    state: &VerifiedPolicySet,
-    policy: &PolicyState,
-    proof: &crate::model::AdmissionProof,
-    facts: &vibeface_secure::authorization::RequestFacts,
-    origin: Option<&CompactSdkOrigin>,
-    now_ms: u64,
-) -> Result<()> {
-    use vibeface_secure::authorization::Actor;
-    let Some(origin) = origin else { return Ok(()) };
-    let Actor::Service(service) = &proof.invocation.payload.actor else {
-        anyhow::bail!("SDK capsule is not a Service request")
-    };
-    let (parent, parent_facts) = compact_parent(policy, origin, proof, facts)?;
-    let parent = state.verify_operation_authorization(
-        &parent,
-        &parent_facts,
-        &origin.transport.clone().into_evidence(),
-        now_ms,
-    )?;
-    let delegated = state.verify_service_delegation(
-        &parent,
-        service,
-        &proof.invocation.payload.grant_leaf,
-        facts,
-        now_ms,
-    )?;
-    ensure!(
-        delegated.device() == &proof.invocation.payload.device
-            && delegated.initiator() == &proof.invocation.payload.initiator
-            && delegated.initiating_grant() == proof.invocation.payload.initiating_grant.as_ref(),
-        "capsule SDK delegation changed"
-    );
-    Ok(())
-}
-
-fn verify_capsule_admission(
-    connection: &Connection,
-    policy: &PolicyState,
-    proof: &crate::model::AdmissionProof,
-    facts: &vibeface_secure::authorization::RequestFacts,
-    origin: Option<&CompactSdkOrigin>,
-) -> Result<vibeface_secure::authorization::VerifiedAdmission> {
-    let historical = super::task_execution_context::OriginalAdmissionView::load(connection, policy, proof)?;
-    let admitted = super::admission::reconstruct_admission_uncached(
-        connection,
-        policy,
-        proof,
-        facts,
-        &proof.transport.clone().into_evidence(),
-    )?;
-    verify_capsule_sdk(
-        historical.state(),
-        policy,
-        proof,
-        facts,
-        origin,
-        proof.admitted_at_ms,
-    )?;
-    Ok(admitted)
 }
 
 pub(super) fn compact_sdk_from_events(
@@ -1115,7 +995,7 @@ fn stored_from(
     let stored = StoredHandoff {
         wire,
         request: operation_request,
-        transport: serde_json::from_str::<StoredTransport>(&raw.transport)?.into_evidence(),
+        transport: serde_json::from_str::<StoredTransport>(&raw.transport)?.existing_evidence()?,
         admission: ExecutionHandoffFreshness {
             challenge: serde_json::from_str(&raw.challenge)?,
             receipts: serde_json::from_str(&raw.receipts)?,
@@ -3339,13 +3219,9 @@ pub(super) fn resolution_resolver_from(
 ) -> Result<VerifiedAuthorization> {
     let facts = execution_resolution_account_facts(&wire.resolution)?;
     let proof = &wire.resolution.account_admission;
-    let admitted = verify_capsule_admission(connection, policy, proof, &facts, None)?;
-    Ok(current.verify_operation_authorization(
-        &admitted,
-        &facts,
-        &proof.transport.clone().into_evidence(),
-        now_ms,
-    )?)
+    let admitted =
+        super::admission::reconstruct_stored_admission_uncached(connection, policy, proof, &facts)?;
+    Ok(current.verify_admitted_operation_authorization(&admitted, &facts, now_ms)?)
 }
 
 fn stored_resolution_from(
@@ -3394,7 +3270,7 @@ fn stored_resolution_from(
     );
     Ok(Some(StoredResolution {
         wire: saved,
-        transport: serde_json::from_str::<StoredTransport>(&transport)?.into_evidence(),
+        transport: serde_json::from_str::<StoredTransport>(&transport)?.existing_evidence()?,
         freshness: serde_json::from_str(&freshness)?,
         resolved_at_ms,
         result,
@@ -5538,7 +5414,7 @@ pub(crate) mod tests {
             let auth = self.store.policy.verified().verify_invocation(
                 &proof.invocation,
                 &facts,
-                &proof.transport.clone().into_evidence(),
+                &proof.transport.existing_evidence()?,
                 now() + 50,
             )?;
             proof.challenge = FreshnessChallenge::new(
@@ -6165,7 +6041,7 @@ pub(crate) mod tests {
                 let auth = fixture.store.policy.verified().verify_invocation(
                     &admission.invocation,
                     &facts,
-                    &admission.transport.clone().into_evidence(),
+                    &admission.transport.existing_evidence()?,
                     now(),
                 )?;
                 admission.challenge = FreshnessChallenge::new(
@@ -6313,7 +6189,7 @@ pub(crate) mod tests {
                 body_hash: invocation.body_hash.clone(),
                 context: invocation.context.clone(),
             };
-            let transport = admission.transport.clone().into_evidence();
+            let transport = admission.transport.existing_evidence()?;
             admission.invocation = Signed::sign(invocation.clone(), &fixture.project.client)?;
             let policy = fixture.store.policy.verified();
             let auth =
@@ -7699,7 +7575,7 @@ pub(crate) mod tests {
         let auth = fixture.store.policy.verified().verify_invocation(
             &admission.invocation,
             &facts,
-            &admission.transport.clone().into_evidence(),
+            &admission.transport.existing_evidence()?,
             now(),
         )?;
         admission.challenge = FreshnessChallenge::new(
