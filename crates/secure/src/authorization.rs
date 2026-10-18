@@ -10,7 +10,7 @@ pub mod client_policy_import;
 pub mod gateway_forward;
 pub mod gateway_client;
 pub mod gateway_original;
-use gateway_original::{AdmittedDestination, AdmissionOrigin, OriginalGatewayTransport, RequestOrigin};
+use gateway_original::{AcceptedGatewayOriginal, AdmittedDestination, AdmissionOrigin, OriginalGatewayTransport, RequestOrigin};
 pub mod directory;
 pub mod enrollment;
 pub mod enrollment_policy_import;
@@ -885,6 +885,7 @@ enum InvocationTransport<'a> {
         original: &'a gateway_forward::GatewayOriginal,
     },
     OriginalGateway(&'a OriginalGatewayTransport),
+    CompactSdkParent { header: &'a Signed<gateway_forward::GatewayForwardHeader>, invocation: &'a Signed<Invocation> },
     PortableIntent,
 }
 
@@ -2451,10 +2452,16 @@ impl VerifiedPolicySet {
         let origin = match &auth.origin {
             RequestOrigin::Existing(transport) => AdmissionOrigin::Existing(transport.clone()),
             RequestOrigin::Gateway(original) => AdmissionOrigin::Gateway(original.clone()),
-            RequestOrigin::PortableIntent => return Err(AuthorizationError::InvalidProof("portable intent cannot create an operation admission")),
+            RequestOrigin::PortableIntent => {
+                return Err(AuthorizationError::InvalidProof(
+                    "portable intent cannot create an operation admission",
+                ));
+            }
         };
         Ok(VerifiedAdmission {
-            invocation: auth.invocation.clone(), admitted_at_ms: now_ms, origin,
+            invocation: auth.invocation.clone(),
+            admitted_at_ms: now_ms,
+            origin,
             usage: gateway_original::admission_usage(auth, freshness)?,
             admission_expires_at_ms: auth.expires_at_ms().min(freshness.expires_at_ms),
             destination: auth.destination.clone(),
@@ -2671,7 +2678,10 @@ impl VerifiedPolicySet {
                 budget.expires(proof.header().payload.expires_at_ms);
             }
             InvocationTransport::GatewayTranscript { header, original } => {
-                require(phase == AuthorizationPhase::Admission, "gateway transcript is only for original admission verification")?;
+                require(
+                    phase == AuthorizationPhase::Admission,
+                    "gateway transcript is only for original admission verification",
+                )?;
                 let target = &self.find_device(&i.audience.device)?.payload.public_key;
                 gateway_forward::verify_gateway_statement(header, original, target, now_ms)?;
                 self.check_directed_gateway_request(signed, &invocation_hash, original)?;
@@ -2680,14 +2690,44 @@ impl VerifiedPolicySet {
                 budget.expires(header.payload.expires_at_ms);
             }
             InvocationTransport::OriginalGateway(original) => {
-                require(phase == AuthorizationPhase::Operation, "accepted gateway origin cannot authorize a new admission")?;
-                self.check_directed_gateway_request(signed, &invocation_hash, &original.original)?;
-                require(original.header.payload.original_hash == original.original.hash()?,
-                    "accepted gateway original bytes changed")?;
-                require(original.header.payload.target_key == self.find_device(&i.audience.device)?.payload.public_key,
-                    "accepted gateway target changed")?;
+                require(
+                    phase == AuthorizationPhase::Operation,
+                    "accepted gateway origin cannot authorize a new admission",
+                )?;
+                match &original.original {
+                    AcceptedGatewayOriginal::Full(full) => {
+                        self.check_directed_gateway_request(signed, &invocation_hash, full)?
+                    }
+                    AcceptedGatewayOriginal::SdkParent(parent) => require(
+                        parent == signed && parent.hash()? == invocation_hash,
+                        "accepted SDK parent changed its signed invocation",
+                    )?,
+                }
+                require(
+                    original.header.payload.original_hash == original.original.commitment()?,
+                    "accepted gateway original bytes changed",
+                )?;
+                require(
+                    original.header.payload.target_key
+                        == self.find_device(&i.audience.device)?.payload.public_key,
+                    "accepted gateway target changed",
+                )?;
                 budget.verify(&original.header)?;
-                budget.record_metadata(original.original.body())?;
+                if let AcceptedGatewayOriginal::Full(full) = &original.original {
+                    budget.record_metadata(full.body())?;
+                }
+            }
+            InvocationTransport::CompactSdkParent { header, invocation } => {
+                require(
+                    phase == AuthorizationPhase::Admission && invocation == signed,
+                    "compact SDK provenance cannot authorize another request",
+                )?;
+                let target = &self.find_device(&i.audience.device)?.payload.public_key;
+                gateway_original::verify_compact_gateway_parent(
+                    header, invocation, target, now_ms,
+                )?;
+                budget.verify(header)?;
+                budget.expires(header.payload.expires_at_ms);
             }
             InvocationTransport::PortableIntent => {
                 if i.presenter != i.device {
@@ -2810,10 +2850,30 @@ impl VerifiedPolicySet {
             verified_at_ms: now_ms,
             destination: None,
             origin: match transport {
-                InvocationTransport::Existing(transport) => RequestOrigin::Existing(transport.clone()),
-                InvocationTransport::DirectedGateway { proof, original } => RequestOrigin::Gateway(OriginalGatewayTransport { header: proof.header().clone(), original: original.clone() }),
-                InvocationTransport::GatewayTranscript { header, original } => RequestOrigin::Gateway(OriginalGatewayTransport { header: header.clone(), original: original.clone() }),
-                InvocationTransport::OriginalGateway(original) => RequestOrigin::Gateway(original.clone()),
+                InvocationTransport::Existing(transport) => {
+                    RequestOrigin::Existing(transport.clone())
+                }
+                InvocationTransport::DirectedGateway { proof, original } => {
+                    RequestOrigin::Gateway(OriginalGatewayTransport {
+                        header: proof.header().clone(),
+                        original: AcceptedGatewayOriginal::Full(original.clone()),
+                    })
+                }
+                InvocationTransport::GatewayTranscript { header, original } => {
+                    RequestOrigin::Gateway(OriginalGatewayTransport {
+                        header: header.clone(),
+                        original: AcceptedGatewayOriginal::Full(original.clone()),
+                    })
+                }
+                InvocationTransport::OriginalGateway(original) => {
+                    RequestOrigin::Gateway(original.clone())
+                }
+                InvocationTransport::CompactSdkParent { header, invocation } => {
+                    RequestOrigin::Gateway(OriginalGatewayTransport {
+                        header: header.clone(),
+                        original: AcceptedGatewayOriginal::SdkParent(invocation.clone()),
+                    })
+                }
                 InvocationTransport::PortableIntent => RequestOrigin::PortableIntent,
             },
         })
@@ -3039,7 +3099,8 @@ impl VerifiedPolicySet {
         let mut usage = execution_handoff::ExecutionProofUsage::default();
         usage.record_budget(&budget)?;
         usage.record_metadata(challenge)?;
-        if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts() {
+        if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts()
+        {
             usage.record_actual_signature_counts(counts);
         }
         usage.enforce_limits()?;
@@ -5323,9 +5384,6 @@ pub struct PolicyCommit {
     pub expires_at_ms: u64,
     pub nonce: Nonce,
     pub dependencies: Vec<PolicyStamp>,
-}
-signed_object!(PolicyCommit, "policy-commit-v2");
-impl Signed<PolicyCommit> {
     pub fn challenge_hash(&self) -> Result<ObjectHash> {
         let mut payload = self.payload.clone();
         payload.accepted_at_ms = 0;

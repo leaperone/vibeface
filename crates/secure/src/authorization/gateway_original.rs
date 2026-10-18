@@ -16,9 +16,33 @@ pub(super) struct AdmittedDestination {
 }
 
 #[derive(Clone, Debug)]
+pub(super) enum AcceptedGatewayOriginal {
+    Full(GatewayOriginal),
+    SdkParent(Signed<Invocation>),
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct OriginalGatewayTransport {
     pub(super) header: Signed<GatewayForwardHeader>,
-    pub(super) original: GatewayOriginal,
+    pub(super) original: AcceptedGatewayOriginal,
+}
+
+impl AcceptedGatewayOriginal {
+    pub(super) fn request(&self) -> &Invocation {
+        match self {
+            Self::Full(original) => original.request(),
+            Self::SdkParent(invocation) => &invocation.payload,
+        }
+    }
+    pub(super) fn commitment(&self) -> Result<ObjectHash> {
+        match self {
+            Self::Full(original) => original.hash(),
+            Self::SdkParent(invocation) => gateway_forward::gateway_invocation_original_hash(
+                gateway_forward::GatewayForwardPurpose::Invoke,
+                invocation,
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -160,15 +184,147 @@ impl VerifiedPolicySet {
                     )
                 }
             }
-            AdmissionOrigin::Gateway(original) => self.verify_original_request_for_body(
-                &admission.invocation,
-                original.original.body(),
-                facts,
-                InvocationTransport::OriginalGateway(original),
-                now_ms,
-                AuthorizationPhase::Operation,
-            ),
+            AdmissionOrigin::Gateway(original) => match &original.original {
+                AcceptedGatewayOriginal::Full(full) => self.verify_original_request_for_body(
+                    &admission.invocation,
+                    full.body(),
+                    facts,
+                    InvocationTransport::OriginalGateway(original),
+                    now_ms,
+                    AuthorizationPhase::Operation,
+                ),
+                AcceptedGatewayOriginal::SdkParent(_) => {
+                    let mut budget = Budget::default();
+                    let hash = budget.verify(&admission.invocation)?;
+                    self.verify_authorized_invocation_body(
+                        &admission.invocation,
+                        hash,
+                        budget,
+                        facts,
+                        InvocationTransport::OriginalGateway(original),
+                        now_ms,
+                        AuthorizationPhase::Operation,
+                    )
+                }
+            },
         }
+    }
+
+    pub(super) fn verify_compact_sdk_parent_admission(
+        &self,
+        source: &execution_handoff::VerifiedProjectExecutionSource,
+        handoff: &execution_handoff::ExecutionHandoff,
+        now_ms: u64,
+    ) -> Result<Option<VerifiedAdmission>> {
+        let _scope = ScopedSignatureVerification::new();
+        require(
+            handoff.source_statement()?.capsule_hash == *source.capsule_hash(),
+            "SDK parent belongs to another verified Project source",
+        )?;
+        let Some(origin) = &handoff.sdk_origin else {
+            return Ok(None);
+        };
+        let event: events::Event =
+            serde_json::from_str(&handoff.project_dispatch.canonical_body)
+                .map_err(|_| AuthorizationError::InvalidProof("invalid SDK Project dispatch"))?;
+        let events::EventCause::Invocation { admission: child } = &event.cause else {
+            return Err(AuthorizationError::InvalidProof(
+                "SDK dispatch has no admitted invocation",
+            ));
+        };
+        let parent = &origin.invocation.payload;
+        let Actor::Service(service) = &child.invocation.payload.actor else {
+            return Err(AuthorizationError::InvalidProof(
+                "SDK parent has no Service child",
+            ));
+        };
+        let session = child
+            .invocation
+            .payload
+            .context
+            .sdk_session
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "SDK child has no adapter session",
+            ))?;
+        require(
+            matches!(parent.actor, Actor::Account(_))
+                && parent.initiator == parent.actor
+                && parent.initiating_grant.is_none()
+                && parent.action == Action::MessageAppend
+                && parent.context.sdk_session.is_none()
+                && parent.context.execution_session.is_none()
+                && parent.resource == child.invocation.payload.resource
+                && parent.audience == child.invocation.payload.audience
+                && parent.context.conversation == child.invocation.payload.context.conversation
+                && parent.context.workspace_resource
+                    == child.invocation.payload.context.workspace_resource
+                && session.target == child.invocation.payload.device
+                && session.session_id == origin.sdk_trigger.as_str()
+                && child.source_body["parent_invocation"].as_str()
+                    == Some(origin.invocation.hash()?.as_str())
+                && child.source_body["sdk_session"]
+                    == serde_json::to_value(session)
+                        .map_err(|_| AuthorizationError::InvalidProof("invalid SDK session"))?
+                && child.transport.existing_evidence()?
+                    == TransportEvidence::LocalAgentAdapter {
+                        service: service.clone(),
+                        session: session.clone(),
+                    }
+                && origin.admitted_at_ms <= child.admitted_at_ms
+                && child.admitted_at_ms <= now_ms
+                && origin.challenge.stage == CheckStage::Admit
+                && origin.challenge.policies.len() <= MAX_POLICY_DOMAINS
+                && origin
+                    .challenge
+                    .policies
+                    .windows(2)
+                    .all(|pair| pair[0].domain < pair[1].domain)
+                && origin.receipts.len() <= MAX_POLICY_DOMAINS,
+            "compact SDK parent changed its verified Account origin",
+        )?;
+        let historical = remote_resolution_history::at_heads(self, &origin.challenge.policies)?;
+        let facts = RequestFacts {
+            resource: parent.resource.clone(),
+            action: parent.action,
+            audience: parent.audience.clone(),
+            operation_id: parent.operation_id.clone(),
+            body_hash: parent.body_hash.clone(),
+            context: parent.context.clone(),
+        };
+        let existing;
+        let transport = match &origin.transport {
+            StoredTransport::DirectedGateway { header } => InvocationTransport::CompactSdkParent {
+                header,
+                invocation: &origin.invocation,
+            },
+            _ => {
+                existing = origin.transport.existing_evidence()?;
+                InvocationTransport::Existing(&existing)
+            }
+        };
+        let mut budget = Budget::default();
+        let hash = budget.verify(&origin.invocation)?;
+        let authorization = historical.verify_authorized_invocation_body(
+            &origin.invocation,
+            hash,
+            budget,
+            &facts,
+            transport,
+            origin.admitted_at_ms,
+            AuthorizationPhase::Admission,
+        )?;
+        let freshness = historical.verify_freshness(
+            &authorization,
+            &origin.challenge,
+            &origin.receipts,
+            origin.admitted_at_ms,
+        )?;
+        Ok(Some(historical.admit_operation(
+            &authorization,
+            &freshness,
+            origin.admitted_at_ms,
+        )?))
     }
 
     fn verify_original_request_for_body(
@@ -224,4 +380,49 @@ pub(super) fn admission_usage(
     }
     usage.enforce_limits()?;
     Ok(usage)
+}
+
+pub(super) fn verify_compact_gateway_parent(
+    header: &Signed<GatewayForwardHeader>,
+    invocation: &Signed<Invocation>,
+    target: &PublicKey,
+    now_ms: u64,
+) -> Result<()> {
+    use gateway_forward::GatewayForwardPurpose;
+    header.verify_signature()?;
+    invocation.verify_signature()?;
+    let h = &header.payload;
+    let i = &invocation.payload;
+    validate_window(h.issued_at_ms, h.expires_at_ms, now_ms)?;
+    validate_window(i.not_before_ms, i.expires_at_ms, now_ms)?;
+    require(
+        h.version == AUTH_VERSION
+            && i.version == AUTH_VERSION
+            && h.purpose == GatewayForwardPurpose::Invoke
+            && i.action == Action::MessageAppend
+            && matches!(i.actor, Actor::Account(_))
+            && i.initiator == i.actor
+            && i.initiating_grant.is_none()
+            && i.context.sdk_session.is_none()
+            && i.context.execution_session.is_none()
+            && header.issuer == h.gateway_key
+            && h.client_key == invocation.issuer
+            && h.client_key != h.gateway_key
+            && h.target_key == *target
+            && h.target_key != h.gateway_key
+            && i.device == DeviceId::from_key(&invocation.issuer)
+            && i.presenter == DeviceId::from_key(&h.gateway_key)
+            && i.audience.device == DeviceId::from_key(target)
+            && valid_operation_id(&i.operation_id)
+            && h.authorization_id == i.operation_id
+            && h.lookup_operation_id.is_none()
+            && h.original_hash
+                == gateway_forward::gateway_invocation_original_hash(
+                    GatewayForwardPurpose::Invoke,
+                    invocation,
+                )?
+            && h.issued_at_ms >= i.not_before_ms
+            && h.expires_at_ms <= i.expires_at_ms,
+        "compact SDK gateway parent changed signed origin or window",
+    )
 }

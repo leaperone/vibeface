@@ -386,6 +386,7 @@ impl VerifiedPolicySet {
                 budget.verify(&original.header)?;
                 return Ok(());
             }
+            InvocationTransport::CompactSdkParent { .. } => return Err(AuthorizationError::InvalidProof("SDK message parent cannot select an execution destination")),
             InvocationTransport::PortableIntent => {
                 return Err(AuthorizationError::InvalidProof(
                     "portable intent has no live execution transport",
