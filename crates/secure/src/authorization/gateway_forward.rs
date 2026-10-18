@@ -485,8 +485,14 @@ impl GatewayOriginal {
                     .windows(2)
                     .all(|pair| pair[0].domain < pair[1].domain)
                 && match self {
-                    Self::Status { .. } => request.action == Action::OperationStatusRead,
-                    Self::Invoke { .. } => request.action != Action::OperationStatusRead,
+                    Self::Status { .. } => {
+                        request.action == Action::OperationStatusRead
+                            && self.body().get("method").and_then(Value::as_str)
+                                == Some("operation")
+                    }
+                    Self::Invoke { .. } => {
+                        self.body().get("method").and_then(Value::as_str) != Some("operation")
+                    }
                     Self::Prepare { .. } => true,
                 },
             "gateway original changed signed request fields or purpose",
@@ -934,7 +940,7 @@ mod tests {
             resource: ResourceId::from_bytes([102; 32]),
         };
         let body = if status {
-            json!({"operation_id":"original_write","authorization_id":"status_read"})
+            json!({"method":"operation","operation_id":"original_write","authorization_id":"status_read"})
         } else {
             json!({"text":"hello","authorization_id":"new_write"})
         };
@@ -1123,6 +1129,70 @@ mod tests {
                 &PublicKey::of(&gateway),
                 &changed,
                 &request,
+                &PublicKey::of(&target),
+                NOW
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ordinary_operation_reads_remain_invocations_and_lookup_cannot_downgrade() {
+        let user = key(90);
+        let gateway = key(91);
+        let target = key(92);
+        for body in [
+            json!({"method":"nodes","authorization_id":"read_nodes"}),
+            json!({"method":"session","authorization_id":"read_session","target_node":"target","session_id":"session"}),
+            json!({"method":"operate","authorization_id":"read_operation","request":{"action":{"type":"read"}}}),
+        ] {
+            let GatewayOriginal::Invoke { invocation, .. } =
+                original(&user, &gateway, &target, false)
+            else {
+                unreachable!()
+            };
+            let mut request = invocation.payload;
+            request.action = Action::OperationStatusRead;
+            request.operation_id = body["authorization_id"].as_str().unwrap().to_owned();
+            request.body_hash = ObjectHash::body(&body).unwrap();
+            let invocation = Signed::sign(request, &user).unwrap();
+            let ordinary = GatewayOriginal::Invoke {
+                body: body.clone(),
+                invocation: invocation.clone(),
+            };
+            let signed = header(&ordinary, &gateway, &target);
+            verify_directed_gateway(
+                &PublicKey::of(&gateway),
+                &signed,
+                &ordinary,
+                &PublicKey::of(&target),
+                NOW,
+            )
+            .unwrap();
+            let lookup = GatewayOriginal::Status { body, invocation };
+            let signed = header(&lookup, &gateway, &target);
+            assert!(
+                verify_directed_gateway(
+                    &PublicKey::of(&gateway),
+                    &signed,
+                    &lookup,
+                    &PublicKey::of(&target),
+                    NOW
+                )
+                .is_err()
+            );
+        }
+        let GatewayOriginal::Status { body, invocation } = original(&user, &gateway, &target, true)
+        else {
+            unreachable!()
+        };
+        let downgraded = GatewayOriginal::Invoke { body, invocation };
+        let signed = header(&downgraded, &gateway, &target);
+        assert!(
+            verify_directed_gateway(
+                &PublicKey::of(&gateway),
+                &signed,
+                &downgraded,
                 &PublicKey::of(&target),
                 NOW
             )

@@ -1133,7 +1133,7 @@ fn gateway_invocation_original(
     signed: &Signed<Invocation>,
     raw_body: &serde_json::Value,
 ) -> gateway_forward::GatewayOriginal {
-    if signed.payload.action == Action::OperationStatusRead {
+    if raw_body.get("method").and_then(serde_json::Value::as_str) == Some("operation") {
         gateway_forward::GatewayOriginal::Status {
             body: raw_body.clone(),
             invocation: signed.clone(),
