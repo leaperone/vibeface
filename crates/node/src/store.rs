@@ -2447,7 +2447,8 @@ mod tests {
         );
         assert!(!store.connection.is_autocommit());
         store.connection.execute_batch("ROLLBACK")?;
-        let other_resource = "another-local-resource";
+        let other_resource_id = ResourceId::random()?;
+        let other_resource = other_resource_id.as_str();
         let mut record = store
             .policy
             .verified()
@@ -2455,7 +2456,7 @@ mod tests {
             .context("original resource is missing")?
             .payload
             .clone();
-        record.resource = ResourceId::parse(other_resource)?;
+        record.resource = other_resource_id;
         record.nonce = Nonce::random()?;
         let record = Signed::sign(record, &network.root)?;
         store.connection.execute(

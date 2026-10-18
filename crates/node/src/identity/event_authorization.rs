@@ -1039,6 +1039,7 @@ pub(super) fn retained_scope_events_in(
     resource: &ResourceId,
     scope: &str,
 ) -> Result<BTreeMap<String, StoredEvent>> {
+    check_retained_scope_resource_indexes_in(connection, space, scope)?;
     let events = retained_scope_event_rows_in(connection, space, resource, scope)?;
     if let Some(source) = events.values().next() {
         validate_retained_event_scope_in(connection, &source.envelope)?;
@@ -1594,6 +1595,22 @@ pub(crate) fn validate_retained_event_dependencies_in(
     Ok(())
 }
 
+fn check_retained_scope_resource_indexes_in(
+    connection: &Connection,
+    space: &str,
+    scope: &str,
+) -> Result<()> {
+    let changed_resource_index: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND scope_id=? AND resource_id IS NOT json_extract(json_extract(envelope,'$.canonical_body'),'$.resource_id'))",
+        params![space, scope], |row| row.get(0),
+    )?;
+    ensure!(
+        !changed_resource_index,
+        "retained scope resource index differs from its signed body"
+    );
+    Ok(())
+}
+
 fn ready_observation_scope_in(
     connection: &Connection,
     source: &SignedEvent,
@@ -1601,15 +1618,7 @@ fn ready_observation_scope_in(
     observation_slot: &str,
 ) -> Result<ObservationScopeCheckpoint> {
     let expected: Event = serde_json::from_str(&source.canonical_body)?;
-    let changed_resource_index: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM events WHERE space_id=? AND scope_id=? AND resource_id IS NOT json_extract(json_extract(envelope,'$.canonical_body'),'$.resource_id'))",
-        params![expected.network_id, expected.scope_id],
-        |row| row.get(0),
-    )?;
-    ensure!(
-        !changed_resource_index,
-        "retained scope resource index differs from its signed body"
-    );
+    check_retained_scope_resource_indexes_in(connection, &expected.network_id, &expected.scope_id)?;
     let row_count: u64 = connection.query_row(
         "SELECT COUNT(*) FROM events WHERE space_id=? AND resource_id=? AND scope_id=?",
         params![
