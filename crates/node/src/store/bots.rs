@@ -556,4 +556,37 @@ mod tests {
         assert!(store.bots(&network)?.is_empty());
         Ok(())
     }
+
+    #[test]
+    fn replica_cannot_create_a_bot_or_leave_a_partial_conversation() -> Result<()> {
+        let replica = LocalIdentity::generate();
+        let network = replica.fixture_network_id()?;
+        let mut store = Store::open(":memory:")?;
+        store.install_trust_bundle(
+            &network,
+            &replica
+                .sign_network_fixture(1, vec![replica.certificate(vec![NodeRole::Replica])?])?,
+        )?;
+        assert!(
+            store
+                .create_bot(
+                    &replica,
+                    &network,
+                    "history",
+                    "bot",
+                    "Assistant",
+                    "",
+                    None,
+                    1
+                )
+                .is_err()
+        );
+        assert!(store.conversations(&network)?.is_empty());
+        let proof = store.trust_bundle(&network)?.unwrap();
+        assert!(
+            validate_gateway_proof_from(&store.connection, &network, &replica.node_id()?, &proof)
+                .is_err()
+        );
+        Ok(())
+    }
 }
