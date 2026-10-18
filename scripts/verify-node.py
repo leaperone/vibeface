@@ -637,14 +637,15 @@ class Client:
         self.process = None
         self.node_id = None
 
-    def command(self, op, *, check=True, **arguments):
+    def command(self, op, *, check=True, _wait_timeout=30, **arguments):
+        require(0 < _wait_timeout <= 30, "client command wait stays within its original deadline")
         if self.process is None:
             self.process = subprocess.Popen(
                 ["node", str(self.helper), *([str(self.identity_file)] if self.identity_file else [])], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self.process.stdin.write(json.dumps({"op": op, **arguments}) + "\n")
         self.process.stdin.flush()
-        require(select.select([self.process.stdout], [], [], 30)[0], "WASM client command completed before timeout")
+        require(select.select([self.process.stdout], [], [], _wait_timeout)[0], "WASM client command completed before timeout")
         line = self.process.stdout.readline()
         require(line, "WASM client returned a bounded JSON response")
         value = json.loads(line)
@@ -813,25 +814,34 @@ class Node:
         path = self.directory / "pair-invitation.json"
         private_json(path, {"url": relay_url or owner.url, "node_id": owner.node_id,
                             "relay": relay_url is not None, "invite": invitation})
-        process = subprocess.Popen([str(self.binary), "pair", "--data-dir", str(self.directory),
-                                    "--invite-file", str(path), "--name", f"Node {self.name}"],
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        log_path = self.directory / f"pair-cli-{uuid.uuid4().hex[:8]}.log"
+        log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
+        process = None
         try:
+            process = subprocess.Popen([str(self.binary), "pair", "--data-dir", str(self.directory),
+                                        "--invite-file", str(path), "--name", f"Node {self.name}"],
+                                       stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
             def pending():
+                if process.poll() is not None:
+                    raise RuntimeError(f"{self.name}: CLI pairing exited {process.returncode} before signed review; see {log_path}")
                 requests = owner.client.call("pair_requests")
                 return next((item for item in requests if item["review"]["new_member"]["subject_id"] == self.node_id
                              and item.get("new_subject_signature")), None)
             review = wait_for(f"{self.name} signed CLI pairing review", pending)
             owner.client.approve(review["request_id"])
-            stdout, stderr = process.communicate(timeout=40)
-            log = self.directory / "pair-cli.log"
-            log.write_bytes(stdout + stderr)
-            log.chmod(0o600)
+            process.wait(timeout=40)
             require(process.returncode == 0, f"{self.name}: pinned CLI pairing completes after management approval")
         finally:
-            if process.poll() is None:
-                process.terminate()
-                process.wait(timeout=5)
+            try:
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+            finally:
+                log.close()
         self.client.pair_client(owner.client, network, f"{self.name} independent client")
         self.client.url = self.url
         self.client.node_id = self.node_id
@@ -858,6 +868,40 @@ class Node:
         self.client.principal = result["principal"]
         require(self.client.principal["can_manage"], "bootstrap grants the local management client")
         return self.client.network_id
+
+
+def wait_for_relay_target(node, capture, after_connection, *, timeout=35):
+    deadline = time.monotonic() + timeout
+
+    def reserved():
+        with capture.lock:
+            controls = list(capture.controls)
+        attempts = {item["connection"] for item in controls
+                    if item["connection"] > after_connection and item["direction"] == "to_relay"
+                    and item["type"] == "reserve" and item["node_id"] == node.node_id}
+        return next((item for item in reversed(controls)
+                     if item["connection"] in attempts and item["direction"] == "from_relay"
+                     and item["type"] == "reserved"), None)
+
+    candidate = wait_for("current fixed target relay reservation", reserved, timeout=timeout)
+    probe = Client(capture.url, node.client.helper, node.client.module)
+    started = time.monotonic()
+    try:
+        probe.command("connect", url=capture.url, node_id=node.node_id, relay=True,
+                      _wait_timeout=min(30, deadline - time.monotonic()))
+        response = probe.command("request", method="info", params={},
+                                 _wait_timeout=min(30, deadline - time.monotonic()))
+        require(not response.get("error") and response.get("result", {}).get("node_id") == node.node_id,
+                "current relay reaches the original target through pinned Noise and an encrypted read")
+        return {"target": node.node_id, "relay_url": capture.url,
+                "after_connection": after_connection, "reservation_connection": candidate["connection"],
+                "capture_generation": candidate["generation"], "read_node_id": response["result"]["node_id"],
+                "probe_seconds": time.monotonic() - started, "kind": "pinned Noise and encrypted read-only info"}
+    finally:
+        if probe.process is not None and deadline - time.monotonic() <= 5:
+            probe.process.kill()
+        probe.close()
+
 
 
 class Events:
@@ -2847,6 +2891,8 @@ def acceptance(options):
 
         verify_browser_origins(a, [f"http://localhost:{a.port}", f"http://0.0.0.0:{a.port}"])
         a.stop()
+        with capture.lock:
+            a_relay_restart_connection = capture.next_connection
         extra_origins = [f"http://192.0.2.10:{a.port}", "https://node.example"]
         a.configure(allowed_origins=extra_origins, allow_insecure_lan=True)
         a.start()
@@ -2856,8 +2902,7 @@ def acceptance(options):
         passed("local aliases and explicit entries validate Host/Origin without account cookies", "real_http_origin_boundaries")
 
         b.pair(a, network)
-        wait_for("A reserves its public relay route",
-                 lambda: b'{"type":"reserved"}' in capture.payloads)
+        report["relay_readiness"] = wait_for_relay_target(a, capture, a_relay_restart_connection)
         c.pair(a, network, relay_url=capture.url)
         b.start()
         c.start()
@@ -4742,9 +4787,11 @@ def network_reliability_acceptance(options):
         for node in (source, receiver):
             node.configure(manager=None, network={"bootstrap_urls": [capture.url.replace("http:", "ws:") + "/api/network/ws"],
                                                   "advertise_urls": [], "mdns": False, "relay_enabled": False})
+        with capture.lock:
+            source_relay_start_connection = capture.next_connection
         source.start()
         network = source.bootstrap()
-        wait_for("source reservation through the sole relay", lambda: b'{"type":"reserved"}' in capture.payloads)
+        report["relay_readiness"] = wait_for_relay_target(source, capture, source_relay_start_connection)
         receiver.pair(source, network, relay_url=capture.url)
         receiver.start(env={**os.environ, "RUST_LOG": "vibeface::runtime=debug", "NO_COLOR": "1"} if lane == 1 else None)
         receiver.client.connect(receiver.node_id)
