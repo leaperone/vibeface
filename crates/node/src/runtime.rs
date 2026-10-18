@@ -1587,6 +1587,7 @@ pub(crate) mod tests {
             },
             network::{MAX_FRAME_BYTES, Service},
         };
+        use std::{future::Future, pin::Pin};
         use vibeface_secure::authorization::{
             Action, EventRef, InvocationContext, JournalEntry,
             execution_handoff::*,
@@ -1629,11 +1630,16 @@ pub(crate) mod tests {
         }
 
         impl Remote {
-            async fn new() -> Result<Self> {
-                Box::pin(Self::from_fixture(false)).await
+            fn new() -> Pin<Box<impl Future<Output = Result<Self>>>> {
+                Self::from_fixture(false)
             }
 
-            async fn from_fixture(foreign_task: bool) -> Result<Self> {
+            #[inline(never)]
+            fn from_fixture(foreign_task: bool) -> Pin<Box<impl Future<Output = Result<Self>>>> {
+                Box::pin(Self::open_fixture(foreign_task))
+            }
+
+            async fn open_fixture(foreign_task: bool) -> Result<Self> {
                 let project = TestNetwork::new()?;
                 let executor = TestNetwork::new()?;
                 let mut store = project.at(&project.directory.join("foreign-approval.sqlite3"))?;
@@ -2286,7 +2292,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         async fn initial_sdk_discovers_its_accounts_bound_task_only() -> Result<()> {
-            let mut remote = Box::pin(Remote::new()).await?;
+            let mut remote = Remote::new().await?;
             let outcome: Result<()> = async {
                 let sdk = agent(&remote.project, &remote.node).await?;
                 let discovered = remote.node.tool(
@@ -2341,7 +2347,7 @@ pub(crate) mod tests {
 
         #[tokio::test]
         async fn initial_sdk_rejects_a_foreign_accounts_bound_task() -> Result<()> {
-            let mut remote = Box::pin(Remote::from_fixture(true)).await?;
+            let mut remote = Remote::from_fixture(true).await?;
             let outcome: Result<()> = async {
                 let sdk = agent(&remote.project, &remote.node).await?;
                 {
@@ -2371,7 +2377,7 @@ pub(crate) mod tests {
         #[tokio::test]
         async fn account_task_sdk_continuation_keeps_the_original_message_and_observed_trigger()
         -> Result<()> {
-            let mut remote = Box::pin(Remote::new()).await?;
+            let mut remote = Remote::new().await?;
             let mut phase = "enable the account task follow-up";
             let outcome: Result<()> = async {
                 let mut body = remote.project.body("create_task", "conversation");
