@@ -4830,6 +4830,31 @@ mod tests {
         })
     }
     #[test]
+    fn net1_duplicate_import_projection_write_baseline() -> Result<()> {
+        let owner = LocalIdentity::generate();
+        let network = owner.fixture_network_id()?;
+        let mut store = memory(&owner, None)?;
+        let root = conversation(&mut store, &owner)?;
+        store.connection.execute_batch(
+            "CREATE TEMP TABLE projection_writes(count INTEGER NOT NULL);
+             INSERT INTO projection_writes VALUES(0);
+             CREATE TEMP TRIGGER count_conversation_delete AFTER DELETE ON conversations
+             BEGIN UPDATE projection_writes SET count=count+1; END;
+             CREATE TEMP TRIGGER count_conversation_insert AFTER INSERT ON conversations
+             BEGIN UPDATE projection_writes SET count=count+1; END;",
+        )?;
+        store.ingest_event(&network, &root)?;
+        let writes: u64 =
+            store
+                .connection
+                .query_row("SELECT count FROM projection_writes", [], |row| row.get(0))?;
+        assert_eq!(writes, 2);
+        assert_eq!(store.conversations(&network)?.len(), 1);
+        assert!(store.operations(&network)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn causal_import_waits_for_every_dependency_and_blob_then_converges() -> Result<()> {
         let a = LocalIdentity::generate();
         let b = LocalIdentity::generate();

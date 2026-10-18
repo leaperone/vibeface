@@ -9,6 +9,7 @@ explicit stream-json fixture, never a model. All state and logs stay beneath
 using a controlled sidecar. It does not verify real provider model behavior.
 --chat-agent checks taskless tools, sandboxed commands and startup event recovery
 with real Node processes and controlled provider protocol fixtures.
+--network-reliability records the NET-1 process baseline without Codex or models.
 """
 
 import argparse
@@ -219,7 +220,7 @@ def verify_direct_start(run, binary):
 
 
 class RelayCapture:
-    def __init__(self, upstream_port):
+    def __init__(self, upstream_port, *, retain_payloads=True):
         self.port = available_port()
         self.url = f"http://127.0.0.1:{self.port}"
         self.upstream_port = upstream_port
@@ -231,6 +232,11 @@ class RelayCapture:
         self.stopped = threading.Event()
         self.connections = []
         self.payloads = []
+        self.retain_payloads = retain_payloads
+        self.payload_bytes = 0
+        self.frame_count = 0
+        self.binary_payload_bytes = 0
+        self.binary_frame_count = 0
         self.errors = []
         self.thread = threading.Thread(target=self.accept, daemon=True)
         self.thread.start()
@@ -287,7 +293,13 @@ class RelayCapture:
                     payload = bytes(buffer[offset:offset + length])
                     if masked:
                         payload = bytes(value ^ key[index % 4] for index, value in enumerate(payload))
-                    self.payloads.append(payload)
+                    self.payload_bytes += len(payload)
+                    self.frame_count += 1
+                    if buffer[0] & 15 == 2:
+                        self.binary_payload_bytes += len(payload)
+                        self.binary_frame_count += 1
+                    if self.retain_payloads or buffer[0] & 15 == 1:
+                        self.payloads.append(payload)
                     del buffer[:offset + length]
         except (OSError, AssertionError) as error:
             if isinstance(error, AssertionError):
@@ -318,6 +330,82 @@ const keys = new Map([['client', Identity.generate()], ['root', Identity.generat
 const connections = new Map();
 const identity = name => { const key = keys.get(name); if (!key) throw new Error('unknown local identity'); return key; };
 const exposed = key => ({ public_key: key.publicKeyHex(), subject_id: key.nodeId() });
+async function networkProbe(input) {
+  const sockets = [], identities = [];
+  async function control() {
+    const socket = new WebSocket(new URL('/api/network/ws', input.url.replace(/^http/, 'ws')));
+    const queue = [], waiting = [];
+    let closed = false;
+    socket.addEventListener('message', event => {
+      const waiter = waiting.shift();
+      if (waiter) waiter(JSON.parse(event.data)); else queue.push(JSON.parse(event.data));
+    });
+    const close = () => { closed = true; for (const waiter of waiting.splice(0)) waiter(null); };
+    socket.addEventListener('close', close); socket.addEventListener('error', close);
+    const next = () => queue.length ? Promise.resolve(queue.shift()) : closed ? Promise.resolve(null) : new Promise(resolve => {
+      const done = value => { clearTimeout(timer); resolve(value); };
+      const timer = setTimeout(() => { const index = waiting.indexOf(done); if (index >= 0) waiting.splice(index, 1); resolve(null); }, 1500);
+      waiting.push(done);
+    });
+    const value = { socket, next, get closed() { return closed; } };
+    sockets.push(value);
+    const welcome = await next();
+    if (welcome?.type !== 'welcome') throw new Error('probe did not receive relay welcome');
+    value.nonce = welcome.nonce;
+    return value;
+  }
+  function key() { const value = Identity.generate(); identities.push(value); return value; }
+  async function reserve(owner) {
+    const connection = await control();
+    const proof = JSON.stringify({nonce:connection.nonce,node_id:owner.nodeId()});
+    connection.socket.send(JSON.stringify({type:'reserve',node_id:owner.nodeId(),public_key:owner.publicKeyHex(),signature:owner.sign('relay-reserve',encoder.encode(proof))}));
+    const response = await connection.next();
+    return { connection, accepted:response?.type === 'reserved',outcome:response?.type || (connection.closed ? 'closed' : 'timeout') };
+  }
+  async function exchange(message) {
+    const connection = await control(); connection.socket.send(JSON.stringify(message));
+    return await connection.next();
+  }
+  try {
+    if (input.kind === 'directory') {
+      const now = Math.floor(Date.now() / 1000), short = key(), healthy = key();
+      async function publish(owner, expires) {
+        const record = {node_id:owner.nodeId(),public_key:owner.publicKeyHex(),direct_urls:[],relay_urls:[],issued_at:now,expires_at:expires,signature:''};
+        record.signature = owner.sign('reachability',encoder.encode(JSON.stringify(record)));
+        if ((await exchange({type:'publish',record}))?.type !== 'published') throw new Error('signed fixture record was rejected');
+      }
+      await publish(short, now + 2); await publish(healthy, now + 120);
+      const before = await exchange({type:'lookup',target:short.nodeId()});
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, (now + 2) * 1000 - Date.now()) + 100));
+      const expired = await exchange({type:'lookup',target:short.nodeId()});
+      const good = await exchange({type:'lookup',target:healthy.nodeId()});
+      return {short_record_present_before_expiry:before?.record?.node_id === short.nodeId(),expired_record_removed:expired?.type === 'record' && expired.record === null,healthy_record_retained:good?.record?.node_id === healthy.nodeId()};
+    }
+    if (input.kind === 'reservations') {
+      const owner = key(), first = await reserve(owner), duplicate = await reserve(owner);
+      if (!first.accepted) throw new Error(`first isolated reservation failed ${first.outcome}`);
+      let accepted = 1, rejected = 0, timeouts = Number(duplicate.outcome === 'timeout');
+      for (let index = 1; index < 65; index++) {
+        const result = await reserve(key());
+        if (result.accepted) accepted++;
+        else if (result.outcome === 'closed') rejected++;
+        else if (result.outcome === 'timeout') timeouts++;
+        else throw new Error(`unexpected reservation reply ${result.outcome}`);
+      }
+      const now = Math.floor(Date.now() / 1000);
+      const record = {node_id:owner.nodeId(),public_key:owner.publicKeyHex(),direct_urls:[],relay_urls:[],issued_at:now,expires_at:now+120,signature:''};
+      record.signature = owner.sign('reachability',encoder.encode(JSON.stringify(record)));
+      first.connection.socket.send(JSON.stringify({type:'publish',record}));
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const lookup = await exchange({type:'lookup',target:owner.nodeId()});
+      return {unique_identities:65,reserve_requests:66,accepted,rejected,timeouts,duplicate_identity_outcome:duplicate.outcome,duplicate_identity_accepted:duplicate.accepted,first_reservation_still_open:!first.connection.closed,first_reservation_published_after_capacity:lookup?.record?.node_id === owner.nodeId(),directory_query_after_capacity:lookup?.type === 'record'};
+    }
+    throw new Error('unknown network probe');
+  } finally {
+    for (const connection of sockets) connection.socket.close();
+    for (const value of identities) value.free();
+  }
+}
 async function connect(input) {
   const key = identity(input.identity || 'client');
   const socket = new WebSocket(new URL('/api/network/ws', input.url.replace(/^http/, 'ws')));
@@ -393,7 +481,8 @@ for await (const line of createInterface({input:process.stdin})) {
   try {
     const input = JSON.parse(line);
     let result;
-    if (input.op === 'identity') result = exposed(identity(input.identity || 'client'));
+    if (input.op === 'network_probe') result = await networkProbe(input);
+    else if (input.op === 'identity') result = exposed(identity(input.identity || 'client'));
     else if (input.op === 'sign') result = identity(input.identity || 'client').sign(input.domain, encoder.encode(typeof input.payload === 'string' ? input.payload : JSON.stringify(input.payload)));
     else if (input.op === 'backup') {
       const root = identity(input.identity || 'root');
@@ -2428,6 +2517,219 @@ def acceptance(options):
         private_json(run / "report.json", report)
 
 
+def network_reliability_acceptance(options):
+    binary = options.binary.resolve(strict=True)
+    repository = Path(__file__).resolve().parents[1]
+    artifacts = options.artifacts.resolve()
+    require(artifacts.is_relative_to(repository / ".artifacts"),
+            "NET-1 artifacts remain inside this worktree's .artifacts")
+    ignored = subprocess.run(["git", "check-ignore", "--quiet", str(artifacts / "probe")],
+                             cwd=repository, capture_output=True)
+    require(ignored.returncode == 0, "NET-1 artifacts are ignored before fixture creation")
+    artifacts.mkdir(parents=True, exist_ok=True)
+    run = artifacts / ("m0-baseline-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    fixture = fixture_wrapper(run, "fixture-executor", "--fixture-executor")
+    module = options.crypto_module.resolve(strict=True)
+    require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
+            "NET-1 uses the real browser cryptography WASM")
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    helper.chmod(0o600)
+    report = {"status": "running", "mode": "network-reliability-m0",
+              "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip(),
+              "binary_sha256": file_sha256(binary), "artifacts": str(run),
+              "command": [sys.executable, *sys.argv], "provider_calls": 0, "cases": {},
+              "not_checked": ["mixed resolver replies and full resolver cache", "slow consumers and source quotas",
+                              "attachment crash recovery and 64 MiB completion", "rendered browser UI", "production networks"]}
+    nodes, capture = [], None
+    try:
+        for name in ("R", "A", "B"):
+            nodes.append(Node(run, name, binary, workspace, fixture, helper, module))
+        relay, source, receiver = nodes
+        relay.configure(roles=["relay"], network={"bootstrap_urls": [], "advertise_urls": [],
+                                               "mdns": False, "relay_enabled": True})
+        capture = RelayCapture(relay.port, retain_payloads=False)
+        relay.configure(allowed_origins=[capture.url])
+        relay.start()
+        probe = relay.client
+        directory = probe.command("network_probe", kind="directory", url=relay.url)
+        require(all(directory.values()), "short directory lease expires without losing the healthy record")
+        report["cases"]["directory_expiry"] = {"status": "observed", **directory,
+                                                 "full_resolver_cache": "not_exercised"}
+        print("OBSERVED NET-1 signed directory expiry", flush=True)
+        reservations = probe.command("network_probe", kind="reservations", url=relay.url)
+        require(reservations["accepted"] == 64 and reservations["rejected"] == 1,
+                "isolated baseline admits exactly 64 unique reservations and rejects the 65th")
+        require(reservations["timeouts"] == 0 and reservations["first_reservation_published_after_capacity"],
+                "reservation capacity has no probe timeouts and retains the first control connection")
+        require(not reservations["duplicate_identity_accepted"], "baseline rejects a duplicate identity reservation")
+        report["cases"]["reservation_capacity"] = {"status": "observed", **reservations}
+        print("OBSERVED NET-1 reservation capacity", flush=True)
+        relay.stop()
+        relay.start()
+        for node in (source, receiver):
+            node.configure(manager=None, network={"bootstrap_urls": [capture.url.replace("http:", "ws:") + "/api/network/ws"],
+                                                  "advertise_urls": [], "mdns": False, "relay_enabled": False})
+        source.start()
+        network = source.bootstrap()
+        wait_for("source reservation through the sole relay", lambda: b'{"type":"reserved"}' in capture.payloads)
+        receiver.pair(source, network, relay_url=capture.url)
+        receiver.start()
+        receiver.client.connect(receiver.node_id)
+        wait_for("receiver client authorization", lambda: receiver.client.authenticate())
+        conversation = "net1-baseline-history"
+        source.client.rpc("create_conversation", conversation_id=conversation, title="NET-1 baseline")
+        baseline = wait_for("receiver has the complete signed history",
+                            lambda: (value if len(value["events"]) == 1 else None)
+                            if (value := receiver.client.rpc("export", conversation_id=conversation)) else None)
+        database = receiver.directory / "node.sqlite3"
+        with sqlite3.connect(database, timeout=10) as connection:
+            connection.execute("CREATE TABLE net1_projection_audit(table_name TEXT, operation TEXT)")
+            for table in ("conversations", "messages", "tasks", "events"):
+                for operation in ("INSERT", "UPDATE", "DELETE"):
+                    connection.execute(f"CREATE TRIGGER net1_{table}_{operation.lower()} AFTER {operation} ON {table} "
+                                       f"BEGIN INSERT INTO net1_projection_audit VALUES('{table}','{operation}'); END")
+        source.client.rpc("create_task", conversation_id=conversation, task_id="net1-baseline-task",
+                          title="NET-1 baseline", goal="Preserve signed history", acceptance="Verified fixture")
+        baseline = wait_for("audit positive control imports a real new event",
+                            lambda: (value if len(value["events"]) == 2 else None)
+                            if (value := receiver.client.rpc("export", conversation_id=conversation)) else None)
+        require(any(item["node_id"] == source.node_id and item["online"]
+                    for item in receiver.client.rpc("nodes")["nodes"]), "receiver has a real authenticated source peer")
+        with sqlite3.connect(database, timeout=10) as connection:
+            positive_writes = connection.execute("SELECT COUNT(*) FROM net1_projection_audit WHERE table_name!='events'").fetchone()[0]
+            require(positive_writes > 0, "database audit observes actual projection writes before the no-op check")
+            connection.execute("DELETE FROM net1_projection_audit")
+        started = time.monotonic()
+        time.sleep(7)
+        after = receiver.client.rpc("export", conversation_id=conversation)
+        require(after == baseline, "unchanged sync preserves the exact complete signed snapshot")
+        with sqlite3.connect(database, timeout=10) as connection:
+            writes = [{"table": table, "operation": operation, "rows": count}
+                      for table, operation, count in connection.execute(
+                          "SELECT table_name,operation,COUNT(*) FROM net1_projection_audit GROUP BY table_name,operation ORDER BY table_name,operation")]
+        business_writes = sum(value["rows"] for value in writes if value["table"] != "events")
+        rebuilds = sum(value["rows"] for value in writes if value["table"] == "conversations" and value["operation"] == "DELETE")
+        report["cases"]["noop_sync"] = {"status": "observed", "history_events": 2,
+                                           "observation_seconds": time.monotonic() - started,
+                                           "business_projection_writes": business_writes,
+                                           "projection_rebuilds": rebuilds,
+                                           "positive_control_business_writes": positive_writes,
+                                           "rebuild_counter": "one conversation DELETE row per rebuild in this fixture",
+                                           "writes": writes, "snapshot_identical": True}
+        print(f"OBSERVED NET-1 no-op sync business writes={business_writes}", flush=True)
+        receiver.stop()
+        source.stop()
+        def seed_attachment(size):
+            payload = b"n" * size
+            blob = {"hash": hashlib.sha256(payload).hexdigest(), "size": len(payload)}
+            with sqlite3.connect(source.directory / "node.sqlite3", timeout=10) as connection:
+                previous, sequence = connection.execute(
+                    "SELECT hash,sequence FROM events WHERE network_id=? AND scope_id=? AND author=? ORDER BY sequence DESC LIMIT 1",
+                    (network, conversation, source.node_id)).fetchone()
+                event = {"version": 1, "network_id": network, "scope_id": conversation, "author": source.node_id,
+                         "sequence": sequence + 1, "previous": previous, "parents": [previous],
+                         "created_at_ms": int(time.time() * 1000),
+                         "body": {"type": "message_posted", "message_id": f"net1-attachment-{size}",
+                                  "role": "assistant", "text": "NET-1 signed attachment fixture"}, "blobs": [blob]}
+                signed = subprocess.run(["node", str(repository / "scripts/crypto-client.mjs"), "--module", str(module)],
+                                        input=json.dumps({"op": "fixture_event", "identity_file": str(source.directory / "identity.json"),
+                                                          "event": event}) + "\n", capture_output=True, text=True, timeout=15)
+                require(signed.returncode == 0, "temporary source identity signs the fixture without exposing its key")
+                result = json.loads(signed.stdout)
+                require(result.get("ok"), "fixture event signing succeeds")
+                envelope = result["result"]
+                connection.execute("INSERT INTO blobs(network_id,hash,size,content) VALUES(?,?,?,?)",
+                                   (network, blob["hash"], blob["size"], payload))
+                connection.execute("INSERT INTO events(network_id,hash,scope_id,author,sequence,envelope,status) VALUES(?,?,?,?,?,?,'ready')",
+                                   (network, envelope["hash"], conversation, source.node_id, sequence + 1,
+                                    json.dumps(envelope, separators=(",", ":"))))
+            del payload
+            return blob, envelope
+
+        def blob_complete(reference):
+            with sqlite3.connect(database, timeout=10) as connection:
+                return connection.execute("SELECT EXISTS(SELECT 1 FROM blobs WHERE network_id=? AND hash=?)",
+                                          (network, reference["hash"])).fetchone()[0] == 1
+
+        small, _ = seed_attachment(4096)
+        source.start()
+        receiver.start()
+        wait_for("small signed attachment validates the transfer fixture", lambda: blob_complete(small), timeout=25)
+        require(verify_blobs(receiver, network) == 1, "small attachment fixture passes real peer signature, size and hash checks")
+        receiver.stop()
+        source.stop()
+        blob, envelope = seed_attachment(32 * 1024 * 1024)
+        source.start()
+        receiver.start()
+        receiver.client.connect(receiver.node_id)
+        wait_for("restarted receiver client authorization", lambda: receiver.client.authenticate())
+        wait_for("restarted attachment peer is authenticated online", lambda: any(
+            item["node_id"] == source.node_id and item["online"]
+            for item in receiver.client.rpc("nodes")["nodes"]))
+        started = time.monotonic()
+        starting_bytes, starting_frames = capture.payload_bytes, capture.frame_count
+        starting_binary_bytes = capture.binary_payload_bytes
+        starting_binary_frames = capture.binary_frame_count
+        observations, complete = [], False
+        while time.monotonic() - started < 90:
+            with sqlite3.connect(database, timeout=10) as connection:
+                complete = connection.execute("SELECT EXISTS(SELECT 1 FROM blobs WHERE network_id=? AND hash=?)",
+                                              (network, blob["hash"])).fetchone()[0] == 1
+                pending = connection.execute("SELECT COUNT(*) FROM events WHERE network_id=? AND hash=? AND status='pending'",
+                                             (network, envelope["hash"])).fetchone()[0]
+            observation = {"elapsed_seconds": time.monotonic() - started,
+                           "wire_payload_bytes": capture.payload_bytes - starting_bytes,
+                           "complete_blob": complete, "pending_envelopes": pending}
+            observations.append(observation)
+            if complete or observation["wire_payload_bytes"] > 130 * 1024 * 1024:
+                break
+            time.sleep(1)
+        private_json(run / "blob-progress.json", observations)
+        if complete:
+            require(verify_blobs(receiver, network) >= 1, "complete receiver blob passes final size and hash")
+        report["cases"]["single_relay_attachment"] = {"status": "observed", "blob": blob,
+            "small_fixture_verified": small, "complete": complete, "verified_complete_bytes": blob["size"] if complete else 0,
+            "wire_payload_bytes": capture.payload_bytes - starting_bytes,
+            "wire_frames": capture.frame_count - starting_frames,
+            "wire_counter": "all captured directions and both relay legs, including control and protocol overhead",
+            "binary_payload_bytes": capture.binary_payload_bytes - starting_binary_bytes,
+            "binary_frames": capture.binary_frame_count - starting_binary_frames,
+            "peer_online_after_restart": True,
+            "observation_seconds": time.monotonic() - started,
+            "termination": "completed" if complete else "wire observation bound" if observations[-1]["wire_payload_bytes"] > 130 * 1024 * 1024 else "observation deadline",
+            "received_body_offset": None, "offset_note": "encrypted relay capture cannot expose uncommitted receiver body offsets",
+            "direct_urls": [], "relay_count": 1, "capture_errors": capture.errors,
+            "progress_artifact": str(run / "blob-progress.json")}
+        require(not capture.errors, "relay capture parses all observed frames")
+        require(capture.binary_payload_bytes - starting_binary_bytes > 65536,
+                "large attachment observation includes actual binary traffic after the authenticated peer reconnects")
+        require(not invocations(run), "NET-1 synchronization fixtures never invoke an executor")
+        verify_no_model_budget(nodes)
+        require(file_sha256(binary) == report["binary_sha256"], "baseline binary remains unchanged")
+        report["status"] = "observed"
+        report["fixture_invocations"] = 0
+        print(f"OBSERVED NET-1 baseline report: {run / 'report.json'}", flush=True)
+    except Exception as error:
+        report["status"] = "failed"
+        report["failure"] = f"{type(error).__name__}: {error}"
+        report["traceback"] = traceback.format_exc()
+        raise
+    finally:
+        for node in reversed(nodes):
+            node.stop()
+            node.client.close()
+        if capture:
+            capture.close()
+        private_json(run / "report.json", report)
+        if options.evidence_dir:
+            options.evidence_dir.mkdir(parents=True, exist_ok=True)
+            private_json(options.evidence_dir / "m0-baseline.json", report)
+
+
 def shared_history(client, conversation, task, dispatched=None):
     actual = None
     if dispatched:
@@ -2477,12 +2779,16 @@ if __name__ == "__main__":
         parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "crates/node/web/generated/vibeface_secure.js")
         parser.add_argument("--codex-bin", default="codex")
         parser.add_argument("--skip-codex", action="store_true", help="omit real Codex transport checks and report that omission")
+        parser.add_argument("--evidence-dir", type=Path, help="save a compact NET-1 baseline report in the task evidence directory")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")
         modes.add_argument("--chat-agent", action="store_true", help="run taskless tools, command isolation and startup subscription process checks")
+        modes.add_argument("--network-reliability", action="store_true", help="record NET-1 isolated process baselines without provider calls")
         arguments = parser.parse_args()
         try:
-            if arguments.chat_agent:
+            if arguments.network_reliability:
+                network_reliability_acceptance(arguments)
+            elif arguments.chat_agent:
                 chat_agent_acceptance(arguments)
             elif arguments.phase1:
                 phase1_acceptance(arguments)

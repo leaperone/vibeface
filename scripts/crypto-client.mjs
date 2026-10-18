@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { resolve, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { createHash, createPrivateKey, sign } from 'node:crypto';
 
 const args = process.argv.slice(2);
 const argument = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
@@ -21,6 +22,14 @@ function endpoint() {
     try {
       let result = null;
       switch (input.op) {
+        case 'fixture_event': {
+          const secret = JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex;
+          const key = createPrivateKey({key:Buffer.concat([Buffer.from('302e020100300506032b657004220420','hex'),Buffer.from(secret,'hex')]),format:'der',type:'pkcs8'});
+          const canonical_body = JSON.stringify(input.event);
+          const hash = createHash('sha256').update(canonical_body).digest('hex');
+          result = {hash,canonical_body,signature:sign(null,Buffer.from(`vibeface:event:v1:${hash}`),key).toString('hex')};
+          break;
+        }
         case 'identity':
           if (input.secret_hex) { identity.free(); identity = crypto.Identity.fromSecretHex(input.secret_hex); }
           result = { public_key: identity.publicKeyHex(), node_id: identity.nodeId() }; break;

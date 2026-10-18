@@ -1308,6 +1308,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn net1_expiring_directory_record_aborts_healthy_slow_directory() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let target_id = identity.node_id()?;
+        let (owner, _) = NetworkHub::new(identity.clone(), NetworkConfig::default());
+        let healthy = owner.local_record().await?;
+        let mut expiring = healthy.clone();
+        expiring.expires_at = now_secs()? + 2;
+        expiring.signature = identity.sign_payload("reachability", &expiring.unsigned()?)?;
+        let (fast, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        let (slow, _) = NetworkHub::new(LocalIdentity::generate(), NetworkConfig::default());
+        fast.publish(expiring.clone()).await?;
+        slow.publish(healthy.clone()).await?;
+        let mut tasks = JoinSet::new();
+        let fast_url = serve(fast.clone(), &mut tasks).await?;
+        let slow_url = serve(slow.clone(), &mut tasks).await?;
+        let (resolver, _) = NetworkHub::new(
+            LocalIdentity::generate(),
+            NetworkConfig {
+                bootstrap_urls: vec![fast_url, slow_url],
+                ..Default::default()
+            },
+        );
+        let delayed = slow.state.lock().await;
+        let resolve = tokio::spawn({
+            let resolver = resolver.clone();
+            let target_id = target_id.clone();
+            async move { resolver.resolve(&target_id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fast.state.lock().await.incoming_rate.count == 1
+                    && resolver.sockets.available_permits() == MAX_SOCKETS - 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(now_secs()? < expiring.expires_at);
+        while now_secs()? < expiring.expires_at {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(delayed);
+        let error = resolve
+            .await?
+            .expect_err("expired first reply aborted resolution");
+        assert_eq!(
+            error.to_string(),
+            "expired or invalid reachability lifetime"
+        );
+        assert_eq!(
+            slow.lookup_local(&target_id)
+                .await?
+                .context("healthy directory lost its record")?
+                .signature,
+            healthy.signature
+        );
+        assert!(resolver.lookup_local(&target_id).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn net1_full_attach_capacity_drops_relay_reservation() -> Result<()> {
+        let mut tasks = JoinSet::new();
+        let (relay, _) = NetworkHub::new(
+            LocalIdentity::generate(),
+            NetworkConfig {
+                relay_enabled: true,
+                ..Default::default()
+            },
+        );
+        let url = serve(relay, &mut tasks).await?;
+        let identity = LocalIdentity::generate();
+        let target_id = identity.node_id()?;
+        let (target, _incoming) = NetworkHub::new(identity, NetworkConfig::default());
+        let maintenance = tokio::spawn({
+            let target = target.clone();
+            let url = url.clone();
+            async move { target.maintain_relay(&url).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !target.state.lock().await.active_relays.contains(&url) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        let _held = target
+            .sockets
+            .clone()
+            .try_acquire_many_owned((MAX_SOCKETS - 1) as u32)?;
+        assert_eq!(target.sockets.available_permits(), 0);
+        let (mut caller, _) = open_control(&url).await?;
+        send_control(
+            &mut caller,
+            &Control::Dial {
+                target: target_id,
+                service: Service::Client,
+            },
+        )
+        .await?;
+        let error = tokio::time::timeout(Duration::from_secs(5), maintenance)
+            .await??
+            .expect_err("one refused attachment terminated the reservation");
+        assert_eq!(error.to_string(), "outbound relay socket limit reached");
+        assert!(!target.state.lock().await.active_relays.contains(&url));
+        assert_eq!(target.sockets.available_permits(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn unrelated_relay_carries_native_noise_after_direct_failure() -> Result<()> {
         let mut tasks = JoinSet::new();
         let relay_identity = LocalIdentity::generate();
