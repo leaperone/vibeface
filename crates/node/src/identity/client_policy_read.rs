@@ -1944,75 +1944,12 @@ mod tests {
         Ok(())
     }
 
-    fn with_twelve_enrolled_nodes()
+    pub(crate) fn with_twelve_enrolled_nodes()
     -> Result<(TestNetwork, Vec<vibeface_secure::authorization::PolicyPin>)> {
         let mut network = TestNetwork::new()?;
         let saved = network.pins.clone();
-        let material = recovery::build_account_recovery_material(
-            &network.created,
-            &network.root,
-            &network.recovery,
-            "https://node.example",
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let authority = signer(&network.node)?;
         for _ in 0..12 {
-            let node = Identity::generate().map_err(anyhow::Error::msg)?;
-            let nonce = Nonce::random()?;
-            let claim = bootstrap::create_node_claim(
-                &node,
-                nonce.as_str(),
-                now() as f64,
-                (now() + 90_000) as f64,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let claim = bootstrap::verify_node_claim(
-                &claim,
-                &node.public_key_hex(),
-                nonce.as_str(),
-                now() as f64,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let pins = serde_json::to_string(&network.pins)?;
-            let bundle = serde_json::to_string(&network.bundle)?;
-            let prepared = node_enrollment::prepare_account_node_enrollment(
-                &material,
-                &pins,
-                &bundle,
-                &network.client,
-                &claim,
-                (now() + 1_000_000) as f64,
-                now() as f64,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let proof = node_enrollment::sign_account_node_enrollment_possession(
-                &prepared.request_json().map_err(anyhow::Error::msg)?,
-                &node,
-                nonce.as_str(),
-                now() as f64,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let prepared = node_enrollment::prepare_account_node_enrollment_commit(
-                &prepared,
-                &material,
-                &proof,
-                now() as f64,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let delta = node_enrollment::commit_account_node_enrollment(
-                &prepared.request_json().map_err(anyhow::Error::msg)?,
-                &authority,
-                &pins,
-                &bundle,
-                now() as f64,
-            )
-            .map_err(anyhow::Error::msg)?;
-            let finished =
-                node_enrollment::finish_account_node_enrollment(&prepared, &delta, now() as f64)
-                    .map_err(anyhow::Error::msg)?;
-            network.bundle = finished.bundle().clone();
-            network.pins = finished.pins().to_vec();
+            network.enroll_node(LocalIdentity::generate())?;
         }
         Ok((network, saved))
     }

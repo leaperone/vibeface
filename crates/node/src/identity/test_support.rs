@@ -148,7 +148,7 @@ impl TestNetwork {
                 .map_err(anyhow::Error::msg)?,
             client: Identity::from_secret_hex(&self.client.secret_hex())
                 .map_err(anyhow::Error::msg)?,
-            node: LocalIdentity::generate(),
+            node: self.node.clone(),
             account: self.account.clone(),
             space: self.space.clone(),
             resource: self.resource.clone(),
@@ -157,97 +157,217 @@ impl TestNetwork {
             directory,
             project,
         };
-        let mut authority = self.at(&network.directory.join("authority.sqlite3"))?;
-        let mut fresh = Store::initialize(&network.directory.join("enrolled.sqlite3"))?;
+        let node = LocalIdentity::generate();
+        network.enroll_node(node.clone())?;
+        assert_ne!(node.public_key_hex()?, self.node.public_key_hex()?);
+        network.node = node;
+        Ok(network)
+    }
+
+    pub fn enroll_node(&mut self, identity: LocalIdentity) -> Result<()> {
+        fn carrier<T>(action: impl FnOnce() -> Result<T>) -> Result<T> {
+            let verification =
+                vibeface_secure::signature_verification::SignatureVerification::new();
+            let result = verification.run(action)?;
+            anyhow::ensure!(
+                verification.counts().actual_verifications <= 32,
+                "Node enrollment fixture carrier exceeded its signature budget"
+            );
+            Ok(result)
+        }
+        let source_path = self.directory.join("node-enrollment-authority.sqlite3");
+        let mut authority = if source_path.exists() {
+            Store::open(&source_path)?
+        } else {
+            self.at(&source_path)?
+        };
+        let target_path = self.directory.join(format!(
+            "node-enrollment-target-{}.sqlite3",
+            identity.public_key_hex()?
+        ));
+        let mut fresh = Store::initialize(&target_path)?;
         let capability = BootstrapCapability::generate();
         fresh.install_bootstrap_capability(&capability)?;
         let signer =
-            Identity::from_secret_hex(&network.node.secret_key_hex).map_err(anyhow::Error::msg)?;
-        let claim_json = bootstrap::create_node_claim(
-            &signer,
-            &capability.capability,
-            now() as f64,
-            (now() + 100_000) as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
+            Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
+        let claim_json = carrier(|| {
+            bootstrap::create_node_claim(
+                &signer,
+                &capability.capability,
+                now() as f64,
+                (now() + 100_000) as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
         fresh.connection.execute(
             "INSERT INTO identity_meta(key,value) VALUES('node_claim',?)",
             [&claim_json],
         )?;
-        let claim = bootstrap::verify_node_claim(
-            &claim_json,
-            &network.node.public_key_hex()?,
-            &capability.capability,
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let material = recovery::build_account_recovery_material(
-            &self.created,
-            &self.root,
-            &self.recovery,
-            "https://authority.example",
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let prepared = node_enrollment::prepare_account_node_enrollment(
-            &material,
-            &serde_json::to_string(&self.pins)?,
-            &serde_json::to_string(&self.bundle)?,
-            &self.client,
-            &claim,
-            (now() + CERT_END) as f64,
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let principal = self.client.public_key_hex();
-        let proof = fresh.node_enrollment_command(
-            &network.node,
-            &principal,
-            "account_node_possession",
-            &serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?,
-            now(),
-        )?;
-        let commit = node_enrollment::prepare_account_node_enrollment_commit(
-            &prepared,
-            &material,
-            proof["proof"]
-                .as_str()
-                .context("Node possession proof missing")?,
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let response = authority.node_enrollment_command(
+        let claim = carrier(|| {
+            bootstrap::verify_node_claim(
+                &claim_json,
+                &identity.public_key_hex()?,
+                &capability.capability,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let source_key = PublicKey::parse(&self.node.public_key_hex()?)?;
+        let authorization = super::client_policy_read::verified_client_policy_for_test(
+            &mut authority,
             &self.node,
-            &principal,
-            "account_node_commit",
-            &serde_json::from_str(&commit.request_json().map_err(anyhow::Error::msg)?)?,
+            &self.client,
+            &self.account,
+            AuthorizationSelection {
+                resource: ResourceRef {
+                    space: self.space.clone(),
+                    resource: self.resource.clone(),
+                },
+                audience: Audience {
+                    service: ServiceId::from_key(&source_key),
+                    device: DeviceId::from_key(&source_key),
+                },
+                grant_leaf: self.bundle.grant_leaf.clone(),
+            },
+            &self.pins,
             now(),
         )?;
-        let verified = node_enrollment::finish_account_node_enrollment(
-            &commit,
-            &serde_json::to_string(&response["journal_delta"])?,
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let installed = fresh.node_enrollment_command(
-            &network.node,
-            &principal,
-            "account_node_install",
-            &serde_json::from_str(&verified.installation_json().map_err(anyhow::Error::msg)?)?,
-            now(),
-        )?;
+        let material = carrier(|| {
+            recovery::build_account_recovery_material(
+                &self.created,
+                &self.root,
+                &self.recovery,
+                "https://authority.example",
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let prepared = carrier(|| {
+            node_enrollment::prepare_account_node_enrollment(
+                &material,
+                &authorization,
+                &self.client,
+                &claim,
+                (now() + CERT_END) as f64,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let principal = self.client.public_key_hex();
+        let mut begin: Value =
+            serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?;
+        let response = carrier(|| {
+            authority.begin_enrollment_policy_read(&self.node, &principal, &begin, now())
+        })?;
+        begin["snapshot"] = response["snapshot"].clone();
+        let mut response = carrier(|| {
+            fresh.node_enrollment_command(
+                &identity,
+                &principal,
+                "account_node_import_begin",
+                &begin,
+                now(),
+            )
+        })?;
+        let context = response["context"].clone();
+        loop {
+            let page = carrier(|| {
+                authority.enrollment_policy_page(
+                    &self.node,
+                    &principal,
+                    &response["page_request"],
+                    now(),
+                )
+            })?;
+            response = carrier(|| {
+                fresh.node_enrollment_command(
+                    &identity,
+                    &principal,
+                    "account_node_import_page",
+                    &json!({"context":context,"page":page["page"]}),
+                    now(),
+                )
+            })?;
+            if page["page"]["payload"]["complete"] == true {
+                break;
+            }
+        }
+        let witness = carrier(|| {
+            authority.enrollment_policy_witness(
+                &self.node,
+                &principal,
+                &response["page_request"],
+                now(),
+            )
+        })?;
+        let proof = carrier(|| {
+            fresh.node_enrollment_command(
+                &identity,
+                &principal,
+                "account_node_import_finish",
+                &json!({"context":context,"witness":witness["witness"]}),
+                now(),
+            )
+        })?;
+        let prepared = carrier(|| {
+            node_enrollment::prepare_account_node_enrollment_commit(
+                &prepared,
+                &material,
+                proof["proof"]
+                    .as_str()
+                    .context("Node possession proof missing")?,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let response = carrier(|| {
+            authority.node_enrollment_command(
+                &self.node,
+                &principal,
+                "account_node_commit",
+                &serde_json::from_str(&prepared.request_json().map_err(anyhow::Error::msg)?)?,
+                now(),
+            )
+        })?;
+        let finished = carrier(|| {
+            node_enrollment::finish_account_node_enrollment(
+                &prepared,
+                &serde_json::to_string(&response["journal_delta"])?,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let installation: Value =
+            serde_json::from_str(&finished.installation_json().map_err(anyhow::Error::msg)?)?;
+        let installed = carrier(|| {
+            fresh.node_enrollment_command(
+                &identity,
+                &principal,
+                "account_node_install",
+                &json!({"context":context,"installation":installation}),
+                now(),
+            )
+        })?;
         assert_eq!(installed["account_id"], self.account.as_str());
-        assert_eq!(installed["node_public_key"], network.node.public_key_hex()?);
-        assert_ne!(network.node.public_key_hex()?, self.node.public_key_hex()?);
+        assert_eq!(installed["node_public_key"], identity.public_key_hex()?);
         assert!(
             fresh
                 .verify_bootstrap_capability(&capability.capability)
                 .is_err()
         );
-        network.bundle = verified.bundle().clone();
-        network.pins = verified.pins().to_vec();
-        network.install(&mut fresh)?;
-        Ok(network)
+        self.bundle
+            .journal
+            .extend(serde_json::from_value::<Vec<JournalEntry>>(
+                response["journal_delta"].clone(),
+            )?);
+        self.pins = finished.pins().to_vec();
+        fresh.save_local_device(self.space.as_str(), &identity)?;
+        fresh.local_set(
+            self.space.as_str(),
+            &format!("resource-root:{}", self.resource),
+            &json!(self.project),
+        )?;
+        Ok(())
     }
 
     pub fn install(&self, store: &mut Store) -> Result<()> {
