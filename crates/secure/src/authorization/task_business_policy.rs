@@ -1,5 +1,7 @@
 //! A source policy stream bound to one immutable Task business wire.
 
+pub mod receipt;
+
 use super::{
     events::{Event, EventCause},
     execution_handoff::{
@@ -828,6 +830,7 @@ impl TaskBusinessScopedView {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum TaskBusinessAuthorization<'a> {
     Submit(&'a VerifiedExecutionHandoff),
     Observe(&'a VerifiedExecutionObservationCurrent),
@@ -903,44 +906,7 @@ pub fn build_task_business_policy_export(
                 .all(|head| current.state().head(&head.domain) == Some(head)),
         "Task business export changed its current policy, signer or Task binding",
     )?;
-    match wire {
-        TaskBusinessWire::Submit(value) => {
-            let event: Event = serde_json::from_str(&value.handoff.project_dispatch.canonical_body)
-                .map_err(|_| AuthorizationError::InvalidProof("invalid source dispatch event"))?;
-            let EventCause::Invocation { admission } = event.cause else {
-                return Err(AuthorizationError::InvalidProof(
-                    "Task business source has no original admission",
-                ));
-            };
-            let request = &admission.invocation.payload;
-            let facts = request_facts(request);
-            current.check_body_scope(&admission.invocation, &facts, &admission.source_body, now)?;
-        }
-        TaskBusinessWire::Observe(value) => {
-            let request = &value.request.payload.request;
-            let context = prepare::PrepareContext {
-                context: request.context.clone(),
-                binding_generation: Some(scope.binding_generation),
-                canonical_cwd: None,
-                execution_target_public_key: Some(scope.target_public_key.clone()),
-            };
-            current.check_business_observation_scope(
-                &request_facts(request),
-                current.selection(),
-                &context,
-                now,
-            )?;
-        }
-        TaskBusinessWire::Resolve(value) => {
-            let admission = &value.resolution.account_admission;
-            current.check_body_scope(
-                &admission.invocation,
-                &request_facts(&admission.invocation.payload),
-                &admission.source_body,
-                now,
-            )?;
-        }
-    }
+    check_source_policy_scope(current, wire, &scope, now)?;
     let mut usage = ExecutionProofUsage::default();
     let (approved, grant_deadline) = source_grant(
         current.state(),
@@ -1003,6 +969,65 @@ pub fn build_task_business_policy_export(
         page_count: 0,
         complete: false,
     })
+}
+
+fn check_source_policy_scope(
+    current: &VerifiedTaskCurrentPolicy,
+    wire: &TaskBusinessWire,
+    scope: &TaskBusinessScope,
+    now: u64,
+) -> Result<()> {
+    require(
+        current.request().source_project() == &scope.source_project
+            && current.request().source_node() == &scope.source_node_public_key
+            && current.selection().execution_resource == scope.execution_resource
+            && current.selection().execution_grant == scope.execution_grant
+            && current.selection().target_public_key == scope.target_public_key
+            && current.context().context.task.as_ref() == Some(&scope.task_ref)
+            && current.context().context.execution_session.as_ref()
+                == Some(&scope.execution_session)
+            && current.context().binding_generation == Some(scope.binding_generation),
+        "Task business source policy changed its exact wire scope",
+    )?;
+    match wire {
+        TaskBusinessWire::Submit(value) => {
+            let event: Event = serde_json::from_str(&value.handoff.project_dispatch.canonical_body)
+                .map_err(|_| AuthorizationError::InvalidProof("invalid source dispatch event"))?;
+            let EventCause::Invocation { admission } = event.cause else {
+                return Err(AuthorizationError::InvalidProof(
+                    "Task business source has no original admission",
+                ));
+            };
+            let request = &admission.invocation.payload;
+            let facts = request_facts(request);
+            current.check_body_scope(&admission.invocation, &facts, &admission.source_body, now)?;
+        }
+        TaskBusinessWire::Observe(value) => {
+            let request = &value.request.payload.request;
+            let context = prepare::PrepareContext {
+                context: request.context.clone(),
+                binding_generation: Some(scope.binding_generation),
+                canonical_cwd: None,
+                execution_target_public_key: Some(scope.target_public_key.clone()),
+            };
+            current.check_business_observation_scope(
+                &request_facts(request),
+                current.selection(),
+                &context,
+                now,
+            )?;
+        }
+        TaskBusinessWire::Resolve(value) => {
+            let admission = &value.resolution.account_admission;
+            current.check_body_scope(
+                &admission.invocation,
+                &request_facts(&admission.invocation.payload),
+                &admission.source_body,
+                now,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn request_facts(request: &Invocation) -> RequestFacts {
