@@ -678,6 +678,7 @@ pub fn verify_client_policy_selections(
     encode(&verify().map_err(|error| error.to_string())?)
 }
 
+#[derive(Clone)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct ClientPolicyImport {
     request: Signed<ClientPolicyReadRequest>,

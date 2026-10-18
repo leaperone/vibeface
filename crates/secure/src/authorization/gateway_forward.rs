@@ -42,10 +42,15 @@ pub struct GatewayRouteApproval {
 gateway_object!(GatewayRouteApproval, "gateway-route-approval-v2");
 
 #[derive(Clone, Debug)]
-pub struct VerifiedGatewayRoute {
+pub struct VerifiedGatewayRouteUpdate {
     approval: Signed<GatewayRouteApproval>,
     minimum_pins: Vec<PolicyPin>,
     usage: ExecutionProofUsage,
+}
+
+#[derive(Clone, Debug)]
+pub struct VerifiedGatewayRoute {
+    update: VerifiedGatewayRouteUpdate,
 }
 
 fn same_pin_roots(pins: &[PolicyPin], expected: &[PolicyPin]) -> bool {
@@ -70,7 +75,7 @@ fn validate_gateway_pins(pins: &[PolicyPin]) -> Result<()> {
 }
 
 /// The caller supplies its current claimed account, persisted route generation and floors.
-pub fn verify_gateway_route(
+pub fn verify_gateway_route_approval(
     state: &VerifiedPolicySet,
     local_account: &AccountId,
     local_gateway: &PublicKey,
@@ -78,7 +83,7 @@ pub fn verify_gateway_route(
     current_generation: u64,
     minimum_pins: &[PolicyPin],
     now: u64,
-) -> Result<VerifiedGatewayRoute> {
+) -> Result<VerifiedGatewayRouteUpdate> {
     let _scope = ScopedSignatureVerification::new();
     require(
         canonical(approval)?.len() <= MAX_PROOF_BYTES,
@@ -116,9 +121,6 @@ pub fn verify_gateway_route(
                 .all(|pair| pair[0] < pair[1]),
         "gateway route differs from current owner, service or generation",
     )?;
-    if route.state != GatewayRouteState::Active {
-        return Err(AuthorizationError::Revoked);
-    }
     validate_window(route.issued_at_ms, route.expires_at_ms, now)?;
     validate_gateway_pins(&route.source_pins)?;
     validate_gateway_pins(minimum_pins)?;
@@ -143,24 +145,57 @@ pub fn verify_gateway_route(
     usage.record_budget(&budget)?;
     usage.record_signed(approval)?;
     finish_usage(&mut usage)?;
-    Ok(VerifiedGatewayRoute {
+    Ok(VerifiedGatewayRouteUpdate {
         approval: approval.clone(),
         minimum_pins: minimum_pins.to_vec(),
         usage,
     })
 }
 
-impl VerifiedGatewayRoute {
+pub fn verify_gateway_route(
+    state: &VerifiedPolicySet,
+    local_account: &AccountId,
+    local_gateway: &PublicKey,
+    approval: &Signed<GatewayRouteApproval>,
+    current_generation: u64,
+    minimum_pins: &[PolicyPin],
+    now: u64,
+) -> Result<VerifiedGatewayRoute> {
+    let update = verify_gateway_route_approval(
+        state,
+        local_account,
+        local_gateway,
+        approval,
+        current_generation,
+        minimum_pins,
+        now,
+    )?;
+    if update.approval.payload.state != GatewayRouteState::Active {
+        return Err(AuthorizationError::Revoked);
+    }
+    Ok(VerifiedGatewayRoute { update })
+}
+
+impl VerifiedGatewayRouteUpdate {
     pub fn approval(&self) -> &Signed<GatewayRouteApproval> {
         &self.approval
     }
     pub fn approval_hash(&self) -> Result<ObjectHash> {
         self.approval.hash()
     }
+}
+
+impl VerifiedGatewayRoute {
+    pub fn approval(&self) -> &Signed<GatewayRouteApproval> {
+        &self.update.approval
+    }
+    pub fn approval_hash(&self) -> Result<ObjectHash> {
+        self.update.approval.hash()
+    }
     fn check_window(&self, now: u64) -> Result<()> {
         validate_window(
-            self.approval.payload.issued_at_ms,
-            self.approval.payload.expires_at_ms,
+            self.update.approval.payload.issued_at_ms,
+            self.update.approval.payload.expires_at_ms,
             now,
         )
     }
@@ -183,6 +218,7 @@ pub enum GatewaySourceFrame {
     },
 }
 
+#[derive(Clone)]
 pub struct GatewayClientPolicyImport {
     route: VerifiedGatewayRoute,
     import: ClientPolicyImport,
@@ -199,7 +235,7 @@ pub fn begin_gateway_client_import(
 ) -> Result<GatewayClientPolicyImport> {
     let _scope = ScopedSignatureVerification::new();
     route.check_window(now)?;
-    let approved = &route.approval.payload;
+    let approved = &route.update.approval.payload;
     require(
         actual_client == &approved.client_key
             && request.issuer == *actual_client
@@ -261,7 +297,7 @@ impl GatewayClientPolicyImport {
             .expires_at_ms
             .min(witness.payload.expires_at_ms)
             .min(confirm_request.payload.expires_at_ms)
-            .min(self.route.approval.payload.expires_at_ms);
+            .min(self.route.update.approval.payload.expires_at_ms);
         let reference = ClientPolicyContextReference {
             snapshot_id: witness.payload.snapshot_id.clone(),
             request_hash: witness.payload.request_hash.clone(),
@@ -277,14 +313,15 @@ impl GatewayClientPolicyImport {
             &auth,
             confirm_request,
             confirmation,
-            self.route.approval.payload.target_key.clone(),
+            self.route.update.approval.payload.target_key.clone(),
             now,
         )?;
         let snapshot = require_confirmed_client_policy(&auth)?;
-        let mut floors = Vec::with_capacity(self.route.minimum_pins.len());
-        for pin in &self.route.minimum_pins {
+        let mut floors = Vec::with_capacity(self.route.update.minimum_pins.len());
+        for pin in &self.route.update.minimum_pins {
             let approved = self
                 .route
+                .update
                 .approval
                 .payload
                 .source_pins
@@ -313,7 +350,7 @@ impl GatewayClientPolicyImport {
         validate_window(now, expires_at_ms, now)?;
         Ok(VerifiedGatewayClientSource {
             authorization: auth,
-            route_hash: self.route.approval.hash()?,
+            route_hash: self.route.update.approval.hash()?,
             reference,
             floors,
             expires_at_ms,
@@ -492,10 +529,10 @@ pub fn verify_gateway_original(
 ) -> Result<VerifiedGatewayForward> {
     let _scope = ScopedSignatureVerification::new();
     route.check_window(now)?;
-    let approved = &route.approval.payload;
+    let approved = &route.update.approval.payload;
     let request = original.request();
     require(
-        source.route_hash == route.approval.hash()?
+        source.route_hash == route.update.approval.hash()?
             && actual_client == &approved.client_key
             && original.issuer() == actual_client
             && request.resource == approved.resource
@@ -506,6 +543,7 @@ pub fn verify_gateway_original(
     )?;
     let snapshot = require_confirmed_client_policy(&source.authorization)?;
     for minimum in route
+        .update
         .minimum_pins
         .iter()
         .filter_map(|pin| pin.minimum_head.as_ref())
@@ -519,7 +557,7 @@ pub fn verify_gateway_original(
         .client_policy_usage
         .clone()
         .ok_or(AuthorizationError::PolicyConflict)?;
-    usage.merge(&route.usage);
+    usage.merge(&route.update.usage);
     original.verify(&mut usage, now)?;
     validate_client_invocation_fields(
         &source.authorization,
@@ -532,7 +570,7 @@ pub fn verify_gateway_original(
         now,
     )?;
     check_source_heads(&source.authorization, &request.expected_policies)?;
-    usage.record_signed(&route.approval)?;
+    usage.record_signed(&route.update.approval)?;
     finish_usage(&mut usage)?;
     Ok(VerifiedGatewayForward {
         usage,
@@ -1227,6 +1265,17 @@ mod tests {
         let mut revoked = route;
         revoked.state = GatewayRouteState::Revoked;
         let revoked = Signed::sign(revoked, &fixture.root).unwrap();
+        let update = verify_gateway_route_approval(
+            &fixture.state,
+            &fixture.account,
+            &PublicKey::of(&fixture.node),
+            &revoked,
+            1,
+            &pins,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(update.approval().payload.state, GatewayRouteState::Revoked);
         assert_eq!(
             verify_gateway_route(
                 &fixture.state,
@@ -1476,8 +1525,13 @@ mod tests {
         )
         .unwrap();
         let source = import
+            .clone()
             .finish(witness.clone(), confirm.clone(), confirmation.clone(), NOW)
             .unwrap();
+        let independent_clone = import
+            .finish(witness.clone(), confirm.clone(), confirmation.clone(), NOW)
+            .unwrap();
+        assert_eq!(source.reference(), independent_clone.reference());
         assert_eq!(source.reference(), &reference);
         assert!(
             a.state
