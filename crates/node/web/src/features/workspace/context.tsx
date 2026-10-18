@@ -309,7 +309,6 @@ function useWorkspaceState(connection: ReadyConnection) {
         replaceMessages(messagesRef.current.map((item) => item.message_id === prepared.pending.message_id ? { ...item, scheduler_node: schedulerNode } : item))
       }
       if (!isQueuedReceipt(receipt, prepared.pending)) {
-        setNoticeText("消息已提交，正在核对接收结果。原消息已保留，不会自动重发。")
         if (activeId.current === id) await refreshRef.current().catch(showError)
         return
       }

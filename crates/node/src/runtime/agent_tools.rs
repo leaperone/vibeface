@@ -99,7 +99,13 @@ impl Runtime {
                     .await
             }
             "command" | "delegate" | "continue_execution" | "stop_execution" => {
-                let reference = args["call_ref"].as_str().unwrap_or(call_id);
+                let sdk_reference = if call_id.len() > 256 || call_id.chars().any(char::is_control)
+                {
+                    format!("sdk:{}", crate::crypto::digest(call_id.as_bytes()))
+                } else {
+                    call_id.to_owned()
+                };
+                let reference = args["call_ref"].as_str().unwrap_or(&sdk_reference);
                 ensure!(
                     !reference.is_empty()
                         && reference.len() <= 256
