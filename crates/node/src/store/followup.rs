@@ -1362,6 +1362,19 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let events = scope_events(&tx, &self.policy, network, scope)?;
+        if let Some(existing) = events.values().find(|stored| matches!(&stored.event.cause,
+            EventCause::Invocation { admission: original } if original.invocation == *auth.signed_invocation())
+            && stored.event.body == body) {
+            let original = invocation(&existing.event)?;
+            ensure!(
+                original.source_body == *source_body
+                    && original.transport == transport.stored(),
+                "task follow-up retry changed its original authorization"
+            );
+            crate::identity::admission::validate_persisted_admission(&tx, original)?;
+            return Ok(existing.envelope.clone());
+        }
         let admission = crate::identity::admission::consume_request_authorization_in(
             &tx,
             &self.policy,
@@ -1372,12 +1385,6 @@ impl Store {
             None,
             now,
         )?;
-        let events = scope_events(&tx, &self.policy, network, scope)?;
-        if let Some(existing) = events.values().find(|stored| matches!(&stored.event.cause,
-            EventCause::Invocation { admission: original } if original.invocation == admission.invocation)
-            && stored.event.body == body) {
-            return Ok(existing.envelope.clone());
-        }
         let current = policy_from(
             &tx,
             &self.policy,
@@ -1462,16 +1469,6 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let admission = crate::identity::admission::consume_request_authorization_in(
-            &tx,
-            &self.policy,
-            auth,
-            freshness,
-            transport,
-            source_body,
-            None,
-            now,
-        )?;
         let events = scope_events(&tx, &self.policy, network, scope)?;
         let resource: String = tx.query_row(
             "SELECT resource_id FROM conversations WHERE space_id=? AND conversation_id=?",
@@ -1482,12 +1479,40 @@ impl Store {
             resource == auth.resource().resource.as_str(),
             "task conversation is outside the admitted resource"
         );
-        if events.values().any(|event| {
+        let previous = if events.values().any(|event| {
             event.event.scope_id == scope
                 && matches!(&event.event.body,
             EventBody::TaskCreated { task_id: id, .. } if id == task_id)
         }) {
-            let (_, previous) = creation_from(&events, scope, task_id)?;
+            Some(creation_from(&events, scope, task_id)?.1)
+        } else {
+            None
+        };
+        if let Some(previous) = previous {
+            let original = invocation(&previous.event)?;
+            if original.invocation == *auth.signed_invocation() {
+                ensure!(
+                    previous.event.body == body
+                        && previous.event.resource_id == auth.resource().resource
+                        && original.source_body == *source_body
+                        && original.transport == transport.stored(),
+                    "task retry changed its original authorization"
+                );
+                crate::identity::admission::validate_persisted_admission(&tx, original)?;
+                return Ok(previous.envelope.clone());
+            }
+        }
+        let admission = crate::identity::admission::consume_request_authorization_in(
+            &tx,
+            &self.policy,
+            auth,
+            freshness,
+            transport,
+            source_body,
+            None,
+            now,
+        )?;
+        if let Some(previous) = previous {
             let previous_admission = invocation(&previous.event)?;
             ensure!(
                 previous.event.body == body
@@ -1816,6 +1841,21 @@ mod tests {
         network.conversation(&mut store, "conversation")?;
         let original = task(&network, &mut store)?;
         assert_eq!(task(&network, &mut store)?, original);
+        let event: Event = serde_json::from_str(&original.canonical_body)?;
+        let original_body = &invocation(&event)?.source_body;
+        let (auth, transport) = network.authorization(&store, original_body, now())?;
+        let freshness = network.freshness(&mut store, &auth, CheckStage::Admit, now())?;
+        assert_eq!(
+            store.create_task_with_origin(
+                &network.node,
+                &auth,
+                &freshness,
+                &crate::identity::policy::RequestTransport::Existing(transport),
+                original_body,
+                now() as i64,
+            )?,
+            original
+        );
         let mut body = network.body("create_task", "conversation");
         body["task_id"] = json!("task");
         body["title"] = json!("Review");

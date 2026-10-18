@@ -266,16 +266,6 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let admission = crate::identity::admission::consume_request_authorization_in(
-            &tx,
-            &self.policy,
-            auth,
-            freshness,
-            transport,
-            source_body,
-            None,
-            now,
-        )?;
         let bots = bots_from(&tx, &self.policy, network)?;
         if let Some(existing) = bots.iter().find(|bot| bot.bot_id == *bot_id) {
             let events = load_events_from(&tx, &self.policy, network)?;
@@ -299,6 +289,28 @@ impl Store {
                     .any(|bot| bot.conversation_id == conversation && bot.bot_id != *bot_id),
                 "conversation already belongs to another Bot"
             );
+            let admission = bot_admission(&original.event)?;
+            if admission.invocation == *auth.signed_invocation() {
+                ensure!(
+                    admission.source_body == *source_body
+                        && admission.transport == transport.stored(),
+                    "Bot retry changed its original authorization"
+                );
+                crate::identity::admission::validate_persisted_admission(&tx, admission)?;
+                return Ok(existing.clone());
+            }
+        }
+        let admission = crate::identity::admission::consume_request_authorization_in(
+            &tx,
+            &self.policy,
+            auth,
+            freshness,
+            transport,
+            source_body,
+            None,
+            now,
+        )?;
+        if let Some(existing) = bots.iter().find(|bot| bot.bot_id == *bot_id) {
             return Ok(existing.clone());
         }
         ensure!(
@@ -392,6 +404,9 @@ mod tests {
         let original = body(&network, "bot-history", "bot");
         let bot = create(&network, &mut store, &original)?;
         assert_eq!(create(&network, &mut store, &original)?, bot);
+        let mut retry = original.clone();
+        retry["authorization_id"] = json!("same-definition");
+        assert_eq!(create(&network, &mut store, &retry)?, bot);
         let mut changed = original.clone();
         changed["authorization_id"] = json!("different-definition");
         changed["instructions"] = json!("Run everything");
