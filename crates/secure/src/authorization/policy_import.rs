@@ -605,6 +605,287 @@ impl VerifiedPolicySnapshot {
     }
 }
 
+impl VerifiedPolicySnapshot {
+    pub(crate) fn with_created_team(
+        &self,
+        approved: &crate::authorization::governance::VerifiedTeamCreationDelta,
+    ) -> Result<Self> {
+        let request: &crate::authorization::governance::TeamCreationRequest =
+            &approved.request().payload;
+        require(
+            self.heads.len() == self.pins.len()
+                && self.heads.iter().zip(&self.pins).all(|(head, pin)| {
+                    head.domain == pin.domain && self.state.head(&head.domain) == Some(head)
+                })
+                && canonical(approved.request())?.len() <= MAX_PROOF_BYTES,
+            "created team changed its closed verified source policy",
+        )?;
+        let [
+            JournalEntry::SpaceGenesis(genesis),
+            JournalEntry::Resource(_),
+            JournalEntry::Membership(_),
+            JournalEntry::Grant(_),
+            JournalEntry::Space(final_policy),
+        ] = request.journal_delta.as_slice()
+        else {
+            return Err(AuthorizationError::InvalidProof(
+                "created team requires its exact five policy objects",
+            ));
+        };
+        let domain = PolicyDomain::Space(request.team_project.space.clone());
+        let final_head = space_stamp(final_policy)?;
+        require(
+            request.team_pin.domain == domain
+                && request.team_pin.minimum_head.as_ref() == Some(&final_head)
+                && request.team_project.space == SpaceId::team(&request.team_pin.genesis_root)
+                && genesis.payload.space == request.team_project.space
+                && genesis.payload.root
+                    == (SpaceRoot::Team {
+                        genesis_root: request.team_pin.genesis_root.clone(),
+                    })
+                && request
+                    .journal_delta
+                    .iter()
+                    .all(|entry| entry_domain(entry) == domain),
+            "created team changed its independent genesis or exact delta",
+        )?;
+        if let Some(existing) = self.pins.iter().find(|pin| pin.domain == domain) {
+            let source_heads = approved.source_heads();
+            require(
+                !source_heads.is_empty()
+                    && source_heads.len() <= self.pins.len()
+                    && source_heads
+                        .windows(2)
+                        .all(|pair| pair[0].domain < pair[1].domain)
+                    && source_heads.iter().all(|head| {
+                        self.pins.iter().any(|pin| pin.domain == head.domain)
+                            && self.state.roots.contains_key(head)
+                    })
+                    && self
+                        .pins
+                        .iter()
+                        .filter(|pin| pin.domain != domain)
+                        .all(|pin| source_heads.iter().any(|head| head.domain == pin.domain)),
+                "existing team lost an exact approved source dependency",
+            )?;
+            require(
+                existing.genesis_root == request.team_pin.genesis_root
+                    && self
+                        .state
+                        .space_history(&request.team_project.space)
+                        .and_then(|history| history.first())
+                        == Some(genesis)
+                    && self.state.roots.contains_key(&final_head),
+                "existing team differs from the approved creation",
+            )?;
+            for entry in &request.journal_delta {
+                let hash = entry_hash(entry)?;
+                require(
+                    self.entry_index
+                        .get(&hash)
+                        .and_then(|index| self.journal.get(*index))
+                        == Some(entry),
+                    "existing team is missing an exact approved creation object",
+                )?;
+            }
+            return Ok(self.clone());
+        }
+        require(
+            self.heads == approved.source_heads()
+                && self.pins.len() < MAX_POLICY_DOMAINS
+                && self.state.space(&request.team_project.space).is_none(),
+            "created team is not a new bounded dependency domain",
+        )?;
+        let mut import = self.clone().into_import();
+        import.pins.push(request.team_pin.clone());
+        import.pins.sort_by(|a, b| a.domain.cmp(&b.domain));
+        import.required_heads.insert(final_head);
+        for entry in &request.journal_delta {
+            import.apply_entry(entry.clone())?;
+        }
+        let heads = import
+            .pins
+            .iter()
+            .map(|pin| {
+                import
+                    .state
+                    .head(&pin.domain)
+                    .cloned()
+                    .ok_or(AuthorizationError::PolicyConflict)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        import.finish(&heads)
+    }
+
+    pub(crate) fn before_team_creation(
+        &self,
+        approved: &crate::authorization::governance::VerifiedPendingTeamCreation,
+    ) -> Result<VerifiedPolicySet> {
+        let request: &crate::authorization::governance::TeamCreationRequest =
+            &approved.request().payload;
+        let excluded = &request.team_pin.domain;
+        let heads: &[PolicyStamp] = approved.source_heads();
+        let pins: Vec<_> = self
+            .pins
+            .iter()
+            .filter(|pin| &pin.domain != excluded)
+            .cloned()
+            .collect();
+        require(
+            !heads.is_empty()
+                && heads.len() == pins.len()
+                && heads.len() <= MAX_POLICY_DOMAINS
+                && heads.windows(2).all(|pair| pair[0].domain < pair[1].domain)
+                && heads.iter().zip(&pins).all(|(head, pin)| {
+                    head.domain == pin.domain && self.state.roots.contains_key(head)
+                })
+                && request
+                    .expected_heads
+                    .iter()
+                    .all(|head| heads.contains(head))
+                && request.team_pin.domain
+                    == PolicyDomain::Space(request.team_project.space.clone()),
+            "team creation history requires every exact retained dependency head",
+        )?;
+        let targets: BTreeMap<_, _> = heads
+            .iter()
+            .map(|head| (head.domain.clone(), head.clone()))
+            .collect();
+        let mut before = self.state.clone();
+        before
+            .accounts
+            .retain(|id, _| targets.contains_key(&PolicyDomain::Account(id.clone())));
+        before
+            .spaces
+            .retain(|id, _| targets.contains_key(&PolicyDomain::Space(id.clone())));
+        for head in heads {
+            match &head.domain {
+                PolicyDomain::Account(id) => {
+                    let account = before
+                        .accounts
+                        .get_mut(id)
+                        .ok_or(AuthorizationError::PolicyConflict)?;
+                    let position = account
+                        .history
+                        .iter()
+                        .position(|entry| {
+                            entry.payload.authority_epoch == head.authority_epoch
+                                && entry.payload.sequence == head.sequence
+                        })
+                        .ok_or(AuthorizationError::PolicyConflict)?;
+                    require(
+                        account_stamp(&account.history[position])? == *head,
+                        "team creation account history has no exact head",
+                    )?;
+                    account.history.truncate(position + 1);
+                    account.stamp = head.clone();
+                }
+                PolicyDomain::Space(id) => {
+                    let space = before
+                        .spaces
+                        .get_mut(id)
+                        .ok_or(AuthorizationError::PolicyConflict)?;
+                    let position = space
+                        .history
+                        .iter()
+                        .position(|entry| {
+                            entry.payload.authority_epoch == head.authority_epoch
+                                && entry.payload.sequence == head.sequence
+                        })
+                        .ok_or(AuthorizationError::PolicyConflict)?;
+                    require(
+                        space_stamp(&space.history[position])? == *head,
+                        "team creation space history has no exact head",
+                    )?;
+                    space.history.truncate(position + 1);
+                    space.stamp = head.clone();
+                }
+            }
+        }
+        before.roots.retain(|stamp, _| {
+            targets.get(&stamp.domain).is_some_and(|head| {
+                (stamp.authority_epoch, stamp.sequence) <= (head.authority_epoch, head.sequence)
+            })
+        });
+        let mut devices = BTreeSet::new();
+        let mut authenticators = BTreeSet::new();
+        let mut resources = BTreeSet::new();
+        let mut memberships = BTreeSet::new();
+        let mut grants = BTreeSet::new();
+        for account in before.accounts.values() {
+            for entry in &account.history {
+                devices.extend(entry.payload.devices.iter().cloned());
+                authenticators.extend(entry.payload.authenticators.iter().cloned());
+            }
+        }
+        for space in before.spaces.values() {
+            for entry in &space.history {
+                devices.extend(entry.payload.devices.iter().cloned());
+                resources.extend(entry.payload.resources.iter().cloned());
+                memberships.extend(entry.payload.memberships.iter().cloned());
+                grants.extend(entry.payload.grants.iter().cloned());
+                grants.extend(entry.payload.governance_grant.iter().cloned());
+            }
+        }
+        before.devices.retain(|hash, value| {
+            devices.contains(hash) && before.roots.contains_key(&value.payload.issued_under)
+        });
+        before.authenticators.retain(|hash, value| {
+            authenticators.contains(hash) && before.roots.contains_key(&value.payload.issued_under)
+        });
+        before.resources.retain(|hash, value| {
+            resources.contains(hash) && before.roots.contains_key(&value.payload.issued_under)
+        });
+        before.memberships.retain(|hash, value| {
+            memberships.contains(hash) && before.roots.contains_key(&value.payload.issued_under)
+        });
+        before.grants.retain(|hash, value| {
+            grants.contains(hash) && before.roots.contains_key(&value.payload.issued_under)
+        });
+        before
+            .authenticator_states
+            .retain(|hash, _| before.authenticators.contains_key(hash));
+        let policy_hashes: BTreeSet<_> = before
+            .roots
+            .keys()
+            .map(|stamp| stamp.head.clone())
+            .collect();
+        before
+            .commits
+            .retain(|_, commit| policy_hashes.contains(&commit.payload.proposal_hash));
+        for account in before.accounts.values() {
+            let document = &account
+                .history
+                .last()
+                .ok_or(AuthorizationError::PolicyConflict)?
+                .payload;
+            account_references(&before, &pins, document, None)?;
+            if let Some(proof) = &document.device_enrollment {
+                for head in &proof.intent.payload.expected_heads {
+                    witness(&before, &pins, head)?;
+                }
+                assertion_reference(&before, &pins, &proof.assertion)?;
+            }
+            if let Some(approval) = &document.authenticator_approval {
+                for head in &approval.intent.payload.expected_heads {
+                    witness(&before, &pins, head)?;
+                }
+                assertion_reference(&before, &pins, &approval.assertion)?;
+            }
+        }
+        for space in before.spaces.values() {
+            let document = &space
+                .history
+                .last()
+                .ok_or(AuthorizationError::PolicyConflict)?
+                .payload;
+            space_references(&before, &pins, document)?;
+            before.ensure_personal_current(document)?;
+        }
+        Ok(before)
+    }
+}
+
 fn merge_map<K: Ord + Clone, V: PartialEq + Clone>(
     target: &mut BTreeMap<K, V>,
     source: &BTreeMap<K, V>,
