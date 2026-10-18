@@ -278,3 +278,70 @@ pub struct RecoveryCompletionStatusRequest {
     pub context: RecoveryContextReference,
     pub input_hash: ObjectHash,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamedCrossNodeRecoveryPossessionRequest {
+    pub context: RecoveryContextReference,
+    pub request: Signed<CrossNodeRecoveryRequest>,
+    pub node_request: RecoveryNodeRequest,
+    pub source_certificate: DeviceCertificate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamedCrossNodeRecoveryCommitRequest {
+    pub possession: StreamedCrossNodeRecoveryPossessionRequest,
+    pub pins: Vec<PolicyPin>,
+    pub journal_delta: Vec<JournalEntry>,
+    pub grant_leaf: ObjectHash,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamedCrossNodeRecoveryCommitReceipt {
+    pub version: u16,
+    pub context: RecoveryContextReference,
+    pub request_hash: ObjectHash,
+    pub input_hash: ObjectHash,
+    pub expected_account_head: PolicyStamp,
+    pub expected_space_head: PolicyStamp,
+    pub committed_account_head: PolicyStamp,
+    pub committed_space_head: PolicyStamp,
+    pub target_node_public_key: PublicKey,
+    pub new_device_public_key: PublicKey,
+    pub grant_leaf: ObjectHash,
+    pub accepted_at_ms: u64,
+}
+impl sealed::Sealed for StreamedCrossNodeRecoveryCommitReceipt {}
+impl SignedObject for StreamedCrossNodeRecoveryCommitReceipt {
+    const DOMAIN: &'static str = "cross-node-recovery-stream-commit-v2";
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamedCrossNodeRecoveryCommitted {
+    pub request: StreamedCrossNodeRecoveryCommitRequest,
+    pub receipt: Signed<StreamedCrossNodeRecoveryCommitReceipt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CrossNodeRecoveryImportApproval {
+    pub version: u16,
+    pub context: RecoveryContextReference,
+    pub account: AccountId,
+    pub space: SpaceId,
+    pub new_device_public_key: PublicKey,
+    pub new_root_public_key: PublicKey,
+    pub source_node_public_key: PublicKey,
+    pub target_node_public_key: PublicKey,
+    pub possession_hash: ObjectHash,
+    pub claim_hash: ObjectHash,
+    pub approved_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+impl sealed::Sealed for CrossNodeRecoveryImportApproval {}
+impl SignedObject for CrossNodeRecoveryImportApproval {
+    const DOMAIN: &'static str = "cross-node-recovery-import-approval-v2";
+}
