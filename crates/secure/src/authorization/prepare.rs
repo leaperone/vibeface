@@ -259,6 +259,7 @@ impl VerifiedPolicySet {
             InvocationTransport::Existing(transport),
             destination,
             now_ms,
+            AuthorizationPhase::Admission,
         )
     }
 
@@ -282,16 +283,18 @@ impl VerifiedPolicySet {
             },
             destination,
             now_ms,
+            AuthorizationPhase::Admission,
         )
     }
 
-    fn verify_invocation_with_execution_transport(
+    pub(super) fn verify_invocation_with_execution_transport(
         &self,
         signed: &Signed<Invocation>,
         facts: &RequestFacts,
         transport: InvocationTransport<'_>,
         destination: &VerifiedExecutionDestination,
         now_ms: u64,
+        phase: AuthorizationPhase,
     ) -> Result<VerifiedAuthorization> {
         let mut budget = Budget::default();
         let hash = budget.verify(signed)?;
@@ -323,7 +326,7 @@ impl VerifiedPolicySet {
             facts,
             transport,
             now_ms,
-            AuthorizationPhase::Admission,
+            phase,
         )
     }
 
@@ -364,6 +367,19 @@ impl VerifiedPolicySet {
                 proof.check_original(original, target, now_ms)?;
                 budget.verify(proof.header())?;
                 budget.expires(proof.header().payload.expires_at_ms);
+                return Ok(());
+            }
+            InvocationTransport::GatewayTranscript { header, original } => {
+                require(original.request() == invocation, "historical gateway destination changed request")?;
+                let target = &self.find_device(&invocation.audience.device)?.payload.public_key;
+                gateway_forward::verify_gateway_statement(header, original, target, now_ms)?;
+                budget.verify(header)?;
+                budget.expires(header.payload.expires_at_ms);
+                return Ok(());
+            }
+            InvocationTransport::OriginalGateway(original) => {
+                require(original.original.request() == invocation, "accepted gateway destination changed request")?;
+                budget.verify(&original.header)?;
                 return Ok(());
             }
             InvocationTransport::PortableIntent => {
@@ -964,27 +980,9 @@ impl VerifiedRemoteExecution {
                         == self.selection.target_public_key,
                 "resolution result differs from the original browser decision",
             )?;
-            let transport = admission.transport.clone().into_evidence();
-            let request = self.state.verify_invocation(
-                &admission.invocation,
-                &facts,
-                &transport,
-                admission.admitted_at_ms,
-            )?;
-            let fresh = self.state.verify_freshness(
-                &request,
-                &admission.challenge,
-                &admission.receipts,
-                admission.admitted_at_ms,
-            )?;
-            let admitted =
-                self.state
-                    .admit_operation(&request, &fresh, admission.admitted_at_ms)?;
-            let resolver = self.state.verify_operation_authorization(
-                &admitted,
-                &facts,
-                &transport,
-                decision_time,
+            let admitted = self.state.verify_original_admission(admission, &facts)?;
+            let resolver = self.state.verify_admitted_operation_authorization(
+                &admitted, &facts, decision_time,
             )?;
             if unknown {
                 let result: ExecutionHandoffResolutionResult =

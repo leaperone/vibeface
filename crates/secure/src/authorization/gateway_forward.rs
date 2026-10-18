@@ -662,8 +662,7 @@ pub struct VerifiedDirectedGateway {
     usage: ExecutionProofUsage,
 }
 
-fn verify_header(
-    actual_gateway: &PublicKey,
+pub(super) fn verify_gateway_statement(
     header: &Signed<GatewayForwardHeader>,
     original: &GatewayOriginal,
     local_target: &PublicKey,
@@ -683,20 +682,19 @@ fn verify_header(
     require(
         h.version == AUTH_VERSION
             && h.purpose == original.purpose()
-            && header.issuer == *actual_gateway
-            && h.gateway_key == *actual_gateway
+            && header.issuer == h.gateway_key
             && h.client_key == *original.issuer()
             && h.client_key != h.gateway_key
             && h.target_key == *local_target
             && h.target_key != h.gateway_key
-            && request.presenter == DeviceId::from_key(actual_gateway)
+            && request.presenter == DeviceId::from_key(&h.gateway_key)
             && request.audience.device == DeviceId::from_key(local_target)
             && h.original_hash == original.hash()?
             && h.authorization_id == request.operation_id
             && h.lookup_operation_id == status_lookup(original)
             && h.issued_at_ms >= request.not_before_ms
             && h.expires_at_ms <= request.expires_at_ms,
-        "directed gateway changed Noise identity, original, target or window",
+        "gateway statement changed signer, original, target or window",
     )?;
     finish_usage(&mut usage)?;
     Ok(usage)
@@ -711,7 +709,11 @@ pub fn verify_directed_gateway(
     now: u64,
 ) -> Result<VerifiedDirectedGateway> {
     let _scope = ScopedSignatureVerification::new();
-    let usage = verify_header(actual_gateway, header, original, local_target, now)?;
+    require(
+        actual_gateway == &header.payload.gateway_key,
+        "directed gateway differs from actual Noise peer",
+    )?;
+    let usage = verify_gateway_statement(header, original, local_target, now)?;
     Ok(VerifiedDirectedGateway {
         header: header.clone(),
         original_hash: original.hash()?,
@@ -874,13 +876,11 @@ pub fn verify_gateway_reply(
     now: u64,
 ) -> Result<VerifiedGatewayReply> {
     let _scope = ScopedSignatureVerification::new();
-    let mut usage = verify_header(
-        &handle.gateway,
-        forward,
-        &handle.original,
-        &handle.target,
-        now,
+    require(
+        forward.payload.gateway_key == handle.gateway,
+        "gateway reply changed the pinned gateway",
     )?;
+    let mut usage = verify_gateway_statement(forward, &handle.original, &handle.target, now)?;
     require(
         canonical(&(reply, outcome))?.len() <= MAX_PROOF_BYTES,
         "gateway reply exceeds byte limit",

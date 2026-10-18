@@ -9,6 +9,8 @@ pub mod bootstrap;
 pub mod client_policy_import;
 pub mod gateway_forward;
 pub mod gateway_client;
+pub mod gateway_original;
+use gateway_original::{AdmissionOrigin, OriginalGatewayTransport, RequestOrigin};
 pub mod directory;
 pub mod enrollment;
 pub mod enrollment_policy_import;
@@ -878,6 +880,11 @@ enum InvocationTransport<'a> {
         proof: &'a gateway_forward::VerifiedDirectedGateway,
         original: &'a gateway_forward::GatewayOriginal,
     },
+    GatewayTranscript {
+        header: &'a Signed<gateway_forward::GatewayForwardHeader>,
+        original: &'a gateway_forward::GatewayOriginal,
+    },
+    OriginalGateway(&'a OriginalGatewayTransport),
     PortableIntent,
 }
 
@@ -890,6 +897,9 @@ enum AuthorizationPhase {
 pub struct VerifiedAdmission {
     invocation: Signed<Invocation>,
     admitted_at_ms: u64,
+    origin: AdmissionOrigin,
+    usage: execution_handoff::ExecutionProofUsage,
+    admission_expires_at_ms: u64,
 }
 impl VerifiedAdmission {
     pub fn signed_invocation(&self) -> &Signed<Invocation> {
@@ -908,6 +918,7 @@ pub struct VerifiedAuthorization {
     budget: Budget,
     phase: AuthorizationPhase,
     verified_at_ms: u64,
+    origin: RequestOrigin,
 }
 impl VerifiedAuthorization {
     pub fn signed_invocation(&self) -> &Signed<Invocation> {
@@ -962,6 +973,7 @@ impl VerifiedAuthorization {
 }
 #[derive(Clone, Debug)]
 pub struct VerifiedFreshness {
+    usage: execution_handoff::ExecutionProofUsage,
     verified_at_ms: u64,
     invocation_hash: ObjectHash,
     challenge_hash: ObjectHash,
@@ -2397,15 +2409,8 @@ impl VerifiedPolicySet {
         &self,
         signed: &Signed<Invocation>,
         invocation_hash: &ObjectHash,
-        gateway: &gateway_forward::VerifiedDirectedGateway,
         original: &gateway_forward::GatewayOriginal,
-        now_ms: u64,
     ) -> Result<()> {
-        let target = &self
-            .find_device(&signed.payload.audience.device)?
-            .payload
-            .public_key;
-        gateway.check_original(original, target, now_ms)?;
         let (hash, signature) = match original {
             gateway_forward::GatewayOriginal::Prepare { intent, .. } => {
                 (intent.hash()?, &intent.signature)
@@ -2441,9 +2446,15 @@ impl VerifiedPolicySet {
                 && now_ms >= freshness.verified_at_ms,
             "admission freshness does not match invocation",
         )?;
+        let origin = match &auth.origin {
+            RequestOrigin::Existing(transport) => AdmissionOrigin::Existing(transport.clone()),
+            RequestOrigin::Gateway(original) => AdmissionOrigin::Gateway(original.clone()),
+            RequestOrigin::PortableIntent => return Err(AuthorizationError::InvalidProof("portable intent cannot create an operation admission")),
+        };
         Ok(VerifiedAdmission {
-            invocation: auth.invocation.clone(),
-            admitted_at_ms: now_ms,
+            invocation: auth.invocation.clone(), admitted_at_ms: now_ms, origin,
+            usage: gateway_original::admission_usage(auth, freshness)?,
+            admission_expires_at_ms: auth.expires_at_ms().min(freshness.expires_at_ms),
         })
     }
     pub fn verify_operation_authorization(
@@ -2453,6 +2464,10 @@ impl VerifiedPolicySet {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<VerifiedAuthorization> {
+        require(
+            matches!(&admission.origin, AdmissionOrigin::Existing(original) if original == transport),
+            "operation transport differs from its accepted origin",
+        )?;
         require(
             now_ms >= admission.admitted_at_ms,
             "operation clock moved backwards",
@@ -2651,16 +2666,31 @@ impl VerifiedPolicySet {
                 )?,
             },
             InvocationTransport::DirectedGateway { proof, original } => {
-                self.check_directed_gateway_request(
-                    signed,
-                    &invocation_hash,
-                    proof,
-                    original,
-                    now_ms,
-                )?;
+                let target = &self.find_device(&i.audience.device)?.payload.public_key;
+                proof.check_original(original, target, now_ms)?;
+                self.check_directed_gateway_request(signed, &invocation_hash, original)?;
                 budget.verify(proof.header())?;
                 budget.record_metadata(original.body())?;
                 budget.expires(proof.header().payload.expires_at_ms);
+            }
+            InvocationTransport::GatewayTranscript { header, original } => {
+                require(phase == AuthorizationPhase::Admission, "gateway transcript is only for original admission verification")?;
+                let target = &self.find_device(&i.audience.device)?.payload.public_key;
+                gateway_forward::verify_gateway_statement(header, original, target, now_ms)?;
+                self.check_directed_gateway_request(signed, &invocation_hash, original)?;
+                budget.verify(header)?;
+                budget.record_metadata(original.body())?;
+                budget.expires(header.payload.expires_at_ms);
+            }
+            InvocationTransport::OriginalGateway(original) => {
+                require(phase == AuthorizationPhase::Operation, "accepted gateway origin cannot authorize a new admission")?;
+                self.check_directed_gateway_request(signed, &invocation_hash, &original.original)?;
+                require(original.header.payload.original_hash == original.original.hash()?,
+                    "accepted gateway original bytes changed")?;
+                require(original.header.payload.target_key == self.find_device(&i.audience.device)?.payload.public_key,
+                    "accepted gateway target changed")?;
+                budget.verify(&original.header)?;
+                budget.record_metadata(original.original.body())?;
             }
             InvocationTransport::PortableIntent => {
                 if i.presenter != i.device {
@@ -2781,6 +2811,13 @@ impl VerifiedPolicySet {
             budget,
             phase,
             verified_at_ms: now_ms,
+            origin: match transport {
+                InvocationTransport::Existing(transport) => RequestOrigin::Existing(transport.clone()),
+                InvocationTransport::DirectedGateway { proof, original } => RequestOrigin::Gateway(OriginalGatewayTransport { header: proof.header().clone(), original: original.clone() }),
+                InvocationTransport::GatewayTranscript { header, original } => RequestOrigin::Gateway(OriginalGatewayTransport { header: header.clone(), original: original.clone() }),
+                InvocationTransport::OriginalGateway(original) => RequestOrigin::Gateway(original.clone()),
+                InvocationTransport::PortableIntent => RequestOrigin::PortableIntent,
+            },
         })
     }
     /// Authenticates the current account client without granting operation rights.
@@ -3001,7 +3038,15 @@ impl VerifiedPolicySet {
             },
             "freshness stage requires matching admission state",
         )?;
+        let mut usage = execution_handoff::ExecutionProofUsage::default();
+        usage.record_budget(&budget)?;
+        usage.record_metadata(challenge)?;
+        if let Some(counts) = crate::signature_verification::SignatureVerification::current_counts() {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
         Ok(VerifiedFreshness {
+            usage,
             verified_at_ms: now_ms,
             invocation_hash: auth.invocation_hash.clone(),
             challenge_hash,
