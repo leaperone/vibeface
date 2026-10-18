@@ -126,6 +126,8 @@ fn finish_response(value: Value, mut usage: ExecutionProofUsage) -> Result<Value
         usage.record_actual_signature_counts(counts);
     }
     usage.enforce_limits()?;
+    #[cfg(test)]
+    eprintln!("client_policy proof_usage={:?}", usage.counts());
     bounded(value)
 }
 
@@ -188,7 +190,7 @@ fn check_heads_in(
     for head in heads {
         ensure!(
             policy.verified().head(&head.domain) == Some(head),
-            "client policy-changed"
+            "client policy_changed"
         );
         let pin = policy
             .pins()
@@ -205,7 +207,7 @@ fn check_heads_in(
         ).optional()?;
         ensure!(
             actual == Some((head.authority_epoch, head.sequence, head.head.to_string())),
-            "client policy-changed"
+            "client policy_changed"
         );
         let stored: Option<(String, Option<String>)> = connection.query_row(
             "SELECT genesis_root,minimum_head FROM policy_pins WHERE domain_kind=? AND domain_id=?",
@@ -1130,12 +1132,21 @@ mod tests {
         store: &mut Store,
         network: &TestNetwork,
         snapshot: &Signed<ClientPolicySnapshot>,
+        mut native: Option<&mut ClientPolicyImport>,
     ) -> Result<(Vec<JournalEntry>, Signed<ClientPolicyWitness>)> {
         let mut cursor = None;
         let mut entries = Vec::new();
         let mut page_count = 0;
         loop {
             let params = page_request(snapshot, cursor)?;
+            if let Some(native) = native.as_deref_mut() {
+                assert_eq!(
+                    serde_json::from_str::<Value>(
+                        &native.page_request_json().map_err(anyhow::Error::msg)?
+                    )?,
+                    params
+                );
+            }
             let response = measured("page", || {
                 store.client_policy_page(
                     &network.node,
@@ -1154,6 +1165,11 @@ mod tests {
             })?;
             assert_eq!(response, replay);
             let page: Signed<ClientPolicyPage> = serde_json::from_value(response["page"].clone())?;
+            if let Some(native) = native.as_deref_mut() {
+                let encoded = serde_json::to_string(&page)?;
+                assert!(encoded.len() <= MAX_PROOF_BYTES);
+                measured_native("append_page", || native.append_page(&encoded, now() as f64))?;
+            }
             page.verify_signature()?;
             assert_eq!(page.payload.page_index, page_count);
             page_count += 1;
@@ -1179,6 +1195,21 @@ mod tests {
         assert_eq!(witness.payload.entry_count, entries.len() as u64);
         assert_eq!(witness.payload.page_count, page_count);
         Ok((entries, witness))
+    }
+
+    fn measured_native<T>(
+        label: &str,
+        action: impl FnOnce() -> std::result::Result<T, String>,
+    ) -> Result<T> {
+        let verification = SignatureVerification::new();
+        let value = verification.run(action).map_err(anyhow::Error::msg)?;
+        let counts = verification.counts();
+        assert!(counts.actual_verifications <= 32);
+        eprintln!(
+            "client_policy native_{label}: actual={}, hits={}",
+            counts.actual_verifications, counts.cache_hits
+        );
+        Ok(value)
     }
 
     fn confirmation_request(
@@ -1223,10 +1254,31 @@ mod tests {
                 )
                 .is_err()
         );
-        let (entries, witness) = import_pages(&mut store, &network, &snapshot)?;
+        let (entries, witness) = import_pages(&mut store, &network, &snapshot, None)?;
         assert_eq!(entries, network.bundle.journal);
         let request = confirmation_request(&network, &snapshot, &witness)?;
         let params = serde_json::to_value(&request)?;
+        store.connection.execute_batch("CREATE TEMP TRIGGER fail_client_confirmation BEFORE INSERT ON identity_meta WHEN NEW.key GLOB 'client-policy-confirmation:*' BEGIN SELECT RAISE(ABORT,'expected confirmation failure'); END;")?;
+        assert!(
+            store
+                .confirm_client_policy_auth(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    &params,
+                    now()
+                )
+                .is_err()
+        );
+        assert!(
+            metadata(
+                &store.connection,
+                &confirmation_key(&snapshot.payload.snapshot_id)
+            )?
+            .is_none()
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_client_confirmation")?;
         let response = measured("confirm", || {
             store.confirm_client_policy_auth(
                 &network.node,
@@ -1257,6 +1309,18 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(count, 1);
+        let mut changed = request.payload;
+        changed.expires_at_ms -= 1;
+        assert!(
+            store
+                .confirm_client_policy_auth(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    &serde_json::to_value(Signed::sign(changed, &network.client)?)?,
+                    now()
+                )
+                .is_err()
+        );
         Ok(())
     }
 
@@ -1406,7 +1470,7 @@ mod tests {
         let mut store = network.at(&path)?;
         let mut writer = Store::open(&path)?;
         let snapshot = begin(&mut store, &network, read_request(&network, true)?)?;
-        let (_, witness) = import_pages(&mut store, &network, &snapshot)?;
+        let (_, witness) = import_pages(&mut store, &network, &snapshot, None)?;
         let confirm = serde_json::to_value(confirmation_request(&network, &snapshot, &witness)?)?;
         network.revoke_client(&mut writer)?;
         assert!(
@@ -1607,15 +1671,52 @@ mod tests {
         let mut store = network.memory()?;
         let mut request = read_request(&network, true)?.payload;
         request.saved_pins = saved;
-        let snapshot = begin(
-            &mut store,
-            &network,
-            Signed::sign(request, &network.client)?,
-        )?;
-        let (entries, witness) = import_pages(&mut store, &network, &snapshot)?;
+        let request = Signed::sign(request, &network.client)?;
+        let snapshot = begin(&mut store, &network, request.clone())?;
+        let pins = serde_json::to_string(&request.payload.saved_pins)?;
+        let encoded_request = serde_json::to_string(&request)?;
+        let encoded_snapshot = serde_json::to_string(&snapshot)?;
+        let node = network.node.public_key_hex()?;
+        let mut native = measured_native("begin_import", || {
+            begin_client_policy_import(
+                &pins,
+                &encoded_request,
+                &encoded_snapshot,
+                &network.client,
+                &node,
+                now() as f64,
+            )
+        })?;
+        let (entries, witness) = import_pages(&mut store, &network, &snapshot, Some(&mut native))?;
         assert_eq!(entries, network.bundle.journal);
-        let params = serde_json::to_value(confirmation_request(&network, &snapshot, &witness)?)?;
-        measured("12_node_confirm", || {
+        let encoded_witness = serde_json::to_string(&witness)?;
+        let encoded_selection = serde_json::to_string(&snapshot.payload.selection)?;
+        let authorization = measured_native("finish_import", || {
+            native.finish(&encoded_witness, &encoded_selection, now() as f64)
+        })?;
+        assert_eq!(authorization.scope().account_id, network.account);
+        assert_eq!(authorization.resources().len(), 1);
+        assert_eq!(
+            authorization.resources()[0].payload.resource,
+            network.resource
+        );
+        assert!(
+            authorization
+                .policy_json()
+                .map_err(anyhow::Error::msg)?
+                .len()
+                <= MAX_PROOF_BYTES
+        );
+        let confirm_request = measured_native("build_confirm", || {
+            build_client_policy_auth_confirm_request(
+                &authorization,
+                &network.client,
+                now() as f64,
+                (now() + 90_000) as f64,
+            )
+        })?;
+        let params: Value = serde_json::from_str(&confirm_request)?;
+        let response = measured("12_node_confirm", || {
             store.confirm_client_policy_auth(
                 &network.node,
                 &network.client.public_key_hex(),
@@ -1623,6 +1724,17 @@ mod tests {
                 now(),
             )
         })?;
+        let encoded_confirmation = serde_json::to_string(&response["confirmation"])?;
+        let authorization = measured_native("verify_confirmation", || {
+            confirm_client_policy_authorization(
+                &authorization,
+                &confirm_request,
+                &encoded_confirmation,
+                &node,
+                now() as f64,
+            )
+        })?;
+        assert_eq!(authorization.grant_leaf(), &network.bundle.grant_leaf);
         eprintln!(
             "client_policy twelve_node_public_history_bytes={public_bytes}; entries={}",
             entries.len()
