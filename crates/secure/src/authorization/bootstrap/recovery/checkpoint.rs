@@ -732,17 +732,6 @@ mod tests {
         Identity::from_secret_hex(&hex::encode([byte; 32])).unwrap()
     }
 
-    fn claim(now: f64, nonce_byte: u8) -> VerifiedNodeClaim {
-        let nonce = Nonce::from_bytes([nonce_byte; 32]).to_string();
-        verify_node_claim(
-            &create_node_claim(&key(4), &nonce, now, now + 100_000.0).unwrap(),
-            &key(4).public_key_hex(),
-            &nonce,
-            now,
-        )
-        .unwrap()
-    }
-
     fn inspect_with_budget(material: &str, now: f64) -> serde_json::Value {
         let signatures = crate::signature_verification::SignatureVerification::new();
         signatures
@@ -793,26 +782,36 @@ mod tests {
         client: u8,
         now: f64,
     ) -> CreatedAccount {
-        let prepared = prepare_account_recovery_from_bundle(
+        let mut stages = Vec::new();
+        let (context, _) = stream::import_account_history(
+            current,
             material,
-            &current.bundle_json().unwrap(),
-            &key(root),
             &key(client),
-            &claim(now, root + 100),
-            END,
             now,
-        )
-        .unwrap();
-        let possession = sign_recovery_node_possession(
-            &prepared.node_request_json().unwrap(),
-            &key(4),
-            &current.pins_json().unwrap(),
-            &current.bundle_json().unwrap(),
-            &Nonce::from_bytes([root + 100; 32]).to_string(),
-            now,
-        )
-        .unwrap();
-        finish_account_recovery(&prepared, &key(root), &possession, now).unwrap()
+            now + 1_000.0,
+            root + 100,
+            &mut stages,
+        );
+        let prepared = stream::measured(&mut stages, "prepare", || {
+            prepare_account_recovery(material, &context, &key(root), &key(client), END, now)
+        });
+        let request: stream::StreamedRecoveryNodeRequest =
+            serde_json::from_str(&prepared.node_request_json().unwrap()).unwrap();
+        let possession = stream::measured(&mut stages, "possession", || {
+            stream::sign_recovery_node_possession_in_state(
+                &request,
+                context.request(),
+                context.snapshot(),
+                context.witness(),
+                &current.authorization.policy_snapshot,
+                &key(4),
+                context.request().nonce(),
+                now as u64,
+            )
+        });
+        stream::measured(&mut stages, "finish", || {
+            finish_account_recovery(&prepared, &key(root), possession.as_str(), now)
+        })
     }
 
     fn approve_again(material: &mut RecoveryMaterial, root: u8) {

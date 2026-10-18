@@ -967,7 +967,6 @@ pub fn finish_account_device_change(
                 now,
             )?;
             current.imported_snapshot = snapshot.clone();
-            current.client_policy_context = original.client_policy_context.clone();
             Ok(current)
         };
         let current_or_none = |result: Result<VerifiedClientAuthorization>| -> Result<Option<VerifiedClientAuthorization>> {
@@ -1014,7 +1013,7 @@ impl VerifiedAccountDeviceChange {
     pub fn authorization(&self) -> crate::Result<VerifiedClientAuthorization> {
         self.authorization
             .clone()
-            .ok_or_else(|| "device change has no current confirmed client authorization".to_owned())
+            .ok_or_else(|| "device change has no current client authorization".to_owned())
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = pinsJson))]
     pub fn pins_json(&self) -> crate::Result<String> {
@@ -1910,7 +1909,20 @@ mod tests {
             next.scope.device_id,
             result.scope.as_ref().unwrap().device_id
         );
-        assert!(require_confirmed_client_policy(&next).is_ok());
+        assert!(require_confirmed_client_policy(&next).is_err());
+        let current = f.after(&result);
+        let next_intent = encode(&current.intent(6, vec![])).unwrap();
+        assert!(
+            sign_device_enrollment_intent(&next_intent, &key(3), &next, NOW as f64)
+                .is_err()
+        );
+        let confirmed = current.authorization();
+        assert_eq!(confirmed.heads, next.heads);
+        assert!(require_confirmed_client_policy(&confirmed).is_ok());
+        assert!(
+            sign_device_enrollment_intent(&next_intent, &key(3), &confirmed, NOW as f64)
+                .is_ok()
+        );
         assert_eq!(
             parse::<Vec<JournalEntry>>(&result.journal_delta_json().unwrap())
                 .unwrap()
