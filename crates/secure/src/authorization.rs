@@ -5694,6 +5694,7 @@ pub struct VerifiedClientAuthorization {
     policy_pins: Vec<PolicyPin>,
     imported_snapshot: Option<policy_import::VerifiedPolicySnapshot>,
     client_policy_context: Option<client_policy_import::ClientPolicyProvenance>,
+    client_policy_usage: Option<execution_handoff::ExecutionProofUsage>,
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedClientAuthorization {
@@ -5907,6 +5908,7 @@ fn verify_client_policy_state_selected(
         policy_pins: pins.to_vec(),
         imported_snapshot: None,
         client_policy_context: None,
+        client_policy_usage: None,
     })
 }
 

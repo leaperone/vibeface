@@ -160,7 +160,7 @@ pub(crate) struct ClientPolicyProvenance {
     request: Signed<ClientPolicyReadRequest>,
     snapshot: Signed<ClientPolicySnapshot>,
     witness: Signed<ClientPolicyWitness>,
-    confirmed: bool,
+    confirmation: Option<Signed<ClientPolicyAuthConfirmation>>,
 }
 
 pub fn client_policy_request_hash(request: &Signed<ClientPolicyReadRequest>) -> Result<ObjectHash> {
@@ -843,8 +843,9 @@ impl ClientPolicyImport {
                 request: self.request,
                 snapshot: self.snapshot,
                 witness,
-                confirmed: false,
+                confirmation: None,
             });
+            auth.client_policy_usage = Some(usage);
             Ok(auth)
         };
         finish().map_err(|error| error.to_string())
@@ -974,7 +975,8 @@ pub fn confirm_client_policy_authorization(
             auth.client_policy_context
                 .as_mut()
                 .ok_or(AuthorizationError::PolicyConflict)?
-                .confirmed = true;
+                .confirmation = Some(confirmation);
+            auth.client_policy_usage = Some(usage);
             Ok(auth)
         };
     confirm().map_err(|error| error.to_string())
@@ -991,7 +993,7 @@ pub(crate) fn require_confirmed_client_policy(
                 "bounded client authentication and confirmation are required",
             ))?;
     require(
-        provenance.confirmed
+        provenance.confirmation.is_some()
             && provenance.request.payload.account == authorization.scope.account_id
             && provenance.request.payload.space == authorization.scope.space_id
             && provenance.request.issuer == provenance.request.payload.device_public_key
@@ -1004,4 +1006,168 @@ pub(crate) fn require_confirmed_client_policy(
         .ok_or(AuthorizationError::InvalidProof(
             "bounded client authorization has no genuine policy snapshot",
         ))
+}
+
+pub fn verify_client_policy_server_session(
+    state: VerifiedPolicySet,
+    read: &Signed<ClientPolicyReadRequest>,
+    snapshot: &Signed<ClientPolicySnapshot>,
+    witness: &Signed<ClientPolicyWitness>,
+    confirm: &Signed<ClientPolicyAuthConfirmRequest>,
+    confirmation: &Signed<ClientPolicyAuthConfirmation>,
+    local_node: &PublicKey,
+    noise: &PublicKey,
+    now: u64,
+) -> Result<VerifiedClientAuthorization> {
+    let _signature_scope = ScopedSignatureVerification::new();
+    let current = verify_client_policy_read(&state, read, local_node, noise, now)?;
+    verify_client_policy_auth_confirm(
+        &state, read, snapshot, witness, confirm, local_node, noise, now,
+    )?;
+    confirmation.verify_signature()?;
+    let receipt = &confirmation.payload;
+    require(
+        confirmation.issuer == *local_node
+            && receipt.source_node_public_key == *local_node
+            && receipt.version == AUTH_VERSION
+            && receipt.context == confirm.payload.context
+            && receipt.confirmation_request_hash == confirm.hash()?
+            && receipt.selection == confirm.payload.selection
+            && receipt.target_heads == current.heads
+            && receipt.device_public_key == *noise
+            && confirm.payload.issued_at_ms <= receipt.accepted_at_ms
+            && receipt.accepted_at_ms < confirm.payload.expires_at_ms
+            && receipt.accepted_at_ms <= now,
+        "client policy session changed its exact signed confirmation",
+    )?;
+    let mut usage = current.usage;
+    for_carrier_usage(&mut usage, snapshot, witness, confirm, confirmation)?;
+    let bundle = ClientAuthorizationBundle {
+        journal: Vec::new(),
+        grant_leaf: receipt.selection.grant_leaf.clone(),
+    };
+    let mut auth = verify_client_policy_state_selected(
+        state,
+        &bundle,
+        &read.payload.saved_pins,
+        read.payload.account.clone(),
+        read.payload.space.clone(),
+        noise.clone(),
+        Some(&receipt.selection.resource),
+        now,
+    )?;
+    usage.record_budget(&auth.budget)?;
+    finish_usage(&mut usage)?;
+    auth.client_policy_usage = Some(usage);
+    Ok(auth)
+}
+
+fn for_carrier_usage(
+    usage: &mut ExecutionProofUsage,
+    snapshot: &Signed<ClientPolicySnapshot>,
+    witness: &Signed<ClientPolicyWitness>,
+    request: &Signed<ClientPolicyAuthConfirmRequest>,
+    receipt: &Signed<ClientPolicyAuthConfirmation>,
+) -> Result<()> {
+    usage.record_signed(snapshot)?;
+    usage.record_signed(witness)?;
+    usage.record_signed(request)?;
+    usage.record_signed(receipt)?;
+    Ok(())
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+impl VerifiedClientAuthorization {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = clientPolicyContextJson))]
+    pub fn client_policy_context_json(&self) -> crate::Result<String> {
+        let context = self
+            .client_policy_context
+            .as_ref()
+            .ok_or_else(|| "client authorization has no confirmed bounded context".to_owned())?;
+        let confirmation = context
+            .confirmation
+            .as_ref()
+            .ok_or_else(|| "client authorization has not been confirmed".to_owned())?;
+        require_confirmed_client_policy(self).map_err(|error| error.to_string())?;
+        require(
+            context.snapshot.payload.selection.grant_leaf == self.grant_leaf
+                && context.snapshot.payload.target_heads == self.heads,
+            "client authorization requires a fresh bounded context for session installation",
+        )
+        .map_err(|error| error.to_string())?;
+        encode(&serde_json::json!({
+            "client_policy_context": provenance_reference(context).map_err(|error| error.to_string())?,
+            "confirmation_hash": confirmation.hash().map_err(|error| error.to_string())?,
+        }))
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = clientPolicyProofUsageJson))]
+    pub fn client_policy_proof_usage_json(&self) -> crate::Result<String> {
+        encode(
+            &self
+                .client_policy_usage
+                .as_ref()
+                .ok_or_else(|| "client authorization has no bounded proof usage".to_owned())?
+                .counts(),
+        )
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = revalidateClientPolicyAuthorization))]
+pub fn revalidate_client_policy_authorization(
+    authorization: &VerifiedClientAuthorization,
+    latest_independent_pins_json: &str,
+    now_ms: f64,
+) -> crate::Result<VerifiedClientAuthorization> {
+    let _signature_scope = ScopedSignatureVerification::new();
+    let revalidate = || -> Result<_> {
+        let original = require_confirmed_client_policy(authorization)?;
+        let incoming: Vec<PolicyPin> = parse(latest_independent_pins_json)?;
+        validate_pins(&incoming)?;
+        let filtered: Vec<_> = incoming
+            .into_iter()
+            .filter(|pin| {
+                original
+                    .pins()
+                    .iter()
+                    .any(|saved| saved.domain == pin.domain)
+            })
+            .collect();
+        let snapshot = original.with_independent_pins(&filtered)?;
+        let provenance = authorization
+            .client_policy_context
+            .as_ref()
+            .ok_or(AuthorizationError::PolicyConflict)?;
+        let selection = &provenance.snapshot.payload.selection;
+        require(
+            selection.grant_leaf == authorization.grant_leaf,
+            "client policy revalidation changed selection",
+        )?;
+        let (state, pins, journal) = snapshot.clone().into_parts();
+        let bundle = ClientAuthorizationBundle {
+            journal,
+            grant_leaf: authorization.grant_leaf.clone(),
+        };
+        let mut auth = verify_client_policy_state_selected(
+            state,
+            &bundle,
+            &pins,
+            authorization.scope.account_id.clone(),
+            authorization.scope.space_id.clone(),
+            provenance.request.issuer.clone(),
+            Some(&selection.resource),
+            bootstrap::timestamp(now_ms)?,
+        )?;
+        require(
+            auth.heads == authorization.heads && auth.audience == authorization.audience,
+            "client policy revalidation requires explicit finite synchronization",
+        )?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_budget(&auth.budget)?;
+        finish_usage(&mut usage)?;
+        auth.imported_snapshot = Some(snapshot);
+        auth.client_policy_context = Some(provenance.clone());
+        auth.client_policy_usage = Some(usage);
+        Ok(auth)
+    };
+    revalidate().map_err(|error| error.to_string())
 }
