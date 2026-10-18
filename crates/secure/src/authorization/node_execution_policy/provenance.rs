@@ -598,3 +598,435 @@ pub fn restore_sdk_source_provenance(
     verified.usage.enforce_limits()?;
     Ok(verified)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const NOW: u64 = 10_000;
+
+    fn key(byte: u8) -> Identity {
+        Identity::from_secret_hex(&hex::encode([byte; 32])).unwrap()
+    }
+
+    fn admission(
+        state: &VerifiedPolicySet,
+        invocation: Signed<Invocation>,
+        source_body: serde_json::Value,
+        transport: TransportEvidence,
+        node: &Identity,
+        nonce: u8,
+    ) -> (events::AdmissionProof, VerifiedAuthorization) {
+        let facts = invocation_facts(&invocation.payload);
+        let authorization = state
+            .verify_invocation(&invocation, &facts, &transport, NOW)
+            .unwrap();
+        let challenge = FreshnessChallenge::new(
+            &authorization,
+            CheckStage::Admit,
+            Nonce::from_bytes([nonce; 32]),
+            NOW,
+            NOW + 5_000,
+        )
+        .unwrap();
+        let receipts: Vec<_> = authorization
+            .dependencies()
+            .iter()
+            .map(|current| {
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: current.clone(),
+                        challenge_hash: challenge.hash().unwrap(),
+                        issued_at_ms: NOW,
+                        expires_at_ms: NOW + 5_000,
+                    },
+                    node,
+                )
+                .unwrap()
+            })
+            .collect();
+        let freshness = state
+            .verify_freshness(&authorization, &challenge, &receipts, NOW)
+            .unwrap();
+        let admitted = state
+            .admit_operation(&authorization, &freshness, NOW)
+            .unwrap();
+        let current = state
+            .verify_operation_authorization(&admitted, &facts, &transport, NOW + 20)
+            .unwrap();
+        (
+            events::AdmissionProof {
+                invocation,
+                source_body,
+                challenge,
+                receipts,
+                admitted_at_ms: NOW,
+                transport: events::StoredTransport::from(&transport),
+            },
+            current,
+        )
+    }
+
+    fn fixture() -> (
+        VerifiedPolicySet,
+        SdkPolicySourceProvenance,
+        VerifiedAuthorization,
+        NodeExecutionPolicyReadRequest,
+        Identity,
+    ) {
+        let root = key(1);
+        let recovery = key(2);
+        let user = key(3);
+        let node = key(4);
+        let nonce = Nonce::from_bytes([5; 32]);
+        let claim =
+            bootstrap::create_node_claim(&node, nonce.as_str(), NOW as f64, (NOW + 10_000) as f64)
+                .unwrap();
+        let claim = bootstrap::verify_node_claim(
+            &claim,
+            &node.public_key_hex(),
+            nonce.as_str(),
+            NOW as f64,
+        )
+        .unwrap();
+        let prepared = bootstrap::prepare_account_creation(
+            &root,
+            &recovery,
+            &user,
+            &claim,
+            (NOW + 1_000_000) as f64,
+            NOW as f64,
+        )
+        .unwrap();
+        let possession = bootstrap::sign_node_possession(
+            &prepared.node_request_json().unwrap(),
+            &node,
+            nonce.as_str(),
+            NOW as f64,
+        )
+        .unwrap();
+        let created =
+            bootstrap::finish_account_creation(&prepared, &root, &possession, NOW as f64).unwrap();
+        let bundle: ClientAuthorizationBundle =
+            serde_json::from_str(&created.bundle_json().unwrap()).unwrap();
+        let pins: Vec<PolicyPin> = serde_json::from_str(&created.pins_json().unwrap()).unwrap();
+        let state = replay_policies(&pins, &bundle.journal).unwrap();
+        let service_grant: Signed<Grant> =
+            serde_json::from_str(&created.service_grant_json().unwrap()).unwrap();
+        let service_grant = service_grant.hash().unwrap();
+        let resource = state
+            .resources
+            .values()
+            .next()
+            .map(|record| ResourceRef {
+                space: record.payload.space.clone(),
+                resource: record.payload.resource.clone(),
+            })
+            .unwrap();
+        let audience = Audience {
+            service: ServiceId::from_key(&PublicKey::of(&node)),
+            device: DeviceId::from_key(&PublicKey::of(&node)),
+        };
+        let context = InvocationContext {
+            conversation: Some("chat".into()),
+            workspace_resource: Some(resource.resource.clone()),
+            ..Default::default()
+        };
+        let actor = state
+            .find_device(&DeviceId::from_key(&PublicKey::of(&user)))
+            .unwrap()
+            .payload
+            .subject
+            .clone();
+        let mut heads = vec![
+            state
+                .head(&PolicyDomain::Account(match &actor {
+                    Actor::Account(id) => id.clone(),
+                    _ => panic!("user has no Account"),
+                }))
+                .unwrap()
+                .clone(),
+            state
+                .head(&PolicyDomain::Space(resource.space.clone()))
+                .unwrap()
+                .clone(),
+        ];
+        heads.sort_by(|a, b| a.domain.cmp(&b.domain));
+        let device = DeviceId::from_key(&PublicKey::of(&user));
+        let source_body = json!({"message":"run this"});
+        let invocation = Signed::sign(
+            Invocation {
+                version: AUTH_VERSION,
+                actor: actor.clone(),
+                device: device.clone(),
+                initiator: actor,
+                initiating_grant: None,
+                resource: resource.clone(),
+                action: Action::MessageAppend,
+                audience: audience.clone(),
+                presenter: device.clone(),
+                operation_id: "parent".into(),
+                body_hash: ObjectHash::body(&source_body).unwrap(),
+                grant_leaf: bundle.grant_leaf,
+                expected_policies: heads,
+                context: context.clone(),
+                nonce: Nonce::from_bytes([6; 32]),
+                not_before_ms: NOW,
+                expires_at_ms: NOW + 10,
+            },
+            &user,
+        )
+        .unwrap();
+        let (origin, parent) = admission(
+            &state,
+            invocation,
+            source_body,
+            TransportEvidence::DirectNoise { device },
+            &node,
+            7,
+        );
+        let trigger = EventRef::parse(&"aa".repeat(32)).unwrap();
+        let sdk = SessionRef {
+            target: audience.device.clone(),
+            session_id: trigger.as_str().into(),
+        };
+        let manager_body = json!({"method":"agent_start","space_id":resource.space,"resource_id":resource.resource,
+            "conversation_id":"chat","authorization_id":format!("manager:{}",trigger.as_str()),"trigger":trigger,
+            "sdk_session":sdk,"parent_invocation":parent.invocation_hash(),"sdk_config":"fixture"});
+        let mut manager_context = context;
+        manager_context.sdk_session = Some(sdk.clone());
+        let manager_facts = RequestFacts {
+            resource: resource.clone(),
+            action: Action::AgentStart,
+            audience: audience.clone(),
+            operation_id: format!("manager:{}", trigger.as_str()),
+            body_hash: ObjectHash::body(&manager_body).unwrap(),
+            context: manager_context,
+        };
+        let delegation = state
+            .verify_service_delegation(
+                &parent,
+                &audience.service,
+                &service_grant,
+                &manager_facts,
+                NOW + 20,
+            )
+            .unwrap();
+        let invocation = Signed::sign(
+            Invocation {
+                version: AUTH_VERSION,
+                actor: Actor::Service(audience.service.clone()),
+                device: delegation.device().clone(),
+                initiator: delegation.initiator().clone(),
+                initiating_grant: delegation.initiating_grant().cloned(),
+                resource: resource.clone(),
+                action: Action::AgentStart,
+                audience: audience.clone(),
+                presenter: delegation.device().clone(),
+                operation_id: manager_facts.operation_id.clone(),
+                body_hash: manager_facts.body_hash.clone(),
+                grant_leaf: service_grant.clone(),
+                expected_policies: delegation.heads().to_vec(),
+                context: manager_facts.context.clone(),
+                nonce: Nonce::from_bytes([8; 32]),
+                not_before_ms: NOW,
+                expires_at_ms: NOW + 1_000,
+            },
+            &node,
+        )
+        .unwrap();
+        let (manager, _) = admission(
+            &state,
+            invocation,
+            manager_body,
+            TransportEvidence::LocalAgentAdapter {
+                service: audience.service.clone(),
+                session: sdk.clone(),
+            },
+            &node,
+            9,
+        );
+        let mut child = manager_facts;
+        child.action = Action::ExecutionOpen;
+        child.operation_id = "child-open".into();
+        child.body_hash = ObjectHash::body(&json!({"open":true})).unwrap();
+        child.context.task = Some(EventRef::parse(&"bb".repeat(32)).unwrap());
+        child.context.executor_kind = Some("codex".into());
+        let target = PublicKey::of(&key(20));
+        child.context.execution_session = Some(SessionRef {
+            target: DeviceId::from_key(&target),
+            session_id: "foreign-session".into(),
+        });
+        let heads = sdk_policy_source_heads(
+            &state,
+            &parent,
+            &audience.service,
+            &service_grant,
+            &child,
+            NOW + 20,
+        )
+        .unwrap();
+        let record = SdkPolicySourceProvenance {
+            version: AUTH_VERSION,
+            origin: execution_handoff::CompactSdkOrigin {
+                message_event: trigger.clone(),
+                sdk_trigger: trigger,
+                invocation: origin.invocation,
+                challenge: origin.challenge,
+                receipts: origin.receipts,
+                admitted_at_ms: origin.admitted_at_ms,
+                transport: origin.transport,
+            },
+            session: SdkPolicySession {
+                space_id: resource.space.clone(),
+                resource_id: resource.resource.clone(),
+                service: audience.service,
+                device: audience.device,
+                conversation_id: "chat".into(),
+                sdk_session: sdk,
+                grant_leaf: service_grant.clone(),
+                initiator: delegation.initiator().clone(),
+                initiating_grant: delegation.initiating_grant().cloned(),
+                parent_invocation: parent.invocation_hash().clone(),
+                expected_policies: delegation.heads().to_vec(),
+                expires_at_ms: delegation.expires_at_ms(),
+            },
+            service_grant,
+            lease: SdkPolicyLease {
+                challenge: manager.challenge.clone(),
+                receipts: manager.receipts.clone(),
+                checked_at_ms: NOW,
+                deadline: NOW + 1_000,
+            },
+            manager_admission: manager,
+            current_binding: None,
+            child_facts: SdkPolicySourceFacts::from(&child),
+            source_heads: heads,
+        };
+        let mut read_context = child.context;
+        read_context.sdk_session = None;
+        let request = NodeExecutionPolicyReadRequest::Current(
+            Signed::sign(
+                NodeExecutionPolicyReadIntent {
+                    version: AUTH_VERSION,
+                    source_project: resource.clone(),
+                    selection: RemoteExecutionPolicySelection {
+                        execution_resource: resource,
+                        target_public_key: target.clone(),
+                        execution_grant: record.service_grant.clone(),
+                    },
+                    context: prepare::PrepareContext {
+                        context: read_context,
+                        binding_generation: Some(1),
+                        canonical_cwd: Some("/workspace".into()),
+                        execution_target_public_key: Some(target),
+                    },
+                    expected_action: Action::ExecutionOpen,
+                    purpose: RemoteExecutionPolicyPurpose::Execution,
+                    execution_pins: pins,
+                    source_provenance: Some(ObjectHash::body(&record).unwrap()),
+                    nonce: Nonce::from_bytes([10; 32]),
+                    issued_at_ms: NOW + 20,
+                    expires_at_ms: NOW + 200,
+                },
+                &node,
+            )
+            .unwrap(),
+        );
+        (state, record, parent, request, node)
+    }
+
+    #[test]
+    fn original_sdk_source_survives_account_window_and_rejects_changed_material() {
+        let (state, record, parent, request, _) = fixture();
+        assert!(parent.signed_invocation().payload.expires_at_ms < NOW + 20);
+        let facts = record.child_facts.request_facts();
+        let current = verify_sdk_source_provenance(
+            &state,
+            &parent,
+            &record,
+            &record.session.service,
+            &record.service_grant,
+            &facts,
+            None,
+            NOW + 20,
+        )
+        .unwrap();
+        assert_eq!(current.facts(), &facts);
+        assert_eq!(current.heads(), record.source_heads);
+        assert_eq!(current.digest(), &ObjectHash::body(&record).unwrap());
+        let restored = restore_sdk_source_provenance(&state, &record, &request, NOW + 20).unwrap();
+        assert_eq!(
+            restored.parent().invocation_hash(),
+            parent.invocation_hash()
+        );
+        assert!(restored.proof_usage().counts().unique_signed_objects > 0);
+        let mut changed = record.clone();
+        changed.child_facts.context.task = Some(EventRef::parse(&"cc".repeat(32)).unwrap());
+        assert!(restore_sdk_source_provenance(&state, &changed, &request, NOW + 20).is_err());
+        let mut changed = record.clone();
+        changed.manager_admission.source_body["sdk_config"] = json!("another-manager");
+        assert!(
+            verify_sdk_source_provenance(
+                &state,
+                &parent,
+                &changed,
+                &record.session.service,
+                &record.service_grant,
+                &facts,
+                None,
+                NOW + 20
+            )
+            .is_err()
+        );
+        let mut changed = record.clone();
+        changed.lease.deadline += 1;
+        assert!(
+            verify_sdk_source_provenance(
+                &state,
+                &parent,
+                &changed,
+                &record.session.service,
+                &record.service_grant,
+                &facts,
+                None,
+                NOW + 20
+            )
+            .is_err()
+        );
+        let mut changed = record.clone();
+        changed.lease.checked_at_ms += 1;
+        assert!(
+            verify_sdk_source_provenance(
+                &state,
+                &parent,
+                &changed,
+                &record.session.service,
+                &record.service_grant,
+                &facts,
+                None,
+                NOW + 20
+            )
+            .is_err()
+        );
+        assert!(restore_sdk_source_provenance(&state, &record, &request, NOW + 200).is_err());
+    }
+
+    #[test]
+    fn signed_node_read_cannot_omit_or_substitute_the_sdk_source_digest() {
+        let (state, record, _, request, node) = fixture();
+        let NodeExecutionPolicyReadRequest::Current(value) = request else {
+            unreachable!()
+        };
+        let mut payload = value.payload;
+        payload.source_provenance = None;
+        let missing =
+            NodeExecutionPolicyReadRequest::Current(Signed::sign(payload.clone(), &node).unwrap());
+        assert!(restore_sdk_source_provenance(&state, &record, &missing, NOW + 20).is_err());
+        payload.source_provenance = Some(ObjectHash::body(&"unrelated").unwrap());
+        let wrong = NodeExecutionPolicyReadRequest::Current(Signed::sign(payload, &node).unwrap());
+        assert!(restore_sdk_source_provenance(&state, &record, &wrong, NOW + 20).is_err());
+    }
+}
