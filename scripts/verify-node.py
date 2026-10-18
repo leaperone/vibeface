@@ -2984,9 +2984,6 @@ def chat_agent_checks(run, workspace, a, b, c, space, passed):
     require_quiet("restart never reruns the unknown command", lambda: marker.read_text() == "once")
     require(local_operation(b, space, operation_id, resource_id=a.client.resource_id)["request"]["session_id"] is None,
             "unknown command recovery does not create an SDK session")
-    wait_for("restarted executor reconnects before subsequent work", lambda:
-        any(row["node_id"] == b.node_id and row["online"] and row.get("capabilities")
-            for row in a.client.rpc("nodes")["nodes"]))
     passed("running command restart preserves Unknown and its original file effect without replay", operation_id=operation_id)
 
 
@@ -3212,9 +3209,9 @@ def chat_agent_acceptance(options):
         outsider.start()
         outsider.bootstrap()
         report["topology"] = setup_manager_topology(a, b, c)
-        wait_for("private Nodes can reach each other", lambda:
-            all(any(row["node_id"] == target.node_id and row["online"] for row in a.client.rpc("nodes")["nodes"])
-                for target in (b, c)))
+        metadata = a.client.rpc("nodes")["nodes"]
+        require(len(metadata) == 1 and metadata[0]["node_id"] == a.node_id and metadata[0]["online"],
+                "Project-scoped node metadata identifies only its authenticated host")
         bot_checks(run, workspace, a, b, c, space, passed, outsider)
         chat_agent_checks(run, workspace, a, b, c, space, passed)
         startup_subscription_checks(run, workspace, a, b, c, space, passed)
@@ -3330,9 +3327,9 @@ def phase1_acceptance(options):
         verify_web_assets(a, module)
         space = a.bootstrap()
         report["topology"] = setup_manager_topology(a, b, c)
-        wait_for("three private Nodes become mutually reachable", lambda:
-                 all(any(row["node_id"] == target.node_id and row["online"]
-                         for row in a.client.rpc("nodes")["nodes"]) for target in (b, c)))
+        metadata = a.client.rpc("nodes")["nodes"]
+        require(len(metadata) == 1 and metadata[0]["node_id"] == a.node_id and metadata[0]["online"],
+                "Project-scoped node metadata identifies only its authenticated host")
         c.client.subscribe()
         passed("three real Nodes enroll independent clients and explicit replica grants; Manager uses a controlled fixture")
 
