@@ -865,6 +865,81 @@ impl PolicyState {
         self.prepare(pins, journal, now_ms, true)
     }
 
+    pub(crate) fn prepare_cross_recovery_commit(
+        &self,
+        verified: vibeface_secure::authorization::bootstrap::recovery::stream::VerifiedStreamedCrossNodeRecoveryCommit,
+        now_ms: u64,
+    ) -> Result<PreparedPolicyUpdate> {
+        let expected = verified.expected_heads().to_vec();
+        let (state, pins, delta) = verified.into_store_parts();
+        self.prepare_verified_recovery_delta(state, &pins, &delta, &expected, now_ms)
+    }
+
+    fn prepare_verified_recovery_delta(
+        &self,
+        state: VerifiedPolicySet,
+        pins: &[PolicyPin],
+        delta: &[JournalEntry],
+        expected: &[PolicyStamp],
+        now_ms: u64,
+    ) -> Result<PreparedPolicyUpdate> {
+        ensure!(
+            !expected.is_empty()
+                && expected
+                    .iter()
+                    .all(|head| self.state.head(&head.domain) == Some(head)),
+            "recovery source policy changed before commit"
+        );
+        ensure!(
+            !delta.is_empty()
+                && delta.len() <= MAX_UPDATE_ENTRIES
+                && serde_json::to_vec(delta)?.len() <= MAX_UPDATE_BYTES,
+            "invalid verified recovery delta size"
+        );
+        for pin in pins {
+            ensure!(
+                self.pins
+                    .iter()
+                    .any(|existing| existing.domain == pin.domain
+                        && existing.genesis_root == pin.genesis_root),
+                "recovery cannot introduce or replace a trusted source pin"
+            );
+        }
+        for pin in &self.pins {
+            if expected.iter().all(|head| head.domain != pin.domain) {
+                ensure!(
+                    state.head(&pin.domain) == self.state.head(&pin.domain),
+                    "recovery changed an unrelated source policy domain"
+                );
+            }
+        }
+        let mut after = self.clone();
+        after.state = state;
+        let mut additions = Vec::with_capacity(delta.len());
+        for entry in delta {
+            let hash = entry_hash(entry)?;
+            ensure!(
+                !after.accepted.contains_key(&hash),
+                "recovery delta repeats accepted history"
+            );
+            let accepted = AcceptedEntry {
+                entry: entry.clone(),
+                encoded: serde_json::to_string(entry)?,
+                received_at_ms: now_ms,
+            };
+            after.order.push(hash.clone());
+            after.accepted.insert(hash.clone(), accepted.clone());
+            additions.push((hash, accepted));
+        }
+        after.check_minimum_heads()?;
+        after.nonce_bindings()?;
+        Ok(PreparedPolicyUpdate {
+            before: self.clone(),
+            after,
+            additions,
+        })
+    }
+
     pub(crate) fn prepare_cross_recovery_install(
         &self,
         verified: vibeface_secure::authorization::bootstrap::recovery::stream::VerifiedCrossNodeRecoveryInstallation,

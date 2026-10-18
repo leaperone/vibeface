@@ -25,9 +25,18 @@ pub(crate) fn request_facts_from(
     body: &Value,
     audience: &Audience,
 ) -> Result<RequestFacts> {
-    if matches!(body["method"].as_str(),Some("seal_remote_execution"|"remote_execution_seal_status")) {
-        return super::execution_binding_seal::facts_from(connection,policies,body,audience,crate::runtime::now_ms() as u64)
-            .map(|(facts,_)|facts);
+    if matches!(
+        body["method"].as_str(),
+        Some("seal_remote_execution" | "remote_execution_seal_status")
+    ) {
+        return super::execution_binding_seal::facts_from(
+            connection,
+            policies,
+            body,
+            audience,
+            crate::runtime::now_ms() as u64,
+        )
+        .map(|(facts, _)| facts);
     }
     ensure!(
         ["execution_resource", "target_public_key", "execution_grant"]
@@ -620,14 +629,27 @@ impl Store {
         now_ms: u64,
     ) -> Result<Value> {
         self.verify_bootstrap_capability(capability)?;
-        let previous: Option<String> = self
+        let tx = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<String> = tx
             .query_row(
                 "SELECT value FROM identity_meta WHERE key='node_claim'",
                 [],
                 |row| row.get(0),
             )
             .optional()?;
+        let pending_possession: Option<String> = tx
+            .query_row(
+                "SELECT value FROM identity_meta WHERE key='node_possession'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        ensure!(
+            previous.is_some() || pending_possession.is_none(),
+            "pending Node possession has lost its original claim"
+        );
         if let Some(previous) = previous {
             let claim: Signed<NodeClaim> = serde_json::from_str(&previous)?;
             ensure!(
@@ -635,7 +657,9 @@ impl Store {
                     && claim.payload.claim_nonce.as_str() == capability,
                 "stored Node claim differs from this installation"
             );
-            if claim.payload.issued_at_ms <= now_ms && now_ms < claim.payload.expires_at_ms {
+            if pending_possession.is_some()
+                || (claim.payload.issued_at_ms <= now_ms && now_ms < claim.payload.expires_at_ms)
+            {
                 return Ok(json!({"claim":claim}));
             }
         }
@@ -650,10 +674,7 @@ impl Store {
                 .context("claim expiry overflow")? as f64,
         )
         .map_err(anyhow::Error::msg)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("DELETE FROM identity_meta WHERE key='node_possession'", [])?;
+
         tx.execute("INSERT INTO identity_meta(key,value) VALUES('node_claim',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&encoded])?;
         tx.commit()?;
         Ok(json!({"claim":serde_json::from_str::<Value>(&encoded)?}))
@@ -1343,11 +1364,28 @@ impl crate::runtime::Runtime {
             "recovery_context" => {
                 store.recovery_context(&self.identity, noise_public_key, params, now_ms)
             }
+            "recovery_context_page" => {
+                store.recovery_context_page(&self.identity, noise_public_key, params, now_ms)
+            }
+            "recovery_context_witness" => {
+                store.recovery_context_witness(&self.identity, noise_public_key, params, now_ms)
+            }
+            "recovery_status" => {
+                store.recovery_status(&self.identity, noise_public_key, params, now_ms)
+            }
             "recovery_node_possession" => {
                 store.recovery_node_possession(&self.identity, noise_public_key, params, now_ms)
             }
             "recover" => store.recover_account(&self.identity, noise_public_key, params, now_ms),
             "cross_node_recovery_context"
+            | "cross_node_recovery_context_page"
+            | "cross_node_recovery_context_witness"
+            | "cross_node_recovery_status"
+            | "cross_node_recovery_import_begin"
+            | "cross_node_recovery_import_page"
+            | "cross_node_recovery_import_cached_page"
+            | "cross_node_recovery_import_finish"
+            | "cross_node_recovery_import_resume"
             | "cross_node_recovery_source_possession"
             | "cross_node_recovery_possession"
             | "cross_node_recovery_commit"
@@ -1444,6 +1482,50 @@ impl crate::runtime::Runtime {
 mod tests {
     use super::*;
     use crate::identity::test_support::{TestNetwork, now};
+
+    #[test]
+    fn pending_node_possession_keeps_its_original_expired_claim() -> Result<()> {
+        let network = TestNetwork::new()?;
+        let mut store = Store::open(":memory:")?;
+        let capability = "a".repeat(64);
+        store.connection.execute(
+            "INSERT INTO identity_meta(key,value) VALUES('bootstrap_capability_hash',?)",
+            [crate::crypto::digest(capability.as_bytes())],
+        )?;
+        let first = store.node_claim(&network.node, &capability, now())?;
+        let claim: Signed<NodeClaim> = serde_json::from_value(first["claim"].clone())?;
+        let marker =
+            json!({"purpose":"cross_node_recovery_v2","claim_hash":claim.hash()?}).to_string();
+        store.connection.execute(
+            "INSERT INTO identity_meta(key,value) VALUES('node_possession',?)",
+            [&marker],
+        )?;
+        assert_eq!(
+            store.node_claim(&network.node, &capability, claim.payload.expires_at_ms + 1)?,
+            first
+        );
+        let retained: String = store.connection.query_row(
+            "SELECT value FROM identity_meta WHERE key='node_possession'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained, marker);
+        store
+            .connection
+            .execute("DELETE FROM identity_meta WHERE key='node_claim'", [])?;
+        assert!(
+            store
+                .node_claim(&network.node, &capability, claim.payload.expires_at_ms + 1)
+                .is_err()
+        );
+        let retained: String = store.connection.query_row(
+            "SELECT value FROM identity_meta WHERE key='node_possession'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained, marker);
+        Ok(())
+    }
 
     #[test]
     fn freshness_signing_rejects_authority_revocation_from_another_connection() -> Result<()> {

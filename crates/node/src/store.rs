@@ -18,6 +18,8 @@ const INITIAL_SCHEMA: &str = include_str!("../migrations/202610180001_initial.sq
 pub struct Store {
     pub(crate) connection: Connection,
     pub(crate) policy: crate::identity::journal::PolicyState,
+    pub(crate) target_recovery_import:
+        Option<crate::identity::cross_node_recovery::TargetRecoveryImport>,
 }
 fn verify_schema(connection: &Connection) -> Result<()> {
     let metadata: (String, u32, u32, String, String) = connection.query_row(
@@ -344,7 +346,11 @@ impl Store {
             }
         }
         let policy = crate::identity::journal::PolicyState::load(&connection)?;
-        Ok(Self { connection, policy })
+        Ok(Self {
+            connection,
+            policy,
+            target_recovery_import: None,
+        })
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -398,7 +404,11 @@ impl Store {
             private_sidecars(path)?;
         }
         let policy = crate::identity::journal::PolicyState::load(&connection)?;
-        let mut store = Self { connection, policy };
+        let mut store = Self {
+            connection,
+            policy,
+            target_recovery_import: None,
+        };
         store
             .connection
             .pragma_update(None, "journal_mode", "WAL")?;
