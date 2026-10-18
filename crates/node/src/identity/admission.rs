@@ -2607,6 +2607,475 @@ pub(crate) mod tests {
         }
     }
 
+    fn local_cache_fixture(
+        persistent: bool,
+    ) -> Result<(
+        crate::identity::test_support::TestNetwork,
+        Store,
+        crate::model::SignedEvent,
+        crate::model::SignedEvent,
+        AdmissionProof,
+        RequestFacts,
+    )> {
+        use crate::identity::test_support::TestNetwork;
+        let network = TestNetwork::new()?;
+        let mut store = if persistent {
+            network.at(&network.directory.join("admission-cache.sqlite3"))?
+        } else {
+            network.memory()?
+        };
+        let ancestor = network.conversation(&mut store, "conversation")?;
+        let anchor = network.message(&mut store, "conversation", "cached admission")?;
+        let event: crate::model::Event = serde_json::from_str(&anchor.canonical_body)?;
+        assert!(event.parents.contains(&ancestor.hash));
+        let EventCause::Invocation { admission } = event.cause else {
+            anyhow::bail!("expected an admitted message");
+        };
+        let facts = persisted_admission_facts(&store.connection, &store.policy, &admission)?;
+        assert!(store.policy.local_admissions.entries.contains_key(&(
+            network.space.to_string(),
+            admission.invocation.payload.operation_id.clone(),
+        )));
+        Ok((network, store, ancestor, anchor, admission, facts))
+    }
+
+    pub(super) fn cached_without_crypto(
+        store: &Store,
+        proof: &AdmissionProof,
+        facts: &RequestFacts,
+    ) -> Result<VerifiedAdmission> {
+        let signatures = vibeface_secure::signature_verification::SignatureVerification::new();
+        let admitted = signatures.run(|| {
+            reconstruct_admission(
+                &store.connection,
+                &store.policy,
+                proof,
+                facts,
+                &proof.transport.clone().into_evidence(),
+            )
+        })?;
+        assert_eq!(signatures.counts().actual_verifications, 0);
+        assert_eq!(admitted.signed_invocation(), &proof.invocation);
+        assert_eq!(admitted.admitted_at_ms(), proof.admitted_at_ms);
+        Ok(admitted)
+    }
+
+    #[test]
+    fn local_admission_cache_reuses_committed_proof_and_rebuilds_on_reopen() -> Result<()> {
+        let (network, store, _, _, proof, facts) = local_cache_fixture(true)?;
+        let signatures = vibeface_secure::signature_verification::SignatureVerification::new();
+        signatures.run(|| {
+            reconstruct_admission_uncached(
+                &store.policy,
+                &proof,
+                &facts,
+                &proof.transport.clone().into_evidence(),
+            )
+        })?;
+        assert!(signatures.counts().actual_verifications > 0);
+        cached_without_crypto(&store, &proof, &facts)?;
+        cached_without_crypto(&store, &proof, &facts)?;
+        let cache_len = store.policy.local_admissions.len();
+        assert_eq!(
+            verified_admission_checkpoints_from(&store.connection, &store.policy)?.len(),
+            cache_len
+        );
+        drop(store);
+        let reopened = Store::open(network.directory.join("admission-cache.sqlite3"))?;
+        assert_eq!(reopened.policy.local_admissions.len(), cache_len);
+        cached_without_crypto(&reopened, &proof, &facts)?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_admission_cache_rejects_changed_rows_proof_facts_and_ready_ancestors() -> Result<()> {
+        let (network, store, ancestor, anchor, proof, facts) = local_cache_fixture(false)?;
+        let id = &proof.invocation.payload.operation_id;
+        for (sql, parameter) in [
+            (
+                "UPDATE accepted_authorizations SET actor_id='changed' WHERE authorization_id=?",
+                id.as_str(),
+            ),
+            (
+                "UPDATE authorization_nonces SET body_hash='changed' WHERE authorization_id=?",
+                id.as_str(),
+            ),
+            (
+                "UPDATE authorization_challenges SET consumed=0 WHERE nonce=?",
+                proof.challenge.nonce.as_str(),
+            ),
+            (
+                "UPDATE authorization_challenges SET challenge='{}' WHERE nonce=?",
+                proof.challenge.nonce.as_str(),
+            ),
+            (
+                "UPDATE events SET resource_id='changed' WHERE hash=?",
+                anchor.hash.as_str(),
+            ),
+            (
+                "UPDATE events SET scope_id='changed' WHERE hash=?",
+                anchor.hash.as_str(),
+            ),
+            (
+                "UPDATE events SET status='conflict' WHERE hash=?",
+                anchor.hash.as_str(),
+            ),
+            (
+                "UPDATE events SET status='conflict' WHERE hash=?",
+                ancestor.hash.as_str(),
+            ),
+        ] {
+            let tx = store.connection.unchecked_transaction()?;
+            tx.pragma_update(None, "defer_foreign_keys", true)?;
+            assert_eq!(tx.execute(sql, [parameter])?, 1);
+            assert!(
+                reconstruct_admission(
+                    &tx,
+                    &store.policy,
+                    &proof,
+                    &facts,
+                    &proof.transport.clone().into_evidence()
+                )
+                .is_err(),
+                "{sql}"
+            );
+            assert!(
+                verified_admission_checkpoints_from(&tx, &store.policy).is_err(),
+                "{sql}"
+            );
+            tx.rollback()?;
+            cached_without_crypto(&store, &proof, &facts)?;
+        }
+        for original in [&anchor, &ancestor] {
+            let mut changed = original.clone();
+            changed.canonical_body.push(' ');
+            let tx = store.connection.unchecked_transaction()?;
+            assert_eq!(
+                tx.execute(
+                    "UPDATE events SET envelope=? WHERE hash=?",
+                    params![serde_json::to_string(&changed)?, original.hash]
+                )?,
+                1
+            );
+            assert!(
+                reconstruct_admission(
+                    &tx,
+                    &store.policy,
+                    &proof,
+                    &facts,
+                    &proof.transport.clone().into_evidence()
+                )
+                .is_err()
+            );
+            tx.rollback()?;
+            cached_without_crypto(&store, &proof, &facts)?;
+        }
+        let mut event: crate::model::Event = serde_json::from_str(&anchor.canonical_body)?;
+        let EventCause::Invocation { admission } = &mut event.cause else {
+            unreachable!()
+        };
+        admission
+            .invocation
+            .payload
+            .operation_id
+            .push_str("-changed");
+        let mut changed_anchor = anchor.clone();
+        changed_anchor.canonical_body = serde_json::to_string(&event)?;
+        let tx = store.connection.unchecked_transaction()?;
+        assert_eq!(
+            tx.execute(
+                "UPDATE events SET envelope=? WHERE hash=?",
+                params![serde_json::to_string(&changed_anchor)?, anchor.hash]
+            )?,
+            1
+        );
+        assert!(
+            reconstruct_admission(
+                &tx,
+                &store.policy,
+                &proof,
+                &facts,
+                &proof.transport.clone().into_evidence()
+            )
+            .is_err()
+        );
+        tx.rollback()?;
+        let mut changed = proof.clone();
+        changed.receipts.clear();
+        assert!(
+            reconstruct_admission(
+                &store.connection,
+                &store.policy,
+                &changed,
+                &facts,
+                &proof.transport.clone().into_evidence()
+            )
+            .is_err()
+        );
+        let mut changed_facts = facts.clone();
+        changed_facts.context.conversation = Some("changed".into());
+        assert!(
+            reconstruct_admission(
+                &store.connection,
+                &store.policy,
+                &proof,
+                &changed_facts,
+                &proof.transport.clone().into_evidence()
+            )
+            .is_err()
+        );
+        let changed_transport = TransportEvidence::DirectNoise {
+            device: DeviceId::from_key(&PublicKey::of(&network.root)),
+        };
+        assert!(
+            reconstruct_admission(
+                &store.connection,
+                &store.policy,
+                &proof,
+                &facts,
+                &changed_transport
+            )
+            .is_err()
+        );
+        let mut changed_facts = facts.clone();
+        changed_facts.operation_id.push_str("-changed");
+        assert!(
+            reconstruct_admission(
+                &store.connection,
+                &store.policy,
+                &proof,
+                &changed_facts,
+                &proof.transport.clone().into_evidence()
+            )
+            .is_err()
+        );
+        cached_without_crypto(&store, &proof, &facts)?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_admission_cache_is_not_published_when_sql_commit_fails() -> Result<()> {
+        use crate::identity::test_support::{TestNetwork, now};
+        let network = TestNetwork::new()?;
+        let mut store = network.memory()?;
+        network.conversation(&mut store, "conversation")?;
+        let cache_len = store.policy.local_admissions.len();
+        let (body, event) = network.message_body("conversation", "retry after rollback")?;
+        let (auth, transport) = network.authorization(&store, &body, now())?;
+        let freshness = network.freshness(&mut store, &auth, CheckStage::Admit, now())?;
+        assert!(
+            store
+                .connection
+                .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))?
+        );
+        store.connection.execute_batch(
+            "CREATE TABLE cache_commit_parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE cache_commit_guard(id INTEGER REFERENCES cache_commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER reject_admission_commit AFTER INSERT ON events BEGIN INSERT INTO cache_commit_guard VALUES(1); END;",
+        )?;
+        let failure = store.append_authorized_event(
+            &network.node,
+            &auth,
+            &freshness,
+            &transport,
+            &body,
+            "conversation",
+            event.clone(),
+            vec![],
+            now() as i64,
+        );
+        let failure = failure.expect_err("deferred foreign key must reject COMMIT");
+        assert!(format!("{failure:#}").contains("FOREIGN KEY constraint failed"));
+        assert_eq!(store.policy.local_admissions.len(), cache_len);
+        assert!(
+            !store
+                .policy
+                .local_admissions
+                .entries
+                .contains_key(&(network.space.to_string(), auth.operation_id().to_owned()))
+        );
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT (SELECT count(*) FROM accepted_authorizations WHERE authorization_id=?1),
+                    (SELECT count(*) FROM authorization_nonces WHERE authorization_id=?1),
+                    (SELECT count(*) FROM cache_commit_guard)",
+                [auth.operation_id()],
+                |row| Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?
+                ))
+            )?,
+            (0, 0, 0)
+        );
+        assert!(!store.connection.query_row(
+            "SELECT consumed FROM authorization_challenges WHERE nonce=?",
+            [freshness.challenge.nonce.as_str()],
+            |row| row.get::<_, bool>(0)
+        )?);
+        store.connection.execute_batch("DROP TRIGGER reject_admission_commit; DROP TABLE cache_commit_guard; DROP TABLE cache_commit_parent;")?;
+        let accepted = store.append_authorized_event(
+            &network.node,
+            &auth,
+            &freshness,
+            &transport,
+            &body,
+            "conversation",
+            event,
+            vec![],
+            now() as i64,
+        )?;
+        assert_eq!(store.policy.local_admissions.len(), cache_len + 1);
+        let accepted: crate::model::Event = serde_json::from_str(&accepted.canonical_body)?;
+        let EventCause::Invocation { admission } = accepted.cause else {
+            unreachable!()
+        };
+        let facts = persisted_admission_facts(&store.connection, &store.policy, &admission)?;
+        cached_without_crypto(&store, &admission, &facts)?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_admission_cache_keeps_policy_time_and_current_revocation_gates() -> Result<()> {
+        let (network, mut store, _, _, proof, facts) = local_cache_fixture(false)?;
+        let transport = proof.transport.clone().into_evidence();
+        let admitted = cached_without_crypto(&store, &proof, &facts)?;
+        let mut earlier = proof.clone();
+        earlier.admitted_at_ms = proof.admitted_at_ms - 1;
+        assert!(
+            store
+                .policy
+                .current_heads_at(&proof.challenge.policies, earlier.admitted_at_ms)
+                .is_err()
+        );
+        assert!(
+            reconstruct_admission_uncached(&store.policy, &earlier, &facts, &transport).is_err()
+        );
+        assert!(
+            reconstruct_admission(
+                &store.connection,
+                &store.policy,
+                &earlier,
+                &facts,
+                &transport
+            )
+            .is_err()
+        );
+        assert!(
+            store
+                .authorization_state()
+                .verify_operation_authorization(
+                    &admitted,
+                    &facts,
+                    &transport,
+                    admitted.admitted_at_ms() - 1
+                )
+                .is_err()
+        );
+        let after_expiry = proof.invocation.payload.expires_at_ms + 1;
+        store.authorization_state().verify_operation_authorization(
+            &admitted,
+            &facts,
+            &transport,
+            after_expiry,
+        )?;
+        let retained = store.policy.local_admissions.len();
+        network.revoke_client(&mut store)?;
+        assert_eq!(store.policy.local_admissions.len(), retained);
+        let historical = cached_without_crypto(&store, &proof, &facts)?;
+        assert!(
+            store
+                .authorization_state()
+                .verify_operation_authorization(&historical, &facts, &transport, after_expiry)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_admission_cache_binds_operation_rows_and_excludes_binding_commands() -> Result<()> {
+        use crate::identity::test_support::{TestNetwork, now};
+        let network = TestNetwork::new()?;
+        let mut store = network.memory()?;
+        network.conversation(&mut store, "conversation")?;
+        let request = network.request(&mut store, "operation-cache", "binding-session")?;
+        let binding = request.binding.clone().context("binding required")?;
+        let retained = store.policy.local_admissions.len();
+        let mut seal_body = network.body("seal_execution", "conversation");
+        seal_body["task_id"] = json!(request.task_id);
+        seal_body["task_ref"] = json!(binding.binding.task_ref);
+        seal_body["binding"] = json!(binding);
+        let (auth, transport) = network.authorization(&store, &seal_body, now())?;
+        let freshness = network.freshness(&mut store, &auth, CheckStage::Admit, now())?;
+        let seal = store.seal_task_authorized(
+            &network.node,
+            &auth,
+            &freshness,
+            &transport,
+            &seal_body,
+            now(),
+        )?;
+        let mut rebind = network.body("rebind_execution", "conversation");
+        rebind["task_id"] = json!(request.task_id);
+        rebind["task_ref"] = json!(binding.binding.task_ref);
+        rebind["binding"] = json!(binding);
+        rebind["previous_seal"] = json!(seal);
+        rebind["target_node"] = json!(network.node.node_id()?);
+        rebind["session_id"] = json!("replacement-session");
+        rebind["executor"] = json!("codex");
+        rebind["cwd"] = json!(network.project);
+        let (auth, transport) = network.authorization(&store, &rebind, now())?;
+        let freshness = network.freshness(&mut store, &auth, CheckStage::Admit, now())?;
+        store.rebind_task_authorized(
+            &network.node,
+            &auth,
+            &freshness,
+            &transport,
+            &rebind,
+            now(),
+        )?;
+        assert_eq!(store.policy.local_admissions.len(), retained);
+        let commands = store.connection.prepare(
+            "SELECT authorization_id FROM accepted_authorizations WHERE json_extract(source_body,'$.method') IN ('bind_execution','seal_execution','rebind_execution') ORDER BY authorization_id",
+        )?.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(commands.len(), 3);
+        for command in commands {
+            let stored =
+                load_authorization_from(&store.connection, network.space.as_str(), &command)?;
+            assert!(admission_anchors_in(&store.connection, &stored.proof)?.is_empty());
+            assert!(
+                !store
+                    .policy
+                    .local_admissions
+                    .entries
+                    .contains_key(&(network.space.to_string(), command))
+            );
+        }
+        let request = network.request(&mut store, "operation-cache", "operation-session")?;
+        network.admit(&mut store, &request)?;
+        let stored = load_admission_from(
+            &store.connection,
+            network.space.as_str(),
+            &request.operation_id,
+        )?;
+        let facts = persisted_admission_facts(&store.connection, &store.policy, &stored.proof)?;
+        cached_without_crypto(&store, &stored.proof, &facts)?;
+        for sql in [
+            "UPDATE accepted_authorizations SET operation_id=NULL WHERE authorization_id=?",
+            "UPDATE operations SET request=json_set(request,'$.session_id','changed') WHERE operation_id=?",
+        ] {
+            let tx = store.connection.unchecked_transaction()?;
+            assert_eq!(tx.execute(sql, [&request.operation_id])?, 1);
+            assert!(
+                reconstruct_admission(&tx, &store.policy, &stored.proof, &facts, &stored.transport)
+                    .is_err()
+            );
+            tx.rollback()?;
+            cached_without_crypto(&store, &stored.proof, &facts)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn admission_persists_and_checks_nonce_and_challenge_relationships() -> Result<()> {
         let mut fixture = Fixture::new()?;
@@ -3119,6 +3588,100 @@ mod manager_tests {
                 now(),
             )
         }
+    }
+
+    #[test]
+    fn local_admission_cache_pins_the_manager_trigger_and_ready_ancestors() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let first = fixture.claim("cache-boot")?;
+        let stored = load_authorization_from(
+            &fixture.store.connection,
+            fixture.network.space.as_str(),
+            &first.manager_id,
+        )?;
+        let facts = persisted_admission_facts(
+            &fixture.store.connection,
+            &fixture.store.policy,
+            &stored.proof,
+        )?;
+        let trigger = manager_field(&fixture.body, "trigger")?;
+        let key = (fixture.network.space.to_string(), first.manager_id.clone());
+        let checkpoint = &fixture.store.policy.local_admissions.entries[&key];
+        assert_eq!(checkpoint.anchors.len(), 1);
+        assert_eq!(checkpoint.anchors[0].hash, trigger);
+        super::tests::cached_without_crypto(&fixture.store, &stored.proof, &facts)?;
+        super::tests::cached_without_crypto(&fixture.store, &stored.proof, &facts)?;
+        let trigger_envelope = fixture
+            .store
+            .event(fixture.network.space.as_str(), trigger)?
+            .context("manager trigger missing")?;
+        let trigger_event: crate::model::Event =
+            serde_json::from_str(&trigger_envelope.canonical_body)?;
+        let ancestor = trigger_event
+            .parents
+            .first()
+            .context("trigger ancestor missing")?;
+        let ancestor = fixture
+            .store
+            .event(fixture.network.space.as_str(), ancestor)?
+            .context("manager trigger ancestor missing")?;
+        for original in [&trigger_envelope, &ancestor] {
+            let mut changed = original.clone();
+            changed.canonical_body.push(' ');
+            let tx = fixture.store.connection.unchecked_transaction()?;
+            assert_eq!(
+                tx.execute(
+                    "UPDATE events SET envelope=? WHERE hash=?",
+                    params![serde_json::to_string(&changed)?, original.hash]
+                )?,
+                1
+            );
+            assert!(
+                reconstruct_admission(
+                    &tx,
+                    &fixture.store.policy,
+                    &stored.proof,
+                    &facts,
+                    &stored.transport
+                )
+                .is_err()
+            );
+            tx.rollback()?;
+            super::tests::cached_without_crypto(&fixture.store, &stored.proof, &facts)?;
+        }
+        let tx = fixture.store.connection.unchecked_transaction()?;
+        assert_eq!(
+            tx.execute(
+                "UPDATE events SET status='conflict' WHERE hash=?",
+                [trigger]
+            )?,
+            1
+        );
+        assert!(
+            reconstruct_admission(
+                &tx,
+                &fixture.store.policy,
+                &stored.proof,
+                &facts,
+                &stored.transport
+            )
+            .is_err()
+        );
+        tx.rollback()?;
+        let mut changed = stored.proof.clone();
+        changed.source_body["trigger"] = json!(ancestor.hash);
+        assert!(
+            reconstruct_admission(
+                &fixture.store.connection,
+                &fixture.store.policy,
+                &changed,
+                &facts,
+                &stored.transport
+            )
+            .is_err()
+        );
+        super::tests::cached_without_crypto(&fixture.store, &stored.proof, &facts)?;
+        Ok(())
     }
 
     #[test]
