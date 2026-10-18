@@ -1127,12 +1127,24 @@ mod tests {
                 .map_err(anyhow::Error::msg)
         })?;
         let signed_prepare: Signed<PrepareIntent> = serde_json::from_str(&signed_prepare)?;
-        for domain in [
-            gateway_domain.clone(),
-            PolicyDomain::Account(fixture.project.account.clone()),
-            PolicyDomain::Space(fixture.project.space.clone()),
-            PolicyDomain::Account(fixture.executor.account.clone()),
-            PolicyDomain::Space(fixture.executor.space.clone()),
+        for (kind, domain) in [
+            ("gateway_account", gateway_domain.clone()),
+            (
+                "project_account",
+                PolicyDomain::Account(fixture.project.account.clone()),
+            ),
+            (
+                "project_space",
+                PolicyDomain::Space(fixture.project.space.clone()),
+            ),
+            (
+                "executor_account",
+                PolicyDomain::Account(fixture.executor.account.clone()),
+            ),
+            (
+                "executor_space",
+                PolicyDomain::Space(fixture.executor.space.clone()),
+            ),
         ] {
             assert!(
                 signed_prepare
@@ -1140,7 +1152,8 @@ mod tests {
                     .request
                     .expected_policies
                     .iter()
-                    .any(|head| head.domain == domain)
+                    .any(|head| head.domain == domain),
+                "signed prepare dropped the {kind} head",
             );
         }
         assert_eq!(signed_prepare.payload.request.presenter, gateway_device);
