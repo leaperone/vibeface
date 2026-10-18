@@ -1,10 +1,13 @@
 //! Team creation and capability-authorized space policy changes.
 
 use super::*;
+use super::{
+    client_policy_import::require_confirmed_client_policy, policy_import::VerifiedPolicySnapshot,
+};
 use zeroize::Zeroize;
 
 fn parse<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T> {
-    require(value.len() <= 1_048_576, "governance JSON too large")?;
+    require(value.len() <= MAX_PROOF_BYTES, "governance JSON too large")?;
     serde_json::from_str(value)
         .map_err(|_| AuthorizationError::InvalidProof("invalid governance JSON"))
 }
@@ -15,17 +18,90 @@ fn time(value: f64) -> Result<u64> {
     bootstrap::timestamp(value)
 }
 fn load(
-    pins: &str,
-    bundle: &str,
-) -> Result<(VerifiedPolicySet, Vec<PolicyPin>, ClientAuthorizationBundle)> {
-    let pins: Vec<PolicyPin> = parse(pins)?;
-    let bundle: ClientAuthorizationBundle = parse(bundle)?;
+    authorization: &VerifiedClientAuthorization,
+    signer: &PublicKey,
+    now: u64,
+) -> Result<(VerifiedPolicySnapshot, VerifiedClientAuthorization)> {
+    let snapshot = require_confirmed_client_policy(authorization)?;
     require(
-        bundle.journal.len() <= 122,
-        "governance journal requires checkpoint",
+        authorization.scope.device_id == DeviceId::from_key(signer)
+            && authorization.resources.len() == 1,
+        "governance changed its authenticated client or selection",
     )?;
-    Ok((replay_policies(&pins, &bundle.journal)?, pins, bundle))
+    let selected = ResourceRef {
+        space: authorization.scope.space_id.clone(),
+        resource: authorization.resources[0].payload.resource.clone(),
+    };
+    let current = selected_authorization(
+        snapshot,
+        &authorization.grant_leaf,
+        &authorization.scope.account_id,
+        signer,
+        &selected,
+        now,
+    )?;
+    require(
+        current.heads == authorization.heads
+            && current.audience == authorization.audience
+            && current.audience_public_key == authorization.audience_public_key,
+        "governance requires explicit policy synchronization",
+    )?;
+    Ok((snapshot.clone(), current))
 }
+
+fn selected_authorization(
+    snapshot: &VerifiedPolicySnapshot,
+    grant: &ObjectHash,
+    account: &AccountId,
+    signer: &PublicKey,
+    selected: &ResourceRef,
+    now: u64,
+) -> Result<VerifiedClientAuthorization> {
+    let mut current = verify_client_policy_state_selected(
+        snapshot.state().clone(),
+        &ClientAuthorizationBundle {
+            journal: Vec::new(),
+            grant_leaf: grant.clone(),
+        },
+        snapshot.pins(),
+        account.clone(),
+        selected.space.clone(),
+        signer.clone(),
+        Some(selected),
+        now,
+    )?;
+    current.imported_snapshot = Some(snapshot.clone());
+    Ok(current)
+}
+
+fn finish_usage(usage: &mut execution_handoff::ExecutionProofUsage) -> Result<()> {
+    if let Some(counts) = SignatureVerification::current_counts() {
+        usage.record_actual_signature_counts(counts);
+    }
+    usage.enforce_limits()
+}
+
+fn record_governance_usage(
+    usage: &mut execution_handoff::ExecutionProofUsage,
+    verified: &VerifiedSpaceGovernanceRequest,
+) -> Result<()> {
+    usage.record_budget(&verified.budget)?;
+    usage.record_signed(&verified.request.proposal)?;
+    for entry in &verified.request.new_objects {
+        match entry {
+            JournalEntry::Membership(value) => usage.record_signed(value)?,
+            JournalEntry::Grant(value) => usage.record_signed(value)?,
+            JournalEntry::Resource(value) => usage.record_signed(value)?,
+            _ => {
+                return Err(AuthorizationError::InvalidProof(
+                    "unexpected governance delta object",
+                ));
+            }
+        }
+    }
+    usage.record_metadata(&verified.request)
+}
+
 fn next_space(
     state: &VerifiedPolicySet,
     space: &SpaceId,
@@ -87,6 +163,7 @@ pub struct VerifiedSpaceGovernanceRequest {
     request: SpaceGovernanceRequest,
     dependencies: Vec<PolicyStamp>,
     expires: u64,
+    budget: Budget,
 }
 impl VerifiedSpaceGovernanceRequest {
     pub fn request(&self) -> &SpaceGovernanceRequest {
@@ -211,19 +288,20 @@ pub fn verify_space_governance_request(
         request: request.clone(),
         dependencies: dependencies.into_values().collect(),
         expires: budget.expires_at_ms,
+        budget,
     })
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct PreparedSpaceGovernanceChange {
     request: SpaceGovernanceRequest,
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
+    snapshot: VerifiedPolicySnapshot,
+    authorization: VerifiedClientAuthorization,
+    usage: execution_handoff::ExecutionProofUsage,
 }
 fn prepared(
-    state: &VerifiedPolicySet,
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
+    snapshot: VerifiedPolicySnapshot,
+    authorization: VerifiedClientAuthorization,
     document: SpaceDocument,
     new_objects: Vec<JournalEntry>,
     signer: &Identity,
@@ -234,11 +312,22 @@ fn prepared(
         new_objects,
         nonce: Nonce::random()?,
     };
-    verify_space_governance_request(state, &request, now)?;
+    let verified = verify_space_governance_request(snapshot.state(), &request, now)?;
+    let mut usage = execution_handoff::ExecutionProofUsage::default();
+    usage.record_budget(&authorization.budget)?;
+    record_governance_usage(&mut usage, &verified)?;
+    usage.record_chain_depth(
+        snapshot
+            .state()
+            .grant_chain(Some(&authorization.grant_leaf))?
+            .len(),
+    );
+    finish_usage(&mut usage)?;
     Ok(PreparedSpaceGovernanceChange {
         request,
-        pins,
-        bundle,
+        snapshot,
+        authorization,
+        usage,
     })
 }
 
@@ -246,10 +335,10 @@ fn prepared(
 pub fn prepare_space_membership_change(
     intent_json: &str,
     signer: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<PreparedSpaceGovernanceChange> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let build = || -> Result<_> {
         let intent: SpaceMembershipIntent = parse(intent_json)?;
         require(
@@ -257,8 +346,9 @@ pub fn prepare_space_membership_change(
             "invalid membership roles",
         )?;
         let now = time(now_ms)?;
-        let (state, pins, bundle) = load(pins_json, bundle_json)?;
-        let mut document = next_space(&state, &intent.space, &bundle.grant_leaf)?;
+        let (snapshot, current) = load(authorization, &PublicKey::of(signer), now)?;
+        let state = snapshot.state();
+        let mut document = next_space(&state, &intent.space, &current.grant_leaf)?;
         document.memberships.retain(|hash| {
             state.membership(hash).is_none_or(|value| {
                 value.payload.subject != Actor::Account(intent.subject_account.clone())
@@ -287,7 +377,7 @@ pub fn prepare_space_membership_change(
             objects.push(JournalEntry::Membership(membership));
         }
         document.memberships.sort();
-        prepared(&state, pins, bundle, document, objects, signer, now)
+        prepared(snapshot, current, document, objects, signer, now)
     };
     build().map_err(|error| error.to_string())
 }
@@ -296,14 +386,15 @@ pub fn prepare_space_membership_change(
 pub fn prepare_directional_grant(
     intent_json: &str,
     signer: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<PreparedSpaceGovernanceChange> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let build = || -> Result<_> {
         let intent: DirectionalGrantIntent = parse(intent_json)?;
         let now = time(now_ms)?;
-        let (state, pins, bundle) = load(pins_json, bundle_json)?;
+        let (snapshot, current) = load(authorization, &PublicKey::of(signer), now)?;
+        let state = snapshot.state();
         let target = state.verify_service_device(
             &intent.space,
             &DeviceId::from_key(&intent.audience_node_public_key),
@@ -313,7 +404,7 @@ pub fn prepare_directional_grant(
             target.payload.public_key == intent.audience_node_public_key,
             "grant audience key mismatch",
         )?;
-        let mut document = next_space(&state, &intent.space, &bundle.grant_leaf)?;
+        let mut document = next_space(&state, &intent.space, &current.grant_leaf)?;
         let grant = Signed::sign(
             Grant {
                 version: AUTH_VERSION,
@@ -326,7 +417,7 @@ pub fn prepare_directional_grant(
                     device: target.payload.device.clone(),
                 },
                 constraints: intent.constraints,
-                parent: Some(bundle.grant_leaf.clone()),
+                parent: Some(current.grant_leaf.clone()),
                 remaining_delegations: intent.remaining_delegations,
                 issued_under: state
                     .head(&PolicyDomain::Space(intent.space))
@@ -341,9 +432,8 @@ pub fn prepare_directional_grant(
         document.grants.push(grant.hash()?);
         document.grants.sort();
         prepared(
-            &state,
-            pins,
-            bundle,
+            snapshot,
+            current,
             document,
             vec![JournalEntry::Grant(grant)],
             signer,
@@ -358,21 +448,22 @@ pub fn prepare_space_grant_revocation(
     space_id: &str,
     grant_hash: &str,
     signer: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<PreparedSpaceGovernanceChange> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let build = || -> Result<_> {
         let now = time(now_ms)?;
-        let (state, pins, bundle) = load(pins_json, bundle_json)?;
-        let mut document = next_space(&state, &SpaceId::parse(space_id)?, &bundle.grant_leaf)?;
+        let (snapshot, current) = load(authorization, &PublicKey::of(signer), now)?;
+        let state = snapshot.state();
+        let mut document = next_space(&state, &SpaceId::parse(space_id)?, &current.grant_leaf)?;
         let hash = ObjectHash::parse(grant_hash)?;
         require(
             document.grants.contains(&hash),
             "cannot revoke an unregistered grant",
         )?;
         document.grants.retain(|value| value != &hash);
-        prepared(&state, pins, bundle, document, Vec::new(), signer, now)
+        prepared(snapshot, current, document, Vec::new(), signer, now)
     };
     build().map_err(|error| error.to_string())
 }
@@ -381,14 +472,15 @@ pub fn prepare_space_grant_revocation(
 pub fn prepare_space_resource_registration(
     intent_json: &str,
     signer: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<PreparedSpaceGovernanceChange> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let build = || -> Result<_> {
         let intent: SpaceResourceIntent = parse(intent_json)?;
         let now = time(now_ms)?;
-        let (state, pins, bundle) = load(pins_json, bundle_json)?;
+        let (snapshot, current) = load(authorization, &PublicKey::of(signer), now)?;
+        let state = snapshot.state();
         state.verify_service_device(
             &intent.space,
             &DeviceId::from_key(&intent.host_node_public_key),
@@ -398,7 +490,7 @@ pub fn prepare_space_resource_registration(
             state.resource(&intent.space, &intent.resource).is_none(),
             "resource identity already registered",
         )?;
-        let mut document = next_space(&state, &intent.space, &bundle.grant_leaf)?;
+        let mut document = next_space(&state, &intent.space, &current.grant_leaf)?;
         let record = Signed::sign(
             ResourceRecord {
                 version: AUTH_VERSION,
@@ -417,9 +509,8 @@ pub fn prepare_space_resource_registration(
         document.resources.push(record.hash()?);
         document.resources.sort();
         prepared(
-            &state,
-            pins,
-            bundle,
+            snapshot,
+            current,
             document,
             vec![JournalEntry::Resource(record)],
             signer,
@@ -435,19 +526,31 @@ impl PreparedSpaceGovernanceChange {
     pub fn request_json(&self) -> crate::Result<String> {
         json(&self.request)
     }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = proofUsageJson))]
+    pub fn proof_usage_json(&self) -> crate::Result<String> {
+        json(&self.usage.counts())
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = issueSpaceGovernanceChallenge))]
 pub fn issue_space_governance_challenge(
     request_json: &str,
     authority: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let issue = || -> Result<_> {
         let now = time(now_ms)?;
-        let (state, _, _) = load(pins_json, bundle_json)?;
+        let source = require_confirmed_client_policy(authorization)?;
+        let signer = source
+            .state()
+            .find_device(&authorization.scope.device_id)?
+            .payload
+            .public_key
+            .clone();
+        let (snapshot, _) = load(authorization, &signer, now)?;
+        let state = snapshot.state();
         let request: SpaceGovernanceRequest = parse(request_json)?;
         let verified = verify_space_governance_request(&state, &request, now)?;
         let space = state
@@ -483,13 +586,21 @@ pub fn accept_space_governance_change(
     challenge_json: &str,
     receipts_json: &str,
     authority: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let accept = || -> Result<_> {
         let now = time(now_ms)?;
-        let (mut state, _, _) = load(pins_json, bundle_json)?;
+        let source = require_confirmed_client_policy(authorization)?;
+        let signer = source
+            .state()
+            .find_device(&authorization.scope.device_id)?
+            .payload
+            .public_key
+            .clone();
+        let (snapshot, _) = load(authorization, &signer, now)?;
+        let mut state = snapshot.state().clone();
         let request: SpaceGovernanceRequest = parse(request_json)?;
         let verified = verify_space_governance_request(&state, &request, now)?;
         let challenge: Signed<PolicyCommit> = decode_signed(challenge_json.as_bytes())?;
@@ -534,9 +645,9 @@ pub fn accept_space_governance_change(
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct VerifiedSpaceGovernanceChange {
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
-    scope: Option<ClientScope>,
+    snapshot: VerifiedPolicySnapshot,
+    authorization: Option<VerifiedClientAuthorization>,
+    usage: execution_handoff::ExecutionProofUsage,
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = finishSpaceGovernanceChange))]
 pub fn finish_space_governance_change(
@@ -544,72 +655,96 @@ pub fn finish_space_governance_change(
     committed_json: &str,
     now_ms: f64,
 ) -> crate::Result<VerifiedSpaceGovernanceChange> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let finish = || -> Result<_> {
         let now = time(now_ms)?;
         let change: Committed<SpaceDocument> = parse(committed_json)?;
         let accepted = change.commit.payload.accepted_at_ms;
         require(accepted <= now, "space receipt is from the future")?;
-        let mut state = replay_policies(&prepared.pins, &prepared.bundle.journal)?;
-        verify_space_governance_request(&state, &prepared.request, accepted)?;
-        let actor = state.actor_for_signer(
-            &prepared.request.proposal.issuer,
+        let verified = verify_space_governance_request(
+            prepared.snapshot.state(),
+            &prepared.request,
             accepted,
-            &mut Budget::default(),
-            &mut BTreeMap::new(),
         )?;
-        let Actor::Account(account) = actor else {
-            return Err(AuthorizationError::InvalidProof(
-                "governance client must be an account",
-            ));
-        };
         require(
             change.proposal == prepared.request.proposal
                 && change.commit.payload.nonce == prepared.request.nonce,
             "space commit belongs to another prepared change",
         )?;
-        install_objects(&mut state, &prepared.request, accepted)?;
-        let head = state.replay_space_committed(change.clone())?;
-        let mut bundle = prepared.bundle.clone();
-        bundle.journal.extend(prepared.request.new_objects.clone());
-        bundle.journal.push(JournalEntry::SpaceCommit(change));
-        let mut pins = prepared.pins.clone();
-        let pin = pins
-            .iter_mut()
-            .find(|pin| pin.domain == head.domain)
-            .ok_or(AuthorizationError::PolicyConflict)?;
-        pin.minimum_head = Some(head);
-        Ok((pins, bundle, account))
+        let mut delta = prepared.request.new_objects.clone();
+        delta.push(JournalEntry::SpaceCommit(change.clone()));
+        let snapshot = prepared.snapshot.apply_delta(&delta)?;
+        let mut pins = snapshot.pins().to_vec();
+        for pin in &mut pins {
+            pin.minimum_head = snapshot.state().head(&pin.domain).cloned();
+        }
+        let snapshot = snapshot.with_independent_pins(&pins)?;
+        let selected = ResourceRef {
+            space: prepared.authorization.scope.space_id.clone(),
+            resource: prepared.authorization.resources[0].payload.resource.clone(),
+        };
+        let authorization = selected_authorization(
+            &snapshot,
+            &prepared.authorization.grant_leaf,
+            &prepared.authorization.scope.account_id,
+            &prepared.request.proposal.issuer,
+            &selected,
+            now,
+        );
+        let authorization = match authorization {
+            Ok(current) => Some(current),
+            Err(AuthorizationError::BudgetExceeded) => {
+                return Err(AuthorizationError::BudgetExceeded);
+            }
+            Err(_) => None,
+        };
+        let mut usage = execution_handoff::ExecutionProofUsage::default();
+        record_governance_usage(&mut usage, &verified)?;
+        usage.record_signed(&change.commit)?;
+        for receipt in &change.receipts {
+            usage.record_signed(receipt)?;
+        }
+        if let Some(current) = &authorization {
+            usage.record_budget(&current.budget)?;
+        }
+        usage.record_metadata(&change)?;
+        usage.record_chain_depth(
+            prepared
+                .snapshot
+                .state()
+                .grant_chain(Some(&prepared.authorization.grant_leaf))?
+                .len(),
+        );
+        finish_usage(&mut usage)?;
+        Ok(VerifiedSpaceGovernanceChange {
+            snapshot,
+            authorization,
+            usage,
+        })
     };
-    let (pins, bundle, account) = finish().map_err(|error| error.to_string())?;
-    let scope = verify_client_authorization(
-        &json(&bundle)?,
-        &json(&pins)?,
-        account.as_str(),
-        prepared.request.proposal.payload.space.as_str(),
-        prepared.request.proposal.issuer.as_str(),
-        now_ms,
-    )
-    .ok()
-    .map(|verified| verified.scope().clone());
-    Ok(VerifiedSpaceGovernanceChange {
-        pins,
-        bundle,
-        scope,
-    })
+    finish().map_err(|error| error.to_string())
+}
+impl VerifiedSpaceGovernanceChange {
+    pub(crate) fn snapshot(&self) -> &VerifiedPolicySnapshot {
+        &self.snapshot
+    }
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedSpaceGovernanceChange {
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = bundleJson))]
-    pub fn bundle_json(&self) -> crate::Result<String> {
-        json(&self.bundle)
+    pub fn authorization(&self) -> Option<VerifiedClientAuthorization> {
+        self.authorization.clone()
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = pinsJson))]
     pub fn pins_json(&self) -> crate::Result<String> {
-        json(&self.pins)
+        json(&self.snapshot.pins())
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = scopeJson))]
     pub fn scope_json(&self) -> crate::Result<String> {
-        json(&self.scope)
+        json(&self.authorization.as_ref().map(|value| value.scope()))
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = proofUsageJson))]
+    pub fn proof_usage_json(&self) -> crate::Result<String> {
+        json(&self.usage.counts())
     }
 }
 
@@ -657,8 +792,8 @@ pub struct VerifiedTeamCreationRequest {
     signed: Signed<TeamCreationRequest>,
     request_hash: ObjectHash,
     account_head: PolicyStamp,
-    bundle: ClientAuthorizationBundle,
-    pins: Vec<PolicyPin>,
+    grant: ObjectHash,
+    budget: Budget,
 }
 impl VerifiedTeamCreationRequest {
     pub fn request(&self) -> &TeamCreationRequest {
@@ -710,13 +845,13 @@ fn owner_actions() -> Vec<Action> {
 
 fn source_authorization(
     state: &VerifiedPolicySet,
-    bundle: &ClientAuthorizationBundle,
+    source_grant: &ObjectHash,
     account: &AccountId,
     governor: &PublicKey,
     node: &PublicKey,
     source: &ResourceRef,
     now: u64,
-) -> Result<(Vec<PolicyStamp>, u64)> {
+) -> Result<(Vec<PolicyStamp>, u64, Budget)> {
     require(
         source.space == SpaceId::personal(account),
         "team source must be the owner's personal project",
@@ -729,7 +864,7 @@ fn source_authorization(
         "team creator is not its current account client",
     )?;
     state.governance_capability(
-        &bundle.grant_leaf,
+        source_grant,
         governor,
         &source.space,
         Some(Action::ResourceManage),
@@ -764,12 +899,16 @@ fn source_authorization(
         &mut dependencies,
     )?;
     state.expand_authorities(now, &mut budget, &mut dependencies)?;
-    Ok((dependencies.into_values().collect(), budget.expires_at_ms))
+    Ok((
+        dependencies.into_values().collect(),
+        budget.expires_at_ms,
+        budget,
+    ))
 }
 
 pub fn verify_team_creation_request(
     state: &VerifiedPolicySet,
-    source_bundle: &ClientAuthorizationBundle,
+    source_grant: &ObjectHash,
     source_pins: &[PolicyPin],
     signed: &Signed<TeamCreationRequest>,
     now: u64,
@@ -788,9 +927,9 @@ pub fn verify_team_creation_request(
             && request.team_project.resource != request.source_project.resource,
         "invalid team creation envelope",
     )?;
-    let (heads, deadline) = source_authorization(
+    let (heads, deadline, source_budget) = source_authorization(
         state,
-        source_bundle,
+        source_grant,
         &request.owner_account,
         &signed.issuer,
         &request.target_node_public_key,
@@ -915,13 +1054,17 @@ pub fn verify_team_creation_request(
             && request.team_pin.minimum_head.as_ref() == Some(&space_stamp(policy)?),
         "initial team policy differs from its exact objects",
     )?;
-    let mut pins = source_pins.to_vec();
+    let mut pins: Vec<_> = source_pins
+        .iter()
+        .filter(|pin| pin.domain != request.team_pin.domain)
+        .cloned()
+        .collect();
     pins.push(request.team_pin.clone());
     pins.sort_by(|a, b| a.domain.cmp(&b.domain));
-    let mut bundle = source_bundle.clone();
-    bundle.journal.extend(request.journal_delta.clone());
-    bundle.grant_leaf = grant.hash()?;
-    let created = replay_policies(&pins, &bundle.journal)?;
+    let mut created = state.clone();
+    for entry in &request.journal_delta {
+        apply_policy_entry(&mut created, &pins, entry.clone())?;
+    }
     require(
         created.space(&space).is_some(),
         "team creation did not produce its policy",
@@ -934,17 +1077,47 @@ pub fn verify_team_creation_request(
         signed: signed.clone(),
         request_hash: ObjectHash::body(signed)?,
         account_head,
-        bundle,
-        pins,
+        grant: grant.hash()?,
+        budget: source_budget,
     })
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedTeamCreationDelta {
+    signed: Signed<TeamCreationRequest>,
+    source_heads: Vec<PolicyStamp>,
+}
+impl VerifiedTeamCreationDelta {
+    pub(crate) fn request(&self) -> &Signed<TeamCreationRequest> {
+        &self.signed
+    }
+    pub(crate) fn source_heads(&self) -> &[PolicyStamp] {
+        &self.source_heads
+    }
+}
+
+pub(crate) struct VerifiedPendingTeamCreation {
+    signed: Signed<TeamCreationRequest>,
+    source_heads: Vec<PolicyStamp>,
+}
+impl VerifiedPendingTeamCreation {
+    pub(crate) fn request(&self) -> &Signed<TeamCreationRequest> {
+        &self.signed
+    }
+    pub(crate) fn source_heads(&self) -> &[PolicyStamp] {
+        &self.source_heads
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct PreparedTeamCreation {
     request: Signed<TeamCreationRequest>,
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
+    source: VerifiedPolicySnapshot,
+    source_grant: ObjectHash,
+    original_heads: Vec<PolicyStamp>,
+    approved: VerifiedTeamCreationDelta,
     root_secret_hex: String,
+    usage: execution_handoff::ExecutionProofUsage,
 }
 impl Drop for PreparedTeamCreation {
     fn drop(&mut self) {
@@ -960,16 +1133,17 @@ pub fn prepare_team_creation(
     target_node_public_key: &str,
     recovery_public_key: &str,
     source_project_resource_id: &str,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     expires_at_ms: f64,
     now_ms: f64,
 ) -> crate::Result<PreparedTeamCreation> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let build = || -> Result<_> {
         let now = time(now_ms)?;
         let expires = time(expires_at_ms)?;
         validate_window(now, expires, now)?;
-        let (state, pins, bundle) = load(pins_json, bundle_json)?;
+        let (snapshot, current) = load(authorization, &PublicKey::of(governor), now)?;
+        let state = snapshot.state();
         let account = AccountId::parse(owner_account_id)?;
         let node = PublicKey::parse(target_node_public_key)?;
         let root = PublicKey::of(team_root);
@@ -978,9 +1152,15 @@ pub fn prepare_team_creation(
             space: SpaceId::personal(&account),
             resource: ResourceId::parse(source_project_resource_id)?,
         };
-        let (heads, deadline) = source_authorization(
-            &state,
-            &bundle,
+        require(
+            current.scope.account_id == account
+                && current.scope.space_id == source.space
+                && current.resources[0].payload.resource == source.resource,
+            "team creation changed its authenticated personal project",
+        )?;
+        let (heads, deadline, _) = source_authorization(
+            state,
+            &current.grant_leaf,
             &account,
             &PublicKey::of(governor),
             &node,
@@ -1116,12 +1296,38 @@ pub fn prepare_team_creation(
             },
             governor,
         )?;
-        verify_team_creation_request(&state, &bundle, &pins, &request, now)?;
+        let verified = verify_team_creation_request(
+            state,
+            &current.grant_leaf,
+            snapshot.pins(),
+            &request,
+            now,
+        )?;
+        let approved = VerifiedTeamCreationDelta {
+            signed: request.clone(),
+            source_heads: snapshot.heads().to_vec(),
+        };
+        let created = snapshot.with_created_team(&approved)?;
+        let mut usage = execution_handoff::ExecutionProofUsage::default();
+        usage.record_budget(&current.budget)?;
+        record_team_usage(&mut usage, &request, &verified)?;
+        usage.record_chain_depth(state.grant_chain(Some(&current.grant_leaf))?.len());
+        finish_usage(&mut usage)?;
+        require(
+            created
+                .state()
+                .space(&request.payload.team_project.space)
+                .is_some(),
+            "new team snapshot is missing its exact policy",
+        )?;
         Ok(PreparedTeamCreation {
+            original_heads: snapshot.heads().to_vec(),
             request,
-            pins,
-            bundle,
+            source: snapshot,
+            source_grant: current.grant_leaf,
+            approved,
             root_secret_hex: team_root.secret_hex(),
+            usage,
         })
     };
     build().map_err(|error| error.to_string())
@@ -1131,34 +1337,27 @@ pub fn prepare_team_creation(
 impl PreparedTeamCreation {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = recoveryMaterialJson))]
     pub fn recovery_material_json(&self) -> crate::Result<String> {
-        let state =
-            replay_policies(&self.pins, &self.bundle.journal).map_err(|error| error.to_string())?;
-        let verified = verify_team_creation_request(
-            &state,
-            &self.bundle,
-            &self.pins,
-            &self.request,
-            self.request.payload.issued_at_ms,
-        )
-        .map_err(|error| error.to_string())?;
         let request = &self.request.payload;
         let Some(JournalEntry::SpaceGenesis(genesis)) = request.journal_delta.first() else {
             return Err("missing prepared team genesis".to_owned());
         };
-        json(&TeamRecoveryMaterial {
+        let material = json(&TeamRecoveryMaterial {
             status: "pending",
-            pending_request: Some(&self.request),
-            source_pins: Some(&self.pins),
-            source_bundle: Some(&self.bundle),
+            pending_request: &self.request,
+            source_pins: self.source.pins(),
+            source_heads: &self.original_heads,
+            source_grant: &self.source_grant,
             format: "vibeface-team-recovery",
             version: AUTH_VERSION,
             root_secret_hex: &self.root_secret_hex,
             owner_account: &request.owner_account,
             team: &request.team_project.space,
             recovery_public_key: &genesis.payload.recovery.keys[0],
-            pins: &verified.pins,
-            bundle: &verified.bundle,
-        })
+        })?;
+        if material.len() > MAX_PROOF_BYTES {
+            return Err("team private material exceeds its carrier".to_owned());
+        }
+        Ok(material)
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = requestJson))]
     pub fn request_json(&self) -> crate::Result<String> {
@@ -1168,21 +1367,38 @@ impl PreparedTeamCreation {
     pub fn team_id(&self) -> String {
         self.request.payload.team_project.space.to_string()
     }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = proofUsageJson))]
+    pub fn proof_usage_json(&self) -> crate::Result<String> {
+        json(&self.usage.counts())
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = acceptTeamCreation))]
 pub fn accept_team_creation(
     request_json: &str,
     node: &Identity,
-    pins_json: &str,
-    bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<String> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let accept = || -> Result<_> {
         let now = time(now_ms)?;
-        let (state, pins, bundle) = load(pins_json, bundle_json)?;
+        let source = require_confirmed_client_policy(authorization)?;
+        let signer = source
+            .state()
+            .find_device(&authorization.scope.device_id)?
+            .payload
+            .public_key
+            .clone();
+        let (snapshot, current) = load(authorization, &signer, now)?;
         let request: Signed<TeamCreationRequest> = decode_signed(request_json.as_bytes())?;
-        let verified = verify_team_creation_request(&state, &bundle, &pins, &request, now)?;
+        let verified = verify_team_creation_request(
+            snapshot.state(),
+            &current.grant_leaf,
+            snapshot.pins(),
+            &request,
+            now,
+        )?;
         require(
             verified.request().target_node_public_key == PublicKey::of(node),
             "team creation reached another physical node",
@@ -1208,21 +1424,41 @@ pub fn accept_team_creation(
 #[derive(Serialize)]
 struct TeamRecoveryMaterial<'a> {
     status: &'static str,
-    pending_request: Option<&'a Signed<TeamCreationRequest>>,
-    source_pins: Option<&'a [PolicyPin]>,
-    source_bundle: Option<&'a ClientAuthorizationBundle>,
+    pending_request: &'a Signed<TeamCreationRequest>,
+    source_pins: &'a [PolicyPin],
+    source_heads: &'a [PolicyStamp],
+    source_grant: &'a ObjectHash,
     format: &'static str,
     version: u16,
     root_secret_hex: &'a str,
     owner_account: &'a AccountId,
     team: &'a SpaceId,
     recovery_public_key: &'a PublicKey,
-    pins: &'a [PolicyPin],
-    bundle: &'a ClientAuthorizationBundle,
 }
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingTeamRecoveryMaterial {
+    status: String,
+    pending_request: Signed<TeamCreationRequest>,
+    source_pins: Vec<PolicyPin>,
+    source_heads: Vec<PolicyStamp>,
+    source_grant: ObjectHash,
+    format: String,
+    version: u16,
+    root_secret_hex: String,
+    owner_account: AccountId,
+    team: SpaceId,
+    recovery_public_key: PublicKey,
+}
+impl Drop for PendingTeamRecoveryMaterial {
+    fn drop(&mut self) {
+        self.root_secret_hex.zeroize();
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierPendingTeamRecoveryMaterial {
     status: String,
     pending_request: Signed<TeamCreationRequest>,
     source_pins: Vec<PolicyPin>,
@@ -1236,9 +1472,87 @@ struct PendingTeamRecoveryMaterial {
     pins: Vec<PolicyPin>,
     bundle: ClientAuthorizationBundle,
 }
-impl Drop for PendingTeamRecoveryMaterial {
+impl Drop for EarlierPendingTeamRecoveryMaterial {
     fn drop(&mut self) {
         self.root_secret_hex.zeroize();
+    }
+}
+
+fn pending_material(
+    value: &str,
+    current: &VerifiedPolicySnapshot,
+) -> Result<PendingTeamRecoveryMaterial> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Material {
+        Compact(PendingTeamRecoveryMaterial),
+        Earlier(EarlierPendingTeamRecoveryMaterial),
+    }
+    match parse(value)? {
+        Material::Compact(material) => Ok(material),
+        Material::Earlier(material) => {
+            require(
+                material.version == AUTH_VERSION,
+                "unsupported team backup version",
+            )?;
+            for entry in &material.source_bundle.journal {
+                let hash = ObjectHash::body(entry)?;
+                let expected = current
+                    .journal()
+                    .iter()
+                    .find(|candidate| ObjectHash::body(candidate).is_ok_and(|value| value == hash))
+                    .ok_or_else(|| {
+                        AuthorizationError::NeedPolicySync(
+                            material.pending_request.payload.expected_heads.clone(),
+                        )
+                    })?;
+                require(
+                    canonical(expected)? == canonical(entry)?,
+                    "pending team source commitment changed",
+                )?;
+            }
+            let request = &material.pending_request.payload;
+            let mut journal = material.source_bundle.journal.clone();
+            journal.extend(request.journal_delta.clone());
+            let Some(JournalEntry::Grant(grant)) = request.journal_delta.get(3) else {
+                return Err(AuthorizationError::InvalidProof(
+                    "missing pending team grant",
+                ));
+            };
+            let mut pins = material.source_pins.clone();
+            pins.push(request.team_pin.clone());
+            pins.sort_by(|left, right| left.domain.cmp(&right.domain));
+            require(
+                material.pins == pins
+                    && material.bundle.journal == journal
+                    && material.bundle.grant_leaf == grant.hash()?,
+                "pending team backup changed its exact signed delta",
+            )?;
+            let source_heads = material
+                .source_pins
+                .iter()
+                .map(|pin| {
+                    pin.minimum_head
+                        .clone()
+                        .ok_or(AuthorizationError::InvalidProof(
+                            "pending team backup has no exact source head",
+                        ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(PendingTeamRecoveryMaterial {
+                status: material.status.clone(),
+                pending_request: material.pending_request.clone(),
+                source_pins: material.source_pins.clone(),
+                source_heads,
+                source_grant: material.source_bundle.grant_leaf.clone(),
+                format: material.format.clone(),
+                version: material.version,
+                root_secret_hex: material.root_secret_hex.clone(),
+                owner_account: material.owner_account.clone(),
+                team: material.team.clone(),
+                recovery_public_key: material.recovery_public_key.clone(),
+            })
+        }
     }
 }
 
@@ -1246,15 +1560,26 @@ impl Drop for PendingTeamRecoveryMaterial {
 pub fn restore_prepared_team_creation(
     material_json: &str,
     client: &Identity,
-    independently_saved_pins_json: &str,
-    current_bundle_json: &str,
+    authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<PreparedTeamCreation> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let restore = || -> Result<_> {
         let now = time(now_ms)?;
-        let material: PendingTeamRecoveryMaterial = parse(material_json)?;
-        let (current, saved, _) = load(independently_saved_pins_json, current_bundle_json)?;
+        let (current, _) = load(authorization, &PublicKey::of(client), now)?;
+        let material = pending_material(material_json, &current)?;
         let request = &material.pending_request.payload;
+        if material
+            .source_heads
+            .iter()
+            .any(|head| !current.state().roots.contains_key(head))
+            || current.state().grant(&material.source_grant).is_none()
+        {
+            return Err(AuthorizationError::NeedPolicySync(
+                material.source_heads.clone(),
+            ));
+        }
+        material.pending_request.verify_signature()?;
         let root = Identity::from_secret_hex(&material.root_secret_hex)
             .map_err(|_| AuthorizationError::InvalidProof("invalid pending team root"))?;
         require(
@@ -1265,27 +1590,44 @@ pub fn restore_prepared_team_creation(
                 && material.team == request.team_project.space
                 && PublicKey::of(&root) == request.team_pin.genesis_root
                 && PublicKey::of(client) == request.governor_device_public_key
+                && material.pending_request.issuer == PublicKey::of(client)
+                && authorization.scope.account_id == request.owner_account
+                && authorization.scope.space_id == request.source_project.space
+                && authorization.resources[0].payload.resource == request.source_project.resource
                 && request.issued_at_ms <= now
+                && material.source_pins.len() == material.source_heads.len()
+                && material
+                    .source_pins
+                    .windows(2)
+                    .all(|pair| pair[0].domain < pair[1].domain)
+                && material
+                    .source_heads
+                    .iter()
+                    .zip(&material.source_pins)
+                    .all(|(head, pin)| head.domain == pin.domain)
                 && material.source_pins.iter().all(|pin| {
-                    saved.iter().any(|trusted| {
+                    current.pins().iter().any(|trusted| {
                         trusted.domain == pin.domain && trusted.genesis_root == pin.genesis_root
                     })
                 })
+                && material
+                    .source_heads
+                    .iter()
+                    .all(|head| current.state().roots.contains_key(head))
                 && request
                     .expected_heads
                     .iter()
-                    .all(|head| current.roots.contains_key(head)),
+                    .all(|head| material.source_heads.contains(head)),
             "pending team differs from independently saved account trust",
         )?;
-        current.verify_account_client_device(
-            &request.owner_account,
-            &DeviceId::from_key(&PublicKey::of(client)),
-            now,
-        )?;
-        let before = replay_policies(&material.source_pins, &material.source_bundle.journal)?;
+        let pending = VerifiedPendingTeamCreation {
+            signed: material.pending_request.clone(),
+            source_heads: material.source_heads.clone(),
+        };
+        let before = current.before_team_creation(&pending)?;
         let verified = verify_team_creation_request(
             &before,
-            &material.source_bundle,
+            &material.source_grant,
             &material.source_pins,
             &material.pending_request,
             request.issued_at_ms,
@@ -1296,28 +1638,64 @@ pub fn restore_prepared_team_creation(
             ));
         };
         require(
-            material.pins == verified.pins
-                && material.bundle == verified.bundle
-                && genesis.payload.recovery.keys == [material.recovery_public_key.clone()],
-            "pending team backup changed its exact signed request or history",
+            genesis.payload.recovery.keys == [material.recovery_public_key.clone()],
+            "pending team backup changed its recovery key",
         )?;
+        let approved = VerifiedTeamCreationDelta {
+            signed: material.pending_request.clone(),
+            source_heads: current.heads().to_vec(),
+        };
+        current.with_created_team(&approved)?;
+        let mut usage = execution_handoff::ExecutionProofUsage::default();
+        record_team_usage(&mut usage, &material.pending_request, &verified)?;
+        usage.record_metadata(&material)?;
+        finish_usage(&mut usage)?;
         Ok(PreparedTeamCreation {
             request: material.pending_request.clone(),
-            pins: material.source_pins.clone(),
-            bundle: material.source_bundle.clone(),
+            source: current,
+            source_grant: material.source_grant.clone(),
+            original_heads: material.source_heads.clone(),
+            approved,
             root_secret_hex: material.root_secret_hex.clone(),
+            usage,
         })
     };
     restore().map_err(|error| error.to_string())
 }
 
+fn record_team_usage(
+    usage: &mut execution_handoff::ExecutionProofUsage,
+    signed: &Signed<TeamCreationRequest>,
+    verified: &VerifiedTeamCreationRequest,
+) -> Result<()> {
+    usage.record_signed(signed)?;
+    usage.record_budget(&verified.budget)?;
+    for entry in &signed.payload.journal_delta {
+        match entry {
+            JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => {
+                usage.record_signed(value)?
+            }
+            JournalEntry::Resource(value) => usage.record_signed(value)?,
+            JournalEntry::Membership(value) => usage.record_signed(value)?,
+            JournalEntry::Grant(value) => usage.record_signed(value)?,
+            _ => {
+                return Err(AuthorizationError::InvalidProof(
+                    "unexpected team delta object",
+                ));
+            }
+        }
+    }
+    usage.record_metadata(signed)?;
+    Ok(())
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct VerifiedTeamCreation {
-    pins: Vec<PolicyPin>,
-    bundle: ClientAuthorizationBundle,
-    scope: Option<ClientScope>,
+    snapshot: VerifiedPolicySnapshot,
+    authorization: Option<VerifiedClientAuthorization>,
     project: ResourceId,
     recovery_material: String,
+    usage: execution_handoff::ExecutionProofUsage,
 }
 impl Drop for VerifiedTeamCreation {
     fn drop(&mut self) {
@@ -1331,17 +1709,22 @@ pub fn finish_team_creation(
     acceptance_json: &str,
     now_ms: f64,
 ) -> crate::Result<VerifiedTeamCreation> {
+    let _signature_scope = ScopedSignatureVerification::new();
     let finish = || -> Result<_> {
         let now = time(now_ms)?;
         let accepted: Signed<TeamCreationAcceptance> = decode_signed(acceptance_json.as_bytes())?;
         accepted.verify_signature()?;
         let accepted_at = accepted.payload.accepted_at_ms;
         require(accepted_at <= now, "team acceptance is from the future")?;
-        let state = replay_policies(&prepared.pins, &prepared.bundle.journal)?;
+        let pending = VerifiedPendingTeamCreation {
+            signed: prepared.request.clone(),
+            source_heads: prepared.original_heads.clone(),
+        };
+        let before = prepared.source.before_team_creation(&pending)?;
         let verified = verify_team_creation_request(
-            &state,
-            &prepared.bundle,
-            &prepared.pins,
+            &before,
+            &prepared.source_grant,
+            prepared.source.pins(),
             &prepared.request,
             accepted_at,
         )?;
@@ -1357,63 +1740,83 @@ pub fn finish_team_creation(
                 && value.account_head == verified.account_head
                 && value.nonce == request.nonce
                 && value.accepted_at_ms >= request.issued_at_ms
-                && value.accepted_at_ms <= now
                 && value.expires_at_ms == request.expires_at_ms,
             "team acceptance differs from its exact prepared request",
         )?;
         validate_window(value.accepted_at_ms, value.expires_at_ms, accepted_at)?;
-        Ok(verified)
+        let snapshot = prepared.source.with_created_team(&prepared.approved)?;
+        let mut pins = snapshot.pins().to_vec();
+        for pin in &mut pins {
+            pin.minimum_head = snapshot.state().head(&pin.domain).cloned();
+        }
+        let snapshot = snapshot.with_independent_pins(&pins)?;
+        let authorization = selected_authorization(
+            &snapshot,
+            &verified.grant,
+            &request.owner_account,
+            &request.governor_device_public_key,
+            &request.team_project,
+            now,
+        );
+        let authorization = match authorization {
+            Ok(current) => Some(current),
+            Err(AuthorizationError::BudgetExceeded) => {
+                return Err(AuthorizationError::BudgetExceeded);
+            }
+            Err(_) => None,
+        };
+        let JournalEntry::SpaceGenesis(genesis) = &request.journal_delta[0] else {
+            return Err(AuthorizationError::InvalidProof(
+                "missing verified team genesis",
+            ));
+        };
+        let recovery_material = json(&TeamRecoveryMaterial {
+            status: "committed",
+            pending_request: &prepared.request,
+            source_pins: prepared.source.pins(),
+            source_heads: &prepared.original_heads,
+            source_grant: &prepared.source_grant,
+            format: "vibeface-team-recovery",
+            version: AUTH_VERSION,
+            root_secret_hex: &prepared.root_secret_hex,
+            owner_account: &request.owner_account,
+            team: &request.team_project.space,
+            recovery_public_key: &genesis.payload.recovery.keys[0],
+        })
+        .map_err(|_| AuthorizationError::InvalidProof("team private material encoding failed"))?;
+        require(
+            recovery_material.len() <= MAX_PROOF_BYTES,
+            "team private material exceeds its carrier",
+        )?;
+        let mut usage = execution_handoff::ExecutionProofUsage::default();
+        record_team_usage(&mut usage, &prepared.request, &verified)?;
+        usage.record_signed(&accepted)?;
+        if let Some(current) = &authorization {
+            usage.record_budget(&current.budget)?;
+        }
+        finish_usage(&mut usage)?;
+        Ok(VerifiedTeamCreation {
+            snapshot,
+            authorization,
+            project: request.team_project.resource.clone(),
+            recovery_material,
+            usage,
+        })
     };
-    let verified = finish().map_err(|error| error.to_string())?;
-    let request = &prepared.request.payload;
-    let scope = verify_client_authorization(
-        &json(&verified.bundle)?,
-        &json(&verified.pins)?,
-        request.owner_account.as_str(),
-        request.team_project.space.as_str(),
-        request.governor_device_public_key.as_str(),
-        now_ms,
-    )
-    .ok()
-    .map(|verified| verified.scope().clone());
-    let JournalEntry::SpaceGenesis(genesis) = &request.journal_delta[0] else {
-        return Err("missing verified team genesis".to_owned());
-    };
-    let recovery_material = json(&TeamRecoveryMaterial {
-        status: "committed",
-        pending_request: None,
-        source_pins: None,
-        source_bundle: None,
-        format: "vibeface-team-recovery",
-        version: AUTH_VERSION,
-        root_secret_hex: &prepared.root_secret_hex,
-        owner_account: &request.owner_account,
-        team: &request.team_project.space,
-        recovery_public_key: &genesis.payload.recovery.keys[0],
-        pins: &verified.pins,
-        bundle: &verified.bundle,
-    })?;
-    Ok(VerifiedTeamCreation {
-        pins: verified.pins,
-        bundle: verified.bundle,
-        scope,
-        project: request.team_project.resource.clone(),
-        recovery_material,
-    })
+    finish().map_err(|error| error.to_string())
 }
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedTeamCreation {
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = bundleJson))]
-    pub fn bundle_json(&self) -> crate::Result<String> {
-        json(&self.bundle)
+    pub fn authorization(&self) -> Option<VerifiedClientAuthorization> {
+        self.authorization.clone()
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = pinsJson))]
     pub fn pins_json(&self) -> crate::Result<String> {
-        json(&self.pins)
+        json(&self.snapshot.pins())
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = scopeJson))]
     pub fn scope_json(&self) -> crate::Result<String> {
-        json(&self.scope)
+        json(&self.authorization.as_ref().map(|value| value.scope()))
     }
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = projectResourceId))]
     pub fn project_resource_id(&self) -> String {
@@ -1422,6 +1825,10 @@ impl VerifiedTeamCreation {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = recoveryMaterialJson))]
     pub fn recovery_material_json(&self) -> String {
         self.recovery_material.clone()
+    }
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = proofUsageJson))]
+    pub fn proof_usage_json(&self) -> crate::Result<String> {
+        json(&self.usage.counts())
     }
 }
 
@@ -1434,6 +1841,240 @@ mod tests {
     const END: u64 = 500_000;
     fn key(byte: u8) -> Identity {
         Identity::from_secret_hex(&hex::encode([byte; 32])).unwrap()
+    }
+    fn confirmed_authorization(
+        state: &VerifiedPolicySet,
+        pins: &[PolicyPin],
+        bundle: &ClientAuthorizationBundle,
+        resource: &ResourceRef,
+    ) -> VerifiedClientAuthorization {
+        use client_policy_import::*;
+        let domains: BTreeSet<_> = verify_client_policy_state_selected(
+            state.clone(),
+            bundle,
+            pins,
+            match &state
+                .find_device(&DeviceId::from_key(&PublicKey::of(&key(3))))
+                .unwrap()
+                .payload
+                .subject
+            {
+                Actor::Account(account) => account.clone(),
+                _ => unreachable!(),
+            },
+            resource.space.clone(),
+            PublicKey::of(&key(3)),
+            Some(resource),
+            NOW,
+        )
+        .unwrap()
+        .heads
+        .into_iter()
+        .map(|head| head.domain)
+        .collect();
+        let pins: Vec<_> = pins
+            .iter()
+            .filter(|pin| domains.contains(&pin.domain))
+            .cloned()
+            .collect();
+        let bundle = ClientAuthorizationBundle {
+            grant_leaf: bundle.grant_leaf.clone(),
+            journal: bundle
+                .journal
+                .iter()
+                .filter(|entry| {
+                    let domain = match entry {
+                        JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
+                            PolicyDomain::Account(value.payload.account.clone())
+                        }
+                        JournalEntry::AccountCommit(value) => {
+                            PolicyDomain::Account(value.proposal.payload.account.clone())
+                        }
+                        JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => {
+                            PolicyDomain::Space(value.payload.space.clone())
+                        }
+                        JournalEntry::SpaceCommit(value) => {
+                            PolicyDomain::Space(value.proposal.payload.space.clone())
+                        }
+                        JournalEntry::Device(value) => value.payload.owner.clone(),
+                        JournalEntry::Resource(value) => {
+                            PolicyDomain::Space(value.payload.space.clone())
+                        }
+                        JournalEntry::Authenticator(value) => {
+                            PolicyDomain::Account(value.payload.account.clone())
+                        }
+                        JournalEntry::Membership(value) => {
+                            PolicyDomain::Space(value.payload.space.clone())
+                        }
+                        JournalEntry::Grant(value) => {
+                            PolicyDomain::Space(value.payload.owner_space.clone())
+                        }
+                    };
+                    domains.contains(&domain)
+                })
+                .cloned()
+                .collect(),
+        };
+        let pins = pins.as_slice();
+        let own = key(3);
+        let node = key(4);
+        let audience = state
+            .grant(&bundle.grant_leaf)
+            .unwrap()
+            .payload
+            .audience
+            .clone();
+        let account = match &state
+            .find_device(&DeviceId::from_key(&PublicKey::of(&own)))
+            .unwrap()
+            .payload
+            .subject
+        {
+            Actor::Account(account) => account.clone(),
+            _ => unreachable!(),
+        };
+        let selection = AuthorizationSelection {
+            resource: resource.clone(),
+            audience,
+            grant_leaf: bundle.grant_leaf.clone(),
+        };
+        let request_json = build_client_policy_read_request(
+            account.as_str(),
+            resource.space.as_str(),
+            &own,
+            &node.public_key_hex(),
+            &json(&pins).unwrap(),
+            &json(&Some(&selection)).unwrap(),
+            NOW as f64,
+            NOW as f64 + 60_000.0,
+        )
+        .unwrap();
+        let request: Signed<ClientPolicyReadRequest> = parse(&request_json).unwrap();
+        let current = verify_client_policy_read(
+            state,
+            &request,
+            &PublicKey::of(&node),
+            &PublicKey::of(&own),
+            NOW as u64,
+        )
+        .unwrap();
+        let snapshot = Signed::sign(
+            ClientPolicySnapshot {
+                version: AUTH_VERSION,
+                request_hash: request.hash().unwrap(),
+                snapshot_id: Nonce::random().unwrap(),
+                saved_pins_hash: client_policy_saved_pins_hash(pins).unwrap(),
+                target_heads: current.heads().to_vec(),
+                selection: selection.clone(),
+                source_node_public_key: PublicKey::of(&node),
+                issued_at_ms: NOW as u64,
+                expires_at_ms: NOW as u64 + 60_000,
+            },
+            &node,
+        )
+        .unwrap();
+        let mut import = begin_client_policy_import(
+            &json(&pins).unwrap(),
+            &request_json,
+            &json(&snapshot).unwrap(),
+            &own,
+            &node.public_key_hex(),
+            NOW as f64,
+        )
+        .unwrap();
+        let mut previous = snapshot.hash().unwrap();
+        for (index, entry) in bundle.journal.iter().enumerate() {
+            let complete = index + 1 == bundle.journal.len();
+            let page = Signed::sign(
+                ClientPolicyPage {
+                    version: AUTH_VERSION,
+                    request_hash: request.hash().unwrap(),
+                    snapshot_id: snapshot.payload.snapshot_id.clone(),
+                    target_heads_hash: client_policy_target_heads_hash(current.heads()).unwrap(),
+                    page_index: index as u64,
+                    previous_page_hash: previous,
+                    entry: Some(entry.clone()),
+                    next_cursor: if complete {
+                        None
+                    } else {
+                        Some(ObjectHash::body(&("native-test-cursor", index)).unwrap())
+                    },
+                    complete,
+                },
+                &node,
+            )
+            .unwrap();
+            previous = page.hash().unwrap();
+            import
+                .append_page(&json(&page).unwrap(), NOW as f64)
+                .unwrap();
+        }
+        let witness = Signed::sign(
+            ClientPolicyWitness {
+                version: AUTH_VERSION,
+                request_hash: request.hash().unwrap(),
+                snapshot_id: snapshot.payload.snapshot_id.clone(),
+                target_heads: current.heads().to_vec(),
+                final_page_hash: previous,
+                page_count: bundle.journal.len() as u64,
+                entry_count: bundle.journal.len() as u64,
+                snapshot_hash: snapshot.hash().unwrap(),
+                source_node_public_key: PublicKey::of(&node),
+                issued_at_ms: NOW as u64,
+                expires_at_ms: NOW as u64 + 60_000,
+            },
+            &node,
+        )
+        .unwrap();
+        let authorization = import
+            .finish(
+                &json(&witness).unwrap(),
+                &json(&selection).unwrap(),
+                NOW as f64,
+            )
+            .unwrap();
+        let confirmation_request_json = build_client_policy_auth_confirm_request(
+            &authorization,
+            &own,
+            NOW as f64,
+            NOW as f64 + 30_000.0,
+        )
+        .unwrap();
+        let confirmation_request: Signed<ClientPolicyAuthConfirmRequest> =
+            parse(&confirmation_request_json).unwrap();
+        verify_client_policy_auth_confirm(
+            state,
+            &request,
+            &snapshot,
+            &witness,
+            &confirmation_request,
+            &PublicKey::of(&node),
+            &PublicKey::of(&own),
+            NOW as u64,
+        )
+        .unwrap();
+        let confirmation = Signed::sign(
+            ClientPolicyAuthConfirmation {
+                version: AUTH_VERSION,
+                context: confirmation_request.payload.context.clone(),
+                confirmation_request_hash: confirmation_request.hash().unwrap(),
+                selection,
+                target_heads: current.heads().to_vec(),
+                device_public_key: PublicKey::of(&own),
+                source_node_public_key: PublicKey::of(&node),
+                accepted_at_ms: NOW as u64,
+            },
+            &node,
+        )
+        .unwrap();
+        confirm_client_policy_authorization(
+            &authorization,
+            &confirmation_request_json,
+            &json(&confirmation).unwrap(),
+            &node.public_key_hex(),
+            NOW as f64,
+        )
+        .unwrap()
     }
     struct Fixture {
         pins: Vec<PolicyPin>,
@@ -1488,6 +2129,23 @@ mod tests {
         fn bundle_json(&self) -> String {
             json(&self.bundle).unwrap()
         }
+        fn authorization(&self) -> VerifiedClientAuthorization {
+            confirmed_authorization(
+                &self.state(),
+                &self.pins,
+                &self.bundle,
+                &ResourceRef {
+                    space: self
+                        .state()
+                        .grant(&self.bundle.grant_leaf)
+                        .unwrap()
+                        .payload
+                        .owner_space
+                        .clone(),
+                    resource: self.project.clone(),
+                },
+            )
+        }
         fn prepare_team(&self, root: &Identity) -> crate::Result<PreparedTeamCreation> {
             prepare_team_creation(
                 root,
@@ -1496,8 +2154,7 @@ mod tests {
                 &key(4).public_key_hex(),
                 &key(2).public_key_hex(),
                 self.project.as_str(),
-                &self.pins_json(),
-                &self.bundle_json(),
+                &self.authorization(),
                 END as f64,
                 NOW as f64,
             )
@@ -1507,19 +2164,65 @@ mod tests {
             let acceptance = accept_team_creation(
                 &prepared.request_json().unwrap(),
                 &key(4),
-                &self.pins_json(),
-                &self.bundle_json(),
+                &self.authorization(),
                 NOW as f64,
             )
             .unwrap();
             let pending = prepared.recovery_material_json().unwrap();
             let pending_value: serde_json::Value = parse(&pending).unwrap();
             assert_eq!(pending_value["status"], "pending");
+            let mut old_bundle = self.bundle.clone();
+            old_bundle
+                .journal
+                .extend(prepared.request.payload.journal_delta.clone());
+            let JournalEntry::Grant(team_grant) = &prepared.request.payload.journal_delta[3] else {
+                unreachable!()
+            };
+            old_bundle.grant_leaf = team_grant.hash().unwrap();
+            let mut old_pins = self.pins.clone();
+            old_pins.push(prepared.request.payload.team_pin.clone());
+            old_pins.sort_by(|left, right| left.domain.cmp(&right.domain));
+            let earlier = EarlierPendingTeamRecoveryMaterial {
+                status: "pending".to_owned(),
+                pending_request: prepared.request.clone(),
+                source_pins: self.pins.clone(),
+                source_bundle: self.bundle.clone(),
+                format: "vibeface-team-recovery".to_owned(),
+                version: AUTH_VERSION,
+                root_secret_hex: key(11).secret_hex(),
+                owner_account: self.account.clone(),
+                team: prepared.request.payload.team_project.space.clone(),
+                recovery_public_key: PublicKey::of(&key(2)),
+                pins: old_pins,
+                bundle: old_bundle,
+            };
+            let restored_earlier = restore_prepared_team_creation(
+                &json(&earlier).unwrap(),
+                &key(3),
+                &self.authorization(),
+                NOW as f64,
+            )
+            .unwrap();
+            assert_eq!(
+                restored_earlier.request_json().unwrap(),
+                prepared.request_json().unwrap()
+            );
+            let mut changed_earlier = serde_json::to_value(&earlier).unwrap();
+            changed_earlier["source_bundle"]["journal"][0]["value"]["payload"]["sequence"] =
+                999.into();
+            assert!(
+                restore_prepared_team_creation(
+                    &changed_earlier.to_string(),
+                    &key(3),
+                    &self.authorization(),
+                    NOW as f64
+                )
+                .is_err()
+            );
             let restored = restore_prepared_team_creation(
                 &pending,
                 &key(3),
-                &self.pins_json(),
-                &self.bundle_json(),
+                &self.authorization(),
                 (NOW + INVOCATION_MAX_AGE_MS + 1) as f64,
             )
             .unwrap();
@@ -1544,8 +2247,7 @@ mod tests {
                     restore_prepared_team_creation(
                         &altered.to_string(),
                         &key(3),
-                        &self.pins_json(),
-                        &self.bundle_json(),
+                        &self.authorization(),
                         NOW as f64
                     )
                     .is_err()
@@ -1555,8 +2257,7 @@ mod tests {
                 restore_prepared_team_creation(
                     &pending,
                     &key(12),
-                    &self.pins_json(),
-                    &self.bundle_json(),
+                    &self.authorization(),
                     NOW as f64
                 )
                 .is_err()
@@ -1579,8 +2280,11 @@ mod tests {
             assert!(finish_team_creation(&prepared, &acceptance, (NOW - 1) as f64).is_err());
             (
                 Self {
-                    pins: result.pins.clone(),
-                    bundle: result.bundle.clone(),
+                    pins: result.snapshot.pins().to_vec(),
+                    bundle: ClientAuthorizationBundle {
+                        journal: result.snapshot.journal().to_vec(),
+                        grant_leaf: result.authorization.as_ref().unwrap().grant_leaf.clone(),
+                    },
                     account: self.account.clone(),
                     project: result.project.clone(),
                 },
@@ -1592,8 +2296,7 @@ mod tests {
             let challenge_json = issue_space_governance_challenge(
                 &request,
                 &key(4),
-                &self.pins_json(),
-                &self.bundle_json(),
+                &self.authorization(),
                 NOW as f64,
             )
             .unwrap();
@@ -1622,8 +2325,7 @@ mod tests {
                     &challenge_json,
                     "[]",
                     &key(4),
-                    &self.pins_json(),
-                    &self.bundle_json(),
+                    &self.authorization(),
                     NOW as f64
                 )
                 .is_err()
@@ -1633,8 +2335,7 @@ mod tests {
                 &challenge_json,
                 &json(&receipts).unwrap(),
                 &key(4),
-                &self.pins_json(),
-                &self.bundle_json(),
+                &self.authorization(),
                 NOW as f64,
             )
             .unwrap();
@@ -1654,8 +2355,11 @@ mod tests {
                 finish_space_governance_change(prepared, &committed, (NOW - 1) as f64).is_err()
             );
             let next = Self {
-                pins: result.pins,
-                bundle: result.bundle,
+                pins: result.snapshot.pins().to_vec(),
+                bundle: ClientAuthorizationBundle {
+                    journal: result.snapshot.journal().to_vec(),
+                    grant_leaf: self.bundle.grant_leaf.clone(),
+                },
                 account: self.account.clone(),
                 project: self.project.clone(),
             };
@@ -1665,11 +2369,126 @@ mod tests {
     }
 
     #[test]
+    fn governance_consumes_confirmed_native_history_and_preserves_team_delta_identity() {
+        let mut personal = Fixture::personal();
+        let mut state = personal.state();
+        let space = SpaceId::personal(&personal.account);
+        for _ in 0..124 {
+            let mut document = state.space(&space).unwrap().clone();
+            document.previous = state.head(&PolicyDomain::Space(space.clone())).cloned();
+            document.sequence += 1;
+            let signed = Signed::sign(document, &key(1)).unwrap();
+            let head = state.install_space(signed.clone()).unwrap();
+            personal.bundle.journal.push(JournalEntry::Space(signed));
+            personal
+                .pins
+                .iter_mut()
+                .find(|pin| pin.domain == head.domain)
+                .unwrap()
+                .minimum_head = Some(head);
+        }
+        assert!(personal.bundle.journal.len() > 122);
+        let confirmed = personal.authorization();
+        let prepared = prepare_team_creation(
+            &key(11),
+            &key(3),
+            personal.account.as_str(),
+            &key(4).public_key_hex(),
+            &key(2).public_key_hex(),
+            personal.project.as_str(),
+            &confirmed,
+            END as f64,
+            NOW as f64,
+        )
+        .unwrap();
+        let counts = prepared.usage.counts();
+        assert!(counts.authorization_bytes <= MAX_PROOF_BYTES);
+        assert!(counts.unique_signed_objects <= MAX_PROOF_OBJECTS);
+        assert!(counts.actual.unwrap().actual_verifications <= MAX_PROOF_SIGNATURES);
+        let mut legacy = confirmed.clone();
+        legacy.client_policy_context = None;
+        assert!(
+            prepare_team_creation(
+                &key(11),
+                &key(3),
+                personal.account.as_str(),
+                &key(4).public_key_hex(),
+                &key(2).public_key_hex(),
+                personal.project.as_str(),
+                &legacy,
+                END as f64,
+                NOW as f64
+            )
+            .is_err()
+        );
+
+        let created = prepared
+            .source
+            .with_created_team(&prepared.approved)
+            .unwrap();
+        let team = &prepared.request.payload.team_project;
+        assert!(created.state().space(&team.space).is_some());
+        let mut grant = created
+            .state()
+            .grant(&match &prepared.request.payload.journal_delta[3] {
+                JournalEntry::Grant(value) => value.hash().unwrap(),
+                _ => unreachable!(),
+            })
+            .unwrap()
+            .payload
+            .clone();
+        grant.grantee = Grantee::Actor(Actor::Account(personal.account.clone()));
+        grant.scope = ResourceScope::Exact(team.clone());
+        grant.actions = vec![Action::ConversationRead];
+        grant.remaining_delegations = 0;
+        grant.issued_under = created
+            .state()
+            .head(&PolicyDomain::Space(team.space.clone()))
+            .unwrap()
+            .clone();
+        grant.nonce = Nonce::random().unwrap();
+        let grant = Signed::sign(grant, &key(11)).unwrap();
+        let future_grant = grant.hash().unwrap();
+        let mut document = created.state().space(&team.space).unwrap().clone();
+        document.previous = created
+            .state()
+            .head(&PolicyDomain::Space(team.space.clone()))
+            .cloned();
+        document.sequence += 1;
+        document.grants.push(future_grant.clone());
+        document.grants.sort();
+        let newer = created
+            .apply_delta(&[
+                JournalEntry::Grant(grant),
+                JournalEntry::Space(Signed::sign(document, &key(11)).unwrap()),
+            ])
+            .unwrap();
+        let mut approved = prepared.approved.clone();
+        approved.source_heads = newer.heads().to_vec();
+        let repeated = newer.with_created_team(&approved).unwrap();
+        assert_eq!(repeated.heads(), newer.heads());
+        assert_eq!(repeated.journal(), newer.journal());
+        let pending = VerifiedPendingTeamCreation {
+            signed: prepared.request.clone(),
+            source_heads: prepared.original_heads.clone(),
+        };
+        let before = newer.before_team_creation(&pending).unwrap();
+        assert!(before.space(&team.space).is_none());
+        assert!(before.grant(&future_grant).is_none());
+        let mut missing = VerifiedPendingTeamCreation {
+            signed: prepared.request.clone(),
+            source_heads: prepared.original_heads.clone(),
+        };
+        missing.source_heads[0].sequence += 999;
+        assert!(newer.before_team_creation(&missing).is_err());
+    }
+
+    #[test]
     fn team_creation_references_the_personal_node_and_preserves_private_recovery_material() {
         let personal = Fixture::personal();
         let (team, result) = personal.team();
         let state = team.state();
-        let space = &result.scope.as_ref().unwrap().space_id;
+        let space = &result.authorization.as_ref().unwrap().scope().space_id;
         let document = state.space(space).unwrap();
         assert_eq!(document.current_root, PublicKey::of(&key(11)));
         assert_eq!(document.recovery.keys, [PublicKey::of(&key(2))]);
@@ -1681,7 +2500,8 @@ mod tests {
             PolicyDomain::Account(personal.account.clone())
         );
         assert_ne!(result.project, personal.project);
-        assert!(!result.bundle_json().unwrap().contains("secret_hex"));
+        assert!(!result.pins_json().unwrap().contains("secret_hex"));
+        assert!(!result.recovery_material_json().contains("source_bundle"));
         let material = result.recovery_material_json();
         let value: serde_json::Value = serde_json::from_str(&material).unwrap();
         let restored_root =
@@ -1698,7 +2518,13 @@ mod tests {
     #[test]
     fn daily_membership_directional_grant_resource_and_revocation_use_real_commits() {
         let (team, result) = Fixture::personal().team();
-        let space = result.scope.as_ref().unwrap().space_id.clone();
+        let space = result
+            .authorization
+            .as_ref()
+            .unwrap()
+            .scope()
+            .space_id
+            .clone();
         let guest = AccountId::from_root(&PublicKey::of(&key(12)));
         let member = SpaceMembershipIntent {
             space: space.clone(),
@@ -1709,8 +2535,7 @@ mod tests {
         let prepared = prepare_space_membership_change(
             &json(&member).unwrap(),
             &key(3),
-            &team.pins_json(),
-            &team.bundle_json(),
+            &team.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1742,8 +2567,7 @@ mod tests {
         let prepared = prepare_directional_grant(
             &json(&grant_intent).unwrap(),
             &key(3),
-            &team.pins_json(),
-            &team.bundle_json(),
+            &team.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1774,8 +2598,7 @@ mod tests {
         let prepared = prepare_space_resource_registration(
             &json(&resource).unwrap(),
             &key(3),
-            &team.pins_json(),
-            &team.bundle_json(),
+            &team.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1785,8 +2608,7 @@ mod tests {
             space.as_str(),
             child.as_str(),
             &key(3),
-            &team.pins_json(),
-            &team.bundle_json(),
+            &team.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1811,8 +2633,7 @@ mod tests {
         let prepared = prepare_space_membership_change(
             &json(&removal).unwrap(),
             &key(3),
-            &team.pins_json(),
-            &team.bundle_json(),
+            &team.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1834,7 +2655,13 @@ mod tests {
     #[test]
     fn bounded_member_selector_builders_follow_current_roles_and_both_policy_domains() {
         let (team, result) = Fixture::personal().team();
-        let space = result.scope.as_ref().unwrap().space_id.clone();
+        let space = result
+            .authorization
+            .as_ref()
+            .unwrap()
+            .scope()
+            .space_id
+            .clone();
         let owner = verify_client_authorization(
             &team.bundle_json(),
             &team.pins_json(),
@@ -1883,8 +2710,7 @@ mod tests {
                 prepare_directional_grant(
                     &json(&bad).unwrap(),
                     &key(3),
-                    &team.pins_json(),
-                    &team.bundle_json(),
+                    &team.authorization(),
                     NOW as f64
                 )
                 .is_err()
@@ -1894,8 +2720,7 @@ mod tests {
         let prepared = prepare_directional_grant(
             &json(&intent).unwrap(),
             &key(3),
-            &team.pins_json(),
-            &team.bundle_json(),
+            &team.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1926,8 +2751,7 @@ mod tests {
         let prepared = prepare_space_membership_change(
             &json(&membership).unwrap(),
             &key(3),
-            &team.pins_json(),
-            &team.bundle_json(),
+            &team.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1961,8 +2785,7 @@ mod tests {
         let prepared = prepare_space_membership_change(
             &json(&membership).unwrap(),
             &key(3),
-            &team.pins_json(),
-            &team.bundle_json(),
+            &team.authorization(),
             NOW as f64,
         )
         .unwrap();
@@ -1993,8 +2816,7 @@ mod tests {
             accept_team_creation(
                 &prepared.request_json().unwrap(),
                 &key(5),
-                &personal.pins_json(),
-                &personal.bundle_json(),
+                &personal.authorization(),
                 NOW as f64
             )
             .is_err()
@@ -2010,7 +2832,7 @@ mod tests {
             assert!(
                 verify_team_creation_request(
                     &personal.state(),
-                    &personal.bundle,
+                    &personal.bundle.grant_leaf,
                     &personal.pins,
                     &signed,
                     NOW
@@ -2020,7 +2842,13 @@ mod tests {
         }
         let (team, result) = personal.team();
         let intent = SpaceMembershipIntent {
-            space: result.scope.as_ref().unwrap().space_id.clone(),
+            space: result
+                .authorization
+                .as_ref()
+                .unwrap()
+                .scope()
+                .space_id
+                .clone(),
             subject_account: team.account.clone(),
             roles: vec![SpaceRole::Viewer],
             expires_at_ms: END,
@@ -2029,16 +2857,29 @@ mod tests {
             prepare_space_membership_change(
                 &json(&intent).unwrap(),
                 &key(4),
-                &team.pins_json(),
-                &team.bundle_json(),
+                &team.authorization(),
                 NOW as f64
             )
             .is_err()
         );
         let grant = DirectionalGrantIntent {
-            space: result.scope.as_ref().unwrap().space_id.clone(),
+            space: result
+                .authorization
+                .as_ref()
+                .unwrap()
+                .scope()
+                .space_id
+                .clone(),
             grantee: Grantee::Actor(Actor::Account(team.account.clone())),
-            scope: ResourceScope::WholeSpace(result.scope.as_ref().unwrap().space_id.clone()),
+            scope: ResourceScope::WholeSpace(
+                result
+                    .authorization
+                    .as_ref()
+                    .unwrap()
+                    .scope()
+                    .space_id
+                    .clone(),
+            ),
             actions: vec![Action::ConversationRead],
             audience_node_public_key: PublicKey::of(&key(4)),
             constraints: GrantConstraints::default(),
@@ -2049,8 +2890,7 @@ mod tests {
             prepare_directional_grant(
                 &json(&grant).unwrap(),
                 &key(3),
-                &team.pins_json(),
-                &team.bundle_json(),
+                &team.authorization(),
                 NOW as f64
             )
             .is_err()
@@ -2095,7 +2935,11 @@ mod tests {
             .unwrap();
         assert!(
             state
-                .verify_service_device(&result.scope.as_ref().unwrap().space_id, &old, NOW)
+                .verify_service_device(
+                    &result.authorization.as_ref().unwrap().scope().space_id,
+                    &old,
+                    NOW
+                )
                 .is_err()
         );
     }
