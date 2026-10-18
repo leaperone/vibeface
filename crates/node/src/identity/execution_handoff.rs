@@ -635,6 +635,7 @@ fn capsule_facts(
                     | "target_public_key"
                     | "execution_grant"
                     | "execution_session_receipt"
+                    | "manager_authority"
             )
         } else {
             matches!(
@@ -651,6 +652,7 @@ fn capsule_facts(
                     | "auto_followup"
                     | "sdk_session"
                     | "parent_invocation"
+                    | "manager_authority"
             )
         }),
         "task capsule cannot disclose unrelated source fields"
@@ -2770,8 +2772,11 @@ impl Store {
             return Ok((result, false, deadline));
         }
         super::execution_binding_seal::ensure_handoff_generation_open_in(&tx, auth.wire())?;
-        let deadline = authority.consume_in(&tx, &self.policy, proof, CheckStage::Start, now_ms)?;
-        save_lease_in(&tx, identity, auth, proof, now_ms, deadline)?;
+        let deadline = authority
+            .consume_in(&tx, &self.policy, proof, CheckStage::Start, now_ms)
+            .context("verify executor start freshness")?;
+        save_lease_in(&tx, identity, auth, proof, now_ms, deadline)
+            .context("persist executor start lease")?;
         ensure!(tx.execute("UPDATE execution_handoffs SET state='running' WHERE execution_space_id=? AND original_space_id=? AND operation_id=? AND state='accepted'",
             params![execution, original, operation])? == 1, "execution handoff was already claimed");
         let stored = stored_from(&tx, &execution, &original, &operation)?
@@ -4557,7 +4562,9 @@ fn save_lease_in(
     for receipt in &proof.receipts {
         usage.record_signed(receipt)?;
     }
-    usage.enforce_limits()?;
+    usage
+        .enforce_limits()
+        .with_context(|| format!("executor lease proof budget {:?}", usage.counts()))?;
     tx.execute(
         "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
         params![
@@ -5175,7 +5182,9 @@ pub(crate) mod tests {
             invocation.context.sdk_session = Some(session.clone());
             invocation.body_hash = ObjectHash::body(&proof.source_body)?;
             invocation.nonce = Nonce::random()?;
-            invocation.expected_policies = descriptor.expected_policies;
+            invocation
+                .expected_policies
+                .extend(descriptor.expected_policies);
             invocation.expected_policies.push(
                 fixture
                     .store
@@ -5204,12 +5213,24 @@ pub(crate) mod tests {
                 body_hash: invocation.body_hash,
                 context: invocation.context,
             };
-            let auth = fixture.store.policy.verified().verify_invocation(
-                &proof.invocation,
+            let destination = crate::identity::policy::execution_destination_for_body(
+                fixture.store.policy.verified(),
                 &facts,
-                &transport,
+                &proof.source_body,
                 now(),
-            )?;
+            )?
+            .context("SDK fixture execution destination")?;
+            let auth = fixture
+                .store
+                .policy
+                .verified()
+                .verify_invocation_with_execution_destination(
+                    &proof.invocation,
+                    &facts,
+                    &transport,
+                    &destination,
+                    now(),
+                )?;
             proof.challenge = FreshnessChallenge::new(
                 &auth,
                 CheckStage::Admit,
@@ -5248,7 +5269,8 @@ pub(crate) mod tests {
                 fixture.store.policy.verified(),
                 &fixture.wire,
                 now(),
-            )?;
+            )
+            .context("SDK fixture original source")?;
             let facts = execution_submission_facts(&fixture.wire.handoff, &original)?;
             let mut carrier = fixture.wire.invocation.payload.clone();
             carrier.body_hash = facts.body_hash;
@@ -5825,23 +5847,27 @@ pub(crate) mod tests {
             Ok(())
         }
         pub(crate) fn start_unknown(&mut self) -> Result<()> {
-            self.accept()?;
-            let proof = self.freshness(CheckStage::Start, now() + 3)?;
-            let auth = self.store.execution_handoff_authorization(
-                self.executor.space.as_str(),
-                self.project.space.as_str(),
-                "original-operation",
-                now() + 4,
-            )?;
-            let (_, fresh, _) = self.store.claim_execution_handoff(
-                &self.executor.node,
-                &auth,
-                &proof,
-                now() + 4,
-            )?;
+            self.accept().context("admit Unknown fixture")?;
+            let proof = self
+                .freshness(CheckStage::Start, now() + 3)
+                .context("refresh Unknown fixture")?;
+            let auth = self
+                .store
+                .execution_handoff_authorization(
+                    self.executor.space.as_str(),
+                    self.project.space.as_str(),
+                    "original-operation",
+                    now() + 4,
+                )
+                .context("authorize Unknown fixture")?;
+            let (_, fresh, _) = self
+                .store
+                .claim_execution_handoff(&self.executor.node, &auth, &proof, now() + 4)
+                .context("claim Unknown fixture")?;
             assert!(fresh);
             self.store
-                .load_execution_handoffs_for_recovery(&self.executor.node, now() + 5)?;
+                .load_execution_handoffs_for_recovery(&self.executor.node, now() + 5)
+                .context("recover Unknown fixture")?;
             Ok(())
         }
 
@@ -6421,11 +6447,13 @@ pub(crate) mod tests {
     -> Result<()> {
         for sdk in [false, true] {
             let mut fixture = if sdk {
-                Fixture::sdk()?
+                Fixture::sdk().context("SDK fixture setup")?
             } else {
                 Fixture::new()?
             };
-            fixture.start_unknown()?;
+            fixture
+                .start_unknown()
+                .with_context(|| format!("start Unknown, sdk={sdk}"))?;
             fixture.project.revoke_client(&mut fixture.store)?;
             let mut revoked_grants = vec![(
                 &fixture.executor,
@@ -6466,7 +6494,9 @@ pub(crate) mod tests {
                     now() + 7,
                 )?;
             }
-            let (wire, proof) = fixture.observation()?;
+            let (wire, proof) = fixture
+                .observation()
+                .with_context(|| format!("prepare Observation, sdk={sdk}"))?;
             let changes = fixture.store.connection.total_changes();
             let verification =
                 vibeface_secure::signature_verification::SignatureVerification::new();

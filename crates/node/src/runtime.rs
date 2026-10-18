@@ -511,6 +511,14 @@ pub(crate) mod tests {
             &trigger.hash,
             &admission.job.state.attempt().unwrap().id,
         )?;
+        node.register_manager_attempt(
+            uuid::Uuid::new_v4().to_string(),
+            descriptor.clone(),
+            &admission.job.state.attempt().unwrap().id,
+            &trigger.hash,
+            false,
+        )
+        .await?;
         Ok(descriptor)
     }
 
@@ -2095,12 +2103,19 @@ pub(crate) mod tests {
             #[inline(never)]
             fn enable_followup_phase(&self) -> Pin<Box<impl Future<Output = Result<()>> + '_>> {
                 Box::pin(async move {
-                    let mut body = self.project.body("create_task", "conversation");
+                    let policy = self.node.store.lock().await.historical_followup_policy(
+                        self.project.space.as_str(),
+                        "conversation",
+                        "remote-task",
+                    )?;
+                    let mut body = self.project.body("set_followup", "conversation");
                     body["task_id"] = json!("remote-task");
-                    body["title"] = json!("remote-task");
-                    body["goal"] = json!("work");
-                    body["acceptance"] = json!("review result");
-                    body["auto_followup"] = json!(true);
+                    body["task_ref"] = json!(policy.task_ref);
+                    body["previous_head"] =
+                        json!(policy.proof_heads.last().context("task origin missing")?);
+                    body["expected_version"] = json!(policy.version);
+                    body["mode"] = json!("continue");
+                    body["scheduler_node"] = json!(self.node.identity.node_id()?);
                     rpc(&self.project, &self.node, body).await?;
                     Ok(())
                 })
@@ -2213,12 +2228,34 @@ pub(crate) mod tests {
                         &trigger,
                         now_ms() as u64,
                     )?;
-                    self.node
+                    let admission = self
+                        .node
                         .claim_manager(
                             &continuation,
                             &trigger,
                             "remote-sdk-continuation",
                             &crypto::digest(b"runtime manager configuration"),
+                        )
+                        .await?;
+                    let attempt = admission
+                        .job
+                        .state
+                        .attempt()
+                        .context("continuation attempt missing")?;
+                    self.node.store.lock().await.mark_started(
+                        self.project.space.as_str(),
+                        "conversation",
+                        &self.node.identity.node_id()?,
+                        &trigger,
+                        &attempt.id,
+                    )?;
+                    self.node
+                        .register_manager_attempt(
+                            uuid::Uuid::new_v4().to_string(),
+                            continuation.clone(),
+                            &attempt.id,
+                            &trigger,
+                            attempt.read_only,
                         )
                         .await?;
                     self.assert_cold_current(Action::ExecutionSend).await?;
@@ -2399,6 +2436,8 @@ pub(crate) mod tests {
                     (store.policy.pins().to_vec(), Self::primary_journal(&store)?)
                 };
                 let access = self.node.authorize_agent(sdk, body).await?;
+                let request: OperationRequest =
+                    serde_json::from_value(access.body["request"].clone())?;
                 let mut store = self.node.store.lock().await;
                 assert_eq!(store.policy.pins(), pins.as_slice());
                 assert_eq!(Self::primary_journal(&store)?, journal);
@@ -5165,9 +5204,9 @@ impl Runtime {
                 | "continue_execution"
                 | "stop_execution"
                 | "call_lookup"
-                | "nodes"
                 | "context"
-        ) || (name == "execution_status" && args.get("target_node").is_none())
+        ) || (name == "nodes" && args.get("task_id").is_none())
+            || (name == "execution_status" && args.get("target_node").is_none())
         {
             let body = json!({"method":"context","space_id":session.space_id,"resource_id":session.resource_id,
                 "conversation_id":session.conversation_id,"authorization_id":uuid::Uuid::new_v4().to_string()});
@@ -7051,32 +7090,37 @@ impl Runtime {
         self.publish_changed(&access.network_id, &operation.request.conversation_id, "");
         Ok(json!({"operation":operation}))
     }
-    pub(super) async fn agent_child_access(
-        self: &Arc<Self>,
-        parent: &Access,
+    pub(super) fn agent_child_access<'a>(
+        self: &'a Arc<Self>,
+        parent: &'a Access,
         mut body: Value,
-    ) -> Result<Access> {
-        let manager = parent
-            .manager
-            .as_ref()
-            .context("tool request has no active manager")?;
-        let session = &manager.session;
-        body["space_id"] = json!(session.space_id);
-        body["resource_id"] = json!(session.resource_id);
-        body["conversation_id"] = json!(session.conversation_id);
-        body["sdk_session"] = json!(session.sdk_session);
-        body["parent_invocation"] = json!(session.parent_invocation);
-        let verification = SignatureVerification::new();
-        self.prepare_agent_dispatch_destination(session, &mut body)
-            .await?;
-        let body = self
-            .normalize_request_body_with_verification(&session.space_id, body, &verification)
-            .await?;
-        let mut access = self
-            .authorize_agent_with_verification(session, body, verification)
-            .await?;
-        access.manager = Some(manager.clone());
-        Ok(access)
+    ) -> futures_util::future::BoxFuture<'a, Result<Access>> {
+        Box::pin(async move {
+            let manager = parent
+                .manager
+                .as_ref()
+                .context("tool request has no active manager")?;
+            let session = &manager.session;
+            body["space_id"] = json!(session.space_id);
+            body["resource_id"] = json!(session.resource_id);
+            body["conversation_id"] = json!(session.conversation_id);
+            body["sdk_session"] = json!(session.sdk_session);
+            body["parent_invocation"] = json!(session.parent_invocation);
+            if body.get("authorization_id").is_none() && authorization_action(&body)?.is_read() {
+                body["authorization_id"] = json!(uuid::Uuid::new_v4().to_string());
+            }
+            let verification = SignatureVerification::new();
+            self.prepare_agent_dispatch_destination(session, &mut body)
+                .await?;
+            let body = self
+                .normalize_request_body_with_verification(&session.space_id, body, &verification)
+                .await?;
+            let mut access = self
+                .authorize_agent_with_verification(session, body, verification)
+                .await?;
+            access.manager = Some(manager.clone());
+            Ok(access)
+        })
     }
     pub(crate) async fn publish_scheduler_result(
         self: &Arc<Self>,

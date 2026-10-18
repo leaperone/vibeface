@@ -595,6 +595,17 @@ impl PolicyState {
         for row in rows {
             let (hash, encoded, received_at_ms) = row?;
             let hash = ObjectHash::parse(&hash)?;
+            if count < known.order.len() {
+                ensure!(
+                    known.order.get(count) == Some(&hash)
+                        && known.accepted.get(&hash).is_some_and(|accepted| {
+                            accepted.encoded == encoded && accepted.received_at_ms == received_at_ms
+                        }),
+                    "verified policy journal prefix was replaced or reordered"
+                );
+                count += 1;
+                continue;
+            }
             let entry: JournalEntry = serde_json::from_str(&encoded)?;
             ensure!(
                 entry_hash(&entry)? == hash,
@@ -605,27 +616,19 @@ impl PolicyState {
                 encoded,
                 received_at_ms,
             };
-            if count < known.order.len() {
-                ensure!(
-                    known.order.get(count) == Some(&hash)
-                        && known.accepted.get(&hash) == Some(&accepted),
-                    "verified policy journal prefix was replaced or reordered"
-                );
-            } else {
-                ensure!(
-                    !result.accepted.contains_key(&hash),
-                    "duplicate policy journal entry"
-                );
-                apply_entry(
-                    &mut result.state,
-                    &result.pins,
-                    &accepted.entry,
-                    received_at_ms,
-                    true,
-                )?;
-                result.order.push(hash.clone());
-                result.accepted.insert(hash, accepted);
-            }
+            ensure!(
+                !result.accepted.contains_key(&hash),
+                "duplicate policy journal entry"
+            );
+            apply_entry(
+                &mut result.state,
+                &result.pins,
+                &accepted.entry,
+                received_at_ms,
+                true,
+            )?;
+            result.order.push(hash.clone());
+            result.accepted.insert(hash, accepted);
             count += 1;
         }
         ensure!(

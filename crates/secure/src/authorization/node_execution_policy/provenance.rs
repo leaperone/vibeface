@@ -208,7 +208,11 @@ fn manager_shape(
                 .as_str()
                 .is_some_and(|config| !config.is_empty())
             && ObjectHash::body(body)? == value.body_hash
-            && value.operation_id == format!("manager:{trigger}")
+            && body["attempt_id"].as_str().is_some_and(|attempt| {
+                !attempt.is_empty()
+                    && attempt.len() <= 1024
+                    && value.operation_id == format!("manager:{trigger}:{attempt}")
+            })
             && value.action == Action::AgentStart
             && value.actor == Actor::Service(session.service.clone())
             && value.device == session.device
@@ -780,7 +784,7 @@ mod tests {
             session_id: trigger.as_str().into(),
         };
         let manager_body = json!({"method":"agent_start","space_id":resource.space,"resource_id":resource.resource,
-            "conversation_id":"chat","authorization_id":format!("manager:{}",trigger.as_str()),"trigger":trigger,
+            "conversation_id":"chat","authorization_id":format!("manager:{}:fixture-attempt",trigger.as_str()),"trigger":trigger,"attempt_id":"fixture-attempt",
             "sdk_session":sdk,"parent_invocation":parent.invocation_hash(),"sdk_config":"fixture"});
         let mut manager_context = context;
         manager_context.sdk_session = Some(sdk.clone());
@@ -788,7 +792,7 @@ mod tests {
             resource: resource.clone(),
             action: Action::AgentStart,
             audience: audience.clone(),
-            operation_id: format!("manager:{}", trigger.as_str()),
+            operation_id: format!("manager:{}:fixture-attempt", trigger.as_str()),
             body_hash: ObjectHash::body(&manager_body).unwrap(),
             context: manager_context,
         };

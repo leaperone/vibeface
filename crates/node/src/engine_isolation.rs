@@ -165,7 +165,19 @@ impl DockerIsolation {
     ) -> Result<IsolatedProcess> {
         self.config.validate()?;
         validate_lease(context.lease_expires_at_ms)?;
-        vibeface_protocol::validate_id(&context.operation_id).map_err(anyhow::Error::msg)?;
+        if self.project_read_only && context.operation_id.starts_with("manager:") {
+            let (trigger, attempt) = context.operation_id["manager:".len()..]
+                .split_once(':')
+                .context("manager isolation ID has no attempt")?;
+            ensure!(
+                context.operation_id.len() <= 128,
+                "manager isolation ID is too long"
+            );
+            vibeface_protocol::validate_id(trigger).map_err(anyhow::Error::msg)?;
+            vibeface_protocol::validate_id(attempt).map_err(anyhow::Error::msg)?;
+        } else {
+            vibeface_protocol::validate_id(&context.operation_id).map_err(anyhow::Error::msg)?;
+        }
         let data_dir = self
             .data_dir
             .canonicalize()
@@ -1548,8 +1560,9 @@ esac
             lease_expires_at_ms: vibeface_protocol::now_ms() + 30_000,
         };
         let mut other_manager = context.clone();
-        other_manager.operation_id = "another-manager-agent-start".into();
+        other_manager.operation_id = format!("manager:{}:{}", "a".repeat(64), uuid::Uuid::nil());
         let result = async {
+            ensure!(executor.prepare(&other_manager, &project).await.is_err(), "ordinary execution accepted a Manager ID");
             let writable = executor.prepare(&context, &project).await?;
             let readonly = manager.prepare(&context, &project).await?;
             let other_readonly = manager.prepare(&other_manager, &project).await?;

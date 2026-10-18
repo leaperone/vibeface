@@ -141,8 +141,8 @@ impl Runtime {
             now_ms() as u64,
         )?;
         let mut selected = candidates.iter().filter(|candidate| {
-            DeviceId::from_key(&candidate.selection().target_public_key).as_str()
-                == request.target_node
+            crate::crypto::fingerprint(candidate.selection().target_public_key.as_str())
+                .is_ok_and(|node| node == request.target_node)
         });
         let destination = selected
             .next()
@@ -686,52 +686,61 @@ impl Runtime {
         original.context("work reference is outside this conversation or has not been dispatched")
     }
 
-    async fn agent_receipt(
-        self: &Arc<Self>,
-        access: &Access,
-        expected: &OperationRequest,
-    ) -> Result<(Option<OperationRequest>, Option<OperationRecord>)> {
-        let original = match self.agent_work(access, &expected.operation_id).await {
-            Ok(original) => Some(original),
-            Err(error)
-                if error.to_string()
-                    == "work reference is outside this conversation or has not been dispatched" =>
-            {
-                None
+    fn agent_receipt<'a>(
+        self: &'a Arc<Self>,
+        access: &'a Access,
+        expected: &'a OperationRequest,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<(Option<OperationRequest>, Option<OperationRecord>)>,
+    > {
+        Box::pin(async move {
+            let original = match self.agent_work(access, &expected.operation_id).await {
+                Ok(original) => Some(original),
+                Err(error)
+                    if error.to_string()
+                        == "work reference is outside this conversation or has not been dispatched" =>
+                {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(original) = &original {
+                ensure!(
+                    same_request(original, expected),
+                    "prepared request differs from its original dispatch"
+                );
             }
-            Err(error) => return Err(error),
-        };
-        if let Some(original) = &original {
-            ensure!(
-                same_request(original, expected),
-                "prepared request differs from its original dispatch"
-            );
-        }
-        let operation = if expected.target_node == self.identity.node_id()? {
-            self.store
-                .lock()
-                .await
-                .operation(&access.network_id, &expected.operation_id)?
-        } else if let Some(original) = &original {
-            let status = self
-                .verified_execution_status(&access.network_id, &original.conversation_id, original)
-                .await?;
-            serde_json::from_value(status["operation"].clone())?
-        } else {
-            None
-        };
-        if let Some(operation) = &operation {
-            let signed = original
-                .as_ref()
-                .context("execution receipt has no original conversation dispatch")?;
-            let mut normalized = signed.clone();
-            normalized.resources = operation.request.resources.clone();
-            ensure!(
-                operation.request == normalized,
-                "execution receipt differs from the original dispatch"
-            );
-        }
-        Ok((original, operation))
+            let operation = if expected.target_node == self.identity.node_id()? {
+                self.store
+                    .lock()
+                    .await
+                    .operation(&access.network_id, &expected.operation_id)?
+            } else if let Some(original) = &original {
+                let status = self
+                    .verified_execution_status(
+                        &access.network_id,
+                        &original.conversation_id,
+                        original,
+                    )
+                    .await?;
+                serde_json::from_value(status["operation"].clone())?
+            } else {
+                None
+            };
+            if let Some(operation) = &operation {
+                let signed = original
+                    .as_ref()
+                    .context("execution receipt has no original conversation dispatch")?;
+                let mut normalized = signed.clone();
+                normalized.resources = operation.request.resources.clone();
+                ensure!(
+                    operation.request == normalized,
+                    "execution receipt differs from the original dispatch"
+                );
+            }
+            Ok((original, operation))
+        })
     }
 
     fn run_agent_call<'a>(

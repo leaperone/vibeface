@@ -262,7 +262,16 @@ fn scheduler_available_in_view(
     let document = state
         .space(&space)
         .context("scheduler space policy is missing")?;
-    for hash in &document.devices {
+    let devices = match &document.root {
+        vibeface_secure::authorization::SpaceRoot::Personal { owner, .. } => {
+            &state
+                .account(owner)
+                .context("scheduler account policy is missing")?
+                .devices
+        }
+        vibeface_secure::authorization::SpaceRoot::Team { .. } => &document.devices,
+    };
+    for hash in devices {
         let Some(certificate) = state.device(hash) else {
             continue;
         };

@@ -75,7 +75,7 @@ async fn sdk_multiline_call_id_runs_command_once_and_can_be_looked_up() -> Resul
         .context("missing call reference")?;
     assert!(!reference.chars().any(char::is_control));
     assert!(reference.len() <= 256);
-    assert_eq!(first["operations"][0]["state"], "succeeded");
+    assert_eq!(first["operations"][0]["state"], "succeeded", "{first}");
     assert_eq!(first["operations"][0]["receipt"]["result"]["stdout"], "x");
 
     let repeated = node

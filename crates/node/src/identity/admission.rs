@@ -2966,12 +2966,19 @@ impl Store {
         );
         check_operation_authorization_in(&tx, self.policy.verified(), &auth, &operation)?;
         validate_basis_in(&tx, &operation.request, &auth.resource().resource)?;
-        let session = checked_session_from(&tx, &operation.request)?
-            .context("accepted operation has no execution session")?;
-        ensure!(
-            canonical_resource(&session.cwd)? == session.cwd,
-            "execution directory changed before claim"
-        );
+        validate_operation_binding_from(&tx, &operation.request)?;
+        if let Some(session) = checked_session_from(&tx, &operation.request)? {
+            ensure!(
+                canonical_resource(&session.cwd)? == session.cwd,
+                "execution directory changed before claim"
+            );
+        } else {
+            ensure!(
+                operation.request.session_id.is_none()
+                    && operation.request.action["type"] == "command",
+                "accepted operation has no execution session"
+            );
+        }
         for resource in &operation.request.resources {
             ensure!(
                 canonical_resource(resource)? == *resource,

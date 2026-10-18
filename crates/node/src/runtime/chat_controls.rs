@@ -1843,6 +1843,10 @@ mod tests {
             bail!("source is not a message")
         };
         let executed=node.agent_tool(access,"command",json!({"call_ref":"projection","command":"printf 'hello\n'","cwd":network.project,"target_node":target,"timeout_secs":10}),"projection-callback").await?;
+        assert_eq!(
+            executed["operations"][0]["state"], "succeeded",
+            "{executed}"
+        );
         let request = node
             .store
             .lock()
@@ -1851,10 +1855,10 @@ mod tests {
             .context("command missing")?
             .request;
         for status in ["progress", "needs_input"] {
-            node.append_operation_fact(&request,EventBody::ExecutionObserved {
+            assert!(node.append_operation_fact(&request,EventBody::ExecutionObserved {
                 operation_id:request.operation_id.clone(),task_id:None,target_node:target.clone(),session_id:None,status:status.into(),
                 detail:json!({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"正在查询"}}}),
-            },vec![]).await?;
+            },vec![]).await.is_err());
         }
         let body = network.body("conversation", "conversation");
         let authorized = super::super::tests::access(&network, &node, &body).await?;
@@ -1878,7 +1882,7 @@ mod tests {
         assert_eq!(executions[0]["session_id"], Value::Null);
         assert_eq!(executions[0]["state"], "succeeded");
         assert_eq!(executions[0]["detail"], "退出码 0\nhello\n");
-        assert_eq!(executions[0]["latest_progress"], "正在查询");
+        assert!(executions[0].get("latest_progress").is_none());
         assert_eq!(executions[0]["source_message_id"], message_id);
         assert_eq!(executions[0]["capabilities"], json!([]));
         drop(node);

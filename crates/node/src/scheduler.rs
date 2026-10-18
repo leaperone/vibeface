@@ -533,42 +533,22 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
             vec!["command"],
         ),
         (
-            "bind_execution",
-            "Explicitly bind a selected task to its first execution session. This cannot move an existing binding.",
-            json!({"task_id":string(),"target_node":string(),"session_id":string(),"executor":{"type":"string","enum":["codex","cursor_agent","claude_code"]},"cwd":string()}),
-            vec!["task_id", "target_node", "session_id", "executor", "cwd"],
+            "delegate",
+            "Delegate coding work. Omitted cwd/target use the Bot project preference when available; otherwise supply an allowed cwd. The Node chooses and freezes the target, session and operations. If opening is pending, reuse the returned call_ref with identical arguments to continue that same delegation.",
+            json!({"text":string(),"cwd":string(),"target_node":string(),"executor":{"type":"string","enum":["codex","cursor_agent","claude_code"]},"call_ref":string()}),
+            vec!["text"],
         ),
         (
-            "open_execution",
-            "Open one execution session. Reuse operation_id and session_id for the same request; unknown outcomes require reconciliation.",
-            json!({"operation_id":string(),"session_id":string(),"target_node":string(),"executor":{"type":"string","enum":["codex","cursor_agent","claude_code"]},"cwd":string(),"task_id":string()}),
-            vec![
-                "operation_id",
-                "session_id",
-                "target_node",
-                "executor",
-                "cwd",
-                "task_id",
-            ],
-        ),
-        (
-            "send_execution",
-            "Send to an existing concrete session at its current revision. Never resend an unknown operation with a fresh ID.",
-            json!({"operation_id":string(),"session_id":string(),"target_node":string(),"expected_revision":{"type":"integer","minimum":0},"text":string(),"task_id":string()}),
-            vec![
-                "operation_id",
-                "session_id",
-                "target_node",
-                "expected_revision",
-                "text",
-                "task_id",
-            ],
+            "continue_execution",
+            "Continue or steer work returned by delegate using its work_ref. The Node checks the current revision and executor capabilities. Never approve requests or expand authorization.",
+            json!({"work_ref":string(),"text":string(),"call_ref":string()}),
+            vec!["work_ref", "text"],
         ),
         (
             "execution_status",
-            "Read actual status without sending a task or approving anything. For a remote Node, supply operation_id from its original Project dispatch.",
-            json!({"target_node":string(),"session_id":string(),"operation_id":string()}),
-            vec!["target_node", "session_id"],
+            "Read work in this conversation. Supply a returned work_ref for actual operation and session status; omit it to list known work references. This never sends work or approves anything.",
+            json!({"work_ref":string()}),
+            vec![],
         ),
         (
             "stop_execution",
@@ -583,20 +563,11 @@ pub fn tools() -> BTreeMap<String, CustomToolConfig> {
             vec!["call_ref"],
         ),
     ];
-    specs.into_iter().map(|(name, description, mut properties, required)| {
-        if matches!(name, "bind_execution" | "open_execution" | "send_execution") {
-            properties["execution_resource"] = json!({"type":"object","properties":{"space":string(),"resource":string()},"required":["space","resource"],"additionalProperties":false,"description":"Required for a remote Node: the explicitly authorized execution resource."});
-            properties["target_public_key"] = json!({"type":"string","minLength":1,"description":"Required for a remote Node: its independently verified public key."});
-            properties["execution_grant"] = json!({"type":"string","minLength":1,"description":"Required for a remote Node: select an existing authorized execution grant ID."});
-        }
-        if name == "send_execution" {
-            properties["prior_operation_id"] = json!({"type":"string","minLength":1,"description":"Required for a remote Node: the original known terminal operation for this exact task binding and session. Unknown outcomes require reconciliation."});
-        }
-        (name.into(), CustomToolConfig {
+    specs.into_iter().map(|(name, description, properties, required)| (name.into(), CustomToolConfig {
         description: Some(description.into()),
         input_schema: json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
         output_schema: None,
-    })}).collect()
+    })).collect()
 }
 
 fn utc_day(seconds: u64) -> String {
