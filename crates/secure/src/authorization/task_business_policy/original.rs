@@ -408,6 +408,10 @@ pub struct VerifiedTaskBusinessOriginalSource {
 }
 
 impl VerifiedTaskBusinessOriginalSource {
+    pub(super) fn source_snapshot(&self) -> &VerifiedPolicySnapshot {
+        &self.source.snapshot
+    }
+
     pub fn wire(&self) -> &TaskBusinessWire {
         &self.wire
     }
