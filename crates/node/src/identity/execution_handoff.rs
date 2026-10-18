@@ -184,7 +184,9 @@ fn capsule_facts(
                     | "request"
                     | "sdk_session"
                     | "parent_invocation"
+                    | "task_id"
                     | "task_ref"
+                    | "basis_heads"
                     | "execution_resource"
                     | "target_public_key"
                     | "execution_grant"
@@ -279,7 +281,11 @@ fn capsule_facts(
                 && (body["conversation_id"].is_null()
                     || body["conversation_id"].as_str() == Some(conversation))
                 && request.network_id == project.space.as_str()
-                && body["method"] == "operate",
+                && body["method"] == "operate"
+                && (body.get("task_id").is_none()
+                    || body["task_id"] == serde_json::to_value(&request.task_id)?)
+                && (body.get("basis_heads").is_none()
+                    || body["basis_heads"] == serde_json::to_value(&request.basis_heads)?),
             "capsule operation scope changed"
         );
         let binding = request
