@@ -3,6 +3,7 @@ import { validEndpoint, validTarget } from '../../transport.js'
 import type { RemoteExecutionObservation, RemoteExecutionRequestInput, RemoteExecutionResolutionResult, TrustedRemoteExecution } from './remote-execution'
 import type { verifyScopedAuthentication } from './authorization'
 import type { AuthorizationTrust } from './authorization-trust'
+import type { RemoteExecutionPolicyUse } from './remote-execution-policy-ingress'
 
 export type ConnectionEntry = { address: string; node_id: string; relay: boolean }
 export type ConnectionCard = { kind: 'connection'; entry: ConnectionEntry; nodePublicKey: string } | { kind: 'claim'; entry: ConnectionEntry; nodePublicKey: string; capability: string; claimNonce: string }
@@ -30,7 +31,7 @@ export type ReadyConnection = {
   readonly audiencePublicKey: string
   currentRemoteExecutionTrust(trust: AuthorizationTrust): AuthorizationTrust
   persistRemoteExecutionTrust(trust: AuthorizationTrust): Promise<AuthorizationTrust>
-  remote(value: TrustedRemoteExecution, context: Record<string, unknown>, action: string): Promise<ReturnType<ReturnType<typeof verifyScopedAuthentication>['remote']>>
+  remote(value: TrustedRemoteExecution, context: Record<string, unknown>, action: string, use?: RemoteExecutionPolicyUse): Promise<ReturnType<ReturnType<typeof verifyScopedAuthentication>['remote']>>
   projectExecutionMetadata: ReturnType<typeof verifyScopedAuthentication>['projectExecutionMetadata']
   remoteExecutionResultHistory(remote: TrustedRemoteExecution, actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown>): Promise<RemoteExecutionObservation>
   remoteResolutionHistory(remote: TrustedRemoteExecution, actual: Record<string, unknown>, original: AuthorizedRequest): Promise<RemoteExecutionResolutionResult>

@@ -14,6 +14,7 @@ import { mergeAuthorizationTrust, parseAuthorizationSelection, parseAuthorizatio
 import { readClientPolicyAuthorization } from '@/lib/client-policy'
 import { readRemoteSharePolicy } from '@/lib/source-share-policy'
 import { readRemoteExecutionPolicy } from '@/lib/remote-execution-policy'
+import type { RemoteExecutionPolicyUse } from '@/lib/remote-execution-policy-ingress'
 import { readRemoteExecutionHistoryPolicy } from '@/lib/remote-execution-history-policy'
 import { callExecutionResource as callPinnedExecutionResource } from '@/lib/execution-resource-call'
 import type { VerifiedClientAuthorization, VerifiedEnrollmentOffer } from '../../../generated/vibeface_secure.js'
@@ -350,7 +351,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     function currentProjectTrust() {
       return authorization.revalidate(mergedRemotePolicyTrust(mergeAuthorizationTrust(authorization.trust, savedSpaces()), signingProfile))
     }
-    async function verifyRemotePolicy(value: Parameters<ReturnType<typeof verifyScopedAuthentication>['remote']>[0], context: Record<string, unknown>, action: string, purpose?: 'execution' | 'observation_read' | 'resolver') {
+    async function verifyRemotePolicy(value: Parameters<ReturnType<typeof verifyScopedAuthentication>['remote']>[0], context: Record<string, unknown>, action: string, purpose?: 'execution' | 'observation_read' | 'resolver', use?: RemoteExecutionPolicyUse) {
       const controller = new AbortController(); independentReads.current.add(controller)
       const check = () => { controller.signal.throwIfAborted(); if (session.current !== active || active.authorization !== authorization || identityRef.current !== signingProfile) throw changed() }
       let bChannel: DeviceChannel | null = null, cChannel: DeviceChannel | null = null
@@ -372,7 +373,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           canonical_cwd: context.canonical_cwd === null ? null : text(context.canonical_cwd), execution_target_public_key: target }
         policy = await readRemoteExecutionPolicy({ bChannel, cChannel, sourceNodePublicKey, executionNodePublicKey: target,
           withSource: work => withSessionAuthorization(active, signingProfile, work, controller.signal), selection: remote.share.selection, context: preparedContext,
-          action, purpose: purpose ?? (proposed.purpose === 'resolution' ? 'resolver' : 'execution'), executionTrust: remote.trust,
+          action, purpose: purpose ?? (proposed.purpose === 'resolution' ? 'resolver' : 'execution'), use, executionTrust: remote.trust,
           latestExecutionTrust: () => mergedRemotePolicyTrust(remote.trust, signingProfile), check, signal: controller.signal })
         const completed = policy
         return await withSessionAuthorization(active, signingProfile, () => {
@@ -496,7 +497,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       request: (method, params) => { if (session.current !== active || active.authorization !== authorization) return Promise.reject(changed()); return request(method, params) },
       rpc: (method, params, facts) => signedCall(method, params, 'rpc', undefined, facts).then(reply => reply.result),
       rpcWithProof: (method, params, beforeSend, facts, replay) => signedCall(method, params, 'rpc', beforeSend, facts, replay),
-      remote: (value, rawContext, action) => verifyRemotePolicy(value, rawContext, action),
+      remote: (value, rawContext, action, use) => verifyRemotePolicy(value, rawContext, action, undefined, use),
       currentRemoteExecutionTrust(trust) {
         if (session.current !== active || active.authorization !== authorization || identityRef.current !== own) throw changed()
         return mergedRemotePolicyTrust(trust, own, true)

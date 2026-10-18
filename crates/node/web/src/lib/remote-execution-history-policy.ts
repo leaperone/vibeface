@@ -5,6 +5,7 @@ import type { VerifiedClientAuthorization, VerifiedRemoteExecutionHistoryPolicy 
 import type { AuthorizationTrust } from './authorization-trust'
 import type { AuthorizedRequest } from './node'
 import { record } from './node'
+import { beginForeignExecutionPolicyImport, lookupForeignExecutionPolicy } from './remote-execution-policy-ingress'
 
 export async function readRemoteExecutionHistoryPolicy(input: {
   withSource<T>(work: (source: VerifiedClientAuthorization) => T): Promise<T>
@@ -27,7 +28,7 @@ export async function readRemoteExecutionHistoryPolicy(input: {
   }
   const call = async (channel: DeviceChannel, method: string, params: Record<string, unknown>) => {
     check()
-    const response = await channel.request(method, params)
+    const response = await channel.request('identity', { method, params })
     check()
     return record(response)
   }
@@ -38,6 +39,9 @@ export async function readRemoteExecutionHistoryPolicy(input: {
   const intentJson = await input.withSource(source => buildClientRemoteExecutionHistoryPolicyReadIntent(source, intentInputJson, pinsJson, Date.now() + 120_000))
   check()
   const intent = record(JSON.parse(intentJson))
+  const callSource = (method: string, params: Record<string, unknown>) => call(input.bChannel, method, params)
+  const selected = await lookupForeignExecutionPolicy(callSource, intent)
+  if (selected.approvalRef === undefined) throw new Error('来源节点缺少原任务已批准的执行政策，请先同步并核对历史。')
   const delegated = await call(input.bChannel, 'remote_execution_policy_delegate', intent)
   const request = { intent, delegation: record(delegated.delegation) }
   const requestJson = JSON.stringify(request)
@@ -45,28 +49,33 @@ export async function readRemoteExecutionHistoryPolicy(input: {
   let importer: ReturnType<typeof beginRemoteExecutionHistoryPolicyImport> | null = null
   let policy: VerifiedRemoteExecutionHistoryPolicy | null = null
   try {
+    const snapshot = record(begun.snapshot)
     importer = await input.withSource(source => {
-      const created = beginRemoteExecutionHistoryPolicyImport(source, requestJson, JSON.stringify(record(begun.snapshot)), pinsJson, input.executionNodePublicKey, Date.now())
+      const created = beginRemoteExecutionHistoryPolicyImport(source, requestJson, JSON.stringify(snapshot), pinsJson, input.executionNodePublicKey, Date.now())
       importer = created
       return created
     })
     check()
+    const ingress = await beginForeignExecutionPolicyImport({ call: callSource, request, snapshot, approvalRef: selected.approvalRef, purpose: 'history' })
     for (;;) {
       const paramsJson = importer.pageRequestJson()
       const response = await call(input.cChannel, 'remote_execution_policy_page', record(JSON.parse(paramsJson)))
       const page = record(response.page)
       importer.appendPage(JSON.stringify(page), Date.now())
+      await ingress.append(page)
       if (record(page.payload).complete === true) break
       if (importer.pageRequestJson() === paramsJson) throw new Error('历史政策分页没有继续推进。')
     }
     const params = record(JSON.parse(importer.pageRequestJson()))
     const response = await call(input.cChannel, 'remote_execution_policy_finish', { ...params, cursor: null })
-    const witnessJson = JSON.stringify(record(response.witness))
+    const witness = record(response.witness), witnessJson = JSON.stringify(witness)
     const completed = importer; importer = null
     policy = completed.finish(witnessJson, Date.now())
     check()
     const current = policy.revalidatePins(JSON.stringify(input.latestIndependentPins()), Date.now())
     policy.free(); policy = current
+    check()
+    await ingress.finish(witness)
     check()
     const result = policy; policy = null
     return result

@@ -6,6 +6,7 @@ import { integer, same, text } from "@/lib/node"
 import { parseRemoteExecutionShare, parseTrustedRemoteExecution, remoteExecutionParams, remoteExecutionProposal } from "@/lib/remote-execution"
 import type { RemoteExecutionObservation, RemoteExecutionPurpose, RemoteExecutionSession, TrustedRemoteExecution } from "@/lib/remote-execution"
 import { prepareContext } from "@/lib/rpc-prepare"
+import type { RemoteExecutionPolicyUse } from "@/lib/remote-execution-policy-ingress"
 import { nodeFingerprint, signedInvocationHash, verifyRemoteExecutionSeal } from "../../../generated/vibeface_secure.js"
 import { verifyBoundExecutionSelection, verifyExecutionBinding, verifyTaskCreation } from "@/lib/task-proof"
 import { prepareSend } from "../chat/protocol"
@@ -149,12 +150,12 @@ function useWorkspaceState(connection: ReadyConnection) {
     requireCurrent()
     return currentRemoteTrust({ ...remote, trust })
   }
-  const verifyRemoteScope = async (remote: TrustedRemoteExecution, rawContext: Record<string, unknown>, action: string) => {
-    const initial = await connection.remote(remote, rawContext, action)
+  const verifyRemoteScope = async (remote: TrustedRemoteExecution, rawContext: Record<string, unknown>, action: string, use?: RemoteExecutionPolicyUse) => {
+    const initial = await connection.remote(remote, rawContext, action, use)
     let trusted: TrustedRemoteExecution
     try { trusted = await saveRemoteTrust({ ...remote, trust: initial.trust }) }
     finally { initial.release() }
-    return { authorization: trusted, verified: await connection.remote(trusted, rawContext, action) }
+    return { authorization: trusted, verified: await connection.remote(trusted, rawContext, action, use) }
   }
   const remoteForSession = (targetNode: string, sessionId: string, taskRef: string, purpose: RemoteExecutionPurpose = 'execution') => {
     if (targetNode === nodeFingerprint(connection.audiencePublicKey)) return undefined
@@ -685,7 +686,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       }
       const facts: RpcFacts = { taskRef: proposed.taskRef, execution: { sessionId: proposed.sessionId, executorKind: proposed.executorKind, canonicalCwd, bindingGeneration }, remote: { authorization: candidate, targetDevice: proposed.targetDevice } }
       const rawContext = prepareContext({ conversation_id: activeId.current, task_id: task.task_id, session_id: proposed.sessionId }, connection.audience.device, connection.project.id, facts)
-      const { authorization: trusted, verified } = await verifyRemoteScope(candidate, rawContext, action)
+      const { authorization: trusted, verified } = await verifyRemoteScope(candidate, rawContext, action, { kind: 'candidate', binding: task.binding })
       try {
         const original = remotesRef.current.find(item => item.share.selection.execution_grant === share.selection.execution_grant)
         if (original && !same(original.share, share)) throw new Error("同一远端 Grant 的分享内容发生变化，请保留原授权并核对。")
