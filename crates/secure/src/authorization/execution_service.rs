@@ -53,6 +53,72 @@ pub struct ExecutionServiceRegistrationRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct ExecutionServiceInstallIntent {
+    pub version: u16,
+    pub account: AccountId,
+    pub registration_hash: ObjectHash,
+    pub committed_hash: ObjectHash,
+    pub target_node_public_key: PublicKey,
+    pub canonical_root: String,
+    pub expected_heads: Vec<PolicyStamp>,
+    pub challenge_hash: ObjectHash,
+    pub nonce: Nonce,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+impl sealed::Sealed for ExecutionServiceInstallIntent {}
+impl SignedObject for ExecutionServiceInstallIntent {
+    const DOMAIN: &'static str = "execution-service-install-intent-v2";
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionServiceInstallRequest {
+    pub registration: ExecutionServiceRegistrationRequest,
+    pub committed: Committed<SpaceDocument>,
+    pub challenge: Signed<FreshnessChallenge>,
+    pub intent: Signed<ExecutionServiceInstallIntent>,
+}
+
+pub struct VerifiedExecutionServiceInstall {
+    source_project: ResourceRef,
+    execution_resource: ResourceRef,
+    management_parent: ObjectHash,
+    canonical_root: String,
+    nonce: Nonce,
+    request_hash: ObjectHash,
+    expires_at_ms: u64,
+    proof_counts: RegistrationProofCounts,
+}
+impl VerifiedExecutionServiceInstall {
+    pub fn source_project(&self) -> &ResourceRef {
+        &self.source_project
+    }
+    pub fn execution_resource(&self) -> &ResourceRef {
+        &self.execution_resource
+    }
+    pub fn management_parent(&self) -> &ObjectHash {
+        &self.management_parent
+    }
+    pub fn canonical_root(&self) -> &str {
+        &self.canonical_root
+    }
+    pub fn nonce(&self) -> &Nonce {
+        &self.nonce
+    }
+    pub fn request_hash(&self) -> &ObjectHash {
+        &self.request_hash
+    }
+    pub fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+    pub fn proof_usage_json(&self) -> crate::Result<String> {
+        json(&self.proof_counts)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionServiceSelection {
     pub source_project: ResourceRef,
     pub execution_resource: ResourceRef,
@@ -133,6 +199,7 @@ fn management_actions() -> Vec<Action> {
     vec![
         Action::ExecutionOpen,
         Action::ExecutionSend,
+        Action::ExecutionCommand,
         Action::ExecutionSteer,
         Action::ExecutionInterrupt,
         Action::ExecutionRespondApproval,
@@ -140,6 +207,7 @@ fn management_actions() -> Vec<Action> {
         Action::ExecutionResolve,
         Action::OperationStatusRead,
         Action::OperationResolve,
+        Action::ResourceManage,
         Action::GrantIssue,
         Action::GrantRevoke,
     ]
@@ -202,12 +270,27 @@ fn authorization(
             .ok_or(AuthorizationError::InvalidProof(
                 "missing execution source project",
             ))?;
+    let source_audience = &state
+        .grant(source_grant)
+        .ok_or(AuthorizationError::Revoked)?
+        .payload
+        .audience;
+    let source_host = state.find_device(&source_audience.device)?;
     require(
         record.payload.kind == ResourceKind::Project
-            && record.payload.host == ServiceId::from_key(node),
-        "execution source must be a project hosted by the selected node",
+            && record.payload.host == source_audience.service
+            && source_host.payload.subject == Actor::Service(source_audience.service.clone()),
+        "execution management grant belongs to another Project host",
     )?;
     budget.verify(record)?;
+    state.validate_service_reference(&source.space, source_host)?;
+    state.validate_certificate(
+        source_host,
+        now,
+        budget,
+        &mut dependencies,
+        &mut BTreeSet::new(),
+    )?;
     state.validate_certificate(target, now, budget, &mut dependencies, &mut BTreeSet::new())?;
     dependencies.extend(budget.dependencies.clone());
     state.dependency(
@@ -733,6 +816,209 @@ pub fn verify_execution_service_registration_commit(
     Ok(verified)
 }
 
+fn install_root(root: &str) -> Result<()> {
+    require(
+        root.starts_with('/')
+            && root.len() <= 4096
+            && !root.chars().any(char::is_control)
+            && (root == "/" || !root.ends_with('/'))
+            && !root.contains("//")
+            && root.split('/').all(|part| part != "." && part != ".."),
+        "execution install requires a canonical configured root",
+    )
+}
+
+fn install_context(
+    state: &VerifiedPolicySet,
+    registration: &ExecutionServiceRegistrationRequest,
+    committed: &Committed<SpaceDocument>,
+    client: &PublicKey,
+    target: &PublicKey,
+    canonical_root: &str,
+    now: u64,
+) -> Result<(
+    VerifiedExecutionServiceRegistrationRequest,
+    ExecutionProofUsage,
+    ObjectHash,
+)> {
+    install_root(canonical_root)?;
+    let intent = &registration.intent.payload;
+    let accepted = committed.commit.payload.accepted_at_ms;
+    require(
+        intent.target_node_public_key == *target
+            && accepted <= now
+            && state.commits.get(&committed.proposal.hash()?) == Some(&committed.commit),
+        "execution install requires the exact accepted authority commit",
+    )?;
+    let historical = super::remote_resolution_history::at_heads(state, &intent.expected_heads)?;
+    let registered = verify_execution_service_registration_commit(
+        &historical,
+        registration,
+        committed,
+        None,
+        target,
+        accepted,
+    )?;
+    let mut budget = Budget::default();
+    let mut current = authorization(
+        state,
+        &intent.account,
+        client,
+        &intent.source_project,
+        &intent.source_grant,
+        target,
+        now,
+        &mut budget,
+        true,
+    )?;
+    let [JournalEntry::Resource(_), JournalEntry::Grant(parent)] =
+        registration.request.new_objects.as_slice()
+    else {
+        return Err(AuthorizationError::InvalidProof(
+            "invalid execution install registration",
+        ));
+    };
+    let parent_hash = parent.hash()?;
+    verify_management_parent(
+        state,
+        &intent.account,
+        client,
+        &intent.execution_resource,
+        &parent_hash,
+        target,
+        now,
+        &mut budget,
+    )?;
+    current.budget = budget;
+    let mut usage = registered.proof_usage()?;
+    usage.record_budget(&current.budget)?;
+    usage.record_metadata(&(registration, committed, canonical_root))?;
+    usage.enforce_limits()?;
+    Ok((current, usage, parent_hash))
+}
+
+pub fn issue_execution_service_install_challenge(
+    state: &VerifiedPolicySet,
+    registration: &ExecutionServiceRegistrationRequest,
+    committed: &Committed<SpaceDocument>,
+    account_client: &PublicKey,
+    canonical_root: &str,
+    signer: &Identity,
+    now: u64,
+) -> Result<Signed<FreshnessChallenge>> {
+    let _signatures = ScopedSignatureVerification::new();
+    let target = PublicKey::of(signer);
+    let (current, mut usage, _) = install_context(
+        state,
+        registration,
+        committed,
+        account_client,
+        &target,
+        canonical_root,
+        now,
+    )?;
+    let nonce = Nonce::random()?;
+    let challenge = Signed::sign(
+        FreshnessChallenge {
+            version: AUTH_VERSION,
+            stage: CheckStage::Admit,
+            invocation_hash: registration.intent.hash()?,
+            operation_id: format!("execution-service-install:{nonce}"),
+            body_hash: ObjectHash::body(&(registration, committed, canonical_root))?,
+            audience: Audience {
+                service: ServiceId::from_key(&target),
+                device: DeviceId::from_key(&target),
+            },
+            presenter: DeviceId::from_key(account_client),
+            policies: current.expected_heads,
+            nonce,
+            issued_at_ms: now,
+            expires_at_ms: now.saturating_add(EXECUTION_LEASE_MS).min(current.expires),
+        },
+        signer,
+    )?;
+    usage.record_signed(&challenge)?;
+    finish_native_usage(&mut usage)?;
+    Ok(challenge)
+}
+
+pub fn verify_execution_service_install(
+    state: &VerifiedPolicySet,
+    request: &ExecutionServiceInstallRequest,
+    local_node: &PublicKey,
+    configured_root: &str,
+    now: u64,
+) -> Result<VerifiedExecutionServiceInstall> {
+    let _signatures = ScopedSignatureVerification::new();
+    require(
+        canonical(request)?.len() <= MAX_PROOF_BYTES,
+        "execution install is too large",
+    )?;
+    request.intent.verify_signature()?;
+    request.challenge.verify_signature()?;
+    let intent = &request.intent.payload;
+    let challenge = &request.challenge.payload;
+    let registration = &request.registration.intent.payload;
+    let (current, mut usage, parent) = install_context(
+        state,
+        &request.registration,
+        &request.committed,
+        &request.intent.issuer,
+        local_node,
+        configured_root,
+        now,
+    )?;
+    validate_window(intent.issued_at_ms, intent.expires_at_ms, now)?;
+    validate_window(challenge.issued_at_ms, challenge.expires_at_ms, now)?;
+    require(
+        intent.version == AUTH_VERSION
+            && intent.account == registration.account
+            && intent.registration_hash == ObjectHash::body(&request.registration)?
+            && intent.committed_hash == ObjectHash::body(&request.committed)?
+            && intent.target_node_public_key == *local_node
+            && intent.canonical_root == configured_root
+            && intent.expected_heads == current.expected_heads
+            && intent.challenge_hash == request.challenge.hash()?
+            && intent.nonce == challenge.nonce
+            && intent.issued_at_ms >= challenge.issued_at_ms
+            && intent.expires_at_ms <= challenge.expires_at_ms
+            && request.challenge.issuer == *local_node
+            && challenge.version == AUTH_VERSION
+            && challenge.stage == CheckStage::Admit
+            && challenge.invocation_hash == request.registration.intent.hash()?
+            && challenge.operation_id == format!("execution-service-install:{}", challenge.nonce)
+            && challenge.body_hash
+                == ObjectHash::body(&(&request.registration, &request.committed, configured_root))?
+            && challenge.audience
+                == (Audience {
+                    service: ServiceId::from_key(local_node),
+                    device: DeviceId::from_key(local_node),
+                })
+            && challenge.presenter == DeviceId::from_key(&request.intent.issuer)
+            && challenge.policies == current.expected_heads
+            && challenge.expires_at_ms <= current.expires
+            && challenge
+                .expires_at_ms
+                .saturating_sub(challenge.issued_at_ms)
+                <= EXECUTION_LEASE_MS,
+        "execution install differs from its current owner and target challenge",
+    )?;
+    usage.record_signed(&request.intent)?;
+    usage.record_signed(&request.challenge)?;
+    usage.record_metadata(request)?;
+    let proof_counts = finish_native_usage(&mut usage)?;
+    Ok(VerifiedExecutionServiceInstall {
+        source_project: registration.source_project.clone(),
+        execution_resource: registration.execution_resource.clone(),
+        management_parent: parent,
+        canonical_root: configured_root.to_owned(),
+        nonce: challenge.nonce.clone(),
+        request_hash: ObjectHash::body(request)?,
+        expires_at_ms: intent.expires_at_ms,
+        proof_counts,
+    })
+}
+
 fn revalidate_selected(
     authorization: &VerifiedClientAuthorization,
     snapshot: &VerifiedPolicySnapshot,
@@ -853,8 +1139,8 @@ pub fn select_execution_service_management(
             .clone();
         let current = revalidate_selected(source, snapshot, &project, &signer, now)?;
         require(
-            current.audience_public_key == target
-                && current.resources[0].payload.kind == ResourceKind::Project,
+            current.resources[0].payload.kind == ResourceKind::Project
+                && current.resources[0].payload.host == current.audience.service,
             "execution management selection changed its source Project host",
         )?;
         let document = snapshot
@@ -1195,6 +1481,9 @@ impl PreparedExecutionServiceRegistration {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 pub struct VerifiedExecutionServiceRegistration {
     resource: ResourceRef,
+    registration: ExecutionServiceRegistrationRequest,
+    committed: Committed<SpaceDocument>,
+    snapshot: VerifiedPolicySnapshot,
     authorization: VerifiedClientAuthorization,
     material_json: zeroize::Zeroizing<String>,
     proof_counts: RegistrationProofCounts,
@@ -1295,10 +1584,13 @@ pub fn finish_execution_service_registration(
         usage.record_metadata(&material)?;
         usage.record_metadata(&prepared.request)?;
         let proof_counts = finish_native_usage(&mut usage)?;
-        authorization.imported_snapshot = Some(snapshot);
+        authorization.imported_snapshot = Some(snapshot.clone());
         authorization.client_policy_usage = Some(usage);
         Ok(VerifiedExecutionServiceRegistration {
             resource: intent.payload.execution_resource.clone(),
+            registration: prepared.request.clone(),
+            committed,
+            snapshot,
             authorization,
             material_json,
             proof_counts,
@@ -1309,6 +1601,61 @@ pub fn finish_execution_service_registration(
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
 impl VerifiedExecutionServiceRegistration {
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = prepareInstall))]
+    pub fn prepare_install(
+        &self,
+        challenge_json: &str,
+        canonical_root: &str,
+        signer: &Identity,
+        now_ms: f64,
+    ) -> crate::Result<String> {
+        (|| -> Result<String> {
+            let now = bootstrap::timestamp(now_ms)?;
+            let challenge: Signed<FreshnessChallenge> = parse(challenge_json)?;
+            let client = PublicKey::of(signer);
+            require(
+                self.authorization.scope.device_id == DeviceId::from_key(&client),
+                "execution install changed its registered Account client",
+            )?;
+            let request = ExecutionServiceInstallRequest {
+                registration: self.registration.clone(),
+                committed: self.committed.clone(),
+                intent: Signed::sign(
+                    ExecutionServiceInstallIntent {
+                        version: AUTH_VERSION,
+                        account: self.registration.intent.payload.account.clone(),
+                        registration_hash: ObjectHash::body(&self.registration)?,
+                        committed_hash: ObjectHash::body(&self.committed)?,
+                        target_node_public_key: self
+                            .registration
+                            .intent
+                            .payload
+                            .target_node_public_key
+                            .clone(),
+                        canonical_root: canonical_root.to_owned(),
+                        expected_heads: challenge.payload.policies.clone(),
+                        challenge_hash: challenge.hash()?,
+                        nonce: challenge.payload.nonce.clone(),
+                        issued_at_ms: now,
+                        expires_at_ms: challenge.payload.expires_at_ms,
+                    },
+                    signer,
+                )?,
+                challenge,
+            };
+            verify_execution_service_install(
+                self.snapshot.state(),
+                &request,
+                &self.registration.intent.payload.target_node_public_key,
+                canonical_root,
+                now,
+            )?;
+            serde_json::to_string(&request)
+                .map_err(|_| AuthorizationError::InvalidProof("execution install encoding failed"))
+        })()
+        .map_err(|error| error.to_string())
+    }
+
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = proofUsageJson))]
     pub fn proof_usage_json(&self) -> crate::Result<String> {
         json(&self.proof_counts)
@@ -1509,12 +1856,19 @@ mod tests {
         source: &VerifiedClientAuthorization,
         project: &ResourceRef,
     ) -> VerifiedExecutionServiceManagementSelection {
+        management_selection_for(source, project, &key(4))
+    }
+    fn management_selection_for(
+        source: &VerifiedClientAuthorization,
+        project: &ResourceRef,
+        target: &Identity,
+    ) -> VerifiedExecutionServiceManagementSelection {
         let mut cursor = "null".to_owned();
         loop {
             let page = select_execution_service_management(
                 source,
                 &json(project).unwrap(),
-                &key(4).public_key_hex(),
+                &target.public_key_hex(),
                 &cursor,
                 NOW,
             )
@@ -1532,6 +1886,15 @@ mod tests {
         }
     }
     fn registration() -> (
+        VerifiedPolicySet,
+        PreparedExecutionServiceRegistration,
+        VerifiedClientAuthorization,
+    ) {
+        registration_for_node(false)
+    }
+    fn registration_for_node(
+        separate_executor: bool,
+    ) -> (
         VerifiedPolicySet,
         PreparedExecutionServiceRegistration,
         VerifiedClientAuthorization,
@@ -1571,8 +1934,47 @@ mod tests {
         )
         .unwrap();
         let pins: Vec<PolicyPin> = parse(&created.pins_json().unwrap()).unwrap();
-        let bundle: ClientAuthorizationBundle = parse(&created.bundle_json().unwrap()).unwrap();
-        let state = replay_policies(&pins, &bundle.journal).unwrap();
+        let mut bundle: ClientAuthorizationBundle = parse(&created.bundle_json().unwrap()).unwrap();
+        let mut state = replay_policies(&pins, &bundle.journal).unwrap();
+        let target = if separate_executor { key(5) } else { key(4) };
+        if separate_executor {
+            let account: AccountId = parse::<ClientScope>(&created.scope_json().unwrap())
+                .unwrap()
+                .account_id;
+            let mut certificate = DeviceCertificate {
+                version: AUTH_VERSION,
+                owner: PolicyDomain::Account(account.clone()),
+                subject: Actor::Service(ServiceId::from_key(&PublicKey::of(&target))),
+                device: DeviceId::from_key(&PublicKey::of(&target)),
+                public_key: PublicKey::of(&target),
+                uses: vec![DeviceUse::Noise, DeviceUse::ServiceInvocation],
+                possession: None,
+                enrollment_grant: None,
+                issued_under: state
+                    .head(&PolicyDomain::Account(account.clone()))
+                    .unwrap()
+                    .clone(),
+                nonce: Nonce::random().unwrap(),
+                not_before_ms: 0,
+                expires_at_ms: 1_000_000,
+            };
+            certificate.prove_possession(&target).unwrap();
+            let certificate = Signed::sign(certificate, &key(1)).unwrap();
+            let hash = state
+                .install_device(certificate.clone(), NOW as u64)
+                .unwrap();
+            let mut document = state.account(&account).unwrap().clone();
+            document.previous = state.head(&PolicyDomain::Account(account.clone())).cloned();
+            document.sequence += 1;
+            document.devices.push(hash);
+            document.devices.sort();
+            let document = Signed::sign(document, &key(1)).unwrap();
+            state.install_account(document.clone()).unwrap();
+            bundle.journal.extend([
+                JournalEntry::Device(certificate),
+                JournalEntry::Account(document),
+            ]);
+        }
         let source = bundle
             .journal
             .iter()
@@ -1585,14 +1987,14 @@ mod tests {
             })
             .unwrap();
         let authorization = confirmed_authorization(&state, &pins, &bundle, &source);
-        let management = management_selection(&authorization, &source);
+        let management = management_selection_for(&authorization, &source, &target);
         let registration = prepare_execution_service_registration(
             &authorization,
             &management,
             &authorization,
             &material,
             &key(3),
-            &key(4).public_key_hex(),
+            &target.public_key_hex(),
             NOW,
             NOW + 60_000.0,
         )
@@ -1607,7 +2009,7 @@ mod tests {
         let verified = verify_execution_service_registration(
             state,
             &prepared.request,
-            &PublicKey::of(&key(4)),
+            &prepared.request.intent.payload.target_node_public_key,
             NOW as u64,
         )
         .unwrap();
@@ -1661,6 +2063,171 @@ mod tests {
             commit: Signed::sign(accepted, &key(4)).unwrap(),
             receipts,
         }
+    }
+
+    #[test]
+    fn separate_executor_installs_only_the_committed_resource_and_challenged_root() {
+        let (mut state, prepared, _) = registration_for_node(true);
+        let source = &prepared.request.intent.payload.source_project;
+        assert_eq!(
+            state
+                .resource(&source.space, &source.resource)
+                .unwrap()
+                .payload
+                .host,
+            ServiceId::from_key(&PublicKey::of(&key(4)))
+        );
+        assert_eq!(
+            prepared.request.intent.payload.target_node_public_key,
+            PublicKey::of(&key(5))
+        );
+        assert!(
+            !state
+                .resources
+                .values()
+                .any(|record| record.payload.kind == ResourceKind::Project
+                    && record.payload.host == ServiceId::from_key(&PublicKey::of(&key(5))))
+        );
+        let commit = committed(&state, &prepared);
+        let JournalEntry::Grant(parent) = &prepared.request.request.new_objects[1] else {
+            unreachable!()
+        };
+        assert!(parent.payload.actions.contains(&Action::ExecutionCommand));
+        assert!(parent.payload.actions.contains(&Action::ResourceManage));
+        let registered =
+            finish_execution_service_registration(&prepared, &json(&commit).unwrap(), NOW).unwrap();
+        let root = "/configured/executor";
+        assert!(
+            issue_execution_service_install_challenge(
+                &state,
+                &prepared.request,
+                &commit,
+                &PublicKey::of(&key(3)),
+                root,
+                &key(5),
+                NOW as u64
+            )
+            .is_err()
+        );
+        for entry in &prepared.request.request.new_objects {
+            match entry {
+                JournalEntry::Resource(resource) => {
+                    state.install_resource(resource.clone()).unwrap();
+                }
+                JournalEntry::Grant(grant) => {
+                    state.install_grant(grant.clone(), NOW as u64).unwrap();
+                }
+                _ => unreachable!(),
+            }
+        }
+        state
+            .install_space_committed(commit.clone(), NOW as u64)
+            .unwrap();
+        let before = state
+            .head(&PolicyDomain::Space(source.space.clone()))
+            .unwrap()
+            .clone();
+        let challenge = issue_execution_service_install_challenge(
+            &state,
+            &prepared.request,
+            &commit,
+            &PublicKey::of(&key(3)),
+            root,
+            &key(5),
+            NOW as u64,
+        )
+        .unwrap();
+        let request: ExecutionServiceInstallRequest = parse(
+            &registered
+                .prepare_install(&json(&challenge).unwrap(), root, &key(3), NOW)
+                .unwrap(),
+        )
+        .unwrap();
+        let verify = |request: &ExecutionServiceInstallRequest, root: &str| {
+            verify_execution_service_install(
+                &state,
+                request,
+                &PublicKey::of(&key(5)),
+                root,
+                NOW as u64,
+            )
+        };
+        let verified = verify(&request, root).unwrap();
+        assert_eq!(verified.source_project(), source);
+        assert_eq!(
+            verified.execution_resource(),
+            &prepared.request.intent.payload.execution_resource
+        );
+        assert_eq!(verified.canonical_root(), root);
+        assert_eq!(verified.nonce(), &challenge.payload.nonce);
+        assert_eq!(
+            state.head(&PolicyDomain::Space(source.space.clone())),
+            Some(&before)
+        );
+        assert!(verify(&request, "/configured/other").is_err());
+        let mut changed = request.clone();
+        changed.intent.payload.canonical_root = "/configured/other".into();
+        changed.intent = Signed::sign(changed.intent.payload, &key(3)).unwrap();
+        assert!(verify(&changed, "/configured/other").is_err());
+        for signer in [key(2), key(5)] {
+            let mut changed = request.clone();
+            changed.intent = Signed::sign(changed.intent.payload, &signer).unwrap();
+            assert!(verify(&changed, root).is_err());
+        }
+        let mut changed = request.clone();
+        changed.challenge = Signed::sign(changed.challenge.payload, &key(4)).unwrap();
+        changed.intent.payload.challenge_hash = changed.challenge.hash().unwrap();
+        changed.intent = Signed::sign(changed.intent.payload, &key(3)).unwrap();
+        assert!(verify(&changed, root).is_err());
+        assert!(
+            verify_execution_service_install(
+                &state,
+                &request,
+                &PublicKey::of(&key(5)),
+                root,
+                NOW as u64 + EXECUTION_LEASE_MS
+            )
+            .is_err()
+        );
+        assert!(
+            issue_execution_service_install_challenge(
+                &state,
+                &prepared.request,
+                &commit,
+                &PublicKey::of(&key(3)),
+                "/configured/../executor",
+                &key(5),
+                NOW as u64
+            )
+            .is_err()
+        );
+        let mut revoked = state.clone();
+        let account = &prepared.request.intent.payload.account;
+        let mut document = revoked.account(account).unwrap().clone();
+        document.previous = revoked
+            .head(&PolicyDomain::Account(account.clone()))
+            .cloned();
+        document.sequence += 1;
+        document
+            .revoked_devices
+            .push(DeviceId::from_key(&PublicKey::of(&key(5))));
+        document.revoked_devices.sort();
+        document.devices.retain(|hash| {
+            revoked.device(hash).unwrap().payload.public_key != PublicKey::of(&key(5))
+        });
+        revoked
+            .install_account(Signed::sign(document, &key(1)).unwrap())
+            .unwrap();
+        assert!(
+            verify_execution_service_install(
+                &revoked,
+                &request,
+                &PublicKey::of(&key(5)),
+                root,
+                NOW as u64
+            )
+            .is_err()
+        );
     }
 
     #[test]

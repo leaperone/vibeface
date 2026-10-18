@@ -1,19 +1,23 @@
 "use client"
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
-import type { ReadyConnection, RpcFacts } from "@/lib/node"
+import type { AuthorizedRequest, ReadyConnection, RpcFacts } from "@/lib/node"
 import { integer, same, text } from "@/lib/node"
-import { parseRemoteExecutionShare, parseTrustedRemoteExecution, remoteExecutionParams, remoteExecutionProposal } from "@/lib/remote-execution"
+import { parseRemoteExecutionShare, parseTrustedRemoteExecution, remoteExecutionParams, remoteExecutionProposal, taskRemoteExecutionProposal } from "@/lib/remote-execution"
 import type { RemoteExecutionObservation, RemoteExecutionPurpose, RemoteExecutionSession, TrustedRemoteExecution } from "@/lib/remote-execution"
 import { prepareContext } from "@/lib/rpc-prepare"
 import type { RemoteExecutionPolicyUse } from "@/lib/remote-execution-policy-ingress"
 import { nodeFingerprint, signedInvocationHash, verifyRemoteExecutionSeal } from "../../../generated/vibeface_secure.js"
+import { executionWorkIntent } from "@/lib/execution-work"
+import type { ExecutionWorkIntent } from "@/lib/execution-work"
 import { verifyBoundExecutionSelection, verifyExecutionBinding, verifyTaskCreation } from "@/lib/task-proof"
-import { prepareSend } from "../chat/protocol"
+import { mergeProgress, type LiveProgress } from "@/lib/progress"
+import { isQueuedReceipt, prepareSend } from "../chat/protocol"
 import { conversationHref } from "./entry-url"
 import { isIncomplete, mergeBasis, missingCount, stateNames } from "./labels"
 import {
-  frontierMap, inputText, parseAction, parseConversation, parseConversations, parseNodes, parseNotifications, parseOperation, parseOperationRequest,
+  parseBot, parseBots, parseCreateBot, parsePendingBot, parsePendingControls, parseArtifactPage, hasQueuedMessage,
+  frontierMap, inputText, parseAction, parseConversation, parseNodes, parseNotifications, parseOperation, parseOperationRequest,
   parsePending, parsePendingMessages, parsePendingConversation, parsePendingTasks, parsePendingBindings, parsePendingRemoteResolutions, parseSession, parseTask, record,
 } from "./model"
 import { errorText, parseReconcile, reconcileDecision, type ReconcileRecord } from "./reconcile"
@@ -22,15 +26,16 @@ import { newId, readStorage, writeStorage } from "./storage"
 import { acceptRebindSeal, acceptReboundBinding, parsePendingRebinds, prepareRemoteRebind, recordRebindAttempt, remoteSealStatusBody } from "@/lib/remote-rebind"
 import type { PendingRebind } from "@/lib/remote-rebind"
 import type {
-  ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, OperateAction,
-  OperationRequest, PendingOperation, PendingMessage, PendingConversation, PendingTask, PendingBinding, PendingRemoteResolution, SessionRecord, TaskRecord, WorkspaceView,
+  PendingExecutionControl, ExecutionControlRequest, ExecutionControlAction, BotRecord, CreateBotRequest, PendingBot, BotProject,
+  ConversationPayload, NodeInfo, NotificationRecord, OperateAction,
+  OperationRecord, OperationRequest, TaskOperationRequest, PendingOperation, PendingMessage, PendingConversation, PendingTask, PendingBinding, PendingRemoteResolution, SessionRecord, TaskRecord, WorkspaceView,
 } from "./types"
 
 function useWorkspaceState(connection: ReadyConnection) {
   const spaceId = connection.scope.space_id
   const canAutoFollowup = connection.info.roles.includes("gateway")
   const canReadNotifications = connection.authorization.actions.includes("notification_read")
-  const canWrite = connection.authorization.actions.some(action => ["conversation_create", "message_append", "task_create", "task_progress", "task_accept", "task_cancel", "execution_open", "execution_send", "execution_steer", "execution_interrupt", "execution_respond_approval", "execution_rebind", "operation_resolve", "notification_ack"].includes(action))
+  const canWrite = connection.authorization.actions.some(action => ["conversation_create", "message_append", "task_create", "task_progress", "task_accept", "task_cancel", "execution_open", "execution_send", "execution_steer", "execution_interrupt", "execution_respond_approval", "execution_rebind", "operation_resolve", "task_followup", "agent_interrupt", "notification_ack"].includes(action))
   const [booted, setBooted] = useState(false)
   const [writeState, setWriteState] = useState<"checking" | "writable" | "readonly" | "unsupported">("checking")
   const writer = useRef(false)
@@ -38,7 +43,10 @@ function useWorkspaceState(connection: ReadyConnection) {
   const [noticeText, setNoticeText] = useState("")
   const [view, setView] = useState<WorkspaceView>("chat")
   const [nodes, setNodes] = useState<NodeInfo[]>([])
-  const [conversations, setConversations] = useState<ConversationSummary[]>([])
+  const [bots, setBots] = useState<BotRecord[]>([])
+  const [pendingBot, setPendingBot] = useState<PendingBot | null>(null)
+  const [pendingControls, setPendingControls] = useState<PendingExecutionControl[]>([])
+  const [liveProgress, setLiveProgress] = useState<LiveProgress[]>([])
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
   const [notifications, setNotifications] = useState<NotificationRecord[]>([])
@@ -54,13 +62,17 @@ function useWorkspaceState(connection: ReadyConnection) {
   const [actual, setActual] = useState<Record<string, unknown>>({})
   const [refreshing, setRefreshing] = useState(false)
   const [messageBusy, setMessageBusy] = useState(false)
-  const [schedulerNodeId, setSchedulerNodeId] = useState("")
+
   const [notificationButton, setNotificationButton] = useState({ label: "开启浏览器提醒", disabled: false })
   const alive = useRef(true)
   const activeId = useRef("")
   const dataRef = useRef<ConversationPayload | null>(null)
   const readSequence = useRef(0)
   const pendingRef = useRef<PendingOperation[]>([])
+  const controlsRef = useRef<PendingExecutionControl[]>([])
+  const botCreationRef = useRef<PendingBot | null>(null)
+  const observedAt = useRef(new Map<string, number>())
+  const refreshingConnection = useRef<ReadyConnection | null>(null)
   const messagesRef = useRef<PendingMessage[]>([])
   const creationsRef = useRef<PendingConversation | null>(null)
   const tasksRef = useRef<PendingTask[]>([])
@@ -85,6 +97,10 @@ function useWorkspaceState(connection: ReadyConnection) {
     if (!id || id !== activeId.current || context?.conversation?.conversation_id !== id || isIncomplete(context.missing)) throw new Error("先选择并读取上下文完整的会话。")
     return context
   }
+  const requireBotContext = (id = activeId.current) => {
+    if (!bots.some((bot) => bot.conversation_id === id)) throw new Error("请先选择机器人后再操作。")
+    return requireContext(id)
+  }
   const showError = (caught: unknown) => { if (current()) setError(errorText(caught)) }
   const requireStorageWriter = () => {
     requireCurrent()
@@ -101,6 +117,12 @@ function useWorkspaceState(connection: ReadyConnection) {
     writeStorage(scoped("pending"), next, true)
     pendingRef.current = next
     if (current()) setPending(next)
+  }
+  const replaceControls = (next: PendingExecutionControl[]) => {
+    requireStorageWriter()
+    writeStorage(scoped("pending-controls"), next, true)
+    controlsRef.current = next
+    if (current()) setPendingControls(next)
   }
   const replaceMessages = (next: PendingMessage[]) => {
     requireWriter()
@@ -144,18 +166,66 @@ function useWorkspaceState(connection: ReadyConnection) {
     return keys[0]
   }
   const currentRemoteTrust = (remote: TrustedRemoteExecution) => ({ ...remote, trust: connection.currentRemoteExecutionTrust(remote.trust) })
+  const knownExecutionTargetKey = (target: string) => {
+    const keys = [...new Set([connection.audiencePublicKey, ...remotesRef.current.map(item => item.share.selection.target_public_key)].filter(key => nodeFingerprint(key) === target))]
+    return keys.length === 1 ? keys[0] : undefined
+  }
+  const executionTargetKey = (target: string) => {
+    const key = knownExecutionTargetKey(target)
+    if (!key) throw new Error('尚未独立保存此执行端的公钥，请先导入其授权。')
+    return key
+  }
+  const verifyProjectOperation = (operation: OperationRecord, deferUnknownTarget = false): OperationRecord => {
+    if (!operation.proof) {
+      if (operation.request.task_id === null) throw new Error('普通执行缺少已签名的派单来源。')
+      return operation
+    }
+    const knownKey = knownExecutionTargetKey(operation.request.target_node)
+    if (!knownKey && deferUnknownTarget) return { ...operation, proofState: 'unverified_target' }
+    const key = knownKey ?? executionTargetKey(operation.request.target_node), proof = operation.proof
+    const verified = connection.projectDispatchWork(proof.dispatch, proof.origin, key, operation.request.operation_id)
+    if (!same(verified.request, record(operation.raw).request)) throw new Error('派单证明与完整原操作不同。')
+    if (proof.result) {
+      const result = connection.projectExecutionResult(proof.result, proof.origin, key, operation.request.operation_id)
+      if (!same(result, verified) || record(record(proof.result.receipt).payload).state !== operation.state) throw new Error('项目执行回执与原操作或状态不同。')
+    } else if (operation.request.task_id === null && operation.request.target_node === nodeFingerprint(connection.audiencePublicKey) && ['succeeded', 'failed', 'rejected'].includes(operation.state)) throw new Error('本机执行终态缺少完整签名回执。')
+    return { ...operation, verified }
+  }
+  const verifyReconcile = (value: unknown): ReconcileRecord => {
+    const result = parseReconcile(value)
+    return result.operation === null ? result : { ...result, operation: verifyProjectOperation(result.operation) }
+  }
   const saveRemoteTrust = async (remote: TrustedRemoteExecution) => {
     requireCurrent()
     const trust = await connection.persistRemoteExecutionTrust(remote.trust)
     requireCurrent()
     return currentRemoteTrust({ ...remote, trust })
   }
-  const verifyRemoteScope = async (remote: TrustedRemoteExecution, rawContext: Record<string, unknown>, action: string, use?: RemoteExecutionPolicyUse) => {
-    const initial = await connection.remote(remote, rawContext, action, use)
+  const verifyRemoteScope = async (remote: TrustedRemoteExecution, rawContext: Record<string, unknown>, action: string, use?: RemoteExecutionPolicyUse, work?: ExecutionWorkIntent) => {
+    const initial = await connection.remote(remote, rawContext, action, use, work)
     let trusted: TrustedRemoteExecution
     try { trusted = await saveRemoteTrust({ ...remote, trust: initial.trust }) }
     finally { initial.release() }
-    return { authorization: trusted, verified: await connection.remote(trusted, rawContext, action, use) }
+    return { authorization: trusted, verified: await connection.remote(trusted, rawContext, action, use, work) }
+  }
+  const ordinaryRemote = (request: Exclude<OperationRequest, TaskOperationRequest>, purpose: RemoteExecutionPurpose = 'execution') => {
+    if (request.target_node === nodeFingerprint(connection.audiencePublicKey)) return undefined
+    const context = requireContext(request.conversation_id)
+    const operation = context.operations.find(item => item.request.operation_id === request.operation_id)
+      ?? context.operations.find(item => request.session_id !== null && item.request.target_node === request.target_node && item.request.session_id === request.session_id)
+    const expected = operation?.verified?.work
+    if (!expected || expected.kind === 'task_session') throw new Error('普通工作尚未取得已验证的派单。')
+    const matches = remotesRef.current.filter(remote => {
+      const proposal = remoteExecutionProposal(remote)
+      if (proposal.purpose !== purpose || nodeFingerprint(remote.share.selection.target_public_key) !== request.target_node
+        || proposal.conversationId !== request.conversation_id || proposal.taskRef !== null || proposal.sessionId !== request.session_id) return false
+      if (expected.kind === 'command') return same(proposal.work, expected)
+      if (proposal.work.kind !== 'conversation_session') return false
+      const { open, ...intent } = proposal.work, { open: original, ...work } = expected
+      return same(intent, work) && (open.kind === 'opening' ? open.operation_id === original.operation_id : same(open.open, original))
+    })
+    if (matches.length !== 1) throw new Error('请先导入并确认此工作的独立远端授权。')
+    return currentRemoteTrust(matches[0])
   }
   const remoteForSession = (targetNode: string, sessionId: string, taskRef: string, purpose: RemoteExecutionPurpose = 'execution') => {
     if (targetNode === nodeFingerprint(connection.audiencePublicKey)) return undefined
@@ -175,6 +245,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     setConversationId(id)
     setData(null)
     setActual({})
+    setLiveProgress([])
     window.history.replaceState(null, "", conversationHref(window.location.href, id, connection.scope, connection.project.id))
   }
   const readConversation = async (id: string) => {
@@ -184,11 +255,21 @@ function useWorkspaceState(connection: ReadyConnection) {
     requireCurrent()
     if (activeId.current !== id || sequence !== readSequence.current) throw new Error("会话读取已更新，请重新核对。")
     for (const task of next.tasks) verifyTask(task, id)
+    next.operations = next.operations.map(operation => verifyProjectOperation(operation, true))
     for (const session of next.sessions) {
+      if (session.task_id === null) {
+        const operation = next.operations.find(item => item.request.target_node === session.target_node && item.request.session_id === session.session_id)
+        if (operation?.proofState === 'unverified_target') continue
+        const work = operation?.verified?.work
+        if (work?.kind !== 'conversation_session' || work.conversation !== id || work.executor !== session.executor || work.canonical_cwd !== session.cwd) throw new Error('普通执行会话缺少对应的已验证派单。')
+        continue
+      }
       const task = next.tasks.find(task => task.task_id === session.task_id)
       if (!task || session.authority_public_key !== connection.audiencePublicKey || !same(session.task_creation, task.task_creation)) throw new Error("执行会话缺少对应工单的可信创建证明。")
     }
     if (next.operations.some(operation => operation.request.space_id !== spaceId || operation.request.conversation_id !== id)) throw new Error("操作记录属于其他空间或会话。")
+    next.executions = next.executions.map(execution => next.operations.some(operation => operation.request.operation_id === execution.operation_id && operation.proofState === 'unverified_target')
+      ? { ...execution, capabilities: [], detail: `尚未导入并核验此执行端授权。${execution.detail}` } : execution)
     if (!isIncomplete(next.missing)) {
       const latest = readFrontiers()
       const concurrent = (latest[id] ?? []).filter((head) => !basis.includes(head))
@@ -196,6 +277,40 @@ function useWorkspaceState(connection: ReadyConnection) {
     }
     dataRef.current = next
     setData(next)
+    if (writer.current) {
+      const unresolved = controlsRef.current.filter(pending => pending.target_node !== nodeFingerprint(connection.audiencePublicKey)
+        || !pending.attempt || pending.attempt.body.method !== 'operate'
+        || !next.operations.some(operation => ['succeeded', 'failed', 'rejected'].includes(operation.state) && same(record(operation.raw).request, pending.attempt?.body.request)))
+      if (unresolved.length !== controlsRef.current.length) replaceControls(unresolved)
+    }
+    if (writer.current && messagesRef.current.some((item) => item.conversation_id === id && hasQueuedMessage(next.scheduler, item))) {
+      replaceMessages(messagesRef.current.filter((item) => item.conversation_id !== id || !hasQueuedMessage(next.scheduler, item)))
+    }
+    setLiveProgress((previous) => previous.filter((progress) => {
+      if (progress.kind === "execution") return next.executions.some((item) => item.target_node === progress.target_node && item.session_id === progress.session_id && item.operation_id === progress.operation_id)
+      const job = next.scheduler?.jobs.find((item) => item.trigger === progress.trigger)
+      return !job || (!job.reply_message_id || !next.messages.some((message) => message.message_id === job.reply_message_id)) && !["completed", "failed", "cancelled", "unknown", "rejected"].includes(job.state)
+    }))
+    const observing = next.executions.filter((item) => item.session_id !== null && ["accepted", "running", "unknown"].includes(item.state) && Date.now() - (observedAt.current.get(item.operation_id) ?? 0) >= 10000)
+    if (observing.length) {
+      const results = await Promise.allSettled(observing.map((item) => {
+        observedAt.current.set(item.operation_id, Date.now())
+        return connection.rpc("execution_status", { conversation_id: id, expected_operation_id: item.operation_id })
+      }))
+      requireCurrent()
+      if (results.some((result) => result.status === "fulfilled")) scheduleRefresh()
+    }
+    if (writer.current && connection.authorization.actions.includes("notification_ack") && view === "chat" && !document.hidden && !isIncomplete(next.missing)) {
+      const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
+      for (const notification of seen) {
+        try {
+          await connection.rpc("ack", { notification_id: notification.notification_id })
+          requireCurrent()
+          notificationsRef.current = notificationsRef.current.filter((item) => item.notification_id !== notification.notification_id)
+          setNotifications(notificationsRef.current)
+        } catch (caught) { showError(caught); break }
+      }
+    }
     return next
   }
   const refreshNotificationButton = () => {
@@ -237,31 +352,31 @@ function useWorkspaceState(connection: ReadyConnection) {
   }
   const refresh = async () => {
     requireCurrent()
-    if (refreshingRef.current) { refreshAgain.current = true; return }
+    if (refreshingRef.current && refreshingConnection.current === connection) { refreshAgain.current = true; return }
     refreshingRef.current = true
+    refreshingConnection.current = connection
     setRefreshing(true)
     try {
-      const [rawNodes, rawConversations, rawNotifications] = await Promise.all([
-        connection.rpc("nodes"), connection.rpc("conversations"), canReadNotifications ? connection.rpc("notifications") : Promise.resolve({ notifications: [] }),
+      const [rawNodes, rawNotifications, rawBots] = await Promise.all([
+        connection.rpc("nodes"), canReadNotifications ? connection.rpc("notifications") : Promise.resolve({ notifications: [] }), connection.rpc("bots"),
       ])
       requireCurrent()
-      const nextNodes = parseNodes(rawNodes), nextConversations = parseConversations(rawConversations), nextNotifications = parseNotifications(rawNotifications)
-      setNodes(nextNodes); setConversations(nextConversations); setNotifications(nextNotifications)
+      const nextNodes = parseNodes(rawNodes), nextNotifications = parseNotifications(rawNotifications)
+      const nextBots = parseBots(rawBots)
+      setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots)
       notificationsRef.current = nextNotifications
-      if (!activeId.current && nextConversations[0]) selectConversation(nextConversations[0].conversation_id)
+      const selected = readStorage<string | null>(scoped("selected-bot"), null)
+      const bot = nextBots.find((item) => item.conversation_id === activeId.current) ?? nextBots.find((item) => item.bot_id === selected) ?? nextBots[0]
+      if (activeId.current !== (bot?.conversation_id ?? "")) selectConversation(bot?.conversation_id ?? "")
       if (activeId.current) await readConversation(activeId.current)
       requireCurrent()
-      setSchedulerNodeId((previous) => {
-        const choices = nextNodes.filter((node) => !node.revoked && node.roles.includes("scheduler") && node.capabilities?.manager)
-        return choices.some((node) => node.node_id === previous) ? previous : choices[0]?.node_id ?? ""
-      })
       notifyBrowser(nextNotifications)
       refreshNotificationButton()
     } catch (caught) {
-      if (current()) { dataRef.current = null; setData(null) }
+      if (current()) setError(errorText(caught))
       throw caught
     } finally {
-      refreshingRef.current = false
+      if (refreshingConnection.current === connection) refreshingRef.current = false
       if (current()) {
         setRefreshing(false)
         if (refreshAgain.current) { refreshAgain.current = false; scheduleRefresh() }
@@ -271,6 +386,11 @@ function useWorkspaceState(connection: ReadyConnection) {
   refreshRef.current = refresh
 
   const loadPending = () => {
+    const rawBot = readStorage<unknown>(scoped("pending-bot"), null, true)
+    const storedBot = rawBot == null ? null : parsePendingBot(rawBot)
+    botCreationRef.current = storedBot; setPendingBot(storedBot)
+    const storedControls = parsePendingControls(readStorage<unknown>(scoped("pending-controls"), [], true))
+    controlsRef.current = storedControls; setPendingControls(storedControls)
     const storedPending = parsePending(readStorage<unknown>(scoped("pending"), [], true), spaceId)
     const storedMessages = parsePendingMessages(readStorage<unknown>(scoped("pending-messages"), [], true))
     const storedConversation = parsePendingConversation(readStorage<unknown>(scoped("pending-conversation"), null, true))
@@ -338,7 +458,16 @@ function useWorkspaceState(connection: ReadyConnection) {
   useEffect(() => {
     if (!booted) return
     void refreshRef.current().catch(showError)
-    const unsubscribe = connection.subscribe(scheduleRefresh)
+    const unsubscribe = connection.subscribe(event => {
+      if (!current()) return
+      if (event.type === "invalidate") { scheduleRefresh(); return }
+      if (event.conversation_id !== activeId.current) return
+      setLiveProgress(previous => {
+        const next = mergeProgress(previous, event)
+        if (next.some(item => item.needsRefresh && !previous.find(prior => prior.key === item.key)?.needsRefresh)) scheduleRefresh()
+        return next
+      })
+    })
     const timer = window.setInterval(scheduleRefresh, 15000)
     const visible = () => { if (!document.hidden) scheduleRefresh() }
     document.addEventListener("visibilitychange", visible)
@@ -361,7 +490,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     requireWriter()
     return withStorageMutation(key, work)
   }
-  const executionScope = async (task: TaskRecord, request: Pick<OperationRequest, "conversation_id" | "task_id" | "target_node" | "session_id">, open: Extract<OperateAction, { type: "open" }>, proof: unknown, originalRemote?: TrustedRemoteExecution, action = "operation_status_read", receipt?: Record<string, unknown>) => {
+  const executionScope = async (task: TaskRecord, request: Pick<TaskOperationRequest, "conversation_id" | "task_id" | "target_node" | "session_id">, open: Extract<OperateAction, { type: "open" }>, proof: unknown, originalRemote?: TrustedRemoteExecution, action = "operation_status_read", receipt?: Record<string, unknown>) => {
     const { taskRef } = verifyTask(task, request.conversation_id)
     const remote = originalRemote ? currentRemoteTrust(originalRemote) : remoteForSession(request.target_node, request.session_id, taskRef)
     const executionPublicKey = remote?.share.selection.target_public_key ?? connection.audiencePublicKey
@@ -393,9 +522,35 @@ function useWorkspaceState(connection: ReadyConnection) {
       facts, snapshot,
     }
   }
+  const ordinaryOperationScope = async (request: Exclude<OperationRequest, TaskOperationRequest>, originalRemote?: TrustedRemoteExecution, action = 'operation_status_read') => {
+    const context = requireContext(request.conversation_id)
+    const operation = context.operations.find(item => item.request.operation_id === request.operation_id)
+      ?? context.operations.find(item => request.session_id !== null && item.request.target_node === request.target_node && item.request.session_id === request.session_id)
+    if (!operation) throw new Error('普通执行缺少原始项目派单。')
+    const checked = verifyProjectOperation(operation), verified = checked.verified
+    if (!verified || !checked.proof || verified.work.kind === 'task_session') throw new Error('普通执行的工作证明无效。')
+    if (verified.work.kind === 'command' ? !same(verified.request, request)
+      : request.session_id !== verified.work.execution_session.session_id || request.target_node !== operation.request.target_node || request.conversation_id !== verified.work.conversation) throw new Error('普通执行请求改变了原工作目标。')
+    const work = verified.work
+    const facts: RpcFacts = { projectWork: { proof: checked.proof, targetPublicKey: executionTargetKey(request.target_node), operationId: operation.request.operation_id }, executionWork: executionWorkIntent(work) }
+    if (work.kind === 'conversation_session') facts.execution = { sessionId: work.execution_session.session_id, executorKind: work.executor, canonicalCwd: work.canonical_cwd }
+    const params = { conversation_id: request.conversation_id, target_node: request.target_node, session_id: request.session_id, operation_id: request.operation_id }
+    const remote = originalRemote ?? ordinaryRemote(request)
+    if (remote) {
+      facts.remote = { authorization: currentRemoteTrust(remote), targetDevice: remoteExecutionProposal(remote).targetDevice }
+      const rawContext = prepareContext(params, connection.audience.device, connection.project.id, facts, verified.context)
+      const opened = await verifyRemoteScope(facts.remote.authorization, rawContext, action, undefined, facts.executionWork)
+      try { facts.remote.authorization = opened.authorization } finally { opened.verified.release() }
+    }
+    return { params, facts, snapshot: undefined }
+  }
   const operationScope = async (request: OperationRequest, remote?: TrustedRemoteExecution, receipt?: Record<string, unknown>) => {
     const context = requireContext(request.conversation_id)
     if (request.space_id !== spaceId) throw new Error("原操作属于其他空间，已保留待核对记录。")
+    if (request.task_id === null) {
+      const action = request.action.type === 'command' ? 'execution_command' : request.action.type === 'read' ? 'operation_status_read' : request.action.type === 'respond_request' ? 'execution_respond_approval' : `execution_${request.action.type}`
+      return ordinaryOperationScope(request, remote, action)
+    }
     const task = context.tasks.find(item => item.task_id === request.task_id)
     if (!task) throw new Error("原操作缺少已验证的工单，请先读取原会话。")
     if (request.action.type === "open") return executionScope(task, request, request.action, request.binding, remote, "execution_open", receipt)
@@ -410,16 +565,42 @@ function useWorkspaceState(connection: ReadyConnection) {
     const context = requireContext(request.conversation_id)
     const task = context.tasks.find(task => task.task_id === request.task_id)
     const operation = context.operations.find(operation => operation.request.operation_id === request.operation_id)
-    if (!task || !operation?.execution_source || !same(record(operation.raw).request, request)) throw new Error("B 项目尚未提供原操作的签名执行历史。保留现有记录，尚未核实远端结果。")
-    const { taskRef } = verifyTask(task, request.conversation_id)
-    const metadata = { source: operation.execution_source, binding: request.binding }
+    if (!operation?.execution_source || !same(record(operation.raw).request, request)) throw new Error("B 项目尚未提供原操作的签名执行历史。保留现有记录，尚未核实远端结果。")
+    if (request.task_id !== null && !task) throw new Error('原操作缺少已验证任务。')
+    const taskRef = task ? verifyTask(task, request.conversation_id).taskRef : undefined
+    if (request.task_id === null) verifyProjectOperation(operation)
+    const metadata = { source: operation.execution_source, binding: request.binding ?? null }
     const verified = connection.projectExecutionMetadata(metadata.source, metadata.binding)
     const facts: RpcFacts = { taskRef, projectExecutionMetadata: metadata }
-    const params = { conversation_id: request.conversation_id, task_id: task.task_id, task_ref: taskRef, target_node: request.target_node, session_id: request.session_id, binding: request.binding, execution_source: metadata.source, operation_id: request.operation_id }
+    const params = { conversation_id: request.conversation_id, task_id: request.task_id, task_ref: taskRef, target_node: request.target_node, session_id: request.session_id, binding: request.binding, execution_source: metadata.source, operation_id: request.operation_id }
     prepareContext(params, connection.audience.device, connection.project.id, facts, verified)
     return { params, facts }
   }
   const verifyRemoteObservation = async (request: OperationRequest, actual: Record<string, unknown>, remote?: TrustedRemoteExecution, original?: Parameters<ReadyConnection['rpcWithProof']>[4]) => {
+    if (request.task_id === null) {
+      const candidate = remote ?? ordinaryRemote(request)
+      if (!candidate) throw new Error('原操作缺少独立远端授权。')
+      const checked = connection.observedExecutionResult(actual, null, candidate.share.selection.target_public_key, request.operation_id)
+      if (!same(checked.request, request) || checked.work.kind === 'task_session') throw new Error('执行回执与原普通操作不同。')
+      let observation: RemoteExecutionObservation
+      if (original) observation = await connection.remoteExecutionResultHistory(currentRemoteTrust(candidate), actual, original, null)
+      else {
+        const scope = await ordinaryOperationScope(request, candidate)
+        const operation = requireContext(request.conversation_id).operations.find(item => item.request.operation_id === request.operation_id)
+        if (!operation?.verified) throw new Error('原普通执行尚未核验。')
+        const rawContext = prepareContext(scope.params, connection.audience.device, connection.project.id, scope.facts, operation.verified.context)
+        const handle = await connection.remote(candidate, rawContext, 'operation_status_read', undefined, scope.facts.executionWork)
+        try {
+          observation = handle.observation(actual, null)
+          if (request.session_id !== null && record(observation.receipt.payload).session != null) remoteSessions.current.set(`${request.target_node}:${request.session_id}`, handle.session(observation.receipt, null))
+        } finally { handle.release() }
+      }
+      requireContext(request.conversation_id)
+      observationsRef.current.set(request.operation_id, observation)
+      setRemoteObservations(previous => ({ ...previous, [request.operation_id]: observation }))
+      setActual(previous => ({ ...previous, [`${request.target_node}:${request.session_id ?? request.operation_id}`]: observation.result }))
+      return observation
+    }
     const context = requireContext(request.conversation_id), task = context.tasks.find(task => task.task_id === request.task_id)
     const open = parseAction(record(record(request.binding).binding).open_spec)
     if (!task || open.type !== "open") throw new Error("原执行缺少已核验的任务或打开绑定。")
@@ -458,6 +639,14 @@ function useWorkspaceState(connection: ReadyConnection) {
   }
   const openRemoteResolver = async (request: OperationRequest, remote: TrustedRemoteExecution) => {
     if (remoteExecutionProposal(remote).purpose !== 'resolution') throw new Error("处理未知结果需要独立的结果处理授权。")
+    if (request.task_id === null) {
+      const scope = await ordinaryOperationScope(request, remote, 'operation_resolve')
+      const original = requireContext(request.conversation_id).operations.find(item => item.request.operation_id === request.operation_id)
+      if (!original?.verified) throw new Error('原普通执行尚未核验。')
+      const rawContext = prepareContext(scope.params, connection.audience.device, connection.project.id, scope.facts, original.verified.context)
+      const handle = await connection.remote(remote, rawContext, 'operation_resolve', undefined, scope.facts.executionWork)
+      return { handle, facts: scope.facts, rawContext }
+    }
     const context = requireContext(request.conversation_id), task = context.tasks.find(task => task.task_id === request.task_id)
     const open = parseAction(record(record(request.binding).binding).open_spec)
     if (!task || open.type !== "open") throw new Error("原裁定缺少已验证的任务和执行绑定。")
@@ -534,7 +723,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     if (scope.facts.remote && request.action.type !== "open" && (!scope.snapshot || scope.snapshot.revision !== request.expected_revision)) throw new Error("远端会话需先取得并独立验证 C 的当前执行回执和版本，已暂停新操作。")
     const pendingOperation: PendingOperation = { space_id: request.space_id, operation_id: request.operation_id, target_node: request.target_node, session_id: request.session_id, conversation_id: request.conversation_id, request, attempt: null, ...(scope.facts.remote ? { remote: scope.facts.remote.authorization, ...(scope.facts.remote.sessionReceipt ? { execution_session_receipt: scope.facts.remote.sessionReceipt } : {}) } : {}) }
     replacePending([...pendingRef.current, pendingOperation])
-    const reply = await connection.rpcWithProof("operate", { request, task_ref: scope.params.task_ref, ...(scope.facts.remote ? remoteExecutionParams(scope.facts.remote.authorization, scope.facts.remote.sessionReceipt) : {}) }, attempt => {
+    const reply = await connection.rpcWithProof("operate", { request, task_ref: scope.facts.taskRef, ...(scope.facts.remote ? remoteExecutionParams(scope.facts.remote.authorization, scope.facts.remote.sessionReceipt) : {}) }, attempt => {
       const original = pendingRef.current.find(item => item.operation_id === request.operation_id)
       if (!original || !same(original.request, request)) throw new Error("原操作待核对记录已变化，已暂停发送。")
       const normalized = parseOperationRequest(attempt.body.request, spaceId)
@@ -608,20 +797,127 @@ function useWorkspaceState(connection: ReadyConnection) {
     if (current()) setError("")
     try { await action() } catch (caught) { showError(caught) }
   }
+  const submitPendingControl = async (expected: PendingExecutionControl) => {
+    const request = expected.execution_control
+    const save = (attempt: AuthorizedRequest) => {
+      const original = controlsRef.current.find(item => item.operation_id === expected.operation_id) ?? expected
+      replaceControls([...controlsRef.current.filter(item => item.operation_id !== expected.operation_id), { ...original, attempt }])
+    }
+    let response: unknown
+    if (expected.remote) {
+      if (!expected.request) throw new Error("远端控制缺少完整原始请求。")
+      const scope = await operationScope(expected.request, currentRemoteTrust(expected.remote))
+      response = (await connection.rpcWithProof('operate', { ...scope.params, request: expected.request }, save, scope.facts, expected.attempt ?? undefined)).result
+    } else {
+      if (!expected.control) throw new Error("原控制请求缺少已核验的执行上下文。")
+      const original = parseOperationRequest(expected.control.originalRequest, spaceId)
+      const scope = await operationScope(original)
+      response = (await connection.rpcWithProof('execution_control', request, save, { ...scope.facts, control: expected.control }, expected.attempt ?? undefined)).result
+    }
+    const result = record(record(response).operation)
+    verifyProjectOperation(parseOperation(result))
+    const returned = record(result.request)
+    requireCurrent()
+    const submitted = controlsRef.current.find(item => item.operation_id === request.operation_id)
+    if (!submitted?.attempt || !same(returned, submitted.attempt.body.request)) throw new Error("控制回执没有绑定原始完整签名请求。")
+    if (returned.operation_id !== request.operation_id || returned.target_node !== expected.target_node || returned.conversation_id !== request.conversation_id || returned.session_id !== expected.session_id) throw new Error("控制回执与原请求不符，已保留原请求待核对。")
+    if (expected.target_node === nodeFingerprint(connection.audiencePublicKey) && ['succeeded', 'failed', 'rejected'].includes(String(result.state))) replaceControls(controlsRef.current.filter(item => item.operation_id !== request.operation_id))
+    const interrupt = request.action.type === "interrupt"
+    setNoticeText(interrupt ? "停止请求已接收，等待独立核验执行结果。" : "本人操作已接收，原请求保留待核对。")
+    if (activeId.current === request.conversation_id) await refreshRef.current()
+  }
+  const reconcileControl = async (expected: PendingExecutionControl) => {
+    requireContext(expected.conversation_id)
+    const stored = controlsRef.current.find(item => item.operation_id === expected.operation_id)
+    if (!stored?.attempt || stored.attempt.body.method !== 'operate') throw new Error("原控制尚未生成最终签名，请原样重试。")
+    const request = parseOperationRequest(stored.attempt.body.request, spaceId)
+    const scope = stored.remote ? projectMetadataScope(request) : await operationScope(request)
+    const method = connection.authorization.actions.includes('operation_reconcile') ? 'reconcile' : 'operation'
+    const response = record(await connection.rpc(method, { ...scope.params, operation_id: request.operation_id }, scope.facts))
+    const result = verifyReconcile(response)
+    requireContext(expected.conversation_id)
+    if (result.operation && !same(record(result.operation.raw).request, stored.attempt.body.request)) throw new Error("控制核对结果改变了原始完整请求。")
+    if (stored.remote) {
+      if (response.actual === null || response.actual === undefined) return '已读取 B 项目记录，等待 C 的独立签名结果。'
+      const observation = await verifyRemoteObservation(request, record(response.actual), stored.remote, stored.attempt)
+      if (!result.operation || result.operation.state !== observation.state || !['succeeded', 'failed', 'rejected'].includes(observation.state)) return '已核验 C 回执，原控制仍在执行或等待核对。'
+    }
+    if (reconcileDecision(result, request) === 'settled') {
+      replaceControls(controlsRef.current.filter(item => item.operation_id !== request.operation_id))
+      return '已核验原控制的最终结果。'
+    }
+    return '原控制仍待核对，已保留原签名。'
+  }
+  const submitMessage = async (text: string) => {
+    const context = requireContext(), id = activeId.current
+    const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
+    const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: null, entryNode: connection.audience.device, pending: prior, heads: context.heads, reportResults: true })
+    if (!prepared.ok) throw new Error(prepared.error)
+    if (prior && !prior.attempt) throw new Error("原消息缺少已保存的签名，已保留待核对记录。")
+    try {
+      const receipt = (await connection.rpcWithProof("message", prepared.body, attempt => {
+        replaceMessages([...messagesRef.current.filter(item => item.conversation_id !== id), { ...prepared.pending, attempt }])
+      }, undefined, prepared.pending.attempt ?? undefined)).result
+      requireCurrent()
+      const response = record(receipt)
+      if (response.accepted === true && response.message_id === prepared.pending.message_id && typeof response.scheduler_node === "string" && response.scheduler_node && ((prepared.pending.selected_route ?? prepared.pending.scheduler_node) === null || (prepared.pending.selected_route ?? prepared.pending.scheduler_node) === response.scheduler_node)) {
+        const schedulerNode = response.scheduler_node
+        replaceMessages(messagesRef.current.map((item) => item.message_id === prepared.pending.message_id ? { ...item, selected_route: schedulerNode } : item))
+      }
+      if (!isQueuedReceipt(receipt, prepared.pending)) {
+        if (activeId.current === id) await refreshRef.current().catch(showError)
+        return
+      }
+      replaceMessages(messagesRef.current.filter((item) => item.message_id !== prepared.pending.message_id))
+      setNoticeText("")
+      if (activeId.current === id) await refreshRef.current().catch(showError)
+    } catch (caught) {
+      if (current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
+        const original = messagesRef.current.find((item) => item.message_id === prepared.pending.message_id)
+        if (original) replaceMessages(messagesRef.current.map((item) => item === original ? { ...item, rejected: { entry_node: connection.audience.device } } : item))
+      }
+      throw caught
+    }
+  }
+  const sameProject = (left?: BotProject, right?: BotProject) => left?.target_node === right?.target_node && left?.cwd === right?.cwd
+  const clearPendingBot = () => {
+    writeStorage(scoped("pending-bot"), null, true)
+    botCreationRef.current = null; setPendingBot(null)
+  }
+  const checkRejectedBot = async (pending: PendingBot): Promise<BotRecord | null> => {
+    if (pending.submission?.state !== "rejected" || pending.submission.entry_node !== connection.audience.device) throw new Error("请回原入口核对机器人创建结果，原配置仍已保留。")
+    const known = parseBots(await connection.rpc("bots"))
+    requireCurrent()
+    const match = known.find((bot) => bot.bot_id === pending.bot_id || bot.conversation_id === pending.conversation_id)
+    if (match && (match.bot_id !== pending.bot_id || match.conversation_id !== pending.conversation_id || match.name !== pending.name || match.instructions !== pending.instructions || !sameProject(match.project, pending.project))) throw new Error("已找到相关机器人定义，请保留原请求并核对配置。")
+    clearPendingBot()
+    if (!match) setNoticeText("已确认机器人没有创建，可以修改配置后重新提交。")
+    return match ?? null
+  }
+  const selectedBot = bots.find((bot) => bot.conversation_id === conversationId) ?? null
+  const selectBot = async (bot: BotRecord) => {
+    requireCurrent()
+    writeStorage(scoped("selected-bot"), bot.bot_id)
+    selectConversation(bot.conversation_id)
+    setView("chat")
+    await refreshRef.current()
+  }
+  const sendMessage = (input: string) => withMutation(`message:${activeId.current}`, async () => {
+    if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选择机器人。")
+    const text = inputText(input, "消息内容", 65536)
+    setMessageBusy(true)
+    try { await submitMessage(text) } finally { if (current()) setMessageBusy(false) }
+  })
   const incomplete = !data || isIncomplete(data.missing)
   const messagePending = pendingMessages.find((item) => item.conversation_id === conversationId) ?? null
-  const selectedScheduler = nodes.find((node) => node.node_id === (messagePending?.scheduler_node ?? schedulerNodeId))
-  const chatSlot = {
-    conversationId: conversationId || null, schedulerNodeId: selectedScheduler?.node_id ?? null,
-    missing: incomplete, schedulerOnline: Boolean(selectedScheduler?.online && !selectedScheduler.revoked), managerReady: Boolean(selectedScheduler?.capabilities?.manager),
-  }
+  const chatSlot = { conversationId: conversationId || null, missing: incomplete }
 
   return {
-    info: connection.info, projectNodeId: nodeFingerprint(connection.audiencePublicKey), projectScopeId: scoped("workspace"), connectionOnline: current(), connectionText: "已建立端到端加密连接",
-    error, noticeText, view, setView, nodes, conversations, conversationId, data, notifications, pending, pendingBindings, actual, remoteExecutions, remoteObservations, pendingRemoteResolutions, pendingRemoteRebinds,
+    info: connection.info, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。", projectNodeId: nodeFingerprint(connection.audiencePublicKey), projectAudienceId: connection.audience.device, projectScopeId: scoped("workspace"),
+    error, noticeText, view, setView, nodes, bots, selectedBot, pendingBot, pendingControls, conversationId, data, notifications, pending, pendingBindings, actual, remoteExecutions, remoteObservations, pendingRemoteResolutions, pendingRemoteRebinds,
     canAutoFollowup, pendingConversation, pendingTask: pendingTasks.find((item) => item.conversation_id === conversationId) ?? null,
-    refreshing, schedulerNodeId, setSchedulerNodeId, incomplete, chatSlot, messagePending, messageBusy,
-    writable: canWrite && writeState === "writable",
+    refreshing,  incomplete, chatSlot, messagePending, messageBusy, liveProgress,
+    writable: canWrite && writeState === "writable" && current(),
     localWritable: writeState === "writable",
     writeNotice: !canWrite ? "当前项目授权仅供读取历史。写入、任务派发和浏览器通知不可用。"
       : writeState === "readonly" ? "另一个页面正在操作此浏览器设备。此页只读，关闭其他页面后重新连接。"
@@ -631,9 +927,11 @@ function useWorkspaceState(connection: ReadyConnection) {
       ? `上下文尚未完整，已暂停派发。缺少事件 ${missingCount(data.missing.events)}，附件 ${missingCount(data.missing.blobs)}，冲突 ${missingCount(data.missing.conflicts)}。`
       : `此入口已取得已知上下文，共 ${data.heads.length} 个历史位置。其他离线设备可能仍有未同步记录。`,
     selectConversation, refresh, run, announce: setNoticeText, notificationButton,
+    selectBot, reconcileControl,
+    canPerform: (action: string) => connection.authorization.actions.includes(action),
     exportRemoteExecutionSourceTrust: () => { requireCurrent(); return connection.exportExecutionSourceTrust() },
     remoteExecutionTarget: (remote: TrustedRemoteExecution) => {
-      const context = requireContext(), proposed = remoteExecutionProposal(remote)
+      const context = requireContext(), proposed = taskRemoteExecutionProposal(remote)
       if (proposed.purpose !== 'execution') throw new Error("结果处理授权不能打开或操作执行会话。")
       const task = context.tasks.find(task => verifyTask(task, activeId.current).taskRef === proposed.taskRef)
       if (!task || proposed.conversationId !== activeId.current) throw new Error("此远端授权属于其他任务或会话。")
@@ -669,6 +967,30 @@ function useWorkspaceState(connection: ReadyConnection) {
       const remote = parseTrustedRemoteExecution({ share, trust: JSON.parse(independentTrustJson) })
       const proposed = remoteExecutionProposal(remote)
       if (proposed.purpose === 'rebind') throw new Error("请在原执行会话的重绑表单中导入这份 Rebind 授权。")
+      if (proposed.work.kind !== 'task_session') {
+        if (proposed.conversationId !== activeId.current || share.sourceProject.space !== spaceId || share.sourceProject.resource !== connection.project.id) throw new Error('执行分享属于其他项目或会话。')
+        const canonicalCwd = inputText(cwd, '远端规范工作目录', 4096)
+        if (proposed.work.canonical_cwd !== canonicalCwd) throw new Error('规范目录与受签工作授权不同。')
+        const rawContext = { context: { ...share.context, workspace_resource: connection.project.id }, binding_generation: null, canonical_cwd: canonicalCwd, execution_target_public_key: share.selection.target_public_key }
+        const action = proposed.purpose === 'resolution' ? 'operation_resolve' : proposed.work.kind === 'command' ? 'execution_command' : 'execution_open'
+        const checked = await verifyRemoteScope(remote, rawContext, action, { kind: 'candidate', binding: null }, proposed.work)
+        try {
+          const existing = remotesRef.current.find(item => item.share.selection.execution_grant === share.selection.execution_grant)
+          if (existing && !same(existing.share, share)) throw new Error('同一授权的分享内容已改变。')
+          const next = [...remotesRef.current.filter(item => {
+            if (item.share.selection.execution_grant === share.selection.execution_grant) return false
+            const previous = remoteExecutionProposal(item)
+            if (previous.purpose !== proposed.purpose || item.share.selection.target_public_key !== share.selection.target_public_key || previous.conversationId !== proposed.conversationId) return true
+            return proposed.work.kind === 'command' ? previous.work.kind !== 'command' || previous.work.request_hash !== proposed.work.request_hash
+              : previous.work.kind !== 'conversation_session' || previous.sessionId !== proposed.sessionId
+          }), checked.authorization]
+          writeStorage(scoped('remote-executions'), next, true)
+          remotesRef.current = next; setRemoteExecutions(next)
+          setNoticeText('已验证此工作的远端授权并保存独立根信任，尚未执行操作。')
+        } finally { checked.verified.release() }
+        return
+      }
+      const taskProposal = taskRemoteExecutionProposal(remote)
       const task = context.tasks.find(task => verifyTask(task, activeId.current).taskRef === proposed.taskRef)
       if (!task || proposed.conversationId !== activeId.current) throw new Error("分享未精确授权当前会话的一张已验证任务。")
       const canonicalCwd = inputText(cwd, "远端规范工作目录", 4096)
@@ -685,7 +1007,7 @@ function useWorkspaceState(connection: ReadyConnection) {
           action = "execution_rebind"
         }
       }
-      const facts: RpcFacts = { taskRef: proposed.taskRef, execution: { sessionId: proposed.sessionId, executorKind: proposed.executorKind, canonicalCwd, bindingGeneration }, remote: { authorization: candidate, targetDevice: proposed.targetDevice } }
+      const facts: RpcFacts = { taskRef: taskProposal.taskRef, execution: { sessionId: taskProposal.sessionId, executorKind: taskProposal.executorKind, canonicalCwd, bindingGeneration }, remote: { authorization: candidate, targetDevice: taskProposal.targetDevice } }
       const rawContext = prepareContext({ conversation_id: activeId.current, task_id: task.task_id, session_id: proposed.sessionId }, connection.audience.device, connection.project.id, facts)
       const { authorization: trusted, verified } = await verifyRemoteScope(candidate, rawContext, action, { kind: 'candidate', binding: task.binding })
       try {
@@ -702,6 +1024,7 @@ function useWorkspaceState(connection: ReadyConnection) {
     }),
     prepareRemoteRebind: (session: SessionRecord, oldShareJson: string, nextGrant: string, cwd: string) => withMutation(`rebind:${session.target_node}:${session.session_id}`, async () => {
       const context = requireContext()
+      if (session.task_id === null) throw new Error('只有任务会话支持任务重绑。')
       if (!connection.authorization.actions.includes('execution_rebind')) throw new Error("当前 B 项目未授权重绑执行，请先取得明确的重绑权限。")
       const task = context.tasks.find(item => item.task_id === session.task_id)
       if (!task || !same(task.binding, session.binding)) throw new Error("原任务绑定已变化，请先读取当前任务。")
@@ -774,7 +1097,7 @@ function useWorkspaceState(connection: ReadyConnection) {
         if (same(task.binding, plan.binding)) {
           requireWriter()
           if (["accepted", "cancelled"].includes(task.status)) throw new Error("工单已结束，已暂停新的 B 重绑写入。")
-          const proposed = remoteExecutionProposal(plan.nextAuthorization), generation = integer(originalBinding.generation) + 1
+          const proposed = taskRemoteExecutionProposal(plan.nextAuthorization), generation = integer(originalBinding.generation) + 1
           if (!Number.isSafeInteger(generation)) throw new Error("新绑定代次超过此客户端支持范围。")
           const facts: RpcFacts = { authorizationId: text(pending.body.authorization_id), taskRef: proposed.taskRef,
             execution: { sessionId: proposed.sessionId, executorKind: proposed.executorKind, canonicalCwd: plan.cwd, bindingGeneration: generation },
@@ -792,7 +1115,7 @@ function useWorkspaceState(connection: ReadyConnection) {
           if (!task || !same(task.binding, returned)) throw new Error("B 的新绑定尚未与当前完整任务一致，请保留原请求继续核对。")
         }
         if (!pending || pending.phase !== 'rebind' || !pending.attempt) throw new Error("原重绑签名缺失，无法接管新绑定。")
-        const next = remoteExecutionProposal(plan.nextAuthorization)
+        const next = taskRemoteExecutionProposal(plan.nextAuthorization)
         const binding = verifyExecutionBinding(connection, task, { conversation_id: conversationId, task_id: task.task_id,
           target_node: nodeFingerprint(plan.nextAuthorization.share.selection.target_public_key), session_id: next.sessionId },
           { type: 'open', executor: next.executorKind, cwd: plan.cwd }, task.binding, plan.nextAuthorization.share.selection.target_public_key,
@@ -803,7 +1126,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       }
       if (!same(task.binding, pending.binding)) throw new Error("当前任务已改用其他绑定，请保留原打开请求并核对。")
       const request = parseOperationRequest(pending.body.request, spaceId)
-      if (request.action.type !== 'open') throw new Error("重绑的后续请求不是原打开操作。")
+      if (request.task_id === null || request.action.type !== 'open') throw new Error("重绑的后续请求不是原任务打开操作。")
       const settle = async (value: unknown, proof: { body: Record<string, unknown>; invocation: unknown }) => {
         const response = record(value), operation = parseOperation(response.operation)
         if (!same(record(operation.raw).request, request)) throw new Error("新 C 的操作记录与原打开请求不同。")
@@ -890,32 +1213,170 @@ function useWorkspaceState(connection: ReadyConnection) {
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),
-    sendMessage: (text: string) => withMutation(`message:${activeId.current}`, async () => {
-      const context = requireContext(), id = activeId.current
-      const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
-      const scheduler = nodes.find((item) => item.node_id === (prior?.scheduler_node ?? schedulerNodeId))
-      if (!scheduler?.online || scheduler.revoked || !scheduler.capabilities?.manager) throw new Error("原调度设备不可用，请先恢复连接并核对原消息。")
-      const prepared = prepareSend({ conversationId: id, text, schedulerNodeId: scheduler.node_id, entryNode: connection.audience.device, pending: prior, heads: context.heads })
-      if (!prepared.ok) throw new Error(prepared.error)
-      if (prior && !prior.attempt) throw new Error("原消息缺少已保存的签名，已保留待核对记录，不能重新签名发送。")
-      setMessageBusy(true)
-      try {
-        await connection.rpcWithProof("message", prepared.body, attempt => {
-          const { rejected: _rejected, ...original } = prepared.pending
-          replaceMessages([...messagesRef.current.filter(item => item.conversation_id !== id), { ...original, attempt }])
-        }, undefined, prepared.pending.attempt ?? undefined)
-        requireCurrent()
-        replaceMessages(messagesRef.current.filter((item) => item.message_id !== prepared.pending.message_id))
-        setNoticeText("消息已提交，调度 Agent 正在处理。")
-        if (activeId.current === id) await refreshRef.current()
-      } catch (caught) {
-        if (current() && caught instanceof Error && "responded" in caught && caught.responded === true) {
-          const original = messagesRef.current.find((item) => item.message_id === prepared.pending.message_id)
-          if (original) replaceMessages(messagesRef.current.map((item) => item === original ? { ...item, rejected: { entry_node: connection.audience.device } } : item))
+    createBot: (input: { name: string; instructions: string; project?: BotProject }) => withMutation("create-bot", async () => {
+      const name = inputText(input.name, "机器人名称", 512), instructions = input.instructions.trim()
+      if (new TextEncoder().encode(instructions).length > 8192) throw new Error("职责说明不能超过 8192 字节。")
+      if (new TextEncoder().encode(JSON.stringify([name, instructions, input.project ?? null])).length > 12000) throw new Error("机器人配置不能超过 12000 字节，请缩短名称、职责或项目路径。")
+      const prior = botCreationRef.current
+      if (prior && (prior.name !== name || prior.instructions !== instructions || !sameProject(prior.project, input.project))) throw new Error("机器人创建结果尚未确认，请保留原配置重试。")
+      if (prior && !prior.attempt) throw new Error("原机器人创建缺少已保存的签名，不能重新签名发送。")
+      if (prior?.submission?.state === "rejected") {
+        const known = await checkRejectedBot(prior)
+        if (known) { await selectBot(known); return }
+        throw new Error("已确认机器人没有创建，可以修改配置后重新提交。")
+      }
+      const pending: PendingBot = prior ?? { bot_id: newId(), conversation_id: newId(), name, instructions, project: input.project, submission: { state: "unconfirmed", entry_node: connection.audience.device }, attempt: null }
+      const request: CreateBotRequest = parseCreateBot(pending)
+      let response: unknown
+      try { response = (await connection.rpcWithProof("create_bot", request, attempt => {
+        const next = { ...pending, attempt }
+        writeStorage(scoped("pending-bot"), next, true)
+        botCreationRef.current = next; setPendingBot(next)
+      }, undefined, pending.attempt ?? undefined)).result }
+      catch (caught) {
+        if (!prior && current() && botCreationRef.current?.attempt && caught instanceof Error && "responded" in caught && caught.responded === true) {
+          const rejected: PendingBot = { ...(botCreationRef.current ?? pending), submission: { state: "rejected", entry_node: connection.audience.device } }
+          writeStorage(scoped("pending-bot"), rejected, true)
+          botCreationRef.current = rejected; setPendingBot(rejected)
+          const known = await checkRejectedBot(rejected)
+          if (known) { await selectBot(known); return }
+          throw new Error(`${errorText(caught)} 已确认没有创建，可以修改配置后重新提交。`)
         }
         throw caught
-      } finally { if (current()) setMessageBusy(false) }
+      }
+      const bot = parseBot(record(response).bot)
+      requireCurrent()
+      if (bot.bot_id !== request.bot_id || bot.conversation_id !== request.conversation_id || bot.name !== request.name || bot.instructions !== request.instructions || !sameProject(bot.project, request.project)) throw new Error("机器人创建回执与原配置不符，请核对原请求。")
+      clearPendingBot()
+      await selectBot(bot)
     }),
+    sendMessage,
+    cancelManager: (trigger: string) => withMutation(`cancel-manager:${trigger}`, async () => {
+      const id = activeId.current
+      const context = requireBotContext(id), job = context.scheduler?.jobs.find(item => item.trigger === trigger)
+      if (!job?.target_node || job.attempt_id === undefined || job.state === 'queued' && job.attempt_id !== null || job.state !== 'queued' && !job.attempt_id) throw new Error("本轮回复缺少完整的调度目标或执行尝试，请先刷新核对。")
+      const receipt = record(await connection.rpc("cancel_manager", { conversation_id: id, trigger, target_node: job.target_node, attempt_id: job.attempt_id }))
+      requireCurrent()
+      const returnedJob = record(receipt.job)
+      if (receipt.publication_pending === true) setNoticeText("本轮已有结果，正在补齐发布；未提交停止请求。")
+      else if (receipt.cancel_requested === true && returnedJob.state === "cancelled") setNoticeText("本轮回复已停止。已派出的后台任务会单独继续。")
+      else if (receipt.cancel_requested === true) setNoticeText("已提交停止回复请求。已派出的后台任务会单独继续，最终状态以核对结果为准。")
+      else setNoticeText("本轮当前状态未接受停止请求，请核对最新状态。")
+      if (activeId.current === id) await refreshRef.current()
+    }),
+    refreshExecution: async (operationId: string) => {
+      const id = activeId.current
+      requireCurrent()
+      await connection.rpc("execution_status", { conversation_id: id, expected_operation_id: operationId })
+      requireCurrent()
+      if (activeId.current === id) await refreshRef.current()
+    },
+    executionControl: (operationId: string, action: ExecutionControlAction) => withMutation(`execution-control:${operationId}`, async () => {
+      const id = activeId.current, context = requireBotContext(id)
+      const execution = context.executions.find((item) => item.operation_id === operationId)
+      if (!execution) throw new Error("未找到当前工作，请先核对进展。")
+      if (execution.session_id === null) throw new Error("此命令没有会话控制，请核对执行结果。")
+      if (execution.state === 'unknown' || execution.session_state === 'unknown') throw new Error('执行结果未知，请先核对原操作。')
+      if (controlsRef.current.some((item) => item.operation_id === operationId || item.target_node === execution.target_node && item.session_id === execution.session_id)) throw new Error("此工作有原操作待核对，请勿生成另一请求。")
+      const original = context.operations.find(item => item.request.operation_id === operationId)
+      if (!original || original.request.target_node !== execution.target_node || original.request.session_id !== execution.session_id) throw new Error("控制缺少已核验的完整原操作。")
+      const originalRequest = original.request
+      if (originalRequest.session_id === null) throw new Error('命令不能提交会话控制。')
+      const status = record(await connection.rpc("execution_status", { conversation_id: id, expected_operation_id: operationId }))
+      requireContext(id)
+      if (execution.target_node !== nodeFingerprint(connection.audiencePublicKey)) {
+        const task = originalRequest.task_id === null ? undefined : context.tasks.find(item => item.task_id === originalRequest.task_id)
+        if (originalRequest.task_id !== null && !task) throw new Error('原控制缺少已核验的任务。')
+        const remote = originalRequest.task_id === null ? ordinaryRemote(originalRequest) : task ? remoteForSession(execution.target_node, execution.session_id, verifyTask(task, id).taskRef) : undefined
+        if (!remote) throw new Error('此工作缺少独立保存的远端授权。')
+        const actual = record(status.actual)
+        const checked = connection.observedExecutionResult(actual, originalRequest.binding ?? null, remote.share.selection.target_public_key, operationId)
+        if (!same(checked.request, record(original.raw).request) || checked.work.kind === 'command') throw new Error('C 控制回执没有对应原会话操作。')
+        const desiredAction = action.type === 'respond_request' ? 'execution_respond_approval' : `execution_${action.type}`
+        const scope = await (async () => {
+          if (originalRequest.task_id === null) return ordinaryOperationScope(originalRequest, remote, desiredAction)
+          if (!task || checked.work.kind !== 'task_session') throw new Error('原任务工作证明不匹配。')
+          const open = parseAction(record(originalRequest.binding.binding).open_spec)
+          if (open.type !== 'open') throw new Error('原远端会话缺少打开绑定。')
+          return executionScope(task, originalRequest, open, originalRequest.binding, remote, desiredAction)
+        })()
+        if (!scope.facts.remote) throw new Error('远端执行权限已失效。')
+        const rawContext = prepareContext({ conversation_id: id, task_id: originalRequest.task_id, session_id: execution.session_id }, connection.audience.device, connection.project.id, scope.facts, original.verified?.context)
+        const handle = await connection.remote(scope.facts.remote.authorization, rawContext, desiredAction, undefined, scope.facts.executionWork)
+        let nativeAction: OperateAction
+        try {
+          const control = handle.control(actual, execution.revision)
+          if (record(record(actual.receipt).payload).session == null || record(record(record(actual.receipt).payload).session).state === 'unknown') throw new Error('C 的执行会话仍待核对。')
+          if (!control.turn_id) throw new Error('C 没有可控制的当前执行轮次。')
+          if (action.type === 'respond_request') {
+            if (!control.pending_requests.some(item => item.request_id === action.request_id && item.turn_id === control.turn_id)) throw new Error('审批请求不属于 C 已核验的当前执行轮次。')
+            nativeAction = { type: 'respond_request', request_id: action.request_id, response: record(action.response) }
+          } else if (action.type === 'steer') nativeAction = { type: 'steer', text: action.text, turn_id: control.turn_id }
+          else nativeAction = { type: 'interrupt', turn_id: control.turn_id }
+        } finally { handle.release() }
+        const request: ExecutionControlRequest = { operation_id: newId(), conversation_id: id, expected_operation_id: operationId, expected_revision: execution.revision, basis_heads: [...context.heads], action }
+        const { manager_authority: _managerAuthority, ...originalFields } = originalRequest
+        const finalRequest: OperationRequest = { ...originalFields, operation_id: request.operation_id, expected_revision: execution.revision, basis_heads: request.basis_heads, action: nativeAction, resources: [] }
+        await submitPendingControl({ operation_id: request.operation_id, target_node: execution.target_node, session_id: execution.session_id, conversation_id: id,
+          execution_control: request, control: null, request: finalRequest, remote: scope.facts.remote.authorization, attempt: null })
+        return
+      }
+      const session = record(status.session), currentOperation = record(status.operation)
+      if (!same(currentOperation.request, record(original.raw).request) || session.target_node !== execution.target_node || session.session_id !== execution.session_id || session.revision !== execution.revision) throw new Error("执行状态已改变，请重新核对后操作。")
+      const nativeSessionId = text(session.native_session_id), snapshot = record(status.snapshot)
+      const turnId = text(record(record(status.turn).turn).id), currentTurn = record(record(record(snapshot.threads)[nativeSessionId]).last_turn)
+      if (currentTurn.id !== turnId || !['inProgress', 'in_progress', 'running'].includes(text(currentTurn.status))) throw new Error("原执行轮次已结束，请重新核对。")
+      const pendingRequests = Array.isArray(snapshot.pending_requests) ? snapshot.pending_requests.map(value => {
+        const item = record(value), params = record(item.params)
+        if (typeof item.id !== 'string' && typeof item.id !== 'number') throw new Error("当前审批请求编号无效。")
+        return { id: item.id, threadId: text(params.threadId), turnId: text(params.turnId) }
+      }) : []
+      const request: ExecutionControlRequest = { operation_id: newId(), conversation_id: id, expected_operation_id: operationId, expected_revision: execution.revision, basis_heads: [...context.heads], action }
+      const pending: PendingExecutionControl = { operation_id: request.operation_id, conversation_id: id, target_node: execution.target_node, session_id: execution.session_id, execution_control: request, attempt: null,
+        control: { originalRequest: record(record(original.raw).request), basisHeads: [...context.heads], nativeSessionId, turnId, pendingRequests } }
+      await submitPendingControl(pending)
+    }),
+    retryExecutionControl: (operation: PendingExecutionControl) => withMutation(`execution-control:${operation.operation_id}`, async () => {
+      const original = controlsRef.current.find((item) => item.operation_id === operation.operation_id)
+      if (!original) throw new Error("原控制请求不存在，请先核对持久状态。")
+      requireBotContext(original.conversation_id)
+      await submitPendingControl(original)
+    }),
+    stopFollowup: (operationId: string) => withMutation(`stop-followup:${operationId}`, async () => {
+      const id = activeId.current, context = requireContext(id)
+      const goal = context.executions.find((item) => item.operation_id === operationId)?.goal
+      if (!goal) throw new Error("未找到此工作的后续授权，请先核对进展。")
+      if (goal.followup_mode === "off") return
+      try {
+        const task = context.tasks.find(item => item.task_id === goal.task_id)
+        if (!task) throw new Error("后续授权缺少已核验的工单。")
+        const { taskRef } = verifyTask(task, id)
+        await connection.rpc("set_followup", { conversation_id: id, task_id: goal.task_id, mode: "off", expected_version: goal.followup_version, scheduler_node: goal.followup_scheduler_node }, { taskRef })
+      } catch (caught) {
+        if (current() && activeId.current === id) await refreshRef.current().catch(showError)
+        throw caught
+      }
+      requireCurrent()
+      setNoticeText("已停止后续处理。正在运行的执行可单独停止。")
+      if (activeId.current === id) await refreshRef.current()
+    }),
+    resolveManagerUnknown: (trigger: string, evidence: string) => withMutation(`resolve-manager:${trigger}`, async () => {
+      const id = activeId.current
+      const context = requireBotContext(id), job = context.scheduler?.jobs.find(item => item.trigger === trigger)
+      if (!job?.target_node || !job.attempt_id || job.state !== 'unknown') throw new Error("缺少原未知调用的调度目标或执行尝试，请先刷新核对。")
+      if (new TextEncoder().encode(evidence.trim()).length < 12) throw new Error("请填写至少 12 字节的本人核查证据。")
+      await connection.rpc("resolve_manager_unknown", { conversation_id: id, trigger, target_node: job.target_node, attempt_id: job.attempt_id, evidence: evidence.trim() })
+      requireCurrent()
+      if (activeId.current === id) await refreshRef.current()
+    }),
+    readArtifact: async (hash: string, offset = 0) => {
+      const id = activeId.current
+      requireCurrent()
+      const result = parseArtifactPage(await connection.rpc("read_artifact", { conversation_id: id, blob_hash: hash, offset, limit: 65536 }), hash, offset)
+      requireCurrent()
+      if (activeId.current !== id) throw new Error("对话已切换，请在原对话中重新打开产物。")
+      return result
+    },
     releaseMessagePending: () => withMutation(`message:${activeId.current}`, async () => {
       requireCurrent()
       const id = activeId.current, original = messagesRef.current.find((item) => item.conversation_id === id)
@@ -966,7 +1427,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       const scope = original.remote ? projectMetadataScope(original.request) : await operationScope(original.request)
       const method = connection.authorization.actions.includes("operation_reconcile") ? "reconcile" : "operation"
       const response = record(await connection.rpc(method, { ...scope.params, operation_id: original.operation_id }, scope.facts))
-      const result = parseReconcile(response)
+      const result = verifyReconcile(response)
       requireCurrent()
       if (result.operation && !same(record(result.operation.raw).request, original.request)) throw new Error("执行设备返回的完整请求与原操作不同，已保留待核对记录。")
       if (original.remote) {
@@ -1001,7 +1462,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       return withMutation(`operate:${operation.target_node}:${operation.session_id}`, async () => {
         if (nodeFingerprint(connection.audiencePublicKey) !== operation.target_node) throw new Error("请连接原执行设备，再读取完整会话并核对原操作。")
         const scope = await operationScope(operation.request)
-        const result = parseReconcile(await connection.rpc("reconcile", { ...scope.params, operation_id: operation.operation_id }, scope.facts))
+        const result = verifyReconcile(await connection.rpc("reconcile", { ...scope.params, operation_id: operation.operation_id }, scope.facts))
         requireCurrent()
         if (result.operation && !same(record(result.operation.raw).request, operation.request)) throw new Error("执行设备返回的完整请求与原操作不同，已保留待核对记录。")
         if (reconcileDecision(result, operation) !== "missing") throw new Error("原执行设备没有确认该操作缺失，已保留待核对记录。")
@@ -1014,7 +1475,25 @@ function useWorkspaceState(connection: ReadyConnection) {
     },
     readSession: async (item: SessionRecord) => {
       const id = activeId.current
-      const context = requireContext(id), task = context.tasks.find(task => task.task_id === item.task_id)
+      const context = requireContext(id)
+      if (item.task_id === null) {
+        const original = [...context.operations].reverse().find(operation => operation.request.target_node === item.target_node && operation.request.session_id === item.session_id)
+        if (!original || original.request.task_id !== null || original.verified?.work.kind !== 'conversation_session') throw new Error('普通会话缺少已验证的原操作。')
+        const remote = item.target_node !== nodeFingerprint(connection.audiencePublicKey)
+        const scope = remote ? projectMetadataScope(original.request) : await ordinaryOperationScope(original.request)
+        const result = record(await connection.rpc('session', scope.params, scope.facts))
+        requireContext(id)
+        if (remote) {
+          if (result.actual == null) throw new Error('尚未取得远端会话的独立回执。')
+          await verifyRemoteObservation(original.request, record(result.actual))
+        } else {
+          const session = parseSession(result.session)
+          if (session.task_id !== null || session.session_id !== item.session_id || session.target_node !== item.target_node || session.cwd !== item.cwd || session.executor !== item.executor) throw new Error('节点返回了其他普通会话。')
+          setActual(previous => ({ ...previous, [`${item.target_node}:${item.session_id}`]: result.actual }))
+        }
+        return
+      }
+      const task = context.tasks.find(task => task.task_id === item.task_id)
       if (!task) throw new Error("执行会话缺少对应工单。")
       const remote = item.target_node !== nodeFingerprint(connection.audiencePublicKey)
       if (remote) {
@@ -1055,10 +1534,9 @@ function useWorkspaceState(connection: ReadyConnection) {
       const request = pendingOperation?.request ?? recorded?.request
       if (!request) throw new Error("未找到原操作的完整请求，请先回到原会话读取并核对。")
       if (request.target_node !== nodeFingerprint(connection.audiencePublicKey)) {
-        const task = context.tasks.find(item => item.task_id === request.task_id)
-        if (!task) throw new Error("原操作缺少已验证的任务。")
-        const { taskRef } = verifyTask(task, id)
-        const remote = remoteForSession(targetNode, request.session_id, taskRef, 'resolution')
+        const task = request.task_id === null ? undefined : context.tasks.find(item => item.task_id === request.task_id)
+        if (request.task_id !== null && !task) throw new Error("原操作缺少已验证的任务。")
+        const remote = request.task_id === null ? ordinaryRemote(request, 'resolution') : task ? remoteForSession(targetNode, request.session_id, verifyTask(task, id).taskRef, 'resolution') : undefined
         if (!remote) throw new Error("原操作缺少独立的结果处理授权。")
         let resolver: Awaited<ReturnType<typeof openRemoteResolver>> | undefined
         let pendingResolution: PendingRemoteResolution
@@ -1083,7 +1561,7 @@ function useWorkspaceState(connection: ReadyConnection) {
           resolver = await openRemoteResolver(request, currentRemoteTrust(remote))
           requireContext(id)
           const original = pendingOperation?.attempt
-          const observation = original ? await connection.remoteExecutionResultHistory(currentRemoteTrust(remote), record(actual), original, request.binding) : resolver.handle.observation(record(actual), request.binding)
+          const observation = original ? await connection.remoteExecutionResultHistory(currentRemoteTrust(remote), record(actual), original, request.binding ?? null) : resolver.handle.observation(record(actual), request.binding ?? null)
           requireContext(id)
           if (observation.operationId !== operationId || originalHandoff && !same(observation.actual.handoff, originalHandoff)) throw new Error("C 回执属于其他操作或签名转交，已保留原请求。")
           observationsRef.current.set(operationId, observation)
@@ -1109,7 +1587,7 @@ function useWorkspaceState(connection: ReadyConnection) {
       await sendRemoteResolution(pending)
     }),
     ack: async (notificationId: string) => { requireWriter(); await connection.rpc("ack", { notification_id: notificationId }); requireCurrent(); await refreshRef.current() },
-    openNotification: async (notification: NotificationRecord) => { selectConversation(notification.conversation_id); setView(["approval", "needs_input"].includes(notification.kind) ? "sessions" : "chat"); await refreshRef.current() },
+    openNotification: async (notification: NotificationRecord) => { selectConversation(notification.conversation_id); setView("chat"); await refreshRef.current() },
     enableBrowserNotifications: async () => {
       requireCurrent()
       if (!canReadNotifications) throw new Error("当前项目授权不允许读取通知。")

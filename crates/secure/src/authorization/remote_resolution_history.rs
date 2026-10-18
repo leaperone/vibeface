@@ -329,19 +329,29 @@ mod tests {
             &serde_json::to_string(&fixture.body).unwrap(),
             &serde_json::to_string(&fixture.invocation).unwrap(),
             &serde_json::to_string(&fixture.binding).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         let accepted = remote_execution_history::verify_remote_execution_history_acceptance(
-            &fixture.state, &reference, &fixture.acceptance,
-            &PublicKey::of(&fixture.executor), 10_020,
-        ).unwrap();
+            &fixture.state,
+            &reference,
+            &fixture.acceptance,
+            &PublicKey::of(&fixture.executor),
+            10_020,
+        )
+        .unwrap();
         let remote_execution_history::RemoteExecutionHistoryAcceptance::ExecutionResult {
-            freshness, receipt, ..
-        } = &fixture.acceptance else {
+            freshness,
+            receipt,
+            ..
+        } = &fixture.acceptance
+        else {
             panic!("fixture requires its original execution acceptance");
         };
         let mut usage = accepted.proof_usage().clone();
         let before = usage.counts();
-        usage.normalize_history_acceptance_metadata(freshness).unwrap();
+        usage
+            .normalize_history_acceptance_metadata(freshness)
+            .unwrap();
         let after = usage.counts();
         assert_eq!(before.unique_signed_objects, after.unique_signed_objects);
         assert_eq!(before.unique_signatures, after.unique_signatures);
@@ -350,7 +360,9 @@ mod tests {
         for offset in 1..=(MAX_PROOF_OBJECTS - after.unique_signed_objects) {
             let mut another = receipt.payload.clone();
             another.admitted_at_ms += offset as u64;
-            usage.record_signed(&Signed::sign(another, &fixture.executor).unwrap()).unwrap();
+            usage
+                .record_signed(&Signed::sign(another, &fixture.executor).unwrap())
+                .unwrap();
         }
         assert_eq!(usage.counts().unique_signed_objects, MAX_PROOF_OBJECTS);
         usage.enforce_limits().unwrap();
@@ -359,11 +371,16 @@ mod tests {
         let extra = Signed::sign(extra, &fixture.executor).unwrap();
         extra.verify_signature().unwrap();
         usage.record_verified_object(&extra).unwrap();
-        usage.normalize_history_acceptance_metadata(freshness).unwrap();
+        usage
+            .normalize_history_acceptance_metadata(freshness)
+            .unwrap();
         let exceeded = usage.counts();
         assert_eq!(exceeded.unique_signed_objects, MAX_PROOF_OBJECTS + 1);
         assert_eq!(exceeded.unique_signatures, MAX_PROOF_SIGNATURES);
         assert!(exceeded.authorization_bytes <= MAX_PROOF_BYTES);
-        assert!(matches!(usage.enforce_limits(), Err(AuthorizationError::BudgetExceeded)));
+        assert!(matches!(
+            usage.enforce_limits(),
+            Err(AuthorizationError::BudgetExceeded)
+        ));
     }
 }

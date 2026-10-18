@@ -13,9 +13,9 @@ use vibeface_secure::{
         execution_handoff::ExecutionProofUsage,
         policy_proof::policy_entry_payload_usage,
         remote_share::{
-            RemoteSharePolicyPage, RemoteSharePolicyPageRequest, RemoteSharePolicyReadRequest,
-            RemoteSharePolicySnapshot, RemoteSharePolicyWitness, VerifiedRemoteSharePolicyRead,
-            verify_remote_share_policy_read,
+            ConversationOpenEvidence, RemoteSharePolicyPage, RemoteSharePolicyPageRequest,
+            RemoteSharePolicyReadRequest, RemoteSharePolicySnapshot, RemoteSharePolicyWitness,
+            RemoteShareWork, VerifiedRemoteSharePolicyRead, verify_remote_share_policy_read,
         },
     },
     signature_verification::ScopedSignatureVerification,
@@ -77,13 +77,69 @@ fn snapshot_id(
     )?)
 }
 
-fn check_source_task(
+fn check_source_work(
     connection: &Connection,
     request: &Signed<RemoteSharePolicyReadRequest>,
 ) -> Result<()> {
     let intent = request.payload.intent.intent();
-    let task = &intent.task_creation.payload;
     let context = &request.payload.intent.invocation().payload.context;
+    let task = match &intent.work {
+        RemoteShareWork::TaskSession { task_creation, .. } => &task_creation.payload,
+        RemoteShareWork::ConversationSession { source, .. }
+        | RemoteShareWork::Command { source } => {
+            let statement = &source.payload;
+            let operation: crate::model::OperationRequest =
+                serde_json::from_value(statement.request.clone())?;
+            ensure!(
+                statement.project == intent.project
+                    && statement.source_node_public_key == intent.source_node_public_key
+                    && operation.network_id == intent.project.space.as_str()
+                    && context.conversation.as_deref() == Some(operation.conversation_id.as_str())
+                    && context.task.is_none(),
+                "remote share operation changed its Project or scope"
+            );
+            let resource: Option<String> = connection
+                .query_row(
+                    "SELECT resource_id FROM conversations WHERE space_id=? AND conversation_id=?",
+                    params![intent.project.space.as_str(), operation.conversation_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            ensure!(
+                resource.as_deref() == Some(intent.project.resource.as_str()),
+                "remote share operation differs from its retained Project conversation"
+            );
+            if let RemoteShareWork::ConversationSession {
+                open: ConversationOpenEvidence::Accepted { open },
+                ..
+            } = &intent.work
+            {
+                let accepted = super::execution_handoff::accepted_conversation_open_in(
+                    connection,
+                    &intent.project,
+                    &operation,
+                )?;
+                let session = accepted
+                    .receipt
+                    .payload
+                    .session
+                    .as_ref()
+                    .context("remote share accepted Open has no created session")?;
+                ensure!(
+                    !matches!(
+                        session.state.as_str(),
+                        "opening" | "unknown" | "resolved" | "failed" | "closed"
+                    ),
+                    "remote share accepted Open did not create a usable session"
+                );
+                ensure!(
+                    accepted == **open,
+                    "remote share conversation changed its retained accepted Open"
+                );
+            }
+            return Ok(());
+        }
+    };
     ensure!(
         task.project == intent.project
             && task.source_node_public_key == intent.source_node_public_key
@@ -165,7 +221,7 @@ fn verify_read(
         now,
     )?;
     check_heads_in(connection, policy, verified.heads())?;
-    check_source_task(connection, request)?;
+    check_source_work(connection, request)?;
     Ok(verified)
 }
 
@@ -635,14 +691,17 @@ mod tests {
             version: AUTH_VERSION,
             purpose: RemoteSharePurpose::Execution,
             project,
-            task_creation,
+            work: RemoteShareWork::TaskSession {
+                task_creation,
+                session_id: "shared-session".into(),
+                executor_kind: "codex".into(),
+                binding_generation: 1,
+            },
             source_node_public_key: source.clone(),
             requester: network.account.clone(),
             requester_device: DeviceId::from_key(&PublicKey::of(&network.client)),
             saved_pins: network.pins.clone(),
             policy_heads: heads.clone(),
-            session_id: "shared-session".into(),
-            executor_kind: "codex".into(),
             execution_resource: None,
             target_public_key: None,
             old_binding: None,

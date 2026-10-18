@@ -128,10 +128,25 @@ fn current_source_in(
                 connection, identity, reference,
             )?,
         );
+        ensure!(
+            intent.payload.work == reference.source.payload.work.intent(),
+            "History policy read changed its verified original work"
+        );
     } else {
-        super::super::remote_execution_policy::check_source_task(
-            connection, intent, &local, &mut usage,
-        )?;
+        match &intent.payload.work {
+            ExecutionWorkIntent::TaskSession { .. } => {
+                super::super::remote_execution_policy::check_source_task(
+                    connection, intent, &local, &mut usage,
+                )?;
+            }
+            ExecutionWorkIntent::ConversationSession { .. }
+            | ExecutionWorkIntent::Command { .. } => {
+                intent.payload.work.validate_context(
+                    &intent.payload.context,
+                    &intent.payload.selection.target_public_key,
+                )?;
+            }
+        }
     }
     let pins: Vec<_> = policy
         .pins()
@@ -540,9 +555,9 @@ impl Store {
             &key("completed-import", &input.import_ref),
             &policy_ref,
         )?;
-        let task_key = match &complete_policy {
+        let work_key = match &complete_policy {
             CompletedPolicy::Current(policy) => Some(
-                super::provenance::TaskExecutionPolicyProvenance::task_key(policy)?,
+                super::provenance::TaskExecutionPolicyProvenance::work_key(policy)?,
             ),
             CompletedPolicy::History(_) => None,
         };
@@ -550,7 +565,7 @@ impl Store {
         match complete_policy {
             CompletedPolicy::Current(policy) => {
                 self.policy.task_execution_policy.insert_current(
-                    task_key.context("current policy lost its Task index")?,
+                    work_key.context("current policy lost its work index")?,
                     policy_ref,
                     policy,
                 );

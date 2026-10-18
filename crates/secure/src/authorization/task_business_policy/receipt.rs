@@ -798,17 +798,13 @@ mod tests {
             target_public_key: PublicKey::of(&fixture.executor),
             project_presenter: fixture.actual.handoff.invocation.payload.presenter.clone(),
             operation_id: fixture.invocation.payload.operation_id.clone(),
-            binding_hash: task_binding::binding_hash(&fixture.binding.binding).unwrap(),
-            binding_generation: 1,
-            execution_session: fixture
+            work: fixture
                 .actual
                 .handoff
-                .invocation
-                .payload
-                .context
-                .execution_session
-                .clone()
-                .unwrap(),
+                .handoff
+                .source_statement()
+                .unwrap()
+                .work,
             policies: challenge.policies.clone(),
             nonce: Nonce::random().unwrap(),
             issued_at_ms: now,

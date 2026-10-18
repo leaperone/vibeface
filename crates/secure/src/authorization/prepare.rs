@@ -28,6 +28,9 @@ signed_object!(PrepareIntent, "prepare-intent-v2");
 pub struct VerifiedExecutionDestination {
     project: ResourceRef,
     project_audience: Audience,
+    project_public_key: PublicKey,
+    work: Option<execution_work::ExecutionWorkIntent>,
+    bound_body_hash: Option<ObjectHash>,
     resource: ResourceRef,
     audience: Audience,
     public_key: PublicKey,
@@ -62,6 +65,121 @@ impl VerifiedExecutionDestination {
     pub fn initiating_grant(&self) -> Option<&ObjectHash> {
         self.initiating_grant.as_ref()
     }
+    pub fn bind_request(mut self, invocation: &Invocation, body: &Value) -> Result<Self> {
+        let hash = ObjectHash::body(body)?;
+        let mut context = invocation.context.clone();
+        context.sdk_session = None;
+        require(
+            invocation.resource == self.project
+                && invocation.audience == self.project_audience
+                && invocation.action == self.action
+                && invocation.body_hash == hash
+                && context == self.context,
+            "execution destination binding changed its signed request",
+        )?;
+        if let Some(work) = &self.work {
+            let prepared = if body["method"] == "resolve_unknown" {
+                let actual: execution_handoff::ExecutionHandoffResult = serde_json::from_value(
+                    body["execution_observation"].clone(),
+                )
+                .map_err(|_| {
+                    AuthorizationError::InvalidProof(
+                        "resolution binding has no original observation",
+                    )
+                })?;
+                work.matches_work(&actual.handoff.handoff.source_statement()?.work)?;
+                remote_resolution_intent(
+                    &actual,
+                    &RemoteExecutionSelection {
+                        execution_resource: self.resource.clone(),
+                        target_public_key: self.public_key.clone(),
+                        execution_grant: self.grant_leaf.clone(),
+                    },
+                    &invocation.operation_id,
+                    body["outcome"].as_str().unwrap_or_default(),
+                    body["evidence"].as_str().unwrap_or_default(),
+                    &self.project_public_key,
+                    invocation.not_before_ms,
+                )?
+                .1
+            } else {
+                let binding = raw_binding(body.get("binding"))?.or(raw_binding(
+                    body.get("request")
+                        .and_then(|request| request.get("binding")),
+                )?);
+                let cwd = text(body.get("cwd"))?
+                    .or(text(
+                        body.get("request")
+                            .and_then(|request| request.get("action"))
+                            .and_then(|action| action.get("cwd")),
+                    )?)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        binding.as_ref().and_then(|binding| {
+                            binding.binding.open_spec["cwd"].as_str().map(str::to_owned)
+                        })
+                    })
+                    .or_else(|| match work {
+                        execution_work::ExecutionWorkIntent::ConversationSession {
+                            canonical_cwd,
+                            ..
+                        }
+                        | execution_work::ExecutionWorkIntent::Command { canonical_cwd, .. } => {
+                            Some(canonical_cwd.clone())
+                        }
+                        _ => None,
+                    });
+                let generation = match work {
+                    execution_work::ExecutionWorkIntent::TaskSession {
+                        binding_generation, ..
+                    } => Some(*binding_generation),
+                    _ => None,
+                };
+                PrepareContext {
+                    context: invocation.context.clone(),
+                    binding_generation: generation,
+                    canonical_cwd: cwd,
+                    execution_target_public_key: Some(self.public_key.clone()),
+                }
+            };
+            work.validate_context(&prepared, &self.public_key)?;
+            if body["method"] == "operate" {
+                work.validate_request(invocation, body)?;
+            }
+            check_raw_context(
+                &PrepareIntent {
+                    request: invocation.clone(),
+                    binding_generation: prepared.binding_generation,
+                    canonical_cwd: prepared.canonical_cwd,
+                    execution_target_public_key: prepared.execution_target_public_key,
+                },
+                body,
+                &self.project_public_key,
+            )?;
+        } else {
+            require(
+                self.context.task.is_some(),
+                "ordinary execution requires approved source work",
+            )?;
+        }
+        self.bound_body_hash = Some(hash);
+        Ok(self)
+    }
+
+    pub(super) fn bind_admitted(mut self, admission: &VerifiedAdmission) -> Result<Self> {
+        let invocation = admission.signed_invocation();
+        require(
+            admission.destination.as_ref().is_some_and(|destination| {
+                destination.resource == self.resource
+                    && destination.public_key == self.public_key
+                    && destination.grant_leaf == self.grant_leaf
+            }),
+            "admitted destination differs from its retained execution grant",
+        )?;
+        self.bound_body_hash = Some(invocation.payload.body_hash.clone());
+        Ok(self)
+    }
+
     pub fn check_facts(&self, facts: &RequestFacts) -> Result<()> {
         let mut context = facts.context.clone();
         context.sdk_session = None;
@@ -69,8 +187,10 @@ impl VerifiedExecutionDestination {
             facts.resource == self.project
                 && facts.audience == self.project_audience
                 && facts.action == self.action
-                && context == self.context,
-            "remote destination differs from Project facts",
+                && context == self.context
+                && (self.context.task.is_some()
+                    || self.bound_body_hash.as_ref() == Some(&facts.body_hash)),
+            "remote destination differs from Project facts or its complete original body",
         )
     }
 }
@@ -94,9 +214,47 @@ pub(super) fn remote_actions(actions: &[Action], resolver: bool) -> bool {
                     | Action::ExecutionSteer
                     | Action::ExecutionInterrupt
                     | Action::ExecutionRespondApproval
+                    | Action::ExecutionCommand
                     | Action::OperationStatusRead
             )
         })
+}
+
+pub(super) fn remote_context_matches(
+    context: &InvocationContext,
+    target: &DeviceId,
+    actions: &[Action],
+) -> bool {
+    if context.conversation.is_none()
+        || context.workspace_resource.is_none()
+        || context.sdk_session.is_some()
+    {
+        return false;
+    }
+    let resolver = remote_actions(actions, true);
+    match &context.execution_session {
+        Some(session) => {
+            session.target == *target
+                && context.executor_kind.is_some()
+                && !actions.contains(&Action::ExecutionCommand)
+                && (resolver || remote_actions(actions, false))
+        }
+        None => {
+            context.task.is_none()
+                && context.executor_kind.is_none()
+                && (resolver
+                    || (actions.contains(&Action::ExecutionSubmit)
+                        && actions.contains(&Action::ExecutionCommand)
+                        && actions.iter().all(|action| {
+                            matches!(
+                                action,
+                                Action::ExecutionSubmit
+                                    | Action::ExecutionCommand
+                                    | Action::OperationStatusRead
+                            )
+                        })))
+        }
+    }
 }
 
 impl VerifiedPolicySet {
@@ -143,6 +301,7 @@ impl VerifiedPolicySet {
             | Action::ExecutionSteer
             | Action::ExecutionInterrupt
             | Action::ExecutionRespondApproval
+            | Action::ExecutionCommand
             | Action::OperationStatusRead
             | Action::OperationResolve => action,
             _ => {
@@ -173,13 +332,7 @@ impl VerifiedPolicySet {
                 && execution.payload.host != project_audience.service
                 && target.payload.public_key == *public_key
                 && target.payload.subject == Actor::Service(audience.service.clone())
-                && context
-                    .execution_session
-                    .as_ref()
-                    .is_some_and(|session| session.target == audience.device)
-                && context.task.is_some()
                 && context.conversation.is_some()
-                && context.executor_kind.is_some()
                 && context.workspace_resource.as_ref() == Some(&project.resource),
             "remote destination must be an independent registered execution service",
         )?;
@@ -188,6 +341,37 @@ impl VerifiedPolicySet {
             .ok_or(AuthorizationError::InvalidProof(
                 "missing remote execution grant",
             ))?;
+        let source_work = leaf.payload.execution_source.as_ref();
+        require(
+            source_work.is_some() || context.task.is_some(),
+            "ordinary execution grant has no owner-approved source work",
+        )?;
+        if let Some(source) = source_work {
+            require(
+                source.project == *project && source.node_public_key == host.payload.public_key,
+                "execution grant approved another Project source",
+            )?;
+            let (binding_generation, canonical_cwd) = match &source.work {
+                execution_work::ExecutionWorkIntent::TaskSession {
+                    binding_generation, ..
+                } => (Some(*binding_generation), None),
+                execution_work::ExecutionWorkIntent::ConversationSession {
+                    canonical_cwd, ..
+                }
+                | execution_work::ExecutionWorkIntent::Command { canonical_cwd, .. } => {
+                    (None, Some(canonical_cwd.clone()))
+                }
+            };
+            source.work.validate_context(
+                &PrepareContext {
+                    context: context.clone(),
+                    binding_generation,
+                    canonical_cwd,
+                    execution_target_public_key: Some(public_key.clone()),
+                },
+                public_key,
+            )?;
+        }
         let mut execution_context = context.clone();
         execution_context.sdk_session = None;
         execution_context.workspace_resource = Some(resource.resource.clone());
@@ -201,9 +385,14 @@ impl VerifiedPolicySet {
                 && !leaf.payload.constraints.require_webauthn_uv
                 && leaf.payload.actions.contains(&execution_action)
                 && remote_actions(&leaf.payload.actions, action == Action::OperationResolve)
+                && remote_context_matches(
+                    &execution_context,
+                    &audience.device,
+                    &leaf.payload.actions,
+                )
                 && leaf.payload.expires_at_ms < u64::MAX
                 && leaf.payload.constraints.context == execution_context,
-            "remote execution grant must exactly bind this task and executor",
+            "remote execution grant must exactly bind this work and executor",
         )?;
         let mut dependencies = BTreeMap::new();
         budget.verify(project_record)?;
@@ -231,6 +420,9 @@ impl VerifiedPolicySet {
         Ok(VerifiedExecutionDestination {
             project: project.clone(),
             project_audience: project_audience.clone(),
+            project_public_key: host.payload.public_key.clone(),
+            work: source_work.map(|source| source.work.clone()),
+            bound_body_hash: None,
             resource: resource.clone(),
             audience,
             public_key: public_key.clone(),
@@ -274,6 +466,9 @@ impl VerifiedPolicySet {
     ) -> Result<VerifiedAuthorization> {
         let _scope = crate::signature_verification::ScopedSignatureVerification::new();
         let original = gateway_invocation_original(signed, raw_body);
+        let destination = destination
+            .clone()
+            .bind_request(&signed.payload, raw_body)?;
         self.verify_invocation_with_execution_transport(
             signed,
             facts,
@@ -281,7 +476,7 @@ impl VerifiedPolicySet {
                 proof: gateway,
                 original: &original,
             },
-            destination,
+            &destination,
             now_ms,
             AuthorizationPhase::Admission,
         )
@@ -310,6 +505,10 @@ impl VerifiedPolicySet {
             now_ms,
             budget,
         )?;
+        require(
+            current.work == destination.work,
+            "execution destination changed its approved work",
+        )?;
         if current.heads != destination.heads {
             return Err(AuthorizationError::NeedPolicySync(current.heads));
         }
@@ -329,7 +528,9 @@ impl VerifiedPolicySet {
             phase,
         )?;
         auth.destination = Some(AdmittedDestination {
-            resource: destination.resource.clone(), public_key: destination.public_key.clone(), grant_leaf: destination.grant_leaf.clone(),
+            resource: destination.resource.clone(),
+            public_key: destination.public_key.clone(),
+            grant_leaf: destination.grant_leaf.clone(),
         });
         Ok(auth)
     }
@@ -374,19 +575,32 @@ impl VerifiedPolicySet {
                 return Ok(());
             }
             InvocationTransport::GatewayTranscript { header, original } => {
-                require(original.request() == invocation, "historical gateway destination changed request")?;
-                let target = &self.find_device(&invocation.audience.device)?.payload.public_key;
+                require(
+                    original.request() == invocation,
+                    "historical gateway destination changed request",
+                )?;
+                let target = &self
+                    .find_device(&invocation.audience.device)?
+                    .payload
+                    .public_key;
                 gateway_forward::verify_gateway_statement(header, original, target, now_ms)?;
                 budget.verify(header)?;
                 budget.expires(header.payload.expires_at_ms);
                 return Ok(());
             }
             InvocationTransport::OriginalGateway(original) => {
-                require(original.original.request() == invocation, "accepted gateway destination changed request")?;
+                require(
+                    original.original.request() == invocation,
+                    "accepted gateway destination changed request",
+                )?;
                 budget.verify(&original.header)?;
                 return Ok(());
             }
-            InvocationTransport::CompactSdkParent { .. } => return Err(AuthorizationError::InvalidProof("SDK message parent cannot select an execution destination")),
+            InvocationTransport::CompactSdkParent { .. } => {
+                return Err(AuthorizationError::InvalidProof(
+                    "SDK message parent cannot select an execution destination",
+                ));
+            }
             InvocationTransport::PortableIntent => {
                 return Err(AuthorizationError::InvalidProof(
                     "portable intent has no live execution transport",
@@ -451,15 +665,13 @@ pub fn inspect_remote_execution_share(share_json: &str) -> crate::Result<String>
                 && grant.audience.device == DeviceId::from_key(&share.selection.target_public_key)
                 && grant.remaining_delegations == 0
                 && grant.expires_at_ms < u64::MAX
-                && (remote_actions(&grant.actions, false) || remote_actions(&grant.actions, true))
+                && remote_context_matches(
+                    &grant.constraints.context,
+                    &grant.audience.device,
+                    &grant.actions,
+                )
                 && grant.constraints.context.workspace_resource.as_ref()
-                    == Some(&share.selection.execution_resource.resource)
-                && grant
-                    .constraints
-                    .context
-                    .execution_session
-                    .as_ref()
-                    .is_some_and(|session| session.target == grant.audience.device),
+                    == Some(&share.selection.execution_resource.resource),
             "share candidate is not an exact execution or resolution Grant",
         )?;
         serde_json::to_string(
@@ -509,12 +721,9 @@ pub fn verify_directional_grant_snapshot(
             && target.payload.subject == Actor::Service(leaf.audience.service.clone())
             && matches!(&leaf.grantee,Grantee::Actor(Actor::Service(service)) if service != &leaf.audience.service)
             && leaf.remaining_delegations == 0 && leaf.expires_at_ms < u64::MAX
-            && (remote_actions(&leaf.actions,false) || remote_actions(&leaf.actions,true))
+            && remote_context_matches(&leaf.constraints.context, &leaf.audience.device, &leaf.actions)
             && !leaf.constraints.require_account_actor && !leaf.constraints.require_webauthn_uv
-            && leaf.constraints.context.sdk_session.is_none() && leaf.constraints.context.task.is_some()
-            && leaf.constraints.context.conversation.is_some() && leaf.constraints.context.executor_kind.is_some()
-            && leaf.constraints.context.workspace_resource.as_ref() == Some(&resource.resource)
-            && leaf.constraints.context.execution_session.as_ref().is_some_and(|session|session.target == leaf.audience.device),
+            && leaf.constraints.context.workspace_resource.as_ref() == Some(&resource.resource),
             "execution share must be a finite, nondelegable grant to the selected Project service")?;
         let mut budget=Budget::default();let mut dependencies=BTreeMap::new();
         budget.verify(record)?;
@@ -536,6 +745,7 @@ pub struct VerifiedRemoteExecution {
     source: VerifiedClientAuthorization,
     selection: RemoteExecutionSelection,
     context: PrepareContext,
+    work: Option<execution_work::ExecutionWorkIntent>,
     action: Action,
     heads: Vec<PolicyStamp>,
     verified_at_ms: u64,
@@ -618,6 +828,7 @@ pub fn verify_remote_execution(
             source: auth.clone(),
             selection,
             context,
+            work: destination.work.clone(),
             action,
             heads: heads.into_values().collect(),
             verified_at_ms: now,
@@ -630,6 +841,45 @@ pub fn verify_remote_execution(
 }
 
 impl VerifiedRemoteExecution {
+    fn check_work(&self, work: &execution_work::ExecutionWork) -> Result<()> {
+        match &self.work {
+            Some(approved) => {
+                approved.matches_work(work)?;
+                work.validate_context(&self.context, &self.selection.target_public_key)
+            }
+            None => require(
+                matches!(work, execution_work::ExecutionWork::TaskSession { .. })
+                    && self.context.context.task.as_ref() == work.task_ref()
+                    && self.context.context.execution_session.as_ref() == work.execution_session()
+                    && self
+                        .context
+                        .binding_generation
+                        .is_none_or(|generation| work.binding_generation() == Some(generation)),
+                "remote handle has no approval for this execution work",
+            ),
+        }
+    }
+
+    fn check_original_work(&self, original: &execution_handoff::ExecutionHandoff) -> Result<()> {
+        let source = original.source_statement()?;
+        require(
+            source.project.space == self.source.scope.space_id
+                && Some(&source.project.resource)
+                    == self.context.context.workspace_resource.as_ref()
+                && source.conversation.as_str()
+                    == self
+                        .context
+                        .context
+                        .conversation
+                        .as_deref()
+                        .unwrap_or_default()
+                && original.execution_resource == self.selection.execution_resource
+                && source.target_public_key == self.selection.target_public_key,
+            "remote handle belongs to another original execution",
+        )?;
+        self.check_work(&source.work)
+    }
+
     fn checked_observation(
         &self,
         actual_json: &str,
@@ -645,10 +895,11 @@ impl VerifiedRemoteExecution {
         let actual: execution_handoff::ExecutionHandoffResult =
             serde_json::from_str(actual_json)
                 .map_err(|_| AuthorizationError::InvalidProof("invalid remote observation"))?;
-        let binding: task_binding::SignedBinding = serde_json::from_str(binding_json)
+        let binding: Option<task_binding::SignedBinding> = serde_json::from_str(binding_json)
             .map_err(|_| AuthorizationError::InvalidProof("invalid observation binding"))?;
         self.state
             .verify_project_execution_source(&actual.handoff.handoff, now_ms)?;
+        self.check_original_work(&actual.handoff.handoff)?;
         execution_handoff::verify_execution_handoff_receipt_signature(
             &actual.handoff,
             &actual.receipt,
@@ -691,6 +942,14 @@ impl VerifiedRemoteExecution {
                     == serde_json::to_value(&binding).map_err(|_| {
                         AuthorizationError::InvalidProof("observation binding encoding failed")
                     })?
+                && binding.is_some()
+                    == actual
+                        .handoff
+                        .handoff
+                        .source_statement()?
+                        .work
+                        .task_ref()
+                        .is_some()
                 && actual.receipt.payload.issued_at_ms <= now_ms
                 && actual.receipt.payload.issued_at_ms
                     >= actual.handoff.invocation.payload.not_before_ms,
@@ -779,7 +1038,7 @@ impl VerifiedRemoteExecution {
             "request changed its independently verified execution destination",
         )?;
         let project = raw_resource(body)?;
-        self.state.verify_execution_destination(
+        let destination = self.state.verify_execution_destination(
             &project,
             &auth.audience,
             &self.selection.execution_resource,
@@ -789,6 +1048,27 @@ impl VerifiedRemoteExecution {
             self.action,
             now,
         )?;
+        require(
+            destination.work == self.work,
+            "remote handle changed its approved execution work",
+        )?;
+        if body["method"] == "resolve_unknown" && body.get("execution_observation").is_some() {
+            let actual: execution_handoff::ExecutionHandoffResult =
+                serde_json::from_value(body["execution_observation"].clone()).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid original resolution observation")
+                })?;
+            self.check_original_work(&actual.handoff.handoff)?;
+        }
+        if body["method"] == "operate" {
+            if let Some(execution_work::ExecutionWorkIntent::Command { request_hash, .. }) =
+                &self.work
+            {
+                require(
+                    *request_hash == ObjectHash::body(&body["request"])?,
+                    "remote handle approved another command request",
+                )?;
+            }
+        }
         let mut result = current;
         result.heads = self.heads.clone();
         Ok(result)
@@ -818,6 +1098,7 @@ impl VerifiedRemoteExecution {
                     .map_err(|_| AuthorizationError::InvalidProof("invalid original handoff"))?;
             let target =
                 execution_observation::ExecutionObservationTarget::from_original(&original)?;
+            self.check_original_work(&original.handoff)?;
             require(
                 self.purpose
                     == remote_execution_policy::RemoteExecutionPolicyPurpose::ObservationRead
@@ -832,7 +1113,7 @@ impl VerifiedRemoteExecution {
                     && target.execution_resource == self.selection.execution_resource
                     && target.target_public_key == self.selection.target_public_key
                     && self.context.context == target.context(&target.source.project.resource)
-                    && self.context.binding_generation == Some(target.source.binding_generation)
+                    && self.context.binding_generation == target.source.work.binding_generation()
                     && self.context.execution_target_public_key.as_ref()
                         == Some(&target.target_public_key)
                     && original
@@ -946,6 +1227,7 @@ impl VerifiedRemoteExecution {
             };
             let encoded = encoded
                 .map_err(|_| AuthorizationError::InvalidProof("resolution encoding failed"))?;
+            self.check_original_work(&wire.resolution.observation.handoff.handoff)?;
             let admission = &wire.resolution.account_admission;
             let facts = execution_resolution_account_facts(&wire.resolution)?;
             require(
@@ -987,7 +1269,9 @@ impl VerifiedRemoteExecution {
             )?;
             let admitted = self.state.verify_original_admission(admission, &facts)?;
             let resolver = self.state.verify_admitted_operation_authorization(
-                &admitted, &facts, decision_time,
+                &admitted,
+                &facts,
+                decision_time,
             )?;
             if unknown {
                 let result: ExecutionHandoffResolutionResult =
@@ -1071,6 +1355,7 @@ impl VerifiedRemoteExecution {
                 })?;
             self.state
                 .verify_project_execution_source(&actual.handoff.handoff, now)?;
+            self.check_original_work(&actual.handoff.handoff)?;
             let (body, context) = remote_resolution_intent(
                 &actual,
                 &self.selection,
@@ -1127,9 +1412,57 @@ impl VerifiedRemoteExecution {
                 &self.selection.execution_resource.resource,
             )
             .ok_or_else(|| "verified execution resource is missing".to_owned())?;
-        serde_json::to_string(&serde_json::json!({"selection":self.selection,"context":self.context,
+        serde_json::to_string(&serde_json::json!({"selection":self.selection,"context":self.context,"work":self.work,
         "audience":Audience {service:record.payload.host.clone(),device:DeviceId::from_key(&self.selection.target_public_key)},
         "pins":self.execution_pins,"purpose":self.purpose,"expires_at_ms":self.expires_at_ms})).map_err(|_| "remote metadata encoding failed".into())
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = controlJson))]
+    pub fn control_json(
+        &self,
+        actual_json: &str,
+        expected_revision: f64,
+        now_ms: f64,
+    ) -> crate::Result<String> {
+        (|| -> Result<String> {
+            require(
+                expected_revision.is_finite()
+                    && expected_revision >= 0.0
+                    && expected_revision.fract() == 0.0
+                    && expected_revision <= 9_007_199_254_740_991.0,
+                "invalid expected execution revision",
+            )?;
+            let now = client_time(now_ms)?;
+            require(
+                actual_json.len() <= execution_handoff::MAX_EXECUTION_HANDOFF_BYTES,
+                "execution control proof is too large",
+            )?;
+            let original: execution_handoff::ExecutionHandoffResult =
+                serde_json::from_str(actual_json).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid execution control observation")
+                })?;
+            let event: events::Event =
+                serde_json::from_str(&original.handoff.handoff.project_dispatch.canonical_body)
+                    .map_err(|_| AuthorizationError::InvalidProof("invalid control dispatch"))?;
+            let events::EventCause::Invocation { admission } = &event.cause else {
+                return Err(AuthorizationError::InvalidProof(
+                    "execution control has no original admission",
+                ));
+            };
+            let binding_json = serde_json::to_string(&admission.source_body["request"]["binding"])
+                .map_err(|_| AuthorizationError::InvalidProof("invalid control binding"))?;
+            let actual = self.checked_observation(actual_json, &binding_json, now)?;
+            let control = execution_handoff::verify_execution_control_state(
+                &actual.handoff,
+                &actual.receipt,
+                &actual.result,
+                expected_revision as u64,
+                now,
+            )?;
+            serde_json::to_string(control)
+                .map_err(|_| AuthorizationError::InvalidProof("execution control encoding failed"))
+        })()
+        .map_err(|error| error.to_string())
     }
 
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = sessionJson))]
@@ -1151,10 +1484,10 @@ impl VerifiedRemoteExecution {
                 serde_json::from_str(receipt_json).map_err(|_| {
                     AuthorizationError::InvalidProof("invalid executor session receipt")
                 })?;
-            let binding: task_binding::SignedBinding =
-                serde_json::from_str(binding_json).map_err(|_| {
-                    AuthorizationError::InvalidProof("invalid executor session binding")
-                })?;
+            let binding: Option<task_binding::SignedBinding> = serde_json::from_str(binding_json)
+                .map_err(|_| {
+                AuthorizationError::InvalidProof("invalid executor session binding")
+            })?;
             let project = ResourceRef {
                 space: self.source.scope.space_id.clone(),
                 resource: self.context.context.workspace_resource.clone().ok_or(
@@ -1171,19 +1504,65 @@ impl VerifiedRemoteExecution {
                 self.action,
                 now,
             )?;
-            let snapshot = execution_handoff::verify_execution_session_snapshot(
-                &receipt,
-                &project,
-                &self.selection.execution_resource,
-                &self.selection.target_public_key,
-                &binding,
-                &self.source.audience_public_key,
-                now,
-            )?;
+            let snapshot =
+                if let Some(binding) = &binding {
+                    execution_handoff::verify_execution_session_snapshot(
+                        &receipt,
+                        &project,
+                        &self.selection.execution_resource,
+                        &self.selection.target_public_key,
+                        binding,
+                        &self.source.audience_public_key,
+                        now,
+                    )?
+                    .clone()
+                } else {
+                    receipt.verify_signature()?;
+                    let snapshot = receipt.payload.session.as_ref().ok_or(
+                        AuthorizationError::InvalidProof(
+                            "executor receipt has no accepted conversation session",
+                        ),
+                    )?;
+                    require(
+                        matches!(
+                            snapshot.work,
+                            execution_work::ExecutionWork::ConversationSession { .. }
+                        ) && receipt.issuer == self.selection.target_public_key
+                            && receipt.payload.version == AUTH_VERSION
+                            && receipt.payload.original_space_id == project.space
+                            && receipt.payload.execution_space_id
+                                == self.selection.execution_resource.space
+                            && receipt.payload.target
+                                == DeviceId::from_key(&self.selection.target_public_key)
+                            && receipt.payload.issued_at_ms <= now
+                            && snapshot.original_project == project
+                            && snapshot.execution_resource == self.selection.execution_resource
+                            && snapshot.work == receipt.payload.work
+                            && snapshot.target == receipt.payload.target
+                            && snapshot.expires_at_ms > now
+                            && snapshot.expires_at_ms > receipt.payload.issued_at_ms
+                            && snapshot.expires_at_ms - receipt.payload.issued_at_ms
+                                <= EXECUTION_LEASE_MS,
+                        "conversation session receipt changed its executor, work or validity",
+                    )?;
+                    snapshot
+                        .work
+                        .validate_context(&self.context, &self.selection.target_public_key)?;
+                    require(
+                        snapshot
+                            .work
+                            .execution_session()
+                            .is_some_and(|session| session.session_id == snapshot.session_id)
+                            && self.context.context.executor_kind.as_deref()
+                                == Some(snapshot.executor.as_str())
+                            && self.context.canonical_cwd.as_deref() == Some(snapshot.cwd.as_str()),
+                        "conversation session receipt changed its session details",
+                    )?;
+                    snapshot.clone()
+                };
+            self.check_work(&snapshot.work)?;
             require(
-                self.context.context.task.as_ref() == Some(&snapshot.task)
-                    && self.context.context.conversation.as_deref()
-                        == Some(binding.binding.conversation_id.as_str())
+                self.context.context.task.as_ref() == snapshot.work.task_ref()
                     && self
                         .context
                         .context
@@ -1193,12 +1572,23 @@ impl VerifiedRemoteExecution {
                             session.target == snapshot.target
                                 && session.session_id == snapshot.session_id
                         }),
-                "session receipt differs from the selected task",
+                "session receipt differs from the selected execution work",
             )?;
+            if let Some(binding) = &binding {
+                require(
+                    self.context.context.conversation.as_deref()
+                        == Some(binding.binding.conversation_id.as_str()),
+                    "session receipt changed its Task conversation",
+                )?;
+            }
             let mut value = serde_json::to_value(snapshot).map_err(|_| {
                 AuthorizationError::InvalidProof("session snapshot encoding failed")
             })?;
-            value["target_node"] = Value::String(binding.binding.target_node.clone());
+            value["target_node"] = Value::String(
+                node_fingerprint(self.selection.target_public_key.as_str()).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid selected executor key")
+                })?,
+            );
             value["execution_session_receipt"] = serde_json::to_value(&receipt)
                 .map_err(|_| AuthorizationError::InvalidProof("session receipt encoding failed"))?;
             serde_json::to_string(&value)
@@ -1271,16 +1661,19 @@ impl VerifiedRemoteExecution {
                 body_hash: ObjectHash::body(&body)?,
                 context: self.context.context.clone(),
             };
-            let destination = self.state.verify_execution_destination(
-                &facts.resource,
-                &facts.audience,
-                &self.selection.execution_resource,
-                &self.selection.target_public_key,
-                &self.selection.execution_grant,
-                &facts.context,
-                facts.action,
-                now,
-            )?;
+            let destination = self
+                .state
+                .verify_execution_destination(
+                    &facts.resource,
+                    &facts.audience,
+                    &self.selection.execution_resource,
+                    &self.selection.target_public_key,
+                    &self.selection.execution_grant,
+                    &facts.context,
+                    facts.action,
+                    now,
+                )?
+                .bind_request(&invocation.payload, &body)?;
             self.state.verify_invocation_with_execution_destination(
                 &invocation,
                 &facts,
@@ -1495,45 +1888,69 @@ fn remote_resolution_intent(
         ));
     };
     let request = &admission.source_body["request"];
-    let binding: task_binding::SignedBinding =
+    let work = &source.payload.work;
+    let binding: Option<task_binding::SignedBinding> =
         serde_json::from_value(request["binding"].clone())
             .map_err(|_| AuthorizationError::InvalidProof("invalid original resolution binding"))?;
-    task_binding::verify_binding(&binding, project_key.as_str())
-        .map_err(|_| AuthorizationError::InvalidProof("resolution binding signature mismatch"))?;
     require(
-        authorization_id != admission.invocation.payload.operation_id,
-        "resolution requires a new authorization ID",
+        binding.is_some() == work.task_ref().is_some()
+            && authorization_id != admission.invocation.payload.operation_id,
+        "resolution changed its work type or reused the original authorization ID",
     )?;
-    let body = serde_json::json!({
+    if let Some(binding) = &binding {
+        task_binding::verify_binding(binding, project_key.as_str()).map_err(|_| {
+            AuthorizationError::InvalidProof("resolution binding signature mismatch")
+        })?;
+        require(
+            work.task_ref()
+                .is_some_and(|task| task.as_str() == binding.binding.task_ref)
+                && work.binding_hash()
+                    == Some(
+                        task_binding::binding_hash(&binding.binding)
+                            .map_err(|_| {
+                                AuthorizationError::InvalidProof("invalid resolution binding hash")
+                            })?
+                            .as_str(),
+                    )
+                && work.binding_generation() == Some(binding.binding.generation),
+            "resolution binding differs from its signed work",
+        )?;
+    }
+    let mut body = serde_json::json!({
         "method":"resolve_unknown", "space_id":event.network_id, "resource_id":event.resource_id,
         "authorization_id":authorization_id, "operation_id":admission.invocation.payload.operation_id,
-        "conversation_id":event.scope_id, "task_id":request["task_id"], "task_ref":binding.binding.task_ref,
-        "target_node":binding.binding.target_node, "session_id":binding.binding.session_id,
+        "conversation_id":event.scope_id,
         "outcome":outcome, "evidence":evidence, "execution_resource":selection.execution_resource,
         "target_public_key":selection.target_public_key, "execution_grant":selection.execution_grant,
         "original_handoff_hash":wire.hash()?, "original_body_hash":admission.invocation.payload.body_hash,
         "unknown_receipt_hash":actual.receipt.hash()?, "resolution_purpose":purpose,
         "execution_observation":actual
     });
-    let context = InvocationContext {
-        conversation: Some(binding.binding.conversation_id.clone()),
-        task: Some(EventRef::parse(&binding.binding.task_ref)?),
-        sdk_session: None,
-        execution_session: Some(SessionRef {
-            target: DeviceId::from_key(&selection.target_public_key),
-            session_id: binding.binding.session_id.clone(),
-        }),
-        executor_kind: binding.binding.open_spec["executor"]
-            .as_str()
-            .map(str::to_owned),
-        workspace_resource: Some(event.resource_id),
-    };
+    body["target_node"] = Value::String(
+        node_fingerprint(selection.target_public_key.as_str())
+            .map_err(|_| AuthorizationError::InvalidProof("invalid resolution target"))?,
+    );
+    if let Some(session) = work.execution_session() {
+        body["session_id"] = serde_json::to_value(&session.session_id)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid resolution session"))?;
+    }
+    if let Some(binding) = &binding {
+        body["task_id"] = request["task_id"].clone();
+        body["task_ref"] = Value::String(binding.binding.task_ref.clone());
+    }
+    let mut context = admission.invocation.payload.context.clone();
+    context.sdk_session = None;
+    context.workspace_resource = Some(event.resource_id);
+    let canonical_cwd = binding
+        .as_ref()
+        .and_then(|binding| binding.binding.open_spec["cwd"].as_str().map(str::to_owned))
+        .or_else(|| work.canonical_cwd().map(str::to_owned));
     Ok((
         body,
         PrepareContext {
             context,
-            binding_generation: Some(binding.binding.generation),
-            canonical_cwd: binding.binding.open_spec["cwd"].as_str().map(str::to_owned),
+            binding_generation: work.binding_generation(),
+            canonical_cwd,
             execution_target_public_key: Some(selection.target_public_key.clone()),
         },
     ))
@@ -1621,6 +2038,7 @@ impl VerifiedPrepareAuthorization {
 
 fn text(value: Option<&Value>) -> Result<Option<&str>> {
     value
+        .filter(|value| !value.is_null())
         .map(|value| {
             value.as_str().ok_or(AuthorizationError::InvalidProof(
                 "raw context value is not text",
@@ -1655,10 +2073,20 @@ fn execution_key<'a>(
     audience_key: &'a PublicKey,
 ) -> Result<&'a PublicKey> {
     let Some(session) = &intent.request.context.execution_session else {
-        require(
-            intent.execution_target_public_key.is_none(),
-            "execution key has no selected session",
-        )?;
+        if let Some(key) = &intent.execution_target_public_key {
+            require(
+                intent.request.context.task.is_none()
+                    && intent.request.context.executor_kind.is_none()
+                    && matches!(
+                        intent.request.action,
+                        Action::ExecutionCommand
+                            | Action::OperationStatusRead
+                            | Action::OperationResolve
+                    ),
+                "sessionless execution key has no command context",
+            )?;
+            return Ok(key);
+        }
         return Ok(audience_key);
     };
     if session.target == intent.request.audience.device {
@@ -1689,40 +2117,77 @@ fn project_metadata_context(
     audience: &Audience,
     key: &PublicKey,
     source: &Signed<execution_handoff::ProjectExecutionSource>,
-    binding: &task_binding::SignedBinding,
+    binding: Option<&task_binding::SignedBinding>,
 ) -> Result<PrepareContext> {
     source.verify_signature()?;
-    task_binding::verify_binding(binding, key.as_str())
-        .map_err(|_| AuthorizationError::InvalidProof("invalid metadata task binding"))?;
-    let b = &binding.binding;
     let statement = &source.payload;
     require(
         source.issuer == *key
             && statement.version == AUTH_VERSION
             && statement.project == *project
-            && b.network_id == project.space.as_str()
-            && b.authority_node
-                == hex::encode(Sha256::digest(crate::decode32(key.as_str()).map_err(
-                    |_| AuthorizationError::InvalidProof("invalid Project host key"),
-                )?))
-            && statement.binding_hash
-                == task_binding::binding_hash(b).map_err(|_| {
-                    AuthorizationError::InvalidProof("invalid metadata binding hash")
-                })?
-            && statement.binding_generation == b.generation
-            && statement.task.as_str() == b.task_ref
-            && statement.execution_session.session_id == b.session_id
-            && statement.execution_session.target != audience.device,
-        "metadata proof differs from its Project host or bound task",
+            && !statement.conversation.is_empty()
+            && statement.work.execution_session().is_none_or(|session| {
+                session.target == DeviceId::from_key(&statement.target_public_key)
+            }),
+        "metadata proof differs from its Project host",
     )?;
+    match (&statement.work, binding) {
+        (
+            execution_work::ExecutionWork::TaskSession {
+                task,
+                binding_hash,
+                binding_generation,
+                execution_session,
+            },
+            Some(binding),
+        ) => {
+            task_binding::verify_binding(binding, key.as_str())
+                .map_err(|_| AuthorizationError::InvalidProof("invalid metadata task binding"))?;
+            let b = &binding.binding;
+            require(
+                b.network_id == project.space.as_str()
+                    && b.conversation_id == statement.conversation
+                    && b.authority_node
+                        == node_fingerprint(key.as_str()).map_err(|_| {
+                            AuthorizationError::InvalidProof("invalid Project host key")
+                        })?
+                    && *binding_hash
+                        == task_binding::binding_hash(b).map_err(|_| {
+                            AuthorizationError::InvalidProof("invalid metadata binding hash")
+                        })?
+                    && *binding_generation == b.generation
+                    && task.as_str() == b.task_ref
+                    && execution_session.session_id == b.session_id
+                    && execution_session.target != audience.device,
+                "metadata proof differs from its bound Task",
+            )?;
+        }
+        (
+            execution_work::ExecutionWork::ConversationSession {
+                conversation,
+                execution_session,
+                ..
+            },
+            None,
+        ) => require(
+            *conversation == statement.conversation && execution_session.target != audience.device,
+            "metadata proof differs from its conversation session",
+        )?,
+        (execution_work::ExecutionWork::Command { .. }, None) => {}
+        _ => {
+            return Err(AuthorizationError::InvalidProof(
+                "metadata binding has another work type",
+            ));
+        }
+    }
     Ok(PrepareContext {
         context: InvocationContext {
-            conversation: Some(b.conversation_id.clone()),
-            task: Some(statement.task.clone()),
+            conversation: Some(statement.conversation.clone()),
+            task: statement.work.task_ref().cloned(),
             workspace_resource: Some(project.resource.clone()),
             ..Default::default()
         },
-        binding_generation: Some(b.generation),
+        binding_generation: statement.work.binding_generation(),
         canonical_cwd: None,
         execution_target_public_key: None,
     })
@@ -1788,7 +2253,7 @@ impl VerifiedPolicySet {
         project: &ResourceRef,
         audience: &Audience,
         source: &Signed<execution_handoff::ProjectExecutionSource>,
-        binding: &task_binding::SignedBinding,
+        binding: Option<&task_binding::SignedBinding>,
         now_ms: u64,
     ) -> Result<PrepareContext> {
         let record = self.resource(&project.space, &project.resource).ok_or(
@@ -1819,24 +2284,283 @@ pub fn verify_project_execution_metadata(
         let source: Signed<execution_handoff::ProjectExecutionSource> =
             serde_json::from_str(source_json)
                 .map_err(|_| AuthorizationError::InvalidProof("invalid Project metadata source"))?;
-        let binding: task_binding::SignedBinding = serde_json::from_str(binding_json)
+        let binding: Option<task_binding::SignedBinding> = serde_json::from_str(binding_json)
             .map_err(|_| AuthorizationError::InvalidProof("invalid Project metadata binding"))?;
-        require(
-            source.payload.project.space == auth.scope.space_id
-                && scope_covers(&auth.grant_scope, &source.payload.project)
-                && (auth.actions.contains(&Action::OperationStatusRead)
-                    || auth.actions.contains(&Action::OperationReconcile)),
-            "client has no Project metadata read permission",
-        )?;
-        let context = project_metadata_context(
-            &source.payload.project,
-            &auth.audience,
-            &auth.audience_public_key,
-            &source,
-            &binding,
-        )?;
+        let context = checked_project_metadata(auth, &source, binding.as_ref())?;
         serde_json::to_string(&context)
             .map_err(|_| AuthorizationError::InvalidProof("metadata context encoding failed"))
+    })()
+    .map_err(|error| error.to_string())
+}
+
+fn checked_project_metadata(
+    auth: &VerifiedClientAuthorization,
+    source: &Signed<execution_handoff::ProjectExecutionSource>,
+    binding: Option<&task_binding::SignedBinding>,
+) -> Result<PrepareContext> {
+    require(
+        source.payload.project.space == auth.scope.space_id
+            && scope_covers(&auth.grant_scope, &source.payload.project)
+            && (auth.actions.contains(&Action::OperationStatusRead)
+                || auth.actions.contains(&Action::OperationReconcile)),
+        "client has no Project metadata read permission",
+    )?;
+    project_metadata_context(
+        &source.payload.project,
+        &auth.audience,
+        &auth.audience_public_key,
+        source,
+        binding,
+    )
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyProjectDispatchWork))]
+pub fn verify_project_dispatch_work(
+    auth: &VerifiedClientAuthorization,
+    event_json: &str,
+    origin_json: &str,
+    expected_target_key: &str,
+    expected_operation_id: &str,
+) -> crate::Result<String> {
+    (|| -> Result<String> {
+        require(
+            event_json.len() <= events::MAX_EVENT_BYTES * 6 + 1024
+                && origin_json.len() <= execution_handoff::MAX_EXECUTION_HANDOFF_BYTES,
+            "Project dispatch evidence is too large",
+        )?;
+        let envelope: events::SignedEvent = serde_json::from_str(event_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid Project dispatch"))?;
+        let origin: execution_work::ProjectDispatchOrigin = serde_json::from_str(origin_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid Project dispatch origin"))?;
+        let target = PublicKey::parse(expected_target_key)?;
+        let (work, context, request) = checked_project_dispatch_work(
+            auth,
+            &envelope,
+            &origin,
+            &target,
+            expected_operation_id,
+        )?;
+        serde_json::to_string(&serde_json::json!({
+            "work": work, "context": context, "request": request,
+        }))
+        .map_err(|_| AuthorizationError::InvalidProof("Project dispatch encoding failed"))
+    })()
+    .map_err(|error| error.to_string())
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyProjectExecutionResult))]
+pub fn verify_project_execution_result(
+    auth: &VerifiedClientAuthorization,
+    actual_json: &str,
+    origin_json: &str,
+    expected_target_key: &str,
+    expected_operation_id: &str,
+) -> crate::Result<String> {
+    (|| -> Result<String> {
+        require(
+            actual_json.len() <= execution_handoff::MAX_EXECUTION_HANDOFF_BYTES
+                && origin_json.len() <= execution_handoff::MAX_EXECUTION_HANDOFF_BYTES,
+            "Project execution result evidence is too large",
+        )?;
+        let actual: execution_work::ProjectExecutionResult = serde_json::from_str(actual_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid Project execution result"))?;
+        let origin: execution_work::ProjectDispatchOrigin = serde_json::from_str(origin_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid Project dispatch origin"))?;
+        let target = PublicKey::parse(expected_target_key)?;
+        let (work, context, request) = checked_project_dispatch_work(
+            auth,
+            &actual.dispatch,
+            &origin,
+            &target,
+            expected_operation_id,
+        )?;
+        execution_work::verify_project_execution_receipt_signature(
+            &actual.dispatch,
+            &origin,
+            &actual.receipt,
+            &actual.result,
+        )?;
+        serde_json::to_string(&serde_json::json!({
+            "work": work, "context": context, "request": request,
+        }))
+        .map_err(|_| AuthorizationError::InvalidProof("Project execution result encoding failed"))
+    })()
+    .map_err(|error| error.to_string())
+}
+
+fn checked_project_dispatch_work(
+    auth: &VerifiedClientAuthorization,
+    envelope: &events::SignedEvent,
+    origin: &execution_work::ProjectDispatchOrigin,
+    target: &PublicKey,
+    expected_operation_id: &str,
+) -> Result<(ExecutionWork, PrepareContext, Value)> {
+    let unverified: events::Event = serde_json::from_str(&envelope.canonical_body)
+        .map_err(|_| AuthorizationError::InvalidProof("invalid Project dispatch body"))?;
+    let project = ResourceRef {
+        space: SpaceId::parse(&unverified.network_id)?,
+        resource: unverified.resource_id.clone(),
+    };
+    require(
+        valid_operation_id(expected_operation_id)
+            && project.space == auth.scope.space_id
+            && scope_covers(&auth.grant_scope, &project)
+            && (auth.actions.contains(&Action::OperationStatusRead)
+                || auth.actions.contains(&Action::OperationReconcile)),
+        "client has no Project dispatch read permission",
+    )?;
+    let record = auth
+        .policy_snapshot
+        .resource(&project.space, &project.resource)
+        .ok_or(AuthorizationError::InvalidProof(
+            "dispatch Project is missing",
+        ))?;
+    require(
+        record.payload.kind == ResourceKind::Project
+            && record.payload.host == auth.audience.service,
+        "dispatch belongs to another Project host",
+    )?;
+    let verified = events::verify_signed_event(
+        &serde_json::to_string(envelope)
+            .map_err(|_| AuthorizationError::InvalidProof("dispatch encoding failed"))?,
+        project.space.as_str(),
+        project.resource.as_str(),
+        auth.audience_public_key.as_str(),
+    )
+    .map_err(|_| AuthorizationError::InvalidProof("invalid signed Project dispatch"))?;
+    let event = verified.event();
+    let (admission, request) = execution_work::project_dispatch_request(event, target)?;
+    require(
+        admission.invocation.payload.operation_id == expected_operation_id
+            && admission.invocation.payload.audience == auth.audience,
+        "dispatch differs from the expected operation or Project audience",
+    )?;
+    let work = execution_work::derive_project_dispatch_work(event, origin, target)?;
+    let context = execution_work::project_dispatch_context(event, &work, target)?;
+    let facts = RequestFacts {
+        resource: project.clone(),
+        action: execution_handoff::execution_action(request)?,
+        audience: auth.audience.clone(),
+        operation_id: expected_operation_id.to_owned(),
+        body_hash: ObjectHash::body(&admission.source_body)?,
+        context: context.context.clone(),
+    };
+    auth.policy_snapshot
+        .verify_original_admission(admission, &facts)?;
+    match origin {
+        execution_work::ProjectDispatchOrigin::TaskSession { task_creation } => {
+            let task = events::verify_signed_event(
+                &serde_json::to_string(task_creation)
+                    .map_err(|_| AuthorizationError::InvalidProof("Task origin encoding failed"))?,
+                project.space.as_str(),
+                project.resource.as_str(),
+                auth.audience_public_key.as_str(),
+            )
+            .map_err(|_| AuthorizationError::InvalidProof("invalid signed Task origin"))?;
+            let events::EventBody::TaskCreated { task_id, .. } = &task.event().body else {
+                return Err(AuthorizationError::InvalidProof(
+                    "dispatch origin is not a Task creation",
+                ));
+            };
+            let binding: task_binding::SignedBinding =
+                serde_json::from_value(request["binding"].clone()).map_err(|_| {
+                    AuthorizationError::InvalidProof("Task dispatch has no binding")
+                })?;
+            require(
+                binding.binding.task_id == *task_id
+                    && binding.binding.task_ref == task_creation.hash
+                    && binding.binding.authority_node == task.event().author
+                    && task.event().scope_id == event.scope_id
+                    && task.event().blobs.is_empty(),
+                "Task dispatch differs from its creation",
+            )?;
+            task_binding::verify_binding(&binding, auth.audience_public_key.as_str())
+                .map_err(|_| AuthorizationError::InvalidProof("invalid Task binding signature"))?;
+        }
+        execution_work::ProjectDispatchOrigin::LocalConversationSession { accepted_open } => {
+            checked_project_dispatch_work(
+                auth,
+                &accepted_open.dispatch,
+                &execution_work::ProjectDispatchOrigin::ConversationOpen,
+                target,
+                &accepted_open.receipt.payload.operation_id,
+            )?;
+        }
+        execution_work::ProjectDispatchOrigin::RemoteConversationSession { accepted_open } => {
+            auth.policy_snapshot.verify_execution_observation_source(
+                &accepted_open.handoff.handoff,
+                admission.admitted_at_ms,
+            )?;
+        }
+        execution_work::ProjectDispatchOrigin::ConversationOpen
+        | execution_work::ProjectDispatchOrigin::Command => {}
+    }
+    Ok((work, context, request.clone()))
+}
+
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyObservedExecutionResult))]
+pub fn verify_observed_execution_result(
+    auth: &VerifiedClientAuthorization,
+    actual_json: &str,
+    binding_json: &str,
+    expected_target_key: &str,
+    expected_operation_id: &str,
+) -> crate::Result<String> {
+    (|| -> Result<String> {
+        require(
+            actual_json.len() <= execution_handoff::MAX_EXECUTION_HANDOFF_BYTES
+                && binding_json.len() <= MAX_PROOF_BYTES,
+            "observed execution evidence is too large",
+        )?;
+        let actual: execution_handoff::ExecutionHandoffResult = serde_json::from_str(actual_json)
+            .map_err(|_| {
+            AuthorizationError::InvalidProof("invalid observed execution result")
+        })?;
+        let binding: Option<task_binding::SignedBinding> = serde_json::from_str(binding_json)
+            .map_err(|_| AuthorizationError::InvalidProof("invalid observation binding"))?;
+        let target = PublicKey::parse(expected_target_key)?;
+        let handoff = &actual.handoff.handoff;
+        let source =
+            handoff
+                .source_attestation
+                .as_ref()
+                .ok_or(AuthorizationError::InvalidProof(
+                    "observed execution has no Project source",
+                ))?;
+        checked_project_metadata(auth, source, binding.as_ref())?;
+        require(
+            valid_operation_id(expected_operation_id)
+                && source.payload.target_public_key == target
+                && source.payload.operation_id == expected_operation_id
+                && source.payload == handoff.source_statement()?,
+            "observed execution differs from the expected Project work",
+        )?;
+        execution_handoff::verify_execution_handoff_receipt_signature(
+            &actual.handoff,
+            &actual.receipt,
+            &actual.result,
+        )?;
+        let (_, admission, request, _) = execution_handoff::original_dispatch(handoff)?;
+        admission.invocation.verify_signature()?;
+        require(
+            actual.handoff.invocation.issuer == auth.audience_public_key
+                && actual.handoff.invocation.payload.action == Action::ExecutionSubmit
+                && actual.handoff.invocation.payload.resource == handoff.execution_resource
+                && admission.invocation.payload.resource == source.payload.project
+                && admission.invocation.payload.audience == auth.audience
+                && admission.invocation.payload.body_hash
+                    == ObjectHash::body(&admission.source_body)?
+                && request["binding"]
+                    == serde_json::to_value(&binding).map_err(|_| {
+                        AuthorizationError::InvalidProof("observation binding encoding failed")
+                    })?,
+            "observed execution differs from its original Project admission",
+        )?;
+        serde_json::to_string(&serde_json::json!({
+            "request": request,
+            "work": source.payload.work,
+        }))
+        .map_err(|_| AuthorizationError::InvalidProof("observed execution encoding failed"))
     })()
     .map_err(|error| error.to_string())
 }
@@ -1869,9 +2593,11 @@ fn check_raw_metadata(intent: &PrepareIntent, body: &Value, key: &PublicKey) -> 
     let source: Signed<execution_handoff::ProjectExecutionSource> =
         serde_json::from_value(source.clone())
             .map_err(|_| AuthorizationError::InvalidProof("invalid metadata source"))?;
-    let binding: task_binding::SignedBinding = serde_json::from_value(body["binding"].clone())
-        .map_err(|_| AuthorizationError::InvalidProof("invalid metadata binding"))?;
-    let expected = project_metadata_context(&i.resource, &i.audience, key, &source, &binding)?;
+    let binding: Option<task_binding::SignedBinding> =
+        serde_json::from_value(body["binding"].clone())
+            .map_err(|_| AuthorizationError::InvalidProof("invalid metadata binding"))?;
+    let expected =
+        project_metadata_context(&i.resource, &i.audience, key, &source, binding.as_ref())?;
     require(
         intent.request.context == expected.context
             && intent.binding_generation == expected.binding_generation
@@ -1880,23 +2606,69 @@ fn check_raw_metadata(intent: &PrepareIntent, body: &Value, key: &PublicKey) -> 
             && text(body.get("operation_id"))? == Some(source.payload.operation_id.as_str()),
         "metadata request differs from its durable Project source",
     )?;
-    for (field, value) in [
-        ("conversation_id", binding.binding.conversation_id.as_str()),
-        ("task_id", binding.binding.task_id.as_str()),
-        ("task_ref", binding.binding.task_ref.as_str()),
-        ("target_node", binding.binding.target_node.as_str()),
-        ("session_id", binding.binding.session_id.as_str()),
-    ] {
-        if let Some(actual) = text(body.get(field))? {
+    if let Some(value) = text(body.get("conversation_id"))? {
+        require(
+            value == source.payload.conversation,
+            "metadata changed its conversation",
+        )?;
+    }
+    if let Some(actual) = text(body.get("target_node"))? {
+        require(
+            actual
+                == node_fingerprint(source.payload.target_public_key.as_str()).map_err(|_| {
+                    AuthorizationError::InvalidProof("invalid metadata executor key")
+                })?,
+            "metadata changed its executor target",
+        )?;
+    }
+    if let Some(binding) = &binding {
+        for (field, value) in [
+            ("task_id", binding.binding.task_id.as_str()),
+            ("task_ref", binding.binding.task_ref.as_str()),
+            ("target_node", binding.binding.target_node.as_str()),
+            ("session_id", binding.binding.session_id.as_str()),
+        ] {
+            if let Some(actual) = text(body.get(field))? {
+                require(
+                    actual == value,
+                    "metadata request changed its original Task context",
+                )?;
+            }
+        }
+    } else {
+        require(
+            text(body.get("task_id"))?.is_none() && text(body.get("task_ref"))?.is_none(),
+            "metadata for ordinary work cannot claim a Task",
+        )?;
+        if let Some(session) = source.payload.work.execution_session() {
+            if let Some(actual) = text(body.get("session_id"))? {
+                require(actual == session.session_id, "metadata changed its session")?;
+            }
+        } else {
             require(
-                actual == value,
-                "metadata request changed its original operation context",
+                text(body.get("session_id"))?.is_none() && body["method"] != "session",
+                "command metadata cannot select a session",
             )?;
         }
     }
     if body["method"] == "session" {
+        let session =
+            source
+                .payload
+                .work
+                .execution_session()
+                .ok_or(AuthorizationError::InvalidProof(
+                    "session metadata has no session work",
+                ))?;
         require(
-            body.get("target_node").is_some() && body.get("session_id").is_some(),
+            session.target == DeviceId::from_key(&source.payload.target_public_key),
+            "metadata changed its executor key",
+        )?;
+        let target = node_fingerprint(source.payload.target_public_key.as_str())
+            .map_err(|_| AuthorizationError::InvalidProof("invalid metadata executor key"))?;
+        require(
+            text(body.get("target_node"))? == Some(target.as_str())
+                && text(body.get("session_id"))? == Some(session.session_id.as_str()),
             "session metadata needs its original target and session",
         )?;
     }
@@ -2136,22 +2908,63 @@ pub(super) fn check_raw_context(
     }
     let remote = remote_selection(body)?;
     if let Some((_, key, _)) = &remote {
+        let target = DeviceId::from_key(key);
         require(
             intent.execution_target_public_key.as_ref() == Some(key)
-                && context.execution_session.as_ref().is_some_and(|session| {
-                    session.target == DeviceId::from_key(key) && session.target != i.audience.device
-                }),
+                && target != i.audience.device
+                && match &context.execution_session {
+                    Some(session) => session.target == target,
+                    None => {
+                        i.action == Action::ExecutionCommand
+                            && context.task.is_none()
+                            && context.executor_kind.is_none()
+                    }
+                },
             "remote execution target differs from the explicit client pin",
         )?;
     }
-    if body["method"].as_str() == Some("operate") && remote.is_none() {
-        require(
-            context
-                .execution_session
-                .as_ref()
-                .is_some_and(|session| session.target == i.audience.device),
-            "operation execution target differs from audience",
-        )?;
+    if body["method"].as_str() == Some("operate") {
+        if i.action == Action::ExecutionCommand {
+            require(
+                context.task.is_none()
+                    && context.execution_session.is_none()
+                    && context.executor_kind.is_none()
+                    && intent.binding_generation.is_none()
+                    && binding.is_none()
+                    && task_ids.iter().all(Option::is_none)
+                    && request.is_some_and(|request| {
+                        request["session_id"].is_null()
+                            && request["expected_revision"].as_u64() == Some(0)
+                            && request["action"]["type"] == "command"
+                            && request["action"]["command"]
+                                .as_str()
+                                .is_some_and(|command| {
+                                    !command.trim().is_empty() && command.len() <= MAX_PROOF_BYTES
+                                })
+                            && request["action"]["timeout_secs"]
+                                .as_u64()
+                                .is_some_and(|seconds| seconds > 0)
+                            && request["action"]["cwd"].as_str() == intent.canonical_cwd.as_deref()
+                    }),
+                "command prepare cannot claim a task, session, binding or revision",
+            )?;
+        } else {
+            require(
+                context
+                    .execution_session
+                    .as_ref()
+                    .is_some_and(|session| remote.is_some() || session.target == i.audience.device),
+                "operation execution target differs from audience",
+            )?;
+            if context.task.is_none() {
+                require(
+                    binding.is_none()
+                        && intent.binding_generation.is_none()
+                        && task_ids.iter().all(Option::is_none),
+                    "conversation operation cannot claim a Task binding",
+                )?;
+            }
+        }
     }
     let raw_target = hex::encode(Sha256::digest(
         crate::decode32(execution_key(intent, audience_key)?.as_str())
@@ -2381,7 +3194,8 @@ impl VerifiedPolicySet {
                     i.action,
                     now_ms,
                     budget.clone(),
-                )
+                )?
+                .bind_request(i, raw_body)
             })
             .transpose()?;
         if let Some(destination) = &destination {
@@ -2587,6 +3401,442 @@ mod tests {
     }
 
     #[test]
+    fn observed_result_requires_the_signed_project_work_and_executor_receipt() {
+        let mut f = execution_observation::tests::retained_project_observation_fixture();
+        let binding = serde_json::to_string(&f.binding).unwrap();
+        let target = f.actual.handoff.handoff.target_public_key.as_str();
+        let operation = &f.actual.receipt.payload.operation_id;
+        let check =
+            |actual: &execution_handoff::ExecutionHandoffResult, target: &str, operation: &str| {
+                verify_observed_execution_result(
+                    &f.source,
+                    &serde_json::to_string(actual).unwrap(),
+                    &binding,
+                    target,
+                    operation,
+                )
+            };
+        let result: Value =
+            serde_json::from_str(&check(&f.actual, target, operation).unwrap()).unwrap();
+        assert_eq!(result["request"], f.body["request"]);
+        assert_eq!(
+            result["work"],
+            serde_json::to_value(&f.actual.receipt.payload.work).unwrap()
+        );
+        assert!(check(&f.actual, PublicKey::of(&f.client).as_str(), operation).is_err());
+        assert!(check(&f.actual, target, "another-operation").is_err());
+        let mut changed = f.actual.clone();
+        changed.result = serde_json::json!({"state": "forged"});
+        assert!(check(&changed, target, operation).is_err());
+        let mut changed = f.actual.clone();
+        let source = changed.handoff.handoff.source_attestation.as_mut().unwrap();
+        source.payload.original_admission_hash = ObjectHash::body(&"another-admission").unwrap();
+        *source = Signed::sign(source.payload.clone(), &f.project_node).unwrap();
+        assert!(check(&changed, target, operation).is_err());
+        assert!(
+            verify_observed_execution_result(
+                &f.source,
+                &serde_json::to_string(&f.actual).unwrap(),
+                "null",
+                target,
+                operation,
+            )
+            .is_err()
+        );
+        f.source.actions.clear();
+        assert!(
+            verify_observed_execution_result(
+                &f.source,
+                &serde_json::to_string(&f.actual).unwrap(),
+                &binding,
+                target,
+                operation,
+            )
+            .is_err()
+        );
+    }
+
+    fn signed_local_dispatch(
+        fixture: &execution_observation::tests::RetainedHistoryFixture,
+        operation: &str,
+        action: Value,
+        at: u64,
+    ) -> events::SignedEvent {
+        use ed25519_dalek::Signer;
+        let state = &fixture.source.policy_snapshot;
+        let project = fixture.invocation.payload.resource.clone();
+        let session = if action["type"] == "command" {
+            None
+        } else {
+            Some("local-session")
+        };
+        let request = json!({
+            "space_id":project.space, "conversation_id":"local-conversation",
+            "operation_id":operation, "target_node":fixture.project_node.node_id(),
+            "session_id":session, "task_id":null, "binding":null,
+            "expected_revision":if action["type"] == "send" { 1 } else { 0 },
+            "action":action,
+        });
+        let body = json!({
+            "method":"operate", "space_id":project.space, "resource_id":project.resource,
+            "authorization_id":operation, "request":request,
+        });
+        let context = InvocationContext {
+            conversation: Some("local-conversation".into()),
+            workspace_resource: Some(project.resource.clone()),
+            execution_session: session.map(|id| SessionRef {
+                target: DeviceId::from_key(&PublicKey::of(&fixture.project_node)),
+                session_id: id.into(),
+            }),
+            executor_kind: session.map(|_| "codex".into()),
+            ..Default::default()
+        };
+        let facts = RequestFacts {
+            resource: project.clone(),
+            action: execution_handoff::execution_action(&request).unwrap(),
+            audience: fixture.source.audience.clone(),
+            operation_id: operation.into(),
+            body_hash: ObjectHash::body(&body).unwrap(),
+            context: context.clone(),
+        };
+        let mut invocation = fixture.invocation.payload.clone();
+        invocation.operation_id = operation.into();
+        invocation.action = facts.action;
+        invocation.body_hash = facts.body_hash.clone();
+        invocation.context = context;
+        invocation.expected_policies.clear();
+        invocation.nonce = Nonce::random().unwrap();
+        invocation.not_before_ms = at;
+        invocation.expires_at_ms = at + 1000;
+        let transport = TransportEvidence::DirectNoise {
+            device: invocation.device.clone(),
+        };
+        let initial = Signed::sign(invocation.clone(), &fixture.client).unwrap();
+        let AuthorizationError::NeedPolicySync(heads) = state
+            .verify_invocation(&initial, &facts, &transport, at)
+            .unwrap_err()
+        else {
+            panic!("local dispatch fixture must discover policy heads")
+        };
+        invocation.expected_policies = heads;
+        let invocation = Signed::sign(invocation, &fixture.client).unwrap();
+        let authorization = state
+            .verify_invocation(&invocation, &facts, &transport, at)
+            .unwrap();
+        let challenge = FreshnessChallenge::new(
+            &authorization,
+            CheckStage::Admit,
+            Nonce::random().unwrap(),
+            at,
+            at + 1000,
+        )
+        .unwrap();
+        let receipts = challenge
+            .policies
+            .iter()
+            .map(|current| {
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: current.clone(),
+                        challenge_hash: challenge.hash().unwrap(),
+                        issued_at_ms: at,
+                        expires_at_ms: at + 1000,
+                    },
+                    &fixture.project_node,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let fresh = state
+            .verify_freshness(&authorization, &challenge, &receipts, at)
+            .unwrap();
+        state.admit_operation(&authorization, &fresh, at).unwrap();
+        let event = events::Event {
+            version: events::EVENT_VERSION,
+            network_id: project.space.to_string(),
+            resource_id: project.resource,
+            cause: events::EventCause::Invocation {
+                admission: events::AdmissionProof {
+                    invocation,
+                    source_body: body,
+                    challenge,
+                    receipts,
+                    admitted_at_ms: at,
+                    transport: events::StoredTransport::from(&transport),
+                },
+            },
+            scope_id: "local-conversation".into(),
+            author: fixture.project_node.node_id(),
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: at as i64,
+            body: events::EventBody::DispatchRecorded {
+                operation_id: operation.into(),
+                task_id: None,
+                target_node: fixture.project_node.node_id(),
+                session_id: session.map(str::to_owned),
+                action: request,
+            },
+            blobs: vec![],
+        };
+        let canonical_body = serde_json::to_string(&event).unwrap();
+        let hash = hex::encode(Sha256::digest(canonical_body.as_bytes()));
+        let mut bytes = b"vibeface:event:v2:".to_vec();
+        bytes.extend_from_slice(hash.as_bytes());
+        events::SignedEvent {
+            hash,
+            canonical_body,
+            signature: hex::encode(fixture.project_node.key.sign(&bytes).to_bytes()),
+        }
+    }
+
+    #[test]
+    fn project_dispatch_work_verifies_local_command_admission() {
+        let mut fixture = execution_observation::tests::retained_project_observation_fixture();
+        let at = fixture.invocation.payload.not_before_ms;
+        let dispatch = signed_local_dispatch(
+            &fixture,
+            "local-command",
+            json!({
+                "type":"command", "command":"pwd", "cwd":"/workspace/project", "timeout_secs":30,
+            }),
+            at,
+        );
+        let target = PublicKey::of(&fixture.project_node);
+        let origin = execution_work::ProjectDispatchOrigin::Command;
+        let check = |auth: &VerifiedClientAuthorization,
+                     event: &events::SignedEvent,
+                     key: &PublicKey,
+                     operation: &str| {
+            verify_project_dispatch_work(
+                auth,
+                &serde_json::to_string(event).unwrap(),
+                &serde_json::to_string(&origin).unwrap(),
+                key.as_str(),
+                operation,
+            )
+        };
+        let result: Value = serde_json::from_str(
+            &check(&fixture.source, &dispatch, &target, "local-command").unwrap(),
+        )
+        .unwrap();
+        let event: events::Event = serde_json::from_str(&dispatch.canonical_body).unwrap();
+        let events::EventBody::DispatchRecorded { action, .. } = &event.body else {
+            unreachable!()
+        };
+        assert_eq!(result["work"]["kind"], "command");
+        assert_eq!(
+            result["work"]["request_hash"],
+            serde_json::to_value(ObjectHash::body(action).unwrap()).unwrap()
+        );
+        assert_eq!(result["request"], *action);
+        assert_eq!(result["context"]["context"]["task"], Value::Null);
+        assert!(check(&fixture.source, &dispatch, &target, "another-command").is_err());
+        assert!(
+            check(
+                &fixture.source,
+                &dispatch,
+                &PublicKey::of(&fixture.client),
+                "local-command"
+            )
+            .is_err()
+        );
+        let mut changed = dispatch.clone();
+        let mut changed_event = event;
+        if let events::EventCause::Invocation { admission } = &mut changed_event.cause {
+            admission.invocation.payload.context.task =
+                Some(EventRef::parse(&"11".repeat(32)).unwrap());
+            admission.invocation =
+                Signed::sign(admission.invocation.payload.clone(), &fixture.client).unwrap();
+        }
+        changed.canonical_body = serde_json::to_string(&changed_event).unwrap();
+        assert!(check(&fixture.source, &changed, &target, "local-command").is_err());
+        fixture.source.actions.clear();
+        assert!(check(&fixture.source, &dispatch, &target, "local-command").is_err());
+    }
+
+    #[test]
+    fn project_dispatch_work_rejects_task_open_spec_changes() {
+        let fixture = execution_observation::tests::retained_history_fixture();
+        let handoff = &fixture.actual.handoff.handoff;
+        let execution_handoff::ExecutionOrigin::TaskSession { task_creation } = &handoff.origin
+        else {
+            unreachable!()
+        };
+        let origin = execution_work::ProjectDispatchOrigin::TaskSession {
+            task_creation: task_creation.clone(),
+        };
+        let mut event: events::Event =
+            serde_json::from_str(&handoff.project_dispatch.canonical_body).unwrap();
+        assert!(
+            execution_work::derive_project_dispatch_work(
+                &event,
+                &origin,
+                &handoff.target_public_key
+            )
+            .is_ok()
+        );
+        let events::EventCause::Invocation { admission } = &mut event.cause else {
+            unreachable!()
+        };
+        admission.source_body["request"]["action"]["cwd"] = json!("/another-workspace");
+        admission.invocation.payload.body_hash = ObjectHash::body(&admission.source_body).unwrap();
+        let events::EventBody::DispatchRecorded { action, .. } = &mut event.body else {
+            unreachable!()
+        };
+        *action = admission.source_body["request"].clone();
+        assert!(
+            execution_work::derive_project_dispatch_work(
+                &event,
+                &origin,
+                &handoff.target_public_key
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn project_dispatch_work_binds_local_continuation_to_signed_open() {
+        use execution_handoff::{ExecutionHandoffState, ExecutionSessionSnapshot};
+        use execution_work::{
+            ProjectDispatchOrigin, ProjectExecutionReceipt, ProjectExecutionResult,
+        };
+        let fixture = execution_observation::tests::retained_project_observation_fixture();
+        let at = fixture.invocation.payload.not_before_ms;
+        let target = PublicKey::of(&fixture.project_node);
+        let dispatch = signed_local_dispatch(
+            &fixture,
+            "local-open",
+            json!({
+                "type":"open", "executor":"codex", "cwd":"/workspace/project",
+            }),
+            at,
+        );
+        let event: events::Event = serde_json::from_str(&dispatch.canonical_body).unwrap();
+        let mut nonzero_revision = event.clone();
+        let events::EventCause::Invocation { admission } = &mut nonzero_revision.cause else {
+            unreachable!()
+        };
+        admission.source_body["request"]["expected_revision"] = json!(1);
+        admission.invocation.payload.body_hash = ObjectHash::body(&admission.source_body).unwrap();
+        let events::EventBody::DispatchRecorded { action, .. } = &mut nonzero_revision.body else {
+            unreachable!()
+        };
+        *action = admission.source_body["request"].clone();
+        assert!(
+            execution_work::derive_project_dispatch_work(
+                &nonzero_revision,
+                &ProjectDispatchOrigin::ConversationOpen,
+                &target,
+            )
+            .is_err()
+        );
+        let (admission, _) = execution_work::project_dispatch_request(&event, &target).unwrap();
+        let work = execution_work::derive_project_dispatch_work(
+            &event,
+            &ProjectDispatchOrigin::ConversationOpen,
+            &target,
+        )
+        .unwrap();
+        let project = admission.invocation.payload.resource.clone();
+        let result = json!({"state":"ready", "session_id":"local-session"});
+        let receipt = Signed::sign(
+            ProjectExecutionReceipt {
+                version: AUTH_VERSION,
+                dispatch: EventRef::parse(&dispatch.hash).unwrap(),
+                project: project.clone(),
+                target_public_key: target.clone(),
+                operation_id: "local-open".into(),
+                original_invocation_hash: admission.invocation.hash().unwrap(),
+                original_admission_hash: ObjectHash::body(admission).unwrap(),
+                work: work.clone(),
+                state: ExecutionHandoffState::Succeeded,
+                result_hash: ObjectHash::body(&result).unwrap(),
+                session: Some(ExecutionSessionSnapshot {
+                    original_project: project.clone(),
+                    execution_resource: project,
+                    work: work.clone(),
+                    target: DeviceId::from_key(&target),
+                    session_id: "local-session".into(),
+                    revision: 1,
+                    executor: "codex".into(),
+                    cwd: "/workspace/project".into(),
+                    state: "ready".into(),
+                    expires_at_ms: at + EXECUTION_LEASE_MS,
+                }),
+                issued_at_ms: at + 1,
+            },
+            &fixture.project_node,
+        )
+        .unwrap();
+        let accepted = ProjectExecutionResult {
+            dispatch,
+            receipt,
+            result,
+        };
+        let check_result = |actual: &ProjectExecutionResult| {
+            verify_project_execution_result(
+                &fixture.source,
+                &serde_json::to_string(actual).unwrap(),
+                &serde_json::to_string(&ProjectDispatchOrigin::ConversationOpen).unwrap(),
+                target.as_str(),
+                "local-open",
+            )
+        };
+        let verified_result: Value =
+            serde_json::from_str(&check_result(&accepted).unwrap()).unwrap();
+        assert_eq!(
+            verified_result["work"],
+            serde_json::to_value(&work).unwrap()
+        );
+        assert_eq!(verified_result["request"]["operation_id"], "local-open");
+        let mut changed_result = accepted.clone();
+        changed_result.result["state"] = json!("forged");
+        assert!(check_result(&changed_result).is_err());
+        let continuation = signed_local_dispatch(
+            &fixture,
+            "local-send",
+            json!({"type":"send", "text":"continue"}),
+            at + 3,
+        );
+        let check = |actual: &ProjectExecutionResult| {
+            verify_project_dispatch_work(
+                &fixture.source,
+                &serde_json::to_string(&continuation).unwrap(),
+                &serde_json::to_string(&ProjectDispatchOrigin::LocalConversationSession {
+                    accepted_open: Box::new(actual.clone()),
+                })
+                .unwrap(),
+                target.as_str(),
+                "local-send",
+            )
+        };
+        let verified: Value = serde_json::from_str(&check(&accepted).unwrap()).unwrap();
+        assert_eq!(verified["work"], serde_json::to_value(&work).unwrap());
+        let mut changed = accepted.clone();
+        changed.result["state"] = json!("forged");
+        assert!(check(&changed).is_err());
+        let mut changed = accepted.clone();
+        changed.receipt.payload.session.as_mut().unwrap().cwd = "/another-project".into();
+        changed.receipt = Signed::sign(changed.receipt.payload, &fixture.project_node).unwrap();
+        assert!(check(&changed).is_err());
+        let mut changed = accepted.clone();
+        changed.receipt.payload.state = ExecutionHandoffState::Failed;
+        changed.receipt = Signed::sign(changed.receipt.payload, &fixture.project_node).unwrap();
+        assert!(check(&changed).is_err());
+        let mut changed = accepted.clone();
+        changed.receipt.payload.issued_at_ms = at + 4;
+        changed.receipt = Signed::sign(changed.receipt.payload, &fixture.project_node).unwrap();
+        assert!(check(&changed).is_err());
+        let mut changed = accepted;
+        changed.receipt.payload.dispatch = EventRef::parse(&"22".repeat(32)).unwrap();
+        changed.receipt = Signed::sign(changed.receipt.payload, &fixture.project_node).unwrap();
+        assert!(check(&changed).is_err());
+    }
+
+    #[test]
     fn remote_prepare_requires_an_exact_current_execution_grant() {
         let mut f = Fixture::new();
         let executor = Identity::from_secret_hex(&hex::encode([87; 32])).unwrap();
@@ -2713,13 +3963,14 @@ mod tests {
             .unwrap();
         let (_, user, bundle, pins) = client_material(&f, None);
         let body = json!({"method":"operate","space_id":space,"resource_id":project.resource,
-            "authorization_id":"prepare_1","conversation_id":"chat","task_ref":context.task,
+            "authorization_id":"prepare_1","conversation_id":"chat","task_ref":context.task,"binding_generation":1,
             "execution_resource":execution,"target_public_key":execution_key,"execution_grant":leaf,
             "request":{"conversation_id":"chat","session_id":"remote-session",
                 "target_node":hex::encode(Sha256::digest(crate::decode32(execution_key.as_str()).unwrap())),
                 "action":{"type":"send","text":"one task"}}});
         let raw = PrepareContext {
             context: context.clone(),
+            binding_generation: Some(1),
             execution_target_public_key: Some(execution_key.clone()),
             ..Default::default()
         };
@@ -2756,6 +4007,28 @@ mod tests {
         .unwrap();
         let policy = stream.import(&auth, NOW).unwrap();
         let handle = verify_remote_execution(&auth, &policy, NOW as f64).unwrap();
+        for revision in [f64::NAN, f64::INFINITY, -1.0, 0.5, 9_007_199_254_740_992.0] {
+            assert!(
+                handle
+                    .control_json("{}", revision, NOW as f64)
+                    .unwrap_err()
+                    .contains("invalid expected execution revision")
+            );
+        }
+        assert!(
+            handle
+                .control_json("{}", 0.0, NOW as f64)
+                .unwrap_err()
+                .contains("invalid execution control observation")
+        );
+        assert!(
+            handle
+                .check_work(&execution_work::ExecutionWork::Command {
+                    request_hash: ObjectHash::body(&body["request"]).unwrap(),
+                    canonical_cwd: "/configured/workspace".into(),
+                })
+                .is_err()
+        );
         let signed: Signed<PrepareIntent> = serde_json::from_str(
             &handle
                 .prepare(
@@ -2860,7 +4133,8 @@ mod tests {
             body_hash: gateway_invocation.payload.body_hash.clone(),
             context: gateway_invocation.payload.context.clone(),
         };
-        let gateway_authorized = f.state
+        let gateway_authorized = f
+            .state
             .verify_gateway_invocation_with_execution_destination(
                 &gateway_invocation,
                 &body,
@@ -2870,37 +4144,144 @@ mod tests {
                 NOW,
             )
             .unwrap();
-        let challenge = FreshnessChallenge::new(&gateway_authorized, CheckStage::Admit, Nonce::from_bytes([92;32]), NOW, NOW+1_000).unwrap();
-        let authority = Identity::from_secret_hex(&hex::encode([3;32])).unwrap();
-        let receipts: Vec<_> = gateway_authorized.dependencies().iter().map(|head| Signed::sign(FreshnessReceipt {
-            version:AUTH_VERSION,current:head.clone(),challenge_hash:challenge.hash().unwrap(),issued_at_ms:NOW,expires_at_ms:NOW+1_000,
-        }, &authority).unwrap()).collect();
+        let challenge = FreshnessChallenge::new(
+            &gateway_authorized,
+            CheckStage::Admit,
+            Nonce::from_bytes([92; 32]),
+            NOW,
+            NOW + 1_000,
+        )
+        .unwrap();
+        let authority = Identity::from_secret_hex(&hex::encode([3; 32])).unwrap();
+        let receipts: Vec<_> = gateway_authorized
+            .dependencies()
+            .iter()
+            .map(|head| {
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: head.clone(),
+                        challenge_hash: challenge.hash().unwrap(),
+                        issued_at_ms: NOW,
+                        expires_at_ms: NOW + 1_000,
+                    },
+                    &authority,
+                )
+                .unwrap()
+            })
+            .collect();
         let proof = events::AdmissionProof {
-            invocation:gateway_invocation.clone(),source_body:body.clone(),challenge,receipts,admitted_at_ms:NOW,
-            transport:events::StoredTransport::DirectedGateway{header:invocation_proof.header().clone()},
+            invocation: gateway_invocation.clone(),
+            source_body: body.clone(),
+            challenge,
+            receipts,
+            admitted_at_ms: NOW,
+            transport: events::StoredTransport::DirectedGateway {
+                header: invocation_proof.header().clone(),
+            },
         };
-        let original = f.state.verify_original_admission(&proof,&gateway_facts).unwrap();
-        f.state.verify_admitted_operation_authorization(&original,&gateway_facts,NOW+INVOCATION_MAX_AGE_MS+1).unwrap();
-        let existing_transport = TransportEvidence::DirectNoise { device: final_invocation.payload.device.clone() };
-        let existing_auth = f.state.verify_invocation_with_execution_destination(&final_invocation,&gateway_facts,&existing_transport,destination,NOW).unwrap();
-        let existing_challenge=FreshnessChallenge::new(&existing_auth,CheckStage::Admit,Nonce::from_bytes([93;32]),NOW,NOW+1_000).unwrap();
-        let existing_receipts:Vec<_>=existing_auth.dependencies().iter().map(|head| Signed::sign(FreshnessReceipt {
-            version:AUTH_VERSION,current:head.clone(),challenge_hash:existing_challenge.hash().unwrap(),issued_at_ms:NOW,expires_at_ms:NOW+1_000,
-        },&authority).unwrap()).collect();
-        let existing_proof=events::AdmissionProof { invocation:final_invocation.clone(),source_body:body.clone(),challenge:existing_challenge,
-            receipts:existing_receipts,admitted_at_ms:NOW,transport:events::StoredTransport::from(&existing_transport) };
-        let existing_admission=f.state.verify_original_admission(&existing_proof,&gateway_facts).unwrap();
-        f.state.verify_admitted_operation_authorization(&existing_admission,&gateway_facts,NOW+INVOCATION_MAX_AGE_MS+1).unwrap();
-        let mut revoked_destination=f.state.clone();
-        let mut document=revoked_destination.space(&space).unwrap().clone();
-        document.previous=revoked_destination.head(&PolicyDomain::Space(space.clone())).cloned();
-        document.sequence+=1;
+        let original = f
+            .state
+            .verify_original_admission(&proof, &gateway_facts)
+            .unwrap();
+        f.state
+            .verify_admitted_operation_authorization(
+                &original,
+                &gateway_facts,
+                NOW + INVOCATION_MAX_AGE_MS + 1,
+            )
+            .unwrap();
+        let existing_transport = TransportEvidence::DirectNoise {
+            device: final_invocation.payload.device.clone(),
+        };
+        let existing_auth = f
+            .state
+            .verify_invocation_with_execution_destination(
+                &final_invocation,
+                &gateway_facts,
+                &existing_transport,
+                destination,
+                NOW,
+            )
+            .unwrap();
+        let existing_challenge = FreshnessChallenge::new(
+            &existing_auth,
+            CheckStage::Admit,
+            Nonce::from_bytes([93; 32]),
+            NOW,
+            NOW + 1_000,
+        )
+        .unwrap();
+        let existing_receipts: Vec<_> = existing_auth
+            .dependencies()
+            .iter()
+            .map(|head| {
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: head.clone(),
+                        challenge_hash: existing_challenge.hash().unwrap(),
+                        issued_at_ms: NOW,
+                        expires_at_ms: NOW + 1_000,
+                    },
+                    &authority,
+                )
+                .unwrap()
+            })
+            .collect();
+        let existing_proof = events::AdmissionProof {
+            invocation: final_invocation.clone(),
+            source_body: body.clone(),
+            challenge: existing_challenge,
+            receipts: existing_receipts,
+            admitted_at_ms: NOW,
+            transport: events::StoredTransport::from(&existing_transport),
+        };
+        let existing_admission = f
+            .state
+            .verify_original_admission(&existing_proof, &gateway_facts)
+            .unwrap();
+        f.state
+            .verify_admitted_operation_authorization(
+                &existing_admission,
+                &gateway_facts,
+                NOW + INVOCATION_MAX_AGE_MS + 1,
+            )
+            .unwrap();
+        let mut revoked_destination = f.state.clone();
+        let mut document = revoked_destination.space(&space).unwrap().clone();
+        document.previous = revoked_destination
+            .head(&PolicyDomain::Space(space.clone()))
+            .cloned();
+        document.sequence += 1;
         document.grants.retain(|hash| hash != &leaf);
-        revoked_destination.install_space(Signed::sign(document,&f.root).unwrap()).unwrap();
-        let original=revoked_destination.verify_original_admission(&proof,&gateway_facts).unwrap();
-        assert!(revoked_destination.verify_admitted_operation_authorization(&original,&gateway_facts,NOW+INVOCATION_MAX_AGE_MS+1).is_err());
-        let existing_admission=revoked_destination.verify_original_admission(&existing_proof,&gateway_facts).unwrap();
-        assert!(revoked_destination.verify_admitted_operation_authorization(&existing_admission,&gateway_facts,NOW+INVOCATION_MAX_AGE_MS+1).is_err());
+        revoked_destination
+            .install_space(Signed::sign(document, &f.root).unwrap())
+            .unwrap();
+        let original = revoked_destination
+            .verify_original_admission(&proof, &gateway_facts)
+            .unwrap();
+        assert!(
+            revoked_destination
+                .verify_admitted_operation_authorization(
+                    &original,
+                    &gateway_facts,
+                    NOW + INVOCATION_MAX_AGE_MS + 1
+                )
+                .is_err()
+        );
+        let existing_admission = revoked_destination
+            .verify_original_admission(&existing_proof, &gateway_facts)
+            .unwrap();
+        assert!(
+            revoked_destination
+                .verify_admitted_operation_authorization(
+                    &existing_admission,
+                    &gateway_facts,
+                    NOW + INVOCATION_MAX_AGE_MS + 1
+                )
+                .is_err()
+        );
 
         let mut missing_executor = f.state.clone();
         missing_executor

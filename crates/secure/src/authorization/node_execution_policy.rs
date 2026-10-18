@@ -1,6 +1,7 @@
-//! Node-local, Task-scoped approval and bounded foreign execution policy reads.
+//! Node-local execution approvals and bounded foreign execution policy reads.
 use super::{
     execution_handoff::ExecutionProofUsage,
+    execution_work::{ConversationOpenIntent, ExecutionWorkIntent},
     remote_execution_policy::{
         RemoteExecutionPolicyPurpose, RemoteExecutionPolicyReadIntent,
         RemoteExecutionPolicySelection, VerifiedRemoteExecutionPolicySourceIntent,
@@ -38,6 +39,7 @@ pub struct NodeExecutionPolicyReadIntent {
     pub source_project: ResourceRef,
     pub selection: RemoteExecutionPolicySelection,
     pub context: prepare::PrepareContext,
+    pub work: ExecutionWorkIntent,
     pub expected_action: Action,
     pub purpose: RemoteExecutionPolicyPurpose,
     pub execution_pins: Vec<PolicyPin>,
@@ -120,6 +122,12 @@ impl NodeExecutionPolicyReadRequest {
         match self {
             Self::Current(value) => Ok(value.payload.context.clone()),
             Self::History(value) => value.payload.reference.context(),
+        }
+    }
+    pub fn work(&self) -> ExecutionWorkIntent {
+        match self {
+            Self::Current(value) => value.payload.work.clone(),
+            Self::History(value) => value.payload.reference.source.payload.work.intent(),
         }
     }
     pub fn purpose(&self) -> RemoteExecutionPolicyPurpose {
@@ -240,6 +248,12 @@ impl TaskExecutionPolicyRequest {
         match self {
             Self::Account(value) => Ok(value.intent.payload.context.clone()),
             Self::Node(value) => value.context(),
+        }
+    }
+    pub fn work(&self) -> ExecutionWorkIntent {
+        match self {
+            Self::Account(value) => value.intent.payload.work.clone(),
+            Self::Node(value) => value.work(),
         }
     }
     pub fn purpose(&self) -> RemoteExecutionPolicyPurpose {
@@ -499,6 +513,7 @@ fn check_task_read_scope(
             && request.source_project() == &original.source_selection.resource
             && selection.execution_resource == original.selection.execution_resource
             && selection.target_public_key == original.selection.target_public_key
+            && original.work.approves_intent(&request.work())
             && actual.task == original_context.task
             && actual.conversation == original_context.conversation
             && actual.workspace_resource == original_context.workspace_resource
@@ -814,6 +829,9 @@ impl VerifiedTaskCurrentPolicy {
             "task policy source permission expired",
         )
     }
+    pub fn work(&self) -> ExecutionWorkIntent {
+        self.request.work()
+    }
     pub fn check_scope(
         &self,
         facts: &RequestFacts,
@@ -950,6 +968,9 @@ impl VerifiedTaskCurrentPolicy {
             now,
         )?;
         prepare::check_raw_context(prepared, body, self.request.source_node())?;
+        if body["method"] == "operate" {
+            self.request.work().validate_request(request, body)?;
+        }
         let mut usage = self.usage.clone();
         usage.record_signed(intent)?;
         usage.record_actual_signature_counts(signatures.counts());
@@ -990,7 +1011,11 @@ impl VerifiedTaskCurrentPolicy {
             canonical_cwd: self.context.canonical_cwd.clone(),
             execution_target_public_key: self.context.execution_target_public_key.clone(),
         };
-        prepare::check_raw_context(&raw, body, self.request.source_node())
+        prepare::check_raw_context(&raw, body, self.request.source_node())?;
+        if body["method"] == "operate" {
+            self.request.work().validate_request(signed, body)?;
+        }
+        Ok(())
     }
     pub fn state(&self) -> &VerifiedPolicySet {
         self.combined.state()
@@ -1274,26 +1299,25 @@ pub(super) fn verify_node_current_policy_claims(
 ) -> Result<remote_execution_policy::ExecutionPolicyClosure> {
     read_window(value.issued_at_ms, value.expires_at_ms, now)?;
     validate_pins(&value.execution_pins)?;
+    value
+        .work
+        .validate_context(&value.context, &value.selection.target_public_key)?;
+    remote_execution_policy::check_work_action(&value.work, value.expected_action, value.purpose)?;
     require(
         value.version == AUTH_VERSION
             && value.purpose != RemoteExecutionPolicyPurpose::History
             && value.context.context.workspace_resource.as_ref()
                 == Some(&value.source_project.resource)
-            && value.context.context.sdk_session.is_none()
-            && value.context.context.task.is_some()
-            && value.context.context.conversation.is_some()
-            && value.context.context.executor_kind.is_some()
-            && value
-                .context
-                .binding_generation
-                .is_some_and(|generation| generation > 0),
+            && value.context.context.sdk_session.is_none(),
         "node policy read changed its Task, purpose or source Project",
     )?;
     remote_execution_policy::verify_execution_policy_closure(
         state,
         &value.selection,
         actual_noise_b,
+        &value.source_project,
         &value.context,
+        &value.work,
         value.expected_action,
         value.purpose,
         &value.execution_pins,
@@ -1427,6 +1451,7 @@ pub fn task_execution_policy_choice_key(
         &value.source_selection.audience,
         &value.selection,
         &value.context,
+        &value.work,
         roots,
     ))
 }
@@ -1452,16 +1477,10 @@ fn approval_anchor(
 ) -> Result<()> {
     let value = &intent.payload;
     let context = &value.context.context;
-    let task = context
-        .task
-        .as_ref()
-        .ok_or(AuthorizationError::InvalidProof("task trust has no Task"))?;
-    let session = context
-        .execution_session
-        .as_ref()
-        .ok_or(AuthorizationError::InvalidProof(
-            "task trust has no execution session",
-        ))?;
+    value
+        .work
+        .validate_context(&value.context, &value.selection.target_public_key)?;
+    remote_execution_policy::check_work_action(&value.work, value.expected_action, value.purpose)?;
     require(
         value.version == AUTH_VERSION
             && value.purpose == RemoteExecutionPolicyPurpose::Execution
@@ -1470,18 +1489,29 @@ fn approval_anchor(
             && value.source_selection.audience.device == DeviceId::from_key(source)
             && context.workspace_resource.as_ref()
                 == Some(&value.source_selection.resource.resource)
-            && context.sdk_session.is_none()
-            && session.target == DeviceId::from_key(&value.selection.target_public_key)
-            && value.context.execution_target_public_key.as_ref()
-                == Some(&value.selection.target_public_key),
-        "task trust changed its source, Task or selected executor",
+            && context.sdk_session.is_none(),
+        "execution trust changed its source, work or selected executor",
     )?;
-    match (value.expected_action, binding) {
-        (Action::ExecutionOpen, None) => require(
-            value.context.binding_generation == Some(1),
+    match (&value.work, value.expected_action, binding) {
+        (
+            ExecutionWorkIntent::TaskSession {
+                binding_generation, ..
+            },
+            Action::ExecutionOpen,
+            None,
+        ) => require(
+            *binding_generation == 1,
             "first task trust requires binding generation one",
         ),
-        (Action::ExecutionRebind, Some(binding)) => {
+        (
+            ExecutionWorkIntent::TaskSession {
+                task,
+                binding_generation,
+                ..
+            },
+            Action::ExecutionRebind,
+            Some(binding),
+        ) => {
             task_binding::verify_binding(binding, source.as_str()).map_err(|_| {
                 AuthorizationError::InvalidProof("task trust has an invalid current binding")
             })?;
@@ -1490,12 +1520,21 @@ fn approval_anchor(
                 prior.network_id == value.source_selection.resource.space.as_str()
                     && prior.task_ref == task.as_str()
                     && context.conversation.as_deref() == Some(prior.conversation_id.as_str())
-                    && prior.generation.checked_add(1) == value.context.binding_generation,
+                    && prior.generation.checked_add(1) == Some(*binding_generation),
                 "task trust rebind changed its current Task or next generation",
             )
         }
+        (
+            ExecutionWorkIntent::ConversationSession {
+                open: ConversationOpenIntent::Opening { .. },
+                ..
+            },
+            Action::ExecutionOpen,
+            None,
+        )
+        | (ExecutionWorkIntent::Command { .. }, Action::ExecutionCommand, None) => Ok(()),
         _ => Err(AuthorizationError::InvalidProof(
-            "only initial execution selection or rebind can approve task roots",
+            "only an initial execution selection or Task rebind can approve execution roots",
         )),
     }
 }
@@ -1592,12 +1631,16 @@ impl VerifiedTaskExecutionTrust {
     pub fn pins(&self) -> &[PolicyPin] {
         &self.original_intent.payload.execution_pins
     }
-    pub fn binding_generation(&self) -> u64 {
-        self.original_intent
-            .payload
-            .context
-            .binding_generation
-            .unwrap_or(0)
+    pub fn binding_generation(&self) -> Option<u64> {
+        match self.work() {
+            ExecutionWorkIntent::TaskSession {
+                binding_generation, ..
+            } => Some(*binding_generation),
+            _ => None,
+        }
+    }
+    pub fn work(&self) -> &ExecutionWorkIntent {
+        &self.original_intent.payload.work
     }
     pub fn original_binding(&self) -> Option<&SignedBinding> {
         self.approval.payload.current_binding.as_ref()
@@ -2095,6 +2138,11 @@ mod tests {
             version: AUTH_VERSION,
             source_provenance: None,
             source_project: project,
+            work: ExecutionWorkIntent::TaskSession {
+                task: context.task.clone().unwrap(),
+                binding_generation: 1,
+                execution_session: context.execution_session.clone().unwrap(),
+            },
             selection: RemoteExecutionPolicySelection {
                 execution_resource: resource.clone(),
                 target_public_key: target.clone(),
@@ -2229,6 +2277,11 @@ mod tests {
                 "execution_grant":fixture.actual.handoff.invocation.payload.grant_leaf,
             },
             "context":context,
+            "work":ExecutionWorkIntent::TaskSession {
+                task: context.context.task.clone().unwrap(),
+                binding_generation: 1,
+                execution_session: context.context.execution_session.clone().unwrap(),
+            },
             "expected_action":Action::ExecutionOpen,
             "purpose":RemoteExecutionPolicyPurpose::Execution,
             "execution_pins":fixture.pins,
@@ -2256,7 +2309,7 @@ mod tests {
         let approved =
             approve_task_execution_policy(&source, None, &fixture.project_node, now).unwrap();
         assert_eq!(approved.original_intent(), &intent);
-        assert_eq!(approved.binding_generation(), 1);
+        assert_eq!(approved.binding_generation(), Some(1));
         assert!(approve_task_execution_policy(&source, None, &fixture.executor, now).is_err());
         assert!(
             approve_task_execution_policy(&source, None, &fixture.project_node, now + 1).is_err()

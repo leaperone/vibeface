@@ -4,11 +4,11 @@ use vibeface_secure::authorization::{
     prepare::PrepareContext, remote_execution_policy::RemoteExecutionPolicySelection,
 };
 
-pub(crate) fn current_task_readonly_policy_in(
+pub(crate) fn current_execution_readonly_policy_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
     source: &PublicKey,
-    binding: &SignedBinding,
+    original: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
     selection: &RemoteExecutionPolicySelection,
     purpose: RemoteExecutionPolicyPurpose,
     actual: &Invocation,
@@ -30,52 +30,67 @@ pub(crate) fn current_task_readonly_policy_in(
                 == vibeface_secure::authorization::ServiceId::from_key(source)
             && actual.not_before_ms <= now
             && now < actual.expires_at_ms,
-        "readonly Task policy requires this current Account request and reader"
+        "readonly execution policy requires this current Account request and reader"
     );
     let mut usage = ExecutionProofUsage::default();
-    let association = binding_association_in(connection, primary, binding, &mut usage)?;
-    let trust = load_task_execution_trust_in(connection, source, &association.approval_ref)?;
-    let original = trust.original_intent();
-    let current = checked_source_task_binding_in(connection, original, source, &mut usage)?
-        .context("readonly Task policy has no current binding")?;
-    let session = context
-        .context
-        .execution_session
-        .as_ref()
-        .context("readonly Task policy has no execution session")?;
+    let statement = provenance::check_local_original_source_in(
+        connection, primary, source, original, &mut usage,
+    )?;
+    let work = statement.work.intent();
+    work.validate_context(context, &selection.target_public_key)?;
     ensure!(
-        current == *binding
-            && actual.resource == original.payload.source_selection.resource
-            && context.binding_generation == Some(binding.binding.generation)
-            && context.context.task.as_ref().map(|task| task.as_str())
-                == Some(binding.binding.task_ref.as_str())
-            && context.context.conversation.as_deref()
-                == Some(binding.binding.conversation_id.as_str())
-            && context.context.workspace_resource.as_ref() == Some(&actual.resource.resource)
-            && context.context.executor_kind.as_deref()
-                == binding.binding.open_spec["executor"].as_str()
-            && session.session_id == binding.binding.session_id
-            && session.target == DeviceId::from_key(&selection.target_public_key)
-            && binding.binding.target_node
-                == crate::crypto::fingerprint(selection.target_public_key.as_str())?
+        actual.resource == statement.project
+            && statement.target_public_key == selection.target_public_key
+            && original.handoff.execution_resource == selection.execution_resource
             && context.execution_target_public_key.as_ref() == Some(&selection.target_public_key)
-            && selection.execution_resource == original.payload.selection.execution_resource
-            && selection.target_public_key == original.payload.selection.target_public_key
-            && match purpose {
-                RemoteExecutionPolicyPurpose::ObservationRead => context.canonical_cwd.is_none(),
-                RemoteExecutionPolicyPurpose::Resolver =>
-                    context.canonical_cwd.is_none()
-                        || context.canonical_cwd.as_deref()
-                            == binding.binding.open_spec["cwd"].as_str(),
-                _ => false,
-            },
-        "readonly Task policy differs from its actual approved binding or context"
+            && context.context.workspace_resource.as_ref() == Some(&actual.resource.resource),
+        "readonly policy changed its actual original Project or destination"
     );
-    let task = context
-        .context
-        .task
-        .as_ref()
-        .context("readonly Task policy has no Task")?;
+    let approval_ref = if matches!(work, ExecutionWorkIntent::TaskSession { .. }) {
+        let binding = original.handoff.task_binding()?;
+        let association = binding_association_in(connection, primary, &binding, &mut usage)?;
+        let trust = load_task_execution_trust_in(connection, source, &association.approval_ref)?;
+        let current = checked_source_task_binding_in(
+            connection,
+            trust.original_intent(),
+            source,
+            &mut usage,
+        )?
+        .context("readonly execution policy has no current binding")?;
+        ensure!(
+            current == binding
+                && context.context.conversation.as_deref()
+                    == Some(binding.binding.conversation_id.as_str())
+                && context.context.executor_kind.as_deref()
+                    == binding.binding.open_spec["executor"].as_str()
+                && binding.binding.target_node
+                    == crate::crypto::fingerprint(selection.target_public_key.as_str())?
+                && match purpose {
+                    RemoteExecutionPolicyPurpose::ObservationRead =>
+                        context.canonical_cwd.is_none(),
+                    RemoteExecutionPolicyPurpose::Resolver =>
+                        context.canonical_cwd.is_none()
+                            || context.canonical_cwd.as_deref()
+                                == binding.binding.open_spec["cwd"].as_str(),
+                    _ => false,
+                },
+            "readonly execution policy differs from its current binding or context"
+        );
+        association.approval_ref
+    } else {
+        let trust = approved_execution_trust_in(
+            connection,
+            source,
+            &statement.project,
+            &work,
+            selection,
+            context,
+            purpose,
+        )?;
+        usage.record_signed(trust.original_intent())?;
+        usage.record_signed(trust.approval())?;
+        trust.approval().hash()?
+    };
     let facts = RequestFacts {
         resource: actual.resource.clone(),
         action: actual.action,
@@ -87,7 +102,7 @@ pub(crate) fn current_task_readonly_policy_in(
     let mut selected: Option<VerifiedTaskCurrentPolicy> = None;
     for policy in primary
         .task_execution_policy
-        .current_for_task(&actual.resource, task)?
+        .current_for_work(&actual.resource, &work)?
     {
         let Some(request) = policy.request().account_request() else {
             continue;
@@ -95,7 +110,8 @@ pub(crate) fn current_task_readonly_policy_in(
         let intent = &request.intent.payload;
         if policy.request().purpose() != purpose
             || policy.request().source_node() != source
-            || policy.trust().approval().hash()? != association.approval_ref
+            || policy.trust().approval().hash()? != approval_ref
+            || policy.work() != work
             || policy.selection() != selection
             || policy.context() != context
             || intent.expected_action != actual.action
@@ -127,7 +143,7 @@ pub(crate) fn current_task_readonly_policy_in(
         }
     }
     let selected = selected.context(
-        "NeedPolicySync: Task has no current dedicated readonly policy for this reader and purpose",
+        "NeedPolicySync: execution work has no current dedicated readonly policy for this reader and purpose",
     )?;
     usage.merge(selected.proof_usage());
     usage.enforce_limits()?;

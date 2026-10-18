@@ -11,7 +11,7 @@ export async function readRemoteExecutionHistoryPolicy(input: {
   withSource<T>(work: (source: VerifiedClientAuthorization) => T): Promise<T>
   actual: Record<string, unknown>
   original: AuthorizedRequest
-  binding?: Record<string, unknown>
+  binding?: Record<string, unknown> | null
   independentPins: AuthorizationTrust['pins']
   latestIndependentPins(): AuthorizationTrust['pins']
   bChannel: DeviceChannel

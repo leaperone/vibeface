@@ -45,6 +45,7 @@ pub fn node_task_policy_source_from_retained(
             service::check_binding(
                 &restored_trust,
                 &context,
+                &original_request.work(),
                 raw.current_binding.as_ref(),
                 original_request.issuer(),
                 source.facts().action,

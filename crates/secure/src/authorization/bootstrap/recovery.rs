@@ -151,7 +151,6 @@ fn validate_material(material: &RecoveryMaterial) -> Result<Identity> {
     Ok(recovery)
 }
 
-
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = inspectAccountRecoveryMaterial))]
 pub fn inspect_account_recovery_material(
     material_json: &str,
@@ -1254,8 +1253,15 @@ mod tests {
         assert_eq!(space.current_root, PublicKey::of(&key(5)));
         assert_eq!(space.resources, p.space_document.resources);
         assert!(!space.grants.contains(&original.bundle.grant_leaf));
+        assert!(
+            recovered
+                .authorization
+                .actions
+                .contains(&Action::TaskFollowup)
+        );
         let service: Signed<Grant> =
             serde_json::from_str(&recovered.service_grant_json().unwrap()).unwrap();
+        assert!(!service.payload.actions.contains(&Action::TaskFollowup));
         assert_eq!(service.issuer, PublicKey::of(&key(6)));
         assert_eq!(service.payload.remaining_delegations, 0);
         assert_eq!(
@@ -2090,28 +2096,59 @@ mod tests {
         });
         let recovery_commit: stream::StreamedRecoveryCommitRequest =
             serde_json::from_str(&recovery_prepared.commit_json(&new_generation).unwrap()).unwrap();
-        let recovery_committed = stream::measured(&mut new_stages, "recovery_commit", || {
-            let approval = stream::verify_recovery_source_proposal_approval(
-                &recovery_approval,
-                recovery_context.request(),
-                &recovery_approved.context,
-                &ObjectHash::body(&recovery_approved)?,
-                &recovery_approved.request.account_recovery,
-                &recovery_possession,
-                &removed.authorization.policy_snapshot,
-                &PublicKey::of(&key(4)),
-                &recovery_prefix,
-                RESTORE as u64,
-            )?;
+        let (recovery_committed, approval) =
+            stream::measured(&mut new_stages, "recovery_commit", || {
+                let approval = stream::verify_recovery_source_proposal_approval(
+                    &recovery_approval,
+                    recovery_context.request(),
+                    &recovery_approved.context,
+                    &ObjectHash::body(&recovery_approved)?,
+                    &recovery_approved.request.account_recovery,
+                    &recovery_possession,
+                    &removed.authorization.policy_snapshot,
+                    &PublicKey::of(&key(4)),
+                    &recovery_prefix,
+                    RESTORE as u64,
+                )?;
+                let committed = stream::verify_recovery_stream_commit_with_source_approval(
+                    &recovery_commit,
+                    &recovery_approved,
+                    recovery_context.request(),
+                    &removed.authorization.policy_snapshot,
+                    &approval,
+                    RESTORE as u64,
+                )?;
+                Ok::<_, AuthorizationError>((committed, approval))
+            });
+        let mut old_template = recovery_commit.clone();
+        let owner = old_template
+            .journal_delta
+            .iter_mut()
+            .find_map(|entry| match entry {
+                JournalEntry::Grant(grant) if grant.payload.parent.is_none() => Some(grant),
+                _ => None,
+            })
+            .unwrap();
+        assert!(owner.payload.actions.contains(&Action::TaskFollowup));
+        let mut payload = owner.payload.clone();
+        payload
+            .actions
+            .retain(|action| *action != Action::TaskFollowup);
+        *owner = Signed::sign(payload, &key(51)).unwrap();
+        assert_eq!(
             stream::verify_recovery_stream_commit_with_source_approval(
-                &recovery_commit,
+                &old_template,
                 &recovery_approved,
                 recovery_context.request(),
                 &removed.authorization.policy_snapshot,
                 &approval,
                 RESTORE as u64,
             )
-        });
+            .err(),
+            Some(AuthorizationError::InvalidProof(
+                "recovery changed its exact owner grant"
+            ))
+        );
         let recovery_usage = recovery_committed.proof_usage();
         assert!(recovery_usage.carrier_bytes <= MAX_PROOF_BYTES);
         assert!(recovery_usage.proof.unique_signed_objects <= MAX_PROOF_OBJECTS);
@@ -2554,5 +2591,4 @@ mod tests {
             std::io::Write::write_all(&mut file, &serde_json::to_vec(&value).unwrap()).unwrap();
         }
     }
-
 }

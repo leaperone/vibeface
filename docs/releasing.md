@@ -44,7 +44,7 @@ bash scripts/package-node.sh
 
 `build-web.sh` 校验生成资源、按 lockfile 安装依赖、生成路由、检查类型，再构建 `crates/node/web/dist/client`。Rust 只内嵌这个目录，不运行 Start 的 SSR 输出。页面和密码学资源使用 `no-store`，成功命中的 `/assets/` 内容使用 immutable 缓存。CSP 根据最终 HTML 生成脚本 hash，并允许 WASM、WebSocket 和 Radix 所需的动态样式。
 
-验收失败时只上传报告和四个测试进程日志，不上传测试目录或数据库。正常制品保留 14 天，诊断保留 7 天。CI 不验证真实模型调用、实体手机、物理局域网、公网反向代理或用户后台服务安装。
+macOS ARM 制品另运行机器人、工具与启动订阅恢复的受控进程验收。验收失败时只上传对应报告和测试进程日志，不上传测试目录或数据库。正常制品保留 14 天，诊断保留 7 天。CI 不验证真实模型调用、实体手机、物理局域网、公网反向代理或用户后台服务安装。
 
 ## 显式发布版本
 
@@ -77,9 +77,9 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 更新器只接受受管安装的 `current` 符号链接，下载对应平台的完整包，核对 SHA256、版本、target、源码身份和存储兼容声明后再安装。包和 checksum 都通过 GitHub HTTPS 下载，这依赖 GitHub 账户、仓库和 TLS 的可信性，不是独立发布签名。macOS 开发者签名和 notarization 仍未提供。
 
-每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序和随包构建来源，不覆盖身份、历史、配置和凭证，也不更新宿主 Provider 程序或已固定的执行镜像。需要新 SDK sidecar 时，从对应新包重建镜像，核对 image ID 后显式更新配置，不复制旧 `node_modules`。
+每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。待投递消息、排队或活动管理轮、正在执行的操作，以及 `unknown` 结果都会推迟升级。更新器不会为升级强行结束任务。更新只更换程序和随包构建来源，不覆盖身份、历史、配置和凭证，也不更新宿主 Provider 程序或已固定的执行镜像。需要新 SDK sidecar 时，从对应新包重建镜像，核对 image ID 后显式更新配置，不复制旧 `node_modules`。
 
-`BUILD-INFO.json` 声明 `update_protocol=2` 和 `data_epoch=3`。包协议 2 要求同名 `vibeface` 程序和制品，不接受旧包布局。新数据库采用 `vibeface-node` 格式和 layout version 1，身份授权与业务状态共用 `node.sqlite3`。更新器只安装与本机存储 epoch 一致的包。epoch 2 及更早的数据目录不兼容，不在启动或更新时导入、转换或清空。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
+`BUILD-INFO.json` 声明 `update_protocol=2` 和 `data_epoch=3`。包协议 2 要求同名 `vibeface` 程序和制品，不接受旧包布局。新数据库采用 `vibeface-node` 格式和 layout version 1，身份授权与业务状态共用 `node.sqlite3`。启动和更新还核对完整目录格式、布局和数据库结构指纹；仅有相同 epoch 不能证明兼容。旧双库 epoch 3、epoch 2 及更早的数据目录不兼容，不在启动或更新时导入、转换或清空。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
 
 ## 首次安装
 

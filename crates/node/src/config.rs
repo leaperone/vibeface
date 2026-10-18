@@ -71,6 +71,8 @@ pub fn verify_data_format(dir: &Path) -> Result<()> {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
+    #[serde(default)]
+    pub local_access: LocalAccessSettings,
     pub public_url: String,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
@@ -90,6 +92,20 @@ pub struct Config {
     pub daily_decision_limit: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalAccessSettings {
+    pub enabled: bool,
+    pub listen: SocketAddr,
+}
+impl Default for LocalAccessSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen: "127.0.0.1:0".parse().unwrap(),
+        }
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagerSettings {
     pub provider: String,
@@ -99,6 +115,7 @@ impl Config {
     pub fn local(listen: SocketAddr, roots: Vec<PathBuf>, allow_insecure_lan: bool) -> Self {
         Self {
             listen,
+            local_access: LocalAccessSettings::default(),
             public_url: format!("http://{listen}"),
             allowed_origins: vec![],
             allow_insecure_lan,
@@ -127,6 +144,14 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.local_access.listen.ip().is_loopback(),
+            "local access must bind a loopback address"
+        );
+        ensure!(
+            self.local_access.listen.port() == 0 || self.local_access.listen != self.listen,
+            "local access requires a separate listener"
+        );
         validate_role_dependencies(&self.roles)?;
         let url = browser_origin(&self.public_url)?;
         let local_origin = url.host_str().is_some_and(|h| {

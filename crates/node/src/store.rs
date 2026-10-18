@@ -1,8 +1,9 @@
 use crate::{
     crypto::{LocalIdentity, digest},
     model::*,
+    scheduling::*,
 };
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -12,6 +13,9 @@ use std::{
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
 };
+
+pub(crate) mod bots;
+pub(crate) mod followup;
 
 const INITIAL_SCHEMA: &str = include_str!("../migrations/202610180001_initial.sql");
 
@@ -64,25 +68,40 @@ fn schema_objects(connection: &Connection) -> Result<Vec<(String, String, String
         .collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-fn validate_persisted_state(connection: &Connection) -> Result<crate::identity::journal::PolicyState> {
-    let snapshot = if connection.is_autocommit() { Some(connection.unchecked_transaction()?) } else { None };
+fn validate_persisted_state(
+    connection: &Connection,
+) -> Result<crate::identity::journal::PolicyState> {
+    let snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
     let mut policy = crate::identity::journal::PolicyState::load(connection)?;
     let local_keys = connection.prepare(
         "SELECT DISTINCT d.device_id,d.public_key,n.public_key FROM local_devices d JOIN node_certificates n ON n.space_id=d.space_id AND n.node_id=d.device_id ORDER BY d.public_key,d.device_id",
     )?.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     for (device, public_key, certificate_key) in local_keys {
-        ensure!(public_key == certificate_key && crate::crypto::fingerprint(&public_key)? == device,
-            "local device key differs from its stored certificate");
+        ensure!(
+            public_key == certificate_key && crate::crypto::fingerprint(&public_key)? == device,
+            "local device key differs from its stored certificate"
+        );
         let source = vibeface_secure::authorization::PublicKey::parse(&public_key)?;
         crate::identity::foreign_execution_policy::rehydrate_task_execution_policy_in(
-            connection, &mut policy, &source,
+            connection,
+            &mut policy,
+            &source,
         )?;
         crate::identity::gateway_forward::rehydrate_gateway_sources_in(
-            connection, &mut policy, &source, crate::runtime::now_ms() as u64,
+            connection,
+            &mut policy,
+            &source,
+            crate::runtime::now_ms() as u64,
         )?;
     }
-    crate::identity::foreign_execution_policy::validate_task_execution_policy_links_in(connection, &policy)?;
+    crate::identity::foreign_execution_policy::validate_task_execution_policy_links_in(
+        connection, &policy,
+    )?;
     let mut statement = connection.prepare("SELECT space_id,revision,bundle FROM spaces")?;
     let rows = statement.query_map([], |row| {
         Ok((
@@ -117,11 +136,14 @@ fn validate_persisted_state(connection: &Connection) -> Result<crate::identity::
         .collect();
     ensure!(seen == expected, "stored space projection is incomplete");
     crate::identity::policy::validate_resource_projections(connection)?;
-    let checkpoints = crate::identity::admission::verified_admission_checkpoints_from(connection, &policy)?;
+    let checkpoints =
+        crate::identity::admission::verified_admission_checkpoints_from(connection, &policy)?;
     crate::identity::enrollment_store::validate_enrollment_storage(connection, &policy)?;
     crate::identity::execution_handoff::validate_execution_handoff_storage(connection, &policy)?;
     policy.local_admissions = checkpoints;
-    if let Some(snapshot) = snapshot { snapshot.commit()?; }
+    if let Some(snapshot) = snapshot {
+        snapshot.commit()?;
+    }
     Ok(policy)
 }
 
@@ -539,6 +561,1008 @@ impl Store {
             status,
             missing: self.missing_dependencies(network_id, std::slice::from_ref(&envelope.hash))?,
         })
+    }
+    pub fn enqueue_trigger(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        trigger: &str,
+        target: &str,
+    ) -> Result<AdmissionReceipt> {
+        self.admit_trigger(network, conversation, trigger, target, target)
+    }
+
+    pub fn admit_trigger(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        trigger: &str,
+        local_node: &str,
+        target: &str,
+    ) -> Result<AdmissionReceipt> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt = admit_scheduler_from(
+            &tx,
+            &self.policy,
+            network,
+            conversation,
+            trigger,
+            local_node,
+            target,
+        )?;
+        tx.commit()?;
+        Ok(receipt)
+    }
+
+    pub(crate) fn next_scheduler_candidate(
+        &mut self,
+        space: &str,
+        conversation: &str,
+        target: &str,
+        boot: &str,
+        skip: &BTreeSet<String>,
+    ) -> Result<SchedulerSelection> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = crate::identity::journal::PolicyState::reload_verified(&tx, &self.policy)?;
+        let mut session = load_scheduler_session(&tx, space, conversation, target)?;
+        recover_scheduler_session(&tx, space, &mut session, boot)?;
+        let (selection, _) = select_scheduler_candidate_in(
+            &tx,
+            &current,
+            space,
+            &mut session,
+            skip,
+            None,
+            crate::runtime::now_ms() as u64,
+        )?;
+        save_scheduler_session(&tx, space, &session)?;
+        tx.commit()?;
+        Ok(selection)
+    }
+
+    pub fn scheduler_job(
+        &self,
+        network: &str,
+        conversation: &str,
+        trigger: &str,
+        target: &str,
+    ) -> Result<Option<SchedulerJob>> {
+        scheduler_load(
+            &self.connection,
+            network,
+            &scheduler_key("job", conversation, target, trigger),
+        )
+    }
+
+    pub fn scheduler_status(
+        &self,
+        network: &str,
+        conversation: &str,
+        trigger: &str,
+        target: &str,
+    ) -> Result<Option<AdmissionReceipt>> {
+        if let Some(job) = self.scheduler_job(network, conversation, trigger, target)? {
+            return Ok(Some(job.receipt(network)));
+        }
+        Ok(scheduler_load::<OutboxEntry>(
+            &self.connection,
+            network,
+            &scheduler_key("outbox", conversation, target, trigger),
+        )?
+        .map(|entry| entry.receipt()))
+    }
+
+    pub fn pending_scheduler_conversations(
+        &self,
+        network: &str,
+        target: &str,
+    ) -> Result<Vec<String>> {
+        Ok(scheduler_sessions(&self.connection, network)?
+            .into_iter()
+            .filter(|s| s.target_node == target && !s.pending.is_empty())
+            .map(|s| s.conversation_id)
+            .collect())
+    }
+
+    pub fn scheduler_jobs(
+        &self,
+        network: &str,
+        conversation: &str,
+        target: &str,
+    ) -> Result<Vec<SchedulerJob>> {
+        let mut statement = self.connection.prepare(
+            "SELECT value FROM local_values WHERE space_id=? AND key LIKE 'scheduler:v1:job:%'",
+        )?;
+        let rows = statement.query_map([network], |r| r.get::<_, String>(0))?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            let job: SchedulerJob = serde_json::from_str(&row?)?;
+            ensure!(
+                job.version == SCHEDULING_VERSION,
+                "unsupported scheduler job version"
+            );
+            if job.conversation_id == conversation && job.target_node == target {
+                ensure!(
+                    job.resource_id
+                        == conversation_resource_in(&self.connection, network, conversation)?,
+                    "scheduler job belongs to another resource"
+                );
+                jobs.push(job);
+            }
+        }
+        jobs.sort_by_key(|job| job.sequence);
+        Ok(jobs)
+    }
+
+    pub fn scheduler_outbox(&self, network: &str) -> Result<Vec<OutboxEntry>> {
+        Ok(self
+            .scheduler_outbox_all(network)?
+            .into_iter()
+            .filter(|entry| !entry.delivered)
+            .collect())
+    }
+
+    pub fn scheduler_outbox_all(&self, network: &str) -> Result<Vec<OutboxEntry>> {
+        let mut statement = self.connection.prepare(
+            "SELECT value FROM local_values WHERE space_id=? AND key LIKE 'scheduler:v1:outbox:%'",
+        )?;
+        let rows = statement.query_map([network], |r| r.get::<_, String>(0))?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let entry: OutboxEntry = serde_json::from_str(&row?)?;
+            ensure!(
+                entry.version == SCHEDULING_VERSION,
+                "unsupported scheduler outbox version"
+            );
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    pub fn acknowledge_outbox(
+        &mut self,
+        network: &str,
+        receipt: &AdmissionReceipt,
+    ) -> Result<AdmissionReceipt> {
+        ensure!(
+            receipt.version == SCHEDULING_VERSION && receipt.space_id == network,
+            "incompatible scheduling acknowledgement"
+        );
+        ensure!(
+            matches!(
+                receipt.state.as_str(),
+                "queued"
+                    | "claimed"
+                    | "running"
+                    | "cancelling"
+                    | "completed"
+                    | "failed"
+                    | "cancelled"
+                    | "unknown"
+            ),
+            "acknowledgement does not prove durable admission"
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let key = scheduler_key(
+            "outbox",
+            &receipt.conversation_id,
+            &receipt.target_node,
+            &receipt.trigger,
+        );
+        let mut entry: OutboxEntry =
+            scheduler_load(&tx, network, &key)?.context("scheduling outbox identity not found")?;
+        ensure!(
+            entry.space_id == receipt.space_id
+                && entry.resource_id == receipt.resource_id
+                && entry.conversation_id == receipt.conversation_id
+                && entry.target_node == receipt.target_node
+                && entry.trigger == receipt.trigger,
+            "scheduling acknowledgement identity mismatch"
+        );
+        entry.delivered = true;
+        scheduler_save(&tx, network, &key, &entry)?;
+        tx.commit()?;
+        Ok(entry.receipt())
+    }
+
+    pub fn recover_scheduler_jobs(
+        &mut self,
+        network: &str,
+        target: &str,
+        boot: &str,
+    ) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for mut session in scheduler_sessions(&tx, network)?
+            .into_iter()
+            .filter(|s| s.target_node == target)
+        {
+            recover_scheduler_session(&tx, network, &mut session, boot)?;
+            save_scheduler_session(&tx, network, &session)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_started(
+        &mut self,
+        space: &str,
+        conversation: &str,
+        target: &str,
+        trigger: &str,
+        attempt_id: &str,
+    ) -> Result<SchedulerJob> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::identity::admission::validate_manager_start_in(
+            &tx,
+            &self.policy,
+            space,
+            trigger,
+            attempt_id,
+            crate::runtime::now_ms() as u64,
+        )?;
+        let key = scheduler_key("job", conversation, target, trigger);
+        let mut job: SchedulerJob =
+            scheduler_load(&tx, space, &key)?.context("manager job missing")?;
+        let JobState::Claimed { attempt } = &job.state else {
+            bail!("manager job is not claimed")
+        };
+        ensure!(attempt.id == attempt_id, "manager attempt changed");
+        job.state = JobState::Running {
+            attempt: attempt.clone(),
+        };
+        scheduler_save(&tx, space, &key, &job)?;
+        tx.commit()?;
+        Ok(job)
+    }
+
+    pub fn save_scheduler_native_id(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        target: &str,
+        trigger: &str,
+        attempt_id: &str,
+        native_id: &str,
+    ) -> Result<()> {
+        self.update_scheduler_attempt(
+            network,
+            conversation,
+            target,
+            trigger,
+            attempt_id,
+            |job, session| {
+                ensure!(
+                    matches!(
+                        job.state,
+                        JobState::Running { .. } | JobState::Claimed { .. }
+                    ),
+                    "scheduler attempt is no longer active"
+                );
+                if !job
+                    .state
+                    .attempt()
+                    .context("scheduler attempt missing")?
+                    .read_only
+                {
+                    session.native_id = Some(native_id.into());
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn request_manager_cancel(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        target: &str,
+        trigger: &str,
+    ) -> Result<Option<SchedulerJob>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut session = load_scheduler_session(&tx, network, conversation, target)?;
+        let key = scheduler_key("job", conversation, target, trigger);
+        let Some(mut job): Option<SchedulerJob> = scheduler_load(&tx, network, &key)? else {
+            return Ok(None);
+        };
+        if scheduler_publication_from(&tx, network, &job)?.is_some() {
+            return Ok(Some(job));
+        }
+        if matches!(job.state, JobState::Queued) {
+            job.state = JobState::Cancelled {
+                attempt: None,
+                evidence: "user cancelled before the scheduler claimed this trigger".into(),
+            };
+            session.pending.retain(|pending| pending != trigger);
+            scheduler_save(&tx, network, &key, &job)?;
+            save_scheduler_session(&tx, network, &session)?;
+        } else if let JobState::Claimed { attempt } | JobState::Running { attempt } = &job.state {
+            ensure!(
+                session.active.as_deref() == Some(trigger),
+                "management reply changed; refresh before stopping"
+            );
+            job.state = JobState::Cancelling {
+                attempt: attempt.clone(),
+            };
+            session.permission_version = session
+                .permission_version
+                .checked_add(1)
+                .context("scheduler permission version overflow")?;
+            session.native_id = None;
+            scheduler_save(&tx, network, &key, &job)?;
+            save_scheduler_session(&tx, network, &session)?;
+        }
+        tx.commit()?;
+        Ok(Some(job))
+    }
+
+    pub(crate) fn fence_manager_permission(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        target: &str,
+        trigger: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        self.update_scheduler_attempt(
+            network,
+            conversation,
+            target,
+            trigger,
+            attempt_id,
+            |job, session| {
+                let attempt = job.state.attempt().context("manager attempt missing")?;
+                if attempt.permission_version == session.permission_version {
+                    session.permission_version = session
+                        .permission_version
+                        .checked_add(1)
+                        .context("scheduler permission version overflow")?;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn manager_attempt_allowed(
+        &self,
+        network: &str,
+        conversation: &str,
+        target: &str,
+        trigger: &str,
+        attempt_id: &str,
+        write: bool,
+    ) -> Result<bool> {
+        let session = load_scheduler_session(&self.connection, network, conversation, target)?;
+        let Some(job) = self.scheduler_job(network, conversation, trigger, target)? else {
+            return Ok(false);
+        };
+        let Some(attempt) = job.state.attempt() else {
+            return Ok(false);
+        };
+        if scheduler_publication_from(&self.connection, network, &job)?.is_some() {
+            return Ok(false);
+        }
+
+        Ok(session.active.as_deref() == Some(trigger)
+            && attempt.id == attempt_id
+            && attempt.permission_version == session.permission_version
+            && matches!(
+                job.state,
+                JobState::Claimed { .. } | JobState::Running { .. }
+            )
+            && (!write || (!attempt.read_only && session.unresolved.is_empty())))
+    }
+
+    pub fn scheduler_publication_pending(
+        &self,
+        network: &str,
+        conversation: &str,
+        target: &str,
+        trigger: &str,
+    ) -> Result<bool> {
+        let Some(job) = self.scheduler_job(network, conversation, trigger, target)? else {
+            return Ok(false);
+        };
+        Ok(scheduler_publication_from(&self.connection, network, &job)?.is_some())
+    }
+
+    pub fn fence_manager_unknown(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        target: &str,
+        trigger: &str,
+        attempt_id: &str,
+    ) -> Result<SchedulerJob> {
+        self.update_scheduler_attempt(
+            network,
+            conversation,
+            target,
+            trigger,
+            attempt_id,
+            |job, session| {
+                let JobState::Unknown { fenced, .. } = &mut job.state else {
+                    bail!("scheduler job is not unknown");
+                };
+                *fenced = true;
+                if session.active.as_deref() == Some(&job.trigger) {
+                    session.active = None;
+                }
+                session.native_id = None;
+                Ok(())
+            },
+        )
+    }
+
+    pub fn resolve_manager_unknown(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        target: &str,
+        trigger: &str,
+        attempt_id: &str,
+        evidence: &str,
+    ) -> Result<()> {
+        ensure!(
+            !evidence.is_empty(),
+            "manager reconciliation evidence is required"
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut session = load_scheduler_session(&tx, network, conversation, target)?;
+        let job: SchedulerJob = scheduler_load(
+            &tx,
+            network,
+            &scheduler_key("job", conversation, target, trigger),
+        )?
+        .context("scheduler job missing")?;
+        ensure!(
+            matches!(job.state, JobState::Unknown { fenced: true, .. })
+                && job
+                    .state
+                    .attempt()
+                    .is_some_and(|attempt| attempt.id == attempt_id),
+            "unknown scheduler tools have not been fenced or attempt does not match"
+        );
+        scheduler_save(
+            &tx,
+            network,
+            &scheduler_key("resolution", conversation, target, trigger),
+            &serde_json::json!({"attempt_id":attempt_id,"evidence":evidence}),
+        )?;
+        session.unresolved.remove(trigger);
+        session.native_id = None;
+        save_scheduler_session(&tx, network, &session)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn scheduler_maintenance_idle(&self, network: &str) -> Result<()> {
+        for session in scheduler_sessions(&self.connection, network)? {
+            ensure!(
+                session.pending.is_empty()
+                    && session.active.is_none()
+                    && session.unresolved.is_empty(),
+                crate::maintenance::Busy(
+                    "scheduler invocation requires completion or reconciliation".into()
+                )
+            );
+        }
+        ensure!(
+            self.scheduler_outbox(network)?.is_empty(),
+            crate::maintenance::Busy("scheduler delivery is pending".into())
+        );
+        Ok(())
+    }
+
+    fn update_scheduler_attempt(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        target: &str,
+        trigger: &str,
+        attempt_id: &str,
+        update: impl FnOnce(&mut SchedulerJob, &mut SchedulerSession) -> Result<()>,
+    ) -> Result<SchedulerJob> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut session = load_scheduler_session(&tx, network, conversation, target)?;
+        let key = scheduler_key("job", conversation, target, trigger);
+        let mut job: SchedulerJob =
+            scheduler_load(&tx, network, &key)?.context("scheduler job missing")?;
+        ensure!(
+            job.state
+                .attempt()
+                .is_some_and(|attempt| attempt.id == attempt_id),
+            "scheduler attempt does not match"
+        );
+        update(&mut job, &mut session)?;
+        scheduler_save(&tx, network, &key, &job)?;
+        save_scheduler_session(&tx, network, &session)?;
+        tx.commit()?;
+        Ok(job)
+    }
+
+    pub(crate) fn admit_manager_control(
+        &mut self,
+        auth: &vibeface_secure::authorization::VerifiedAuthorization,
+        freshness: &crate::identity::policy::FreshnessProof,
+        transport: &crate::identity::policy::RequestTransport,
+        body: &Value,
+        now: u64,
+    ) -> Result<SchedulerJob> {
+        use vibeface_secure::authorization::{Action, Actor};
+        ensure!(
+            matches!(auth.actor(), Actor::Account(_)),
+            "manager control requires an Account"
+        );
+        let method = body["method"]
+            .as_str()
+            .context("manager control method is required")?;
+        ensure!(
+            matches!(
+                (method, auth.action()),
+                ("cancel_manager", Action::AgentInterrupt)
+                    | ("resolve_manager_unknown", Action::OperationResolve)
+            ),
+            "manager control action mismatch"
+        );
+        let space = auth.resource().space.as_str();
+        let scope = body["conversation_id"]
+            .as_str()
+            .context("conversation_id is required")?;
+        let target = body["target_node"]
+            .as_str()
+            .context("target_node is required")?;
+        let trigger = body["trigger"].as_str().context("trigger is required")?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt_key = format!("manager-control:{}", auth.operation_id());
+        let admission = crate::identity::admission::consume_request_authorization_in(
+            &tx,
+            &self.policy,
+            auth,
+            freshness,
+            transport,
+            body,
+            None,
+            now,
+        )?;
+        if let Some(receipt) = scheduler_load::<ManagerControlReceipt>(&tx, space, &receipt_key)? {
+            ensure!(
+                receipt.admission == admission,
+                "manager control retry changed its original authorization"
+            );
+            tx.commit()?;
+            return Ok(receipt.job);
+        }
+        let key = scheduler_key("job", scope, target, trigger);
+        let mut job: SchedulerJob =
+            scheduler_load(&tx, space, &key)?.context("scheduler job missing")?;
+        ensure!(
+            job.resource_id == auth.resource().resource,
+            "manager control belongs to another Project"
+        );
+        let actual = job.state.attempt().map(|attempt| attempt.id.clone());
+        ensure!(
+            body["attempt_id"].as_str() == actual.as_deref(),
+            "manager control attempt changed"
+        );
+        let mut session = load_scheduler_session(&tx, space, scope, target)?;
+        if method == "cancel_manager" {
+            if scheduler_publication_from(&tx, space, &job)?.is_none() {
+                match &job.state {
+                    JobState::Queued => {
+                        job.state = JobState::Cancelled {
+                            attempt: None,
+                            evidence: "Account cancelled before SDK start".into(),
+                        };
+                        session.pending.retain(|value| value != trigger);
+                    }
+                    JobState::Claimed { attempt } | JobState::Running { attempt } => {
+                        ensure!(
+                            session.active.as_deref() == Some(trigger),
+                            "manager active attempt changed"
+                        );
+                        job.state = JobState::Cancelling {
+                            attempt: attempt.clone(),
+                        };
+                        session.permission_version = session
+                            .permission_version
+                            .checked_add(1)
+                            .context("permission version exhausted")?;
+                        session.native_id = None;
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            ensure!(
+                matches!(job.state, JobState::Unknown { fenced: true, .. }),
+                "unknown manager must be fenced before resolution"
+            );
+            let evidence = body["evidence"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .context("reconciliation evidence is required")?;
+            scheduler_save(
+                &tx,
+                space,
+                &scheduler_key("resolution", scope, target, trigger),
+                &serde_json::json!({"attempt_id":actual,"evidence":evidence,"admission":admission}),
+            )?;
+            session.unresolved.remove(trigger);
+            session.native_id = None;
+        }
+        scheduler_save(&tx, space, &key, &job)?;
+        save_scheduler_session(&tx, space, &session)?;
+        scheduler_save(
+            &tx,
+            space,
+            &receipt_key,
+            &ManagerControlReceipt {
+                admission,
+                job: job.clone(),
+            },
+        )?;
+        tx.commit()?;
+        Ok(job)
+    }
+
+    pub(crate) fn accept_message_authorized(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &vibeface_secure::authorization::VerifiedAuthorization,
+        freshness: &crate::identity::policy::FreshnessProof,
+        transport: &crate::identity::policy::RequestTransport,
+        body: &Value,
+        now: u64,
+    ) -> Result<(SignedEvent, AdmissionReceipt)> {
+        use vibeface_secure::authorization::Actor;
+        ensure!(
+            matches!(auth.actor(), Actor::Account(_)) && body["method"] == "message",
+            "message requires an Account admission"
+        );
+        let space = auth.resource().space.as_str();
+        let scope = body["conversation_id"]
+            .as_str()
+            .context("conversation_id is required")?;
+        let target = body["scheduler_node"]
+            .as_str()
+            .context("signed scheduler_node is required")?;
+        ensure!(
+            conversation_resource_in(&self.connection, space, scope)? == auth.resource().resource,
+            "message resource mismatch"
+        );
+        let event = EventBody::MessagePosted {
+            message_id: body["message_id"]
+                .as_str()
+                .context("message_id is required")?
+                .into(),
+            role: "user".into(),
+            text: body["text"].as_str().context("text is required")?.into(),
+            scheduler_node: Some(target.into()),
+        };
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prior = load_events_from(&tx, &self.policy, space)?.into_values().find(|prior| prior.event.scope_id == scope
+            && matches!(&prior.event.body, EventBody::MessagePosted { message_id, .. } if body["message_id"].as_str() == Some(message_id)));
+        if let Some(prior) = prior {
+            ensure!(
+                prior.status == "ready"
+                    && prior.event.resource_id == auth.resource().resource
+                    && prior.event.body == event
+                    && prior.event.blobs.is_empty(),
+                "message ID reused with different content or target"
+            );
+            let EventCause::Invocation { admission } = &prior.event.cause else {
+                bail!("message has no Account admission")
+            };
+            ensure!(
+                admission.invocation.payload.actor == *auth.actor()
+                    && admission.source_body["report_results"] == body["report_results"],
+                "message retry changed its Account or result reporting"
+            );
+            let receipt = admit_scheduler_from(
+                &tx,
+                &self.policy,
+                space,
+                scope,
+                &prior.envelope.hash,
+                &identity.node_id()?,
+                target,
+            )?;
+            tx.commit()?;
+            return Ok((prior.envelope, receipt));
+        }
+        let admitted = crate::identity::admission::consume_request_authorization_in(
+            &tx,
+            &self.policy,
+            auth,
+            freshness,
+            transport,
+            body,
+            None,
+            now,
+        )?;
+        let mut events = crate::identity::event_authorization::append_admitted_events_in(
+            &tx,
+            &self.policy,
+            identity,
+            &admitted,
+            vec![(scope.into(), event, vec![])],
+            now,
+        )?;
+        let envelope = events.remove(0);
+        let receipt = admit_scheduler_from(
+            &tx,
+            &self.policy,
+            space,
+            scope,
+            &envelope.hash,
+            &identity.node_id()?,
+            target,
+        )?;
+        let checkpoint = crate::identity::admission::prepare_local_admission_checkpoint_in(
+            &tx,
+            &self.policy,
+            &admitted,
+        )?;
+        tx.commit()?;
+        self.policy.local_admissions.insert(checkpoint);
+        Ok((envelope, receipt))
+    }
+
+    pub(crate) fn retain_scheduler_result(
+        &mut self,
+        space: &str,
+        job: &SchedulerJob,
+        output: &str,
+        blobs: &[BlobRef],
+    ) -> Result<()> {
+        let key = scheduler_key(
+            "known-result",
+            &job.conversation_id,
+            &job.target_node,
+            &job.trigger,
+        );
+        let value = SchedulerKnownResult {
+            job: job.clone(),
+            output: output.into(),
+            blobs: blobs.into(),
+        };
+        if let Some(old) = scheduler_load::<SchedulerKnownResult>(&self.connection, space, &key)? {
+            ensure!(
+                old.job.state.attempt().map(|a| &a.id) == job.state.attempt().map(|a| &a.id)
+                    && old.output == output
+                    && old.blobs == blobs,
+                "known manager output changed"
+            );
+        } else {
+            scheduler_save(&self.connection, space, &key, &value)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn pending_scheduler_results(
+        &self,
+        space: &str,
+    ) -> Result<Vec<SchedulerKnownResult>> {
+        let mut statement=self.connection.prepare("SELECT value FROM local_values WHERE space_id=? AND key LIKE 'scheduler:v1:known-result:%'")?;
+        statement
+            .query_map([space], |row| row.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str(&row?)?))
+            .collect()
+    }
+
+    pub(crate) fn stage_scheduler_terminal(
+        &mut self,
+        identity: &LocalIdentity,
+        auth: &vibeface_secure::authorization::VerifiedAuthorization,
+        freshness: &crate::identity::policy::FreshnessProof,
+        transport: &crate::identity::policy::RequestTransport,
+        body: &Value,
+        job: &SchedulerJob,
+        outcome: JobOutcome,
+        events: Vec<(EventBody, Vec<BlobRef>)>,
+        now: u64,
+    ) -> Result<SchedulerJob> {
+        let space = auth.resource().space.as_str();
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: SchedulerJob = scheduler_load(
+            &tx,
+            space,
+            &scheduler_key("job", &job.conversation_id, &job.target_node, &job.trigger),
+        )?
+        .context("scheduler job missing")?;
+        ensure!(
+            &current == job && auth.resource().resource == job.resource_id,
+            "scheduler terminal changed its job or resource"
+        );
+        validate_scheduler_terminal(job, &outcome, &events)?;
+        if scheduler_publication_from(&tx, space, job)?.is_none() {
+            let admission = crate::identity::admission::consume_request_authorization_in(
+                &tx,
+                &self.policy,
+                auth,
+                freshness,
+                transport,
+                body,
+                None,
+                now,
+            )?;
+            let marker = SchedulerTerminalPublication {
+                version: SCHEDULING_VERSION,
+                job: job.clone(),
+                outcome,
+                events,
+                admission,
+                created_at_ms: i64::try_from(now)?,
+            };
+            scheduler_save(
+                &tx,
+                space,
+                &scheduler_key(
+                    "publication",
+                    &job.conversation_id,
+                    &job.target_node,
+                    &job.trigger,
+                ),
+                &marker,
+            )?;
+        }
+        tx.commit()?;
+        self.flush_scheduler_publications(identity, space, &job.target_node)?;
+        self.scheduler_job(space, &job.conversation_id, &job.trigger, &job.target_node)?
+            .context("scheduler job disappeared")
+    }
+
+    pub(crate) fn flush_scheduler_publications(
+        &mut self,
+        identity: &LocalIdentity,
+        space: &str,
+        target: &str,
+    ) -> Result<SchedulerPublicationBatch> {
+        ensure!(
+            identity.node_id()? == target,
+            "scheduler publication belongs to another Node"
+        );
+        let values = self.connection.prepare("SELECT value FROM local_values WHERE space_id=? AND key LIKE 'scheduler:v1:publication:%'")?
+            .query_map([space], |row| row.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+        let mut batch = SchedulerPublicationBatch::default();
+        for value in values {
+            let marker: SchedulerTerminalPublication = serde_json::from_str(&value)?;
+            if marker.job.target_node != target {
+                continue;
+            }
+            let result = (|| -> Result<Option<SchedulerPublication>> {
+                let tx = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                if !scheduler_scope_publishable(
+                    &tx,
+                    &self.policy,
+                    space,
+                    &marker.job.conversation_id,
+                )? {
+                    return Ok(None);
+                }
+                let current: SchedulerJob = scheduler_load(
+                    &tx,
+                    space,
+                    &scheduler_key(
+                        "job",
+                        &marker.job.conversation_id,
+                        target,
+                        &marker.job.trigger,
+                    ),
+                )?
+                .context("scheduler job missing")?;
+                ensure!(
+                    current == marker.job,
+                    "scheduler publication refers to another attempt"
+                );
+                let signed = crate::identity::event_authorization::append_admitted_events_in(
+                    &tx,
+                    &self.policy,
+                    identity,
+                    &marker.admission,
+                    marker
+                        .events
+                        .iter()
+                        .cloned()
+                        .map(|(body, blobs)| (marker.job.conversation_id.clone(), body, blobs))
+                        .collect(),
+                    marker.admission.admitted_at_ms,
+                )?;
+                let job = finish_scheduler_in(&tx, space, &current, &marker.outcome)?;
+                tx.execute(
+                    "DELETE FROM local_values WHERE space_id=? AND key=?",
+                    params![
+                        space,
+                        scheduler_key(
+                            "known-result",
+                            &job.conversation_id,
+                            &job.target_node,
+                            &job.trigger
+                        )
+                    ],
+                )?;
+                tx.execute(
+                    "DELETE FROM local_values WHERE space_id=? AND key=?",
+                    params![
+                        space,
+                        scheduler_key("publication", &job.conversation_id, target, &job.trigger)
+                    ],
+                )?;
+                let checkpoint = crate::identity::admission::prepare_local_admission_checkpoint_in(
+                    &tx,
+                    &self.policy,
+                    &marker.admission,
+                )?;
+                tx.commit()?;
+                self.policy.local_admissions.insert(checkpoint);
+                Ok(Some(SchedulerPublication {
+                    job,
+                    event_hashes: signed.into_iter().map(|event| event.hash).collect(),
+                }))
+            })();
+            match result {
+                Ok(Some(value)) => batch.published.push(value),
+                Ok(None) => {}
+                Err(error) => batch.errors.push(format!(
+                    "{}:{}: {error:#}",
+                    marker.job.conversation_id, marker.job.trigger
+                )),
+            }
+        }
+        Ok(batch)
+    }
+
+    pub(crate) fn finish_scheduler_locally(
+        &mut self,
+        space: &str,
+        job: &SchedulerJob,
+        outcome: JobOutcome,
+    ) -> Result<SchedulerJob> {
+        ensure!(
+            !matches!(outcome, JobOutcome::Completed),
+            "completed scheduler output requires an exact admitted publication"
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: SchedulerJob = scheduler_load(
+            &tx,
+            space,
+            &scheduler_key("job", &job.conversation_id, &job.target_node, &job.trigger),
+        )?
+        .context("scheduler job missing")?;
+        ensure!(
+            current.state.attempt().map(|a| &a.id) == job.state.attempt().map(|a| &a.id),
+            "scheduler attempt changed"
+        );
+        let job = finish_scheduler_in(&tx, space, &current, &outcome)?;
+        tx.commit()?;
+        Ok(job)
     }
     fn load_events(&self, network_id: &str) -> Result<BTreeMap<String, StoredEvent>> {
         load_events_from(&self.connection, &self.policy, network_id)
@@ -1226,11 +2250,9 @@ impl Store {
     }
 
     pub fn validate_operation_binding(&self, request: &OperationRequest) -> Result<()> {
-        let proof = request
-            .binding
-            .as_ref()
-            .context("execution requires a confirmed task binding")?;
-        self.verify_binding_creation(proof)?;
+        if let Some(proof) = &request.binding {
+            self.verify_binding_creation(proof)?;
+        }
         validate_operation_binding_from(&self.connection, request)
     }
 
@@ -1312,14 +2334,6 @@ impl Store {
         )?;
         count += crate::identity::execution_handoff::recover_execution_handoffs_in(&tx)?;
         tx.execute("UPDATE continuation_claims SET record=json_set(record,'$.state','unknown') WHERE json_extract(record,'$.state')='running'",[])?;
-        tx.execute(
-            "UPDATE local_values SET value=json_set(value,'$.state','unknown') WHERE key GLOB 'scheduler:invocation:*' AND json_extract(value,'$.state')='running'",
-            [],
-        )?;
-        tx.execute(
-            "UPDATE local_values SET value=json_set(value,'$.active.state','unknown','$.native_id',NULL) WHERE key GLOB 'scheduler:session:*' AND json_extract(value,'$.active.state') IN ('running','unknown')",
-            [],
-        )?;
         tx.commit()?;
         Ok(count)
     }
@@ -1532,6 +2546,828 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 }
+pub(crate) fn scheduler_publication_from(
+    connection: &Connection,
+    network: &str,
+    job: &SchedulerJob,
+) -> Result<Option<SchedulerTerminalPublication>> {
+    let marker: Option<SchedulerTerminalPublication> = scheduler_load(
+        connection,
+        network,
+        &scheduler_key(
+            "publication",
+            &job.conversation_id,
+            &job.target_node,
+            &job.trigger,
+        ),
+    )?;
+    if let Some(marker) = &marker {
+        ensure!(
+            marker.version == SCHEDULING_VERSION && marker.job == *job,
+            "scheduler publication does not match its exact invocation"
+        );
+    }
+    Ok(marker)
+}
+
+fn validate_scheduler_terminal(
+    job: &SchedulerJob,
+    outcome: &JobOutcome,
+    events: &[(EventBody, Vec<BlobRef>)],
+) -> Result<()> {
+    match outcome {
+        JobOutcome::Completed => {
+            ensure!(
+                !matches!(job.state, JobState::Cancelling { .. }),
+                "cancelled manager credentials cannot complete a reply"
+            );
+            ensure!(events.iter().filter(|(body, _)| matches!(body, EventBody::MessagePosted { message_id, role, .. } if message_id == &job.message_id && role == "assistant")).count() == 1, "completed scheduler job requires one final reply");
+            ensure!(
+                events
+                    .iter()
+                    .filter(|(body, _)| matches!(body, EventBody::MessagePosted { .. }))
+                    .count()
+                    == 1,
+                "completed scheduler job cannot publish additional replies"
+            );
+        }
+        JobOutcome::Cancelled(evidence) => {
+            ensure!(!evidence.is_empty(), "cancellation evidence is required")
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn scheduler_scope_publishable(
+    connection: &Connection,
+    policy: &crate::identity::journal::PolicyState,
+    network: &str,
+    conversation: &str,
+) -> Result<bool> {
+    let events = load_events_from(connection, policy, network)?;
+    for hash in closure_hashes(&events, &heads_from_events(&events, conversation)) {
+        let Some(stored) = events.get(&hash) else {
+            return Ok(false);
+        };
+        if stored.status != "ready" {
+            return Ok(false);
+        }
+        for blob in &stored.event.blobs {
+            if !has_blob_from(connection, network, blob)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) fn scheduler_load<T: DeserializeOwned>(
+    connection: &Connection,
+    network: &str,
+    key: &str,
+) -> Result<Option<T>> {
+    optional_json(
+        connection
+            .query_row(
+                "SELECT value FROM local_values WHERE space_id=? AND key=?",
+                params![network, key],
+                |r| r.get(0),
+            )
+            .optional()?,
+    )
+}
+
+pub(crate) fn scheduler_save(
+    connection: &Connection,
+    network: &str,
+    key: &str,
+    value: &impl serde::Serialize,
+) -> Result<()> {
+    connection.execute("INSERT INTO local_values(space_id,key,value) VALUES(?,?,?) ON CONFLICT(space_id,key) DO UPDATE SET value=excluded.value", params![network,key,serde_json::to_string(value)?])?;
+    Ok(())
+}
+
+pub(crate) fn load_scheduler_session(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    target: &str,
+) -> Result<SchedulerSession> {
+    let session: SchedulerSession = scheduler_load(
+        connection,
+        network,
+        &scheduler_key("session", conversation, target, ""),
+    )?
+    .unwrap_or_else(|| SchedulerSession::new(conversation, target));
+    ensure!(
+        session.version == SCHEDULING_VERSION,
+        "unsupported scheduler session version"
+    );
+    Ok(session)
+}
+
+pub(crate) fn save_scheduler_session(
+    connection: &Connection,
+    network: &str,
+    session: &SchedulerSession,
+) -> Result<()> {
+    scheduler_save(
+        connection,
+        network,
+        &scheduler_key(
+            "session",
+            &session.conversation_id,
+            &session.target_node,
+            "",
+        ),
+        session,
+    )
+}
+
+fn scheduler_sessions(connection: &Connection, network: &str) -> Result<Vec<SchedulerSession>> {
+    let mut statement = connection.prepare(
+        "SELECT value FROM local_values WHERE space_id=? AND key LIKE 'scheduler:v1:session:%'",
+    )?;
+    let rows = statement.query_map([network], |r| r.get::<_, String>(0))?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        let session: SchedulerSession = serde_json::from_str(&row?)?;
+        ensure!(
+            session.version == SCHEDULING_VERSION,
+            "unsupported scheduler session version"
+        );
+        sessions.push(session);
+    }
+    Ok(sessions)
+}
+
+fn validated_scheduler_trigger(
+    connection: &Connection,
+    policy: &crate::identity::journal::PolicyState,
+    network: &str,
+    conversation: &str,
+    trigger: &str,
+    target: &str,
+) -> Result<TriggerKind> {
+    authorize_node_from(connection, network, target, Some(NodeRole::Scheduler))?;
+    let resource = conversation_resource_in(connection, network, conversation)?;
+    let events = crate::identity::event_authorization::retained_scope_events_in(
+        connection,
+        network,
+        &resource,
+        conversation,
+    )?;
+    let stored = events
+        .get(trigger)
+        .context("scheduler trigger is missing")?;
+    ensure!(
+        stored.status == "ready"
+            && stored.event.scope_id == conversation
+            && stored.event.resource_id == resource,
+        "scheduler trigger belongs to another resource or is not ready"
+    );
+    let origin = crate::identity::services::resolve_current_agent_origin(
+        policy,
+        connection,
+        &events,
+        trigger,
+        crate::runtime::now_ms() as u64,
+    )?;
+    match &stored.event.body {
+        EventBody::MessagePosted {
+            role,
+            scheduler_node,
+            ..
+        } if role == "user" => {
+            ensure!(
+                scheduler_node.as_deref() == Some(target),
+                "message is addressed to another scheduler"
+            );
+            ensure!(
+                matches!(
+                    origin.parent.actor(),
+                    vibeface_secure::authorization::Actor::Account(_)
+                ),
+                "scheduler message has no account authority"
+            );
+            Ok(TriggerKind::Human)
+        }
+        EventBody::ExecutionObserved { .. } => {
+            followup::validate_followup_result_from(
+                connection,
+                policy,
+                network,
+                conversation,
+                trigger,
+                target,
+            )?;
+            Ok(TriggerKind::Autonomous)
+        }
+        _ => bail!("invalid scheduler trigger"),
+    }
+}
+
+pub(crate) fn conversation_resource_in(
+    connection: &Connection,
+    space: &str,
+    conversation: &str,
+) -> Result<vibeface_secure::authorization::ResourceId> {
+    let id: String = connection
+        .query_row(
+            "SELECT resource_id FROM conversations WHERE space_id=? AND conversation_id=?",
+            params![space, conversation],
+            |row| row.get(0),
+        )
+        .context("conversation resource is unavailable")?;
+    vibeface_secure::authorization::ResourceId::parse(&id).map_err(Into::into)
+}
+
+pub(crate) fn admit_scheduler_from(
+    connection: &Connection,
+    policy: &crate::identity::journal::PolicyState,
+    network: &str,
+    conversation: &str,
+    trigger: &str,
+    local_node: &str,
+    target: &str,
+) -> Result<AdmissionReceipt> {
+    let kind =
+        validated_scheduler_trigger(connection, policy, network, conversation, trigger, target)?;
+    if local_node != target {
+        let key = scheduler_key("outbox", conversation, target, trigger);
+        if let Some(entry) = scheduler_load::<OutboxEntry>(connection, network, &key)? {
+            return Ok(entry.receipt());
+        }
+        let count: usize = connection.query_row("SELECT COUNT(*) FROM local_values WHERE space_id=? AND key LIKE 'scheduler:v1:outbox:%' AND json_extract(value,'$.delivered')=0", [network], |r| r.get(0))?;
+        ensure!(
+            count < MAX_PENDING_JOBS,
+            "scheduler delivery queue is full; message was not admitted"
+        );
+        let entry = OutboxEntry {
+            resource_id: conversation_resource_in(connection, network, conversation)?,
+            version: SCHEDULING_VERSION,
+            space_id: network.into(),
+            conversation_id: conversation.into(),
+            trigger: trigger.into(),
+            target_node: target.into(),
+            delivered: false,
+        };
+        scheduler_save(connection, network, &key, &entry)?;
+        return Ok(entry.receipt());
+    }
+    let key = scheduler_key("job", conversation, target, trigger);
+    if let Some(job) = scheduler_load::<SchedulerJob>(connection, network, &key)? {
+        return Ok(job.receipt(network));
+    }
+    let mut session = load_scheduler_session(connection, network, conversation, target)?;
+    ensure!(
+        session.pending.len() < MAX_PENDING_JOBS,
+        "scheduler inbox is full; trigger was not admitted"
+    );
+    let job = SchedulerJob {
+        resource_id: conversation_resource_in(connection, network, conversation)?,
+        version: SCHEDULING_VERSION,
+        conversation_id: conversation.into(),
+        trigger: trigger.into(),
+        target_node: target.into(),
+        kind,
+        sequence: session.next_sequence,
+        basis_heads: {
+            let mut heads = vec![trigger.into()];
+            if let Some(head) = followup::report_intent_head_from(
+                connection,
+                policy,
+                network,
+                conversation,
+                trigger,
+            )? {
+                heads.push(head);
+            }
+            heads
+        },
+        message_id: format!(
+            "scheduler-message-{}",
+            digest(&serde_json::to_vec(&(
+                network,
+                conversation,
+                trigger,
+                target
+            ))?)
+        ),
+        state: JobState::Queued,
+    };
+    session.next_sequence = session
+        .next_sequence
+        .checked_add(1)
+        .context("scheduler queue sequence overflow")?;
+    session.pending.push(trigger.into());
+    scheduler_save(connection, network, &key, &job)?;
+    save_scheduler_session(connection, network, &session)?;
+    Ok(job.receipt(network))
+}
+
+pub(crate) fn recover_scheduler_session(
+    connection: &Connection,
+    network: &str,
+    session: &mut SchedulerSession,
+    boot: &str,
+) -> Result<()> {
+    let Some(trigger) = session.active.clone() else {
+        return Ok(());
+    };
+    let key = scheduler_key(
+        "job",
+        &session.conversation_id,
+        &session.target_node,
+        &trigger,
+    );
+    let mut job: SchedulerJob =
+        scheduler_load(connection, network, &key)?.context("missing active scheduler job")?;
+    let Some(attempt) = job.state.attempt().cloned() else {
+        bail!("active scheduler job has no attempt");
+    };
+    if scheduler_publication_from(connection, network, &job)?.is_some() {
+        return Ok(());
+    }
+    if attempt.boot == boot {
+        return Ok(());
+    }
+    match job.state {
+        JobState::Claimed { .. } => {
+            job.state = JobState::Queued;
+            if !session.pending.contains(&trigger) {
+                session.pending.push(trigger.clone());
+            }
+            session.active = None;
+        }
+        JobState::Running { .. } | JobState::Cancelling { .. } => {
+            job.state = JobState::Unknown {
+                attempt,
+                detail: "Node restarted after the SDK start boundary; this call was not replayed"
+                    .into(),
+                fenced: false,
+            };
+            session.unresolved.insert(trigger);
+            session.native_id = None;
+            session.permission_version = session
+                .permission_version
+                .checked_add(1)
+                .context("scheduler permission version overflow")?;
+        }
+        JobState::Unknown { .. } => {}
+        _ => session.active = None,
+    }
+    scheduler_save(connection, network, &key, &job)?;
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum SchedulerWithdrawal {
+    FollowupOff {
+        event: String,
+    },
+    TaskFinalized {
+        event: String,
+        status: String,
+    },
+    DeviceRevoked {
+        account: String,
+        device: String,
+        policy: String,
+    },
+    DeviceExpired {
+        device: String,
+        expires_at_ms: u64,
+    },
+    GrantRemoved {
+        grant: String,
+        policy: String,
+    },
+    GrantExpired {
+        grant: String,
+        expires_at_ms: u64,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct SchedulerDeferred {
+    pub trigger: String,
+    pub error: anyhow::Error,
+}
+
+pub(crate) struct SchedulerSelection {
+    pub job: Option<SchedulerJob>,
+    pub deferred: Vec<SchedulerDeferred>,
+}
+
+enum SchedulerEligibility {
+    Ready(Option<followup::ResultFollowupPolicy>),
+    Withdrawn(SchedulerWithdrawal),
+    Deferred(anyhow::Error),
+}
+
+fn scheduler_credential_withdrawal(
+    state: &vibeface_secure::authorization::VerifiedPolicySet,
+    proof: &AdmissionProof,
+    now: u64,
+) -> Result<Option<SchedulerWithdrawal>> {
+    use vibeface_secure::authorization::{Actor, PolicyDomain};
+    let invocation = &proof.invocation.payload;
+    let Actor::Account(account) = &invocation.actor else {
+        return Ok(None);
+    };
+    let document = state
+        .account(account)
+        .context("Account policy is unavailable")?;
+    if document.revoked_devices.contains(&invocation.device) {
+        return Ok(Some(SchedulerWithdrawal::DeviceRevoked {
+            account: account.to_string(),
+            device: invocation.device.to_string(),
+            policy: state
+                .head(&PolicyDomain::Account(account.clone()))
+                .context("Account policy head is unavailable")?
+                .head
+                .to_string(),
+        }));
+    }
+    let mut registered_device = false;
+    for hash in &document.devices {
+        let certificate = state
+            .device(hash)
+            .context("Account device proof is unavailable")?;
+        if certificate.payload.device == invocation.device {
+            registered_device = true;
+            if certificate.payload.expires_at_ms <= now {
+                return Ok(Some(SchedulerWithdrawal::DeviceExpired {
+                    device: invocation.device.to_string(),
+                    expires_at_ms: certificate.payload.expires_at_ms,
+                }));
+            }
+        }
+    }
+    ensure!(
+        registered_device,
+        "original Account device is absent without an explicit revocation"
+    );
+    let mut cursor = Some(invocation.grant_leaf.clone());
+    let mut visited = BTreeSet::new();
+    while let Some(hash) = cursor {
+        ensure!(
+            visited.insert(hash.clone())
+                && visited.len() <= vibeface_secure::authorization::MAX_DELEGATION_DEPTH,
+            "grant ancestry is incomplete or cyclic"
+        );
+        let grant = state
+            .grant(&hash)
+            .context("original grant proof is unavailable")?;
+        let owner = state
+            .space(&grant.payload.owner_space)
+            .context("grant owner policy is unavailable")?;
+        let head = state
+            .head(&PolicyDomain::Space(grant.payload.owner_space.clone()))
+            .context("grant owner policy head is unavailable")?;
+        if !owner.grants.contains(&hash) {
+            return Ok(Some(SchedulerWithdrawal::GrantRemoved {
+                grant: hash.to_string(),
+                policy: head.head.to_string(),
+            }));
+        }
+        if grant.payload.expires_at_ms <= now {
+            return Ok(Some(SchedulerWithdrawal::GrantExpired {
+                grant: hash.to_string(),
+                expires_at_ms: grant.payload.expires_at_ms,
+            }));
+        }
+        cursor = grant.payload.parent.clone();
+    }
+    Ok(None)
+}
+
+fn scheduler_eligibility_in(
+    connection: &Connection,
+    policy: &crate::identity::journal::PolicyState,
+    space: &str,
+    job: &SchedulerJob,
+    now: u64,
+) -> SchedulerEligibility {
+    let checked = (|| -> Result<SchedulerEligibility> {
+        let mut events = load_events_from(connection, policy, space)?;
+        events.retain(|_, stored| stored.event.resource_id == job.resource_id);
+        let heads = heads_from_events(&events, &job.conversation_id);
+        ensure!(
+            closure_hashes(&events, &heads).iter().all(|hash| events
+                .get(hash)
+                .is_some_and(|event| event.status == "ready")),
+            "scheduler history is incomplete or conflicting"
+        );
+        ensure!(
+            closure_hashes(&events, &job.basis_heads)
+                .iter()
+                .all(|hash| events
+                    .get(hash)
+                    .is_some_and(|event| event.status == "ready")),
+            "queued scheduler proof is incomplete or conflicting"
+        );
+        let source = events
+            .get(&job.trigger)
+            .context("scheduler trigger is unavailable")?;
+        ensure!(source.status == "ready", "scheduler trigger is not ready");
+        ensure!(
+            match (&job.kind, &source.event.body) {
+                (
+                    TriggerKind::Human,
+                    EventBody::MessagePosted {
+                        role,
+                        scheduler_node: Some(target),
+                        ..
+                    },
+                ) => role == "user" && target == &job.target_node,
+                (TriggerKind::Autonomous, EventBody::ExecutionObserved { .. }) => true,
+                _ => false,
+            },
+            "scheduler job kind or target differs from its original trigger"
+        );
+        let mut authorities = Vec::new();
+        if job.kind == TriggerKind::Autonomous {
+            let (withdrawal, proofs) = followup::scheduler_followup_evidence_in(
+                connection,
+                policy,
+                space,
+                &job.conversation_id,
+                &events,
+                &job.trigger,
+                now,
+            )?;
+            if let Some(reason) = withdrawal {
+                return Ok(SchedulerEligibility::Withdrawn(reason));
+            }
+            authorities.extend(proofs);
+        }
+        let readiness = match job.kind {
+            TriggerKind::Human => crate::identity::services::resolve_current_agent_origin(
+                policy,
+                connection,
+                &events,
+                &job.trigger,
+                now,
+            )
+            .map(|_| None),
+            TriggerKind::Autonomous => followup::validate_followup_result_in_view(
+                connection,
+                policy,
+                policy.verified(),
+                &events,
+                space,
+                &job.conversation_id,
+                &job.trigger,
+                &job.target_node,
+                &heads,
+                now,
+            )
+            .map(Some),
+        };
+        match readiness {
+            Ok(followup) => Ok(SchedulerEligibility::Ready(followup)),
+            Err(error) => {
+                let parent =
+                    crate::identity::services::agent_account_message(&events, &job.trigger)?;
+                let EventCause::Invocation { admission } = &parent.event.cause else {
+                    bail!("scheduler Account source has no admission")
+                };
+                authorities.push(admission.clone());
+                for authority in &authorities {
+                    if let Some(reason) =
+                        scheduler_credential_withdrawal(policy.verified(), authority, now)?
+                    {
+                        return Ok(SchedulerEligibility::Withdrawn(reason));
+                    }
+                }
+                Ok(SchedulerEligibility::Deferred(error))
+            }
+        }
+    })();
+    checked.unwrap_or_else(SchedulerEligibility::Deferred)
+}
+
+fn select_scheduler_candidate_in(
+    connection: &Connection,
+    policy: &crate::identity::journal::PolicyState,
+    space: &str,
+    session: &mut SchedulerSession,
+    skip: &BTreeSet<String>,
+    expected: Option<&str>,
+    now: u64,
+) -> Result<(SchedulerSelection, Option<followup::ResultFollowupPolicy>)> {
+    if session.active.is_some() {
+        return Ok((
+            SchedulerSelection {
+                job: None,
+                deferred: Vec::new(),
+            },
+            None,
+        ));
+    }
+    let mut queued = Vec::new();
+    for trigger in &session.pending {
+        if skip.contains(trigger) || expected.is_some_and(|requested| requested != trigger) {
+            continue;
+        }
+        let job: SchedulerJob = scheduler_load(
+            connection,
+            space,
+            &scheduler_key(
+                "job",
+                &session.conversation_id,
+                &session.target_node,
+                trigger,
+            ),
+        )?
+        .context("queued scheduler job is missing")?;
+        ensure!(
+            matches!(job.state, JobState::Queued),
+            "pending scheduler job is not queued"
+        );
+        ensure!(
+            job.conversation_id == session.conversation_id
+                && job.target_node == session.target_node
+                && job.resource_id
+                    == conversation_resource_in(connection, space, &session.conversation_id)?,
+            "queued scheduler scope differs from its session"
+        );
+        if session.unresolved.is_empty() || job.kind == TriggerKind::Human {
+            queued.push(job);
+        }
+    }
+    queued.sort_by_key(|job| (job.kind != TriggerKind::Human, job.sequence));
+    let mut selection = SchedulerSelection {
+        job: None,
+        deferred: Vec::new(),
+    };
+    for mut job in queued {
+        match scheduler_eligibility_in(connection, policy, space, &job, now) {
+            SchedulerEligibility::Ready(followup) => {
+                selection.job = Some(job);
+                return Ok((selection, followup));
+            }
+            SchedulerEligibility::Withdrawn(reason) => {
+                crate::identity::admission::retire_queued_manager_in(
+                    connection,
+                    space,
+                    &job.trigger,
+                )?;
+                job.state = JobState::Cancelled {
+                    attempt: None,
+                    evidence: serde_json::to_string(&reason)?,
+                };
+                session.pending.retain(|trigger| trigger != &job.trigger);
+                scheduler_save(
+                    connection,
+                    space,
+                    &scheduler_key("job", &job.conversation_id, &job.target_node, &job.trigger),
+                    &job,
+                )?;
+            }
+            SchedulerEligibility::Deferred(error) => selection.deferred.push(SchedulerDeferred {
+                trigger: job.trigger,
+                error,
+            }),
+        }
+    }
+    Ok((selection, None))
+}
+
+pub(crate) fn claim_next_in(
+    tx: &Connection,
+    policy: &crate::identity::journal::PolicyState,
+    network: &str,
+    conversation: &str,
+    target: &str,
+    boot: &str,
+    sdk_config: &str,
+    attempt_id: &str,
+    expected_trigger: &str,
+) -> Result<Option<ClaimedJob>> {
+    let mut session = load_scheduler_session(tx, network, conversation, target)?;
+    recover_scheduler_session(tx, network, &mut session, boot)?;
+    if session.active.is_some() {
+        save_scheduler_session(tx, network, &session)?;
+        return Ok(None);
+    }
+    let (selected, policy) = select_scheduler_candidate_in(
+        tx,
+        policy,
+        network,
+        &mut session,
+        &BTreeSet::new(),
+        Some(expected_trigger),
+        crate::runtime::now_ms() as u64,
+    )?;
+    let Some(mut job) = selected.job else {
+        save_scheduler_session(tx, network, &session)?;
+        if let Some(deferred) = selected.deferred.into_iter().next() {
+            return Err(deferred.error.context("scheduler eligibility is deferred"));
+        }
+        return Ok(None);
+    };
+    if session.sdk_config.as_deref() != Some(sdk_config) {
+        session.native_id = None;
+        session.sdk_config = Some(sdk_config.into());
+    }
+    if let Some(policy) = &policy {
+        for head in &policy.proof_heads {
+            if !job.basis_heads.contains(head) {
+                job.basis_heads.push(head.clone());
+            }
+        }
+    }
+    let read_only = !session.unresolved.is_empty()
+        || policy
+            .as_ref()
+            .is_some_and(|policy| policy.mode != followup::FollowupMode::Continue);
+    let previous_native_id = if read_only {
+        None
+    } else {
+        session.native_id.clone()
+    };
+    job.state = JobState::Claimed {
+        attempt: ManagerAttempt {
+            id: attempt_id.into(),
+            boot: boot.into(),
+            read_only,
+            permission_version: session.permission_version,
+            followup_version: policy.map(|policy| policy.version),
+        },
+    };
+    session.pending.retain(|trigger| trigger != &job.trigger);
+    session.active = Some(job.trigger.clone());
+    scheduler_save(
+        tx,
+        network,
+        &scheduler_key("job", conversation, target, &job.trigger),
+        &job,
+    )?;
+    save_scheduler_session(tx, network, &session)?;
+    Ok(Some(ClaimedJob {
+        job,
+        previous_native_id,
+    }))
+}
+
+fn finish_scheduler_in(
+    connection: &Connection,
+    space: &str,
+    current: &SchedulerJob,
+    outcome: &JobOutcome,
+) -> Result<SchedulerJob> {
+    let mut job = current.clone();
+    let mut session =
+        load_scheduler_session(connection, space, &job.conversation_id, &job.target_node)?;
+    let attempt = job
+        .state
+        .attempt()
+        .context("scheduler attempt missing")?
+        .clone();
+    job.state = match outcome {
+        JobOutcome::Completed => {
+            session.unresolved.remove(&job.trigger);
+            JobState::Completed { attempt }
+        }
+        JobOutcome::Failed(detail) => JobState::Failed {
+            attempt,
+            detail: detail.clone(),
+        },
+        JobOutcome::Cancelled(evidence) => JobState::Cancelled {
+            attempt: Some(attempt),
+            evidence: evidence.clone(),
+        },
+        JobOutcome::Unknown(detail) => {
+            session.unresolved.insert(job.trigger.clone());
+            session.native_id = None;
+            session.permission_version = session
+                .permission_version
+                .checked_add(1)
+                .context("scheduler permission version overflow")?;
+            JobState::Unknown {
+                attempt,
+                detail: detail.clone(),
+                fenced: false,
+            }
+        }
+    };
+    if !matches!(job.state, JobState::Unknown { .. }) {
+        session.active = None;
+    }
+    scheduler_save(
+        connection,
+        space,
+        &scheduler_key("job", &job.conversation_id, &job.target_node, &job.trigger),
+        &job,
+    )?;
+    save_scheduler_session(connection, space, &session)?;
+    Ok(job)
+}
 pub(crate) fn rebuild_projections_from(
     connection: &Connection,
     policy: &crate::identity::journal::PolicyState,
@@ -1608,6 +3444,7 @@ pub(crate) fn rebuild_projections_from(
             events.get_mut(hash).unwrap().status = "ready".into();
         }
     }
+    bots::validate_bot_projections_from(connection, network_id, &mut events, &ordered);
     for (hash, e) in &events {
         connection.execute(
             "UPDATE events SET status=? WHERE space_id=? AND hash=?",
@@ -1762,14 +3599,122 @@ pub(crate) fn validate_released_operation_reservations_from(
     Ok(())
 }
 
+fn validate_session_ownership_from(
+    connection: &Connection,
+    space: &str,
+    target: &str,
+    session: &str,
+    conversation: &str,
+) -> Result<bool> {
+    let mut owned = false;
+    let mut statement = connection.prepare(
+        "SELECT request FROM operations WHERE space_id=? AND target_node=? AND session_id=?",
+    )?;
+    for encoded in statement.query_map(params![space, target, session], |row| {
+        row.get::<_, String>(0)
+    })? {
+        let request: OperationRequest = serde_json::from_str(&encoded?)?;
+        ensure!(
+            request.conversation_id == conversation,
+            "execution session belongs to another conversation"
+        );
+        owned = true;
+    }
+    let mut statement = connection.prepare(
+        "SELECT value FROM local_values WHERE space_id=? AND key LIKE 'task-binding-record:%'",
+    )?;
+    for encoded in statement.query_map([space], |row| row.get::<_, String>(0))? {
+        let proof: crate::binding::SignedBinding = serde_json::from_str(&encoded?)?;
+        if proof.binding.target_node == target && proof.binding.session_id == session {
+            ensure!(
+                proof.binding.conversation_id == conversation,
+                "execution binding belongs to another conversation"
+            );
+            owned = true;
+        }
+    }
+    Ok(owned)
+}
+fn validate_unbound_operation_from(
+    connection: &Connection,
+    request: &OperationRequest,
+) -> Result<()> {
+    let Some(session) = request.session_id.as_deref() else {
+        ensure!(
+            request.action["type"] == "command",
+            "only commands are sessionless"
+        );
+        return Ok(());
+    };
+    validate_session_ownership_from(
+        connection,
+        &request.network_id,
+        &request.target_node,
+        session,
+        &request.conversation_id,
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT request FROM operations WHERE space_id=? AND target_node=? AND session_id=?",
+    )?;
+    for encoded in statement.query_map(
+        params![request.network_id, request.target_node, session],
+        |row| row.get::<_, String>(0),
+    )? {
+        let previous: OperationRequest = serde_json::from_str(&encoded?)?;
+        ensure!(
+            previous.task_id.is_none() && previous.binding.is_none(),
+            "task-bound session cannot be used without its binding"
+        );
+    }
+    let mut statement = connection.prepare(
+        "SELECT value FROM local_values WHERE space_id=? AND key LIKE 'task-binding-record:%'",
+    )?;
+    for encoded in statement.query_map([&request.network_id], |row| row.get::<_, String>(0))? {
+        let proof: crate::binding::SignedBinding = serde_json::from_str(&encoded?)?;
+        ensure!(
+            proof.binding.target_node != request.target_node || proof.binding.session_id != session,
+            "task-bound session cannot be downgraded to ordinary execution"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_operation_binding_from(
     connection: &Connection,
     request: &OperationRequest,
 ) -> Result<()> {
-    let proof = request
-        .binding
-        .as_ref()
-        .context("execution requires a confirmed task binding")?;
+    if request.action["type"] == "command" {
+        ensure!(
+            request.session_id.is_none()
+                && request.task_id.is_none()
+                && request.binding.is_none()
+                && request.expected_revision == 0,
+            "command cannot carry a Task, session, binding or revision"
+        );
+        return Ok(());
+    }
+    ensure!(
+        request
+            .session_id
+            .as_deref()
+            .is_some_and(|session| !session.is_empty()),
+        "session execution requires a nonempty session ID"
+    );
+    if let Some(session) = request.session_id.as_deref() {
+        validate_session_ownership_from(
+            connection,
+            &request.network_id,
+            &request.target_node,
+            session,
+            &request.conversation_id,
+        )?;
+    }
+    match (&request.task_id, &request.binding) {
+        (None, None) => return validate_unbound_operation_from(connection, request),
+        (Some(_), Some(_)) => {}
+        _ => bail!("task and confirmed binding must be supplied together"),
+    }
+    let proof = request.binding.as_ref().expect("checked binding");
     let binding = &proof.binding;
     ensure!(
         binding.network_id == request.network_id
@@ -1778,7 +3723,8 @@ pub(crate) fn validate_operation_binding_from(
         "operation does not match its bound task"
     );
     ensure!(
-        binding.target_node == request.target_node && binding.session_id == request.session_id,
+        binding.target_node == request.target_node
+            && Some(binding.session_id.as_str()) == request.session_id.as_deref(),
         "operation target or session differs from confirmed task binding"
     );
     if request.action["type"] == "open" {
@@ -2318,7 +4264,10 @@ mod tests {
                 kind: "succeeded".into(),
                 text: format!(
                     "执行会话 {} 的本轮执行状态为 succeeded。工单验收仍需本人确认。",
-                    request.session_id
+                    request
+                        .session_id
+                        .as_deref()
+                        .context("fixture session is missing")?
                 ),
             },
             vec![],
@@ -3774,6 +5723,118 @@ mod tests {
             root.join("real").canonicalize()?.to_str().unwrap()
         );
         assert!(canonical_resource(root.join("absent/../other").to_str().unwrap()).is_err());
+        Ok(())
+    }
+    #[test]
+    fn scheduler_withdrawal_skips_only_verified_revocation_and_defers_missing_history() -> Result<()>
+    {
+        let mut network = TestNetwork::new()?;
+        let mut store = network.memory()?;
+        network.conversation(&mut store, "conversation")?;
+        let space = network.space.to_string();
+        let target = network.node.node_id()?;
+        let first =
+            network.message(&mut store, "conversation", "queued before grant revocation")?;
+        store.admit_trigger(&space, "conversation", &first.hash, &target, &target)?;
+
+        let old_hash = network.bundle.grant_leaf.clone();
+        let original = store
+            .authorization_state()
+            .grant(&old_hash)
+            .unwrap()
+            .clone();
+        let mut replacement = original.payload.clone();
+        replacement.nonce = Nonce::random()?;
+        replacement.issued_under = store
+            .authorization_state()
+            .head(&PolicyDomain::Space(network.space.clone()))
+            .unwrap()
+            .clone();
+        let signer = if original.issuer == PublicKey::of(&network.root) {
+            &network.root
+        } else {
+            assert_eq!(original.issuer, PublicKey::of(&network.client));
+            &network.client
+        };
+        let replacement = Signed::sign(replacement, signer)?;
+        let new_hash = replacement.hash()?;
+        let mut document = store
+            .authorization_state()
+            .space(&network.space)
+            .unwrap()
+            .clone();
+        document.previous = store
+            .authorization_state()
+            .head(&PolicyDomain::Space(network.space.clone()))
+            .cloned();
+        document.sequence += 1;
+        document.grants.retain(|hash| hash != &old_hash);
+        document.grants.push(new_hash.clone());
+        document.grants.sort();
+        store.install_policy_journal(
+            &[
+                JournalEntry::Grant(replacement),
+                JournalEntry::Space(Signed::sign(document, &network.root)?),
+            ],
+            now(),
+        )?;
+        network.bundle.grant_leaf = new_hash;
+        let second = network.message(&mut store, "conversation", "new signed permission")?;
+        store.admit_trigger(&space, "conversation", &second.hash, &target, &target)?;
+        let selection = store.next_scheduler_candidate(
+            &space,
+            "conversation",
+            &target,
+            "boot",
+            &BTreeSet::new(),
+        )?;
+        assert_eq!(selection.job.unwrap().trigger, second.hash);
+        assert!(selection.deferred.is_empty());
+        let retired = store
+            .scheduler_job(&space, "conversation", &first.hash, &target)?
+            .unwrap();
+        let JobState::Cancelled {
+            attempt: None,
+            evidence,
+        } = retired.state
+        else {
+            panic!("revoked queued job was not retired")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&evidence)?["kind"],
+            "grant_removed"
+        );
+
+        let third =
+            network.message(&mut store, "conversation", "continue past missing evidence")?;
+        store.admit_trigger(&space, "conversation", &third.hash, &target, &target)?;
+        let mut deferred = store
+            .scheduler_job(&space, "conversation", &second.hash, &target)?
+            .unwrap();
+        deferred.basis_heads.push("f".repeat(64));
+        scheduler_save(
+            &store.connection,
+            &space,
+            &scheduler_key("job", "conversation", &target, &second.hash),
+            &deferred,
+        )?;
+        let selection = store.next_scheduler_candidate(
+            &space,
+            "conversation",
+            &target,
+            "boot",
+            &BTreeSet::new(),
+        )?;
+        assert_eq!(selection.job.unwrap().trigger, third.hash);
+        assert_eq!(selection.deferred.len(), 1);
+        assert_eq!(selection.deferred[0].trigger, second.hash);
+        assert!(matches!(
+            store
+                .scheduler_job(&space, "conversation", &second.hash, &target)?
+                .unwrap()
+                .state,
+            JobState::Queued
+        ));
         Ok(())
     }
 }

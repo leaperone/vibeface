@@ -60,12 +60,16 @@ pub fn execution_binding_seal_facts(
             && value.original_space_id == session.original_project.space
             && value.original_space_id.as_str() == binding.binding.network_id
             && value.execution_space_id == session.execution_resource.space
-            && value.session_id == session.session_id
-            && value.session_id == binding.binding.session_id
-            && value.binding_generation == session.binding_generation
-            && value.binding_generation == binding.binding.generation
-            && session.task.as_str() == binding.binding.task_ref
-            && session.binding_hash == binding_hash
+            && value.work.execution_session().is_some_and(|v| {
+                v.session_id == session.session_id && v.session_id == binding.binding.session_id
+            })
+            && value.work == session.work
+            && session
+                .work
+                .task_ref()
+                .is_some_and(|task| task.as_str() == binding.binding.task_ref)
+            && session.work.binding_generation() == Some(binding.binding.generation)
+            && session.work.binding_hash() == Some(binding_hash.as_str())
             && session.executor == executor
             && binding.binding.open_spec["cwd"].as_str() == Some(session.cwd.as_str())
             && node_fingerprint(target_key.as_str())
@@ -92,7 +96,7 @@ pub fn execution_binding_seal_facts(
     }
     let context = InvocationContext {
         conversation: Some(binding.binding.conversation_id.clone()),
-        task: Some(session.task.clone()),
+        task: session.work.task_ref().cloned(),
         sdk_session: None,
         execution_session: Some(SessionRef {
             target: session.target.clone(),
@@ -181,16 +185,19 @@ pub fn verify_remote_execution_seal(
 ) -> crate::Result<String> {
     let _signatures = crate::signature_verification::ScopedSignatureVerification::new();
     (|| -> Result<String> {
-        require(binding_json.len().saturating_add(seal_json.len()) <= MAX_PROOF_BYTES,
-            "remote seal proof is too large")?;
+        require(
+            binding_json.len().saturating_add(seal_json.len()) <= MAX_PROOF_BYTES,
+            "remote seal proof is too large",
+        )?;
         let binding: task_binding::SignedBinding = serde_json::from_str(binding_json)
             .map_err(|_| AuthorizationError::InvalidProof("invalid old binding JSON"))?;
         let seal: task_binding::SignedSeal = serde_json::from_str(seal_json)
             .map_err(|_| AuthorizationError::InvalidProof("invalid executor seal JSON"))?;
         let project_key = PublicKey::parse(expected_project_public_key)?;
         let execution_key = PublicKey::parse(expected_execution_public_key)?;
-        task_binding::verify_binding(&binding, project_key.as_str())
-            .map_err(|_| AuthorizationError::InvalidProof("old binding has another Project authority"))?;
+        task_binding::verify_binding(&binding, project_key.as_str()).map_err(|_| {
+            AuthorizationError::InvalidProof("old binding has another Project authority")
+        })?;
         task_binding::verify_seal(&seal, execution_key.as_str())
             .map_err(|_| AuthorizationError::InvalidProof("seal has another executor authority"))?;
         require(expected_revision_json.len() <= 32, "invalid final revision")?;
@@ -198,12 +205,14 @@ pub fn verify_remote_execution_seal(
             .map_err(|_| AuthorizationError::InvalidProof("invalid final revision"))?;
         require(revision <= 9_007_199_254_740_991, "unsafe final revision")?;
         require(
-            binding.binding.target_node == node_fingerprint(execution_key.as_str())
-                .map_err(|_| AuthorizationError::InvalidProof("invalid old executor pin"))?
+            binding.binding.target_node
+                == node_fingerprint(execution_key.as_str())
+                    .map_err(|_| AuthorizationError::InvalidProof("invalid old executor pin"))?
                 && seal.seal.network_id == binding.binding.network_id
                 && seal.seal.target_node == binding.binding.target_node
-                && seal.seal.binding_hash == task_binding::binding_hash(&binding.binding)
-                    .map_err(|_| AuthorizationError::InvalidProof("invalid old binding"))?
+                && seal.seal.binding_hash
+                    == task_binding::binding_hash(&binding.binding)
+                        .map_err(|_| AuthorizationError::InvalidProof("invalid old binding"))?
                 && seal.seal.final_revision == revision,
             "executor seal changed the old binding or final revision",
         )?;
@@ -213,5 +222,6 @@ pub fn verify_remote_execution_seal(
         usage.enforce_limits()?;
         serde_json::to_string(&seal)
             .map_err(|_| AuthorizationError::InvalidProof("executor seal encoding failed"))
-    })().map_err(|error|error.to_string())
+    })()
+    .map_err(|error| error.to_string())
 }

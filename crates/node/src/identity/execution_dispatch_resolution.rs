@@ -1,8 +1,7 @@
 use super::{
     admission::{
         admission_for_operation_from, check_operation_reservations_in,
-        consume_execution_request_dispatch_in,
-        validate_persisted_admission,
+        consume_execution_request_dispatch_in, validate_persisted_admission,
     },
     execution_dispatch::{VerifiedDispatchFacts, check_destination_heads_in},
     journal::PolicyState,
@@ -332,11 +331,8 @@ impl Store {
             "resolution differs from its immutable local outbox"
         );
         let (operation, _) = check_original_in(&tx, identity, &wire.resolution.observation)?;
-        let binding = operation
-            .request
-            .binding
-            .as_ref()
-            .context("resolution original has no Task binding")?;
+        let original = &wire.resolution.observation.handoff;
+        let work = original.handoff.source_statement()?.work;
         let body = &wire.resolution.account_admission.source_body;
         let selection = RemoteExecutionPolicySelection {
             execution_resource: serde_json::from_value(body["execution_resource"].clone())?,
@@ -344,19 +340,25 @@ impl Store {
             execution_grant: serde_json::from_value(body["execution_grant"].clone())?,
         };
         let local = PublicKey::parse(&identity.public_key_hex()?)?;
-        let scope = super::foreign_execution_policy::current_task_readonly_policy_in(
+        let scope = super::foreign_execution_policy::current_execution_readonly_policy_in(
             &tx,
             &current,
             &local,
-            binding,
+            original,
             &selection,
             RemoteExecutionPolicyPurpose::Resolver,
             &account.payload,
             &account.issuer,
             &PrepareContext {
                 context: account.payload.context.clone(),
-                binding_generation: Some(binding.binding.generation),
-                canonical_cwd: binding.binding.open_spec["cwd"].as_str().map(str::to_owned),
+                binding_generation: work.binding_generation(),
+                canonical_cwd: operation
+                    .request
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.binding.open_spec["cwd"].as_str())
+                    .or_else(|| work.canonical_cwd())
+                    .map(str::to_owned),
                 execution_target_public_key: Some(selection.target_public_key.clone()),
             },
             now_ms,
@@ -394,7 +396,13 @@ impl Store {
         now_ms: u64,
     ) -> Result<(SignedExecutionHandoffResolution, bool)> {
         self.prepare_execution_request_dispatch_resolution(
-            identity, dispatch, scoped, proof, &RequestTransport::Existing(transport.clone()), body, now_ms,
+            identity,
+            dispatch,
+            scoped,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            body,
+            now_ms,
         )
     }
 
@@ -494,7 +502,8 @@ impl Store {
         };
         let facts = execution_resolution_facts(&resolution, auth)?;
         let destination = dispatch.destination();
-        let grant = scoped.state(current.verified())
+        let grant = scoped
+            .state(current.verified())
             .grant(destination.grant_leaf())
             .context("executor resolution grant disappeared")?;
         let expires_at_ms = now_ms
@@ -528,15 +537,17 @@ impl Store {
             resolution,
             invocation,
         };
-        scoped.state(current.verified()).verify_execution_resolution(
-            &wire,
-            auth,
-            &TransportEvidence::VerifiedPeer {
-                origin: auth.audience().device.clone(),
-            },
-            None,
-            now_ms,
-        )?;
+        scoped
+            .state(current.verified())
+            .verify_execution_resolution(
+                &wire,
+                auth,
+                &TransportEvidence::VerifiedPeer {
+                    origin: auth.audience().device.clone(),
+                },
+                None,
+                now_ms,
+            )?;
         tx.execute(
             "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
             params![
@@ -548,7 +559,12 @@ impl Store {
                 })?
             ],
         )?;
-        scoped.bind_in(&tx, body, None, wire.resolution.account_admission.admitted_at_ms)?;
+        scoped.bind_in(
+            &tx,
+            body,
+            None,
+            wire.resolution.account_admission.admitted_at_ms,
+        )?;
         tx.commit()?;
         self.policy = current;
         Ok((wire, true))
@@ -613,9 +629,7 @@ impl Store {
             );
             validate_persisted_admission(&tx, account)?;
             let facts = execution_resolution_account_facts(&wire.resolution)?;
-            super::admission::reconstruct_stored_admission(
-                &tx, &current, account, &facts,
-            )?;
+            super::admission::reconstruct_stored_admission(&tx, &current, account, &facts)?;
             validate_released_operation_reservations_from(&tx, space, operation)?;
             tx.commit()?;
             self.policy = current;
@@ -641,8 +655,8 @@ impl Store {
         let task_state = scoped.state(current.verified());
         let verified = match result {
             ResolutionResult::Unknown(result) => {
-                let verified = task_state
-                    .verify_execution_resolution_ack(result, resolver, now_ms)?;
+                let verified =
+                    task_state.verify_execution_resolution_ack(result, resolver, now_ms)?;
                 task_state.verify_execution_resolution_freshness(
                     &verified,
                     &result.freshness,

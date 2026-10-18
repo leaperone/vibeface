@@ -24,6 +24,7 @@ fn sign_current_receipts<T: Serialize>(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
     current: &VerifiedTaskCurrentPolicy,
+    wire: &TaskBusinessWire,
     authority: &VerifiedTaskBusinessReceiptAuthority,
     identity: &Identity,
     input: &T,
@@ -36,7 +37,7 @@ fn sign_current_receipts<T: Serialize>(
         authority.primary_heads(),
     )?;
     super::super::foreign_execution_policy::check_task_policy_heads_in(connection, current)?;
-    super::source::current_task(connection, authority.scope(), &mut usage)?;
+    super::source::current_work(connection, authority.scope(), wire, &mut usage)?;
     let receipts = authority.sign_receipts(identity, now)?;
     ensure!(
         serde_json::to_vec(input)?.len() + serde_json::to_vec(&receipts)?.len() <= MAX_PROOF_BYTES,
@@ -75,14 +76,14 @@ impl Store {
             &request.payload.source_header_hash,
             &request.payload.business_wire_hash,
         )?;
-        let TaskBusinessWire::Submit(wire) = wire else {
+        let TaskBusinessWire::Submit(original) = &wire else {
             anyhow::bail!("Task operation receipt read requires an original Submit wire")
         };
         let authority = verify_task_business_operation_receipt_read(
             self.policy.verified(),
             current,
             &header,
-            &wire,
+            original,
             actual_c_noise,
             request,
             &local_b,
@@ -92,6 +93,7 @@ impl Store {
             &tx,
             &self.policy,
             current,
+            &wire,
             &authority,
             &signer,
             request,
@@ -137,6 +139,7 @@ impl Store {
             &tx,
             &self.policy,
             current,
+            wire,
             &authority,
             &signer,
             challenge,
@@ -180,6 +183,7 @@ impl Store {
             &tx,
             &self.policy,
             current,
+            &wire,
             &authority,
             &signer,
             request,

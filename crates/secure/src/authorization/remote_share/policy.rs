@@ -6,6 +6,7 @@ use crate::authorization::{
     task_binding::SignedBinding,
 };
 use crate::signature_verification::{ScopedSignatureVerification, SignatureVerification};
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -21,14 +22,12 @@ pub struct RemoteShareIntent {
     pub version: u16,
     pub purpose: RemoteSharePurpose,
     pub project: ResourceRef,
-    pub task_creation: Signed<RemoteShareTaskAttestation>,
+    pub work: RemoteShareWork,
     pub source_node_public_key: PublicKey,
     pub requester: AccountId,
     pub requester_device: DeviceId,
     pub saved_pins: Vec<PolicyPin>,
     pub policy_heads: Vec<PolicyStamp>,
-    pub session_id: String,
-    pub executor_kind: String,
     pub execution_resource: Option<ResourceRef>,
     pub target_public_key: Option<PublicKey>,
     pub old_binding: Option<SignedBinding>,
@@ -36,6 +35,126 @@ pub struct RemoteShareIntent {
     pub nonce: Nonce,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteShareWork {
+    TaskSession {
+        task_creation: Signed<RemoteShareTaskAttestation>,
+        session_id: String,
+        executor_kind: String,
+        binding_generation: u64,
+    },
+    ConversationSession {
+        source: Signed<RemoteShareOperationAttestation>,
+        open: ConversationOpenEvidence,
+    },
+    Command {
+        source: Signed<RemoteShareOperationAttestation>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteShareOperationAttestation {
+    pub version: u16,
+    pub project: ResourceRef,
+    pub work: execution_work::ExecutionWorkIntent,
+    pub context: prepare::PrepareContext,
+    pub request: Value,
+    pub source_node_public_key: PublicKey,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConversationOpenEvidence {
+    Opening,
+    Accepted {
+        open: Box<execution_handoff::ExecutionHandoffResult>,
+    },
+}
+
+impl sealed::Sealed for RemoteShareOperationAttestation {}
+impl SignedObject for RemoteShareOperationAttestation {
+    const DOMAIN: &'static str = "remote-share-operation-attestation-v2";
+}
+
+impl RemoteShareWork {
+    fn operation_source(&self) -> Option<&Signed<RemoteShareOperationAttestation>> {
+        match self {
+            Self::TaskSession { .. } => None,
+            Self::ConversationSession { source, .. } | Self::Command { source } => Some(source),
+        }
+    }
+}
+
+impl RemoteShareIntent {
+    pub fn execution_context(
+        &self,
+        target: &PublicKey,
+        resource: &ResourceRef,
+    ) -> Result<InvocationContext> {
+        let mut context = match &self.work {
+            RemoteShareWork::TaskSession {
+                task_creation,
+                session_id,
+                executor_kind,
+                ..
+            } => InvocationContext {
+                conversation: Some(task_creation.payload.conversation_id.clone()),
+                task: Some(task_creation.payload.task.clone()),
+                execution_session: Some(SessionRef {
+                    target: DeviceId::from_key(target),
+                    session_id: session_id.clone(),
+                }),
+                executor_kind: Some(executor_kind.clone()),
+                ..Default::default()
+            },
+            RemoteShareWork::ConversationSession { source, .. }
+            | RemoteShareWork::Command { source } => {
+                require(
+                    source.payload.context.execution_target_public_key.as_ref() == Some(target),
+                    "sharing changed the operation's selected executor",
+                )?;
+                source.payload.context.context.clone()
+            }
+        };
+        context.sdk_session = None;
+        context.workspace_resource = Some(resource.resource.clone());
+        Ok(context)
+    }
+
+    pub fn work_intent(&self, target: &PublicKey) -> execution_work::ExecutionWorkIntent {
+        match &self.work {
+            RemoteShareWork::TaskSession {
+                task_creation,
+                session_id,
+                binding_generation,
+                ..
+            } => execution_work::ExecutionWorkIntent::TaskSession {
+                task: task_creation.payload.task.clone(),
+                binding_generation: *binding_generation,
+                execution_session: SessionRef {
+                    target: DeviceId::from_key(target),
+                    session_id: session_id.clone(),
+                },
+            },
+            RemoteShareWork::ConversationSession { source, .. }
+            | RemoteShareWork::Command { source } => source.payload.work.clone(),
+        }
+    }
+
+    pub fn canonical_cwd(&self) -> Option<&str> {
+        self.work
+            .operation_source()
+            .and_then(|source| source.payload.context.canonical_cwd.as_deref())
+    }
+
+    pub fn is_command(&self) -> bool {
+        matches!(self.work, RemoteShareWork::Command { .. })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -177,28 +296,180 @@ fn usage_finish(usage: &mut ExecutionProofUsage) -> Result<()> {
     }
     usage.enforce_limits()
 }
-fn intent_task(intent: &RemoteShareIntent, now: u64) -> Result<&RemoteShareTaskAttestation> {
-    let signed = &intent.task_creation;
-    let task = &signed.payload;
-    signed.verify_signature()?;
-    validity(task.issued_at_ms, task.expires_at_ms, now)?;
-    require(
-        signed.issuer == intent.source_node_public_key
-            && task.version == AUTH_VERSION
-            && task.project == intent.project
-            && task.source_node_public_key == intent.source_node_public_key
-            && text(&task.task_id, 512)
-            && text(&task.conversation_id, 512)
-            && text(&task.author, 512)
-            && task.sequence > 0
-            && task.issued_at_ms <= intent.issued_at_ms
-            && task.expires_at_ms >= intent.expires_at_ms,
-        "source sharing Task attestation changed its exact Project, host or validity",
-    )?;
-    Ok(task)
+fn intent_context(intent: &RemoteShareIntent, now: u64) -> Result<InvocationContext> {
+    match &intent.work {
+        RemoteShareWork::TaskSession {
+            task_creation: signed,
+            session_id,
+            executor_kind,
+            binding_generation,
+        } => {
+            let task = &signed.payload;
+            signed.verify_signature()?;
+            validity(task.issued_at_ms, task.expires_at_ms, now)?;
+            require(
+                signed.issuer == intent.source_node_public_key
+                    && task.version == AUTH_VERSION
+                    && task.project == intent.project
+                    && task.source_node_public_key == intent.source_node_public_key
+                    && text(&task.task_id, 512)
+                    && text(&task.conversation_id, 512)
+                    && text(&task.author, 512)
+                    && text(session_id, 512)
+                    && text(executor_kind, 128)
+                    && *binding_generation > 0
+                    && task.sequence > 0
+                    && task.issued_at_ms <= intent.issued_at_ms
+                    && task.expires_at_ms >= intent.expires_at_ms,
+                "source sharing Task attestation changed its exact Project, host or validity",
+            )?;
+            Ok(InvocationContext {
+                conversation: Some(task.conversation_id.clone()),
+                task: Some(task.task.clone()),
+                workspace_resource: Some(intent.project.resource.clone()),
+                ..Default::default()
+            })
+        }
+        RemoteShareWork::ConversationSession { source, .. }
+        | RemoteShareWork::Command { source } => {
+            use execution_work::{ConversationOpenIntent, ExecutionWorkIntent};
+            source.verify_signature()?;
+            let statement = &source.payload;
+            validity(statement.issued_at_ms, statement.expires_at_ms, now)?;
+            let target =
+                intent
+                    .target_public_key
+                    .as_ref()
+                    .ok_or(AuthorizationError::InvalidProof(
+                        "operation sharing has no selected executor",
+                    ))?;
+            let context = &statement.context;
+            let request = &statement.request;
+            require(
+                source.issuer == intent.source_node_public_key
+                    && statement.version == AUTH_VERSION
+                    && statement.project == intent.project
+                    && statement.source_node_public_key == intent.source_node_public_key
+                    && statement.issued_at_ms <= intent.issued_at_ms
+                    && statement.expires_at_ms >= intent.expires_at_ms
+                    && context.context.sdk_session.is_none()
+                    && context.context.workspace_resource.as_ref()
+                        == Some(&intent.project.resource)
+                    && request["space_id"].as_str() == Some(intent.project.space.as_str())
+                    && request["conversation_id"].as_str()
+                        == context.context.conversation.as_deref()
+                    && request.is_object()
+                    && request["operation_id"]
+                        .as_str()
+                        .is_some_and(valid_operation_id)
+                    && request["task_id"].is_null()
+                    && request["task_ref"].is_null()
+                    && request["binding"].is_null()
+                    && request["target_node"].as_str()
+                        == Some(
+                            node_fingerprint(target.as_str())
+                                .map_err(|_| {
+                                    AuthorizationError::InvalidProof("invalid shared executor key")
+                                })?
+                                .as_str(),
+                        ),
+                "operation sharing changed its source, request, target or validity",
+            )?;
+            statement.work.validate_context(context, target)?;
+            match (&intent.work, &statement.work) {
+                (
+                    RemoteShareWork::Command { .. },
+                    ExecutionWorkIntent::Command {
+                        request_hash,
+                        canonical_cwd,
+                    },
+                ) => {
+                    require(
+                        *request_hash == ObjectHash::body(request)?
+                            && request["session_id"].is_null()
+                            && request["expected_revision"].as_u64() == Some(0)
+                            && request["action"]["type"] == "command"
+                            && request["action"]["command"]
+                                .as_str()
+                                .is_some_and(|command| text(command, MAX_PROOF_BYTES))
+                            && request["action"]["timeout_secs"]
+                                .as_u64()
+                                .is_some_and(|seconds| seconds > 0)
+                            && request["action"]["cwd"].as_str() == Some(canonical_cwd.as_str()),
+                        "command sharing changed its complete request or claimed a session",
+                    )?;
+                }
+                (
+                    RemoteShareWork::ConversationSession { open: evidence, .. },
+                    ExecutionWorkIntent::ConversationSession {
+                        execution_session,
+                        executor,
+                        canonical_cwd,
+                        open,
+                        ..
+                    },
+                ) => {
+                    require(
+                        request["session_id"].as_str()
+                            == Some(execution_session.session_id.as_str()),
+                        "conversation sharing changed its execution session",
+                    )?;
+                    match open {
+                        ConversationOpenIntent::Opening { operation_id } => require(
+                            request["action"]["type"] == "open"
+                                && request["operation_id"].as_str() == Some(operation_id.as_str())
+                                && request["action"]["executor"].as_str()
+                                    == Some(executor.as_str())
+                                && request["action"]["cwd"].as_str()
+                                    == Some(canonical_cwd.as_str())
+                                && request["expected_revision"].as_u64() == Some(0)
+                                && matches!(evidence, ConversationOpenEvidence::Opening),
+                            "conversation sharing changed its original Open",
+                        )?,
+                        ConversationOpenIntent::Existing { open } => {
+                            let ConversationOpenEvidence::Accepted { open: accepted } = evidence
+                            else {
+                                return Err(AuthorizationError::InvalidProof(
+                                    "conversation sharing has no accepted Open",
+                                ));
+                            };
+                            execution_handoff::verify_execution_handoff_receipt_signature(
+                                &accepted.handoff,
+                                &accepted.receipt,
+                                &accepted.result,
+                            )?;
+                            let original = accepted.handoff.handoff.source_statement()?;
+                            require(
+                                matches!(
+                                    &accepted.handoff.handoff.origin,
+                                    execution_handoff::ExecutionOrigin::ConversationOpen
+                                ) && original.project == intent.project
+                                    && original.operation_id == open.operation_id
+                                    && original.original_invocation_hash == open.invocation_hash
+                                    && original.original_admission_hash == open.admission_hash
+                                    && original.work.intent() == statement.work
+                                    && accepted.handoff.handoff.target_public_key == *target
+                                    && request["action"]["type"] != "open",
+                                "conversation sharing changed its accepted Open or executor",
+                            )?;
+                        }
+                    }
+                }
+                _ => {
+                    return Err(AuthorizationError::InvalidProof(
+                        "sharing work has another type",
+                    ));
+                }
+            }
+            Ok(InvocationContext {
+                conversation: context.context.conversation.clone(),
+                workspace_resource: Some(intent.project.resource.clone()),
+                ..Default::default()
+            })
+        }
+    }
 }
 fn intent_facts(intent: &RemoteShareIntent, now: u64) -> Result<RequestFacts> {
-    let task = intent_task(intent, now)?;
     Ok(RequestFacts {
         resource: intent.project.clone(),
         action: Action::ConversationRead,
@@ -208,21 +479,11 @@ fn intent_facts(intent: &RemoteShareIntent, now: u64) -> Result<RequestFacts> {
         },
         operation_id: intent.nonce.to_string(),
         body_hash: ObjectHash::body(intent)?,
-        context: InvocationContext {
-            conversation: Some(task.conversation_id.clone()),
-            task: Some(task.task.clone()),
-            workspace_resource: Some(intent.project.resource.clone()),
-            ..Default::default()
-        },
+        context: intent_context(intent, now)?,
     })
 }
 
-fn old_tuple(
-    intent: &RemoteShareIntent,
-    task: &RemoteShareTaskAttestation,
-    usage: &mut ExecutionProofUsage,
-    now: u64,
-) -> Result<()> {
+fn old_tuple(intent: &RemoteShareIntent, usage: &mut ExecutionProofUsage, now: u64) -> Result<()> {
     if intent.purpose == RemoteSharePurpose::Execution {
         require(
             intent.old_binding.is_none() && intent.old_execution_receipt.is_none(),
@@ -234,6 +495,59 @@ fn old_tuple(
         )?;
         return Ok(());
     }
+    let RemoteShareWork::TaskSession {
+        task_creation,
+        session_id,
+        executor_kind,
+        binding_generation,
+    } = &intent.work
+    else {
+        require(
+            intent.purpose != RemoteSharePurpose::Rebind && intent.old_binding.is_none(),
+            "only Task sharing can rebind or carry a Task binding",
+        )?;
+        let receipt =
+            intent
+                .old_execution_receipt
+                .as_ref()
+                .ok_or(AuthorizationError::InvalidProof(
+                    "resolution sharing has no original executor receipt",
+                ))?;
+        let target = intent
+            .target_public_key
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "resolution sharing has no executor pin",
+            ))?;
+        let resource =
+            intent
+                .execution_resource
+                .as_ref()
+                .ok_or(AuthorizationError::InvalidProof(
+                    "resolution sharing has no execution service",
+                ))?;
+        let source = intent
+            .work
+            .operation_source()
+            .ok_or(AuthorizationError::InvalidProof(
+                "resolution sharing has no operation source",
+            ))?;
+        receipt.verify_signature()?;
+        source.payload.work.matches_work(&receipt.payload.work)?;
+        require(
+            receipt.issuer == *target
+                && receipt.payload.original_space_id == intent.project.space
+                && receipt.payload.execution_space_id == resource.space
+                && receipt.payload.issued_at_ms <= now
+                && source.payload.request["operation_id"].as_str()
+                    == Some(receipt.payload.operation_id.as_str())
+                && receipt.payload.target == DeviceId::from_key(target),
+            "resolution sharing changed its original execution receipt",
+        )?;
+        usage.record_signed(receipt)?;
+        return Ok(());
+    };
+    let task = &task_creation.payload;
     let binding = intent
         .old_binding
         .as_ref()
@@ -275,31 +589,39 @@ fn old_tuple(
             && receipt.payload.original_space_id == intent.project.space
             && receipt.payload.execution_space_id == execution.space
             && receipt.payload.target == DeviceId::from_key(target)
-            && receipt.payload.session_id == intent.session_id
-            && receipt.payload.binding_generation == binding.binding.generation
+            && receipt
+                .payload
+                .work
+                .execution_session()
+                .is_some_and(|session| session.session_id == *session_id)
+            && receipt.payload.work.binding_generation() == Some(*binding_generation)
+            && *binding_generation == binding.binding.generation
             && receipt.payload.issued_at_ms <= now
             && snapshot.expires_at_ms > receipt.payload.issued_at_ms
             && snapshot.expires_at_ms - receipt.payload.issued_at_ms <= EXECUTION_LEASE_MS
+            && snapshot.work == receipt.payload.work
             && snapshot.original_project == intent.project
             && snapshot.execution_resource == *execution
-            && snapshot.task == task.task
-            && snapshot.binding_hash
-                == task_binding::binding_hash(&binding.binding)
-                    .map_err(|_| AuthorizationError::InvalidProof("invalid old binding"))?
-            && snapshot.binding_generation == binding.binding.generation
+            && snapshot.work.task_ref() == Some(&task.task)
+            && snapshot.work.binding_hash()
+                == Some(
+                    task_binding::binding_hash(&binding.binding)
+                        .map_err(|_| AuthorizationError::InvalidProof("invalid old binding"))?
+                        .as_str(),
+                )
+            && snapshot.work.binding_generation() == Some(binding.binding.generation)
             && snapshot.target == receipt.payload.target
-            && snapshot.session_id == intent.session_id
-            && snapshot.executor == intent.executor_kind
+            && snapshot.session_id == *session_id
+            && snapshot.executor == *executor_kind
             && binding.binding.network_id == intent.project.space.as_str()
             && binding.binding.conversation_id == task.conversation_id
             && binding.binding.task_ref == task.task.as_str()
             && binding.binding.task_id == task.task_id
-            && binding.binding.session_id == intent.session_id
+            && binding.binding.session_id == *session_id
             && binding.binding.target_node
                 == node_fingerprint(target.as_str())
                     .map_err(|_| AuthorizationError::InvalidProof("invalid old executor pin"))?
-            && binding.binding.open_spec["executor"].as_str()
-                == Some(intent.executor_kind.as_str())
+            && binding.binding.open_spec["executor"].as_str() == Some(executor_kind.as_str())
             && binding.binding.open_spec["cwd"].as_str() == Some(snapshot.cwd.as_str()),
         "source sharing changed the exact old executor, binding or Task",
     )?;
@@ -352,11 +674,9 @@ fn verify_intent(
     let intent = &signed.intent;
     let invocation = &signed.invocation.payload;
     validity(intent.issued_at_ms, intent.expires_at_ms, now)?;
-    let task = intent_task(intent, now)?;
+    intent_context(intent, now)?;
     require(
         intent.version == AUTH_VERSION
-            && text(&intent.session_id, 512)
-            && text(&intent.executor_kind, 128)
             && matches!(&invocation.actor,Actor::Account(account) if account==&intent.requester)
             && invocation.initiator == invocation.actor
             && invocation.initiating_grant.is_none()
@@ -398,8 +718,23 @@ fn verify_intent(
     let mut usage = ExecutionProofUsage::default();
     usage.record_authorization(&auth)?;
     usage.record_metadata(intent)?;
-    usage.record_signed(&intent.task_creation)?;
-    old_tuple(intent, &task, &mut usage, now)?;
+    match &intent.work {
+        RemoteShareWork::TaskSession { task_creation, .. } => usage.record_signed(task_creation)?,
+        RemoteShareWork::ConversationSession { source, .. }
+        | RemoteShareWork::Command { source } => {
+            usage.record_signed(source)?;
+            if let RemoteShareWork::ConversationSession {
+                open: ConversationOpenEvidence::Accepted { open: accepted },
+                ..
+            } = &intent.work
+            {
+                let verified =
+                    state.verify_project_execution_source(&accepted.handoff.handoff, now)?;
+                usage.merge(verified.proof_usage());
+            }
+        }
+    }
+    old_tuple(intent, &mut usage, now)?;
     usage_finish(&mut usage)?;
     Ok(usage)
 }
@@ -853,17 +1188,43 @@ impl VerifiedRemoteShareRequest {
     #[cfg_attr(target_arch="wasm32",wasm_bindgen::prelude::wasm_bindgen(js_name=summaryJson))]
     pub fn summary_json(&self) -> crate::Result<String> {
         let intent = &self.original.intent;
-        let task = intent_task(intent, self.header.payload.issued_at_ms)
+        let context = intent_context(intent, self.header.payload.issued_at_ms)
             .map_err(|error| error.to_string())?;
-        encode(
-            &serde_json::json!({"purpose":intent.purpose,"requesterAccountId":intent.requester,
+        let (task_id, session_id, executor, request) = match &intent.work {
+            RemoteShareWork::TaskSession {
+                task_creation,
+                session_id,
+                executor_kind,
+                ..
+            } => (
+                Some(task_creation.payload.task_id.as_str()),
+                Some(session_id.as_str()),
+                Some(executor_kind.as_str()),
+                None,
+            ),
+            RemoteShareWork::ConversationSession { source, .. }
+            | RemoteShareWork::Command { source } => (
+                None,
+                source
+                    .payload
+                    .context
+                    .context
+                    .execution_session
+                    .as_ref()
+                    .map(|s| s.session_id.as_str()),
+                source.payload.context.context.executor_kind.as_deref(),
+                Some(&source.payload.request),
+            ),
+        };
+        encode(&serde_json::json!({
+            "purpose":intent.purpose,"requesterAccountId":intent.requester,
             "requesterDevice":intent.requester_device,"project":intent.project,
-            "taskRef":task.task,"taskId":task.task_id,
-            "conversationId":task.conversation_id,"sessionId":intent.session_id,
-            "executorKind":intent.executor_kind,"executionResource":intent.execution_resource,
+            "work":intent.work,"taskRef":context.task,"taskId":task_id,
+            "conversationId":context.conversation,"sessionId":session_id,
+            "executorKind":executor,"request":request,"executionResource":intent.execution_resource,
             "targetPublicKey":intent.target_public_key,"intentHash":self.original.hash().map_err(|error|error.to_string())?,
-            "expiresAtMs":intent.expires_at_ms}),
-        )
+            "expiresAtMs":intent.expires_at_ms,
+        }))
     }
     #[cfg_attr(target_arch="wasm32",wasm_bindgen::prelude::wasm_bindgen(js_name=proofUsageJson))]
     pub fn proof_usage_json(&self) -> crate::Result<String> {

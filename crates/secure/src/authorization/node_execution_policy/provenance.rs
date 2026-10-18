@@ -900,6 +900,11 @@ mod tests {
                 NodeExecutionPolicyReadIntent {
                     version: AUTH_VERSION,
                     source_project: resource.clone(),
+                    work: ExecutionWorkIntent::TaskSession {
+                        task: read_context.task.clone().unwrap(),
+                        binding_generation: 1,
+                        execution_session: read_context.execution_session.clone().unwrap(),
+                    },
                     selection: RemoteExecutionPolicySelection {
                         execution_resource: resource,
                         target_public_key: target.clone(),

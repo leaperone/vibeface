@@ -18,7 +18,15 @@ use vibeface_secure::authorization::{
     ServiceId, SessionRef, SpaceId, VerifiedAuthorization, VerifiedPolicySet,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentOriginKind {
+    User,
+    TaskContinue { version: u64 },
+    ReportOnly { version: u64 },
+}
+
 pub(crate) struct AgentOrigin {
+    pub kind: AgentOriginKind,
     pub parent: VerifiedAuthorization,
     pub task: Option<(String, EventRef)>,
     pub execution: Option<OperationRequest>,
@@ -125,6 +133,7 @@ pub(crate) fn resolve_agent_origin(
             "agent message has no account authority"
         );
         return Ok(AgentOrigin {
+            kind: AgentOriginKind::User,
             parent,
             task: None,
             execution: None,
@@ -132,14 +141,14 @@ pub(crate) fn resolve_agent_origin(
     }
     let EventBody::ExecutionObserved {
         operation_id,
-        task_id: Some(task_id),
+        task_id,
         target_node,
         session_id,
         status,
         ..
     } = &event.body
     else {
-        anyhow::bail!("agent trigger is neither an account message nor a task execution result");
+        anyhow::bail!("agent trigger is neither an account message nor an execution result");
     };
     ensure!(
         matches!(status.as_str(), "succeeded" | "failed" | "rejected"),
@@ -162,19 +171,26 @@ pub(crate) fn resolve_agent_origin(
         serde_json::from_value(admission.source_body["request"].clone())?;
     ensure!(
         matches!(admission.invocation.payload.actor, Actor::Service(_))
-            && request.action["type"] == "send"
             && request.operation_id == *operation_id
-            && request.task_id.as_ref() == Some(task_id)
+            && request.task_id.as_ref() == task_id.as_ref()
             && request.target_node == *target_node
             && request.session_id == *session_id
             && dispatch.event.scope_id == event.scope_id
             && dispatch.event.resource_id == event.resource_id,
-        "continuation result differs from its service-dispatched task"
+        "continuation result differs from its service dispatch"
     );
     let authorized = event_authorization_in_view(policy, connection, state, event, events, now_ms)?;
     ensure!(
-        authorized.action() == Action::ExecutionSend,
-        "continuation has no execution-send authority"
+        matches!(
+            authorized.action(),
+            Action::ExecutionOpen
+                | Action::ExecutionSend
+                | Action::ExecutionCommand
+                | Action::ExecutionSteer
+                | Action::ExecutionInterrupt
+                | Action::ExecutionRespondApproval
+        ),
+        "continuation has no execution authority"
     );
     let causal = closure_hashes(events, &[trigger.to_owned()]);
     let closure = closure_hashes(events, basis_heads);
@@ -211,72 +227,71 @@ pub(crate) fn resolve_agent_origin(
     let parent =
         event_authorization_in_view(policy, connection, state, &message.event, events, now_ms)?;
     ensure!(
-        verify_event_envelope(connection, policy, &event.network_id, &message.envelope)? == message.event,
+        verify_event_envelope(connection, policy, &event.network_id, &message.envelope)?
+            == message.event,
         "continuation account message differs from its signed envelope"
     );
     ensure!(
         parent.actor() == authorized.initiator() && parent.resource() == authorized.resource(),
         "continuation changed its initiating account or project"
     );
-    let binding = request
-        .binding
-        .as_ref()
-        .context("continuation has no confirmed task binding")?;
-    let creation = events
-        .get(&binding.binding.task_ref)
-        .context("continuation task creation is missing")?;
-    let EventBody::TaskCreated {
-        task_id: created_task,
-        title,
-        goal,
-        acceptance,
-    } = &creation.event.body
-    else {
-        anyhow::bail!("continuation binding does not identify a task creation");
+    let scheduler = admission.invocation.issuer.clone();
+    let scheduler = crate::crypto::fingerprint(scheduler.as_str())?;
+    let followup = crate::store::followup::validate_followup_result_in_view(
+        connection,
+        policy,
+        state,
+        events,
+        &event.network_id,
+        &event.scope_id,
+        trigger,
+        &scheduler,
+        basis_heads,
+        now_ms,
+    )?;
+    ensure!(
+        followup
+            .proof_heads
+            .iter()
+            .all(|head| closure.contains(head)),
+        "agent snapshot omits its exact follow-up authority"
+    );
+    let task = if let Some(task_id) = task_id {
+        let binding = request
+            .binding
+            .as_ref()
+            .context("task continuation has no binding")?;
+        let creation = events
+            .get(&binding.binding.task_ref)
+            .context("task creation is missing")?;
+        ensure!(
+            matches!(&creation.event.body, EventBody::TaskCreated { task_id: created, .. } if created == task_id)
+                && causal.contains(&creation.envelope.hash),
+            "continuation task is not causal to its result"
+        );
+        Some((task_id.clone(), EventRef::parse(&creation.envelope.hash)?))
+    } else {
+        None
     };
-    ensure!(
-        created_task == task_id && causal.contains(&creation.envelope.hash),
-        "continuation task is not causal to its result"
-    );
-    ensure!(!closure.iter().any(|hash| matches!(&events[hash].event.body,
-        EventBody::TaskChanged { task_id: changed, status, .. } if changed == task_id && matches!(status.as_str(), "accepted" | "cancelled"))),
-        "continuation task was finalized in its snapshot");
-    let mut permission = false;
-    for hash in &closure {
-        let decision = &events[hash].event;
-        let EventCause::Invocation { admission } = &decision.cause else {
-            continue;
-        };
-        let body = &admission.source_body;
-        if body["method"] != "create_task"
-            || body["auto_followup"] != true
-            || body["task_id"] != *task_id
-            || body["title"] != *title
-            || body["goal"] != *goal
-            || body["acceptance"] != *acceptance
-            || !matches!(&decision.body, EventBody::DecisionRecorded { decision_id, effective_constraints, tool_configuration, .. }
-                if decision_id == &format!("auto:{task_id}") && effective_constraints.contains(&format!("auto_followup:{task_id}")) && tool_configuration["auto_followup"] == *task_id)
-        {
-            continue;
+    let kind = match followup.mode {
+        crate::store::followup::FollowupMode::Continue => {
+            ensure!(
+                task.is_some(),
+                "ordinary results cannot continue task execution"
+            );
+            AgentOriginKind::TaskContinue {
+                version: followup.version,
+            }
         }
-        if verify_event_envelope(connection, policy, &event.network_id, &events[hash].envelope)
-            .is_ok_and(|verified| verified == *decision)
-            && event_authorization_in_view(policy, connection, state, decision, events, now_ms)
-                .is_ok_and(|grant| {
-                    matches!(grant.actor(), Actor::Account(_)) && grant.actor() == parent.actor()
-                })
-        {
-            permission = true;
-            break;
-        }
-    }
-    ensure!(
-        permission,
-        "continuation has no current account authorization for this task"
-    );
+        crate::store::followup::FollowupMode::Report => AgentOriginKind::ReportOnly {
+            version: followup.version,
+        },
+        crate::store::followup::FollowupMode::Off => anyhow::bail!("follow-up is disabled"),
+    };
     Ok(AgentOrigin {
+        kind,
         parent,
-        task: Some((task_id.clone(), EventRef::parse(&creation.envelope.hash)?)),
+        task,
         execution: Some(request),
     })
 }
@@ -773,8 +788,8 @@ mod tests {
                 connection: fixture.connection,
                 policy: fixture.policy,
                 target_recovery_import: None,
-            account_node_enrollment_import: None,
-            foreign_execution_policy: Default::default(),
+                account_node_enrollment_import: None,
+                foreign_execution_policy: Default::default(),
             };
             store.append_authorized_event(
                 &fixture.node,

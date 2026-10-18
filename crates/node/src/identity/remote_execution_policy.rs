@@ -12,6 +12,7 @@ use vibeface_secure::{
         AUTH_VERSION, Action, DeviceId, JournalEntry, MAX_PROOF_BYTES, Nonce, ObjectHash,
         PolicyDomain, PolicyPin, PolicyStamp, PublicKey, Signed,
         execution_handoff::ExecutionProofUsage,
+        execution_work::ExecutionWorkIntent,
         node_execution_policy::{
             NodeExecutionPolicyReadRequest, VerifiedNodeExecutionPolicyRead,
             verify_node_execution_policy_read,
@@ -262,9 +263,14 @@ pub(super) fn checked_source_task_binding_in(
     usage: &mut ExecutionProofUsage,
 ) -> Result<Option<crate::binding::SignedBinding>> {
     let value = &intent.payload;
+    let ExecutionWorkIntent::TaskSession { task, .. } = &value.work else {
+        anyhow::bail!("Task binding read requires TaskSession work");
+    };
+    value
+        .work
+        .validate_context(&value.context, &value.selection.target_public_key)?;
     let project = &value.source_selection.resource;
     let context = &value.context.context;
-    let task = context.task.as_ref().context("policy read has no Task")?;
     let creation: Option<(String, String, String, String, u64)> = connection
         .query_row(
             "SELECT envelope,resource_id,scope_id,author,sequence FROM events WHERE space_id=? AND hash=? AND status='ready' AND length(CAST(envelope AS BLOB))<=?",
@@ -329,11 +335,14 @@ pub(super) fn check_source_task(
     usage: &mut ExecutionProofUsage,
 ) -> Result<()> {
     let value = &intent.payload;
+    let ExecutionWorkIntent::TaskSession {
+        execution_session: session,
+        ..
+    } = &value.work
+    else {
+        anyhow::bail!("Task policy read requires TaskSession work");
+    };
     let context = &value.context.context;
-    let session = context
-        .execution_session
-        .as_ref()
-        .context("policy read has no execution session")?;
     let Some(binding) = checked_source_task_binding_in(connection, intent, local, usage)? else {
         ensure!(
             value.expected_action == Action::ExecutionOpen
@@ -654,8 +663,23 @@ impl Store {
                     &tx, identity, reference,
                 )?,
             );
+            ensure!(
+                intent.payload.work == reference.source.payload.work.intent(),
+                "history policy read changed its verified original work"
+            );
         } else {
-            check_source_task(&tx, &intent, &local, &mut usage)?;
+            match &intent.payload.work {
+                ExecutionWorkIntent::TaskSession { .. } => {
+                    check_source_task(&tx, &intent, &local, &mut usage)?;
+                }
+                ExecutionWorkIntent::ConversationSession { .. }
+                | ExecutionWorkIntent::Command { .. } => {
+                    intent.payload.work.validate_context(
+                        &intent.payload.context,
+                        &intent.payload.selection.target_public_key,
+                    )?;
+                }
+            }
         }
         let key = delegation_key(&intent);
         if let Some(encoded) = metadata(&tx, &key)? {
@@ -669,9 +693,7 @@ impl Store {
                     && value.source_node_public_key == local
                     && value.source_device_public_key == intent.issuer
                     && value.source_project == intent.payload.source_selection.resource
-                    && Some(&value.task_ref) == intent.payload.context.context.task.as_ref()
-                    && Some(&value.execution_session)
-                        == intent.payload.context.context.execution_session.as_ref()
+                    && value.work == intent.payload.work
                     && intent.payload.issued_at_ms <= value.issued_at_ms
                     && value.issued_at_ms <= now
                     && value.expires_at_ms == intent.payload.expires_at_ms,
@@ -1111,6 +1133,14 @@ mod tests {
         )?;
         let target = PublicKey::parse(&fixture.executor.node.public_key_hex()?)?;
         let input = json!({
+            "work":ExecutionWorkIntent::TaskSession {
+                task:EventRef::parse(&fixture.task.hash)?,
+                binding_generation:1,
+                execution_session:SessionRef {
+                    target:DeviceId::from_key(&target),
+                    session_id:"remote-session".into(),
+                },
+            },
             "selection":{
                 "execution_resource":fixture.execution,
                 "target_public_key":target,
@@ -1179,6 +1209,7 @@ mod tests {
                 source_project: original.payload.source_selection.resource.clone(),
                 selection: original.payload.selection.clone(),
                 context: original.payload.context.clone(),
+                work: original.payload.work.clone(),
                 expected_action: original.payload.expected_action,
                 purpose: original.payload.purpose,
                 source_provenance: None,
@@ -1421,6 +1452,14 @@ mod tests {
             execution_target_public_key: Some(target_key.clone()),
         };
         let policy_input = json!({
+            "work":ExecutionWorkIntent::TaskSession {
+                task:EventRef::parse(&fixture.task.hash)?,
+                binding_generation:1,
+                execution_session:SessionRef {
+                    target:DeviceId::from_key(&target_key),
+                    session_id:"remote-session".into(),
+                },
+            },
             "selection":{
                 "execution_resource":fixture.execution,
                 "target_public_key":target_key,
@@ -2000,7 +2039,7 @@ mod tests {
             conversation_id: "foreign-conversation".into(),
             task_id: Some("foreign-task".into()),
             target_node: fixture.executor.node.node_id()?,
-            session_id: "foreign-session".into(),
+            session_id: Some("foreign-session".into()),
             expected_revision: 0,
             basis_heads: vec![binding.binding.task_ref.clone()],
             action: binding.binding.open_spec.clone(),
@@ -2010,6 +2049,7 @@ mod tests {
                     .context("history binding cwd is missing")?
                     .into(),
             ],
+            manager_authority: None,
             binding: Some(binding.clone()),
         };
         let body = json!({
@@ -2176,6 +2216,7 @@ mod tests {
                 &json!({
                     "selection":intent.payload.selection,
                     "context":current_context,
+                    "work":intent.payload.work,
                     "expected_action":Action::ExecutionOpen,
                     "purpose":RemoteExecutionPolicyPurpose::Execution,
                     "execution_pins":pins,
@@ -2697,6 +2738,13 @@ mod tests {
             .unwrap()
             .session_id
             .push_str("-other");
+        let ExecutionWorkIntent::TaskSession {
+            execution_session, ..
+        } = &mut changed.work
+        else {
+            anyhow::bail!("fixture has no TaskSession work");
+        };
+        execution_session.session_id.push_str("-other");
         let changed = Signed::sign(changed, &fixture.project.client)?;
         assert!(delegate(&mut fixture, &changed).is_err());
         Ok(())
@@ -2743,6 +2791,13 @@ mod tests {
         let original = delegate(&mut fixture, &intent)?;
         let mut changed = intent.payload.clone();
         changed.context.binding_generation = Some(2);
+        let ExecutionWorkIntent::TaskSession {
+            binding_generation, ..
+        } = &mut changed.work
+        else {
+            anyhow::bail!("fixture has no TaskSession work");
+        };
+        *binding_generation = 2;
         let changed = Signed::sign(changed, &fixture.project.client)?;
         assert!(delegate(&mut fixture, &changed).is_err());
         let mut changed = intent.payload.clone();

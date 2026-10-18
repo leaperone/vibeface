@@ -1523,6 +1523,39 @@ mod tests {
         assert!(canonical(&fixture.original.bundle).unwrap().len() > MAX_PROOF_BYTES);
         let (input, approval, source_approval, mut pending) = fixture.commit();
         assert!(canonical(&input).unwrap().len() <= MAX_PROOF_BYTES);
+        let mut old_template = input.journal_delta.clone();
+        let owner = old_template
+            .iter_mut()
+            .find_map(|entry| match entry {
+                JournalEntry::Grant(grant) if grant.payload.parent.is_none() => Some(grant),
+                _ => None,
+            })
+            .unwrap();
+        assert!(owner.payload.actions.contains(&Action::TaskFollowup));
+        let mut payload = owner.payload.clone();
+        payload
+            .actions
+            .retain(|action| *action != Action::TaskFollowup);
+        *owner = Signed::sign(payload, &key(51)).unwrap();
+        assert_eq!(
+            cross_node::verify_delta_shape_in_state(
+                &input.possession.request.payload,
+                &input.possession.node_request,
+                &fixture.original.authorization.policy_snapshot,
+                &old_template,
+            ),
+            Err(AuthorizationError::InvalidProof(
+                "recovery changed its target owner grant"
+            ))
+        );
+        assert!(input.journal_delta.iter().all(|entry| match entry {
+            JournalEntry::Grant(grant)
+                if matches!(grant.payload.grantee, Grantee::Actor(Actor::Service(_))) =>
+            {
+                !grant.payload.actions.contains(&Action::TaskFollowup)
+            }
+            _ => true,
+        }));
         let committed = fixture.accept(&input, &source_approval);
         assert!(canonical(&committed).unwrap().len() <= MAX_PROOF_BYTES);
         assert!(

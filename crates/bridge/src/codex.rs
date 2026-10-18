@@ -2,7 +2,7 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt, io,
     path::PathBuf,
     pin::Pin,
@@ -13,7 +13,7 @@ use std::{
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
-    sync::{RwLock, mpsc, oneshot},
+    sync::{RwLock, mpsc, oneshot, watch},
     time::{Instant, timeout},
 };
 use tokio_tungstenite::{client_async, tungstenite::Message};
@@ -47,14 +47,26 @@ fn rejected(message: impl Into<String>) -> CodexError {
 pub struct CodexClient {
     commands: mpsc::UnboundedSender<Execute>,
     cache: Arc<RwLock<Cache>>,
+    observed_threads: watch::Sender<BTreeSet<String>>,
 }
 
 impl CodexClient {
     pub fn start(socket: PathBuf, events: mpsc::UnboundedSender<Value>) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
         let cache = Arc::new(RwLock::new(Cache::default()));
-        tokio::spawn(connection_loop(socket, receiver, cache.clone(), events));
-        Self { commands, cache }
+        let (observed_threads, observed) = watch::channel(BTreeSet::new());
+        tokio::spawn(connection_loop(
+            socket,
+            receiver,
+            observed,
+            cache.clone(),
+            events,
+        ));
+        Self {
+            commands,
+            cache,
+            observed_threads,
+        }
     }
 
     pub fn start_process(
@@ -63,8 +75,19 @@ impl CodexClient {
     ) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
         let cache = Arc::new(RwLock::new(Cache::default()));
-        tokio::spawn(process_session(command, receiver, cache.clone(), events));
-        Self { commands, cache }
+        let (observed_threads, observed) = watch::channel(BTreeSet::new());
+        tokio::spawn(process_session(
+            command,
+            receiver,
+            observed,
+            cache.clone(),
+            events,
+        ));
+        Self {
+            commands,
+            cache,
+            observed_threads,
+        }
     }
 
     pub async fn execute(&self, command: &Command) -> Result<Value, CodexError> {
@@ -89,6 +112,15 @@ impl CodexClient {
                 message: "Codex adapter stopped before returning a result".into(),
             })
         })
+    }
+
+    pub fn set_observed_threads(&self, threads: Vec<String>) -> Result<(), CodexError> {
+        for thread in &threads {
+            vibeface_protocol::validate_id(thread).map_err(rejected)?;
+        }
+        self.observed_threads
+            .send_replace(threads.into_iter().collect());
+        Ok(())
     }
 
     pub async fn snapshot(&self) -> Value {
@@ -330,7 +362,7 @@ fn wire_command(command: &Command) -> Option<(&'static str, Value)> {
 enum PendingKind {
     Initialize,
     Command(Execute),
-    ResumeForTurn(String),
+    SubscribeThread(String),
 }
 
 struct Pending {
@@ -347,6 +379,7 @@ struct Session {
     pending: HashMap<RpcId, Pending>,
     subscribed: HashSet<String>,
     resuming: HashMap<String, Vec<Execute>>,
+    retry_observation_at: HashMap<String, Instant>,
 }
 
 impl Session {
@@ -417,6 +450,38 @@ impl Session {
         )
     }
 
+    fn observe_threads(
+        &mut self,
+        writer: &mpsc::UnboundedSender<Write>,
+        threads: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        if !self.ready {
+            return Ok(());
+        }
+        self.retry_observation_at
+            .retain(|id, _| threads.contains(id));
+        for id in threads {
+            if self.subscribed.contains(id)
+                || self.resuming.contains_key(id)
+                || self
+                    .retry_observation_at
+                    .get(id)
+                    .is_some_and(|at| *at > Instant::now())
+            {
+                continue;
+            }
+            self.resuming.insert(id.clone(), Vec::new());
+            self.request(
+                writer,
+                "thread/resume",
+                json!({"threadId":id,"excludeTurns":true}),
+                PendingKind::SubscribeThread(id.clone()),
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
     fn fail(&mut self, pending: Pending, reason: &str, uncertain: bool) {
         match pending.kind {
             PendingKind::Command(execute) => {
@@ -425,7 +490,9 @@ impl Session {
                     message: reason.into(),
                 }));
             }
-            PendingKind::ResumeForTurn(thread) => {
+            PendingKind::SubscribeThread(thread) => {
+                self.retry_observation_at
+                    .insert(thread.clone(), Instant::now() + Duration::from_secs(5));
                 if let Some(waiters) = self.resuming.remove(&thread) {
                     for execute in waiters {
                         let _ = execute.reply.send(Err(rejected(format!(
@@ -450,6 +517,7 @@ impl Session {
 async fn connection_loop(
     socket: PathBuf,
     mut commands: mpsc::UnboundedReceiver<Execute>,
+    observed: watch::Receiver<BTreeSet<String>>,
     cache: Arc<RwLock<Cache>>,
     events: mpsc::UnboundedSender<Value>,
 ) {
@@ -478,7 +546,8 @@ async fn connection_loop(
         let reason = match result {
             Ok(stream) => {
                 let (sink, reader) = stream.split();
-                let reason = run_transport(sink, reader, &mut commands, &cache, &events).await;
+                let reason =
+                    run_transport(sink, reader, &mut commands, &observed, &cache, &events).await;
                 if cache.read().await.connection["state"] == "connected" {
                     backoff = 1;
                 }
@@ -506,6 +575,7 @@ async fn connection_loop(
 async fn process_session(
     mut command: tokio::process::Command,
     mut commands: mpsc::UnboundedReceiver<Execute>,
+    observed: watch::Receiver<BTreeSet<String>>,
     cache: Arc<RwLock<Cache>>,
     events: mpsc::UnboundedSender<Value>,
 ) {
@@ -543,7 +613,8 @@ async fn process_session(
                     )
                 },
             ));
-            let reason = run_transport(sink, reader, &mut commands, &cache, &events).await;
+            let reason =
+                run_transport(sink, reader, &mut commands, &observed, &cache, &events).await;
             let _ = child.kill().await;
             let _ = child.wait().await;
             reason
@@ -698,6 +769,7 @@ async fn run_transport<S, R, E>(
     sink: S,
     mut reader: R,
     commands: &mut mpsc::UnboundedReceiver<Execute>,
+    observed: &watch::Receiver<BTreeSet<String>>,
     cache: &Arc<RwLock<Cache>>,
     events: &mpsc::UnboundedSender<Value>,
 ) -> String
@@ -756,10 +828,10 @@ where
                 if let Command::StartTurn { thread_id, .. } = &execute.command
                     && !state.subscribed.contains(thread_id) {
                         let thread_id = thread_id.clone();
-                        let waiters = state.resuming.entry(thread_id.clone()).or_default();
-                        waiters.push(execute);
-                        if waiters.len() == 1
-                            && let Err(reason) = state.request(&writer, "thread/resume", json!({"threadId":thread_id,"excludeTurns":true}), PendingKind::ResumeForTurn(thread_id), false) {
+                        let subscribing = state.resuming.contains_key(&thread_id);
+                        state.resuming.entry(thread_id.clone()).or_default().push(execute);
+                        if !subscribing
+                            && let Err(reason) = state.request(&writer, "thread/resume", json!({"threadId":thread_id,"excludeTurns":true}), PendingKind::SubscribeThread(thread_id), false) {
                                 break reason;
                             }
                         continue;
@@ -807,9 +879,10 @@ where
                         cache.write().await.connection = json!({"state":"connected","user_agent":result["userAgent"],"at_ms":now_ms()});
                         let _ = events.send(json!({"method":"bridge.codex_connected","params":{"userAgent":result["userAgent"],"at_ms":now_ms()}}));
                     }
-                    PendingKind::ResumeForTurn(thread_id) => {
+                    PendingKind::SubscribeThread(thread_id) => {
                         cache.write().await.observe_thread(&result["thread"]);
                         state.subscribed.insert(thread_id.clone());
+                        state.retry_observation_at.remove(&thread_id);
                         for execute in state.resuming.remove(&thread_id).unwrap_or_default() {
                             if let Err(reason) = state.command(&writer, execute) { break 'session reason; }
                         }
@@ -823,6 +896,7 @@ where
                 }
             }
             _ = ticker.tick() => {
+                if let Err(reason) = state.observe_threads(&writer, &observed.borrow()) { break reason; }
                 let expired: Vec<_> = state.pending.iter().filter(|(_, pending)| pending.deadline <= Instant::now()).map(|(id, _)| id.clone()).collect();
                 let mut initialize_expired = false;
                 for id in expired {
@@ -1018,13 +1092,15 @@ mod tests {
             let (commands, mut receiver) = mpsc::unbounded_channel();
             let (events, mut received) = mpsc::unbounded_channel();
             let cache = Arc::new(RwLock::new(Cache::default()));
+            let (observed_threads, observed) = watch::channel(BTreeSet::new());
             let client = CodexClient {
                 commands,
                 cache: cache.clone(),
+                observed_threads,
             };
             let task = tokio::spawn(async move {
                 let (sink, reader) = websocket.split();
-                run_transport(sink, reader, &mut receiver, &cache, &events).await
+                run_transport(sink, reader, &mut receiver, &observed, &cache, &events).await
             });
             let mut server = server.unwrap();
             let initialize: Value =
@@ -1200,10 +1276,11 @@ printf '%s\n' '{"id":"vibeface-2","result":{"thread":{"id":"t","status":{"type":
             let (commands, mut receiver) = mpsc::unbounded_channel();
             let (events, mut received_events) = mpsc::unbounded_channel();
             let cache = Arc::new(RwLock::new(Cache::default()));
-            let client = CodexClient { commands, cache: cache.clone() };
+            let (observed_threads, observed) = watch::channel(BTreeSet::new());
+            let client = CodexClient { commands, cache: cache.clone(), observed_threads };
             let session = tokio::spawn(async move {
                 let (sink, reader) = websocket.split();
-                run_transport(sink, reader, &mut receiver, &cache, &events).await
+                run_transport(sink, reader, &mut receiver, &observed, &cache, &events).await
             });
             let mut server = server.unwrap();
             let initialize: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
@@ -1239,6 +1316,62 @@ printf '%s\n' '{"id":"vibeface-2","result":{"thread":{"id":"t","status":{"type":
             server.close(None).await.unwrap();
             assert_eq!(session.await.unwrap(), "Codex connection closed");
         }).await.expect("mock Codex session must finish");
+    }
+
+    #[tokio::test]
+    async fn known_threads_resubscribe_after_disconnect_without_replaying_a_turn() {
+        timeout(Duration::from_secs(8), async {
+            let socket = std::env::temp_dir().join(format!("vibeface-subscribe-{}-{}.sock", std::process::id(), now_ms()));
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let (events, mut received_events) = mpsc::unbounded_channel();
+            let client = CodexClient::start(socket.clone(), events);
+            client.set_observed_threads(vec!["known".into()]).unwrap();
+            let mut sent_turns = 0;
+            for connection in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let initialize: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(initialize["method"], "initialize");
+                server.send(Message::Text(json!({"id":initialize["id"],"result":{"userAgent":"test"}}).to_string().into())).await.unwrap();
+                let initialized: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(initialized["method"], "initialized");
+                let resume: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(resume["method"], "thread/resume");
+                assert_eq!(resume["params"], json!({"threadId":"known","excludeTurns":true}));
+                server.send(Message::Text(json!({"id":resume["id"],"result":{"thread":{"id":"known","status":{"type":"active"}}}}).to_string().into())).await.unwrap();
+                if connection == 0 {
+                    let sender = client.clone();
+                    let sending = tokio::spawn(async move {
+                        sender.execute(&Command::StartTurn { thread_id:"known".into(), text:"write once".into() }).await
+                    });
+                    let start: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                    assert_eq!(start["method"], "turn/start");
+                    sent_turns += 1;
+                    server.close(None).await.unwrap();
+                    assert!(sending.await.unwrap().unwrap_err().uncertain);
+                } else {
+                    let approval = json!({"id":42,"method":"item/commandExecution/requestApproval","params":{"threadId":"known"}});
+                    let completed = json!({"method":"turn/completed","params":{"threadId":"known","turn":{"id":"turn","status":"failed","error":{"message":"declined"},"items":[]}}});
+                    server.send(Message::Text(approval.to_string().into())).await.unwrap();
+                    server.send(Message::Text(completed.to_string().into())).await.unwrap();
+                    let mut recovered = Vec::new();
+                    while recovered.len() < 2 {
+                        let event = received_events.recv().await.unwrap();
+                        if event == approval || event == completed {
+                            recovered.push(event);
+                        }
+                    }
+                    assert_eq!(recovered, vec![approval, completed]);
+                    assert_eq!(client.snapshot().await["pending_requests"][0]["id"], 42);
+                    client.set_observed_threads(vec!["known".into(), "known".into()]).unwrap();
+                    assert!(timeout(Duration::from_millis(300), server.next()).await.is_err());
+                    server.close(None).await.unwrap();
+                }
+            }
+            assert_eq!(sent_turns, 1);
+            drop(client);
+            std::fs::remove_file(socket).unwrap();
+        }).await.expect("Codex reconnect must restore observation without replaying a mutation");
     }
 
     #[test]

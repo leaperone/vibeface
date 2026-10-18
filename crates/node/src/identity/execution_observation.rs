@@ -1,6 +1,7 @@
 use super::{
-    HandoffPolicy, StoredHandoff, lease_checkpoint_key, public_execution_result, session_from,
-    signed_receipt, stored_from, verify_local_handoff_checkpoint,
+    HandoffPolicy, StoredHandoff, check_session_work, lease_checkpoint_key,
+    public_execution_result, session_from, signed_receipt, stored_from,
+    verify_local_handoff_checkpoint,
 };
 use crate::{crypto::LocalIdentity, model::Event, store::Store};
 use anyhow::{Context, Result, ensure};
@@ -12,14 +13,16 @@ use vibeface_secure::{
         Signed, TransportEvidence, VerifiedPolicySet,
         events::StoredTransport,
         execution_handoff::{
-            ExecutionHandoffLeaseReceipt, ExecutionHandoffResult,
+            ExecutionHandoffLeaseReceipt, ExecutionHandoffResult, ExecutionProofUsage,
             verify_execution_handoff_admission_checkpoint,
             verify_execution_handoff_lease_checkpoint,
         },
         execution_observation::{
             ExecutionObservationChallenge, ExecutionObservationFreshness,
             ExecutionObservationTarget, SignedExecutionObservation,
+            VerifiedExecutionObservationRead,
         },
+        execution_work::ExecutionWork,
         task_business_policy::{TaskBusinessScopedView, TaskBusinessWire},
     },
     signature_verification::ScopedSignatureVerification,
@@ -132,25 +135,61 @@ fn check_local_checkpoint_in(connection: &Connection, stored: &StoredHandoff) ->
     );
     let dispatch: Event =
         serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
-    let (session, binding) = session_from(
+    let source = stored.wire.handoff.source_statement()?;
+    let session = session_from(
         connection,
         execution,
         original,
         dispatch.resource_id.as_str(),
         &stored.request.target_node,
-        &stored.request.session_id,
-    )?
-    .context("observed execution session disappeared")?;
+        stored.request.session_id.as_deref(),
+    )?;
+    let native = match session.as_ref() {
+        Some((session, binding, work)) => {
+            ensure!(
+                *work == source.work,
+                "observation changed its original work"
+            );
+            check_session_work(work, &stored.request, session, binding)?;
+            session.native_session_id.as_deref()
+        }
+        None => {
+            ensure!(
+                matches!(source.work, ExecutionWork::Command { .. }),
+                "observed execution session disappeared"
+            );
+            None
+        }
+    };
     ensure!(
-        stored.request.binding.as_ref() == Some(&binding),
-        "observation session binding differs from the accepted operation"
-    );
-    ensure!(
-        public_execution_result(stored.result.clone(), session.native_session_id.as_deref())
-            == stored.result,
+        public_execution_result(stored.result.clone(), native) == stored.result,
         "observed execution result contains private provider identifiers"
     );
     Ok(())
+}
+
+fn retained_observation_usage_in(
+    connection: &Connection,
+    read: &VerifiedExecutionObservationRead,
+    stored: &StoredHandoff,
+) -> Result<ExecutionProofUsage> {
+    check_local_checkpoint_in(connection, stored)?;
+    let checkpoint = verify_execution_handoff_admission_checkpoint(
+        &stored.wire,
+        &stored.admission_receipt,
+        &stored.admission,
+        &StoredTransport::from(&stored.transport),
+        stored.admitted_at_ms,
+    )?;
+    ensure!(
+        read.target() == &ExecutionObservationTarget::from_original(&stored.wire)?,
+        "observation differs from the complete locally retained execution"
+    );
+    let mut usage = read.proof_usage().clone();
+    usage.merge(checkpoint.proof_usage());
+    usage.record_signed(&stored.wire.invocation)?;
+    usage.record_historical_handoff(&stored.wire)?;
+    Ok(usage)
 }
 
 impl Store {
@@ -472,26 +511,8 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
-        check_local_checkpoint_in(&tx, &stored)?;
-        let checkpoint = verify_execution_handoff_admission_checkpoint(
-            &stored.wire,
-            &stored.admission_receipt,
-            &stored.admission,
-            &StoredTransport::from(&stored.transport),
-            stored.admitted_at_ms,
-        )?;
-        let full = policy.state(&self.policy).verify_execution_observation(
-            wire,
-            &stored.wire,
-            transport,
-            now_ms,
-        )?;
+        let mut usage = retained_observation_usage_in(&tx, &current_freshness, &stored)?;
         let receipt = signed_receipt(&tx, identity, &stored, now_ms)?;
-        let fresh = policy
-            .state(&self.policy)
-            .verify_execution_observation_freshness(&full, proof, now_ms)?;
-        let mut usage = fresh.proof_usage().clone();
-        usage.merge(checkpoint.proof_usage());
         if let Some((lease, verified_at, deadline)) = &stored.lease {
             let encoded: String = tx
                 .query_row(

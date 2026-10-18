@@ -24,6 +24,22 @@ pub(super) fn execution_operation_view(
     )? {
         value["execution_source"] = serde_json::to_value(wire.handoff.source_attestation)?;
     }
+    if let Some(dispatch) = store.operation_dispatch(
+        &operation.request.network_id,
+        &operation.request.operation_id,
+    )? {
+        if operation.request.target_node
+            == serde_json::from_str::<Event>(&dispatch.canonical_body)?.author
+        {
+            value["project_execution_origin"] =
+                json!(store.local_project_dispatch_origin(&dispatch)?);
+            value["project_dispatch"] = json!(dispatch);
+            value["project_execution_result"] = json!(store.local_project_execution_result(
+                &operation.request.network_id,
+                &operation.request.operation_id
+            )?);
+        }
+    }
     Ok(value)
 }
 
@@ -175,7 +191,10 @@ impl Runtime {
         now: u64,
     ) -> Result<RequestFacts> {
         if self.is_execution_resolution(body)? || self.is_execution_dispatch(body)? {
-            return Ok(store.execution_dispatch_facts_in_scope(authorization, body, audience, now)?.facts().clone());
+            return Ok(store
+                .execution_dispatch_facts_in_scope(authorization, body, audience, now)?
+                .facts()
+                .clone());
         }
         self.authorization_facts(store, body, audience, now)
     }
@@ -328,7 +347,10 @@ impl Runtime {
                     session,
                     &operation,
                     &target,
-                    &request.session_id,
+                    request
+                        .session_id
+                        .as_deref()
+                        .context("SDK operation requires a session")?,
                     request.task_id.as_deref(),
                 )?;
                 ensure!(
@@ -425,7 +447,7 @@ impl Runtime {
             request.network_id == session.space_id.as_str()
                 && request.conversation_id == session.conversation_id
                 && request.target_node == target
-                && request.session_id == execution_session
+                && request.session_id.as_deref() == Some(execution_session)
                 && original.invocation.payload.resource.space == session.space_id
                 && original.invocation.payload.resource.resource == session.resource_id
                 && original.invocation.payload.initiator == session.initiator
@@ -475,30 +497,47 @@ impl Runtime {
         );
         let store = self.store.lock().await;
         verification.run(|| -> Result<Value> {
-            if request.binding.is_none() {
-                let task = request
-                    .task_id
-                    .as_deref()
-                    .context("remote execution requires a task")?;
-                let creation =
-                    store.task_creation(&request.network_id, &request.conversation_id, task)?;
-                request.binding = Some(
-                    store
-                        .task_binding(&request.network_id, &creation.hash)?
-                        .context("confirm the remote task binding before operating")?,
+            if let Some(task) = request.task_id.as_deref() {
+                if request.binding.is_none() {
+                    let creation =
+                        store.task_creation(&request.network_id, &request.conversation_id, task)?;
+                    request.binding = Some(
+                        store
+                            .task_binding(&request.network_id, &creation.hash)?
+                            .context("confirm the remote task binding before operating")?,
+                    );
+                }
+                let binding = request
+                    .binding
+                    .as_ref()
+                    .context("remote Task binding is missing")?;
+                store.verify_historical_binding(binding)?;
+                if matches!(request.action["type"].as_str(), Some("open" | "send")) {
+                    request
+                        .resources
+                        .push(field(&binding.binding.open_spec, "cwd")?.to_owned());
+                }
+            } else {
+                ensure!(
+                    request.binding.is_none(),
+                    "ordinary remote execution cannot claim a Task binding"
                 );
+                if matches!(request.action["type"].as_str(), Some("open" | "command")) {
+                    let cwd = field(&request.action, "cwd")?;
+                    crate::identity::execution_dispatch::validate_remote_resource_path(cwd)?;
+                    request.resources.push(cwd.to_owned());
+                } else if request.action["type"] == "send" {
+                    let receipt: Signed<
+                        vibeface_secure::authorization::execution_handoff::ExecutionHandoffReceipt,
+                    > = serde_json::from_value(body["execution_session_receipt"].clone())?;
+                    let snapshot = receipt
+                        .payload
+                        .session
+                        .context("remote continuation requires its signed session snapshot")?;
+                    request.resources.push(snapshot.cwd);
+                }
             }
-            let binding = request
-                .binding
-                .as_ref()
-                .context("remote task binding is missing")?;
-            store.verify_historical_binding(binding)?;
             crate::store::validate_operation_binding_from(&store.connection, &request)?;
-            if matches!(request.action["type"].as_str(), Some("open" | "send")) {
-                request
-                    .resources
-                    .push(field(&binding.binding.open_spec, "cwd")?.to_owned());
-            }
             request.resources.sort();
             request.resources.dedup();
             body["request"] = serde_json::to_value(request)?;
@@ -1013,7 +1052,7 @@ impl Runtime {
                 .context("session has no authorized Project dispatch")?;
             ensure!(
                 operation.request.target_node == target
-                    && operation.request.session_id == session
+                    && operation.request.session_id.as_deref() == Some(session)
                     && access
                         .authorization
                         .signed_invocation()
@@ -1036,7 +1075,7 @@ impl Runtime {
         )
     }
 
-    async fn execution_dispatch_metadata(
+    pub(super) async fn execution_dispatch_metadata(
         &self,
         space: &str,
         operation_id: &str,

@@ -263,7 +263,11 @@ impl TaskBusinessOperationCheck {
         self.authorization.hash()
     }
 
-    pub fn binding(&self) -> &task_binding::SignedBinding {
+    pub fn work(&self) -> &ExecutionWork {
+        self.authorization.work()
+    }
+
+    pub fn binding(&self) -> Result<task_binding::SignedBinding> {
         self.authorization.binding()
     }
 
@@ -512,7 +516,11 @@ impl VerifiedTaskBusinessOperationCurrent {
         self.original.accepted_at_ms()
     }
 
-    pub fn binding(&self) -> &task_binding::SignedBinding {
+    pub fn work(&self) -> &ExecutionWork {
+        self.authorization.work()
+    }
+
+    pub fn binding(&self) -> Result<task_binding::SignedBinding> {
         self.authorization.binding()
     }
 
@@ -772,7 +780,13 @@ mod tests {
                     .is_err()
             );
             let mut changed = challenge.clone();
-            changed.binding_generation += 1;
+            let ExecutionWork::TaskSession {
+                binding_generation, ..
+            } = &mut changed.work
+            else {
+                panic!("fixture requires Task work");
+            };
+            *binding_generation += 1;
             assert!(
                 check
                     .sign_receipts(&fixture.executor, &changed, now)

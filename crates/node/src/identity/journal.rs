@@ -17,7 +17,8 @@ pub(crate) struct PolicyState {
     accepted: BTreeMap<ObjectHash, AcceptedEntry>,
     order: Vec<ObjectHash>,
     pub(crate) local_admissions: super::admission::AdmissionCheckpoints,
-    pub(crate) task_execution_policy: super::foreign_execution_policy::TaskExecutionPolicyProvenance,
+    pub(crate) task_execution_policy:
+        super::foreign_execution_policy::TaskExecutionPolicyProvenance,
     pub(crate) gateway_policy: super::gateway_forward::GatewayPolicyCache,
 }
 

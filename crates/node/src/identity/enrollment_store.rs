@@ -819,7 +819,9 @@ mod tests {
         store: &mut Store,
         at: u64,
     ) -> Result<vibeface_secure::authorization::VerifiedClientAuthorization> {
-        use vibeface_secure::authorization::{client_policy_import::AuthorizationSelection, ResourceRef};
+        use vibeface_secure::authorization::{
+            ResourceRef, client_policy_import::AuthorizationSelection,
+        };
         let audience = store
             .policy
             .verified()

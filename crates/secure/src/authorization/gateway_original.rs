@@ -156,16 +156,18 @@ impl VerifiedPolicySet {
         match &admission.origin {
             AdmissionOrigin::Existing(transport) => {
                 if let Some(retained) = &admission.destination {
-                    let destination = self.verify_execution_destination(
-                        &facts.resource,
-                        &facts.audience,
-                        &retained.resource,
-                        &retained.public_key,
-                        &retained.grant_leaf,
-                        &facts.context,
-                        facts.action,
-                        now_ms,
-                    )?;
+                    let destination = self
+                        .verify_execution_destination(
+                            &facts.resource,
+                            &facts.audience,
+                            &retained.resource,
+                            &retained.public_key,
+                            &retained.grant_leaf,
+                            &facts.context,
+                            facts.action,
+                            now_ms,
+                        )?
+                        .bind_admitted(admission)?;
                     self.verify_invocation_with_execution_transport(
                         &admission.invocation,
                         facts,
@@ -344,16 +346,18 @@ impl VerifiedPolicySet {
             "admission body differs from request facts",
         )?;
         if let Some((resource, key, grant)) = prepare::remote_selection(body)? {
-            let destination = self.verify_execution_destination(
-                &facts.resource,
-                &facts.audience,
-                &resource,
-                &key,
-                &grant,
-                &facts.context,
-                facts.action,
-                now_ms,
-            )?;
+            let destination = self
+                .verify_execution_destination(
+                    &facts.resource,
+                    &facts.audience,
+                    &resource,
+                    &key,
+                    &grant,
+                    &facts.context,
+                    facts.action,
+                    now_ms,
+                )?
+                .bind_request(&signed.payload, body)?;
             self.verify_invocation_with_execution_transport(
                 signed,
                 facts,

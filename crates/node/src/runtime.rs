@@ -1,8 +1,8 @@
+mod gateway_forward;
+mod gateway_target;
 mod handoff;
 mod observation;
 mod task_business;
-mod gateway_forward;
-mod gateway_target;
 pub(crate) use gateway_forward::GatewaySourceRequest;
 
 mod dispatch;
@@ -44,10 +44,25 @@ use vibeface_secure::authorization::{
 };
 use vibeface_secure::signature_verification::SignatureVerification;
 
+mod agent_tools;
+mod bots;
+mod chat_controls;
+mod commands;
+mod execution_subscription;
+mod followup;
+mod manager_control;
+#[cfg(test)]
+mod manager_control_tests;
+mod progress_observation;
+mod schedule_delivery;
+pub use manager_control::ManagerAccess;
+pub(crate) use progress_observation::ObservationGuard;
+
 #[derive(Clone)]
 pub struct Access {
     pub network_id: String,
     pub conversation_id: Option<String>,
+    pub(super) manager: Option<ManagerAccess>,
     authorization: TaskScopedAuthorization,
     freshness: FreshnessProof,
     transport: RequestTransport,
@@ -165,7 +180,9 @@ pub(crate) mod tests {
     use vibeface_secure::authorization::{ResourceId, SessionRef};
 
     impl Runtime {
-        pub(crate) async fn hold_handoff_resolution_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        pub(crate) async fn hold_handoff_resolution_for_test(
+            &self,
+        ) -> tokio::sync::MutexGuard<'_, ()> {
             self.handoff_resolution_lock.lock().await
         }
     }
@@ -218,7 +235,11 @@ pub(crate) mod tests {
         Ok((network, node))
     }
 
-    async fn access(network: &TestNetwork, node: &Runtime, body: &Value) -> Result<Access> {
+    pub(super) async fn access(
+        network: &TestNetwork,
+        node: &Runtime,
+        body: &Value,
+    ) -> Result<Access> {
         let now = now_ms() as u64;
         let mut store = node.store.lock().await;
         let (authorization, transport) = network.authorization(&store, body, now)?;
@@ -231,6 +252,7 @@ pub(crate) mod tests {
         Ok(Access {
             network_id: network.space.to_string(),
             conversation_id: body["conversation_id"].as_str().map(str::to_owned),
+            manager: None,
             authorization: TaskScopedAuthorization::from_primary(authorization),
             freshness,
             transport: RequestTransport::Existing(transport),
@@ -239,7 +261,11 @@ pub(crate) mod tests {
         })
     }
 
-    async fn rpc(network: &TestNetwork, node: &Arc<Runtime>, body: Value) -> Result<Value> {
+    pub(super) async fn rpc(
+        network: &TestNetwork,
+        node: &Arc<Runtime>,
+        body: Value,
+    ) -> Result<Value> {
         node.rpc(access(network, node, &body).await?, body).await
     }
 
@@ -254,8 +280,27 @@ pub(crate) mod tests {
         body["title"] = json!(name);
         body["goal"] = json!("complete the requested work");
         body["acceptance"] = json!("the user verifies the result");
-        body["auto_followup"] = json!(auto);
-        rpc(network, node, body).await
+        body["auto_followup"] = json!(false);
+        let result = rpc(network, node, body).await?;
+        if auto {
+            let policy = node.store.lock().await.historical_followup_policy(
+                network.space.as_str(),
+                "conversation",
+                name,
+            )?;
+            if policy.version == 0 {
+                let mut grant = network.body("set_followup", "conversation");
+                grant["task_id"] = json!(name);
+                grant["task_ref"] = json!(policy.task_ref);
+                grant["previous_head"] =
+                    json!(policy.proof_heads.last().context("task origin missing")?);
+                grant["expected_version"] = json!(0);
+                grant["mode"] = json!("continue");
+                grant["scheduler_node"] = json!(node.identity.node_id()?);
+                rpc(network, node, grant).await?;
+            }
+        }
+        Ok(result)
     }
 
     async fn change_task(
@@ -315,7 +360,7 @@ pub(crate) mod tests {
             conversation_id: "conversation".into(),
             task_id: Some(name.into()),
             target_node: node.identity.node_id()?,
-            session_id: name.into(),
+            session_id: Some(name.into()),
             expected_revision: 0,
             basis_heads: node
                 .store
@@ -325,6 +370,7 @@ pub(crate) mod tests {
             action: json!({"type":"open","executor":executor,"cwd":network.project}),
             resources: vec![network.project.to_string_lossy().into_owned()],
             binding: Some(binding),
+            manager_authority: None,
         };
         admit(network, node, &open).await?;
         claim(network, node, &open).await?;
@@ -336,7 +382,13 @@ pub(crate) mod tests {
         .await?;
         let mut store = node.store.lock().await;
         let mut session = store
-            .session(network.space.as_str(), &open.target_node, &open.session_id)?
+            .session(
+                network.space.as_str(),
+                &open.target_node,
+                open.session_id
+                    .as_deref()
+                    .context("fixture open has no session")?,
+            )?
             .context("open did not persist its session")?;
         session.native_session_id = Some("native-test".into());
         store.upsert_session(network.space.as_str(), &session)?;
@@ -353,15 +405,18 @@ pub(crate) mod tests {
             body["sdk_session"] = json!(manager.sdk_session);
             body["parent_invocation"] = json!(manager.parent_invocation);
             let access = node.authorize_agent(manager, body).await?;
-            node.store.lock().await.accept_request_authorized_operation(
-                &node.identity,
-                &access.authorization,
-                &access.freshness,
-                &access.transport,
-                &access.body,
-                &request,
-                now_ms() as u64,
-            )?;
+            node.store
+                .lock()
+                .await
+                .accept_request_authorized_operation(
+                    &node.identity,
+                    &access.authorization,
+                    &access.freshness,
+                    &access.transport,
+                    &access.body,
+                    &request,
+                    now_ms() as u64,
+                )?;
         } else {
             admit(network, node, &request).await?;
         }
@@ -415,11 +470,18 @@ pub(crate) mod tests {
             .context("operation is missing")
     }
 
-    async fn agent(network: &TestNetwork, node: &Arc<Runtime>) -> Result<AgentSession> {
+    pub(super) async fn agent(network: &TestNetwork, node: &Arc<Runtime>) -> Result<AgentSession> {
         let trigger = network.message(
             &mut *node.store.lock().await,
             "conversation",
             "manage these tasks",
+        )?;
+        node.store.lock().await.admit_trigger(
+            network.space.as_str(),
+            "conversation",
+            &trigger.hash,
+            &node.identity.node_id()?,
+            &node.identity.node_id()?,
         )?;
         let audience = node.audience()?;
         let session = SessionRef {
@@ -434,13 +496,21 @@ pub(crate) mod tests {
             &trigger.hash,
             now_ms() as u64,
         )?;
-        node.claim_manager(
-            &descriptor,
+        let admission = node
+            .claim_manager(
+                &descriptor,
+                &trigger.hash,
+                "runtime-tests",
+                &crypto::digest(b"runtime manager configuration"),
+            )
+            .await?;
+        node.store.lock().await.mark_started(
+            network.space.as_str(),
+            "conversation",
+            &node.identity.node_id()?,
             &trigger.hash,
-            "runtime-tests",
-            &crypto::digest(b"runtime manager configuration"),
-        )
-        .await?;
+            &admission.job.state.attempt().unwrap().id,
+        )?;
         Ok(descriptor)
     }
 
@@ -664,24 +734,18 @@ pub(crate) mod tests {
                         .local_value(network.space.as_str(), "completion:followup")?
                         .is_some()
                 );
-                let value = store
-                    .local_value(
+                let job = store
+                    .scheduler_job(
                         network.space.as_str(),
-                        &crate::scheduler::key(
-                            "invocation",
-                            "conversation",
-                            &manager.sdk_session.session_id,
-                        ),
+                        "conversation",
+                        &manager.sdk_session.session_id,
+                        &node.identity.node_id()?,
                     )?
-                    .context("original Manager claim is missing")?;
-                let mut invocation: crate::scheduler::Invocation = serde_json::from_value(value)?;
-                assert!(invocation.state == crate::scheduler::InvocationState::Running);
-                invocation.state = crate::scheduler::InvocationState::Completed;
-                crate::scheduler::finish(
-                    &mut store,
+                    .context("manager fixture job missing")?;
+                store.finish_scheduler_locally(
                     network.space.as_str(),
-                    "conversation",
-                    &invocation,
+                    &job,
+                    crate::scheduling::JobOutcome::Failed("fixture manager finished".into()),
                 )?;
             }
             drop(node);
@@ -779,7 +843,10 @@ pub(crate) mod tests {
                 !retried.fresh,
                 "the original continuation was admitted again after context advanced"
             );
-            assert!(retried.invocation.state != crate::scheduler::InvocationState::Running);
+            assert!(!matches!(
+                retried.job.state,
+                crate::scheduling::JobState::Running { .. }
+            ));
             let mut another_task = network.body("create_task", "conversation");
             another_task["task_id"] = json!("unrelated");
             assert!(node.authorize_agent(&session, another_task).await.is_err());
@@ -989,7 +1056,11 @@ pub(crate) mod tests {
         }
         let mut triggers = BTreeSet::new();
         for call in calls {
-            triggers.insert(call.await??["trigger"].as_str().unwrap().to_owned());
+            let receipt = call.await??;
+            assert_eq!(receipt["state"], "queued");
+            assert_eq!(receipt["queued"], true);
+            assert_eq!(receipt["receipt"]["target_node"], node.identity.node_id()?);
+            triggers.insert(receipt["trigger"].as_str().unwrap().to_owned());
         }
         assert_eq!(triggers.len(), 1);
         assert_eq!(
@@ -1025,6 +1096,14 @@ pub(crate) mod tests {
                 task(&network, &node, name, true).await?;
             }
         }
+        let grant = json!({"method":"set_followup","conversation_id":"chat","task_id":"active",
+            "mode":"report","expected_version":0,"scheduler_node":node.identity.node_id()?});
+        let grant_access = access(&network, &node, &grant).await?;
+        assert_eq!(
+            node.rpc(grant_access.clone(), grant.clone()).await?["policy"]["version"],
+            1
+        );
+        assert!(node.rpc(grant_access, grant).await.is_err());
         let store = node.store.lock().await;
         assert!(followup_authorized(
             &store,
@@ -1223,7 +1302,10 @@ pub(crate) mod tests {
                 .session(
                     network.space.as_str(),
                     &request.target_node,
-                    &request.session_id,
+                    request
+                        .session_id
+                        .as_deref()
+                        .context("fixture operation has no session")?,
                 )?
                 .unwrap();
             session.native_session_id = None;
@@ -1243,7 +1325,10 @@ pub(crate) mod tests {
                 .session(
                     network.space.as_str(),
                     &request.target_node,
-                    &request.session_id
+                    request
+                        .session_id
+                        .as_deref()
+                        .context("fixture operation has no session")?
                 )?
                 .unwrap()
                 .native_session_id
@@ -1579,9 +1664,7 @@ pub(crate) mod tests {
                 execution_dispatch::tests::Fixture,
                 foreign_execution_policy::{
                     current_task_prepare_policy_in, task_policy_for_binding_in,
-                    tests::{
-                        UnseededFixture, import_current_policy, unseeded_fixture_with_context,
-                    },
+                    tests::{UnseededFixture, import_current_policy, unseeded_fixture_with_source},
                 },
                 test_support::now as fixture_now,
             },
@@ -1589,11 +1672,15 @@ pub(crate) mod tests {
         };
         use std::{future::Future, pin::Pin};
         use vibeface_secure::authorization::{
-            Action, EventRef, InvocationContext, JournalEntry,
+            Action, EventRef, ExecutionSourcePolicy, InvocationContext, JournalEntry,
             execution_handoff::*,
             node_execution_policy::{PolicyCarrierOrigin, SdkPolicySourceProvenance},
             prepare::{PrepareContext, PrepareIntent, VerifiedRemoteExecution},
             remote_execution_policy::RemoteExecutionPolicySelection,
+            task_business_policy::{
+                TaskBusinessAuthorization, TaskBusinessPolicyHeader, TaskBusinessWire,
+                receipt::{TaskBusinessChallenge, TaskBusinessReceiptRead},
+            },
         };
 
         fn checked<T>(phase: &str, action: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -1627,6 +1714,7 @@ pub(crate) mod tests {
             execution: ResourceRef,
             grant: ObjectHash,
             binding: SignedBinding,
+            receipt_sources: Mutex<BTreeMap<ObjectHash, Signed<TaskBusinessPolicyHeader>>>,
         }
 
         impl Remote {
@@ -1670,8 +1758,27 @@ pub(crate) mod tests {
                     canonical_cwd: Some(executor.project.to_string_lossy().into_owned()),
                     execution_target_public_key: Some(target_key),
                 };
-                let mut fixture =
-                    unseeded_fixture_with_context(project, executor, store, context.clone(), true)?;
+                let approved_source = ExecutionSourcePolicy {
+                    work: vibeface_secure::authorization::execution_work::ExecutionWorkIntent::TaskSession {
+                        task: context.context.task.clone().context("fixture task is missing")?,
+                        binding_generation: context.binding_generation.context("fixture binding generation is missing")?,
+                        execution_session: context.context.execution_session.clone().context("fixture session is missing")?,
+                    },
+                    project: ResourceRef {
+                        space: project.space.clone(),
+                        resource: project.resource.clone(),
+                    },
+                    node_public_key: PublicKey::parse(&project.node.public_key_hex()?)?,
+                    pins: store.policy.pins().to_vec(),
+                };
+                let mut fixture = unseeded_fixture_with_source(
+                    project,
+                    executor,
+                    store,
+                    context.clone(),
+                    true,
+                    Some(approved_source),
+                )?;
                 let remote = import_current_policy(&mut fixture)?;
                 let binding = Self::bind(&mut fixture, &remote)?;
                 assert!(
@@ -1736,6 +1843,7 @@ pub(crate) mod tests {
                     execution,
                     grant,
                     binding,
+                    receipt_sources: Mutex::new(BTreeMap::new()),
                 };
                 value.assert_cold_current(Action::ExecutionOpen).await?;
                 value.connect(listener).await?;
@@ -2075,24 +2183,20 @@ pub(crate) mod tests {
                             .find(|event| matches!(&event.body, EventBody::ExecutionObserved { operation_id, status, .. } if operation_id == "sdk-first-send" && status == "succeeded"))
                             .context("B did not record the actual C result")?;
                         let trigger = crypto::digest(&serde_json::to_vec(&observed)?);
-                        let saved = store
-                            .local_value(
+                        let job = store
+                            .scheduler_job(
                                 self.project.space.as_str(),
-                                &crate::scheduler::key(
-                                    "invocation",
-                                    "conversation",
-                                    &initial.sdk_session.session_id,
-                                ),
+                                "conversation",
+                                &initial.sdk_session.session_id,
+                                &self.node.identity.node_id()?,
                             )?
-                            .context("initial Manager invocation is missing")?;
-                        let mut invocation: crate::scheduler::Invocation =
-                            serde_json::from_value(saved)?;
-                        invocation.state = crate::scheduler::InvocationState::Completed;
-                        crate::scheduler::finish(
-                            &mut store,
+                            .context("manager fixture job missing")?;
+                        store.finish_scheduler_locally(
                             self.project.space.as_str(),
-                            "conversation",
-                            &invocation,
+                            &job,
+                            crate::scheduling::JobOutcome::Failed(
+                                "fixture manager finished".into(),
+                            ),
                         )?;
                         trigger
                     };
@@ -2252,7 +2356,7 @@ pub(crate) mod tests {
                     conversation_id: "conversation".into(),
                     task_id: Some("remote-task".into()),
                     target_node: self.executor.node.node_id()?,
-                    session_id: "remote-session".into(),
+                    session_id: Some("remote-session".into()),
                     expected_revision: snapshot.map_or(0, |value| value.revision),
                     basis_heads: self
                         .node
@@ -2273,6 +2377,7 @@ pub(crate) mod tests {
                             .into(),
                     ],
                     binding: Some(self.binding.clone()),
+                    manager_authority: None,
                 };
                 let mut body = json!({"method":"operate","space_id":self.project.space,"resource_id":self.project.resource,
                     "authorization_id":id,"execution_resource":self.execution,"execution_grant":self.grant,
@@ -2357,29 +2462,122 @@ pub(crate) mod tests {
                 wire: &SignedExecutionHandoff,
                 stage: CheckStage,
             ) -> Result<ExecutionHandoffFreshness> {
+                let now = now_ms() as u64;
                 let transport = TransportEvidence::VerifiedPeer {
                     origin: self.node.audience()?.device,
                 };
-                let challenge = self.c.lock().await.issue_execution_handoff_challenge(
-                    wire,
-                    &transport,
-                    stage,
-                    now_ms() as u64,
-                )?;
-                let mut receipts = self
-                    .node
-                    .store
+                let challenge = self
+                    .c
                     .lock()
                     .await
-                    .sign_execution_handoff_receipts(
-                        &challenge,
-                        &self.project.node,
-                        now_ms() as u64,
+                    .issue_execution_handoff_challenge(wire, &transport, stage, now)?;
+                let wire_hash = wire.hash()?;
+                let original_header = self.receipt_sources.lock().await.get(&wire_hash).cloned();
+                let (header, c_noise, mut receipts) = {
+                    let mut store = self.node.store.lock().await;
+                    checked("manual C TaskBusiness source", || {
+                        let business_wire = TaskBusinessWire::Submit(wire.clone());
+                        let (scoped, authorization) =
+                            store.current_task_business_submit(&self.project.node, wire, now)?;
+                        let current = scoped
+                            .task_policy()
+                            .context("SDK fixture Submit has no genuine Task Current")?;
+                        let PolicyCarrierOrigin::DirectNoise(c_noise) = current.carrier_origin()
+                        else {
+                            bail!("SDK fixture requires its actual C Noise peer");
+                        };
+                        ensure!(
+                            c_noise.public_key()
+                                == &PublicKey::parse(&self.executor.node.public_key_hex()?)?,
+                            "SDK fixture Task Current came from another executor"
+                        );
+                        let header = match original_header {
+                            Some(header) => header,
+                            None => {
+                                ensure!(
+                                    stage == CheckStage::Admit,
+                                    "SDK fixture operation has no original TaskBusiness header"
+                                );
+                                store
+                                    .begin_task_business_source(
+                                        &self.project.node,
+                                        current,
+                                        TaskBusinessAuthorization::Submit(&authorization),
+                                        &business_wire,
+                                        now,
+                                    )?
+                                    .header()
+                                    .clone()
+                            }
+                        };
+                        let receipts = if stage == CheckStage::Admit {
+                            store.task_business_challenge_receipts(
+                                &self.project.node,
+                                current,
+                                TaskBusinessAuthorization::Submit(&authorization),
+                                &business_wire,
+                                &header.hash()?,
+                                &TaskBusinessChallenge::Submit(challenge.clone()),
+                                now,
+                            )?
+                        } else {
+                            Vec::new()
+                        };
+                        Ok((header, c_noise.clone(), receipts))
+                    })?
+                };
+                if stage == CheckStage::Admit {
+                    self.receipt_sources
+                        .lock()
+                        .await
+                        .insert(wire_hash, header.clone());
+                }
+                if stage != CheckStage::Admit {
+                    let (accepted_wire, acceptance) =
+                        self.c.lock().await.execution_handoff_original_acceptance(
+                            self.execution.space.as_str(),
+                            self.project.space.as_str(),
+                            &wire.invocation.payload.operation_id,
+                        )?;
+                    ensure!(
+                        accepted_wire == *wire,
+                        "SDK fixture operation changed its accepted wire"
+                    );
+                    let signer = vibeface_secure::Identity::from_secret_hex(
+                        &self.executor.node.secret_key_hex,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+                    let request = Signed::sign(
+                        TaskBusinessReceiptRead {
+                            version: AUTH_VERSION,
+                            source_header_hash: header.hash()?,
+                            business_wire_hash: header.payload.scope.business_wire_hash.clone(),
+                            challenge: TaskBusinessChallenge::Submit(challenge.clone()),
+                            acceptance: Some(acceptance),
+                            nonce: Nonce::random()?,
+                            issued_at_ms: now,
+                            expires_at_ms: (now + INVOCATION_MAX_AGE_MS)
+                                .min(challenge.expires_at_ms),
+                        },
+                        &signer,
                     )?;
+                    receipts = self
+                        .node
+                        .task_business_receipt_read(&c_noise, request)
+                        .await?;
+                }
+                let source_key = self.project.node.public_key_hex()?;
+                ensure!(
+                    !receipts.is_empty()
+                        && receipts
+                            .iter()
+                            .all(|receipt| receipt.issuer.as_str() == source_key),
+                    "SDK fixture requires genuine B TaskBusiness receipts"
+                );
                 receipts.extend(self.c.lock().await.sign_execution_handoff_receipts(
                     &challenge,
                     &self.executor.node,
-                    now_ms() as u64,
+                    now,
                 )?);
                 Ok(ExecutionHandoffFreshness {
                     challenge,
@@ -2599,12 +2797,18 @@ pub struct Update {
 }
 pub struct Runtime {
     pub config: Config,
+    pub local_access: Arc<crate::local_access::LocalAccess>,
     pub identity: LocalIdentity,
     pub store: Arc<Mutex<Store>>,
     pub network: Arc<NetworkHub>,
     pub hub: Arc<PeerHub>,
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, AgentSession>>,
+    manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
+    schedule_workers: Mutex<BTreeSet<(String, String)>>,
+    schedule_wakeup: tokio::sync::Notify,
+    progress_observation: std::sync::Mutex<progress_observation::ObservationState>,
+    progress_sequences: std::sync::Mutex<BTreeMap<(String, String), u64>>,
     peer_connecting: Arc<Mutex<BTreeSet<(String, String)>>>,
     pub tool_url: std::sync::OnceLock<String>,
     pub maintenance: Arc<Gate>,
@@ -2683,7 +2887,8 @@ fn session_views(
                 .rev()
                 .find(|operation| {
                     operation.request.target_node == session.target_node
-                        && operation.request.session_id == session.session_id
+                        && operation.request.session_id.as_deref()
+                            == Some(session.session_id.as_str())
                 })?
                 .request
                 .clone();
@@ -2765,152 +2970,29 @@ fn require_task_write(
     Ok(())
 }
 
-fn followup_authorized(store: &Store, network: &str, scope: &str, task: &str) -> Result<bool> {
-    let Some(task) = store
-        .tasks(network, scope)?
-        .into_iter()
-        .find(|record| record.task_id == task)
-    else {
-        return Ok(false);
-    };
-    if matches!(task.status.as_str(), "accepted" | "cancelled") {
-        return Ok(false);
-    }
-    let events = crate::identity::services::retained_agent_events(
-        &store.connection,
-        network,
-        &task.event_hash,
-    )?;
-    ensure!(
-        events
-            .get(&task.event_hash)
-            .is_some_and(|event| event.event.scope_id == scope),
-        "follow-up task belongs to another conversation"
-    );
-    for stored in events.values() {
-        let event = &stored.event;
-        if event.scope_id != scope
-            || !matches!(&event.body,EventBody::DecisionRecorded {decision_id,effective_constraints,tool_configuration,..}
-            if decision_id==&format!("auto:{}",task.task_id)
-                && effective_constraints.contains(&format!("auto_followup:{}",task.task_id))
-                && tool_configuration["auto_followup"]==task.task_id)
-        {
-            continue;
-        }
-        let EventCause::Invocation { admission } = &event.cause else {
-            continue;
-        };
-        let source = &admission.source_body;
-        if !matches!(admission.invocation.payload.actor, Actor::Account(_))
-            || source["method"] != "create_task"
-            || source["auto_followup"] != true
-            || source["task_id"] != task.task_id
-            || source["title"] != task.title
-            || source["goal"] != task.goal
-            || source["acceptance"] != task.acceptance
-        {
-            continue;
-        }
-        if crate::identity::event_authorization::current_event_authorization(
-            &store.policy,
-            &store.connection,
-            event,
-            &events,
-            now_ms() as u64,
-        )
-        .is_ok_and(|auth| matches!(auth.actor(), Actor::Account(_)))
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+#[cfg(test)]
+fn followup_authorized(store: &Store, space: &str, scope: &str, task: &str) -> Result<bool> {
+    Ok(store
+        .followup_policy(space, scope, task)
+        .is_ok_and(|policy| policy.mode == crate::store::followup::FollowupMode::Continue))
 }
-
+#[cfg(test)]
 fn require_executor_followup(
     store: &Store,
-    network: &str,
+    space: &str,
     origin: &str,
     scope: &str,
     trigger: &str,
 ) -> Result<()> {
     let envelope = store
-        .event(network, trigger)?
-        .context("follow-up result is missing")?;
-    let event = store.verify_event(network, &envelope)?;
+        .event(space, trigger)?
+        .context("follow-up event missing")?;
+    let event = store.verify_event(space, &envelope)?;
     ensure!(
-        event.author == origin && event.scope_id == scope,
-        "executor may only schedule its own result in this conversation"
+        matches!(&event.body,EventBody::ExecutionObserved{target_node,..} if target_node==origin),
+        "wrong executor result"
     );
-    let EventBody::ExecutionObserved {
-        operation_id,
-        task_id: Some(task),
-        target_node,
-        session_id,
-        status,
-        ..
-    } = &event.body
-    else {
-        bail!("executor follow-up requires a task result");
-    };
-    ensure!(
-        target_node == origin && matches!(status.as_str(), "succeeded" | "failed" | "rejected"),
-        "executor follow-up requires its known terminal result"
-    );
-    ensure!(
-        followup_authorized(store, network, scope, task)?,
-        "automatic follow-up needs an active task and user authorization"
-    );
-    let events =
-        crate::identity::services::retained_agent_events(&store.connection, network, trigger)?;
-    let causal = crate::store::closure_hashes(&events, &[trigger.to_owned()]);
-    ensure!(
-        causal
-            .iter()
-            .filter_map(|hash| events.get(hash))
-            .any(|stored| {
-                let dispatch = &stored.event;
-                let EventBody::DispatchRecorded {
-                    operation_id: id,
-                    task_id,
-                    target_node: target,
-                    session_id: session,
-                    action,
-                } = &dispatch.body
-                else {
-                    return false;
-                };
-                dispatch.scope_id == scope
-                    && id == operation_id
-                    && task_id.as_ref() == Some(task)
-                    && target == origin
-                    && session == session_id
-                    && store
-                        .authorize_node(network, &dispatch.author, None)
-                        .is_ok()
-                    && crate::identity::event_authorization::current_event_authorization(
-                        &store.policy,
-                        &store.connection,
-                        dispatch,
-                        &events,
-                        now_ms() as u64,
-                    )
-                    .is_ok_and(|auth| {
-                        auth.action() == vibeface_secure::authorization::Action::ExecutionSend
-                    })
-                    && serde_json::from_value::<OperationRequest>(action.clone()).is_ok_and(
-                        |request| {
-                            request.network_id == network
-                                && request.conversation_id == scope
-                                && request.operation_id == *operation_id
-                                && request.task_id.as_ref() == Some(task)
-                                && request.target_node == origin
-                                && request.session_id == *session_id
-                                && request.action["type"] == "send"
-                        },
-                    )
-            }),
-        "executor result has no matching dispatch"
-    );
+    store.execution_result_policy(space, scope, trigger)?;
     Ok(())
 }
 
@@ -3171,7 +3253,10 @@ impl Runtime {
             );
             self.prepare_operation_binding(&mut request, verification)
                 .await?;
-            if request.action["type"] == "open" {
+            if matches!(request.action["type"].as_str(), Some("open" | "command")) {
+                if request.action["type"] == "command" {
+                    self.command_spec(&request.action)?;
+                }
                 request.action["cwd"] = json!(
                     self.allowed_path(field(&request.action, "cwd")?)?
                         .to_str()
@@ -3189,7 +3274,7 @@ impl Runtime {
                         .to_owned())
                 })
                 .collect::<Result<Vec<_>>>()?;
-            if request.action["type"] == "open" {
+            if matches!(request.action["type"].as_str(), Some("open" | "command")) {
                 resources.push(field(&request.action, "cwd")?.to_owned());
             } else if request.action["type"] == "send" {
                 let session = self
@@ -3199,7 +3284,10 @@ impl Runtime {
                     .session(
                         &request.network_id,
                         &request.target_node,
-                        &request.session_id,
+                        request
+                            .session_id
+                            .as_deref()
+                            .context("SDK operation requires a session")?,
                     )?
                     .context("execution session is not open")?;
                 resources.push(
@@ -3355,12 +3443,23 @@ impl Runtime {
             prepared.audience() == &self.audience()?,
             "prepare reached another resource host"
         );
-        let body = self
-            .normalize_request_body_with_verification(
-                &prepared.resource().space,
-                prepared.raw_body().clone(),
-                verification,
+        let control = if prepared.raw_body()["method"] == "execution_control"
+            || (prepared.raw_body()["method"] == "task_control"
+                && prepared.raw_body()["action"] != "status")
+        {
+            Some(
+                self.prepare_chat_control(prepared.resource().space.as_str(), prepared.raw_body())
+                    .await?,
             )
+        } else {
+            None
+        };
+        let raw = control.as_ref().map_or_else(
+            || prepared.raw_body().clone(),
+            |control| control["body"].clone(),
+        );
+        let body = self
+            .normalize_request_body_with_verification(&prepared.resource().space, raw, verification)
             .await?;
         let now = now_ms() as u64;
         let original = &scoped.intent.payload.request;
@@ -3451,7 +3550,11 @@ impl Runtime {
         invocation.nonce = Nonce::random()?;
         invocation.not_before_ms = now;
         invocation.expires_at_ms = now.saturating_add(INVOCATION_MAX_AGE_MS);
-        Ok(json!({"invocation":invocation,"body":body}))
+        let mut result = json!({"invocation":invocation,"body":body});
+        if let Some(control) = control {
+            result["control"] = control["control"].clone();
+        }
+        Ok(result)
     }
 
     async fn freshness(
@@ -3497,8 +3600,12 @@ impl Runtime {
             })?
         };
         self.collect_freshness_challenge_in_scope_with_verification(
-            authorization.resource().space.as_str(), &challenge, Some((authorization, transport)), verification,
-        ).await
+            authorization.resource().space.as_str(),
+            &challenge,
+            Some((authorization, transport)),
+            verification,
+        )
+        .await
     }
 
     pub(crate) async fn collect_freshness_challenge(
@@ -3520,7 +3627,13 @@ impl Runtime {
         challenge: &FreshnessChallenge,
         verification: &SignatureVerification,
     ) -> Result<FreshnessProof> {
-        self.collect_freshness_challenge_in_scope_with_verification(space, challenge, None, verification).await
+        self.collect_freshness_challenge_in_scope_with_verification(
+            space,
+            challenge,
+            None,
+            verification,
+        )
+        .await
     }
 
     async fn collect_freshness_challenge_in_scope_with_verification(
@@ -3534,7 +3647,9 @@ impl Runtime {
             let store = self.store.lock().await;
             let receipts = verification
                 .run(|| store.sign_current_receipts(challenge, &self.identity, now_ms() as u64))?;
-            let policies = authorization.map_or(store.authorization_state(), |(scope, _)| scope.state(store.authorization_state()));
+            let policies = authorization.map_or(store.authorization_state(), |(scope, _)| {
+                scope.state(store.authorization_state())
+            });
             let mut authorities = BTreeSet::new();
             for stamp in &challenge.policies {
                 if receipts
@@ -3545,12 +3660,14 @@ impl Runtime {
                 }
                 let authority = match &stamp.domain {
                     PolicyDomain::Account(id) => {
-                        &policies.account(id)
+                        &policies
+                            .account(id)
                             .context("account policy missing")?
                             .authority
                     }
                     PolicyDomain::Space(id) => {
-                        &policies.space(id)
+                        &policies
+                            .space(id)
                             .context("space policy missing")?
                             .authority
                     }
@@ -3570,19 +3687,30 @@ impl Runtime {
                     let store = self.store.lock().await;
                     verification.run(|| {
                         store.task_execution_freshness_read(
-                            &self.identity, scoped, transport, challenge, now_ms() as u64,
+                            &self.identity,
+                            scoped,
+                            transport,
+                            challenge,
+                            now_ms() as u64,
                         )
                     })?
                 };
                 let mut client = crate::client::NodePolicyReadClient::connect(
-                    &self.network, &self.identity, &prepared.trust,
-                ).await?;
-                let reply = client.read(
-                    &crate::identity::node_execution_policy::NodeReadRequest::Freshness(
-                        prepared.request,
-                    ),
-                ).await?;
-                let crate::identity::node_execution_policy::NodeReadResponse::Receipts(current) = reply else {
+                    &self.network,
+                    &self.identity,
+                    &prepared.trust,
+                )
+                .await?;
+                let reply = client
+                    .read(
+                        &crate::identity::node_execution_policy::NodeReadRequest::Freshness(
+                            prepared.request,
+                        ),
+                    )
+                    .await?;
+                let crate::identity::node_execution_policy::NodeReadResponse::Receipts(current) =
+                    reply
+                else {
                     bail!("Node freshness returned another policy read stage");
                 };
                 receipts.extend(current);
@@ -3682,7 +3810,13 @@ impl Runtime {
                     now_ms() as u64,
                 )?;
                 let facts = self
-                    .authorization_facts_in_scope(&store, &raw_authorization, &body, &audience, now_ms() as u64)
+                    .authorization_facts_in_scope(
+                        &store,
+                        &raw_authorization,
+                        &body,
+                        &audience,
+                        now_ms() as u64,
+                    )
                     .map_err(|_| anyhow::anyhow!("request facts do not match authorization"))?;
                 store.authorize_scoped_request_for_transport(
                     &self.identity,
@@ -3709,6 +3843,7 @@ impl Runtime {
         Ok(Access {
             network_id: space.to_string(),
             conversation_id: body["conversation_id"].as_str().map(str::to_owned),
+            manager: None,
             authorization,
             freshness,
             transport,
@@ -3842,6 +3977,11 @@ impl Runtime {
             tx,
         );
         Ok(Self {
+            local_access: Arc::new(crate::local_access::LocalAccess::load(
+                dir,
+                &config,
+                &identity.node_id()?,
+            )?),
             config,
             identity,
             store,
@@ -3849,6 +3989,11 @@ impl Runtime {
             hub,
             events,
             agent_tokens: Mutex::new(HashMap::new()),
+            manager_controls: Mutex::new(HashMap::new()),
+            schedule_workers: Mutex::new(BTreeSet::new()),
+            schedule_wakeup: tokio::sync::Notify::new(),
+            progress_observation: std::sync::Mutex::new(Default::default()),
+            progress_sequences: std::sync::Mutex::new(BTreeMap::new()),
             peer_connecting: Arc::new(Mutex::new(BTreeSet::new())),
             tool_url: std::sync::OnceLock::new(),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
@@ -3922,6 +4067,18 @@ impl Runtime {
         json!({"node_id":self.identity.node_id().ok(),"version":env!("CARGO_PKG_VERSION"),"roles":self.config.roles,"manager_available":self.config.manager.is_some()})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
+        self.start_schedule_delivery();
+        self.start_observation_worker();
+        let restore = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                if let Err(error) = restore.restore_execution_subscriptions().await {
+                    tracing::debug!(%error,"execution subscription recovery pending");
+                }
+            }
+        });
         let mut receiver = self
             .peer_rx
             .lock()
@@ -4157,11 +4314,19 @@ impl Runtime {
         let _verification = access.verification.enter();
         let invocation = &access.authorization.signed_invocation().payload;
         let facts = vibeface_secure::authorization::RequestFacts {
-            resource: invocation.resource.clone(), action: invocation.action,
-            audience: invocation.audience.clone(), operation_id: invocation.operation_id.clone(),
-            body_hash: invocation.body_hash.clone(), context: invocation.context.clone(),
+            resource: invocation.resource.clone(),
+            action: invocation.action,
+            audience: invocation.audience.clone(),
+            operation_id: invocation.operation_id.clone(),
+            body_hash: invocation.body_hash.clone(),
+            context: invocation.context.clone(),
         };
-        access.authorization.check_current_in(&store.connection, store.authorization_state(), &facts, now_ms() as u64)?;
+        access.authorization.check_current_in(
+            &store.connection,
+            store.authorization_state(),
+            &facts,
+            now_ms() as u64,
+        )?;
         ensure!(
             store
                 .authorized_conversation_ids(&access.authorization)?
@@ -4414,6 +4579,18 @@ impl Runtime {
         json!({"executors":["codex","claude_code","cursor_agent"],"manager":self.config.manager.as_ref().map(|m|m.provider.clone())})
     }
     pub async fn rpc(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
+        let write = !access.authorization.action().is_read()
+            && !matches!(
+                input["method"].as_str(),
+                Some("agent_result" | "agent_notification")
+            );
+        let task = input["task_id"]
+            .as_str()
+            .or_else(|| input["request"]["task_id"].as_str());
+        let _lease = self.manager_tool_lease(&access, write, task).await?;
+        self.rpc_inner(access, input).await
+    }
+    async fn rpc_inner(self: &Arc<Self>, access: Access, input: Value) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         access.require_body(&input)?;
         self.check_execution_actor(&input, &access.authorization.signed_invocation().payload)?;
@@ -4421,8 +4598,13 @@ impl Runtime {
         {
             let store = self.store.lock().await;
             let _verification = access.verification.enter();
-            let facts =
-                self.authorization_facts_in_scope(&store, &access.authorization, &input, &self.audience()?, now_ms() as u64)?;
+            let facts = self.authorization_facts_in_scope(
+                &store,
+                &access.authorization,
+                &input,
+                &self.audience()?,
+                now_ms() as u64,
+            )?;
             store.authorize_scoped_request_for_transport(
                 &self.identity,
                 access.authorization.signed_invocation(),
@@ -4435,7 +4617,7 @@ impl Runtime {
         let method = field(&input, "method")?;
         let scope = input["conversation_id"].as_str().map(String::from);
         if let Some(scope) = &scope
-            && method != "create_conversation"
+            && !matches!(method, "create_conversation" | "create_bot")
         {
             self.require_scope(&access, scope).await?;
         }
@@ -4528,30 +4710,19 @@ impl Runtime {
                     json!({"conversation_id":scope,"title":title,"heads":self.store.lock().await.heads(network,&scope)?}),
                 )
             }
-            "conversation" => {
+            "conversation" => self.conversation_snapshot(&access, &input).await,
+            "message" => self.accept_chat_message(&access, &input).await,
+            "set_followup" => {
                 let scope = scope.context("conversation_id is required")?;
-                let mut store = self.store.lock().await;
-                let _verification = access.verification.enter();
-                store.authorize_request_read(
-                    &access.authorization,
-                    &access.freshness,
-                    &access.transport,
-                    now_ms() as u64,
-                )?;
-                let context = store.context(network, &scope, &heads(&input)?)?;
-                let operations = store
-                    .operations(network)?
-                    .into_iter()
-                    .filter(|operation| operation.request.conversation_id == scope)
-                    .collect::<Vec<_>>();
-                let sessions = session_views(&store, network, &scope, &operations)?;
-                let operations = operations
-                    .iter()
-                    .map(|operation| dispatch::execution_operation_view(&store, operation))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(
-                    json!({"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),"messages":store.messages(network,&scope)?,"tasks":task_views(&store,network,&scope)?,"heads":context.heads,"missing":context.missing,"sessions":sessions,"operations":operations}),
-                )
+                self.set_followup(&access, &scope, &input).await
+            }
+            "progress_read" => self.read_progress(&access, &input).await,
+            "schedule" => self.receive_schedule(&access, &input).await,
+            "manager_status" => {
+                self.validate_subscription(&access).await?;
+                let scope = scope.context("conversation_id is required")?;
+                self.manager_status(network, &scope, field(&input, "trigger")?)
+                    .await
             }
             "context" => {
                 let scope = scope.context("conversation_id is required")?;
@@ -4596,179 +4767,34 @@ impl Runtime {
                     json!({"heads":context.heads,"missing":context.missing,"events":&events[offset..end],"next_offset":(end<events.len()).then_some(end)}),
                 )
             }
-            "message" => {
-                ensure!(
-                    access.account_actor(),
-                    "agents cannot recursively invoke managers"
-                );
-                let scope = scope.context("conversation_id is required")?;
-                let message_id = id(&input, "message_id")?;
-                let text = field(&input, "text")?.to_owned();
-                let complete = {
-                    let store = self.store.lock().await;
-                    access.verification.run(|| {
-                        Ok::<_, anyhow::Error>(
-                            store
-                                .context(network, &scope, &heads(&input)?)?
-                                .missing
-                                .is_complete(),
-                        )
-                    })?
-                };
-                ensure!(complete, "context is incomplete; wait for synchronization");
-                let target = input["scheduler_node"]
-                    .as_str()
-                    .unwrap_or(&self.identity.node_id()?)
-                    .to_owned();
-                ensure!(
-                    target == self.identity.node_id()?,
-                    "message must target this resource host's scheduler"
-                );
-                let trigger = {
-                    let mut store = self.store.lock().await;
-                    let _verification = access.verification.enter();
-                    let duplicate = store
-                        .messages(network, &scope)?
-                        .into_iter()
-                        .find(|message| message.message_id == message_id);
-                    if let Some(old) = duplicate {
-                        ensure!(
-                            old.text == text && old.role == "user",
-                            "message ID reused with different content"
-                        );
-                        let envelope = store
-                            .event(network, &old.event_hash)?
-                            .context("message event missing")?;
-                        let event = store.verify_event(network, &envelope)?;
-                        ensure!(
-                            matches!(&event.body, EventBody::MessagePosted { scheduler_node: Some(selected), .. } if selected == &target),
-                            "retry this message through its original scheduler; send a new message to continue elsewhere"
-                        );
-                        old.event_hash
-                    } else {
-                        let event = store.append_request_authorized_event(
-                            &self.identity,
-                            &access.authorization,
-                            &access.freshness,
-                            &access.transport,
-                            &access.body,
-                            &scope,
-                            EventBody::MessagePosted {
-                                message_id,
-                                role: "user".into(),
-                                text,
-                                scheduler_node: Some(target.clone()),
-                            },
-                            vec![],
-                            now_ms(),
-                        )?;
-                        self.publish_changed(network, &scope, &event.hash);
-                        event.hash
-                    }
-                };
-                if target == self.identity.node_id()? {
-                    if self.config.manager.is_some() {
-                        self.require_role_with_verification(
-                            network,
-                            NodeRole::Scheduler,
-                            &access.verification,
-                        )
-                        .await?;
-                        self.spawn_scheduler(network.clone(), scope, trigger.clone())
-                            .await?;
-                    }
-                    Ok(
-                        json!({"state":"accepted","trigger":trigger,"manager_started":self.config.manager.is_some()}),
-                    )
-                } else {
-                    self.peer_request(
-                        network,
-                        &target,
-                        json!({"type":"schedule","conversation_id":scope,"trigger":trigger}),
-                    )
-                    .await
-                }
-            }
+            "read_artifact" => self.read_artifact(&access, &input).await,
+            "task_control" => self.task_control(&access, &input).await,
+            "execution_control" => self.execution_control(&access, &input).await,
+            "execution_status" => self.execution_status(&access, &input).await,
+            "bots" => self.bots(&access).await,
+            "create_bot" => self.create_bot(&access, &input).await,
+            "cancel_manager" => self.cancel_manager(&access, &input).await,
+            "resolve_manager_unknown" => self.resolve_manager_invocation(&access, &input).await,
             "create_task" => {
                 ensure!(
-                    access.account_actor() || input["auto_followup"].as_bool() != Some(true),
-                    "Agent cannot grant follow-up authority"
+                    input["auto_followup"].as_bool() != Some(true),
+                    "use set_followup for explicit versioned permission"
                 );
                 let scope = scope.context("conversation_id is required")?;
-                let task_id = id(&input, "task_id")?;
-                let title = field(&input, "title")?;
-                let goal = field(&input, "goal")?;
-                let acceptance = field(&input, "acceptance")?;
-                let mut store = self.store.lock().await;
-                let _verification = access.verification.enter();
-                let existing = store
-                    .tasks(network, &scope)?
-                    .into_iter()
-                    .find(|task| task.task_id == task_id);
-                let terminal = existing
-                    .as_ref()
-                    .is_some_and(|task| matches!(task.status.as_str(), "accepted" | "cancelled"));
-                let mut events = Vec::new();
-                if let Some(old) = &existing {
-                    ensure!(
-                        old.title == title && old.goal == goal && old.acceptance == acceptance,
-                        "task ID reused with different content"
-                    );
-                } else {
-                    events.push((
-                        scope.clone(),
-                        EventBody::TaskCreated {
-                            task_id: task_id.clone(),
-                            title: title.into(),
-                            goal: goal.into(),
-                            acceptance: acceptance.into(),
-                        },
-                        vec![],
-                    ));
-                }
-                if input["auto_followup"].as_bool() == Some(true)
-                    && !terminal
-                    && !followup_authorized(&store, network, &scope, &task_id)?
-                {
-                    events.push((
-                        scope.clone(),
-                        EventBody::DecisionRecorded {
-                            decision_id: format!("auto:{task_id}"),
-                            text: format!(
-                                "User enabled bounded automatic follow-up for task {task_id}"
-                            ),
-                            effective_constraints: vec![format!("auto_followup:{task_id}")],
-                            tool_configuration: json!({"auto_followup":task_id}),
-                        },
-                        vec![],
-                    ));
-                }
-                let appended = if events.is_empty() {
-                    Vec::new()
-                } else {
-                    store.append_request_authorized_events(
+                let envelope = {
+                    let mut store = self.store.lock().await;
+                    let _verification = access.verification.enter();
+                    store.create_task_with_origin(
                         &self.identity,
                         &access.authorization,
                         &access.freshness,
                         &access.transport,
                         &access.body,
-                        events,
                         now_ms(),
                     )?
                 };
-                for event in &appended {
-                    self.publish_changed(network, &scope, &event.hash);
-                }
-                let creation = store.task_creation(network, &scope, &task_id)?;
-                let event = store.verify_event(network, &creation)?;
-                let authority = store.authorize_node(network, &event.author, None)?;
-                let task = task_views(&store, network, &scope)?
-                    .into_iter()
-                    .find(|task| task["task_id"].as_str() == Some(task_id.as_str()))
-                    .context("created task projection is unavailable")?;
-                Ok(
-                    json!({"task":task,"creation":creation,"authority_public_key":authority.public_key,"binding":store.task_binding(network,&creation.hash)?}),
-                )
+                self.publish_changed(network, &scope, &envelope.hash);
+                Ok(json!({"event":envelope}))
             }
             "update_task" => {
                 let scope = scope.context("conversation_id is required")?;
@@ -5097,6 +5123,23 @@ impl Runtime {
         call_id: &str,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
+        if matches!(
+            name,
+            "command"
+                | "delegate"
+                | "continue_execution"
+                | "stop_execution"
+                | "call_lookup"
+                | "nodes"
+                | "context"
+        ) || (name == "execution_status" && args.get("target_node").is_none())
+        {
+            let body = json!({"method":"context","space_id":session.space_id,"resource_id":session.resource_id,
+                "conversation_id":session.conversation_id,"authorization_id":uuid::Uuid::new_v4().to_string()});
+            let access = self.authorize_agent(&session, body).await?;
+            return self.agent_tool(access, name, args, call_id).await;
+        }
+
         ensure!(args.is_object(), "tool arguments must be an object");
         let verification = SignatureVerification::new();
         let execution_args = matches!(
@@ -5109,7 +5152,10 @@ impl Runtime {
             verification.run(|| {
                 store.manager_tool_authorization(
                     session.space_id.as_str(),
-                    &format!("manager:{}", session.sdk_session.session_id),
+                    &store.active_manager_authorization_id(
+                        session.space_id.as_str(),
+                        &session.sdk_session.session_id,
+                    )?,
                     now_ms() as u64,
                 )
             })?;
@@ -5168,7 +5214,7 @@ impl Runtime {
                     conversation_id: session.conversation_id.clone(),
                     task_id: Some(id(&args, "task_id")?),
                     target_node: field(&args, "target_node")?.to_owned(),
-                    session_id: id(&args, "session_id")?,
+                    session_id: Some(id(&args, "session_id")?),
                     expected_revision: args["expected_revision"].as_u64().unwrap_or(0),
                     basis_heads: self
                         .store
@@ -5178,6 +5224,7 @@ impl Runtime {
                     action,
                     resources: vec![],
                     binding: None,
+                    manager_authority: None,
                 };
                 json!({"method":"operate","request":request,"authorization_id":operation})
             }
@@ -5234,6 +5281,17 @@ impl Runtime {
                 .context("SDK authorize session refresh")?;
             let origin = store.agent_origin(&session, now)
                 .context("SDK authorize initial origin")?;
+            if matches!(origin.kind,crate::identity::services::AgentOriginKind::ReportOnly{..}) {
+                ensure!(authorization_action(&body)?.is_read() || matches!(body["method"].as_str(),Some("agent_start"|"agent_result"|"agent_notification")),
+                    "report-only manager cannot write business state");
+            }
+            if body["method"] != "agent_start" {
+                let job=store.scheduler_job(session.space_id.as_str(),&session.conversation_id,&session.sdk_session.session_id,&self.identity.node_id()?)?.context("manager job is missing")?;
+                let attempt=job.state.attempt().context("manager attempt is missing")?;
+                let authority=json!({"scheduler_node":job.target_node,"trigger":job.trigger,"followup_version":attempt.followup_version.unwrap_or(0),"attempt_id":attempt.id,"permission_version":attempt.permission_version});
+                body["manager_authority"]=authority.clone();
+                if body["method"]=="operate" { body["request"]["manager_authority"]=authority; }
+            }
             if let Some((task, reference)) = origin.task {
                 ensure!(
                     body["method"] != "create_task",
@@ -5361,6 +5419,11 @@ impl Runtime {
             "Agent session is owned by another service"
         );
         ensure!(now < session.expires_at_ms, "Agent delegation expired");
+        let descriptor = session.clone();
+        let needs_manager = !matches!(
+            body["method"].as_str(),
+            Some("agent_start" | "agent_result" | "agent_notification")
+        );
         let invocation = Signed::sign(
             Invocation {
                 version: AUTH_VERSION,
@@ -5385,17 +5448,22 @@ impl Runtime {
             },
             &identity,
         )?;
-        self.authorize_rpc_with_verification(
-            body,
-            invocation,
-            TransportEvidence::LocalAgentAdapter {
-                service: session.service,
-                session: session.sdk_session,
-            },
-            verification,
-        )
-        .await
-        .context("SDK authorize final RPC access")
+        let mut access = self
+            .authorize_rpc_with_verification(
+                body,
+                invocation,
+                TransportEvidence::LocalAgentAdapter {
+                    service: session.service,
+                    session: session.sdk_session,
+                },
+                verification,
+            )
+            .await
+            .context("SDK authorize final RPC access")?;
+        if needs_manager {
+            access.manager = Some(self.manager_access(&descriptor).await?);
+        }
+        Ok(access)
     }
 
     pub(crate) async fn claim_manager(
@@ -5405,8 +5473,22 @@ impl Runtime {
         boot: &str,
         sdk_config: &str,
     ) -> Result<crate::identity::admission::ManagerAdmission> {
+        {
+            let mut store = self.store.lock().await;
+            store.refresh_agent_session(session, now_ms() as u64)?;
+            if let Some(existing) = store.existing_manager_admission(
+                session.space_id.as_str(),
+                &session.conversation_id,
+                trigger,
+                &self.identity.node_id()?,
+                boot,
+            )? {
+                return Ok(existing);
+            }
+        }
+        let attempt_id = uuid::Uuid::new_v4().to_string();
         let body = json!({"method":"agent_start","space_id":session.space_id,
-            "resource_id":session.resource_id,"authorization_id":format!("manager:{trigger}"),
+            "resource_id":session.resource_id,"authorization_id":format!("manager:{trigger}:{attempt_id}"),"attempt_id":attempt_id,
             "conversation_id":session.conversation_id,"trigger":trigger,
             "scheduler_node":self.identity.node_id()?,
             "sdk_session":session.sdk_session,"parent_invocation":session.parent_invocation,
@@ -5505,19 +5587,22 @@ impl Runtime {
         request: &mut OperationRequest,
         verification: &SignatureVerification,
     ) -> Result<()> {
-        if request.binding.is_none() {
-            let task = request
-                .task_id
-                .as_ref()
-                .context("create a task and explicitly bind its execution before operating")?;
-            let store = self.store.lock().await;
-            let _verification = verification.enter();
-            let creation =
-                store.task_creation(&request.network_id, &request.conversation_id, task)?;
-            request.binding = Some(
-                store
-                    .task_binding(&request.network_id, &creation.hash)?
-                    .context("signed bind_execution must complete before operating")?,
+        if let Some(task) = &request.task_id {
+            if request.binding.is_none() {
+                let store = self.store.lock().await;
+                let _verification = verification.enter();
+                let creation =
+                    store.task_creation(&request.network_id, &request.conversation_id, task)?;
+                request.binding = Some(
+                    store
+                        .task_binding(&request.network_id, &creation.hash)?
+                        .context("signed bind_execution must complete before operating")?,
+                );
+            }
+        } else {
+            ensure!(
+                request.binding.is_none(),
+                "ordinary execution cannot claim a Task binding"
             );
         }
         let store = self.store.lock().await;
@@ -5577,6 +5662,7 @@ impl Runtime {
             serde_json::to_value(&request)? == access.body["request"],
             "execution request differs from signed body"
         );
+        Self::record_manager_operation(&mut *self.store.lock().await, &access, &request)?;
         if self.is_execution_dispatch(&access.body)? {
             return self.dispatch_execution(&access, request).await;
         }
@@ -5615,10 +5701,45 @@ impl Runtime {
         );
         let mut store = self.store.lock().await;
         let _verification = access.verification.enter();
+        if kind == "command" {
+            self.command_spec(&request.action)?;
+            ensure!(
+                request.session_id.is_none()
+                    && request.task_id.is_none()
+                    && request.binding.is_none()
+                    && request.expected_revision == 0,
+                "command must not invent a Task, session or binding"
+            );
+            let existed = store
+                .operation(&request.network_id, &request.operation_id)?
+                .is_some();
+            let operation = store.accept_request_authorized_operation(
+                &self.identity,
+                &access.authorization,
+                &access.freshness,
+                &access.transport,
+                &access.body,
+                &request,
+                now_ms() as u64,
+            )?;
+            drop(store);
+            if !existed {
+                let node = self.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = node.execute_command(request).await {
+                        tracing::warn!(%error,"command execution requires reconciliation");
+                    }
+                });
+            }
+            return Ok(json!({"operation":operation}));
+        }
         let current = store.session(
             &request.network_id,
             &request.target_node,
-            &request.session_id,
+            request
+                .session_id
+                .as_deref()
+                .context("execution session is required")?,
         )?;
         let existing_operation = store.operation(&request.network_id, &request.operation_id)?;
         if !access.account_actor()
@@ -5671,7 +5792,10 @@ impl Runtime {
             current.unwrap_or(ExecutionSession {
                 network_id: request.network_id.clone(),
                 target_node: request.target_node.clone(),
-                session_id: request.session_id.clone(),
+                session_id: request
+                    .session_id
+                    .clone()
+                    .context("SDK operation requires a session")?,
                 revision: 0,
                 state: "opening".into(),
                 executor: serde_json::to_value(executor)?.as_str().unwrap().into(),
@@ -5766,7 +5890,7 @@ impl Runtime {
             .lock()
             .await
             .context(&access.network_id, scope, &[])?;
-        ensure!(context.events.iter().any(|e| e.scope_id==scope && matches!(&e.body,EventBody::DispatchRecorded{target_node,session_id,..} if target_node==target && session_id==session)),"execution session is outside this conversation");
+        ensure!(context.events.iter().any(|e| e.scope_id==scope && matches!(&e.body,EventBody::DispatchRecorded{target_node,session_id,..} if target_node==target && session_id.as_deref()==Some(session))),"execution session is outside this conversation");
         Ok(())
     }
     fn engine_action(&self, action: &Value) -> Result<EngineAction> {
@@ -5857,7 +5981,11 @@ impl Runtime {
                 .session(
                     context.space_id.as_str(),
                     &operation.request.target_node,
-                    &operation.request.session_id,
+                    operation
+                        .request
+                        .session_id
+                        .as_deref()
+                        .context("SDK operation requires a session")?,
                 )?
                 .context("cancelled execution session is missing")?;
             let turn = store.local_value(
@@ -5890,11 +6018,10 @@ impl Runtime {
                     .into_iter()
                     .filter(|record| !record.state.terminal())
                 {
-                    if let Some(session) = store.session(
-                        &space,
-                        &operation.request.target_node,
-                        &operation.request.session_id,
-                    )? && session.executor == "codex"
+                    if let Some(id) = operation.request.session_id.as_deref()
+                        && let Some(session) =
+                            store.session(&space, &operation.request.target_node, id)?
+                        && session.executor == "codex"
                         && !execution_context(&store, &operation.request, 0)?.shared
                     {
                         affected.push((space.clone(), operation.request.operation_id));
@@ -5977,6 +6104,9 @@ impl Runtime {
     }
     async fn execute_operation(self: Arc<Self>, request: OperationRequest) -> Result<()> {
         let _work = self.maintenance.enter()?;
+        if request.action["type"] == "command" {
+            return self.execute_command(request).await;
+        }
         let action = self.engine_action(&request.action)?;
         let preparation: Result<(ExecutionSession, ExecutionContext)> = async {
             self.require_role(&request.network_id, NodeRole::Executor)
@@ -5992,7 +6122,10 @@ impl Runtime {
                 .session(
                     &request.network_id,
                     &request.target_node,
-                    &request.session_id,
+                    request
+                        .session_id
+                        .as_deref()
+                        .context("execution session is required")?,
                 )?
                 .context("accepted operation has no local session")?;
             store.validate_operation_binding(&request)?;
@@ -6067,7 +6200,10 @@ impl Runtime {
                     .session(
                         &request.network_id,
                         &request.target_node,
-                        &request.session_id,
+                        request
+                            .session_id
+                            .as_deref()
+                            .context("execution session is required")?,
                     )?
                     .context("session disappeared")?;
                 session.native_session_id = result.native_session_id;
@@ -6081,6 +6217,12 @@ impl Runtime {
                         &format!("turn:{}", request.operation_id),
                         &result.result,
                     )?;
+                    let observed = store.seal_local_execution_result(
+                        &self.identity,
+                        &request.network_id,
+                        &request.operation_id,
+                        now_ms() as u64,
+                    )?;
                     drop(store);
                     self.append_operation_fact(
                         &request,
@@ -6090,7 +6232,7 @@ impl Runtime {
                             target_node: request.target_node.clone(),
                             session_id: request.session_id.clone(),
                             status: "running".into(),
-                            detail: result.result,
+                            detail: serde_json::to_value(observed)?,
                         },
                         vec![],
                     )
@@ -6115,7 +6257,10 @@ impl Runtime {
                         .session(
                             &request.network_id,
                             &request.target_node,
-                            &request.session_id,
+                            request
+                                .session_id
+                                .as_deref()
+                                .context("execution session is required")?,
                         )?
                         .context("session disappeared")?;
                     session.native_session_id = error.native_session_id.clone();
@@ -6164,7 +6309,7 @@ impl Runtime {
         if current.state == OperationState::Unknown && state.terminal() {
             return Ok(());
         }
-        if state.terminal() && !current.state.terminal() {
+        if state.terminal() && !current.state.terminal() && request.action["type"] != "command" {
             let context = {
                 let store = self.store.lock().await;
                 verification.run(|| execution_context(&store, request, 0))?
@@ -6199,7 +6344,7 @@ impl Runtime {
         }
         let status = serde_json::to_value(&state)?.as_str().unwrap().to_owned();
         let completion_key = format!("completion:{}", request.operation_id);
-        {
+        let sealed = {
             let mut store = self.store.lock().await;
             let _verification = verification.enter();
             if let Some(old) = store.operation(&request.network_id, &request.operation_id)?
@@ -6219,11 +6364,13 @@ impl Runtime {
                 state.clone(),
                 result.clone(),
             )?;
-            if let Some(mut session) = store.session(
-                &request.network_id,
-                &request.target_node,
-                &request.session_id,
-            )? {
+            if let Some(mut session) = request
+                .session_id
+                .as_deref()
+                .map(|session| store.session(&request.network_id, &request.target_node, session))
+                .transpose()?
+                .flatten()
+            {
                 let outstanding = store
                     .operations(&request.network_id)?
                     .into_iter()
@@ -6246,9 +6393,15 @@ impl Runtime {
                 .into();
                 store.upsert_session(&request.network_id, &session)?;
             }
-        }
+            store.seal_local_execution_result(
+                &self.identity,
+                &request.network_id,
+                &request.operation_id,
+                now_ms() as u64,
+            )?
+        };
         let mut blobs = vec![];
-        let mut detail = result;
+        let mut detail = serde_json::to_value(sealed)?;
         let bytes = serde_json::to_vec(&detail)?;
         if bytes.len() > 262144 {
             let blob = BlobRef {
@@ -6285,7 +6438,7 @@ impl Runtime {
             .await?
             .hash
         };
-        if matches!(request.action["type"].as_str(), Some("send")) {
+        if !matches!(request.action["type"].as_str(), Some("read")) {
             let notification_id = format!("result:{}:{}", request.operation_id, status);
             let already = {
                 let store = self.store.lock().await;
@@ -6302,10 +6455,10 @@ impl Runtime {
                             EventBody::NotificationRaised {
                                 notification_id,
                                 kind: status.clone(),
-                                text: format!(
-                                    "执行会话 {} 的本轮执行状态为 {}。工单验收仍需本人确认。",
-                                    request.session_id, status
-                                ),
+                                text: match &request.session_id {
+                                    Some(session)=>format!("执行会话 {session} 的本轮执行状态为 {status}。工单验收仍需本人确认。"),
+                                    None=>format!("执行命令 {} 的本轮执行状态为 {status}。",request.operation_id),
+                                },
                             },
                             vec![],
                             now_ms(),
@@ -6321,6 +6474,12 @@ impl Runtime {
             {
                 return Ok(());
             }
+        }
+        if state.terminal() {
+            self.progress_sequences
+                .lock()
+                .expect("progress sequence lock")
+                .remove(&(request.network_id.clone(), request.operation_id.clone()));
         }
         self.store
             .lock()
@@ -6363,7 +6522,8 @@ impl Runtime {
                 .into_iter()
                 .rev()
                 .find(|record| {
-                    record.request.target_node == target && record.request.session_id == session_id
+                    record.request.target_node == target
+                        && record.request.session_id.as_deref() == Some(session_id)
                 })
                 .context("execution session has no admitted operation")?;
             execution_context(&store, &operation.request, 0)?
@@ -6393,9 +6553,32 @@ impl Runtime {
     }
     pub async fn current_facts(&self, network: &str, scope: &str) -> Result<Value> {
         let context = self.store.lock().await.context(network, scope, &[])?;
+        let terminal: BTreeSet<_> = context
+            .events
+            .iter()
+            .filter_map(|event| {
+                if event.scope_id == scope
+                    && let EventBody::ExecutionObserved {
+                        operation_id,
+                        target_node,
+                        status,
+                        ..
+                    } = &event.body
+                    && event.author == *target_node
+                    && matches!(
+                        status.as_str(),
+                        "succeeded" | "failed" | "rejected" | "completed" | "interrupted"
+                    )
+                {
+                    Some(operation_id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
         let mut keys = BTreeSet::new();
         let mut operations = BTreeSet::new();
-        for event in context.events {
+        for event in &context.events {
             if event.scope_id != scope {
                 continue;
             }
@@ -6404,10 +6587,13 @@ impl Runtime {
                 session_id,
                 operation_id,
                 ..
-            } = event.body
+            } = &event.body
+                && !terminal.contains(operation_id.as_str())
             {
-                keys.insert((target_node.clone(), session_id));
-                operations.insert((target_node, operation_id));
+                if let Some(session_id) = session_id {
+                    keys.insert((target_node.clone(), session_id.clone()));
+                }
+                operations.insert((target_node.clone(), operation_id.clone()));
             }
         }
         let mut sessions = vec![];
@@ -6487,7 +6673,16 @@ impl Runtime {
         ensure!(
             matches!(
                 kind,
-                "prepare" | "subscription" | "rpc" | "execute" | "inventory" | "event" | "blob"
+                "prepare"
+                    | "subscription"
+                    | "rpc"
+                    | "execute"
+                    | "inventory"
+                    | "event"
+                    | "blob"
+                    | "progress_read"
+                    | "schedule"
+                    | "manager_status"
             ),
             "unsupported peer operation"
         );
@@ -6529,6 +6724,9 @@ impl Runtime {
             "inventory" => Some("replica_inventory"),
             "event" => Some("replica_event"),
             "blob" => Some("replica_blob"),
+            "progress_read" => Some("progress_read"),
+            "schedule" => Some("schedule"),
+            "manager_status" => Some("manager_status"),
             _ => None,
         };
         if let Some(expected) = expected_method {
@@ -6647,7 +6845,14 @@ impl Runtime {
             .store
             .lock()
             .await
-            .session(space.as_str(), &request.target_node, &request.session_id)?
+            .session(
+                space.as_str(),
+                &request.target_node,
+                request
+                    .session_id
+                    .as_deref()
+                    .context("Provider operation has no SDK session")?,
+            )?
             .context("running operation lost its session")?;
         if method == "bridge.codex_disconnected" && session.executor == "codex" {
             if operation.state == OperationState::Running {
@@ -6671,13 +6876,20 @@ impl Runtime {
         {
             return Ok(());
         }
-        let _ = self.events.send(Update {
-            network_id: space.to_string(),
-            payload: json!({
-                "type":"execution_progress","conversation_id":request.conversation_id,
-                "session_id":request.session_id,"event":event,
-            }),
-        });
+        let sequence = {
+            let mut sequences = self
+                .progress_sequences
+                .lock()
+                .expect("progress sequence lock");
+            let value = sequences
+                .entry((space.to_string(), operation_id.clone()))
+                .or_default();
+            *value += 1;
+            *value
+        };
+        self.publish_progress(space.as_str(),json!({"type":"execution_progress","conversation_id":request.conversation_id,
+            "target_node":request.target_node,"operation_id":request.operation_id,"session_id":request.session_id,
+            "sequence":sequence,"attempt":request.operation_id,"progress":progress_observation::execution_progress(event)}));
         if method == "turn/completed" && operation.state == OperationState::Running {
             let turn = field(&event["params"]["turn"], "id")?;
             let known = self
@@ -6719,9 +6931,12 @@ impl Runtime {
         if operation.state.terminal() {
             return Ok(json!({"operation":operation}));
         }
-        let mut actual = self
-            .session_fact(network, target, &operation.request.session_id)
-            .await?;
+        let Some(session_id) = operation.request.session_id.as_deref() else {
+            return Ok(
+                json!({"operation":operation,"actual":{"state":"unknown","detail":"Command process outcome requires evidence from the execution device; it will not be replayed."}}),
+            );
+        };
+        let mut actual = self.session_fact(network, target, session_id).await?;
         let known = self
             .store
             .lock()
@@ -6760,7 +6975,7 @@ impl Runtime {
         access.require_body(input)?;
         let operation = {
             let mut store = self.store.lock().await;
-            access.verification.run(|| {
+            let operation = access.verification.run(|| {
                 store.resolve_request_authorized_operation(
                     &self.identity,
                     &access.authorization,
@@ -6769,196 +6984,127 @@ impl Runtime {
                     input,
                     now_ms() as u64,
                 )
-            })?
+            })?;
+            store.seal_local_execution_result(
+                &self.identity,
+                &operation.request.network_id,
+                &operation.request.operation_id,
+                now_ms() as u64,
+            )?;
+            operation
         };
         self.publish_changed(&access.network_id, &operation.request.conversation_id, "");
         Ok(json!({"operation":operation}))
     }
-    fn spawn_scheduler(
+    pub(super) async fn agent_child_access(
         self: &Arc<Self>,
-        network: String,
-        scope: String,
-        trigger: String,
-    ) -> futures_util::future::BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
-            let work = self.maintenance.enter()?;
-            let audience = self.audience()?;
-            let session = vibeface_secure::authorization::SessionRef {
-                target: audience.device.clone(),
-                session_id: trigger.clone(),
-            };
-            let access = self.store.lock().await.agent_grant(
-                &network,
-                &scope,
-                &audience.service,
-                &session,
-                &trigger,
-                now_ms() as u64,
-            )?;
-            let node = self.clone();
-            tokio::spawn(async move {
-                let _work = work;
-                if let Err(error) = crate::scheduler::run(
-                    node.clone(),
-                    access.clone(),
-                    scope.clone(),
-                    trigger.clone(),
-                )
-                .await
-                    && crate::scheduler::status(&node, &network, &scope, &trigger)
-                        .await
-                        .is_ok_and(|status| status["state"] == "not_found")
-                {
-                    let _ = node
-                        .agent_notification(
-                            &access,
-                            "manager_failed",
-                            &format!("管理 Agent 未完成：{error:#}"),
-                        )
-                        .await;
-                }
-            });
-            Ok(())
-        })
+        parent: &Access,
+        mut body: Value,
+    ) -> Result<Access> {
+        let manager = parent
+            .manager
+            .as_ref()
+            .context("tool request has no active manager")?;
+        let session = &manager.session;
+        body["space_id"] = json!(session.space_id);
+        body["resource_id"] = json!(session.resource_id);
+        body["conversation_id"] = json!(session.conversation_id);
+        body["sdk_session"] = json!(session.sdk_session);
+        body["parent_invocation"] = json!(session.parent_invocation);
+        let verification = SignatureVerification::new();
+        self.prepare_agent_dispatch_destination(session, &mut body)
+            .await?;
+        let body = self
+            .normalize_request_body_with_verification(&session.space_id, body, &verification)
+            .await?;
+        let mut access = self
+            .authorize_agent_with_verification(session, body, verification)
+            .await?;
+        access.manager = Some(manager.clone());
+        Ok(access)
     }
-    fn maybe_followup<'a>(
-        self: &'a Arc<Self>,
-        request: &'a OperationRequest,
-        result_hash: &'a str,
-        verification: &'a SignatureVerification,
-    ) -> futures_util::future::BoxFuture<'a, Result<bool>> {
-        Box::pin(async move {
-            if request.action["type"] != "send" {
-                return Ok(true);
-            }
-            let Some(task) = &request.task_id else {
-                return Ok(true);
-            };
-            let authorized = {
-                let store = self.store.lock().await;
-                verification.run(|| {
-                    followup_authorized(&store, &request.network_id, &request.conversation_id, task)
-                })?
-            };
-            if !authorized {
-                return Ok(true);
-            }
-            {
-                let store = self.store.lock().await;
-                let _verification = verification.enter();
-                let result = store
-                    .event(&request.network_id, result_hash)?
-                    .context("continuation result is missing")?;
-                let result = store.verify_event(&request.network_id, &result)?;
-                if !matches!(&result.cause, EventCause::Derived { admission, .. }
-                    if matches!(admission.invocation.payload.actor, Actor::Service(_)))
-                {
-                    return Ok(true);
-                }
-            }
-            if self.config.manager.is_none() || !self.config.roles.contains(&NodeRole::Scheduler) {
-                return Ok(false);
-            }
-            let audience = self.audience()?;
-            let session = vibeface_secure::authorization::SessionRef {
-                target: audience.device,
-                session_id: result_hash.to_owned(),
-            };
-            let access = {
-                let mut store = self.store.lock().await;
-                let _verification = verification.enter();
-                if store
-                    .continuation(&request.network_id, result_hash, "v2")?
-                    .is_some()
-                    || !followup_authorized(
-                        &store,
-                        &request.network_id,
-                        &request.conversation_id,
-                        task,
-                    )?
-                {
-                    return Ok(true);
-                }
-                let access = store.agent_grant(
-                    &request.network_id,
-                    &request.conversation_id,
-                    &audience.service,
-                    &session,
-                    result_hash,
-                    now_ms() as u64,
-                )?;
-                access
-            };
-            let sdk_config =
-                crypto::digest(&serde_json::to_vec(self.config.manager.as_ref().unwrap())?);
-            let admission = match self
-                .claim_manager(
-                    &access,
-                    result_hash,
-                    crate::scheduler::boot_id(),
-                    &sdk_config,
-                )
-                .await
-            {
-                Ok(admission) => admission,
-                Err(error)
-                    if error
-                        .downcast_ref::<crate::scheduler::ManagerBusy>()
-                        .is_some() =>
-                {
-                    return Ok(false);
-                }
-                Err(error) => return Err(error),
-            };
-            let work = self.maintenance.enter()?;
-            let node = self.clone();
-            let request = request.clone();
-            let source = result_hash.to_owned();
-            tokio::spawn(async move {
-                let _work = work;
-                let outcome = crate::scheduler::run_admitted(
-                    node.clone(),
-                    access,
-                    request.conversation_id.clone(),
-                    source.clone(),
-                    Some(admission),
-                )
-                .await;
-                let (state, value) = match outcome {
-                    Ok(value) if value["state"] == "completed" => ("completed", value),
-                    Ok(value) if value["state"] == "failed" => ("failed", value),
-                    Ok(value) => ("unknown", value),
-                    Err(error) => {
-                        let state = crate::scheduler::status(
-                            &node,
-                            &request.network_id,
-                            &request.conversation_id,
-                            &source,
-                        )
-                        .await;
-                        let confirmed_failed = state.is_ok_and(|value| value["state"] == "failed");
-                        (
-                            if confirmed_failed {
-                                "failed"
-                            } else {
-                                "unknown"
-                            },
-                            json!({"error":format!("{error:#}")}),
-                        )
-                    }
-                };
-                if let Ok(target) = node.identity.node_id() {
-                    let _ = node.store.lock().await.finish_continuation(
-                        &request.network_id,
-                        &source,
-                        "v2",
-                        &target,
-                        state,
-                        value,
-                    );
-                }
-            });
-            Ok(true)
-        })
+    pub(crate) async fn publish_scheduler_result(
+        self: &Arc<Self>,
+        session: &AgentSession,
+        job: &crate::scheduling::SchedulerJob,
+        output: String,
+        blobs: Vec<BlobRef>,
+    ) -> Result<crate::scheduling::SchedulerJob> {
+        self.store.lock().await.retain_scheduler_result(
+            session.space_id.as_str(),
+            job,
+            &output,
+            &blobs,
+        )?;
+        let body = json!({"method":"agent_result","space_id":session.space_id,"resource_id":session.resource_id,
+            "conversation_id":session.conversation_id,"sdk_session":session.sdk_session,"parent_invocation":session.parent_invocation,
+            "authorization_id":format!("result:{}",job.message_id),"decision_id":format!("decision:{}",job.message_id),
+            "text":output,"output":output,"message_id":job.message_id,"blobs":blobs,
+            "effective_constraints":[],"tool_configuration":{"trigger":job.trigger,"attempt_id":job.state.attempt().map(|a|&a.id)}});
+        let access = self.authorize_agent(session, body).await?;
+        let events = vec![
+            (
+                EventBody::DecisionRecorded {
+                    decision_id: field(&access.body, "decision_id")?.into(),
+                    text: output.clone(),
+                    effective_constraints: vec![],
+                    tool_configuration: access.body["tool_configuration"].clone(),
+                },
+                blobs.clone(),
+            ),
+            (
+                EventBody::MessagePosted {
+                    message_id: job.message_id.clone(),
+                    role: "assistant".into(),
+                    text: output,
+                    scheduler_node: None,
+                },
+                blobs,
+            ),
+        ];
+        let mut store = self.store.lock().await;
+        let _verification = access.verification.enter();
+        store.stage_scheduler_terminal(
+            &self.identity,
+            &access.authorization,
+            &access.freshness,
+            &access.transport,
+            &access.body,
+            job,
+            crate::scheduling::JobOutcome::Completed,
+            events,
+            now_ms() as u64,
+        )
+    }
+    pub(super) async fn conversation_verified_facts(
+        self: &Arc<Self>,
+        access: &Access,
+        input: &Value,
+    ) -> Result<Value> {
+        let network = &access.network_id;
+        let scope = input["conversation_id"].as_str().map(String::from);
+        let scope = scope.context("conversation_id is required")?;
+        let mut store = self.store.lock().await;
+        let _verification = access.verification.enter();
+        store.authorize_request_read(
+            &access.authorization,
+            &access.freshness,
+            &access.transport,
+            now_ms() as u64,
+        )?;
+        let context = store.context(network, &scope, &heads(&input)?)?;
+        let operations = store
+            .operations(network)?
+            .into_iter()
+            .filter(|operation| operation.request.conversation_id == scope)
+            .collect::<Vec<_>>();
+        let sessions = session_views(&store, network, &scope, &operations)?;
+        let operations = operations
+            .iter()
+            .map(|operation| dispatch::execution_operation_view(&store, operation))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(
+            json!({"conversation":store.conversations(network)?.into_iter().find(|conversation|conversation.conversation_id==scope),"messages":store.messages(network,&scope)?,"tasks":task_views(&store,network,&scope)?,"heads":context.heads,"missing":context.missing,"sessions":sessions,"operations":operations}),
+        )
     }
 }

@@ -11,6 +11,9 @@ export type VaultProfile = { id: string; name: string; passkey: boolean }
 export function initClient(options: ClientVaultOptions): Promise<{ nodeId: string; publicKey: string; profileId: string | null }>
 export function clientVaultStatus(): Promise<{ status: 'locked' | 'empty' | 'key_lost'; profiles: VaultProfile[] } | { status: 'unavailable'; profiles: VaultProfile[]; error: string }>
 export function lockClient(): void
+export function setLocalAccessNode(nodeId: string | null): void
+export function bindLocalVault(nodeId: string, unlockKey: string, isCurrent?: () => boolean, signal?: AbortSignal): Promise<void>
+export function unlockLocalVault(nodeId: string, unlockKey: string, isCurrent?: () => boolean): Promise<{ nodeId: string; publicKey: string; profileId: string } | null>
 export function exportDeviceVault(): Promise<string>
 export function sealDeviceVault(secret: string, password: string): Promise<unknown>
 export function openDeviceVault(value: unknown, password: string): Promise<string>

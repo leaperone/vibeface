@@ -18,7 +18,7 @@ import type { TaskRecord } from "./types"
 
 const taskStatuses = ["open", "working", "blocked", "needs_review", "accepted", "cancelled"] as const
 
-export function TasksScreen() {
+export function TaskControls() {
   const workspace = useWorkspace()
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -27,7 +27,7 @@ export function TasksScreen() {
   const tasks = workspace.data?.tasks ?? []
 
   return (
-    <section className="workspace-screen space-y-5" aria-label="工单" hidden={workspace.view !== "tasks"}>
+    <section className="workspace-screen space-y-5" aria-label="工单">
       <Collapsible open={open || Boolean(pending)} onOpenChange={setOpen}>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-semibold">工单 <span className="text-sm font-normal text-muted-foreground">{tasks.length}</span></h2>

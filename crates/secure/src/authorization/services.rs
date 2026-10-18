@@ -833,6 +833,11 @@ mod tests {
                 &source,
                 &serde_json::to_string(&serde_json::json!({
                     "selection":selection, "context":context, "expected_action":Action::ExecutionOpen,
+                    "work": ExecutionWorkIntent::TaskSession {
+                        task: facts.context.task.clone().unwrap(),
+                        binding_generation: 1,
+                        execution_session: facts.context.execution_session.clone().unwrap(),
+                    },
                     "purpose":remote_execution_policy::RemoteExecutionPolicyPurpose::Execution,
                     "execution_pins":remote.pins,
                 })).unwrap(),
@@ -902,6 +907,7 @@ mod tests {
             &facts,
             &selection,
             &context,
+            trust.work(),
             None,
             &provenance,
             &fixture.node,
@@ -1111,8 +1117,8 @@ mod tests {
             "execution_resource":selection.execution_resource,"target_public_key":selection.target_public_key,
             "execution_grant":selection.execution_grant,"request":{"space_id":fixture.space,
                 "conversation_id":"chat","operation_id":facts.operation_id,"task_id":"task",
-                "target_node":remote.node.node_id(),"session_id":"foreign-execution","binding":binding,
-                "action":{"type":"open"},"resources":[]}});
+                "target_node":remote.node.node_id(),"session_id":"foreign-execution","expected_revision":0,"binding":binding,
+                "action":binding.binding.open_spec,"resources":[]}});
         facts.body_hash = ObjectHash::body(&body).unwrap();
         let parent = fixture.parent(&fixture.owner_grant, NOW);
         let provenance = fixture.sdk_source_provenance(&parent, &facts, NOW + 250);
@@ -1126,6 +1132,7 @@ mod tests {
             &facts,
             &selection,
             &context,
+            trust.work(),
             None,
             &provenance,
             &fixture.node,
@@ -1519,6 +1526,7 @@ mod tests {
                 &facts,
                 &selection,
                 &context,
+                trust.work(),
                 None,
                 &provenance,
                 &fixture.node,

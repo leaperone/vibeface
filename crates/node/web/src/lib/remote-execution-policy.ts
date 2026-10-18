@@ -5,6 +5,7 @@ import type { VerifiedClientAuthorization, VerifiedRemoteExecutionPolicy } from 
 import type { AuthorizationTrust } from './authorization-trust'
 import { counter, parseAuthorizationTrust, typedId } from './authorization-trust'
 import type { RemoteExecutionSelection } from './remote-execution'
+import type { ExecutionWorkIntent } from './execution-work'
 import type { prepareContext } from './rpc-prepare'
 import { beginForeignExecutionPolicyImport, lookupForeignExecutionPolicy } from './remote-execution-policy-ingress'
 import type { RemoteExecutionPolicyUse } from './remote-execution-policy-ingress'
@@ -16,6 +17,7 @@ export async function readRemoteExecutionPolicy(input: {
   withSource<T>(work: (source: VerifiedClientAuthorization) => T): Promise<T>
   selection: RemoteExecutionSelection
   context: ReturnType<typeof prepareContext>
+  work: ExecutionWorkIntent
   action: string
   purpose: RemoteExecutionPolicyPurpose
   use?: RemoteExecutionPolicyUse
@@ -43,9 +45,9 @@ export async function readRemoteExecutionPolicy(input: {
   check()
   if (input.executionTrust.spaceId !== input.selection.execution_resource.space) throw new Error('执行政策信任与选定的执行空间不同。')
   const pinsJson = JSON.stringify(input.executionTrust.pins)
-  let context = input.context, action = input.action
+  let context = input.context, action = input.action, work = input.work
   const buildIntent = async () => {
-    const intentInputJson = JSON.stringify({ selection: input.selection, context, expected_action: action,
+    const intentInputJson = JSON.stringify({ selection: input.selection, context, work, expected_action: action,
       purpose: input.purpose, execution_pins: input.executionTrust.pins })
     const intentJson = await input.withSource(source => buildClientRemoteExecutionPolicyReadIntent(source, intentInputJson, Date.now() + 120_000))
     check()
@@ -65,7 +67,8 @@ export async function readRemoteExecutionPolicy(input: {
       if (!same(record(selected.metadata.selection), input.selection) || !same(roots(approved), roots(input.executionTrust))) {
         const generation = counter(binding.generation) + 1
         if (!Number.isSafeInteger(generation)) throw new Error('新绑定代次超过此客户端支持范围。')
-        action = 'execution_rebind'; context = { ...context, binding_generation: generation }
+        if (work.kind !== 'task_session') throw new Error('只有任务会话支持绑定代次。')
+        action = 'execution_rebind'; context = { ...context, binding_generation: generation }; work = { ...work, binding_generation: generation }
         intent = await buildIntent()
       }
     }

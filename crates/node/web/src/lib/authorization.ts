@@ -1,7 +1,8 @@
 import { signAuthorizedClientInvocation, signAuthorizedClientPrepare, prepareRemoteClientExecution, signRemoteClientExecution, signRemoteExecutionObservation } from '../../transport.js'
-import { deriveAuthorizationId, revalidateClientPolicyAuthorization, verifyAccountDeviceDirectory, verifyProjectExecutionMetadata, verifyRemoteExecution, verifyRemoteExecutionResultHistory, verifyRemoteResolutionHistory } from '../../generated/vibeface_secure.js'
+import { deriveAuthorizationId, revalidateClientPolicyAuthorization, verifyAccountDeviceDirectory, verifyProjectExecutionMetadata, verifyRemoteExecution, verifyRemoteExecutionResultHistory, verifyRemoteResolutionHistory, verifyObservedExecutionResult, verifyProjectDispatchWork, verifyProjectExecutionResult } from '../../generated/vibeface_secure.js'
+import { parseVerifiedProjectWork } from './execution-work'
 import type * as secure from '../../generated/vibeface_secure.js'
-import { parseRemoteExecutionObservation, parseRemoteExecutionResolutionResult, parseRemoteExecutionSession, parseRemoteExecutionShare, parseTrustedRemoteExecution } from './remote-execution'
+import { parseRemoteExecutionObservation, parseRemoteExecutionResolutionResult, parseRemoteExecutionSession, parseRemoteExecutionShare, parseTrustedRemoteExecution, parseRemoteExecutionControl } from './remote-execution'
 import type { RemoteExecutionObservation, RemoteExecutionResolutionResult, TrustedRemoteExecution } from './remote-execution'
 import { array, record, same, strings } from './node'
 import { parseIdentityScope } from './scope'
@@ -74,17 +75,21 @@ export function verifyScopedAuthentication(handle: secure.VerifiedClientAuthoriz
             requireRemoteActive()
             handle.validateReplay(verified, bodyJson, invocationJson, expectedAction, operationId, presenter, Date.now())
           },
-          session(receipt: Record<string, unknown>, binding: Record<string, unknown>) {
+          session(receipt: Record<string, unknown>, binding: Record<string, unknown> | null) {
             requireRemoteActive()
             return parseRemoteExecutionSession(JSON.parse(handle.sessionJson(JSON.stringify(receipt), JSON.stringify(binding), Date.now())))
           },
-          result(actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown>) {
+          result(actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown> | null) {
             requireRemoteActive()
             return parseRemoteExecutionObservation(JSON.parse(handle.resultJson(JSON.stringify(actual), JSON.stringify(original.body), JSON.stringify(original.invocation), JSON.stringify(binding), Date.now())))
           },
-          observation(actual: Record<string, unknown>, binding: Record<string, unknown>) {
+          observation(actual: Record<string, unknown>, binding: Record<string, unknown> | null) {
             requireRemoteActive()
             return parseRemoteExecutionObservation(JSON.parse(handle.observationJson(JSON.stringify(actual), JSON.stringify(binding), Date.now())))
+          },
+          control(actual: Record<string, unknown>, expectedRevision: number) {
+            requireRemoteActive()
+            return parseRemoteExecutionControl(JSON.parse(handle.controlJson(JSON.stringify(actual), expectedRevision, Date.now())))
           },
           observationRequest(original: Record<string, unknown>, authorizationId: string) {
             requireRemoteActive()
@@ -143,11 +148,24 @@ export function verifyScopedAuthentication(handle: secure.VerifiedClientAuthoriz
         try { return adoptRemote(verifyRemoteExecution(verified, currentPolicy, Date.now()), remote) }
         finally { currentPolicy.free() }
       },
-      projectExecutionMetadata(source: Record<string, unknown>, binding: Record<string, unknown>) {
+      observedExecutionResult(actual: Record<string, unknown>, binding: Record<string, unknown> | null, targetPublicKey: string, operationId: string) {
+        requireActive()
+        const result = record(JSON.parse(verifyObservedExecutionResult(verified, JSON.stringify(actual), JSON.stringify(binding), targetPublicKey, operationId)))
+        return { request: record(result.request), work: record(result.work) }
+      },
+      projectDispatchWork(dispatch: Record<string, unknown>, origin: Record<string, unknown>, targetPublicKey: string, operationId: string) {
+        requireActive()
+        return parseVerifiedProjectWork(JSON.parse(verifyProjectDispatchWork(verified, JSON.stringify(dispatch), JSON.stringify(origin), targetPublicKey, operationId)))
+      },
+      projectExecutionResult(actual: Record<string, unknown>, origin: Record<string, unknown>, targetPublicKey: string, operationId: string) {
+        requireActive()
+        return parseVerifiedProjectWork(JSON.parse(verifyProjectExecutionResult(verified, JSON.stringify(actual), JSON.stringify(origin), targetPublicKey, operationId)))
+      },
+      projectExecutionMetadata(source: Record<string, unknown>, binding: Record<string, unknown> | null) {
         if (released) throw new Error('账户授权已释放，请重新连接。')
         return record(JSON.parse(verifyProjectExecutionMetadata(verified, JSON.stringify(source), JSON.stringify(binding))))
       },
-      remoteExecutionResultHistory(value: TrustedRemoteExecution, policy: secure.VerifiedRemoteExecutionHistoryPolicy, actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown>): RemoteExecutionObservation {
+      remoteExecutionResultHistory(value: TrustedRemoteExecution, policy: secure.VerifiedRemoteExecutionHistoryPolicy, actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown> | null): RemoteExecutionObservation {
         requireActive()
         const remote = parseTrustedRemoteExecution(value)
         const currentPolicy = policy.revalidatePins(JSON.stringify(remote.trust.pins), Date.now())

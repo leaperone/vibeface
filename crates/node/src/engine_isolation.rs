@@ -86,6 +86,7 @@ pub(super) struct DockerIsolation {
     data_dir: PathBuf,
     scopes: Arc<Mutex<BTreeMap<String, IsolatedScope>>>,
     project_read_only: bool,
+    command_scope: bool,
 }
 
 struct IsolatedScope {
@@ -119,6 +120,7 @@ impl DockerIsolation {
             data_dir,
             scopes: Arc::new(Mutex::new(BTreeMap::new())),
             project_read_only: false,
+            command_scope: false,
         }
     }
 
@@ -133,8 +135,20 @@ impl DockerIsolation {
         }
     }
 
+    pub fn command(config: ExecutionIsolationConfig, data_dir: PathBuf) -> Self {
+        Self {
+            command_scope: true,
+            ..Self::new(config, data_dir)
+        }
+    }
+
     fn key(&self, context: &ExecutionContext) -> String {
-        if self.project_read_only {
+        if self.command_scope {
+            hash(&format!(
+                "command\0{}\0{}\0{}",
+                context.space_id, context.resource_id, context.operation_id
+            ))
+        } else if self.project_read_only {
             hash(&format!(
                 "manager\0{}\0{}\0{}",
                 context.space_id, context.resource_id, context.operation_id

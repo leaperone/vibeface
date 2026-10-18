@@ -12,6 +12,7 @@ import { useDevice } from './context'
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
 import { VaultControls } from './vault-controls'
 import { IncomingEnrollmentControls } from './enrollment-status'
+import { LocalAccessControls } from './local-access-controls'
 
 const input = 'min-h-10'
 const button = 'min-h-10'
@@ -50,13 +51,14 @@ export function ConnectionScreen() {
         <h1 className="text-2xl font-semibold tracking-tight">连接设备</h1>
         <p className="text-sm text-muted-foreground">解锁此浏览器的独立设备配置，再选择入口或使用设备邀请。</p>
       </header>
-      {['initializing', 'connecting', 'unpaired'].includes(device.phase) && <p role="status" className="text-sm text-muted-foreground">{device.phase === 'initializing' ? '正在读取设备密钥…' : device.phase === 'connecting' ? '正在建立加密连接并核对设备…' : '等待此浏览器授权。'}</p>}
+      {['initializing', 'connecting', 'reconnecting', 'unpaired'].includes(device.phase) && <p role="status" className="text-sm text-muted-foreground">{device.phase === 'initializing' ? '正在读取设备密钥…' : device.phase === 'connecting' ? '正在建立加密连接并核对设备…' : '等待此浏览器授权。'}</p>}
       {(device.nodeEnrollmentReview || device.teamCreationReview || device.governancePending) && <Card className={panel}>
         <p role="status" className="text-sm">已保留原 Node、团队或政策请求。请用原设备配置重新连接同一授权 Node 和空间，再核对原结果。</p>
         <Button type="button" variant="outline" onClick={device.cancelSensitive}>关闭原待核对请求</Button>
         <p className="text-xs text-muted-foreground">关闭不会撤回已生效的变更。团队请求请保留提交前下载的加密恢复包。</p>
       </Card>}
       {(error || device.error) && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error || device.error}</p>}
+      <LocalAccessControls />
       {device.phase === 'blocked' && <Card className={panel} aria-labelledby="secure-page-title"><h2 id="secure-page-title" className="font-semibold">需要可信的安全页面</h2><p className="text-sm text-muted-foreground">请在节点本机打开 http://localhost:4790，或使用你信任的 HTTPS 客户端。普通局域网 HTTP 页面不能安全保存设备密钥。可信页面仍可连接允许的局域网节点。</p></Card>}
       {['vault_empty', 'vault_locked', 'vault_unavailable', 'key_lost'].includes(device.phase) && <VaultControls />}
       {device.identity && <Button variant="outline" className={`${button} self-start`} type="button" onClick={device.lockVault}>锁定设备仓库</Button>}

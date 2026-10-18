@@ -1,19 +1,42 @@
 export function rpcAction(method: string, body: Record<string, unknown>) {
   switch (method) {
+    case 'bots':
     case 'conversations':
     case 'execution_share_request':
     case 'conversation': return 'conversation_read'
+    case 'read_artifact': return 'attachment_read'
     case 'notifications': return 'notification_read'
+    case 'create_bot':
     case 'create_conversation': return 'conversation_create'
     case 'message': return 'message_append'
     case 'create_task': return 'task_create'
     case 'update_task': return body.status === 'accepted' ? 'task_accept' : body.status === 'cancelled' ? 'task_cancel' : 'task_progress'
+    case 'execution_status':
     case 'nodes':
     case 'operation':
     case 'remote_execution_seal_status':
     case 'session': return 'operation_status_read'
     case 'reconcile': return 'operation_reconcile'
     case 'resolve_unknown': return 'operation_resolve'
+    case 'cancel_manager': return 'agent_interrupt'
+    case 'set_followup': return 'task_followup'
+    case 'resolve_manager_unknown': return 'operation_resolve'
+    case 'task_control':
+      if (body.action === 'status') return 'operation_status_read'
+      if (body.action === 'steer') return 'execution_steer'
+      if (body.action === 'interrupt') return 'execution_interrupt'
+      if (body.action === 'respond_request') return 'execution_respond_approval'
+      throw new Error('工单控制请求包含未支持的操作。')
+    case 'execution_control': {
+      const action = body.action
+      if (!action || typeof action !== 'object' || !('type' in action)) throw new Error('执行控制缺少最终操作类型。')
+      switch (action.type) {
+        case 'steer': return 'execution_steer'
+        case 'interrupt': return 'execution_interrupt'
+        case 'respond_request': return 'execution_respond_approval'
+        default: throw new Error('执行控制包含未支持的操作。')
+      }
+    }
     case 'ack': return 'notification_ack'
     case 'bind_execution': return 'execution_open'
     case 'rebind_execution':
@@ -54,6 +77,14 @@ export function prepareRpc(input: { method: string; params: Record<string, unkno
       authorizationId = request.operation_id
       break
     }
+    case 'task_control':
+      if (params.action === 'status') break
+      if (typeof params.operation_id !== 'string' || !params.operation_id) throw new Error('控制请求缺少原操作编号。')
+      authorizationId = params.operation_id; break
+    case 'execution_control':
+      if (typeof params.operation_id !== 'string' || !params.operation_id) throw new Error('控制请求缺少原操作编号。')
+      authorizationId = params.operation_id; break
+    case 'create_bot': authorizationId = stableAuthorizationId('bot', params.bot_id); break
     case 'message': authorizationId = stableAuthorizationId('message', params.message_id); break
     case 'create_conversation': authorizationId = stableAuthorizationId('conversation', params.conversation_id); break
     case 'create_task': authorizationId = stableAuthorizationId('task', params.task_id); break

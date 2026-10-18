@@ -174,11 +174,100 @@ pub struct IncomingSocket {
     pub socket: NetworkSocket,
 }
 
+pub(crate) async fn serve_local_client(
+    node: Arc<crate::runtime::Runtime>,
+    socket: WebSocket,
+    session: crate::local_access::Session,
+) -> Result<()> {
+    let mut socket = NetworkSocket::Local(Box::new(LocalSocket {
+        socket: Box::new(NetworkSocket::server(socket)),
+        revoked: Box::pin(session.revoked()),
+        closed: false,
+    }));
+    send_control(
+        &mut socket,
+        &Control::Welcome {
+            nonce: random_token(),
+        },
+    )
+    .await?;
+    let control = tokio::time::timeout(CONNECT_TIMEOUT, receive_control(&mut socket))
+        .await
+        .context("local client handshake timed out")??;
+    ensure!(
+        matches!(
+            control,
+            Control::Direct {
+                service: Service::Client
+            }
+        ),
+        "local entry only accepts direct clients"
+    );
+    send_control(&mut socket, &Control::Ready).await?;
+    crate::client::serve(node, socket).await
+}
+
 pub enum NetworkSocket {
     Server(Box<WebSocket>),
+    Local(Box<LocalSocket>),
     Limited(Box<NetworkSocket>, OwnedSemaphorePermit),
     Routed(Box<NetworkSocket>, String),
     Client(Box<WebSocketStream<MaybeTlsStream<TcpStream>>>),
+}
+
+pub struct LocalSocket {
+    socket: Box<NetworkSocket>,
+    revoked: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    closed: bool,
+}
+
+impl LocalSocket {
+    fn active(&mut self, cx: &mut TaskContext<'_>) -> bool {
+        if !self.closed && self.revoked.as_mut().poll(cx).is_ready() {
+            self.closed = true;
+        }
+        !self.closed
+    }
+    fn closed_error() -> anyhow::Error {
+        anyhow::anyhow!("local browser session ended")
+    }
+}
+impl Stream for LocalSocket {
+    type Item = Result<Message>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if !this.active(cx) {
+            return Poll::Ready(None);
+        }
+        Pin::new(&mut *this.socket).poll_next(cx)
+    }
+}
+impl Sink<Message> for LocalSocket {
+    type Error = anyhow::Error;
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
+        let this = self.get_mut();
+        if !this.active(cx) {
+            return Poll::Ready(Err(Self::closed_error()));
+        }
+        Pin::new(&mut *this.socket).poll_ready(cx)
+    }
+    fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
+        let this = self.get_mut();
+        if this.closed {
+            return Err(Self::closed_error());
+        }
+        Pin::new(&mut *this.socket).start_send(item)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
+        let this = self.get_mut();
+        if !this.active(cx) {
+            return Poll::Ready(Err(Self::closed_error()));
+        }
+        Pin::new(&mut *this.socket).poll_flush(cx)
+    }
+    fn poll_close(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
+        Pin::new(&mut *self.get_mut().socket).poll_close(cx)
+    }
 }
 impl NetworkSocket {
     pub fn server(socket: WebSocket) -> Self {
@@ -188,6 +277,7 @@ impl NetworkSocket {
         match self {
             Self::Routed(_, route) => Some(route.clone()),
             Self::Limited(socket, _) => socket.route(),
+            Self::Local(socket) => socket.socket.route(),
             _ => None,
         }
     }
@@ -196,6 +286,7 @@ impl Stream for NetworkSocket {
     type Item = Result<Message>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         match self.get_mut() {
+            Self::Local(socket) => Pin::new(&mut **socket).poll_next(cx),
             Self::Limited(socket, _) | Self::Routed(socket, _) => {
                 Pin::new(&mut **socket).poll_next(cx)
             }
@@ -229,6 +320,7 @@ impl Sink<Message> for NetworkSocket {
     type Error = anyhow::Error;
     fn poll_ready(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
         match self.get_mut() {
+            Self::Local(socket) => Pin::new(&mut **socket).poll_ready(cx),
             Self::Limited(socket, _) | Self::Routed(socket, _) => {
                 Pin::new(&mut **socket).poll_ready(cx)
             }
@@ -238,6 +330,7 @@ impl Sink<Message> for NetworkSocket {
     }
     fn start_send(self: Pin<&mut Self>, item: Message) -> Result<()> {
         match self.get_mut() {
+            Self::Local(socket) => Pin::new(&mut **socket).start_send(item),
             Self::Limited(socket, _) | Self::Routed(socket, _) => {
                 Pin::new(&mut **socket).start_send(item)
             }
@@ -255,6 +348,7 @@ impl Sink<Message> for NetworkSocket {
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
         match self.get_mut() {
+            Self::Local(socket) => Pin::new(&mut **socket).poll_flush(cx),
             Self::Limited(socket, _) | Self::Routed(socket, _) => {
                 Pin::new(&mut **socket).poll_flush(cx)
             }
@@ -264,6 +358,7 @@ impl Sink<Message> for NetworkSocket {
     }
     fn poll_close(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<()>> {
         match self.get_mut() {
+            Self::Local(socket) => Pin::new(&mut **socket).poll_close(cx),
             Self::Limited(socket, _) | Self::Routed(socket, _) => {
                 Pin::new(&mut **socket).poll_close(cx)
             }

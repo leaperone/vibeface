@@ -5,7 +5,7 @@ use super::{
     },
     foreign_execution_policy::{
         bind_task_execution_policy_in, check_task_policy_heads_in,
-        current_task_execution_policy_in, current_task_readonly_policy_in,
+        current_execution_readonly_policy_in, current_task_execution_policy_in,
         original_task_execution_policy_in, task_policy_for_binding_in,
     },
     journal::PolicyState,
@@ -102,10 +102,16 @@ impl TaskScopedAuthorization {
             "resolution scope targets another Node"
         );
         let task_policy = if original.task_policy().is_some() {
-            let binding = request
-                .binding
-                .as_ref()
-                .context("NeedPolicySync: resolved operation has no original binding")?;
+            let encoded: String = connection.query_row(
+                "SELECT value FROM local_values WHERE space_id=? AND key=?",
+                params![
+                    invocation.resource.space.as_str(),
+                    format!("project-execution-handoff:{operation_id}")
+                ],
+                |row| row.get(0),
+            )?;
+            let original_handoff: vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff = serde_json::from_str(&encoded)?;
+            let original_work = original_handoff.handoff.source_statement()?.work;
             let selection = RemoteExecutionPolicySelection {
                 execution_resource: serde_json::from_value(
                     proof.source_body["execution_resource"].clone(),
@@ -122,15 +128,20 @@ impl TaskScopedAuthorization {
             };
             let context = PrepareContext {
                 context: facts.context.clone(),
-                binding_generation: Some(binding.binding.generation),
-                canonical_cwd: binding.binding.open_spec["cwd"].as_str().map(str::to_owned),
+                binding_generation: original_work.binding_generation(),
+                canonical_cwd: request
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.binding.open_spec["cwd"].as_str())
+                    .or_else(|| original_work.canonical_cwd())
+                    .map(str::to_owned),
                 execution_target_public_key: Some(selection.target_public_key.clone()),
             };
-            Some(current_task_readonly_policy_in(
+            Some(current_execution_readonly_policy_in(
                 connection,
                 policy,
                 &source,
-                binding,
+                &original_handoff,
                 &selection,
                 RemoteExecutionPolicyPurpose::Resolver,
                 invocation,
@@ -198,34 +209,50 @@ impl TaskScopedAuthorization {
             "operation scope targets another Node"
         );
         let task_policy = if original.task_policy().is_some() {
-            let binding = request
-                .binding
-                .as_ref()
-                .context("NeedPolicySync: admitted remote operation has no original binding")?;
-            let selection = RemoteExecutionPolicySelection {
-                execution_resource: serde_json::from_value(
-                    proof.source_body["execution_resource"].clone(),
+            if request.binding.is_none() {
+                Some(
+                    current_task_execution_policy_in(
+                        connection,
+                        policy,
+                        identity,
+                        &proof.invocation,
+                        &proof.source_body,
+                        now_ms,
+                    )?
+                    .context("NeedPolicySync: admitted execution work has no current policy")?,
                 )
-                .context("NeedPolicySync: admitted remote operation has no execution resource")?,
-                target_public_key: serde_json::from_value(
-                    proof.source_body["target_public_key"].clone(),
-                )
-                .context("NeedPolicySync: admitted remote operation has no execution key")?,
-                execution_grant: serde_json::from_value(
-                    proof.source_body["execution_grant"].clone(),
-                )
-                .context("NeedPolicySync: admitted remote operation has no execution grant")?,
-            };
-            Some(task_policy_for_binding_in(
-                connection,
-                policy,
-                &source,
-                binding,
-                &facts.resource,
-                &selection,
-                facts.action,
-                now_ms,
-            )?)
+            } else {
+                let binding = request
+                    .binding
+                    .as_ref()
+                    .context("NeedPolicySync: admitted remote operation has no original binding")?;
+                let selection = RemoteExecutionPolicySelection {
+                    execution_resource: serde_json::from_value(
+                        proof.source_body["execution_resource"].clone(),
+                    )
+                    .context(
+                        "NeedPolicySync: admitted remote operation has no execution resource",
+                    )?,
+                    target_public_key: serde_json::from_value(
+                        proof.source_body["target_public_key"].clone(),
+                    )
+                    .context("NeedPolicySync: admitted remote operation has no execution key")?,
+                    execution_grant: serde_json::from_value(
+                        proof.source_body["execution_grant"].clone(),
+                    )
+                    .context("NeedPolicySync: admitted remote operation has no execution grant")?,
+                };
+                Some(task_policy_for_binding_in(
+                    connection,
+                    policy,
+                    &source,
+                    binding,
+                    &facts.resource,
+                    &selection,
+                    facts.action,
+                    now_ms,
+                )?)
+            }
         } else {
             None
         };

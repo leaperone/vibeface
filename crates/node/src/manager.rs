@@ -7,8 +7,10 @@ use std::{collections::BTreeMap, future::Future, path::PathBuf, process::Stdio, 
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
+    sync::watch,
 };
-use vibeface_bridge::agent::{AgentResult, CustomToolConfig};
+pub use vibeface_bridge::agent::AgentFailure as ManagerFailure;
+use vibeface_bridge::agent::{self, AgentResult, CustomToolConfig};
 
 const MAX_LINE: usize = 1_048_576;
 const MAX_STREAM: usize = 16_777_216;
@@ -51,6 +53,15 @@ fn validate_callback(config: &ManagerConfig) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct ToolFailure(&'static str);
+impl std::fmt::Display for ToolFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+impl std::error::Error for ToolFailure {}
+
 async fn call_tool(config: &ManagerConfig, message: &Value) -> Result<Value> {
     let name = message["name"].as_str().context("tool name missing")?;
     let call = message["call_id"]
@@ -58,13 +69,15 @@ async fn call_tool(config: &ManagerConfig, message: &Value) -> Result<Value> {
         .context("tool call ID missing")?;
     vibeface_protocol::validate_id(call).map_err(anyhow::Error::msg)?;
     ensure!(
-        config.custom_tools.contains_key(name)
-            && message["arguments"].is_object()
+        message["arguments"].is_object()
             && message.as_object().is_some_and(|object| object
                 .keys()
                 .all(|key| matches!(key.as_str(), "type" | "name" | "call_id" | "arguments"))),
         "manager tool is outside its fixed catalog"
     );
+    if !config.custom_tools.contains_key(name) {
+        return Err(ToolFailure("tool_unavailable_in_scope").into());
+    }
     validate_callback(config)?;
     let url = reqwest::Url::parse(
         config
@@ -84,10 +97,7 @@ async fn call_tool(config: &ManagerConfig, message: &Value) -> Result<Value> {
         .json(&json!({"name":name,"arguments":message["arguments"],"call_id":call}))
         .send()
         .await?;
-    ensure!(
-        response.status().is_success(),
-        "scoped Node callback rejected manager tool"
-    );
+    let successful = response.status().is_success();
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         ensure!(
@@ -96,7 +106,31 @@ async fn call_tool(config: &ManagerConfig, message: &Value) -> Result<Value> {
         );
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).context("Node callback returned invalid JSON")
+    let value: Value =
+        serde_json::from_slice(&body).context("Node callback returned invalid JSON")?;
+    if !successful {
+        let code = match value["error"].as_str() {
+            Some("call reference reused with different tool arguments") => {
+                "call reference reused with different tool arguments"
+            }
+            Some("a bounded stable call reference is required") => {
+                "a bounded stable call reference is required"
+            }
+            Some("unknown or unavailable tool") => "tool_unavailable_in_scope",
+            Some("management invocation has been stopped") => {
+                "management invocation has been stopped"
+            }
+            Some("management invocation permission is no longer valid") => {
+                "management invocation permission is no longer valid"
+            }
+            Some("this management invocation is read-only") => {
+                "this management invocation is read-only"
+            }
+            _ => "manager_tool_rejected",
+        };
+        return Err(ToolFailure(code).into());
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -134,11 +168,37 @@ impl Default for ManagerConfig {
     }
 }
 
+impl ManagerKind {
+    pub fn capabilities(self) -> Value {
+        json!({
+            "verified": false,
+            "streaming": true,
+            "cancel": true,
+            "steer": false,
+            "resume_local_session": true,
+            "text_stream_mode": match self { ManagerKind::CursorSdk => "delta_and_snapshot", ManagerKind::CodexSdk => "snapshot" },
+            "cancel_request": true,
+            "cancel_confirmation": self == ManagerKind::CursorSdk,
+            "cancel_confirmation_evidence": match self { ManagerKind::CursorSdk => "provider_terminal_or_managed_process_exit", ManagerKind::CodexSdk => "unavailable_for_detached_sdk_tools" },
+            "native_steer": false,
+            "run_reconcile": false,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct ManagerError {
-    pub uncertain: bool,
+    pub kind: ManagerFailure,
     pub session_id: Option<String>,
     pub message: String,
+}
+impl ManagerError {
+    pub fn uncertain(&self) -> bool {
+        self.kind == ManagerFailure::Unknown
+    }
+    pub fn cancelled(&self) -> bool {
+        self.kind == ManagerFailure::Cancelled
+    }
 }
 impl std::fmt::Display for ManagerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -154,6 +214,7 @@ pub async fn run_manager_authorized<F, P, PF>(
     prompt: &str,
     previous_session_id: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
+    cancel: watch::Receiver<bool>,
     progress: P,
 ) -> Result<AgentResult>
 where
@@ -174,6 +235,14 @@ where
         vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
     }
     validate_callback(config)?;
+    if *cancel.borrow() {
+        return Err(ManagerError {
+            kind: ManagerFailure::Cancelled,
+            session_id: previous_session_id.map(str::to_owned),
+            message: "management cancelled before SDK launch".into(),
+        }
+        .into());
+    }
     let isolated = engine.prepare_manager(context, &config.workspace).await?;
     let mut command = isolated.command("node");
     command.arg("/opt/vibeface/sdk/codex-manager.mjs");
@@ -185,6 +254,7 @@ where
         prompt,
         previous_session_id,
         persist_session,
+        cancel,
         progress,
     )
     .await;
@@ -192,7 +262,7 @@ where
         Ok(_) => {
             if let Err(error) = engine.complete_manager(context).await {
                 return Err(ManagerError {
-                    uncertain: true,
+                    kind: ManagerFailure::Unknown,
                     session_id: result
                         .as_ref()
                         .ok()
@@ -217,6 +287,7 @@ async fn run_codex<F, P, PF>(
     prompt: &str,
     session_id: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
+    mut cancel: watch::Receiver<bool>,
     mut progress: P,
 ) -> Result<AgentResult>
 where
@@ -230,7 +301,7 @@ where
         persist.take().unwrap()(id.clone())
             .await
             .map_err(|error| ManagerError {
-                uncertain: false,
+                kind: ManagerFailure::Failed,
                 session_id: native.clone(),
                 message: format!("persist Codex SDK session before resume: {error}"),
             })?;
@@ -240,10 +311,12 @@ where
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
     let mut child = command
         .spawn()
         .context("start official Codex SDK sidecar; install the pinned SDK dependencies first")?;
+    let process_group = child.id().context("Codex SDK sidecar has no process id")?;
     let mut stdin = child.stdin.take().context("Codex SDK input unavailable")?;
     let stdout = child
         .stdout
@@ -265,10 +338,10 @@ where
     });
     let mut sent = false;
     let secrets = secret_values(config);
+    let mut reader = BufReader::new(stdout);
     let operation = async {
         write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":native,"cwd":cwd,"model":config.model,"codex_path":codex,
-            "tools":config.custom_tools.keys().collect::<Vec<_>>()})).await?;
-        let mut reader = BufReader::new(stdout);
+            "tools":config.custom_tools})).await?;
         let ready = read_message(&mut reader).await?;
         ensure!(
             ready["type"] == "ready" && ready["session_id"].as_str() == native.as_deref(),
@@ -303,12 +376,18 @@ where
                     write_message(&mut stdin, &json!({"type":"session_ack","session_id":id}))
                         .await?;
                 }
-                Some("event") => progress(message["event"].clone()).await?,
+                Some("event") => {
+                    if let Some(event) = codex_progress(&message["event"]) {
+                        progress(event).await?;
+                    }
+                }
                 Some("tool_call") => {
                     let reply = call_tool(config, &message).await;
                     let result = match reply {
                         Ok(value) => value,
-                        Err(_) => json!({"error":"Node tool rejected or unavailable"}),
+                        Err(error) => {
+                            json!({"error":error.downcast_ref::<ToolFailure>().map_or("manager_tool_unavailable",|failure|failure.0)})
+                        }
                     };
                     write_message(
                         &mut stdin,
@@ -349,7 +428,9 @@ where
             }
         }
     };
+    let mut cancellation_requested = false;
     let outcome = tokio::select! {
+        biased;
         result = tokio::time::timeout(Duration::from_secs(config.timeout_secs), operation) => result.unwrap_or_else(|_|Err(anyhow!("Codex SDK management timed out; reconcile before retrying"))),
         diagnostics = async {
             match (&mut stderr_task).await {
@@ -357,25 +438,117 @@ where
                 _ => Err(anyhow!("Codex SDK diagnostic stream failed")),
             }
         } => diagnostics,
-    };
-    stderr_task.abort();
-    if outcome.is_err() {
-        let _ = write_message(&mut stdin, &json!({"type":"cancel"})).await;
-        if tokio::time::timeout(Duration::from_secs(3), child.wait())
-            .await
-            .is_err()
-        {
-            let _ = child.kill().await;
+        _ = agent::wait_for_cancel(&mut cancel) => {
+            cancellation_requested = true;
+            Err(anyhow!("Codex SDK management cancellation requested"))
         }
+    };
+    let mut cancellation_confirmed = false;
+    if outcome.is_err() {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            write_message(&mut stdin, &json!({"type":"cancel","session_id":native})),
+        )
+        .await;
+        if cancellation_requested {
+            cancellation_confirmed = tokio::time::timeout(Duration::from_secs(6), async {
+                let mut total = 0;
+                loop {
+                    let message = read_message(&mut reader).await?;
+                    total += serde_json::to_vec(&message)?.len();
+                    ensure!(
+                        total <= MAX_STREAM,
+                        "Codex cancellation stream exceeded its size limit"
+                    );
+                    match message["type"].as_str() {
+                        Some("cancelled") => {
+                            ensure!(
+                                message["session_id"].as_str() == native.as_deref()
+                                    && message["confirmation"] == "managed_processes_exited",
+                                "Codex SDK returned an invalid cancellation confirmation"
+                            );
+                            ensure!(
+                                child.wait().await?.success(),
+                                "Codex SDK sidecar failed after cancellation"
+                            );
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        Some("event") => {}
+                        _ => return Err(anyhow!("Codex SDK cancellation was not confirmed")),
+                    }
+                }
+            })
+            .await
+            .is_ok_and(|result| result.is_ok());
+        } else {
+            let _ = tokio::time::timeout(Duration::from_secs(6), child.wait()).await;
+        }
+        let _ = agent::terminate_process_group(&mut child, process_group).await;
     }
+    stderr_task.abort();
     outcome.map_err(|error| {
         ManagerError {
-            uncertain: sent,
+            kind: if cancellation_confirmed {
+                ManagerFailure::Cancelled
+            } else if cancellation_requested || sent {
+                ManagerFailure::Unknown
+            } else {
+                ManagerFailure::Failed
+            },
             session_id: native,
             message: redact_string(error.to_string(), &secrets),
         }
         .into()
     })
+}
+
+fn codex_progress(event: &Value) -> Option<Value> {
+    let kind = event.get("type")?.as_str()?;
+    match kind {
+        "item.started" | "item.updated" | "item.completed" => {
+            let item = event.get("item")?;
+            let id = item.get("id")?.as_str()?;
+            if vibeface_protocol::validate_id(id).is_err() {
+                return None;
+            }
+            match item.get("type")?.as_str()? {
+                "agent_message" => {
+                    let text: String = item
+                        .get("text")?
+                        .as_str()?
+                        .chars()
+                        .filter(|ch| !ch.is_control() || matches!(*ch, '\n' | '\r' | '\t'))
+                        .take(16_384)
+                        .collect();
+                    Some(json!({"type":"text_snapshot","item_id":id,"text":text}))
+                }
+                "command_execution" | "mcp_tool_call" | "file_change" | "web_search" => {
+                    let status = if kind == "item.completed" {
+                        "completed"
+                    } else {
+                        "running"
+                    };
+                    let mut value =
+                        json!({"type":"tool","item_id":id,"status":status,"name":item["type"]});
+                    if let Some(status) =
+                        item.get("status").and_then(Value::as_str).filter(|text| {
+                            !text.is_empty()
+                                && text.len() <= 128
+                                && !text.chars().any(char::is_control)
+                        })
+                    {
+                        value["status"] = json!(status);
+                    }
+                    Some(value)
+                }
+                _ => None,
+            }
+        }
+        "turn.started" => Some(json!({"type":"status","status":"running"})),
+        "turn.completed" => Some(json!({"type":"status","status":"finishing"})),
+        "turn.failed" | "error" => Some(json!({"type":"status","status":"failed"})),
+        _ => None,
+    }
 }
 
 async fn write_message(
@@ -492,6 +665,7 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
                 tokio::fs::write(marker, b"yes").await?;
                 Ok(())
             },
+            watch::channel(false).1,
             |_| async { Ok(()) },
         )
         .await
@@ -508,14 +682,94 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
             "fixture",
             None,
             |_| async { anyhow::bail!("fixture storage failed") },
+            watch::channel(false).1,
             |_| async { Ok(()) },
         )
         .await
         .err()
         .unwrap();
         let error = error.downcast_ref::<ManagerError>().unwrap();
-        assert!(error.uncertain);
+        assert!(error.uncertain());
         assert_eq!(error.session_id.as_deref(), Some("fixture-native"));
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[test]
+    fn codex_full_item_updates_are_snapshots_without_tool_arguments() {
+        for (kind, status) in [
+            ("turn.started", "running"),
+            ("turn.completed", "finishing"),
+            ("turn.failed", "failed"),
+        ] {
+            assert_eq!(
+                codex_progress(&json!({"type":kind})),
+                Some(json!({"type":"status","status":status}))
+            );
+        }
+        let started = codex_progress(&json!({"type":"item.started","item":{"id":"m1","type":"agent_message","text":"hello"}})).unwrap();
+        let updated = codex_progress(&json!({"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"hello\nworld"}})).unwrap();
+        assert_eq!(started["type"], "text_snapshot");
+        assert_eq!(
+            updated,
+            json!({"type":"text_snapshot","item_id":"m1","text":"hello\nworld"})
+        );
+        assert_eq!(codex_progress(&json!({"type":"item.completed","item":{"id":"t1","type":"command_execution","command":"secret-token","aggregated_output":"private","status":"completed"}})).unwrap(),
+            json!({"type":"tool","item_id":"t1","status":"completed","name":"command_execution"}));
+        assert_eq!(codex_progress(&json!({"type":"item.started","item":{"id":"t1","type":"command_execution","status":""}})).unwrap(),
+            json!({"type":"tool","item_id":"t1","status":"running","name":"command_execution"}));
+        assert!(codex_progress(&json!({"type":"item.updated","item":{"id":"r1","type":"reasoning","text":"private"}})).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_requires_bound_managed_process_confirmation() {
+        let directory =
+            std::env::temp_dir().join(format!("vibeface-manager-cancel-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let script = directory.join("fixture.sh");
+        for (session, expected) in [
+            ("fixture-native", ManagerFailure::Cancelled),
+            ("wrong-native", ManagerFailure::Unknown),
+        ] {
+            let fixture = format!(
+                r#"IFS= read -r init || exit 1
+printf '%s\n' '{{"type":"ready","session_id":"fixture-native"}}'
+IFS= read -r ack || exit 2
+printf '%s\n' '{{"type":"event","event":{{"type":"turn.started"}}}}'
+IFS= read -r cancel || exit 3
+case "$cancel" in *cancel*) ;; *) exit 4 ;; esac
+printf '%s\n' '{{"type":"cancelled","session_id":"{session}","confirmation":"managed_processes_exited"}}'
+"#
+            );
+            tokio::fs::write(&script, fixture).await.unwrap();
+            let config = ManagerConfig {
+                kind: ManagerKind::CodexSdk,
+                workspace: directory.clone(),
+                timeout_secs: 5,
+                ..ManagerConfig::default()
+            };
+            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let mut command = Command::new("/bin/sh");
+            command.arg(&script);
+            let error = run_codex(
+                &config,
+                command,
+                directory.to_str().unwrap(),
+                "/usr/bin/true",
+                "fixture",
+                Some("fixture-native"),
+                |_| async { Ok(()) },
+                cancel_rx,
+                move |event| {
+                    assert_eq!(event, json!({"type":"status","status":"running"}));
+                    cancel_tx.send(true).unwrap();
+                    async { Ok(()) }
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.downcast_ref::<ManagerError>().unwrap().kind, expected);
+        }
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
@@ -673,7 +927,7 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
         };
         let outcome = async {
             let prompt = format!("manager_fixture={}", json!({"secret":secret,"scope":"fixture-manager-scope","callback":callback}));
-            let result = run_manager_authorized(&engine, &contexts[0], &config, &prompt, None, |id| async move { ensure!(id == "fixture-manager-native", "unexpected native session"); Ok(()) }, |_| async { Ok(()) }).await?;
+            let result = run_manager_authorized(&engine, &contexts[0], &config, &prompt, None, |id| async move { ensure!(id == "fixture-manager-native", "unexpected native session"); Ok(()) }, watch::channel(false).1, |_| async { Ok(()) }).await?;
             let proof: Value = serde_json::from_str(&result.output)?;
             ensure!(proof.as_object().is_some_and(|p| p.len() == 11 && p.values().all(|v| v == true)), "Manager isolation proof failed: {proof}");
             ensure!(calls.load(Ordering::SeqCst) == 1, "unexpected Node tool calls");
@@ -687,7 +941,7 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
                 let process = engine.prepare_manager(&context, &project).await?;
                 let waiting = home(&context).join("waiting");
                 let prompt = "manager_fixture={\"wait\":true}";
-                let run = run_manager_authorized(&engine, &context, &config, prompt, None, |_| async { Ok(()) }, |_| async { Ok(()) });
+                let run = run_manager_authorized(&engine, &context, &config, prompt, None, |_| async { Ok(()) }, watch::channel(false).1, |_| async { Ok(()) });
                 let stop = async {
                     tokio::time::timeout(Duration::from_secs(4), async {
                         while !waiting.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
@@ -698,7 +952,7 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
                 let (result, stopped) = tokio::join!(run, stop);
                 stopped?;
                 let error = result.err().context("stopped Manager unexpectedly succeeded")?;
-                ensure!(error.downcast_ref::<ManagerError>().is_some_and(|e| e.uncertain), "stopped Manager did not preserve Unknown: {error}");
+                ensure!(error.downcast_ref::<ManagerError>().is_some_and(|e| e.uncertain()), "stopped Manager did not preserve Unknown: {error}");
                 let status = process.command("true").status().await?;
                 ensure!(!status.success(), "stopped Manager container still accepts execution");
                 negative.push(json!({"cause":if cancel {"cancel"} else {"lease_expiry"},"unknown":true,"container_stopped":true}));
@@ -800,7 +1054,7 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
             let record = persisted.clone();
             let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
             let captured = progress.clone();
-            let run = run_manager_authorized(&engine, &context, &config, "Use your command-execution tool to run '/opt/vibeface/sdk/codex-manager.mjs' tool nodes --json '{}' exactly once. Read its JSON result. Reply with exactly the marker field from that real result. Do not invent the marker. Do not read files, change files, use network tools or run other commands.", None, move |id| async move { crate::config::private_write(&record, &serde_json::to_vec(&id)?)?; Ok(()) }, move |event| { captured.lock().unwrap().push(event); async { Ok(()) } });
+            let run = run_manager_authorized(&engine, &context, &config, "Use your command-execution tool to run '/opt/vibeface/sdk/codex-manager.mjs' tool nodes --json '{}' exactly once. Read its JSON result. Reply with exactly the marker field from that real result. Do not invent the marker. Do not read files, change files, use network tools or run other commands.", None, move |id| async move { crate::config::private_write(&record, &serde_json::to_vec(&id)?)?; Ok(()) }, watch::channel(false).1, move |event| { captured.lock().unwrap().push(event); async { Ok(()) } });
             tokio::pin!(run);
             let result = loop {
                 tokio::select! {

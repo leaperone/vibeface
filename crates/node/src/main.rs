@@ -53,6 +53,8 @@ enum Action {
     Service(service::Service),
     /// Display this node's trusted entry for account setup or enrollment.
     Access(Access),
+    /// Open this node's private local browser entry.
+    Open(DataDir),
     /// Select a release channel, check, or apply a managed update.
     Update(Update),
     /// Call a node tool from a locally managed SDK process.
@@ -60,6 +62,9 @@ enum Action {
         name: String,
         #[arg(long)]
         json: String,
+        /// Stable reference for a write intent; reuse it after a timeout or partial result.
+        #[arg(long)]
+        call_ref: Option<String>,
     },
 }
 
@@ -148,7 +153,7 @@ async fn main() -> Result<()> {
             let runtime = Arc::new(Runtime::open(&options.data_dir).await?);
             runtime.start().await?;
             eprintln!(
-                "Web: {}\nRun vibeface access with the same --data-dir for the trusted browser entry.",
+                "Web: {}\nRun vibeface open with the same --data-dir for private local access, or vibeface access for an account connection card.",
                 runtime.config.public_url
             );
             tokio::select! {
@@ -157,11 +162,39 @@ async fn main() -> Result<()> {
             }
         }
         Action::Access(options) => access(options),
+        Action::Open(options) => open_browser(options).await,
         Action::Status(options) => status(options).await,
         Action::Service(options) => service::run(options).await,
         Action::Update(options) => update::run(options).await,
-        Action::Tool { name, json } => call_tool(name, json).await,
+        Action::Tool {
+            name,
+            json,
+            call_ref,
+        } => call_tool(name, json, call_ref).await,
     }
+}
+
+async fn open_browser(options: DataDir) -> Result<()> {
+    let url = vibeface::local_access::browser_url(&options.data_dir).await?;
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open")
+        .arg(&url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    #[cfg(not(target_os = "macos"))]
+    let result = std::process::Command::new("xdg-open")
+        .arg(&url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    ensure!(
+        result
+            .context("could not open the local browser")?
+            .success(),
+        "browser opener failed"
+    );
+    Ok(())
 }
 
 fn prepare_start(dir: &Path) -> Result<()> {
@@ -634,7 +667,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn call_tool(name: String, arguments: String) -> Result<()> {
+async fn call_tool(name: String, arguments: String, call_ref: Option<String>) -> Result<()> {
     ensure!(!name.is_empty() && name.len() <= 128, "invalid tool name");
     let arguments: Value =
         serde_json::from_str(&arguments).context("invalid tool arguments JSON")?;
@@ -642,44 +675,71 @@ async fn call_tool(name: String, arguments: String) -> Result<()> {
         arguments.is_object(),
         "tool arguments must be a JSON object"
     );
-    let url =
-        origin(&std::env::var("VIBEFACE_NODE_URL").context("VIBEFACE_NODE_URL is required")?)?;
-    ensure!(
-        is_loopback(&url),
-        "SDK tools must connect to a loopback node URL"
+    let write = !matches!(
+        name.as_str(),
+        "nodes" | "context" | "execution_status" | "call_lookup"
     );
-    let token = std::env::var("VIBEFACE_TOOL_TOKEN").context("VIBEFACE_TOOL_TOKEN is required")?;
-    ensure!(!token.is_empty(), "VIBEFACE_TOOL_TOKEN is empty");
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?
-        .post(url.join("api/tools")?)
-        .bearer_auth(token)
-        .json(&json!({"name": name, "arguments": arguments, "call_id": uuid::Uuid::new_v4().to_string()}))
-        .send()
-        .await
-        .context("reach local node tool API")?;
     ensure!(
-        response.status().is_success(),
-        "node tool rejected with HTTP {}",
-        response.status()
+        arguments.get("call_ref").is_none_or(Value::is_string),
+        "arguments.call_ref must be a string"
     );
-    let result: Value = serde_json::from_slice(&bounded_body(response).await?)
-        .context("invalid node tool response")?;
+    let argument_ref = arguments["call_ref"].as_str();
+    ensure!(
+        call_ref
+            .as_deref()
+            .zip(argument_ref)
+            .is_none_or(|(flag, argument)| flag == argument),
+        "--call-ref must match arguments.call_ref"
+    );
+    let call_ref = call_ref.or_else(|| argument_ref.map(String::from));
+    ensure!(
+        !write || call_ref.is_some(),
+        "write tools require --call-ref; keep it and query call_lookup after any uncertain result"
+    );
+    let has_call_ref = call_ref.is_some();
+    let reference = call_ref.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    ensure!(
+        !reference.is_empty() && reference.len() <= 256 && !reference.chars().any(char::is_control),
+        "invalid call reference"
+    );
+    let mut arguments = arguments;
+    if has_call_ref {
+        arguments["call_ref"] = Value::String(reference.clone());
+    }
+    let socket = std::env::var_os("VIBEFACE_MANAGER_TOOL_SOCKET")
+        .map(PathBuf::from)
+        .context("private SDK tool channel is unavailable")?;
+    ensure!(
+        socket.is_absolute()
+            && socket.parent() == Some(Path::new("/tmp"))
+            && socket
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("vibeface-manager-tools-") && name.ends_with(".sock")
+                }),
+        "invalid private SDK tool channel"
+    );
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let mut stream = tokio::net::UnixStream::connect(&socket).await?;
+        let mut frame = serde_json::to_vec(&json!({"name":name,"arguments":arguments}))?;
+        ensure!(frame.len() <= 65_536, "tool arguments exceed the size limit");
+        frame.push(b'\n');
+        stream.write_all(&frame).await?;
+        let mut response = Vec::new();
+        BufReader::new(stream).take(1_048_577).read_until(b'\n', &mut response).await?;
+        ensure!(
+            response.len() <= 1_048_576 && response.last() == Some(&b'\n'),
+            "private tool response is incomplete or exceeds the size limit"
+        );
+        serde_json::from_slice::<Value>(&response).context("invalid private tool response")
+    })
+    .await
+    .context("private tool request timed out; preserve call_ref and query call_lookup before retrying")?
+    .with_context(|| format!("private tool request failed; preserve call_ref {reference} and query call_lookup before retrying"))?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
-}
-
-async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if body.len().saturating_add(chunk.len()) > 1024 * 1024 {
-            bail!("node response exceeds 1 MiB");
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 #[cfg(test)]

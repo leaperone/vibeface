@@ -40,6 +40,14 @@ enum HandoffExecutionCheck {
 
 type SharedHandoffExecutionPolicy = Arc<Mutex<HandoffExecutionPolicy>>;
 
+enum HandoffProgram {
+    Command(crate::command::CommandSpec),
+    Session {
+        kind: ExecutorKind,
+        action: EngineAction,
+    },
+}
+
 fn original(wire: &SignedExecutionHandoff) -> Result<(ResourceRef, String)> {
     let event: Event = serde_json::from_str(&wire.handoff.project_dispatch.canonical_body)?;
     let EventBody::DispatchRecorded { operation_id, .. } = event.body else {
@@ -52,6 +60,14 @@ fn original(wire: &SignedExecutionHandoff) -> Result<(ResourceRef, String)> {
         },
         operation_id,
     ))
+}
+
+pub(super) fn handoff_is_command(wire: &SignedExecutionHandoff) -> Result<bool> {
+    let event: Event = serde_json::from_str(&wire.handoff.project_dispatch.canonical_body)?;
+    let EventBody::DispatchRecorded { action, .. } = event.body else {
+        bail!("execution handoff has no Project dispatch")
+    };
+    Ok(action["action"]["type"] == "command")
 }
 
 fn context(value: &AdmittedExecutionHandoff) -> ExecutionContext {
@@ -121,6 +137,25 @@ fn provider_result(mut value: Value, native: Option<&str>) -> Value {
 }
 
 impl Runtime {
+    async fn handoff_affected(&self, value: &AdmittedExecutionHandoff) -> Vec<String> {
+        if value.original_request.action["type"] == "command" {
+            vec![value.original_request.operation_id.clone()]
+        } else {
+            self.engine.affected_operations(&context(value)).await
+        }
+    }
+
+    pub(super) async fn fence_handoff(
+        &self,
+        value: &AdmittedExecutionHandoff,
+    ) -> Result<(crate::engine::StoppedExecution, Vec<String>)> {
+        if value.original_request.action["type"] == "command" {
+            self.engine.fence_command(&context(value)).await
+        } else {
+            self.engine.fence_operation(&context(value)).await
+        }
+    }
+
     pub(super) async fn request_execution_dispatch_resolution(
         &self,
         wire: &SignedExecutionHandoffResolution,
@@ -461,9 +496,13 @@ impl Runtime {
                 }
             }
         };
-        self.engine
-            .renew_operation(&context(value), deadline)
-            .await?;
+        if value.original_request.action["type"] == "command" {
+            self.engine.renew_command(&context(value), deadline).await?;
+        } else {
+            self.engine
+                .renew_operation(&context(value), deadline)
+                .await?;
+        }
         Ok(deadline)
     }
 
@@ -815,8 +854,17 @@ impl Runtime {
             shared: true,
             lease_expires_at_ms: proof.challenge.expires_at_ms,
         };
-        let mut affected = self.engine.affected_operations(&context).await;
-        let stopped = self.engine.fence_operation(&context).await;
+        let command = handoff_is_command(&wire.resolution.observation.handoff)?;
+        let mut affected = if command {
+            vec![context.operation_id.clone()]
+        } else {
+            self.engine.affected_operations(&context).await
+        };
+        let stopped = if command {
+            self.engine.fence_command(&context).await
+        } else {
+            self.engine.fence_operation(&context).await
+        };
         if let Ok((_, operations)) = &stopped {
             affected.extend(operations.iter().cloned());
         }
@@ -937,7 +985,10 @@ impl Runtime {
                 }
             });
         }
-        Ok(json!(public_result(wire, value)?))
+        Ok(json!(
+            self.attach_execution_control(public_result(wire, value)?)
+                .await?
+        ))
     }
 
     async fn finish_handoff(
@@ -951,7 +1002,7 @@ impl Runtime {
             Ok(policy) => policy,
             Err(error) => {
                 let _completion = self.handoff_resolution_lock.lock().await;
-                self.engine.fence_operation(&context(value)).await?;
+                self.fence_handoff(value).await?;
                 return Err(error);
             }
         };
@@ -1031,8 +1082,13 @@ impl Runtime {
         let context = context(&current);
         let mut cleanup_affected = Vec::new();
         if state.terminal() && current.state == OperationState::Running {
-            let affected = self.engine.affected_operations(&context).await;
-            if let Err(error) = self.engine.complete_operation(&context).await {
+            let affected = self.handoff_affected(&current).await;
+            let completion = if current.original_request.action["type"] == "command" {
+                self.engine.complete_command(&context).await
+            } else {
+                self.engine.complete_operation(&context).await
+            };
+            if let Err(error) = completion {
                 state = OperationState::Unknown;
                 result = json!({
                     "error":format!("execution cleanup could not be confirmed: {error:#}"),
@@ -1063,8 +1119,8 @@ impl Runtime {
         }
         if state == OperationState::Unknown {
             let mut affected = cleanup_affected;
-            affected.extend(self.engine.affected_operations(&context).await);
-            let stopped = self.engine.fence_operation(&context).await;
+            affected.extend(self.handoff_affected(&current).await);
+            let stopped = self.fence_handoff(&current).await;
             if let Ok((_, operations)) = &stopped {
                 affected.extend(operations.iter().cloned());
             }
@@ -1115,12 +1171,20 @@ impl Runtime {
         };
         let mut store = self.store.lock().await;
         verification.run(|| {
-            let session = store.execution_handoff_session(
-                value.execution_context.execution_space_id.as_str(),
-                &project,
-                &value.original_request.target_node,
-                &value.original_request.session_id,
-            )?;
+            let session = value
+                .original_request
+                .session_id
+                .as_deref()
+                .map(|session| {
+                    store.execution_handoff_session(
+                        value.execution_context.execution_space_id.as_str(),
+                        &project,
+                        &value.original_request.target_node,
+                        session,
+                    )
+                })
+                .transpose()?
+                .flatten();
             let value = match policy {
                 HandoffExecutionPolicy::Primary => store.finish_execution_handoff(
                     &self.identity,
@@ -1225,13 +1289,26 @@ impl Runtime {
                     &verification,
                 )
                 .await?;
-            let session = accepted
-                .execution_session
-                .as_ref()
-                .context("accepted handoff has no local session")?;
-            let kind: ExecutorKind = serde_json::from_value(json!(session.executor))?;
-            let action = self.engine_action(&accepted.original_request.action)?;
-            self.allowed_path(&session.cwd)?;
+            let program = if accepted.original_request.action["type"] == "command" {
+                ensure!(
+                    accepted.execution_session.is_none()
+                        && accepted.original_request.session_id.is_none()
+                        && accepted.original_request.task_id.is_none()
+                        && accepted.original_request.binding.is_none(),
+                    "command must not invent a Task, session or binding"
+                );
+                HandoffProgram::Command(self.command_spec(&accepted.original_request.action)?)
+            } else {
+                let session = accepted
+                    .execution_session
+                    .as_ref()
+                    .context("accepted handoff has no local session")?;
+                self.allowed_path(&session.cwd)?;
+                HandoffProgram::Session {
+                    kind: serde_json::from_value(json!(session.executor))?,
+                    action: self.engine_action(&accepted.original_request.action)?,
+                }
+            };
             for resource in &accepted.original_request.resources {
                 self.allowed_path(resource)?;
             }
@@ -1271,10 +1348,10 @@ impl Runtime {
                     }
                 }
             };
-            Ok::<_, anyhow::Error>((value, fresh, kind, action))
+            Ok::<_, anyhow::Error>((value, fresh, program))
         }
         .await;
-        let (value, fresh, kind, action) = match preparation {
+        let (value, fresh, program) = match preparation {
             Ok(value) => value,
             Err(error) => {
                 let current = {
@@ -1315,6 +1392,43 @@ impl Runtime {
         if !fresh {
             return Ok(());
         }
+        let (kind, action) = match program {
+            HandoffProgram::Session { kind, action } => (kind, action),
+            HandoffProgram::Command(spec) => {
+                self.supervise_handoff(value.clone(), policy.clone()).await;
+                let result = self
+                    .engine
+                    .execute_command_authorized(&context(&value), &spec)
+                    .await;
+                let (state, result) = match result {
+                    Ok(output) => (
+                        if output.exit_code == Some(0) {
+                            OperationState::Succeeded
+                        } else {
+                            OperationState::Failed
+                        },
+                        serde_json::to_value(output)?,
+                    ),
+                    Err(error) => (
+                        if error.uncertain {
+                            OperationState::Unknown
+                        } else {
+                            OperationState::Failed
+                        },
+                        json!({"error":error.message}),
+                    ),
+                };
+                return self
+                    .finish_handoff_with_policy(
+                        &value,
+                        state,
+                        result,
+                        &SignatureVerification::new(),
+                        &policy,
+                    )
+                    .await;
+            }
+        };
         let context = context(&value);
         let session = value
             .execution_session
@@ -1506,7 +1620,7 @@ impl Runtime {
             Ok(policy) => policy,
             Err(error) => {
                 let _completion = self.handoff_resolution_lock.lock().await;
-                self.engine.fence_operation(&context(value)).await?;
+                self.fence_handoff(value).await?;
                 return Err(error);
             }
         };
@@ -1523,8 +1637,8 @@ impl Runtime {
     ) -> Result<()> {
         let _completion = self.handoff_resolution_lock.lock().await;
         let context = context(value);
-        let mut affected = self.engine.affected_operations(&context).await;
-        let stopped = self.engine.fence_operation(&context).await;
+        let mut affected = self.handoff_affected(value).await;
+        let stopped = self.fence_handoff(value).await;
         if let Ok((_, operations)) = &stopped {
             affected.extend(operations.iter().cloned());
         }

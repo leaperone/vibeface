@@ -309,9 +309,11 @@ impl Runtime {
                             now,
                         )
                     })?;
-                    return Ok(TaskBusinessResponse::Status(serde_json::to_value(result(
-                        wire, value,
-                    )?)?));
+                    let result = result(wire, value)?;
+                    drop(store);
+                    return Ok(TaskBusinessResponse::Status(serde_json::to_value(
+                        self.attach_execution_control(result).await?,
+                    )?));
                 }
                 ensure!(
                     proof.challenge.stage == CheckStage::Admit,
@@ -351,6 +353,11 @@ impl Runtime {
                         now_ms() as u64,
                     )
                 })?;
+                drop(store);
+                let actual = match actual {
+                    Some(actual) => Some(self.attach_execution_control(actual).await?),
+                    None => None,
+                };
                 Ok(TaskBusinessResponse::Status(json!({"actual":actual})))
             }
             (TaskBusinessWire::Resolve(wire), TaskBusinessChallenge::Resolve(challenge)) => {
@@ -407,8 +414,18 @@ impl Runtime {
                     shared: true,
                     lease_expires_at_ms: proof.challenge.expires_at_ms,
                 };
-                let mut affected = self.engine.affected_operations(&context).await;
-                let stopped = self.engine.fence_operation(&context).await;
+                let command =
+                    super::handoff::handoff_is_command(&wire.resolution.observation.handoff)?;
+                let mut affected = if command {
+                    vec![context.operation_id.clone()]
+                } else {
+                    self.engine.affected_operations(&context).await
+                };
+                let stopped = if command {
+                    self.engine.fence_command(&context).await
+                } else {
+                    self.engine.fence_operation(&context).await
+                };
                 if let Ok((_, operations)) = &stopped {
                     affected.extend(operations.iter().cloned());
                 }

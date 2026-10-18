@@ -13,7 +13,7 @@ use std::{
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::{Child, Command},
-    sync::oneshot,
+    sync::{oneshot, watch},
     task::JoinHandle,
 };
 
@@ -57,9 +57,16 @@ pub struct AgentResult {
     pub usage: Option<Value>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentFailure {
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
 #[derive(Debug)]
 pub struct AgentRunError {
-    pub uncertain: bool,
+    pub kind: AgentFailure,
     pub session_id: Option<String>,
     message: String,
 }
@@ -72,6 +79,58 @@ impl std::fmt::Display for AgentRunError {
 
 impl std::error::Error for AgentRunError {}
 
+pub async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancel.borrow_and_update() {
+            return;
+        }
+        if cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// A local process reap is not a provider terminal state. Cancellation stays
+/// `Unknown` until the provider reports `Cancelled`, `Failed`, or another finish.
+fn provider_cancel_failure(native_terminal: Option<AgentFailure>) -> AgentFailure {
+    native_terminal.unwrap_or(AgentFailure::Unknown)
+}
+
+/// Reaps the local process group only; already accepted external work is unaffected.
+pub async fn terminate_process_group(child: &mut Child, group: u32) -> bool {
+    async fn signal(group: u32, signal: &str) -> Option<bool> {
+        Command::new("/bin/kill")
+            .arg(signal)
+            .arg(format!("-{group}"))
+            .output()
+            .await
+            .ok()
+            .map(|output| output.status.success())
+    }
+    let _ = signal(group, "-TERM").await;
+    let reaped = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    if !matches!(reaped, Ok(Ok(_))) {
+        let _ = signal(group, "-KILL").await;
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(2), child.wait()).await,
+            Ok(Ok(_))
+        ) {
+            return false;
+        }
+    }
+    for _ in 0..20 {
+        match signal(group, "-0").await {
+            Some(false) => return true,
+            None => return false,
+            Some(true) => {
+                let _ = signal(group, "-KILL").await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
 /// Runs the supplied prompt with the explicitly configured tools.
 /// The callback commits the native ID before the first mutating Send request.
 pub async fn run_sdk<F, P, PF>(
@@ -79,6 +138,7 @@ pub async fn run_sdk<F, P, PF>(
     prompt: &str,
     previous_session_id: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
+    mut cancel: watch::Receiver<bool>,
     mut progress: P,
 ) -> Result<AgentResult>
 where
@@ -102,14 +162,33 @@ where
     if let Some(id) = previous_session_id {
         validate_sdk_id(id)?;
     }
+    if *cancel.borrow() {
+        return Err(AgentRunError {
+            kind: AgentFailure::Cancelled,
+            session_id: previous_session_id.map(str::to_owned),
+            message: "Cursor SDK management cancelled before launch".into(),
+        }
+        .into());
+    }
     let api_key = std::env::var("CURSOR_API_KEY")
         .map_err(|_| anyhow!("CURSOR_API_KEY is required for the Cursor SDK manager"))?;
     ensure!(
         !api_key.trim().is_empty() && api_key.len() <= 4096,
         "CURSOR_API_KEY is missing or invalid"
     );
-    prepare_sdk_workspace(&config.workspace).await?;
-    let (mut process, rpc) = SdkProcess::start(config, &api_key).await?;
+    let startup = async {
+        prepare_sdk_workspace(&config.workspace).await?;
+        SdkProcess::start(config, &api_key).await
+    };
+    let (mut process, rpc) = tokio::select! {
+        result = startup => result?,
+        _ = wait_for_cancel(&mut cancel) => return Err(AgentRunError {
+            kind: AgentFailure::Cancelled,
+            session_id: previous_session_id.map(str::to_owned),
+            message: "Cursor SDK management cancelled before Send".into(),
+        }.into()),
+    };
+    let process_group = process.group.context("Cursor SDK process has no group")?;
     let mut agent_id = previous_session_id.map(str::to_owned);
     let mut state = RunState::default();
     let mut send_started = false;
@@ -153,8 +232,9 @@ where
             .context("persist Cursor SDK session before sending management prompt")?;
         send_started = true;
         let bearer = rpc.bearer.clone();
+        let mut pending_text = BTreeMap::new();
         let mut emit_progress = |value| {
-            progress(redact_progress(
+            progress(redact_stream_progress(
                 value,
                 &[
                     api_key.as_str(),
@@ -165,6 +245,7 @@ where
                         .map(|callback| callback.auth_token.as_str())
                         .unwrap_or(""),
                 ],
+                &mut pending_text,
             ))
         };
         rpc.send(id, prompt, &mut state, &mut emit_progress).await?;
@@ -185,14 +266,21 @@ where
         result.usage = result.usage.map(|usage| redact_progress(usage, &secrets));
         Ok(result)
     };
+    let mut cancellation_requested = false;
     let outcome = tokio::select! {
+        biased;
         result = tokio::time::timeout(Duration::from_secs(config.timeout_secs), operation) => {
             result.unwrap_or_else(|_| Err(anyhow!("Cursor SDK manager timed out; completion is unknown")))
         }
         _ = &mut process.stdout => Err(anyhow!("Cursor SDK stdout closed unexpectedly; completion is unknown")),
         _ = &mut process.stderr => Err(anyhow!("Cursor SDK stderr closed unexpectedly; completion is unknown")),
         _ = process.child.wait() => Err(anyhow!("Cursor SDK process exited unexpectedly; completion is unknown")),
+        _ = wait_for_cancel(&mut cancel) => {
+            cancellation_requested = true;
+            Err(anyhow!("Cursor SDK management cancellation requested"))
+        }
     };
+    let mut native_terminal = None;
     if outcome.is_err()
         && let Some(run_id) = &state.run_id
     {
@@ -205,6 +293,36 @@ where
             ),
         )
         .await;
+        if cancellation_requested && let Some(agent_id) = &agent_id {
+            native_terminal = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let reply = rpc
+                        .unary(AGENT_SERVICE, "GetRun", json!({"runId":run_id}))
+                        .await?;
+                    let snapshot = reply
+                        .get("run")
+                        .context("Cursor SDK returned no run snapshot")?;
+                    let mut identity = RunState {
+                        run_id: Some(run_id.clone()),
+                        ..RunState::default()
+                    };
+                    identity.identity(snapshot, agent_id, true)?;
+                    if cancelled(snapshot.get("status")) {
+                        return Ok::<AgentFailure, anyhow::Error>(AgentFailure::Cancelled);
+                    }
+                    if finished(snapshot.get("status")) {
+                        return Ok(AgentFailure::Unknown);
+                    }
+                    if failed(snapshot.get("status")) {
+                        return Ok(AgentFailure::Failed);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
+        }
     }
     if let Some(id) = &agent_id {
         let _ = tokio::time::timeout(
@@ -218,15 +336,19 @@ where
         rpc.unary(CONTROL_SERVICE, "Shutdown", json!({"graceSeconds": 0})),
     )
     .await;
-    if tokio::time::timeout(Duration::from_secs(3), process.child.wait())
-        .await
-        .is_err()
-    {
-        let _ = process.child.kill().await;
+    let reaped = terminate_process_group(&mut process.child, process_group).await;
+    if reaped {
+        process.group = None;
     }
     outcome.map_err(|error| {
         AgentRunError {
-            uncertain: send_started,
+            kind: if cancellation_requested {
+                provider_cancel_failure(native_terminal)
+            } else if send_started {
+                AgentFailure::Unknown
+            } else {
+                AgentFailure::Failed
+            },
             session_id: agent_id,
             message: error
                 .to_string()
@@ -370,6 +492,7 @@ impl Discovery {
 
 struct SdkProcess {
     child: Child,
+    group: Option<u32>,
     stdout: JoinHandle<Result<()>>,
     stderr: JoinHandle<Result<()>>,
 }
@@ -377,6 +500,13 @@ impl Drop for SdkProcess {
     fn drop(&mut self) {
         self.stdout.abort();
         self.stderr.abort();
+        if let Some(group) = self.group.take() {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", &format!("-{group}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 
@@ -393,6 +523,7 @@ impl SdkProcess {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .kill_on_drop(true);
         for (key, _) in std::env::vars_os() {
             let name = key.to_string_lossy();
@@ -420,6 +551,7 @@ impl SdkProcess {
         let mut child = command
             .spawn()
             .context("could not start cursor-sdk-bridge")?;
+        let group = child.id().context("Cursor SDK process has no group")?;
         let stdout = child
             .stdout
             .take()
@@ -433,6 +565,7 @@ impl SdkProcess {
         let stderr = tokio::spawn(read_discovery(stderr, ready_tx));
         let mut process = Self {
             child,
+            group: Some(group),
             stdout,
             stderr,
         };
@@ -563,7 +696,10 @@ impl Rpc {
         P: FnMut(Value) -> PF,
         PF: Future<Output = Result<()>>,
     {
-        let body = encode_frame(0, &json!({"agentId": agent_id, "message": {"text": text}}))?;
+        let body = encode_frame(
+            0,
+            &json!({"agentId": agent_id, "message": {"text": text}, "options":{"enableDeltas":true}}),
+        )?;
         let mut response = self
             .request(AGENT_SERVICE, "Send")?
             .header("Content-Type", "application/connect+json")
@@ -665,6 +801,8 @@ struct RunState {
     usage: Option<Value>,
     done: bool,
     ended: bool,
+    text_deltas: bool,
+    assistant_text: String,
 }
 impl RunState {
     fn identity(&mut self, message: &Value, expected_agent: &str, required: bool) -> Result<()> {
@@ -735,7 +873,7 @@ impl RunState {
                 "Cursor SDK stream closed before result and done"
             );
             self.ended = true;
-            progress(json!({"kind": "stream_end"})).await?;
+            progress(json!({"type":"status","status":"completed"})).await?;
             return Ok(());
         }
         ensure!(!self.done, "Cursor SDK emitted data after done");
@@ -773,15 +911,14 @@ impl RunState {
                 "Cursor SDK result is too large"
             );
             self.output = Some(text.into());
+            progress(json!({"type":"text_snapshot","item_id":"assistant-0","text":safe_text(&json!(text)).unwrap_or_default()})).await?;
             self.usage = result
                 .get("usage")
                 .filter(|value| !value.is_null())
                 .and_then(safe_usage);
             let mut event = Map::new();
-            event.insert("kind".into(), Value::String("result".into()));
-            if let Some(status) = result.get("status").and_then(safe_scalar) {
-                event.insert("status".into(), status);
-            }
+            event.insert("type".into(), Value::String("status".into()));
+            event.insert("status".into(), Value::String("finishing".into()));
             if let Some(run_id) = &self.run_id {
                 event.insert("run_id".into(), Value::String(run_id.clone()));
             }
@@ -796,11 +933,10 @@ impl RunState {
                 "Cursor SDK emitted done before a successful result"
             );
             self.done = true;
-            progress(json!({"kind": "done"})).await?;
-        } else if let Some(event) = message
-            .get("sdkMessage")
-            .and_then(|value| value.get("message"))
-        {
+        } else if let Some(envelope) = message.get("sdkMessage") {
+            let Some(event) = envelope.get("message") else {
+                return Ok(());
+            };
             self.identity(event, expected_agent, false)?;
             if let Some(status) = event.get("status").and_then(Value::as_str) {
                 ensure!(
@@ -816,8 +952,48 @@ impl RunState {
                     "Cursor SDK run reported failure or cancellation"
                 );
             }
-            if let Some(progress_event) = safe_progress_event(event) {
+            let kind = envelope
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if kind == "assistant" {
+                // The bridge can mirror each text fragment in both envelopes.
+                if !self.text_deltas
+                    && let Some(mut progress_event) = safe_progress_event(kind, event)
+                {
+                    self.assistant_text
+                        .push_str(progress_event["text"].as_str().unwrap_or_default());
+                    self.assistant_text = self.assistant_text.chars().take(16_384).collect();
+                    progress_event["item_id"] = json!("assistant-0");
+                    progress_event["text"] = json!(self.assistant_text);
+                    progress(progress_event).await?;
+                }
+            } else if let Some(progress_event) = safe_progress_event(kind, event) {
                 progress(progress_event).await?;
+            }
+        } else if let Some(envelope) = message.get("interactionUpdate") {
+            let kind = envelope
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if kind == "text-delta"
+                && let Some(event) = envelope.get("update")
+            {
+                self.identity(event, expected_agent, false)?;
+                if let Some(text) = event.get("text").and_then(safe_text) {
+                    if !self.text_deltas {
+                        self.text_deltas = true;
+                        if !self.assistant_text.is_empty() {
+                            progress(
+                                json!({"type":"text_snapshot","item_id":"assistant-0","text":""}),
+                            )
+                            .await?;
+                            self.assistant_text.clear();
+                        }
+                    }
+                    progress(json!({"type":"text_delta","item_id":"assistant-0","text":text}))
+                        .await?;
+                }
             }
         }
         Ok(())
@@ -839,12 +1015,13 @@ impl RunState {
     }
 }
 
-fn safe_scalar(value: &Value) -> Option<Value> {
+fn safe_label(value: &Value) -> Option<Value> {
     match value {
-        Value::String(text) if text.len() <= 128 && !text.chars().any(char::is_control) => {
+        Value::String(text)
+            if !text.is_empty() && text.len() <= 128 && !text.chars().any(char::is_control) =>
+        {
             Some(Value::String(text.clone()))
         }
-        Value::Number(number) => Some(Value::Number(number.clone())),
         _ => None,
     }
 }
@@ -880,27 +1057,71 @@ fn safe_usage(value: &Value) -> Option<Value> {
     (!output.is_empty()).then_some(Value::Object(output))
 }
 
-fn safe_progress_event(event: &Value) -> Option<Value> {
+fn safe_text(value: &Value) -> Option<String> {
+    let text = value.as_str()?;
+    Some(
+        text.chars()
+            .filter(|ch| !ch.is_control() || matches!(*ch, '\n' | '\r' | '\t'))
+            .take(16_384)
+            .collect(),
+    )
+}
+
+fn safe_progress_event(kind: &str, event: &Value) -> Option<Value> {
     let object = event.as_object()?;
     let mut output = Map::new();
-    output.insert("kind".into(), Value::String("progress".into()));
-    for key in ["status", "type"] {
-        if let Some(value) = object.get(key).and_then(safe_scalar) {
-            output.insert(key.into(), value);
-        }
-    }
-    for key in ["text", "delta"] {
-        if let Some(value) = object
-            .get(key)
-            .and_then(Value::as_str)
-            .filter(|text| !text.chars().any(char::is_control))
-        {
+    match kind {
+        "assistant" => {
+            let blocks = object.get("message")?.get("content")?.as_array()?;
+            let text: String = blocks
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block.get("text").and_then(safe_text))
+                .collect();
+            output.insert("type".into(), json!("text_snapshot"));
             output.insert(
                 "text".into(),
-                Value::String(value.chars().take(4096).collect()),
+                json!(text.chars().take(16_384).collect::<String>()),
             );
-            break;
         }
+        "tool_call" => {
+            output.insert("type".into(), json!("tool"));
+            for key in ["name", "status"] {
+                if let Some(value) = object.get(key).and_then(safe_label) {
+                    output.insert(key.into(), value);
+                }
+            }
+            if !output.contains_key("name") && !output.contains_key("status") {
+                return None;
+            }
+            if let Some(id) = object
+                .get("call_id")
+                .or_else(|| object.get("id"))
+                .and_then(safe_label)
+            {
+                output.insert("item_id".into(), id);
+            }
+        }
+        "system" | "status" => {
+            output.insert("type".into(), json!("status"));
+            if let Some(value) = object
+                .get("status")
+                .or_else(|| object.get("subtype"))
+                .and_then(safe_label)
+            {
+                output.insert("status".into(), value);
+            }
+            if kind == "status"
+                && let Some(text) = object.get("message").and_then(safe_text)
+                && !text.is_empty()
+            {
+                output.insert("text".into(), json!(text));
+            }
+            if !output.contains_key("status") && !output.contains_key("text") {
+                return None;
+            }
+        }
+        _ => return None,
     }
     if let Some(usage) = object.get("usage").and_then(safe_usage) {
         output.insert("usage".into(), usage);
@@ -932,9 +1153,67 @@ fn redact_progress(value: Value, secrets: &[&str]) -> Value {
     }
 }
 
+fn redact_stream_progress(
+    mut value: Value,
+    secrets: &[&str],
+    pending: &mut BTreeMap<String, String>,
+) -> Value {
+    if let Some(item) = value
+        .get("item_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    {
+        if value["type"] == "text_snapshot" {
+            pending.remove(&item);
+        }
+        if value["type"] == "text_delta"
+            && let Some(text) = value.get("text").and_then(Value::as_str)
+        {
+            let buffered = pending.entry(item).or_default();
+            buffered.push_str(text);
+            let Value::String(clean) = redact_progress(json!(buffered), secrets) else {
+                unreachable!()
+            };
+            let max_prefix = secrets
+                .iter()
+                .map(|secret| secret.len().saturating_sub(1))
+                .max()
+                .unwrap_or(0);
+            let split = clean
+                .char_indices()
+                .map(|(index, _)| index)
+                .filter(|index| clean.len() - index <= max_prefix)
+                .find(|index| {
+                    secrets.iter().any(|secret| {
+                        secret.len() > clean.len() - index && secret.starts_with(&clean[*index..])
+                    })
+                })
+                .unwrap_or(clean.len());
+            *buffered = clean[split..].to_owned();
+            value["text"] = json!(&clean[..split]);
+        }
+    }
+    redact_progress(value, secrets)
+}
+
 fn finished(status: Option<&Value>) -> bool {
     status.is_some_and(|status| {
         status.as_str() == Some("RUN_LIFECYCLE_STATUS_FINISHED") || status.as_u64() == Some(3)
+    })
+}
+
+fn cancelled(status: Option<&Value>) -> bool {
+    status.is_some_and(|status| {
+        status.as_str() == Some("RUN_LIFECYCLE_STATUS_CANCELLED") || status.as_u64() == Some(5)
+    })
+}
+
+fn failed(status: Option<&Value>) -> bool {
+    status.is_some_and(|status| {
+        matches!(
+            status.as_str(),
+            Some("RUN_LIFECYCLE_STATUS_ERROR" | "RUN_LIFECYCLE_STATUS_EXPIRED")
+        ) || matches!(status.as_u64(), Some(4 | 6))
     })
 }
 
@@ -1108,7 +1387,7 @@ mod tests {
         state
             .accept(
                 0,
-                json!({"sdkMessage":{"message":{"status":"RUNNING","text":"x".repeat(10000),"secret":"do-not-forward"}}}),
+                json!({"sdkMessage":{"type":"assistant","message":{"message":{"content":[{"type":"text","text":"x".repeat(20000)}]},"secret":"do-not-forward"}}}),
                 "a",
                 &mut progress,
             )
@@ -1116,9 +1395,126 @@ mod tests {
             .unwrap();
         let events = captured.lock().unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["kind"], "progress");
-        assert!(events[0]["text"].as_str().unwrap().len() <= 4096);
+        assert_eq!(events[0]["type"], "text_snapshot");
+        assert!(events[0]["text"].as_str().unwrap().len() <= 16_384);
         assert!(events[0].get("secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn cursor_text_deltas_ignore_mirrored_assistant_content_and_keep_newlines() {
+        let mut state = RunState::default();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let mut progress = move |value| {
+            sink.lock().unwrap().push(value);
+            async { Ok(()) }
+        };
+        state.accept(0,json!({"interactionUpdate":{"type":"text-delta","update":{"type":"text-delta","text":"first\n\tsecond\u{0000}"}}}),"a",&mut progress).await.unwrap();
+        state.accept(0,json!({"sdkMessage":{"type":"assistant","message":{"message":{"content":[{"type":"text","text":"first\n\tsecond"},{"type":"tool_use","input":{"secret":"hidden"}}]}}}}),"a",&mut progress).await.unwrap();
+        state
+            .accept(
+                0,
+                json!({"interactionUpdate":{"type":"thinking-delta","update":{"text":"private"}}}),
+                "a",
+                &mut progress,
+            )
+            .await
+            .unwrap();
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            json!({"type":"text_delta","item_id":"assistant-0","text":"first\n\tsecond"})
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.to_string().contains("hidden"))
+        );
+        assert!(cancelled(Some(&json!(5))));
+        assert!(!cancelled(Some(&json!(3))));
+    }
+
+    #[tokio::test]
+    async fn cursor_unkeyed_assistant_fragments_and_deltas_render_exactly_once() {
+        for deltas in [false, true] {
+            for assistant_first in [false, true] {
+                let mut state = RunState::default();
+                let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let sink = captured.clone();
+                let mut progress = move |value| {
+                    sink.lock().unwrap().push(value);
+                    async { Ok(()) }
+                };
+                for text in ["first\n", "\tsecond", "!"] {
+                    let assistant = json!({"sdkMessage":{"type":"assistant","message":{"type":"assistant","agent_id":"a","run_id":"r","message":{"role":"assistant","content":[{"type":"text","text":text}]}}}});
+                    let delta = json!({"interactionUpdate":{"type":"text-delta","update":{"type":"text-delta","text":text}}});
+                    let messages = if !deltas {
+                        vec![assistant]
+                    } else if assistant_first {
+                        vec![assistant, delta]
+                    } else {
+                        vec![delta, assistant]
+                    };
+                    for message in messages {
+                        state.accept(0, message, "a", &mut progress).await.unwrap();
+                    }
+                }
+                let mut preview = String::new();
+                for event in captured.lock().unwrap().iter() {
+                    assert_eq!(event["item_id"], "assistant-0");
+                    let text = event["text"].as_str().unwrap();
+                    match event["type"].as_str().unwrap() {
+                        "text_snapshot" => preview = text.to_owned(),
+                        "text_delta" => preview.push_str(text),
+                        kind => panic!("unexpected text event {kind}"),
+                    }
+                }
+                assert_eq!(
+                    preview, "first\n\tsecond!",
+                    "deltas={deltas},assistant_first={assistant_first}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cursor_final_snapshot_restores_safe_secret_prefix_tail() {
+        for (text, expected) in [("yes", "yes"), ("sk-secret", "[redacted]")] {
+            let mut state = RunState::default();
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = captured.clone();
+            let mut pending = BTreeMap::new();
+            let mut progress = move |value| {
+                sink.lock().unwrap().push(redact_stream_progress(
+                    value,
+                    &["sk-secret"],
+                    &mut pending,
+                ));
+                async { Ok(()) }
+            };
+            state
+                .accept(
+                    0,
+                    json!({"interactionUpdate":{"type":"text-delta","update":{"text":text}}}),
+                    "a",
+                    &mut progress,
+                )
+                .await
+                .unwrap();
+            let mut terminal = result(json!(3));
+            terminal["result"]["result"]["result"] = json!(text);
+            state.accept(0, terminal, "a", &mut progress).await.unwrap();
+            let mut preview = String::new();
+            for event in captured.lock().unwrap().iter() {
+                match event["type"].as_str().unwrap() {
+                    "text_snapshot" => preview = event["text"].as_str().unwrap().to_owned(),
+                    "text_delta" => preview.push_str(event["text"].as_str().unwrap()),
+                    _ => {}
+                }
+            }
+            assert_eq!(preview, expected);
+        }
     }
 
     #[test]
@@ -1131,6 +1527,107 @@ mod tests {
             redacted,
             json!({"text": "prefix [redacted] [redacted]", "items": ["[redacted]"]})
         );
+    }
+
+    #[test]
+    fn cursor_status_and_tool_fields_match_the_live_progress_contract() {
+        assert_eq!(
+            safe_progress_event("system", &json!({"subtype":"init"})),
+            Some(json!({"type":"status","status":"init"}))
+        );
+        assert_eq!(
+            safe_progress_event("status", &json!({"status":"RUNNING","message":""})),
+            Some(json!({"type":"status","status":"RUNNING"}))
+        );
+        assert_eq!(
+            safe_progress_event(
+                "tool_call",
+                &json!({"call_id":"call-1","name":"context","status":"completed","args":{"secret":"hidden"},"result":{"secret":"hidden"}})
+            ),
+            Some(json!({"type":"tool","item_id":"call-1","name":"context","status":"completed"}))
+        );
+        assert!(
+            safe_progress_event(
+                "tool_call",
+                &json!({"name":"","status":3,"call_id":"call-1"})
+            )
+            .is_none()
+        );
+        assert!(safe_progress_event("status", &json!({"status":3,"message":""})).is_none());
+        assert!(safe_progress_event("usage", &json!({"usage":{"inputTokens":3}})).is_none());
+    }
+
+    #[tokio::test]
+    async fn cursor_terminal_progress_reports_canonical_status_without_native_numbers() {
+        let mut state = RunState::default();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        let mut progress = move |value| {
+            sink.lock().unwrap().push(value);
+            async { Ok(()) }
+        };
+        for (flags, message) in [
+            (0, result(json!(3))),
+            (0, json!({"done":{"agentId":"a","runId":"r"}})),
+            (2, json!({})),
+        ] {
+            state
+                .accept(flags, message, "a", &mut progress)
+                .await
+                .unwrap();
+        }
+        let events = captured.lock().unwrap();
+        let statuses: Vec<_> = events
+            .iter()
+            .filter(|value| value["type"] == "status")
+            .cloned()
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                json!({"type":"status","status":"finishing","run_id":"r","usage":{"inputTokens":"42","outputTokens":"7"}}),
+                json!({"type":"status","status":"completed"})
+            ]
+        );
+    }
+
+    #[test]
+    fn local_reap_without_provider_terminal_stays_unknown() {
+        assert_eq!(provider_cancel_failure(None), AgentFailure::Unknown);
+        assert_eq!(
+            provider_cancel_failure(Some(AgentFailure::Cancelled)),
+            AgentFailure::Cancelled
+        );
+        assert_eq!(
+            provider_cancel_failure(Some(AgentFailure::Failed)),
+            AgentFailure::Failed
+        );
+    }
+
+    #[test]
+    fn text_delta_redaction_holds_partial_secrets_across_frames() {
+        for (secret, fragments) in [
+            ("sk-secret", vec!["prefix sk-", "sec", "ret suffix"]),
+            ("aba", vec!["a", "b", "a"]),
+            ("密钥", vec!["密", "钥"]),
+        ] {
+            let mut pending = BTreeMap::new();
+            let output: String = fragments
+                .into_iter()
+                .map(|text| {
+                    redact_stream_progress(
+                        json!({"type":"text_delta","item_id":"a","text":text}),
+                        &[secret],
+                        &mut pending,
+                    )["text"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect();
+            assert!(!output.contains(secret));
+            assert!(output.contains("[redacted]"));
+        }
     }
 
     #[test]

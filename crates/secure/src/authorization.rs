@@ -7,29 +7,36 @@ pub use authenticator_management::{
 };
 pub mod bootstrap;
 pub mod client_policy_import;
-pub mod gateway_forward;
 pub mod gateway_client;
+pub mod gateway_forward;
 pub mod gateway_original;
 pub mod gateway_owner;
-use gateway_original::{AcceptedGatewayOriginal, AdmittedDestination, AdmissionOrigin, OriginalGatewayTransport, RequestOrigin};
+use gateway_original::{
+    AcceptedGatewayOriginal, AdmissionOrigin, AdmittedDestination, OriginalGatewayTransport,
+    RequestOrigin,
+};
 pub mod directory;
 pub mod enrollment;
 pub mod enrollment_policy_import;
 pub mod execution_handoff;
+pub mod execution_work;
+pub use execution_work::{
+    ConversationOpenIntent, ConversationOpenRef, ExecutionWork, ExecutionWorkIntent,
+};
 pub mod execution_binding_seal;
 pub mod execution_observation;
-pub mod remote_execution_policy;
-pub mod node_execution_policy;
-pub mod task_business_policy;
-pub mod remote_execution_history;
 pub mod execution_service;
-pub mod remote_share;
-pub mod remote_resolution_history;
+pub mod node_execution_policy;
 pub mod passkey_node;
 mod policy_import;
 pub mod policy_proof;
 pub mod projection;
+pub mod remote_execution_history;
+pub mod remote_execution_policy;
+pub mod remote_resolution_history;
+pub mod remote_share;
 pub mod services;
+pub mod task_business_policy;
 use crate::{Identity, membership::canonical_json};
 pub use authenticators::{AuthenticatorRecord, PasskeyClientEnrollment, VerifiedAuthenticator};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -655,6 +662,7 @@ pub enum Action {
     TaskProgress,
     TaskAccept,
     TaskCancel,
+    TaskFollowup,
     ExecutionOpen,
     ExecutionSend,
     ExecutionCommand,
@@ -698,6 +706,7 @@ impl Action {
         matches!(
             self,
             Self::TaskAccept
+                | Self::TaskFollowup
                 | Self::ExecutionRespondApproval
                 | Self::ExecutionRebind
                 | Self::OperationResolve
@@ -711,6 +720,7 @@ pub struct ExecutionSourcePolicy {
     pub project: ResourceRef,
     pub node_public_key: PublicKey,
     pub pins: Vec<PolicyPin>,
+    pub work: ExecutionWorkIntent,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -889,7 +899,10 @@ enum InvocationTransport<'a> {
         original: &'a gateway_forward::GatewayOriginal,
     },
     OriginalGateway(&'a OriginalGatewayTransport),
-    CompactSdkParent { header: &'a Signed<gateway_forward::GatewayForwardHeader>, invocation: &'a Signed<Invocation> },
+    CompactSdkParent {
+        header: &'a Signed<gateway_forward::GatewayForwardHeader>,
+        invocation: &'a Signed<Invocation>,
+    },
     PortableIntent,
 }
 
@@ -2285,6 +2298,15 @@ impl VerifiedPolicySet {
                     && g.issued_under.domain == PolicyDomain::Space(g.owner_space.clone()),
                 "invalid grant",
             )?;
+            if g.actions.contains(&Action::TaskFollowup) {
+                require(
+                    match &g.grantee {
+                        Grantee::Actor(actor) => matches!(actor, Actor::Account(_)),
+                        Grantee::MembersOf(selector) => selector.kind == MemberKind::Account,
+                    },
+                    "task followup grant requires account grantee",
+                )?;
+            }
             validate_window(g.not_before_ms, g.expires_at_ms, now_ms)?;
             budget.expires(g.expires_at_ms);
             validate_context(&g.constraints.context)?;
@@ -3567,6 +3589,7 @@ mod tests {
         );
         for action in [
             Action::TaskAccept,
+            Action::TaskFollowup,
             Action::ExecutionRespondApproval,
             Action::ExecutionRebind,
             Action::OperationResolve,
@@ -3579,6 +3602,40 @@ mod tests {
                 AuthorizationError::InvalidProof("action requires account actor")
             );
         }
+        let mut followup = f.state.grant(&f.root_grant).unwrap().payload.clone();
+        followup.actions = vec![Action::TaskFollowup];
+        followup.issued_under = f
+            .state
+            .head(&PolicyDomain::Space(f.space.clone()))
+            .unwrap()
+            .clone();
+        let followup_hash = f
+            .state
+            .install_grant(Signed::sign(followup.clone(), &f.root).unwrap(), NOW)
+            .unwrap();
+        f.update_space(|space| space.grants.push(followup_hash.clone()));
+        let mut invocation = f.invocation();
+        invocation.action = Action::TaskFollowup;
+        invocation.grant_leaf = followup_hash.clone();
+        assert_eq!(
+            f.check(invocation, &f.user, NOW).unwrap().actor(),
+            &Actor::Account(f.account.clone())
+        );
+        followup.grantee = Grantee::Actor(Actor::Service(f.audience.service.clone()));
+        assert_eq!(
+            f.state
+                .install_grant(Signed::sign(followup.clone(), &f.root).unwrap(), NOW)
+                .unwrap_err(),
+            AuthorizationError::InvalidProof("task followup grant requires account grantee")
+        );
+        followup.parent = Some(followup_hash);
+        followup.remaining_delegations -= 1;
+        assert_eq!(
+            f.state
+                .install_grant(Signed::sign(followup, &f.user).unwrap(), NOW)
+                .unwrap_err(),
+            AuthorizationError::InvalidProof("task followup grant requires account grantee")
+        );
     }
     #[test]
     fn endpoint_body_operation_and_expiry_are_bound() {
@@ -6071,8 +6128,12 @@ fn verify_client_policy_state_selected(
         && leaf.remaining_delegations == 0
         && leaf.expires_at_ms < u64::MAX
         && !leaf.actions.is_empty()
-        && leaf.actions.iter().all(|action| matches!(action,
-            Action::ExecutionRebind | Action::OperationStatusRead));
+        && leaf.actions.iter().all(|action| {
+            matches!(
+                action,
+                Action::ExecutionRebind | Action::OperationStatusRead
+            )
+        });
     if let Some(selected) = selected {
         let record = state.resource(&selected.space, &selected.resource).ok_or(
             AuthorizationError::InvalidProof("missing selected client resource"),
@@ -6095,7 +6156,8 @@ fn verify_client_policy_state_selected(
                 continue;
             };
             if (record.payload.kind == ResourceKind::Project
-                || (record.payload.kind == ResourceKind::ExecutionService && explicit_execution_control))
+                || (record.payload.kind == ResourceKind::ExecutionService
+                    && explicit_execution_control))
                 && record.payload.host == leaf.audience.service
                 && scope_covers(
                     &leaf.scope,
@@ -6192,9 +6254,14 @@ fn client_policy_tail(
     execution_pins: &[PolicyPin],
 ) -> Result<(Vec<PolicyPin>, Vec<JournalEntry>)> {
     require(
-        project_pins.len() <= MAX_POLICY_DOMAINS && execution_pins.len() <= MAX_POLICY_DOMAINS
-            && project_pins.windows(2).all(|pins| pins[0].domain < pins[1].domain)
-            && execution_pins.windows(2).all(|pins| pins[0].domain < pins[1].domain),
+        project_pins.len() <= MAX_POLICY_DOMAINS
+            && execution_pins.len() <= MAX_POLICY_DOMAINS
+            && project_pins
+                .windows(2)
+                .all(|pins| pins[0].domain < pins[1].domain)
+            && execution_pins
+                .windows(2)
+                .all(|pins| pins[0].domain < pins[1].domain),
         "invalid independent policy pin bounds",
     )?;
     require(
@@ -6231,16 +6298,25 @@ fn client_policy_tail(
         }
     }
     for pin in project_pins {
-        if !reader.policy_pins.iter().any(|saved| saved.domain == pin.domain) {
+        if !reader
+            .policy_pins
+            .iter()
+            .any(|saved| saved.domain == pin.domain)
+        {
             require(
-                execution_pins.iter().any(|saved| saved.domain == pin.domain
-                    && saved.genesis_root == pin.genesis_root),
+                execution_pins.iter().any(|saved| {
+                    saved.domain == pin.domain && saved.genesis_root == pin.genesis_root
+                }),
                 "additional execution policy requires its independent saved pin",
             )?;
         }
     }
     let mut pins = BTreeMap::<PolicyDomain, PolicyPin>::new();
-    for pin in project_pins.iter().cloned().chain(execution_pins.iter().cloned()) {
+    for pin in project_pins
+        .iter()
+        .cloned()
+        .chain(execution_pins.iter().cloned())
+    {
         if let Some(saved) = pins.get_mut(&pin.domain) {
             require(
                 saved.genesis_root == pin.genesis_root,
@@ -6746,7 +6822,14 @@ fn sign_client_invocation_inner(
         "invocation template does not match client request",
     )?;
     validate_client_invocation_fields(
-        auth, &invocation, &request, action, operation, &PublicKey::of(key), presenter, now as u64,
+        auth,
+        &invocation,
+        &request,
+        action,
+        operation,
+        &PublicKey::of(key),
+        presenter,
+        now as u64,
     )?;
     invocation.nonce = Nonce::random()?;
     serde_json::to_string(&Signed::sign(invocation, key)?)
@@ -6787,11 +6870,7 @@ pub(super) fn validate_client_invocation_fields(
     if auth.constraints.require_webauthn_uv {
         return Err(AuthorizationError::UserPresenceRequired);
     }
-    validate_window(
-        invocation.not_before_ms,
-        invocation.expires_at_ms,
-        now,
-    )?;
+    validate_window(invocation.not_before_ms, invocation.expires_at_ms, now)?;
     require(
         invocation.expires_at_ms - invocation.not_before_ms <= INVOCATION_MAX_AGE_MS,
         "invocation lifetime too long",
@@ -6838,53 +6917,53 @@ fn apply_policy_entry(
     pins: &[PolicyPin],
     entry: JournalEntry,
 ) -> Result<()> {
-        match entry {
-            JournalEntry::AccountGenesis(signed) => {
-                let domain = PolicyDomain::Account(signed.payload.account.clone());
-                let pin = pins.iter().find(|p| p.domain == domain).ok_or(
-                    AuthorizationError::InvalidProof("account genesis is not pinned"),
-                )?;
-                state.trust_account_genesis(&pin.genesis_root, signed)?;
-            }
-            JournalEntry::SpaceGenesis(signed) => {
-                let domain = PolicyDomain::Space(signed.payload.space.clone());
-                let pin = pins.iter().find(|p| p.domain == domain).ok_or(
-                    AuthorizationError::InvalidProof("space genesis is not pinned"),
-                )?;
-                state.trust_space_genesis(&pin.genesis_root, signed)?;
-            }
-            JournalEntry::Account(signed) => {
-                state.install_account(signed)?;
-            }
-            JournalEntry::Space(signed) => {
-                state.install_space(signed)?;
-            }
-            JournalEntry::Device(signed) => {
-                let at = signed.payload.not_before_ms;
-                state.install_device(signed, at)?;
-            }
-            JournalEntry::Resource(signed) => {
-                state.install_resource(signed)?;
-            }
-            JournalEntry::Authenticator(signed) => {
-                let at = signed.payload.not_before_ms;
-                state.install_authenticator(signed, at)?;
-            }
-            JournalEntry::Membership(signed) => {
-                let at = signed.payload.not_before_ms;
-                state.install_membership(signed, at)?;
-            }
-            JournalEntry::Grant(signed) => {
-                let at = signed.payload.not_before_ms;
-                state.install_grant(signed, at)?;
-            }
-            JournalEntry::AccountCommit(change) => {
-                state.replay_account_committed(change)?;
-            }
-            JournalEntry::SpaceCommit(change) => {
-                state.replay_space_committed(change)?;
-            }
+    match entry {
+        JournalEntry::AccountGenesis(signed) => {
+            let domain = PolicyDomain::Account(signed.payload.account.clone());
+            let pin = pins.iter().find(|p| p.domain == domain).ok_or(
+                AuthorizationError::InvalidProof("account genesis is not pinned"),
+            )?;
+            state.trust_account_genesis(&pin.genesis_root, signed)?;
         }
+        JournalEntry::SpaceGenesis(signed) => {
+            let domain = PolicyDomain::Space(signed.payload.space.clone());
+            let pin = pins.iter().find(|p| p.domain == domain).ok_or(
+                AuthorizationError::InvalidProof("space genesis is not pinned"),
+            )?;
+            state.trust_space_genesis(&pin.genesis_root, signed)?;
+        }
+        JournalEntry::Account(signed) => {
+            state.install_account(signed)?;
+        }
+        JournalEntry::Space(signed) => {
+            state.install_space(signed)?;
+        }
+        JournalEntry::Device(signed) => {
+            let at = signed.payload.not_before_ms;
+            state.install_device(signed, at)?;
+        }
+        JournalEntry::Resource(signed) => {
+            state.install_resource(signed)?;
+        }
+        JournalEntry::Authenticator(signed) => {
+            let at = signed.payload.not_before_ms;
+            state.install_authenticator(signed, at)?;
+        }
+        JournalEntry::Membership(signed) => {
+            let at = signed.payload.not_before_ms;
+            state.install_membership(signed, at)?;
+        }
+        JournalEntry::Grant(signed) => {
+            let at = signed.payload.not_before_ms;
+            state.install_grant(signed, at)?;
+        }
+        JournalEntry::AccountCommit(change) => {
+            state.replay_account_committed(change)?;
+        }
+        JournalEntry::SpaceCommit(change) => {
+            state.replay_space_committed(change)?;
+        }
+    }
     Ok(())
 }
 

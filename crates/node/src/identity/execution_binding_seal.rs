@@ -1,5 +1,7 @@
 use super::{
-    admission::{check_policy_heads_in, consume_request_authorization_in, validate_persisted_admission},
+    admission::{
+        check_policy_heads_in, consume_request_authorization_in, validate_persisted_admission,
+    },
     journal::PolicyState,
     policy::{FreshnessProof, RequestTransport},
 };
@@ -30,9 +32,13 @@ fn stored_seal_from(
     target: &ExecutionBindingSealTarget,
 ) -> Result<Option<(AdmissionProof, SignedSeal)>> {
     let source = &target.session;
+    let task = source
+        .work
+        .task_ref()
+        .context("executor seal requires a Task binding")?;
     let raw:Option<(String,String,String)> = connection.query_row(
         "SELECT admission,seal,seal_invocation_hash FROM execution_binding_seals WHERE original_space_id=? AND original_resource_id=? AND task_ref=? AND target_node=? AND generation=?",
-        params![source.original_project.space.as_str(),source.original_project.resource.as_str(),source.task.as_str(),target.binding.binding.target_node,target.binding.binding.generation],
+        params![source.original_project.space.as_str(),source.original_project.resource.as_str(),task.as_str(),target.binding.binding.target_node,target.binding.binding.generation],
         |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
     ).optional()?;
     raw.map(|(admission, seal, hash)| {
@@ -95,7 +101,12 @@ fn authorize_in(
         "executor seal requires its current Account authority"
     );
     let verified = super::policy::authorize_request_invocation_for_body(
-        policy.verified(), auth.signed_invocation(), &facts, transport, body, now,
+        policy.verified(),
+        auth.signed_invocation(),
+        &facts,
+        transport,
+        body,
+        now,
     )?;
     policy
         .verified()
@@ -133,6 +144,18 @@ fn quiescent_in(
     target: &ExecutionBindingSealTarget,
 ) -> Result<ExecutionSession> {
     let source = &target.session;
+    let task = source
+        .work
+        .task_ref()
+        .context("executor seal requires a Task binding")?;
+    let generation = source
+        .work
+        .binding_generation()
+        .context("executor seal requires a Task generation")?;
+    let binding_hash = source
+        .work
+        .binding_hash()
+        .context("executor seal requires a Task binding hash")?;
     let mut statement=connection.prepare(
         "SELECT execution_space_id,operation_id,handoff,state,target_node FROM execution_handoffs WHERE original_space_id=?",
     )?;
@@ -165,11 +188,11 @@ fn quiescent_in(
             state.terminal(),
             "Project has accepted, running or unknown execution; reconcile it before sealing"
         );
-        if row_source.task == source.task
-            && row_source.binding_generation == source.binding_generation
+        if row_source.work.task_ref() == Some(task)
+            && row_source.work.binding_generation() == Some(generation)
         {
             ensure!(
-                row_source.binding_hash == source.binding_hash,
+                row_source.work.binding_hash() == Some(binding_hash),
                 "executor contains a conflicting task binding generation"
             );
             let locks:bool=connection.query_row(
@@ -220,7 +243,7 @@ fn project_binding_quiescent_in(
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(4)?,
         ))
     })?;
     for row in rows {
@@ -233,7 +256,8 @@ fn project_binding_quiescent_in(
             request.network_id == binding.binding.network_id
                 && request.operation_id == operation
                 && request.target_node == target
-                && request.session_id == session,
+                && request.session_id.as_deref() == Some(binding.binding.session_id.as_str())
+                && session.as_deref() == Some(binding.binding.session_id.as_str()),
             "Project operation metadata differs from its retained binding"
         );
         let state: OperationState = serde_json::from_str(&state)?;
@@ -255,10 +279,18 @@ pub(super) fn ensure_handoff_generation_open_in(
     wire: &SignedExecutionHandoff,
 ) -> Result<()> {
     let source = wire.handoff.source_statement()?;
+    let vibeface_secure::authorization::execution_work::ExecutionWork::TaskSession {
+        task,
+        binding_generation,
+        ..
+    } = &source.work
+    else {
+        return Ok(());
+    };
     let target = crate::crypto::fingerprint(wire.handoff.target_public_key.as_str())?;
     let sealed:bool=connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM execution_binding_seals WHERE original_space_id=? AND original_resource_id=? AND task_ref=? AND target_node=? AND generation=?)",
-        params![source.project.space.as_str(),source.project.resource.as_str(),source.task.as_str(),target,source.binding_generation],|row|row.get(0))?;
+        params![source.project.space.as_str(),source.project.resource.as_str(),task.as_str(),target,binding_generation],|row|row.get(0))?;
     ensure!(!sealed, "execution binding generation is sealed");
     Ok(())
 }
@@ -275,7 +307,13 @@ impl Store {
         now: u64,
     ) -> Result<crate::binding::SignedBinding> {
         self.rebind_execution_dispatch_request_authorized(
-            identity, dispatch, scoped, proof, &RequestTransport::Existing(transport.clone()), body, now,
+            identity,
+            dispatch,
+            scoped,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            body,
+            now,
         )
     }
 
@@ -371,7 +409,12 @@ impl Store {
         let current = PolicyState::reload_verified(&tx, &self.policy)?;
         let facts = dispatch.revalidate(&tx, &current, scoped, body, auth.audience(), now)?;
         super::policy::authorize_request_invocation_for_body(
-            scoped.state(current.verified()), auth.signed_invocation(), &facts, transport, body, now,
+            scoped.state(current.verified()),
+            auth.signed_invocation(),
+            &facts,
+            transport,
+            body,
+            now,
         )?;
         let saved: String = tx.query_row(
             "SELECT value FROM local_values WHERE space_id=? AND key=?",
@@ -404,7 +447,9 @@ impl Store {
             "rebind task differs from its exact ready Project source"
         );
         project_binding_quiescent_in(&tx, &old)?;
-        if super::operation_control::accepted_request_before(&tx, &current, auth, proof, transport, body, now)? {
+        if super::operation_control::accepted_request_before(
+            &tx, &current, auth, proof, transport, body, now,
+        )? {
             let stored: String = tx.query_row(
                 "SELECT value FROM local_values WHERE space_id=? AND key=?",
                 params![next.network_id, format!("task-binding-record:{hash}")],
@@ -483,7 +528,12 @@ impl Store {
         now: u64,
     ) -> Result<RemoteExecutionSealPreflight> {
         self.authorize_remote_execution_seal_request_fence(
-            identity, auth, proof, &RequestTransport::Existing(transport.clone()), body, now,
+            identity,
+            auth,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            body,
+            now,
         )
     }
 
@@ -531,7 +581,13 @@ impl Store {
         now: u64,
     ) -> Result<SignedSeal> {
         self.seal_remote_execution_request_authorized(
-            identity, auth, proof, &RequestTransport::Existing(transport.clone()), body, stopped, now,
+            identity,
+            auth,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            body,
+            stopped,
+            now,
         )
     }
 
@@ -553,7 +609,10 @@ impl Store {
         let target = authorize_in(&tx, &current, identity, auth, proof, transport, body, now)?;
         ensure!(
             auth.action() == Action::ExecutionRebind
-                && stopped.matches_context(&context(&target, auth.expires_at_ms().min(transport.expires_at_ms()))),
+                && stopped.matches_context(&context(
+                    &target,
+                    auth.expires_at_ms().min(transport.expires_at_ms())
+                )),
             "remote seal has no matching real executor fence"
         );
         if let Some((admission, seal)) = stored_seal_from(&tx, &target)? {
@@ -566,8 +625,17 @@ impl Store {
         }
         let mut session = quiescent_in(&tx, &target)?;
         let source = &target.session;
-        let generation = i64::try_from(source.binding_generation)
-            .context("binding generation exceeds SQLite range")?;
+        let task = source
+            .work
+            .task_ref()
+            .context("executor seal requires a Task binding")?;
+        let generation = i64::try_from(
+            source
+                .work
+                .binding_generation()
+                .context("executor seal requires a Task generation")?,
+        )
+        .context("binding generation exceeds SQLite range")?;
         let seal = binding::sign_seal(
             identity,
             &BindingSeal {
@@ -577,8 +645,9 @@ impl Store {
                 final_revision: session.revision,
             },
         )?;
-        let admission =
-            consume_request_authorization_in(&tx, &current, auth, proof, transport, body, None, now)?;
+        let admission = consume_request_authorization_in(
+            &tx, &current, auth, proof, transport, body, None, now,
+        )?;
         session.state = "closed".into();
         session.native_session_id = None;
         ensure!(tx.execute(
@@ -586,7 +655,7 @@ impl Store {
             params![serde_json::to_string(&session)?,target.session.execution_resource.space.as_str(),source.original_project.space.as_str(),source.original_project.resource.as_str(),session.target_node,session.session_id,session.revision],
         )?==1,"executor session changed before seal");
         tx.execute("INSERT INTO execution_binding_seals(original_space_id,original_resource_id,task_ref,target_node,generation,execution_space_id,execution_resource_id,binding_hash,seal_invocation_hash,admission,seal) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            params![source.original_project.space.as_str(),source.original_project.resource.as_str(),source.task.as_str(),target.binding.binding.target_node,generation,target.session.execution_resource.space.as_str(),target.session.execution_resource.resource.as_str(),seal.seal.binding_hash,auth.signed_invocation().hash()?.as_str(),serde_json::to_string(&admission)?,serde_json::to_string(&seal)?])?;
+            params![source.original_project.space.as_str(),source.original_project.resource.as_str(),task.as_str(),target.binding.binding.target_node,generation,target.session.execution_resource.space.as_str(),target.session.execution_resource.resource.as_str(),seal.seal.binding_hash,auth.signed_invocation().hash()?.as_str(),serde_json::to_string(&admission)?,serde_json::to_string(&seal)?])?;
         tx.commit()?;
         self.policy = current;
         Ok(seal)
@@ -602,7 +671,12 @@ impl Store {
         now: u64,
     ) -> Result<Option<SignedSeal>> {
         self.remote_execution_seal_status_request_authorized(
-            identity, auth, proof, &RequestTransport::Existing(transport.clone()), body, now,
+            identity,
+            auth,
+            proof,
+            &RequestTransport::Existing(transport.clone()),
+            body,
+            now,
         )
     }
 

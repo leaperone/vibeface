@@ -30,6 +30,22 @@ pub enum ExecutorKind {
     CursorAgent,
 }
 
+impl ExecutorKind {
+    pub fn capabilities(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &[
+                "open",
+                "send",
+                "read",
+                "steer",
+                "interrupt",
+                "respond_request",
+            ],
+            Self::ClaudeCode | Self::CursorAgent => &["open", "send"],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
@@ -139,6 +155,7 @@ pub(crate) struct StoppedExecution {
     context: ExecutionContext,
     owner: Arc<Mutex<BTreeSet<ExecutionGeneration>>>,
     scope: isolation::StoppedScope,
+    command: bool,
 }
 
 impl StoppedExecution {
@@ -168,6 +185,7 @@ pub struct Engine {
     events: mpsc::UnboundedSender<Value>,
     isolation: Option<DockerIsolation>,
     manager_isolation: Option<DockerIsolation>,
+    command_isolation: Option<DockerIsolation>,
     codex_contexts: Arc<Mutex<BTreeMap<(Option<String>, String), ExecutionContext>>>,
     personal_turns: Arc<Mutex<BTreeMap<(String, String, String), (String, String)>>>,
     fenced_operations: Arc<Mutex<BTreeSet<ExecutionGeneration>>>,
@@ -187,12 +205,18 @@ impl Engine {
             .clone()
             .zip(config.data_dir.clone())
             .map(|(settings, data_dir)| DockerIsolation::manager(settings, data_dir));
+        let command_isolation = config
+            .execution_isolation
+            .clone()
+            .zip(config.data_dir.clone())
+            .map(|(settings, data_dir)| DockerIsolation::command(settings, data_dir));
         Self {
             config,
             codex,
             events,
             isolation,
             manager_isolation,
+            command_isolation,
             codex_contexts,
             personal_turns: Arc::new(Mutex::new(BTreeMap::new())),
             fenced_operations: Arc::new(Mutex::new(BTreeSet::new())),
@@ -213,6 +237,37 @@ impl Engine {
         }))
     }
 
+    pub(crate) async fn restore_observed_thread(
+        &self,
+        context: &ExecutionContext,
+        native_id: &str,
+    ) -> Result<()> {
+        vibeface_protocol::validate_id(native_id).map_err(anyhow::Error::msg)?;
+        let (codex, generation) = if context.shared {
+            let (codex, generation) = self
+                .isolation
+                .as_ref()
+                .context("shared execution isolation is not configured")?
+                .existing_codex(context)
+                .await?;
+            (codex, Some(generation))
+        } else {
+            (self.personal_codex()?.clone(), None)
+        };
+        let mut bindings = self.codex_contexts.lock().await;
+        if let Some(existing) = bindings.get(&(generation.clone(), native_id.to_owned())) {
+            ensure_same_host_scope(existing, context)?;
+        }
+        bindings.insert((generation.clone(), native_id.to_owned()), context.clone());
+        let threads = bindings
+            .iter()
+            .filter(|((source, _), _)| *source == generation)
+            .map(|((_, thread), _)| thread.clone())
+            .collect();
+        codex.set_observed_threads(threads)?;
+        Ok(())
+    }
+
     pub async fn snapshot(&self) -> Value {
         match self.codex.get() {
             Some(codex) => codex.snapshot().await,
@@ -228,23 +283,58 @@ impl Engine {
     }
 
     pub async fn snapshot_authorized(&self, context: &ExecutionContext) -> Result<Value> {
-        if context.shared {
-            return Ok(self
+        let (codex, generation) = if context.shared {
+            let (codex, generation) = self
                 .isolation
                 .as_ref()
                 .context("shared execution isolation is not configured")?
                 .existing_codex(context)
-                .await?
-                .0
-                .snapshot()
-                .await);
-        }
-        Ok(self
-            .codex
-            .get()
-            .context("personal Provider is not connected")?
-            .snapshot()
-            .await)
+                .await?;
+            (codex, Some(generation))
+        } else {
+            (
+                self.codex
+                    .get()
+                    .context("personal Provider is not connected")?
+                    .clone(),
+                None,
+            )
+        };
+        let allowed: BTreeSet<String> = self
+            .codex_contexts
+            .lock()
+            .await
+            .iter()
+            .filter(|((source, _), bound)| {
+                *source == generation
+                    && bound.space_id == context.space_id
+                    && bound.resource_id == context.resource_id
+                    && bound.operation_id == context.operation_id
+            })
+            .map(|((_, thread), _)| thread.clone())
+            .collect();
+        let snapshot = codex.snapshot().await;
+        let threads: serde_json::Map<String, Value> = snapshot["threads"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(thread, _)| allowed.contains(*thread))
+            .map(|(thread, value)| (thread.clone(), value.clone()))
+            .collect();
+        let requests = snapshot["pending_requests"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|request| {
+                request["params"]["threadId"]
+                    .as_str()
+                    .is_some_and(|thread| allowed.contains(thread))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(
+            json!({"connection":snapshot["connection"],"threads":threads,"pending_requests":requests}),
+        )
     }
 
     pub async fn read_turn_authorized(
@@ -397,12 +487,31 @@ impl Engine {
         &self,
         context: &ExecutionContext,
     ) -> Result<(StoppedExecution, Vec<String>)> {
+        self.fence_execution(context, false).await
+    }
+
+    pub(crate) async fn fence_command(
+        &self,
+        context: &ExecutionContext,
+    ) -> Result<(StoppedExecution, Vec<String>)> {
+        self.fence_execution(context, true).await
+    }
+
+    async fn fence_execution(
+        &self,
+        context: &ExecutionContext,
+        command: bool,
+    ) -> Result<(StoppedExecution, Vec<String>)> {
         ensure!(context.shared, "only isolated execution can be fenced");
         vibeface_protocol::validate_id(&context.operation_id).map_err(anyhow::Error::msg)?;
         let mut fenced = self.fenced_operations.lock().await;
         fenced.insert(execution_generation(context));
-        let (scope, affected) = self
-            .isolation
+        let isolation = if command {
+            &self.command_isolation
+        } else {
+            &self.isolation
+        };
+        let (scope, affected) = isolation
             .as_ref()
             .context("shared execution isolation is not configured")?
             .fence(context)
@@ -419,6 +528,7 @@ impl Engine {
                 context: context.clone(),
                 owner: self.fenced_operations.clone(),
                 scope,
+                command,
             },
             affected,
         ))
@@ -480,7 +590,12 @@ impl Engine {
             fenced.contains(&execution_generation(&stopped.context)),
             "stopped execution generation is not fenced"
         );
-        self.isolation
+        let isolation = if stopped.command {
+            &self.command_isolation
+        } else {
+            &self.isolation
+        };
+        isolation
             .as_ref()
             .context("shared execution isolation is not configured")?
             .complete_fenced(&stopped.scope)
@@ -566,6 +681,55 @@ impl Engine {
         })
         .await
         .context("personal turn stop was not confirmed; preserve unknown state")?
+    }
+
+    pub(crate) async fn execute_command_authorized(
+        &self,
+        context: &ExecutionContext,
+        spec: &crate::command::CommandSpec,
+    ) -> std::result::Result<crate::command::CommandOutput, crate::command::CommandError> {
+        let prepared: Result<_> = async {
+            ensure!(context.shared, "isolated command requires shared execution");
+            let fenced = self.fenced_operations.lock().await;
+            ensure!(
+                !fenced.contains(&execution_generation(context)),
+                "execution generation was fenced; reconcile its original operation"
+            );
+            let isolation = self
+                .command_isolation
+                .as_ref()
+                .context("shared command isolation is not configured")?;
+            let prepared = isolation.prepare(context, &spec.cwd).await?;
+            drop(fenced);
+            Ok(prepared)
+        }
+        .await;
+        let prepared = prepared.map_err(|error| crate::command::CommandError {
+            uncertain: false,
+            message: error.to_string(),
+        })?;
+        crate::command::execute_in_container(spec, prepared.command("/bin/sh")).await
+    }
+
+    pub(crate) async fn renew_command(
+        &self,
+        context: &ExecutionContext,
+        lease_expires_at_ms: u64,
+    ) -> Result<()> {
+        self.command_isolation
+            .as_ref()
+            .context("shared command isolation is not configured")?
+            .renew(context, lease_expires_at_ms)
+            .await
+    }
+
+    pub(crate) async fn complete_command(&self, context: &ExecutionContext) -> Result<()> {
+        let _fenced = self.fenced_operations.lock().await;
+        self.command_isolation
+            .as_ref()
+            .context("shared command isolation is not configured")?
+            .complete(context)
+            .await
     }
 
     pub async fn renew_operation(
@@ -798,6 +962,54 @@ impl Engine {
             let thread_id = native
                 .clone()
                 .ok_or_else(|| EngineError::rejected(session, "execution session is not open"))?;
+            if matches!(
+                action,
+                EngineAction::Steer { .. }
+                    | EngineAction::Interrupt { .. }
+                    | EngineAction::RespondRequest { .. }
+            ) {
+                codex
+                    .execute(&Command::ReadThread {
+                        thread_id: thread_id.clone(),
+                    })
+                    .await
+                    .map_err(|error| codex_error(error, native.clone()))?;
+                let snapshot = codex.snapshot().await;
+                let turn = &snapshot["threads"][&thread_id]["last_turn"];
+                let current = turn["id"]
+                    .as_str()
+                    .filter(|_| {
+                        matches!(
+                            turn["status"].as_str(),
+                            Some("inProgress" | "in_progress" | "running")
+                        )
+                    })
+                    .ok_or_else(|| {
+                        EngineError::rejected(session, "execution has no current active turn")
+                    })?;
+                let belongs = match &action {
+                    EngineAction::Steer { turn_id, .. } | EngineAction::Interrupt { turn_id } => {
+                        turn_id == current
+                    }
+                    EngineAction::RespondRequest { request_id, .. } => snapshot["pending_requests"]
+                        .as_array()
+                        .is_some_and(|requests| {
+                            requests.iter().any(|request| {
+                                request["id"] == json!(request_id)
+                                    && request["params"]["threadId"].as_str()
+                                        == Some(thread_id.as_str())
+                                    && request["params"]["turnId"].as_str() == Some(current)
+                            })
+                        }),
+                    _ => true,
+                };
+                if !belongs {
+                    return Err(EngineError::rejected(
+                        session,
+                        "control no longer matches the active turn or approval request",
+                    ));
+                }
+            }
             let command = match action {
                 EngineAction::Open {} => {
                     return Ok(EngineResult {
@@ -1058,8 +1270,8 @@ mod tests {
         );
         let mut context = personal_context();
         context.shared = true;
-        context.lease_expires_at_ms = vibeface_protocol::now_ms()
-            + vibeface_secure::authorization::EXECUTION_LEASE_MS;
+        context.lease_expires_at_ms =
+            vibeface_protocol::now_ms() + vibeface_secure::authorization::EXECUTION_LEASE_MS;
         let original = engine
             .prepare_operation_for_test(&context, &project)
             .await?;

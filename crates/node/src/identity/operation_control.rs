@@ -165,7 +165,7 @@ pub(super) fn accepted_request_before(
 }
 
 fn operation_from(connection: &Connection, space: &str, id: &str) -> Result<OperationRecord> {
-    let (request, state, result, target, session): (String, String, String, String, String) = connection.query_row(
+    let (request, state, result, target, session): (String, String, String, String, Option<String>) = connection.query_row(
         "SELECT request,state,result,target_node,session_id FROM operations WHERE space_id=? AND operation_id=?",
         params![space, id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     ).context("operation is missing")?;
@@ -314,7 +314,7 @@ impl Store {
         );
         ensure!(
             operation.request.conversation_id == text(body, "conversation_id")?
-                && operation.request.session_id == text(body, "session_id")?
+                && serde_json::to_value(&operation.request.session_id)? == body["session_id"]
                 && serde_json::to_value(&operation.request.task_id)? == body["task_id"],
             "resolution differs from the original operation context"
         );
@@ -370,7 +370,7 @@ impl Store {
             ensure!(
                 session.network_id == space
                     && session.target_node == operation.request.target_node
-                    && session.session_id == operation.request.session_id
+                    && Some(session.session_id.as_str()) == operation.request.session_id.as_deref()
                     && session.revision == revision,
                 "execution session metadata changed"
             );
@@ -507,9 +507,11 @@ impl Store {
                 let completions = events.values().filter(|stored| stored.status == "ready" && stored.event.author == binding.binding.target_node
                     && stored.event.scope_id == binding.binding.conversation_id
                     && matches!(&stored.event.body, EventBody::ExecutionObserved {operation_id,target_node,session_id,status:actual,..}
-                        if operation_id == &id && target_node == &binding.binding.target_node && session_id == &binding.binding.session_id && Some(actual.as_str()) == status.as_str())).collect::<Vec<_>>();
-                ensure!(completions.len() == 1,
-                    "execution completion is not durable");
+                        if operation_id == &id && target_node == &binding.binding.target_node && session_id.as_deref() == Some(binding.binding.session_id.as_str()) && Some(actual.as_str()) == status.as_str())).collect::<Vec<_>>();
+                ensure!(
+                    completions.len() == 1,
+                    "execution completion is not durable"
+                );
                 let completion = completions[0];
                 ensure!(
                     super::event_authorization::verify_event_envelope(
@@ -762,8 +764,8 @@ mod tests {
                 connection: fixture.connection,
                 policy: fixture.policy,
                 target_recovery_import: None,
-            account_node_enrollment_import: None,
-            foreign_execution_policy: Default::default(),
+                account_node_enrollment_import: None,
+                foreign_execution_policy: Default::default(),
             };
             store.append_authorized_event(
                 &fixture.node,
@@ -1002,12 +1004,13 @@ mod tests {
                 conversation_id: "chat".into(),
                 task_id: Some("task".into()),
                 target_node: self.node.node_id()?,
-                session_id: "old".into(),
+                session_id: Some("old".into()),
                 expected_revision: 0,
                 basis_heads: self.store.heads(self.resource.space.as_str(), "chat")?,
                 action: self.binding.binding.open_spec.clone(),
                 resources: vec![self.cwd.clone()],
                 binding: Some(self.binding.clone()),
+                manager_authority: None,
             };
             let body = json!({"method":"operate","space_id":self.resource.space,"resource_id":self.resource.resource,"authorization_id":"operation","request":request});
             let (auth, proof) = self.authorization(&body)?;
@@ -1177,7 +1180,10 @@ mod tests {
             .session(
                 fixture.resource.space.as_str(),
                 &request.target_node,
-                &request.session_id,
+                request
+                    .session_id
+                    .as_deref()
+                    .context("fixture session is missing")?,
             )?
             .unwrap();
         assert_eq!(session.revision, 1);

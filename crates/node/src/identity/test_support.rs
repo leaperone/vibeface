@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use vibeface_secure::{
     Identity,
     authorization::{
-        client_policy_import::AuthorizationSelection,
         bootstrap::{
             self,
             recovery::{self, node_enrollment},
         },
+        client_policy_import::AuthorizationSelection,
         *,
     },
 };
@@ -667,7 +667,7 @@ impl TestNetwork {
             conversation_id: "conversation".into(),
             task_id: Some(task_id),
             target_node: self.node.node_id()?,
-            session_id: session.into(),
+            session_id: Some(session.into()),
             expected_revision: 0,
             basis_heads: store.heads(self.space.as_str(), "conversation")?,
             action: binding.binding.open_spec.clone(),
@@ -678,6 +678,7 @@ impl TestNetwork {
                     .into(),
             ],
             binding: Some(binding),
+            manager_authority: None,
         })
     }
 

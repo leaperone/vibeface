@@ -1,8 +1,11 @@
 #!/usr/bin/env node
+import childProcess from "node:child_process";
 import { access, chmod, constants, stat, unlink } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { syncBuiltinESMExports } from "node:module";
+import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
 import { Codex } from "@openai/codex-sdk";
 
@@ -14,7 +17,6 @@ const MAX_STREAM_BYTES = 16_777_216;
 const MAX_ID_BYTES = 256;
 const MAX_MODEL_BYTES = 256;
 const ID_PATTERN = /^[^\u0000-\u001f\u007f\r\n]{1,256}$/;
-
 const INIT_FIELDS = new Set([
   "type",
   "prompt",
@@ -24,6 +26,8 @@ const INIT_FIELDS = new Set([
   "codex_path",
   "tools",
 ]);
+
+class InputClosedError extends Error {}
 
 class ProtocolError extends Error {
   constructor(message) {
@@ -71,7 +75,6 @@ function rejectUnknownFields(value, allowed, name) {
   }
 }
 
-
 async function validateExecutable(value, name) {
   const executable = requireAbsolutePath(value, name);
   const metadata = await stat(executable).catch(() => null);
@@ -105,18 +108,23 @@ function validateInit(value) {
   const model = value.model === undefined || value.model === null || value.model === ""
     ? undefined
     : requireString(value.model, "model", MAX_MODEL_BYTES);
-  if (!Array.isArray(value.tools) || value.tools.length > 32 || value.tools.some((name) => typeof name !== "string" || !/^[a-z][a-z0-9_]{0,127}$/.test(name)) || new Set(value.tools).size !== value.tools.length) {
-    throw new ProtocolError("tools must be a bounded unique catalog");
-  }
-
   return {
     prompt,
     sessionId,
     cwd: value.cwd,
     model,
     codexPath: value.codex_path,
-    tools: value.tools,
+    tools: validateTools(value.tools),
   };
+}
+
+function validateTools(value) {
+  if (!isObject(value) || Object.keys(value).length > 32 || bytes(JSON.stringify(value)) > MAX_EVENT_BYTES) throw new ProtocolError("tools must be a bounded tool catalog");
+  for (const [name, spec] of Object.entries(value)) {
+    if (!/^[a-z][a-z0-9_]{0,127}$/.test(name) || !isObject(spec) || !isObject(spec.inputSchema) || spec.inputSchema.type !== "object") throw new ProtocolError("invalid custom tool schema");
+    if (spec.description !== undefined && typeof spec.description !== "string") throw new ProtocolError("invalid custom tool description");
+  }
+  return value;
 }
 
 function redactString(text, secrets) {
@@ -219,21 +227,11 @@ function childEnvironment(socket) {
   return env;
 }
 
-function managerPrompt(prompt, toolCli, allowedTools) {
+function managerPrompt(prompt, toolCli, tools) {
   if (toolCli === undefined) return prompt;
   const executable = `'${toolCli.replaceAll("'", "'\"'\"'")}'`;
-  const tools = [
-    ["nodes", {}, "List reachable execution nodes, capabilities and allowed roots."],
-    ["context", { offset: 0, limit: 20 }, "Page original conversation events. For referenced blobs, add blob_hash; offset counts bytes and limit counts KiB."],
-    ["create_task", { task_id: "stable-id", title: "title", goal: "goal", acceptance: "human acceptance criteria" }, "Create a task. Reuse its task_id when retrying."],
-    ["bind_execution", { task_id: "selected-task-id", target_node: "node-id", session_id: "stable-id", executor: "codex", cwd: "/allowed/root" }, "Bind a selected Task to this execution target before opening it. The Node validates the real Task and signs its execution binding. Reuse the exact target when retrying. Existing bindings cannot be moved by the Manager."],
-    ["open_execution", { operation_id: "stable-id", task_id: "selected-task-id", session_id: "stable-id", target_node: "node-id", executor: "codex", cwd: "/allowed/root" }, "Open an execution session for a selected Task. executor is codex, cursor_agent or claude_code. task_id is required. The Node verifies the Task binding; never invent authorization proofs."],
-    ["send_execution", { operation_id: "stable-id", task_id: "selected-task-id", session_id: "existing-id", target_node: "node-id", expected_revision: 0, text: "task instructions" }, "Send to the selected Task's existing session at its current revision. task_id is required. The Node verifies the Task binding. Reconcile unknown results before any resend."],
-    ["execution_status", { target_node: "node-id", session_id: "existing-id" }, "Read actual execution status without sending work or approving anything."],
-    ["update_task", { task_id: "existing-id", status: "working", detail: "progress" }, "Record progress. status is open, working, blocked or needs_review. Only the human may accept or cancel tasks."],
-  ];
-  const catalog = tools.filter(([name]) => allowedTools.includes(name)).map(([name, args, description]) => `${name} ${JSON.stringify(args)}\n${description}`).join("\n\n");
-  const result = `Node tool access is available through your command-execution tool. Run this executable with a tool name and one shell-quoted JSON object:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor example, run ${executable} tool nodes --json '{}'. The CLI uses the private local tool channel and prints a JSON result. The Node callback credentials remain outside this process. Use these Node tools to manage tasks and execution; do not use MCP, edit project files or launch executors directly. Conversation and network scope are supplied by the CLI. Use the real results and report errors instead of claiming a failed call succeeded.\n\nAvailable tool arguments and meanings follow. Replace example values with the requested values.\n${catalog}\n\n${prompt}`;
+  const catalog = Object.entries(tools).map(([name, spec]) => `${name}\n${spec.description || ""}\nJSON schema: ${JSON.stringify(spec.inputSchema)}`).join("\n\n");
+  const result = `Node tools are available through your command-execution tool. Run:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor every write tool, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {"call_ref":"THE_SAME_REFERENCE"}; never replace an uncertain call with a new reference. Different authorized intentions need different references, even when their command text is equal. Returned work_ref values select existing work without exposing SDK session bookkeeping.\nThe CLI uses a private local tool channel and prints JSON. Node callback credentials remain outside this process. Use only the listed Node tools for execution; do not edit project files or launch executors directly. Report failed calls honestly. Conversation and Space scope come from Node.\n\nAvailable tools for this invocation:\n${catalog}\n\n${prompt}`;
   if (bytes(result) > MAX_PROMPT_BYTES) throw new ProtocolError("management prompt with Node tool instructions exceeded the size limit");
   return result;
 }
@@ -260,32 +258,49 @@ async function* frameReader(stream) {
 
 async function readFrame(reader) {
   const line = await reader.next();
-  if (line.done) throw new ProtocolError("sidecar input closed before the next frame");
+  if (line.done) throw new InputClosedError("sidecar input closed before the next frame");
   try {
     return JSON.parse(line.value);
   } catch {
     throw new ProtocolError("sidecar input was not valid JSON");
   }
 }
+
 async function toolCommand(args) {
-  if (args.length !== 3 || args[1] !== "--json" || !/^[a-z][a-z0-9_]{0,127}$/.test(args[0])) throw new ProtocolError("invalid tool command");
-  const argumentsValue = JSON.parse(args[2]);
-  if (!isObject(argumentsValue) || bytes(args[2]) > MAX_PROMPT_BYTES) throw new ProtocolError("invalid tool arguments");
+  const name = args[0];
+  if (typeof name !== "string" || !/^[a-z][a-z0-9_]{0,127}$/.test(name)) throw new ProtocolError("invalid tool command");
+  const options = new Map();
+  for (let i = 1; i < args.length; i += 2) {
+    if (!["--json", "--call-ref"].includes(args[i]) || options.has(args[i]) || args[i + 1] === undefined) throw new ProtocolError("invalid tool command");
+    options.set(args[i], args[i + 1]);
+  }
+  const encodedArguments = options.get("--json");
+  if (encodedArguments === undefined || bytes(encodedArguments) > MAX_PROMPT_BYTES) throw new ProtocolError("invalid tool arguments");
+  const argumentsValue = JSON.parse(encodedArguments);
+  if (!isObject(argumentsValue)) throw new ProtocolError("invalid tool arguments");
+  const argumentRef = argumentsValue.call_ref;
+  const flagRef = options.get("--call-ref");
+  if (argumentRef !== undefined) requireId(argumentRef, "arguments.call_ref");
+  if (flagRef !== undefined) requireId(flagRef, "--call-ref");
+  if (argumentRef !== undefined && flagRef !== undefined && argumentRef !== flagRef) throw new ProtocolError("--call-ref must match arguments.call_ref");
+  const callRef = flagRef ?? argumentRef;
+  if (!["nodes", "context", "execution_status", "call_lookup"].includes(name) && callRef === undefined) throw new ProtocolError("write tools require --call-ref; preserve it and query call_lookup after an uncertain result");
+  if (callRef !== undefined) argumentsValue.call_ref = callRef;
   const socketPath = process.env.VIBEFACE_MANAGER_TOOL_SOCKET;
   if (typeof socketPath !== "string" || !socketPath.startsWith("/tmp/vibeface-manager-tools-")) throw new ProtocolError("private tool channel missing");
   const socket = createConnection(socketPath);
   socket.setTimeout(10_000, () => socket.destroy(new Error("tool channel timeout")));
-  const connected = new Promise((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
-  await connected;
-  socket.write(`${JSON.stringify({ name: args[0], arguments: argumentsValue })}\n`);
-  const result = await readFrame(frameReader(socket));
-  socket.destroy();
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  try {
+    await new Promise((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+    socket.write(`${JSON.stringify({ name, arguments: argumentsValue })}\n`);
+    const result = await readFrame(frameReader(socket));
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } finally { socket.destroy(); }
 }
 
 async function startToolChannel(catalog) {
   const pending = new Map();
-  if (catalog.length === 0) return { path: undefined, respond() { throw new ProtocolError("unexpected tool response"); }, close() {} };
+  if (Object.keys(catalog).length === 0) return { path: undefined, respond() { throw new ProtocolError("unexpected tool response"); }, close() {} };
   const socketPath = `/tmp/vibeface-manager-tools-${process.pid}-${randomUUID()}.sock`;
   let closed = false;
   let connections = 0;
@@ -297,7 +312,7 @@ async function startToolChannel(catalog) {
     void (async () => {
       const request = await readFrame(frameReader(socket));
       rejectUnknownFields(request, new Set(["name", "arguments"]), "tool request");
-      if (closed || !catalog.includes(request.name) || !isObject(request.arguments) || pending.size >= 16) throw new ProtocolError("tool outside catalog");
+      if (closed || !Object.hasOwn(catalog, request.name) || !isObject(request.arguments) || pending.size >= 16) throw new ProtocolError("tool outside catalog");
       const callId = randomUUID();
       const timeout = setTimeout(() => { pending.delete(callId); socket.destroy(); }, 10_000);
       socket.once("close", () => { clearTimeout(timeout); pending.delete(callId); });
@@ -329,10 +344,12 @@ async function startToolChannel(catalog) {
   };
 }
 
-function startControlPump(reader, controller, tools) {
+function startControlPump(reader, controller, tools, sessionId) {
   let pendingSessionAck = null;
   const queuedSessionAcks = [];
   let closed = false;
+  let cancelled = false;
+  let failure = null;
   const rejectPending = (error) => {
     if (pendingSessionAck) {
       pendingSessionAck.reject(error);
@@ -359,12 +376,16 @@ function startControlPump(reader, controller, tools) {
           continue;
         }
         if (isObject(frame) && frame.type === "cancel" && Object.keys(frame).every((key) => ["type", "session_id"].includes(key))) {
+          if ((frame.session_id ?? null) !== sessionId()) throw new ProtocolError("cancel did not match the native session");
+          cancelled = true;
           throw new ProtocolError("Codex execution cancelled");
         }
         throw new ProtocolError("unexpected control frame");
       }
     } catch (error) {
       closed = true;
+      cancelled ||= error instanceof InputClosedError;
+      failure = error;
       rejectPending(error);
       controller.abort();
       tools.close();
@@ -372,6 +393,8 @@ function startControlPump(reader, controller, tools) {
   })();
   return {
     task,
+    get cancelled() { return cancelled; },
+    get failure() { return failure; },
     waitSessionAck(id) {
       if (closed || pendingSessionAck) return Promise.reject(new ProtocolError("session ACK channel is unavailable"));
       const queued = queuedSessionAcks.indexOf(id);
@@ -386,10 +409,83 @@ function startControlPump(reader, controller, tools) {
   };
 }
 
+function manageCodexProcess(executable, signal) {
+  const originalSpawn = childProcess.spawn;
+  let child = null;
+  let closed = false;
+  let stopping = null;
+  childProcess.spawn = function (file, args, options) {
+    if (file !== executable) return originalSpawn(file, args, options);
+    if (signal.aborted) throw new ProtocolError("Codex execution cancelled before spawn");
+    if (child) throw new ProtocolError("Codex SDK attempted more than one managed process");
+    child = originalSpawn(file, args, { ...options, detached: process.platform !== "win32" });
+    const observeClose = () => { closed = true; };
+    const observeError = () => {};
+    child.once("close", observeClose);
+    child.on("error", observeError);
+    const removeAllListeners = child.removeAllListeners;
+    child.removeAllListeners = function (event) {
+      const result = event === undefined ? removeAllListeners.call(this) : removeAllListeners.call(this, event);
+      // The pinned SDK removes all listeners before the child necessarily emits close.
+      if (!closed && (event === undefined || event === "close")) this.once("close", observeClose);
+      if (event === undefined || event === "error") this.on("error", observeError);
+      return result;
+    };
+    return child;
+  };
+  syncBuiltinESMExports();
+  const groupExists = () => {
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (error) {
+      return error.code !== "ESRCH";
+    }
+  };
+  const killGroup = (name) => {
+    try { process.kill(-child.pid, name); } catch {}
+  };
+  const stop = () => stopping ??= (async () => {
+    if (!child) return true;
+    if (child.pid && process.platform !== "win32") {
+      // shortcut: Codex tools create separate groups; CLI-group exit cannot confirm tool exit without OS containment.
+      killGroup("SIGTERM");
+      const started = performance.now();
+      while (performance.now() - started < 1_500) {
+        if (closed && !groupExists()) return true;
+        if (performance.now() - started >= 300) killGroup("SIGKILL");
+        await delay(20);
+      }
+    } else {
+      if (process.platform === "win32" && !closed) {
+        try { child.kill("SIGKILL"); } catch {}
+      }
+      for (let attempt = 0; attempt < 75; attempt++) {
+        if (closed) return true;
+        await delay(20);
+      }
+    }
+    // An unconfirmed child must not keep the sidecar alive after its uncertain response.
+    try { child.kill("SIGKILL"); } catch {}
+    for (const stream of child.stdio) stream?.destroy();
+    child.unref();
+    return false;
+  })();
+  signal.addEventListener("abort", stop, { once: true });
+  return {
+    stop,
+    restore() {
+      signal.removeEventListener("abort", stop);
+      childProcess.spawn = originalSpawn;
+      syncBuiltinESMExports();
+    },
+  };
+}
+
 async function run(input, reader, secrets) {
   const cwd = await validateCwd(input.cwd);
   const codexPath = await validateExecutable(input.codexPath, "codex_path");
-  const toolCli = input.tools.length === 0 ? undefined : fileURLToPath(import.meta.url);
+  const toolCli = Object.keys(input.tools).length === 0 ? undefined : fileURLToPath(import.meta.url);
   const tools = await startToolChannel(input.tools);
   try {
     const prompt = managerPrompt(input.prompt, toolCli, input.tools);
@@ -422,53 +518,77 @@ async function run(input, reader, secrets) {
     }
 
     const controller = new AbortController();
-    const onSignal = () => controller.abort();
+    let signalCancelled = false;
+    let nativeSessionId = input.sessionId;
+    const onSignal = () => { signalCancelled = true; controller.abort(); };
     process.once("SIGTERM", onSignal);
     process.once("SIGINT", onSignal);
-    const control = startControlPump(reader, controller, tools);
-    const streamed = await thread.runStreamed(prompt, { signal: controller.signal });
+    const managed = manageCodexProcess(codexPath, controller.signal);
+    const control = startControlPump(reader, controller, tools, () => nativeSessionId);
+    const interrupted = new Promise((_, reject) => {
+      controller.signal.addEventListener("abort", () => {
+        managed.stop().then(() => reject(new ProtocolError("Codex execution aborted")));
+      }, { once: true });
+    });
     let finalResponse = "";
     let usage = null;
     let turnCompleted = false;
-    let nativeSessionId = input.sessionId;
     let streamBytes = 0;
-    for await (const rawEvent of streamed.events) {
-      const event = redact(rawEvent, secrets);
-      if (event?.type === "thread.started") {
-        const observed = requireId(event.thread_id, "thread_id");
-        if (nativeSessionId !== null && observed !== nativeSessionId) {
-          throw new ProtocolError("Codex resumed a different native session");
+    let failure = null;
+    try {
+      await Promise.race([(async () => {
+        const streamed = await thread.runStreamed(prompt, { signal: controller.signal });
+        for await (const rawEvent of streamed.events) {
+          const event = redact(rawEvent, secrets);
+          if (event?.type === "thread.started") {
+            const observed = requireId(event.thread_id, "thread_id");
+            if (nativeSessionId !== null && observed !== nativeSessionId) {
+              throw new ProtocolError("Codex resumed a different native session");
+            }
+            if (nativeSessionId === null) {
+              nativeSessionId = observed;
+              const sessionAck = control.waitSessionAck(observed);
+              write({ type: "session", session_id: observed });
+              await sessionAck;
+            }
+          }
+          if (event?.type === "item.completed" && event.item?.type === "agent_message") {
+            finalResponse = event.item.text ?? "";
+          }
+          if (event?.type === "turn.completed") {
+            usage = event.usage ?? null;
+            turnCompleted = true;
+          }
+          // SDK item.started/updated/completed each carry the current item snapshot.
+          const message = { type: "event", event: bounded(event, MAX_EVENT_BYTES) };
+          streamBytes += bytes(JSON.stringify(message));
+          if (streamBytes > MAX_STREAM_BYTES) throw new ProtocolError("sidecar output stream exceeded the size limit");
+          write(message);
+          if (event?.type === "turn.failed") throw new Error(event.error?.message || "Codex turn failed");
         }
-        if (nativeSessionId === null) {
-          nativeSessionId = observed;
-          const sessionAck = control.waitSessionAck(observed);
-          write({ type: "session", session_id: observed });
-          await sessionAck;
-        }
-      }
-      if (event?.type === "item.completed" && event.item?.type === "agent_message") {
-        finalResponse = event.item.text ?? "";
-      }
-      if (event?.type === "turn.completed") {
-        usage = event.usage ?? null;
-        turnCompleted = true;
-      }
-      const message = { type: "event", event: bounded(event, MAX_EVENT_BYTES) };
-      streamBytes += bytes(JSON.stringify(message));
-      if (streamBytes > MAX_STREAM_BYTES) throw new ProtocolError("sidecar output stream exceeded the size limit");
-      write(message);
-      if (event?.type === "turn.failed") throw new Error(event.error?.message || "Codex turn failed");
+        if (!turnCompleted) throw new Error("Codex stream ended without turn.completed");
+        if (nativeSessionId === null) throw new Error("Codex stream ended without a native session ID");
+        if (bytes(finalResponse) > MAX_RESULT_BYTES) throw new ProtocolError("Codex final response exceeded the size limit");
+      })(), interrupted]);
+    } catch (error) {
+      failure = error;
     }
-    if (!turnCompleted) throw new Error("Codex stream ended without turn.completed");
-    if (nativeSessionId === null) throw new Error("Codex stream ended without a native session ID");
-    if (bytes(finalResponse) > MAX_RESULT_BYTES) throw new ProtocolError("Codex final response exceeded the size limit");
-    write({ type: "result", session_id: nativeSessionId, final_response: redactString(finalResponse, secrets), usage: bounded(redact(usage, secrets), MAX_EVENT_BYTES) });
     controller.abort();
-    tools.close();
+    const exited = await managed.stop();
     process.removeListener("SIGTERM", onSignal);
     process.removeListener("SIGINT", onSignal);
-    void control.task;
+    managed.restore();
     closeInput();
+    if (!exited) throw new ProtocolError("Codex cancellation could not confirm managed process exit");
+    if (signalCancelled || control.cancelled) {
+      write({ type: "error", session_id: nativeSessionId, confirmation: "managed_cli_exited", message: "Codex CLI exited; detached tool process exit is unconfirmed", uncertain: true });
+      process.exitCode = 1;
+      return;
+    }
+    if (control.failure) throw control.failure;
+    if (failure) throw failure;
+    write({ type: "result", session_id: nativeSessionId, final_response: redactString(finalResponse, secrets), usage: bounded(redact(usage, secrets), MAX_EVENT_BYTES) });
+    void control.task;
   } finally { tools.close(); }
 }
 
@@ -490,7 +610,7 @@ async function main() {
 
 if (process.argv[2] === "tool") {
   try { await toolCommand(process.argv.slice(3)); }
-  catch { process.stderr.write("Node tool rejected or unavailable\n"); process.exitCode = 1; }
+  catch (error) { process.stderr.write(`${error instanceof ProtocolError ? error.message : "Node tool rejected or unavailable; preserve call_ref and query call_lookup before retrying"}\n`); process.exitCode = 1; }
 } else {
   await main();
 }

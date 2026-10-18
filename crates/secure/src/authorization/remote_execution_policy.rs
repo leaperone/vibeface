@@ -9,6 +9,7 @@ use super::{
         record_confirmed_client_policy_metadata, require_confirmed_client_policy,
     },
     execution_handoff::ExecutionProofUsage,
+    execution_work::{ConversationOpenIntent, ExecutionWorkIntent},
     policy_import::{BoundedPolicyImport, VerifiedPolicySnapshot},
     prepare::PrepareContext,
     *,
@@ -44,6 +45,7 @@ pub struct RemoteExecutionPolicyReadIntent {
     pub source_heads: Vec<PolicyStamp>,
     pub selection: RemoteExecutionPolicySelection,
     pub context: PrepareContext,
+    pub work: ExecutionWorkIntent,
     pub expected_action: Action,
     pub purpose: RemoteExecutionPolicyPurpose,
     pub execution_pins: Vec<PolicyPin>,
@@ -74,8 +76,7 @@ pub struct RemoteExecutionPolicyReadDelegation {
     pub source_node_public_key: PublicKey,
     pub source_device_public_key: PublicKey,
     pub source_project: ResourceRef,
-    pub task_ref: EventRef,
-    pub execution_session: SessionRef,
+    pub work: ExecutionWorkIntent,
     pub issued_at_ms: u64,
     pub expires_at_ms: u64,
 }
@@ -158,6 +159,7 @@ policy_object!(
 struct IntentInput {
     selection: RemoteExecutionPolicySelection,
     context: PrepareContext,
+    work: ExecutionWorkIntent,
     expected_action: Action,
     purpose: RemoteExecutionPolicyPurpose,
     execution_pins: Vec<PolicyPin>,
@@ -231,7 +233,8 @@ fn purpose_action(purpose: RemoteExecutionPolicyPurpose, action: Action) -> Resu
         }
         RemoteExecutionPolicyPurpose::Execution => match action {
             Action::ExecutionRebind => Ok(Action::ExecutionOpen),
-            Action::ExecutionOpen
+            Action::ExecutionCommand
+            | Action::ExecutionOpen
             | Action::ExecutionSend
             | Action::ExecutionSteer
             | Action::ExecutionInterrupt
@@ -242,6 +245,63 @@ fn purpose_action(purpose: RemoteExecutionPolicyPurpose, action: Action) -> Resu
             )),
         },
     }
+}
+
+pub(super) fn check_work_action(
+    work: &ExecutionWorkIntent,
+    action: Action,
+    purpose: RemoteExecutionPolicyPurpose,
+) -> Result<()> {
+    let allowed = match (work, purpose) {
+        (_, RemoteExecutionPolicyPurpose::History) => matches!(
+            action,
+            Action::OperationStatusRead | Action::OperationResolve | Action::OperationReconcile
+        ),
+        (
+            _,
+            RemoteExecutionPolicyPurpose::ObservationRead | RemoteExecutionPolicyPurpose::Resolver,
+        ) => action == Action::OperationResolve,
+        (ExecutionWorkIntent::Command { .. }, RemoteExecutionPolicyPurpose::Execution) => {
+            matches!(
+                action,
+                Action::ExecutionCommand | Action::OperationStatusRead
+            )
+        }
+        (
+            ExecutionWorkIntent::ConversationSession {
+                open: ConversationOpenIntent::Opening { .. },
+                ..
+            },
+            RemoteExecutionPolicyPurpose::Execution,
+        ) => action == Action::ExecutionOpen,
+        (
+            ExecutionWorkIntent::ConversationSession {
+                open: ConversationOpenIntent::Existing { .. },
+                ..
+            },
+            RemoteExecutionPolicyPurpose::Execution,
+        ) => matches!(
+            action,
+            Action::ExecutionSend
+                | Action::ExecutionSteer
+                | Action::ExecutionInterrupt
+                | Action::ExecutionRespondApproval
+                | Action::OperationStatusRead
+        ),
+        (ExecutionWorkIntent::TaskSession { .. }, RemoteExecutionPolicyPurpose::Execution) => {
+            matches!(
+                action,
+                Action::ExecutionOpen
+                    | Action::ExecutionSend
+                    | Action::ExecutionSteer
+                    | Action::ExecutionInterrupt
+                    | Action::ExecutionRespondApproval
+                    | Action::ExecutionRebind
+                    | Action::OperationStatusRead
+            )
+        }
+    };
+    require(allowed, "execution policy action is invalid for its work")
 }
 
 fn finish_usage(usage: &mut ExecutionProofUsage) -> Result<()> {
@@ -334,6 +394,10 @@ fn check_source_claims(
     window(value.issued_at_ms, value.expires_at_ms, now)?;
     pins(&value.execution_pins)?;
     purpose_action(value.purpose, value.expected_action)?;
+    value
+        .work
+        .validate_context(&value.context, &value.selection.target_public_key)?;
+    check_work_action(&value.work, value.expected_action, value.purpose)?;
     match (&value.history, value.purpose) {
         (Some(reference), RemoteExecutionPolicyPurpose::History) => require(
             reference.source.payload.project == value.source_selection.resource
@@ -341,7 +405,11 @@ fn check_source_claims(
                 && reference.old_submission.payload.resource == value.selection.execution_resource
                 && reference.old_submission.payload.grant_leaf == value.selection.execution_grant
                 && reference.target_public_key == value.selection.target_public_key
-                && reference.context()? == value.context,
+                && reference.context()? == value.context
+                && value
+                    .work
+                    .matches_work(&reference.source.payload.work)
+                    .is_ok(),
             "history intent changed its original artifact selection or context",
         )?,
         (None, purpose) if purpose != RemoteExecutionPolicyPurpose::History => {}
@@ -380,17 +448,6 @@ fn check_source_claims(
             && context_tighter(&current.constraints.context, &value.context.context)
             && value.context.context.workspace_resource.as_ref() == Some(&project.resource)
             && value.context.context.sdk_session.is_none()
-            && value.context.context.task.is_some()
-            && value.context.context.conversation.is_some()
-            && value.context.context.executor_kind.is_some()
-            && value
-                .context
-                .context
-                .execution_session
-                .as_ref()
-                .is_some_and(|session| {
-                    session.target == DeviceId::from_key(&value.selection.target_public_key)
-                })
             && value.context.execution_target_public_key.as_ref()
                 == Some(&value.selection.target_public_key),
         "remote policy intent changed its confirmed source or exact task",
@@ -433,6 +490,7 @@ pub fn build_remote_execution_policy_read_intent(
                 source_heads: current.heads.clone(),
                 selection: input.selection,
                 context: input.context,
+                work: input.work,
                 expected_action: input.expected_action,
                 purpose: input.purpose,
                 execution_pins: input.execution_pins,
@@ -523,6 +581,7 @@ pub fn build_remote_execution_history_policy_read_intent(
                 source_heads: current.heads.clone(),
                 selection,
                 context,
+                work: reference.source.payload.work.intent(),
                 expected_action: action,
                 purpose: RemoteExecutionPolicyPurpose::History,
                 execution_pins,
@@ -671,15 +730,7 @@ pub fn sign_remote_execution_policy_read_delegation(
             source_node_public_key: verified.source_node_public_key.clone(),
             source_device_public_key: verified.intent.issuer.clone(),
             source_project: intent.source_selection.resource.clone(),
-            task_ref: intent
-                .context
-                .context
-                .task
-                .clone()
-                .ok_or(AuthorizationError::InvalidProof("policy read has no Task"))?,
-            execution_session: intent.context.context.execution_session.clone().ok_or(
-                AuthorizationError::InvalidProof("policy read has no session"),
-            )?,
+            work: intent.work.clone(),
             issued_at_ms: now,
             expires_at_ms: intent.expires_at_ms,
         },
@@ -699,6 +750,10 @@ fn check_request(request: &RemoteExecutionPolicyReadRequest, now: u64) -> Result
     window(delegation.issued_at_ms, delegation.expires_at_ms, now)?;
     pins(&intent.execution_pins)?;
     purpose_action(intent.purpose, intent.expected_action)?;
+    intent
+        .work
+        .validate_context(&intent.context, &intent.selection.target_public_key)?;
+    check_work_action(&intent.work, intent.expected_action, intent.purpose)?;
     require(
         (intent.purpose == RemoteExecutionPolicyPurpose::History) == intent.history.is_some(),
         "remote policy purpose changed its historical artifact",
@@ -715,16 +770,12 @@ fn check_request(request: &RemoteExecutionPolicyReadRequest, now: u64) -> Result
                 == ServiceId::from_key(&request.delegation.issuer)
             && intent.source_selection.audience.device
                 == DeviceId::from_key(&request.delegation.issuer)
-            && intent.context.context.task.as_ref() == Some(&delegation.task_ref)
-            && intent.context.context.execution_session.as_ref()
-                == Some(&delegation.execution_session)
+            && intent.work == delegation.work
             && intent.context.context.workspace_resource.as_ref()
                 == Some(&delegation.source_project.resource)
             && intent.context.context.sdk_session.is_none()
             && intent.context.execution_target_public_key.as_ref()
                 == Some(&intent.selection.target_public_key)
-            && delegation.execution_session.target
-                == DeviceId::from_key(&intent.selection.target_public_key)
             && delegation.issued_at_ms >= intent.issued_at_ms
             && delegation.expires_at_ms <= intent.expires_at_ms,
         "execution policy delegation changed its original client, source, Task or selection",
@@ -950,7 +1001,9 @@ pub(super) fn verify_execution_policy_closure(
     state: &VerifiedPolicySet,
     selection: &RemoteExecutionPolicySelection,
     source_b: &PublicKey,
+    source_project: &ResourceRef,
     prepare_context: &PrepareContext,
+    work: &ExecutionWorkIntent,
     action: Action,
     purpose: RemoteExecutionPolicyPurpose,
     independent_pins: &[PolicyPin],
@@ -958,15 +1011,12 @@ pub(super) fn verify_execution_policy_closure(
     now: u64,
 ) -> Result<ExecutionPolicyClosure> {
     let _scope = ScopedSignatureVerification::new();
+    work.validate_context(prepare_context, local_node)?;
+    check_work_action(work, action, purpose)?;
     require(
         purpose != RemoteExecutionPolicyPurpose::History
             && &selection.target_public_key == local_node
-            && prepare_context.execution_target_public_key.as_ref() == Some(local_node)
-            && prepare_context
-                .context
-                .execution_session
-                .as_ref()
-                .is_some_and(|session| session.target == DeviceId::from_key(local_node)),
+            && prepare_context.execution_target_public_key.as_ref() == Some(local_node),
         "current execution policy closure reached another purpose or target",
     )?;
     pins(independent_pins)?;
@@ -989,6 +1039,24 @@ pub(super) fn verify_execution_policy_closure(
             "selected execution grant is missing",
         ))?;
     let expected_action = purpose_action(purpose, action)?;
+    require(
+        prepare_context.context.workspace_resource.as_ref() == Some(&source_project.resource),
+        "execution policy read changed its source Project",
+    )?;
+    match &leaf.payload.execution_source {
+        Some(source) => {
+            require(
+                source.project == *source_project
+                    && source.node_public_key == *source_b
+                    && source.work.approves_intent(work),
+                "execution policy read differs from its owner-approved source work",
+            )?;
+        }
+        None => require(
+            matches!(work, ExecutionWorkIntent::TaskSession { .. }),
+            "ordinary execution policy has no owner-approved source work",
+        )?,
+    }
     let mut context = prepare_context.context.clone();
     context.workspace_resource = Some(selection.execution_resource.resource.clone());
     require(
@@ -1009,9 +1077,11 @@ pub(super) fn verify_execution_policy_closure(
             && !leaf.payload.constraints.require_account_actor
             && !leaf.payload.constraints.require_webauthn_uv
             && leaf.payload.constraints.context == context
-            && context.task.is_some()
-            && context.conversation.is_some()
-            && context.executor_kind.is_some()
+            && prepare::remote_context_matches(
+                &context,
+                &DeviceId::from_key(local_node),
+                &leaf.payload.actions,
+            )
             && leaf.payload.actions.contains(&expected_action)
             && prepare::remote_actions(
                 &leaf.payload.actions,
@@ -1036,11 +1106,9 @@ pub(super) fn verify_execution_policy_closure(
     let (heads, allowed_hashes) = reference_closure(state, &dependencies, independent_pins)?;
     require(
         !heads.is_empty()
-            && heads.iter().all(|head| {
-                independent_pins
-                    .iter()
-                    .any(|pin| pin.domain == head.domain)
-            }),
+            && heads
+                .iter()
+                .all(|head| independent_pins.iter().any(|pin| pin.domain == head.domain)),
         "execution policy read needs independently pinned dependency domains",
     )?;
     let mut usage = ExecutionProofUsage::default();
@@ -1070,15 +1138,16 @@ pub fn verify_remote_execution_policy_read(
         "history requires its independent read verifier",
     )?;
     require(
-        &request.intent.issuer == noise_client
-            && &intent.selection.target_public_key == local_node,
+        &request.intent.issuer == noise_client && &intent.selection.target_public_key == local_node,
         "execution policy request reached another Noise client or target",
     )?;
     let closure = verify_execution_policy_closure(
         state,
         &intent.selection,
         &request.delegation.issuer,
+        &intent.source_selection.resource,
         &intent.context,
+        &intent.work,
         intent.expected_action,
         intent.purpose,
         &intent.execution_pins,
@@ -1313,7 +1382,11 @@ pub(super) fn begin_native_execution_policy_import(
     pins(effective_independent_pins)?;
     carrier(header)?;
     header.verify_signature()?;
-    window(header.payload.issued_at_ms, header.payload.expires_at_ms, now)?;
+    window(
+        header.payload.issued_at_ms,
+        header.payload.expires_at_ms,
+        now,
+    )?;
     let original_pins = &request.intent.payload.execution_pins;
     require(
         effective_independent_pins.len() == original_pins.len()
@@ -1510,8 +1583,7 @@ impl RemoteExecutionPolicyImport {
         carrier(witness)?;
         require(
             history
-                == (self.request.intent.payload.purpose
-                    == RemoteExecutionPolicyPurpose::History)
+                == (self.request.intent.payload.purpose == RemoteExecutionPolicyPurpose::History)
                 && history == self.header.payload.history.is_some(),
             "policy completion changed its independent historical purpose",
         )?;
@@ -1564,8 +1636,7 @@ impl RemoteExecutionPolicyImport {
         require(
             verified.target_heads() == self.header.payload.target_heads
                 && snapshot.journal().iter().all(|entry| {
-                    policy_import::entry_hash(entry)
-                        .is_ok_and(|hash| verified.allows_hash(&hash))
+                    policy_import::entry_hash(entry).is_ok_and(|hash| verified.allows_hash(&hash))
                 }),
             "execution policy stream contains objects outside its necessary reference closure",
         )?;
@@ -1626,7 +1697,7 @@ impl VerifiedRemoteExecutionPolicy {
     pub fn metadata_json(&self) -> crate::Result<String> {
         let intent = self.intent();
         encode(
-            &serde_json::json!({"selection":intent.selection,"context":intent.context,
+            &serde_json::json!({"selection":intent.selection,"context":intent.context,"work":intent.work,
             "expected_action":intent.expected_action,"purpose":intent.purpose,"pins":self.snapshot.pins(),
             "heads":self.snapshot.heads(),"expires_at_ms":self.expires_at_ms()}),
         )
@@ -1966,30 +2037,54 @@ pub(crate) mod tests {
             serde_json::to_value(&fixture.actual).unwrap()
         );
         let merged = policy_import::merge_same_head_snapshots(
-            require_confirmed_client_policy(&fixture.source).unwrap(), history.snapshot(),
-        ).unwrap();
+            require_confirmed_client_policy(&fixture.source).unwrap(),
+            history.snapshot(),
+        )
+        .unwrap();
         let event: events::Event = serde_json::from_str(
-            &fixture.actual.handoff.handoff.project_dispatch.canonical_body,
-        ).unwrap();
+            &fixture
+                .actual
+                .handoff
+                .handoff
+                .project_dispatch
+                .canonical_body,
+        )
+        .unwrap();
         let events::EventCause::Invocation { mut admission } = event.cause else {
             panic!("fixture has no original admission");
         };
         let original = &admission.invocation.payload;
         let facts = RequestFacts {
-            resource: original.resource.clone(), action: original.action,
-            audience: original.audience.clone(), operation_id: original.operation_id.clone(),
-            body_hash: original.body_hash.clone(), context: original.context.clone(),
+            resource: original.resource.clone(),
+            action: original.action,
+            audience: original.audience.clone(),
+            operation_id: original.operation_id.clone(),
+            body_hash: original.body_hash.clone(),
+            context: original.context.clone(),
         };
         let execution_domain = PolicyDomain::Space(
-            fixture.actual.handoff.handoff.execution_resource.space.clone(),
+            fixture
+                .actual
+                .handoff
+                .handoff
+                .execution_resource
+                .space
+                .clone(),
         );
-        assert!(original.expected_policies.iter().any(|head| head.domain == execution_domain));
+        assert!(
+            original
+                .expected_policies
+                .iter()
+                .any(|head| head.domain == execution_domain)
+        );
         let mut missing = original.clone();
-        missing.expected_policies.retain(|head| head.domain != execution_domain);
+        missing
+            .expected_policies
+            .retain(|head| head.domain != execution_domain);
         admission.invocation = Signed::sign(missing, &fixture.client).unwrap();
-        let AuthorizationError::NeedPolicySync(heads) = remote_resolution_history::admitted(
-            merged.state(), &admission, &facts,
-        ).unwrap_err() else {
+        let AuthorizationError::NeedPolicySync(heads) =
+            remote_resolution_history::admitted(merged.state(), &admission, &facts).unwrap_err()
+        else {
             panic!("missing signed execution policy must require explicit synchronization");
         };
         assert_eq!(heads, admission.challenge.policies);
@@ -2247,10 +2342,13 @@ pub(crate) mod tests {
     ) -> crate::Result<RemotePolicyStream> {
         let intent_json = build_remote_execution_policy_read_intent(
             source,
-            &wire(
-                &json!({"selection": selection, "context": context, "expected_action": action,
-                "purpose": purpose, "execution_pins": execution_pins}),
-            ),
+            &wire(&json!({"selection": selection, "context": context,
+                "work":ExecutionWorkIntent::TaskSession {
+                    task: context.context.task.clone().ok_or("fixture has no Task")?,
+                    binding_generation: context.binding_generation.ok_or("fixture has no binding generation")?,
+                    execution_session: context.context.execution_session.clone().ok_or("fixture has no execution session")?,
+                },
+                "expected_action": action, "purpose": purpose, "execution_pins": execution_pins})),
             client,
             now as f64,
             (now + 1_000) as f64,

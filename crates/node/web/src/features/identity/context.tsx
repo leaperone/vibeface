@@ -2,10 +2,15 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import type { ReactNode } from 'react'
 import { prepareClientGatewayOwnerRoute, prepareClientGatewayReply, buildClientRemoteShareIntent, approveClientEnrollmentIntent, clientVaultStatus, connectDevice, createClientEnrollmentOffer, exportDeviceVault, initClient, lockClient, prepareClientDeviceEnrollment, prepareClientDeviceRevocation, prepareClientAccountNodeEnrollment, prepareClientFirstAuthenticatorIntent, prepareClientFirstAuthenticatorRegistration, prepareClientMembershipChange, prepareClientDirectionalGrant, prepareClientGrantRevocation, prepareClientTeamCreation, restoreClientTeamCreation, prepareClientPasskeyDeviceEnrollment, prepareClientRecoveryContext, prepareClientExecutionServiceRegistration, prepareClientRemoteExecutionShare, protectClientVaultWithPrf, readInvitation, signClientEnrollmentPossession, signClientPasskeyEnrollmentIntent, signClientPasskeyEnrollmentPossession } from '../../../transport.js'
 import type { ClientVaultOptions, DeviceChannel, VaultProfile } from '../../../transport.js'
+import { bindLocalVault, setLocalAccessNode, unlockLocalVault } from '../../../transport.js'
+import type { ExecutionWorkIntent } from '../../lib/execution-work'
+import { exchangeLocalAccess, readLocalAccessSession, readLocalAccessStatus, setLocalAccessEnabled } from '@/lib/local-access'
+import type { LocalAccessStatus } from '@/lib/local-access'
 import {
   array, entryKey, integer, messageOf, parseEntry, parseInfo, parseConnectionCard, parseGatewayConnectionCard, record, same, text,
 } from '@/lib/node'
 import type { AuthorizedRequest, ConnectionCard, ConnectionEntry, EntryInfo, AccountDeviceDirectory, PublicIdentity, ReadyConnection, RpcFacts, GatewayConnectionCard } from '@/lib/node'
+import { parseChanged, type ChangedEvent } from '@/lib/progress'
 import { prepareRpc } from '@/lib/rpc-action'
 import { prepareContext, verifyPreparedBody } from '@/lib/rpc-prepare'
 import { validateRpcReplay } from '@/lib/rpc-replay'
@@ -37,7 +42,7 @@ import type { TeamControlsProps } from './team-controls'
 import { parseRemoteExecutionShare, parseRemoteExecutionShareInput, parseRemoteExecutionSourceTrust, remoteExecutionProposal } from '@/lib/remote-execution'
 import type { RemoteExecutionRequestSummary } from '@/lib/remote-execution'
 
-type Phase = 'initializing' | 'blocked' | 'vault_empty' | 'vault_locked' | 'vault_unavailable' | 'key_lost' | 'disconnected' | 'connecting' | 'unpaired' | 'no_project' | 'ready'
+type Phase = 'initializing' | 'blocked' | 'vault_empty' | 'vault_locked' | 'vault_unavailable' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'no_project' | 'ready'
 type Review = { kind: 'bootstrap' | 'recovery'; accountId: string; spaceId: string; serviceGrant: { projectId: string; actions: string[] }; targetChanged: boolean; sourceRead?: CrossNodeRecoveryReview['sourceRead']; recoveryStage?: 'prepared' | 'submitted' | 'committed' | 'installed' }
 type Sensitive = { cancel(): void; download?: () => void; bootstrap?: (saved: boolean) => Promise<void>; recover?: (saved: boolean) => Promise<void>; refreshEnrollment?: () => Promise<void>; passkeyEnrollment?: (protectLocal: boolean) => Promise<void>; retryPasskeyRegistration?: () => Promise<void>; nodeEnrollment?: () => Promise<void>; governance?: () => Promise<void>; teamCreation?: (saved: boolean) => Promise<void>; keepOnNetworkClose?: () => boolean; retainForReconnect?: (entry: ConnectionEntry) => boolean; crossPrepare?: () => Promise<void> }
 type RecoveryReadProject = { accountId: string; spaceId: string; projectId: string; entry: ConnectionEntry; nodePublicKey: string; expiresAt: number }
@@ -52,6 +57,7 @@ type Session = {
   renewal?: number; authorization?: ReturnType<typeof verifyScopedAuthentication>; channel: DeviceChannel; entry: ConnectionEntry; info: EntryInfo; generation: number;
   businessRoute: BusinessRoute; businessGeneration: number; policyFrames: ClientPolicyFrame[]; connection?: ReadyConnection
 }
+type ReconnectTarget = { entry: ConnectionEntry; transportPublicKey: string; own: PublicIdentity; trust: AuthorizationTrust; projectId: string; selection: AuthorizationSelection }
 type GovernanceConfirmation = { trust: AuthorizationTrust; authorized: boolean; grantLeaf?: string }
 type GovernanceProtocol = {
   method: string
@@ -70,6 +76,7 @@ function releaseSession(active: Session | null) {
   active?.authorization?.release()
 }
 type DeviceContextValue = {
+  localAccess: LocalAccessStatus | null; localAccessNotice: string; setLocalAccess(enabled: boolean): Promise<void>
   identity: PublicIdentity | null; vaults: VaultProfile[]; spaces: AuthorizationTrust[]; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: AccountDeviceDirectory | null; review: Review | null; initialInvitation: string
   connect(entry: ConnectionEntry, spaceId?: string, projectId?: string): Promise<void>; selectSpace(spaceId: string): Promise<void>; selectProject(projectId: string): Promise<void>; disconnect(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
@@ -137,6 +144,14 @@ function executionManagement(authorization: VerifiedClientAuthorization, sourceP
 }
 
 export function DeviceProvider({ children }: { children: ReactNode }) {
+  const [localAccess, setLocalAccessState] = useState<LocalAccessStatus | null>(null)
+  const [localAccessNotice, setLocalAccessNotice] = useState('')
+  const localSessionActive = useRef(false)
+  const localSessionNode = useRef<string | null>(null)
+  const localIdentity = useRef<PublicIdentity | null>(null)
+  const localBinding = useRef<AbortController | null>(null)
+  const localStatusVersion = useRef(0)
+  const localSettingsVersion = useRef(0)
   const [identity, setIdentity] = useState<PublicIdentity | null>(null)
   const [vaults, setVaults] = useState<VaultProfile[]>([])
   const [spaces, setSpaces] = useState<AuthorizationTrust[]>([])
@@ -168,12 +183,15 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const [teamCreationReview, setTeamCreationReview] = useState<DeviceContextValue['teamCreationReview']>(null)
   const [nodeEnrollmentReview, setNodeEnrollmentReview] = useState<DeviceContextValue['nodeEnrollmentReview']>(null)
   const managerEnrollment = useRef<ManagerEnrollment | null>(null)
+  const reconnectTarget = useRef<ReconnectTarget | null>(null)
+  const reconnectTimer = useRef<number | null>(null)
+  const reconnectAttempt = useRef(0)
   const generation = useRef(0)
   const session = useRef<Session | null>(null)
   const connecting = useRef<AbortController | null>(null)
   const independentReads = useRef(new Set<AbortController>())
   const sensitive = useRef<Sensitive | null>(null)
-  const listeners = useRef(new Set<() => void>())
+  const listeners = useRef(new Set<(event: ChangedEvent) => void>())
   const identityRef = useRef<PublicIdentity | null>(null)
   const temporaryRecords = useRef(new Map<string, unknown>())
   function load(key: string, required = false): unknown {
@@ -192,7 +210,10 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const savedSpaces = () => array(load(profileKey('policy-trusts'), true) ?? []).map(parseAuthorizationTrust)
 
   const cancelSensitive = useCallback(() => { sensitive.current?.cancel(); sensitive.current = null; setReview(null); setIncomingEnrollment(null); setFirstPasskeyPending(false); setNodeEnrollmentReview(null); setGovernancePending(''); setTeamCreationReview(null); setCrossRecoveryPending(false) }, [])
-  const closeConnection = useCallback((preserveSensitive: boolean) => {
+  const closeConnection = useCallback((preserveSensitive: boolean, preserveView = false) => {
+    if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current)
+    reconnectTimer.current = null
+    if (!preserveView) { reconnectTarget.current = null; reconnectAttempt.current = 0 }
     generation.current += 1
     if (!preserveSensitive) cancelSensitive()
     connecting.current?.abort(); connecting.current = null
@@ -200,14 +221,14 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     independentReads.current.clear()
     const previous = session.current; session.current = null
     releaseSession(previous); if (previous?.businessRoute.kind === 'gateway') previous.businessRoute.channel?.close(); previous?.channel.close()
-    listeners.current.clear(); setReady(null); setDirectory(null); setInfo(null); setEntry(null); setOwnerGatewayRoute(null)
+    listeners.current.clear(); if (!preserveView) { setReady(null); setDirectory(null); setInfo(null); setEntry(null); setOwnerGatewayRoute(null) }
     managerEnrollment.current = null; setEnrollmentRequests([]); setManagerEnrollmentActive(false)
     for (const authorization of executionAuthorizations.current) authorization.free()
     executionAuthorizations.current.clear(); setExecutionServiceResource(null); setExecutionServiceResources([]); setRemoteExecutionShare(null)
     setLocalProtectionNotice('')
-    setPhase('disconnected'); setError('')
+    setPhase(preserveView ? 'reconnecting' : 'disconnected'); setError('')
   }, [cancelSensitive])
-  const disconnect = useCallback(() => closeConnection(false), [closeConnection])
+  const disconnect = useCallback(() => { localStatusVersion.current += 1; closeConnection(false) }, [closeConnection])
   const saveEntry = useCallback((candidate: ConnectionEntry) => {
     const parsed = parseEntry(candidate)
     const next = [...savedEntries(storageProfile(), load).filter(item => entryKey(item) !== entryKey(parsed)), parsed]
@@ -582,6 +603,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const selectedProject = projectId ?? load(projectKey)
     const project = authorization.projects.find(project => project.id === selectedProject) ?? (projectId ? undefined : authorization.projects[0])
     if (!project) {
+      reconnectTarget.current = null
       setReady(null); setPhase('no_project')
       setError(projectId ? '所选项目已不在当前授权内，请重新核对项目权限。' : '账户已验证，当前入口没有可用的已授权项目。请在 Node 上登记项目并授权后重新连接。')
       return
@@ -594,7 +616,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     function currentProjectTrust() {
       return authorization.revalidate(mergedRemotePolicyTrust(mergeAuthorizationTrust(authorization.trust, savedSpaces()), signingProfile))
     }
-    async function verifyRemotePolicy(value: Parameters<ReturnType<typeof verifyScopedAuthentication>['remote']>[0], context: Record<string, unknown>, action: string, purpose?: 'execution' | 'observation_read' | 'resolver', use?: RemoteExecutionPolicyUse) {
+    async function verifyRemotePolicy(value: Parameters<ReturnType<typeof verifyScopedAuthentication>['remote']>[0], context: Record<string, unknown>, action: string, purpose?: 'execution' | 'observation_read' | 'resolver', use?: RemoteExecutionPolicyUse, work?: ExecutionWorkIntent) {
       const controller = new AbortController(); independentReads.current.add(controller)
       const check = () => { controller.signal.throwIfAborted(); if (session.current !== active || active.authorization !== authorization || identityRef.current !== signingProfile) throw changed() }
       let bChannel: DeviceChannel | null = null, cChannel: DeviceChannel | null = null
@@ -616,6 +638,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
           canonical_cwd: context.canonical_cwd === null ? null : text(context.canonical_cwd), execution_target_public_key: target }
         policy = await readRemoteExecutionPolicy({ bChannel, cChannel, sourceNodePublicKey, executionNodePublicKey: target,
           withSource: work => withSessionAuthorization(active, signingProfile, work, controller.signal), selection: remote.share.selection, context: preparedContext,
+          work: work ?? (preparedContext.context.task !== null ? { kind: 'task_session', task: text(preparedContext.context.task), binding_generation: integer(preparedContext.binding_generation),
+            execution_session: { target: text(preparedContext.context.execution_session?.target), session_id: text(preparedContext.context.execution_session?.session_id) } } : value.share.work),
           action, purpose: purpose ?? (proposed.purpose === 'resolution' ? 'resolver' : 'execution'), use, executionTrust: remote.trust,
           latestExecutionTrust: () => mergedRemotePolicyTrust(remote.trust, signingProfile), check, signal: controller.signal })
         const completed = policy
@@ -625,7 +649,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         }, controller.signal)
       } finally { policy?.free(); if (bChannel !== active.channel) bChannel?.close(); cChannel?.close(); independentReads.current.delete(controller) }
     }
-    async function verifyRemoteHistory<T>(value: Parameters<ReturnType<typeof verifyScopedAuthentication>['remote']>[0], actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown> | undefined,
+    async function verifyRemoteHistory<T>(value: Parameters<ReturnType<typeof verifyScopedAuthentication>['remote']>[0], actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown> | null | undefined,
       verify: (remote: typeof value, policy: Awaited<ReturnType<typeof readRemoteExecutionHistoryPolicy>>) => T): Promise<T> {
       const controller = new AbortController(); independentReads.current.add(controller)
       const check = () => { controller.signal.throwIfAborted(); if (session.current !== active || active.authorization !== authorization || identityRef.current !== signingProfile) throw changed() }
@@ -704,9 +728,10 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const prepared = prepareRpc({ method, params, spaceId: authorization.scope.space_id, authorizationId: facts?.authorizationId ?? crypto.randomUUID() })
       if (!authorization.actions.includes(prepared.action)) throw new Error('当前入口未授权此操作，请核对项目权限。')
       const body = record(JSON.parse(JSON.stringify(prepared.body)))
-      const projectMetadata = facts?.projectExecutionMetadata ? authorization.projectExecutionMetadata(facts.projectExecutionMetadata.source, facts.projectExecutionMetadata.binding) : undefined
+      const projectMetadata = facts?.projectWork ? authorization.projectDispatchWork(facts.projectWork.proof.dispatch, facts.projectWork.proof.origin, facts.projectWork.targetPublicKey, facts.projectWork.operationId).context
+        : facts?.projectExecutionMetadata ? authorization.projectExecutionMetadata(facts.projectExecutionMetadata.source, facts.projectExecutionMetadata.binding) : undefined
       const rawContext = prepareContext(body, authorization.audience.device, selectedProjectId, facts, projectMetadata, text(authorization.policy.audience_public_key))
-      const openRemote = () => facts?.remote ? verifyRemotePolicy({ ...facts.remote.authorization, trust: mergedRemotePolicyTrust(facts.remote.authorization.trust, signingProfile, true) }, rawContext, prepared.action) : Promise.resolve(null)
+      const openRemote = () => facts?.remote ? verifyRemotePolicy({ ...facts.remote.authorization, trust: mergedRemotePolicyTrust(facts.remote.authorization.trust, signingProfile, true) }, rawContext, prepared.action, undefined, undefined, facts.executionWork) : Promise.resolve(null)
       let remote: ReturnType<typeof authorization.remote> | null = null
       const releaseRemote = () => { remote?.release(); remote = null }
       try {
@@ -734,7 +759,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         const template = record(await (route.kind === 'gateway' ? forward({ kind: 'prepare', body, intent }) : request('prepare_invocation', { body, intent })))
         check()
         const normalized = record(template.body)
-        verifyPreparedBody(body, normalized, facts)
+        verifyPreparedBody(body, normalized, facts, template.control)
         const invocationTemplate = record(template.invocation)
         if (!same(invocationTemplate.context, rawContext.context)) throw new Error('节点准备的执行范围与本地已验证的工单或会话不同。')
         releaseRemote(); remote = await openRemote()
@@ -778,7 +803,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       request: (method, params) => { if (session.current !== active || active.authorization !== authorization) return Promise.reject(changed()); return request(method, params) },
       rpc: (method, params, facts) => signedCall(method, params, 'rpc', undefined, facts).then(reply => reply.result),
       rpcWithProof: (method, params, beforeSend, facts, replay) => signedCall(method, params, 'rpc', beforeSend, facts, replay),
-      remote: (value, rawContext, action, use) => verifyRemotePolicy(value, rawContext, action, undefined, use),
+      remote: (value, rawContext, action, use, work) => verifyRemotePolicy(value, rawContext, action, undefined, use, work),
       currentRemoteExecutionTrust(trust) {
         if (session.current !== active || active.authorization !== authorization || identityRef.current !== own) throw changed()
         return mergedRemotePolicyTrust(trust, own, true)
@@ -789,6 +814,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
         if (session.current !== active || active.authorization !== authorization) throw changed()
         return updated
       },
+      observedExecutionResult(actual, binding, targetPublicKey, operationId) {
+        if (session.current !== active || active.authorization !== authorization) throw changed()
+        return authorization.observedExecutionResult(actual, binding, targetPublicKey, operationId)
+      },
+      projectDispatchWork: (dispatch, origin, key, operationId) => { if (session.current !== active || active.authorization !== authorization) throw changed(); return authorization.projectDispatchWork(dispatch, origin, key, operationId) },
+      projectExecutionResult: (actual, origin, key, operationId) => { if (session.current !== active || active.authorization !== authorization) throw changed(); return authorization.projectExecutionResult(actual, origin, key, operationId) },
       projectExecutionMetadata: (source, binding) => { if (session.current !== active || active.authorization !== authorization) throw changed(); return authorization.projectExecutionMetadata(source, binding) },
       async remoteExecutionResultHistory(value, actual, original, binding) {
         return verifyRemoteHistory(value, actual, original, binding, (remote, policy) => authorization.remoteExecutionResultHistory(remote, policy, actual, original, binding))
@@ -889,7 +920,6 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       isCurrent: () => session.current === active && active.authorization === authorization && generation.current === active.generation,
     }
     active.connection = connection
-    setReady(null)
     const storedOwnerRoute = load(ownerGatewayKey(connection.audiencePublicKey), true)
     setOwnerGatewayRoute(storedOwnerRoute ? parseGatewayOwnerRoute(storedOwnerRoute, connection.audiencePublicKey) : null)
     const saved = restoreGateway ? load(gatewayKey(connection), true) : null
@@ -900,22 +930,71 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       catch (cause) { if (session.current === active) setError(messageOf(cause)) }
     }
     if (session.current !== active || active.authorization !== authorization || active.connection !== connection || identityRef.current !== signingProfile) throw changed()
+    reconnectTarget.current = { entry: active.entry, transportPublicKey: active.channel.publicKey, own: signingProfile,
+      trust: authorization.trust, projectId: selectedProjectId, selection: { resourceId: selectedProjectId, audience: connection.audience, grantLeaf: authorization.grantLeaf } }
+    reconnectAttempt.current = 0
     setDirectory(null); setReady(connection); setPhase('ready')
     if (active.businessRoute.kind === 'direct' || active.businessRoute.status === 'ready') setError('')
   }
-  async function open(entryValue: ConnectionEntry, expectedPublicKey?: string) {
+  function scheduleReconnect() {
+    const target = reconnectTarget.current
+    if (!target || identityRef.current !== target.own || reconnectTimer.current !== null) return
+    const delay = Math.min(30000, 1000 * 2 ** Math.min(reconnectAttempt.current++, 5))
+    reconnectTimer.current = window.setTimeout(() => {
+      reconnectTimer.current = null
+      void restoreConnection(target)
+    }, delay)
+  }
+  async function restoreConnection(target: ReconnectTarget) {
+    if (reconnectTarget.current !== target || identityRef.current !== target.own) return
+    let active: Session | null = null
+    try {
+      active = await open(target.entry, target.transportPublicKey, true)
+      if (reconnectTarget.current !== target || identityRef.current !== target.own) return
+      const auth = await readAuthentication(active, target.trust, target.selection, undefined, target.projectId)
+      if (reconnectTarget.current !== target || identityRef.current !== target.own) { auth.free(); return }
+      await authenticate(auth, active, target.trust, target.projectId, target.selection)
+    } catch (cause) {
+      if (reconnectTarget.current !== target || identityRef.current !== target.own) return
+      if (isResponseError(cause) || active && session.current === active) { closeConnection(false); setError(messageOf(cause)); return }
+      setPhase('reconnecting'); setError(messageOf(cause)); scheduleReconnect()
+    }
+  }
+  async function open(entryValue: ConnectionEntry, expectedPublicKey?: string, restoring = false) {
     const parsed = parseEntry(entryValue)
     const preserveSensitive = sensitive.current?.retainForReconnect?.(parsed) === true
-    closeConnection(preserveSensitive); setPhase('connecting'); setEntry(parsed)
+    closeConnection(preserveSensitive, restoring); setPhase(restoring ? 'reconnecting' : 'connecting'); setEntry(parsed)
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
     try {
       const channel = await connectDevice(parsed, {
         signal: controller.signal,
-        onEvent(value) { const event = record(value); if (version === generation.current && event.type === 'changed') for (const listener of listeners.current) listener() },
+        onEvent(value) {
+          if (version !== generation.current || !session.current?.authorization) return
+          const event = record(value)
+          if (event.type === 'subscription_expired') { session.current.channel.close(); return }
+          if (['changed', 'manager_progress', 'execution_progress'].includes(String(event.type))) for (const listener of listeners.current) listener(parseChanged(event))
+        },
         onClose(reason) {
           if (version !== generation.current) return
-          generation.current += 1; for (const controller of independentReads.current) controller.abort(); independentReads.current.clear(); if (session.current?.businessRoute.kind === 'gateway') session.current.businessRoute.channel?.close(); releaseSession(session.current); session.current = null; if (!sensitive.current?.keepOnNetworkClose?.()) cancelSensitive(); listeners.current.clear(); setReady(null); setDirectory(null); setPhase('disconnected'); setError(messageOf(reason))
+          if (localSessionActive.current && parsed.address === location.origin && parsed.node_id === localSessionNode.current && !parsed.relay) {
+            endLocalAccess()
+            setLocalAccessNotice('本机连接已关闭，设备仓库已锁定。请重新打开本机入口或使用账户登录。')
+            return
+          }
+          const target = reconnectTarget.current
+          const previous = session.current
+          if (target && previous?.authorization) target.trust = previous.authorization.trust
+          generation.current += 1
+          for (const controller of independentReads.current) controller.abort()
+          independentReads.current.clear()
+          if (previous?.businessRoute.kind === 'gateway') previous.businessRoute.channel?.close()
+          releaseSession(previous); session.current = null
+          if (!sensitive.current?.keepOnNetworkClose?.()) cancelSensitive()
+          listeners.current.clear()
+          if (target && identityRef.current === target.own) { setPhase('reconnecting'); scheduleReconnect() }
+          else { setReady(null); setDirectory(null); setPhase('disconnected') }
+          setError(messageOf(reason))
         },
       })
       if (version !== generation.current) { channel.close(); throw changed() }
@@ -926,7 +1005,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const active: Session = { channel, entry: parsed, info: details, generation: version, businessRoute: { kind: 'direct' }, businessGeneration: 0, policyFrames: [] }
       session.current = active; setInfo(details); setPhase('unpaired'); return active
     } catch (cause) {
-      if (version === generation.current) { closeConnection(preserveSensitive); setError(messageOf(cause)) }
+      if (version === generation.current) { closeConnection(preserveSensitive, restoring); setError(messageOf(cause)) }
       throw cause
     }
   }
@@ -2145,14 +2224,66 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     } finally { opened.release(); input.password = '' }
   }
   async function initializeVault(options: ClientVaultOptions) {
+    localStatusVersion.current += 1
     const version = generation.current
     const own = await initClient(options)
     if (version !== generation.current) throw changed()
-    identityRef.current = own; setIdentity(own); setPhase('disconnected'); setError('')
-    setEntries(savedEntries(storageProfile(own), load)); setSpaces(savedSpaces()); setRecoveryReadProjects(readRecoveryReadProjects(load(profileKey('recovery-read-projects'))))
+    adoptIdentity(own)
     if (!initialInvitation) {
       const lastEntry = load(profileKey('last-entry'), true)
       if (lastEntry) await connect(parseEntry(lastEntry))
+    }
+  }
+  function adoptIdentity(own: PublicIdentity) {
+    localIdentity.current = null
+    identityRef.current = own; setIdentity(own); setPhase('disconnected'); setError('')
+    setEntries(savedEntries(storageProfile(own), load)); setSpaces(savedSpaces()); setRecoveryReadProjects(readRecoveryReadProjects(load(profileKey('recovery-read-projects'))))
+  }
+  function endLocalAccess() {
+    localStatusVersion.current += 1
+    localBinding.current?.abort(); localBinding.current = null
+    const active = session.current
+    const ownsCurrent = active
+      ? active.entry.address === location.origin && active.entry.node_id === localSessionNode.current && !active.entry.relay
+      : identityRef.current !== null && identityRef.current === localIdentity.current
+    localSessionActive.current = false; localSessionNode.current = null; localIdentity.current = null; setLocalAccessNode(null)
+    if (ownsCurrent) lockVault()
+  }
+  async function setLocalAccess(enabled: boolean) {
+    const settingsVersion = ++localSettingsVersion.current
+    localStatusVersion.current += 1
+    if (!enabled) {
+      endLocalAccess()
+      setLocalAccessNotice('本机自动访问已停止，正在关闭设置。')
+    }
+    const unlockVersion = localStatusVersion.current
+    try { await setLocalAccessEnabled(enabled) }
+    catch (cause) {
+      if (!enabled && settingsVersion === localSettingsVersion.current) setLocalAccessNotice('本机自动访问已停止；服务端开关尚未确认，请重试或核对配置。')
+      throw cause
+    }
+    if (settingsVersion !== localSettingsVersion.current) return
+    if (!enabled) {
+      setLocalAccessState(previous => previous ? { ...previous, enabled: false, authenticated: false } : null)
+      setLocalAccessNotice('本机自动登录已关闭。已启动的任务继续运行。')
+      return
+    }
+    const status = await readLocalAccessStatus()
+    if (settingsVersion !== localSettingsVersion.current) return
+    setLocalAccessState(status)
+    if (unlockVersion !== localStatusVersion.current) return
+    if (status?.authenticated) {
+      localSessionActive.current = true; localSessionNode.current = status.nodeId; setLocalAccessNode(status.nodeId)
+      const connection = ready
+      if (connection?.isCurrent() && connection.entry.node_id === status.nodeId && connection.entry.address === location.origin && !connection.entry.relay) await connect(connection.entry, connection.scope.space_id, connection.project.id)
+      else if (!identityRef.current) {
+        const access = await readLocalAccessSession()
+        if (unlockVersion !== localStatusVersion.current || settingsVersion !== localSettingsVersion.current || access.nodeId !== status.nodeId || !access.unlockKey) return
+        const own = await unlockLocalVault(access.nodeId, access.unlockKey, () => unlockVersion === localStatusVersion.current && settingsVersion === localSettingsVersion.current)
+        if (unlockVersion !== localStatusVersion.current || settingsVersion !== localSettingsVersion.current) return
+        if (own) { adoptIdentity(own); localIdentity.current = own; await connect({ address: location.origin, node_id: status.nodeId, relay: false }) }
+        else lockVault()
+      }
     }
   }
   function lockVault() {
@@ -2175,16 +2306,78 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }
   useEffect(() => {
     let mounted = true
+    const startupVersion = localStatusVersion.current
+    const startupCurrent = () => mounted && startupVersion === localStatusVersion.current
     const fragment = new URLSearchParams(location.hash.slice(1))
     const invitation = fragment.get('enroll') || fragment.get('bootstrap') || fragment.get('invite') || ''
     if (location.hash) { const clean = new URL(location.href); clean.hash = ''; history.replaceState(null, '', clean) }
     if (invitation) setInitialInvitation(invitation)
-    clientVaultStatus().then(status => {
-      if (mounted) { setVaults(status.profiles); setPhase(status.status === 'locked' ? 'vault_locked' : status.status === 'key_lost' ? 'key_lost' : status.status === 'unavailable' ? 'vault_unavailable' : 'vault_empty'); if (status.status === 'unavailable') setError(status.error) }
-    }).catch(cause => { if (mounted) { setPhase('blocked'); setError(messageOf(cause)) } })
-    return () => { mounted = false; generation.current += 1; lockClient(); temporaryRecords.current.clear(); sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); for (const controller of independentReads.current) controller.abort(); independentReads.current.clear(); const previous = session.current; session.current = null; releaseSession(previous); if (previous?.businessRoute.kind === 'gateway') previous.businessRoute.channel?.close(); previous?.channel.close(); listeners.current.clear(); for (const authorization of executionAuthorizations.current) authorization.free(); executionAuthorizations.current.clear() }
+    const token = fragment.get('local_access')
+    void (async () => {
+      let local: LocalAccessStatus | null = null
+      try {
+        if (token) await exchangeLocalAccess(token)
+        if (!startupCurrent()) return
+        local = await readLocalAccessStatus()
+        if (!startupCurrent()) return
+        setLocalAccessState(local)
+        if (local?.authenticated && local.enabled) {
+          const access = await readLocalAccessSession()
+          if (!startupCurrent()) return
+          if (access.nodeId !== local.nodeId || !access.unlockKey) throw new Error('本机访问身份不一致。')
+          if (!invitation) setInitialInvitation(access.connectionCard)
+          localSessionActive.current = true; localSessionNode.current = local.nodeId; setLocalAccessNode(local.nodeId)
+          const own = await unlockLocalVault(local.nodeId, access.unlockKey, startupCurrent)
+          if (!startupCurrent()) return
+          if (own) {
+            adoptIdentity(own); localIdentity.current = own
+            try { await connect({ address: location.origin, node_id: local.nodeId, relay: false }) }
+            catch (cause) { if (startupCurrent()) setError(messageOf(cause)) }
+            return
+          }
+        }
+      } catch (cause) {
+        if (!startupCurrent()) return
+        setLocalAccessNotice(messageOf(cause))
+      }
+      const status = await clientVaultStatus()
+      if (startupCurrent()) { setVaults(status.profiles); setPhase(status.status === 'locked' ? 'vault_locked' : status.status === 'key_lost' ? 'key_lost' : status.status === 'unavailable' ? 'vault_unavailable' : 'vault_empty'); if (status.status === 'unavailable') setError(status.error) }
+    })().catch(cause => { if (startupCurrent()) { setPhase('blocked'); setError(messageOf(cause)) } })
+    const polling = window.setInterval(() => {
+      if (!localSessionActive.current) return
+      const statusVersion = localStatusVersion.current
+      void readLocalAccessStatus().then(status => {
+        if (!mounted || statusVersion !== localStatusVersion.current) return
+        setLocalAccessState(status)
+        if (!status?.authenticated || !status.enabled) {
+          endLocalAccess()
+          setLocalAccessNotice('本机访问已关闭或到期。请使用账户登录，或在本机运行 vibeface open。')
+        }
+      }).catch(() => { if (mounted && statusVersion === localStatusVersion.current) { endLocalAccess() } })
+    }, 15000)
+    return () => { mounted = false; localStatusVersion.current += 1; localSettingsVersion.current += 1; reconnectTarget.current = null; if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current); reconnectTimer.current = null; window.clearInterval(polling); localSessionActive.current = false; setLocalAccessNode(null); generation.current += 1; lockClient(); temporaryRecords.current.clear(); sensitive.current?.cancel(); sensitive.current = null; connecting.current?.abort(); for (const controller of independentReads.current) controller.abort(); independentReads.current.clear(); const previous = session.current; session.current = null; releaseSession(previous); if (previous?.businessRoute.kind === 'gateway') previous.businessRoute.channel?.close(); previous?.channel.close(); listeners.current.clear(); for (const authorization of executionAuthorizations.current) authorization.free(); executionAuthorizations.current.clear() }
   }, [])
+  useEffect(() => {
+    if (!ready || !localAccess?.authenticated || !localAccess.enabled || !identity?.profileId
+      || ready.entry.address !== location.origin || ready.entry.node_id !== localAccess.nodeId || ready.entry.relay
+      || ready.info.node_id !== localAccess.nodeId) return
+    const connection = ready
+    const version = localStatusVersion.current
+    const controller = new AbortController()
+    const isCurrent = () => !controller.signal.aborted && version === localStatusVersion.current && connection.isCurrent()
+    localBinding.current = controller
+    void readLocalAccessSession().then(async access => {
+      if (!isCurrent() || access.nodeId !== localAccess.nodeId || !access.unlockKey) return
+      await bindLocalVault(access.nodeId, access.unlockKey, isCurrent, controller.signal)
+      if (!isCurrent()) return
+      localIdentity.current = identityRef.current
+      setLocalAccessNotice('此浏览器已启用本机自动登录。')
+    }).catch(cause => { if (isCurrent()) setLocalAccessNotice(messageOf(cause)) })
+      .finally(() => { if (localBinding.current === controller) localBinding.current = null })
+    return () => { controller.abort(); if (localBinding.current === controller) localBinding.current = null }
+  }, [ready, identity, localAccess?.authenticated, localAccess?.enabled, localAccess?.nodeId])
   const value: DeviceContextValue = {
+    localAccess, localAccessNotice, setLocalAccess,
     identity, vaults, spaces, ready, entries, phase, error, entry, info, directory, review, initialInvitation, ownerGatewayRoute,
     exportGatewayRequest, approveGatewayRoute, retryGatewayRoute, connectGatewayCard, disconnectGateway, connect, selectSpace, selectProject, disconnect, saveEntry, removeEntry, initializeVault, lockVault, backupVault, useConnectionCard, refreshDirectory, createEnrollmentOffer, beginRecovery, restorePendingAccountRecovery, reencrypt,
     incomingEnrollment, enrollmentRequests, managerEnrollmentActive, localProtectionNotice, governancePending, retryGovernance, createTeam, restoreTeamCreation, changeMembership, grantProject, revokeProjectGrant, teamCreationReview, confirmTeamCreation, nodeEnrollmentReview, beginNodeEnrollment, confirmNodeEnrollment, refreshIncomingEnrollment, refreshEnrollmentRequests, approveEnrollmentRequest, completeEnrollmentRequest, revokeDevice, joinWithPasskey,

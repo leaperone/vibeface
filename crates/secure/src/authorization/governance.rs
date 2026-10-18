@@ -896,6 +896,7 @@ fn owner_actions() -> Vec<Action> {
         Action::TaskProgress,
         Action::TaskAccept,
         Action::TaskCancel,
+        Action::TaskFollowup,
         Action::ExecutionOpen,
         Action::ExecutionSend,
         Action::ExecutionCommand,
@@ -2638,6 +2639,14 @@ pub(crate) mod tests {
         let personal = Fixture::personal();
         let (team, result) = personal.team();
         let state = team.state();
+        assert!(
+            result
+                .authorization
+                .as_ref()
+                .unwrap()
+                .actions
+                .contains(&Action::TaskFollowup)
+        );
         let space = &result.authorization.as_ref().unwrap().scope().space_id;
         let document = state.space(space).unwrap();
         assert_eq!(document.current_root, PublicKey::of(&key(11)));

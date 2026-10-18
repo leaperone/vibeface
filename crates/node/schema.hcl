@@ -344,6 +344,12 @@ table "operations" {
   check "operation_control" {
     expr = "control IN (0,1)"
   }
+  check "operation_request_json" {
+    expr = "json_valid(request)"
+  }
+  check "operation_request_session" {
+    expr = "COALESCE(CASE json_extract(request, '$.action.type') WHEN 'command' THEN session_id IS NULL AND json_type(request, '$.session_id') = 'null' AND json_type(request, '$.task_id') = 'null' AND COALESCE(json_type(request, '$.binding'), 'null') = 'null' AND json_extract(request, '$.expected_revision') = 0 ELSE json_extract(request, '$.action.type') IN ('open','read','send','steer','interrupt','respond_request') AND session_id IS NOT NULL AND length(session_id) > 0 AND json_extract(request, '$.session_id') = session_id END, 0)"
+  }
 }
 
 table "resource_reservations" {
@@ -1036,6 +1042,7 @@ table "execution_handoffs" {
   }
   column "session_id" {
     type = text
+    null = true
   }
   column "original_request" {
     type = text
@@ -1121,6 +1128,15 @@ table "execution_handoffs" {
   }
   check {
     expr = "json_valid(admission_receipt)"
+  }
+  check "handoff_request_json" {
+    expr = "json_valid(original_request) AND json_valid(handoff)"
+  }
+  check "handoff_request_session" {
+    expr = "COALESCE(CASE json_extract(original_request, '$.action.type') WHEN 'command' THEN session_id IS NULL AND json_type(original_request, '$.session_id') = 'null' AND json_type(original_request, '$.task_id') = 'null' AND COALESCE(json_type(original_request, '$.binding'), 'null') = 'null' AND json_extract(original_request, '$.expected_revision') = 0 ELSE json_extract(original_request, '$.action.type') IN ('open','read','send','steer','interrupt','respond_request') AND session_id IS NOT NULL AND length(session_id) > 0 AND json_extract(original_request, '$.session_id') = session_id END, 0)"
+  }
+  check "handoff_work_session" {
+    expr = "COALESCE((json_extract(handoff, '$.handoff.source_attestation.payload.work.kind') = 'command' AND session_id IS NULL) OR (json_extract(handoff, '$.handoff.source_attestation.payload.work.kind') IN ('task_session','conversation_session') AND session_id IS NOT NULL AND json_extract(handoff, '$.handoff.source_attestation.payload.work.execution_session.session_id') = session_id), 0)"
   }
   check {
     expr = "(admitted_at_ms >= 0)"
@@ -1268,6 +1284,7 @@ table "execution_handoff_sessions" {
   }
   column "binding" {
     type = text
+    null = true
   }
   column "record" {
     type = text
@@ -1281,6 +1298,12 @@ table "execution_handoff_sessions" {
   }
   check {
     expr = "(revision >= 0)"
+  }
+  check "handoff_session_record_json" {
+    expr = "json_valid(record)"
+  }
+  check "handoff_session_work" {
+    expr = "COALESCE(json_extract(record, '$.session_id') = session_id AND json_extract(record, '$.work.execution_session.session_id') = session_id AND json_extract(record, '$.revision') = revision AND ((json_extract(record, '$.work.kind') = 'task_session' AND binding IS NOT NULL AND json_valid(binding) AND json_type(binding) = 'object') OR (json_extract(record, '$.work.kind') = 'conversation_session' AND binding IS NULL)), 0)"
   }
 }
 

@@ -1,5 +1,5 @@
 //! Read-only reconciliation of one locally retained execution handoff.
-use super::{events::*, execution_handoff::*, task_binding::SignedBinding, *};
+use super::{events::*, execution_handoff::*, *};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -14,9 +14,7 @@ pub struct ExecutionObservationTarget {
     pub handoff_hash: ObjectHash,
     pub original_body_hash: ObjectHash,
     pub original_request_hash: ObjectHash,
-    pub conversation_id: String,
-    pub task_id: String,
-    pub executor_kind: String,
+    pub context: InvocationContext,
     pub execution_resource: ResourceRef,
     pub execution_audience: Audience,
     pub target_public_key: PublicKey,
@@ -38,10 +36,9 @@ impl ExecutionObservationTarget {
             ));
         };
         let request = &admission.source_body["request"];
-        let binding: SignedBinding =
-            serde_json::from_value(request["binding"].clone()).map_err(shape_error)?;
         let original_invocation = &admission.invocation.payload;
         let expected_action = match request["action"]["type"].as_str() {
+            Some("command") => Action::ExecutionCommand,
             Some("open") => Action::ExecutionOpen,
             Some("read") => Action::OperationStatusRead,
             Some("send") => Action::ExecutionSend,
@@ -54,20 +51,7 @@ impl ExecutionObservationTarget {
                 ));
             }
         };
-        let executor_kind = binding.binding.open_spec["executor"]
-            .as_str()
-            .ok_or(AuthorizationError::InvalidProof(
-                "missing observed executor",
-            ))?
-            .to_owned();
-        let context = InvocationContext {
-            conversation: Some(event.scope_id.clone()),
-            task: Some(source.task.clone()),
-            sdk_session: original_invocation.context.sdk_session.clone(),
-            execution_session: Some(source.execution_session.clone()),
-            executor_kind: Some(executor_kind.clone()),
-            workspace_resource: Some(source.project.resource.clone()),
-        };
+        let context = handoff.execution_context()?;
         let source_signature =
             handoff
                 .source_attestation
@@ -93,8 +77,6 @@ impl ExecutionObservationTarget {
                 && original_invocation.body_hash == ObjectHash::body(&admission.source_body)?
                 && original_invocation.action == expected_action
                 && original_invocation.context == context
-                && binding.binding.target_node
-                    == node_fingerprint(handoff.target_public_key.as_str()).map_err(shape_error)?
                 && handoff.execution_audience.device
                     == DeviceId::from_key(&handoff.target_public_key)
                 && handoff.execution_audience.service
@@ -123,9 +105,11 @@ impl ExecutionObservationTarget {
             handoff_hash: original.hash()?,
             original_body_hash: original_invocation.body_hash.clone(),
             original_request_hash: ObjectHash::body(request)?,
-            conversation_id: event.scope_id,
-            task_id: binding.binding.task_id,
-            executor_kind,
+            context: {
+                let mut context = context;
+                context.sdk_session = None;
+                context
+            },
             execution_resource: handoff.execution_resource.clone(),
             execution_audience: handoff.execution_audience.clone(),
             target_public_key: handoff.target_public_key.clone(),
@@ -133,14 +117,9 @@ impl ExecutionObservationTarget {
     }
 
     pub(super) fn context(&self, workspace: &ResourceId) -> InvocationContext {
-        InvocationContext {
-            conversation: Some(self.conversation_id.clone()),
-            task: Some(self.source.task.clone()),
-            sdk_session: None,
-            execution_session: Some(self.source.execution_session.clone()),
-            executor_kind: Some(self.executor_kind.clone()),
-            workspace_resource: Some(workspace.clone()),
-        }
+        let mut context = self.context.clone();
+        context.workspace_resource = Some(workspace.clone());
+        context
     }
 }
 
@@ -458,7 +437,7 @@ impl VerifiedPolicySet {
         )?;
         for device in [
             &facts.audience.device,
-            &intent.target.source.execution_session.target,
+            &intent.target.execution_audience.device,
         ] {
             let certificate = self.find_device(device)?;
             require(
@@ -626,12 +605,21 @@ impl VerifiedPolicySet {
                 && valid_operation_id(&intent.authorization_id)
                 && intent.target.source.version == AUTH_VERSION
                 && valid_operation_id(&intent.target.source.operation_id)
-                && intent.target.source.binding_generation > 0
-                && lower_hex(&intent.target.source.binding_hash, 32)
-                && !intent.target.task_id.is_empty()
-                && intent.target.task_id.len() <= 512
-                && intent.target.source.execution_session.target
-                    == intent.target.execution_audience.device
+                && intent
+                    .target
+                    .source
+                    .work
+                    .execution_session()
+                    .is_none_or(|session| {
+                        session.target == intent.target.execution_audience.device
+                    })
+                && intent.target.source.target_public_key == intent.target.target_public_key
+                && intent.target.context.conversation.as_deref()
+                    == Some(intent.target.source.conversation.as_str())
+                && intent.target.context.task.as_ref() == intent.target.source.work.task_ref()
+                && intent.target.context.execution_session.as_ref()
+                    == intent.target.source.work.execution_session()
+                && intent.target.context.sdk_session.is_none()
                 && intent.target.execution_audience.device
                     == DeviceId::from_key(&intent.target.target_public_key)
                 && intent.target.execution_audience.service
@@ -828,6 +816,12 @@ impl VerifiedPolicySet {
                 && leaf.constraints.context == facts.context,
             "executor observation requires only the exact finite resolve pair",
         )?;
+        check_execution_source_work(
+            leaf,
+            &request.target.source.project,
+            &wire.invocation.issuer,
+            &request.target.source.work,
+        )?;
         let mut heads = BTreeMap::new();
         for stamp in request.heads().iter().chain(submission.dependencies()) {
             require(
@@ -955,6 +949,7 @@ impl VerifiedPolicySet {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::authorization::task_binding::SignedBinding;
     use ed25519_dalek::Signer;
     use serde_json::{Value, json};
 
@@ -996,8 +991,8 @@ pub(crate) mod tests {
         };
         let context = prepare::PrepareContext {
             context: target.context(&target.source.project.resource),
-            binding_generation: Some(target.source.binding_generation),
-            canonical_cwd: None,
+            binding_generation: target.source.work.binding_generation(),
+            canonical_cwd: target.source.work.canonical_cwd().map(str::to_owned),
             execution_target_public_key: Some(target.target_public_key.clone()),
         };
         let stream = remote_execution_policy::tests::remote_policy_stream(
@@ -1171,12 +1166,266 @@ pub(crate) mod tests {
         retained_history_fixture_from(Fixture::new())
     }
 
+    pub(crate) fn retained_project_observation_fixture() -> RetainedHistoryFixture {
+        let fixture = Fixture::new();
+        let source = remote_execution_policy::tests::confirmed_source(
+            &fixture.project.bundle,
+            &fixture.project.pins,
+            &fixture.project.client,
+            &fixture.project.node,
+            &fixture.project.project,
+            NOW,
+        )
+        .unwrap();
+        let mut retained = retained_history_fixture_from(fixture);
+        retained.source = source;
+        retained
+    }
+
     pub(crate) fn retained_history_fixture_with_execution_source() -> RetainedHistoryFixture {
         retained_history_fixture_from(Fixture::with_authorization_resources_and_execution_source(
             "task",
             &[],
             true,
         ))
+    }
+
+    fn control_fixture() -> (ExecutionHandoffResult, Identity) {
+        let fixture = retained_history_fixture();
+        let mut actual = fixture.actual;
+        let mut receipt = actual.receipt.payload.clone();
+        receipt.issued_at_ms = NOW + 20;
+        receipt.session = Some(ExecutionSessionSnapshot {
+            original_project: actual.handoff.handoff.source_statement().unwrap().project,
+            execution_resource: actual.handoff.handoff.execution_resource.clone(),
+            work: receipt.work.clone(),
+            target: receipt.target.clone(),
+            session_id: fixture.binding.binding.session_id,
+            revision: 7,
+            executor: fixture.binding.binding.open_spec["executor"]
+                .as_str()
+                .unwrap()
+                .into(),
+            cwd: fixture.binding.binding.open_spec["cwd"]
+                .as_str()
+                .unwrap()
+                .into(),
+            state: "busy".into(),
+            expires_at_ms: NOW + 100,
+        });
+        let control = ExecutionControlState {
+            turn_id: Some("turn-1".into()),
+            pending_requests: vec![
+                ExecutionPendingRequest {
+                    request_id: json!(23),
+                    turn_id: "turn-1".into(),
+                },
+                ExecutionPendingRequest {
+                    request_id: json!("23"),
+                    turn_id: "turn-1".into(),
+                },
+            ],
+            expires_at_ms: NOW + 50,
+        };
+        let original_hash = actual.receipt.payload.result_hash.clone();
+        actual.receipt = sign_execution_handoff_receipt_with_control(
+            &actual.handoff,
+            receipt,
+            &actual.result,
+            Some(control),
+            &fixture.executor,
+        )
+        .unwrap();
+        assert_eq!(actual.receipt.payload.result_hash, original_hash);
+        (actual, fixture.executor)
+    }
+
+    #[test]
+    fn control_receipt_binds_actual_work_revision_and_observation_lease() {
+        let (actual, _) = control_fixture();
+        let control = verify_execution_control_state(
+            &actual.handoff,
+            &actual.receipt,
+            &actual.result,
+            7,
+            NOW + 21,
+        )
+        .unwrap();
+        assert_eq!(control.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(control.pending_requests[0].request_id, json!(23));
+        assert_eq!(control.pending_requests[1].request_id, json!("23"));
+        for (revision, now) in [(6, NOW + 21), (7, NOW + 50), (7, NOW + 19)] {
+            assert!(
+                verify_execution_control_state(
+                    &actual.handoff,
+                    &actual.receipt,
+                    &actual.result,
+                    revision,
+                    now
+                )
+                .is_err()
+            );
+        }
+        let mut changed = actual.receipt.clone();
+        changed.payload.control.as_mut().unwrap().turn_id = Some("other-turn".into());
+        assert!(
+            verify_execution_control_state(&actual.handoff, &changed, &actual.result, 7, NOW + 21)
+                .is_err()
+        );
+        let mut changed_work = actual.handoff.clone();
+        changed_work.handoff.execution_resource.resource = ResourceId::from_bytes([246; 32]);
+        assert!(
+            verify_execution_control_state(
+                &changed_work,
+                &actual.receipt,
+                &actual.result,
+                7,
+                NOW + 21
+            )
+            .is_err()
+        );
+        assert!(
+            verify_execution_control_state(
+                &actual.handoff,
+                &actual.receipt,
+                &json!({"other":"result"}),
+                7,
+                NOW + 21
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn control_receipt_rejects_non_rpc_ids_other_turns_and_missing_sessions() {
+        let (actual, executor) = control_fixture();
+        let valid = actual.receipt.payload.control.clone().unwrap();
+        for request_id in [
+            Value::Null,
+            json!(true),
+            json!(1.5),
+            json!({"id":23}),
+            json!(9_007_199_254_740_992u64),
+        ] {
+            let mut control = valid.clone();
+            control.pending_requests[0].request_id = request_id;
+            assert!(
+                sign_execution_handoff_receipt_with_control(
+                    &actual.handoff,
+                    actual.receipt.payload.clone(),
+                    &actual.result,
+                    Some(control),
+                    &executor
+                )
+                .is_err()
+            );
+        }
+        for turn in [None, Some("other-turn".into())] {
+            let mut control = valid.clone();
+            control.turn_id = turn;
+            assert!(
+                sign_execution_handoff_receipt_with_control(
+                    &actual.handoff,
+                    actual.receipt.payload.clone(),
+                    &actual.result,
+                    Some(control),
+                    &executor
+                )
+                .is_err()
+            );
+        }
+        let mut duplicate = valid.clone();
+        duplicate
+            .pending_requests
+            .push(duplicate.pending_requests[0].clone());
+        assert!(
+            sign_execution_handoff_receipt_with_control(
+                &actual.handoff,
+                actual.receipt.payload.clone(),
+                &actual.result,
+                Some(duplicate),
+                &executor
+            )
+            .is_err()
+        );
+        let mut overlong = valid.clone();
+        overlong.expires_at_ms = NOW + 101;
+        assert!(
+            sign_execution_handoff_receipt_with_control(
+                &actual.handoff,
+                actual.receipt.payload.clone(),
+                &actual.result,
+                Some(overlong),
+                &executor
+            )
+            .is_err()
+        );
+        let mut no_session = actual.receipt.payload.clone();
+        no_session.session = None;
+        assert!(
+            sign_execution_handoff_receipt_with_control(
+                &actual.handoff,
+                no_session,
+                &actual.result,
+                Some(valid),
+                &executor
+            )
+            .is_err()
+        );
+        let mut command_session = actual.receipt.payload.session.clone().unwrap();
+        command_session.work = ExecutionWork::Command {
+            request_hash: ObjectHash::body(&"command").unwrap(),
+            canonical_cwd: "/workspace".into(),
+        };
+        assert!(
+            actual
+                .receipt
+                .payload
+                .control
+                .as_ref()
+                .unwrap()
+                .validate_for_session(&command_session, NOW + 20)
+                .is_err()
+        );
+        let idle = ExecutionControlState {
+            turn_id: None,
+            pending_requests: vec![],
+            expires_at_ms: NOW + 50,
+        };
+        let signed_idle = sign_execution_handoff_receipt_with_control(
+            &actual.handoff,
+            actual.receipt.payload.clone(),
+            &actual.result,
+            Some(idle),
+            &executor,
+        )
+        .unwrap();
+        assert!(
+            verify_execution_control_state(
+                &actual.handoff,
+                &signed_idle,
+                &actual.result,
+                7,
+                NOW + 21
+            )
+            .unwrap()
+            .turn_id
+            .is_none()
+        );
+        let ordinary = sign_execution_handoff_receipt_with_control(
+            &actual.handoff,
+            actual.receipt.payload.clone(),
+            &actual.result,
+            None,
+            &executor,
+        )
+        .unwrap();
+        verify_execution_handoff_receipt_signature(&actual.handoff, &ordinary, &actual.result)
+            .unwrap();
+        assert!(
+            verify_execution_control_state(&actual.handoff, &ordinary, &actual.result, 7, NOW + 21)
+                .is_err()
+        );
     }
 
     fn retained_history_fixture_from(fixture: Fixture) -> RetainedHistoryFixture {
@@ -1287,11 +1536,11 @@ pub(crate) mod tests {
                 execution_space_id: fixture.original.handoff.execution_resource.space.clone(),
                 handoff_hash: fixture.original.hash().unwrap(),
                 target: fixture.executor.audience().device,
-                session_id: source.payload.execution_session.session_id.clone(),
-                binding_generation: source.payload.binding_generation,
+                work: source.payload.work.clone(),
                 state: ExecutionHandoffState::Succeeded,
                 result_hash: ObjectHash::body(&result).unwrap(),
                 session: None,
+                control: None,
                 issued_at_ms: NOW + 10,
             },
             &fixture.executor.node,
@@ -1627,6 +1876,11 @@ pub(crate) mod tests {
             let pair = Signed::sign(
                 Grant {
                     execution_source: execution_source.then(|| ExecutionSourcePolicy {
+                        work: ExecutionWorkIntent::TaskSession {
+                            task: EventRef::parse(&task.hash).unwrap(),
+                            binding_generation: 1,
+                            execution_session: execution_context.execution_session.clone().unwrap(),
+                        },
                         project: project.project.clone(),
                         node_public_key: PublicKey::of(&project.node),
                         pins: project
@@ -1699,7 +1953,7 @@ pub(crate) mod tests {
                     .unwrap(),
                 binding,
             };
-            let request = json!({"space_id":project.project.space,"conversation_id":"chat","operation_id":"original-open","task_id":"task","target_node":executor.node.node_id(),"session_id":"execution-session","binding":binding,"action":{"type":"open"},"resources":resources});
+            let request = json!({"space_id":project.project.space,"conversation_id":"chat","operation_id":"original-open","task_id":"task","target_node":executor.node.node_id(),"session_id":"execution-session","expected_revision":0,"binding":binding,"action":binding.binding.open_spec,"resources":resources});
             let body = json!({"method":"operate","space_id":project.project.space,"resource_id":project.project.resource,"authorization_id":"original-open","request":request,"execution_resource":execution_resource,"target_public_key":PublicKey::of(&executor.node),"execution_grant":old_execution_grant});
             let mut context = execution_context;
             context.workspace_resource = Some(project.project.resource.clone());
@@ -1718,7 +1972,7 @@ pub(crate) mod tests {
                     operation_id: "original-open".into(),
                     task_id: Some("task".into()),
                     target_node: executor.node.node_id(),
-                    session_id: "execution-session".into(),
+                    session_id: Some("execution-session".into()),
                     action: request,
                 },
                 Some(&task),
@@ -1726,7 +1980,9 @@ pub(crate) mod tests {
             let mut handoff = ExecutionHandoff {
                 version: AUTH_VERSION,
                 project_dispatch: dispatch,
-                task_creation: task,
+                origin: ExecutionOrigin::TaskSession {
+                    task_creation: task,
+                },
                 sdk_origin: None,
                 task_sdk_origin: None,
                 execution_resource,
@@ -2098,10 +2354,23 @@ pub(crate) mod tests {
                 .state
                 .verify_execution_observation(&wire, &fixture.original, &fixture.transport(), NOW)
                 .unwrap();
-            fixture
+            let mut union = full.proof_usage().clone();
+            union.record_metadata(&proof.challenge).unwrap();
+            for receipt in &proof.receipts {
+                union.record_signed(receipt).unwrap();
+            }
+            println!(
+                "forwarded_observation_union={}",
+                serde_json::to_string(&union.counts()).unwrap()
+            );
+            let result = fixture
                 .state
-                .verify_execution_observation_freshness(&full, &proof, NOW)
-                .unwrap()
+                .verify_execution_observation_freshness(&full, &proof, NOW);
+            println!(
+                "forwarded_observation_actual={}",
+                serde_json::to_string(&verification.counts()).unwrap()
+            );
+            result.unwrap()
         });
         assert_eq!(read.target().source.operation_id, "original-open");
         assert!(verification.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
@@ -2421,8 +2690,11 @@ pub(crate) mod tests {
             .state
             .verify_execution_observation(&wire, &fixture.original, &fixture.transport(), NOW)
             .unwrap();
-        let task: Event =
-            serde_json::from_str(&fixture.original.handoff.task_creation.canonical_body).unwrap();
+        let ExecutionOrigin::TaskSession { task_creation } = &fixture.original.handoff.origin
+        else {
+            panic!("expected Task fixture")
+        };
+        let task: Event = serde_json::from_str(&task_creation.canonical_body).unwrap();
         assert!(
             matches!(task.body, EventBody::TaskCreated { title: actual, .. } if actual == title)
         );
@@ -2627,6 +2899,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn observation_rejects_resolver_grant_for_another_original_work() {
+        let mut fixture =
+            Fixture::with_authorization_resources_and_execution_source("task", &[], true);
+        let initial = fixture.observe_current(NOW);
+        fixture
+            .state
+            .verify_execution_observation(&initial, &fixture.original, &fixture.transport(), NOW)
+            .unwrap();
+        let mut grant = fixture
+            .state
+            .grant(&fixture.execution_grant)
+            .unwrap()
+            .payload
+            .clone();
+        let source = grant.execution_source.as_mut().unwrap();
+        let ExecutionWorkIntent::TaskSession { task, .. } = &mut source.work else {
+            panic!("expected Task work")
+        };
+        *task = EventRef::parse(&"ac".repeat(32)).unwrap();
+        grant.nonce = Nonce::random().unwrap();
+        let grant = Signed::sign(grant, &fixture.executor.root).unwrap();
+        let wrong = fixture.state.install_grant(grant, NOW).unwrap();
+        update_space(&mut fixture.state, &mut fixture.executor, |document| {
+            document.grants.push(wrong.clone())
+        });
+        fixture.execution_grant = wrong;
+        let wire = fixture.observe_current(NOW);
+        assert!(matches!(
+            fixture
+                .state
+                .verify_execution_observation_current(&wire, &fixture.transport(), NOW),
+            Err(AuthorizationError::InvalidProof(
+                "execution work differs from its approved intent"
+            ))
+        ));
+    }
+
+    #[test]
     fn observation_rejects_execution_submit_in_resolver_grant_and_revoked_account_grant() {
         let mut fixture = Fixture::new();
         let mut mixed = fixture
@@ -2694,8 +3004,8 @@ pub(crate) mod tests {
         let target = ExecutionObservationTarget::from_original(&fixture.original).unwrap();
         let context = prepare::PrepareContext {
             context: target.context(&target.source.project.resource),
-            binding_generation: Some(target.source.binding_generation),
-            canonical_cwd: None,
+            binding_generation: target.source.work.binding_generation(),
+            canonical_cwd: target.source.work.canonical_cwd().map(str::to_owned),
             execution_target_public_key: Some(target.target_public_key.clone()),
         };
         for (purpose, action, source_grant, execution_grant, name) in [

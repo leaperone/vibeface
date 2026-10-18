@@ -26,6 +26,8 @@
 | `public_url` | 展示使用的主入口 origin，公网为 HTTPS |
 | `allowed_origins` | 额外允许的浏览器 origin 数组，默认空；`init --allowed-origin` 可重复指定 |
 | `allow_insecure_lan` | 明确允许可信 LAN 上的明文 HTTP |
+| `local_access.enabled` | 默认 `true`，允许本机可信入口自动解锁浏览器设备配置；关闭会使已有本机会话失效 |
+| `local_access.listen` | 独立回环监听地址；初次 `127.0.0.1:0` 自动选择端口并写回配置，之后保持同一浏览器 origin |
 | `roles` | 本机启用的 Node 角色 |
 | `roots` | 编码执行允许使用的绝对目录列表 |
 | `network` | 公共发现、候选直连地址、mDNS 与公共中继配置 |
@@ -33,9 +35,9 @@
 | `codex_socket` | 已有 Codex App Server socket，`null` 时尝试启动私有实例 |
 | `codex_bin`、`claude_bin`、`cursor_bin` | 对应 Provider 程序路径 |
 | `timeout_secs` | 单次适配器超时，默认 600 秒 |
-| `daily_decision_limit` | 本 Node 每个个人空间的 UTC 每日管理调用次数，默认 20 |
+| `daily_decision_limit` | 本 Node 每个个人空间的 UTC 每日自主管理调用次数，默认 20；本人主动聊天不受此额度限制 |
 
-`gateway`、`scheduler`、`executor` 依赖 `replica`，配置和设备角色授权均须满足此条件。无需 Agent 的入口可启用 `gateway`、`replica` 和可选 `relay`；纯 `relay` 可以只转发消息而不保存业务副本。当前不提供无本地历史的 Gateway 代理模式。
+`gateway`、`scheduler`、`executor` 依赖 `replica`，配置和设备角色授权均须满足此条件。无需 Agent 的入口可启用 `gateway`、`replica` 和可选 `relay`；没有业务 Grant 的 Gateway 只转发指向已验证 Project 宿主的请求，不因此获得业务副本。纯 `relay` 可以只转发密文而不加入个人身份网络。
 
 启用管理 Agent 时，`manager` 业务配置只保留 Provider 和模型，不接受宿主 SDK 程序路径：
 
@@ -47,6 +49,8 @@
 ```
 
 该对象作为 `manager` 的值，保留 `config.json` 的其他字段。管理 Agent 按本次空间与资源选择唯一只读项目目录，不使用全局工作区或全部执行根。它在固定镜像内使用受信 sidecar，必须另外配置 `execution_isolation` 和受信模型网关，见[执行镜像说明](execution-image.md)。Cursor SDK 管理目前拒绝，不回退到宿主进程。
+
+`manager_capabilities` 与执行器能力分别声明，实际支持情况以当前运行时返回值为准。适配器协议包含流式进度、取消请求和本机原生会话延续，不提供原生 steer 或 Provider run 对账。Cursor 文本支持增量和快照，Codex 文本是按 item 替换的快照。`cancel=true` 表示可请求取消；Codex 的 `cancel_confirmation=false` 表示 CLI 退出不能证明分离的工具进程已退出。`verified=false` 不表示已通过当前环境的真实模型验收。配置存在、进程可达和已验证是不同状态。
 
 ## HTTP 与客户端通道
 
@@ -61,7 +65,9 @@
 | `/api/info` | GET | Node 公开身份与能力信息 |
 | `/api/network/ws` | GET，WebSocket upgrade | 直连、发现、中继及端到端客户端通道 |
 
-网站不提供用户名密码注册、登录 cookie 或明文业务 RPC。网页的密钥存储需要安全上下文。localhost 或可信 HTTPS 页面可启动客户端，普通 LAN HTTP 页面不能降级为无密钥认证。
+公开入口不提供用户名密码注册、登录 cookie 或明文业务 RPC。网页的密钥存储需要安全上下文。localhost 或可信 HTTPS 页面可启动客户端，普通 LAN HTTP 页面不能降级为无密钥认证。
+
+独立本机 listener 额外挂载 `/api/local/status`、`/api/local/launch`、`/api/local/exchange`、`/api/local/session`、`/api/local/settings` 和 `/api/local/network/ws`。它使用本机私有 launch 凭据、短时一次性 token 与 HttpOnly cookie；这些路径不出现在公开 listener。cookie 仅解锁此浏览器保存的设备配置，业务仍通过真实 Noise、client-policy 验证与签名 Invocation。详见[本机自动登录](node.md#本机自动登录)。
 
 WebSocket 建立后先接收文本 `welcome`。直连客户端发送 `{"type":"direct","service":"client"}`。通过中继时发送 `{"type":"dial","target":"NODE_ID","service":"client"}`。收到 `ready` 后，真实两端执行 Noise XX 握手，协议 context 为 `vibeface:client:v2`。客户端从可信入口钉住 Node 公钥和 NodeID，服务端把已验证的客户端授权绑定到该 Noise 会话。
 
@@ -108,7 +114,7 @@ Project 的宿主为 B、入口为 A 时，客户端分别保存 A 的 Noise 公
 
 管理 SDK 的工具调用走隔离 sidecar 的受信通道，绑定账户、空间、资源、原发起人和当前 SDK 会话。它不提供外部 Bot 可保存的长期身份，不能添加或撤销设备、回答审批或验收工单。
 
-HTTP 成功或通道返回结果表示本次请求已处理。任务是否完成仍查询执行账本及工单状态。
+HTTP 成功或通道返回结果表示本次请求已处理。消息是否在目标入队以版本化调度回执为准，工作是否完成仍查询执行账本及结果。
 
 ## RPC 方法
 
@@ -117,13 +123,21 @@ HTTP 成功或通道返回结果表示本次请求已处理。任务是否完成
 | method | 主要字段 | 结果或行为 |
 |---|---|---|
 | `nodes` | `resource_id` | 已授权 Node、可达性和当前可查能力 |
+| `bots` | `resource_id` | 当前授权资源的持久机器人定义 |
+| `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project` | 本人显式创建机器人并绑定独立聊天历史；完整请求精确去重 |
 | `conversations` | `resource_id` | 本地已知业务会话 |
-| `create_conversation` | `resource_id`、`conversation_id`、`title` | 以稳定 ID 创建会话，同 ID 同内容可去重 |
-| `conversation` | `conversation_id`、可选 `basis_heads` | 消息、工单、heads、missing，以及执行端可查事实 |
-| `context` | `conversation_id`、可选 `blob_hash` | 读取当前资源的 DAG 上下文或由其事件引用的附件 |
-| `message` | `conversation_id`、`message_id`、`text`、可选 `basis_heads`、`scheduler_node` | 保存用户消息并请求指定管理 Agent |
-| `create_task` | `conversation_id`、`task_id`、`title`、`goal`、`acceptance`、可选 `auto_followup` | 创建工单，自动后续只接受本人授权 |
+| `create_conversation` | `conversation_id`、`title` | 以稳定 ID 创建会话，同 ID 同内容可去重 |
+| `conversation` | `conversation_id`、可选 `basis_heads` | 本机已知消息、机器人定义、executions 投影、历史目标、heads、missing、调度队列及事实新鲜度 |
+| `message` | `conversation_id`、`message_id`、`text`、可选 `basis_heads`、`scheduler_node`、`report_results` | 原子保存用户消息、汇报意图和本机 inbox 或 outbox，返回调度回执 |
+| `create_task` | `conversation_id`、`task_id`、`title`、`goal`、`acceptance` | 创建工单；`auto_followup=true` 被拒绝，授权使用 `set_followup` |
 | `update_task` | `conversation_id`、`task_id`、`status`、`detail` | 追加工单状态变化 |
+| `set_followup` | `conversation_id`、`task_id`、`mode`、`expected_version`、可选 `scheduler_node` | 本人设置具体任务的后续权限，模式为 `off`、`report` 或 `continue` |
+| `cancel_manager` | `conversation_id`、`trigger` | 本人请求停止指定管理轮，返回取消请求状态，不表示后台任务已停止 |
+| `resolve_manager_unknown` | `conversation_id`、`trigger`、`evidence` | 本人核对旧管理轮及原操作证据后解除管理写冻结，不重做旧触发 |
+| `task_control` | `conversation_id`、`task_id`、`action`，写控制另需 `operation_id`、`expected_operation_id`、`expected_revision` | 读取具体任务状态，或按原绑定执行 `steer`、`interrupt`、`respond_request` |
+| `execution_control` | `conversation_id`、`operation_id`、`expected_operation_id`、`expected_revision`、`action` | 从原签名派发解析目标和执行资源，按真实能力控制后台工作，不要求 Task |
+| `read_artifact` | `conversation_id`、`blob_hash`、可选 `offset`、`limit` | 分页读取当前空间和资源中、该会话实际引用的 UTF-8 文本附件 |
+| `context` | `conversation_id`、可选 `blob_hash` | 读取当前资源的 DAG 上下文或由其事件引用的附件 |
 | `bind_execution` | `conversation_id`、`task_id`、`task_ref`、`target_node`、`session_id`、`executor`、`cwd` | 取得明确执行意图的已签任务绑定 |
 | `operate` | `request` | 向指定执行 Node 提交 `OperationRequest` |
 | `session` | `target_node`、`session_id` | 查询原执行会话及当前事实 |
@@ -138,13 +152,58 @@ HTTP 成功或通道返回结果表示本次请求已处理。任务是否完成
 
 工单状态为 `open`、`working`、`blocked`、`needs_review`、`accepted` 或 `cancelled`。`accepted` 和 `cancelled` 只能由本人设置，Agent 不能将它们改回活动状态。`resolve_unknown.outcome` 为 `succeeded` 或 `failed`，证据至少 12 字节。
 
-`message_id`、`conversation_id`、`task_id` 和 `operation_id` 是业务去重身份。重试保留原 ID 和原内容；同 ID 换内容会被拒绝。管理 Agent 的可用工具为 `nodes`、`context`、`create_task`、`update_task`、`bind_execution`、`open_execution`、`send_execution` 和 `execution_status`，实际列表继续按当前 Grant 过滤。
+`bot_id`、`message_id`、`conversation_id`、`task_id` 和 `operation_id` 是业务去重身份。重试保留原 ID 和原内容；同 ID 换内容会被拒绝。聊天 Agent 的工具为 `nodes`、`context`、`command`、`delegate`、`continue_execution`、`execution_status`、`stop_execution` 和只读的 `call_lookup`。只读结果回调只得到查询工具。
+
+Bot 定义包含独立的 `bot_id`、内部 `conversation_id`、`name`、`instructions`、可选 `project` 和来源 `event_hash`。`project` 为 `{ target_node, cwd }`，只表达执行偏好，不授予权限。`BotCreated` 进入对应聊天的签名 DAG，Store 从事件重建投影。创建新机器人时，新聊天与 Bot 定义在同一事务保存。导入或重建同版本定义不启动模型。
+
+Node 的 manager 配置选择 SDK Provider 和模型，凭证通过受信模型网关保留在隔离边界外，Bot 定义保存职责。每个 Bot 的内部聊天 scope 独立，原生 SDK 缓存仍按空间、scope 和本机节点保存。缓存不是共享聊天的事实来源。
+
+写工具在副作用前保存稳定调用引用与已准备的实际请求。程序生成 operation/session ID 并固定目标与 revision；恢复先读取原调用，不能根据同一命令文本猜测是否重复，也不能换目标重派。
+
+`conversation.scheduler` 包含 `jobs`、`provider`、`model`、`capabilities` 和 `write_frozen`。每个 job 保留 `trigger`、`target_node`、`kind`、`sequence`、`state` 及可用的 `message_id`、`read_only`、`reply_message_id`。`kind` 为 `human` 或 `autonomous`。完成消息替换同一调用的临时文字，不把临时文字当成已持久保存的回答。
+
+任务包含 `followup_mode` 和 `followup_version`。已验证的 `binding` 包含目标、会话、原操作、revision、真实 `capabilities` 和 `pending_requests`。远端摘要保留缓存或未知标记，`facts_freshness=local_known_history` 不证明全网最新。
+
+`task_control.action=status` 是只读查询。其他动作返回完整 `OperationRecord`，重试必须保留原控制 `operation_id` 和内容。Node 检查原操作及 revision，解析真实 turn 和审批请求。`steer` 另需 `text`，`respond_request` 另需 `request_id` 和 `response`。过期请求被拒绝，模型不能回答审批。
+
+`execution_control.action` 为互斥对象，支持 `{ type: "interrupt" }`、`{ type: "steer", text }` 或 `{ type: "respond_request", request_id, response }`。Node 从 `expected_operation_id` 找到原派发，不信任客户端传入执行目标。审批仍要求本人和有效原请求；重试保留完整载荷与原控制 ID。无 SDK 会话的短命令只声明实际支持的查询能力，不伪造 SDK 中断。
+
+`read_artifact` 返回 `{ blob_hash, text, offset, next_offset, size }`。偏移与长度按 UTF-8 字节计算，`limit` 范围为 4 至 65536，默认 65536。偏移必须位于字符边界；下一页使用返回的 `next_offset`，为 `null` 时结束。Node 核对签名附件引用、长度和哈希，正文未同步、非 UTF-8 或仅凭其他会话的哈希猜读都会拒绝。
+
+## 可靠调度回执
+
+可靠调度版本为 `1`。入口在同一事务保存消息、不可改写的汇报意图以及 inbox 或 outbox。远端投递前先查询目标的 `reliable_schedule.version`，不向旧版目标发送可能启动执行的旧协议请求。
+
+`message` 返回 `accepted`、`queued`、`state`、`trigger`、`message_id`、`scheduler_node` 和 `receipt`。目标调度节点持久入队后，回执结构为：
+
+```json
+{
+	"version": 1,
+	"space_id": "spc2_<64 lowercase hex>",
+	"conversation_id": "conversation-id",
+	"trigger": "SIGNED_EVENT_HASH",
+	"target_node": "SCHEDULER_NODE_ID",
+	"state": "queued"
+}
+```
+
+入口仅写入 outbox 时，`accepted=true`、`queued=false`、`state=pending_delivery`。只有目标提交 inbox 后的匹配回执才能确认已入队，HTTP 成功或本机已保存不替代这个确认。`queued=true` 表示已经可靠接收，查询时 `state` 可能已推进至运行或终态。
+
+投递以空间、资源、会话、trigger、原目标和版本核对回执。ACK 丢失后向同一目标重投同一 trigger，目标返回原 job。已投递项通过原目标的 `manager_status` 查询进展和结果，不因离线或超时改派另一台。
+
+每个会话的本机管理队列有界，最多保留 256 个待处理触发；本机每个空间的未投递 outbox 也上限为 256。单消费者按持久状态领取，本人待处理消息优先于自主后续。提示通知只负责唤醒，周期扫描补上丢失的唤醒。每轮按持久固定的依据准备上下文，后发消息不会隐式算作已处理。
+
+job 状态为 `queued`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled` 或 `unknown`。`queued` 和确认尚未跨启动边界的 `claimed` 可恢复首次执行。跨重启的 `running` 与 `cancelling` 进入 `unknown`，不自动重新调用 SDK。最终回答和 job 终态一次提交。导入 DAG 或重建视图不创建 job，也不重放模型、工具或执行操作。
+
+取消先封存旧 attempt 的工具权限并排空已接纳工具，再检查 SDK 取消证据。`cancelling` 不是停止成功，无法证明终止时进入 `unknown`。旧管理轮保持未知，工具权限隔离后可创建新的只读管理轮。`resolve_manager_unknown` 核对原 attempt 关联的业务操作；执行仍未知时须先走 `reconcile` 或 `resolve_unknown`。人工结论不重跑旧 trigger，已有只读 token 不自动获得写权限。
+
+本机版本化队列、outbox、原生 SDK 会话及操作账本不通过 DAG 迁移。维护空闲检查包含待投递、排队、活动和未知项，新进程通过更新健康门后才消费。存在新调度记录时不承诺任意降级旧程序。
 
 `authorization_id` 标识这次签名调用。`operate` 使用原 `operation_id`，结果不明时仍保留该 ID。查询 `operation` 则生成独立的授权 ID，不能把被查询的操作 ID 当作本次读取的身份。
 
 ## 执行请求
 
-以下展示 `operate.request` 的业务字段。实际发送时还必须附上完整、已验证的 `binding` 对象，不能只发送绑定编号：
+以下展示显式 Task 的 `operate.request` 业务字段。该分支实际发送时还必须附上完整、已验证的 `binding` 对象，不能只发送绑定编号：
 
 ```json
 {
@@ -165,9 +224,11 @@ HTTP 成功或通道返回结果表示本次请求已处理。任务是否完成
 }
 ```
 
-新执行会话先创建任务并显式取得绑定。`task_ref` 必须是经过共享事件 verifier 核验的 `TaskCreated.hash`。`basis_heads` 标记本次操作依据的已知历史。目标 Node 在接单前拉取并校验其依赖闭包、派发记录和必要附件。空数组不表示全网没有其他历史。
+`task_id` 可为 `null`。普通打开和发送操作不创建隐式 Task。`session_id` 可为 `null`，SDK 动作必须指定真实逻辑会话，短命令必须为 `null` 且 `expected_revision=0`。`basis_heads` 标记本次操作依据的已知历史。目标 Node 在接单前拉取并校验其依赖闭包、派发记录和必要附件。空数组不表示全网没有其他历史。
 
-向已关联工单的执行会话提交新工作时，必须显式提供活动工单的 `task_id`，不能省略编号来绕过验收或取消。执行端独立核对绑定、任务创建依据及当前授权。
+向已关联显式 Task 的执行会话提交新工作时，必须保留活动 Task 的 `task_id`，不能省略编号来绕过验收或取消。普通无 Task 操作使用独立的未绑定会话，接单与领取执行事务都核验会话归属原 conversation。显式 Task 路径仍在派发前取得唯一执行绑定，执行端独立验签。
+
+显式 Task 的 `task_ref` 必须是共享事件 verifier 核验的 `TaskCreated.hash`。
 
 | action.type | 其他字段 | 执行器支持 |
 |---|---|---|
@@ -177,18 +238,31 @@ HTTP 成功或通道返回结果表示本次请求已处理。任务是否完成
 | `steer` | `turn_id`、`text` | Codex |
 | `interrupt` | `turn_id` | Codex |
 | `respond_request` | 原始 `request_id`、`response` | Codex，仅本人 |
+| `command` | `command`、`cwd`、`timeout_secs` | Node 受限命令，不调用编码 SDK |
 
 执行器枚举为 `codex`、`claude_code`、`cursor_agent`。逻辑 session ID 与执行器原生 session ID 分开保存。审批回答必须绑定当前仍有效的原请求，Node 不自动批准。
 
 `OperationRequest.binding` 是共享的 `SignedBinding`。客户端先通过已授权的 `bind_execution` 取得证明，再调用共享 `verifyTaskBinding`，用已验证的任务创建事件和自身执行意图逐字段核对，随后签署包含该证明的最终业务正文。执行端实际接单时再次验证，不能只依靠请求中的目标字段。
 
+普通会话和命令没有 Task binding。`ExecutionWork` 明确区分 `task_session`、`conversation_session` 和 `command`。普通会话首次 Open 绑定本次 operation，后续请求引用原 Open 的 admission、invocation 和 C 已成功创建会话的回执。命令绑定完整请求 hash 与规范目录，不创建会话或虚构 Task。
+
+自主继续的签名来源另固定原调度节点、结果 trigger 和 followup version。首次接单与领取执行都验证当前授权；原件读取不授予继续执行权限。
+
 绑定正文包含 `space_id`、`conversation_id`、`task_ref`、`task_id`、`authority_node`、`generation`、`target_node`、`session_id`、`open_spec`、`previous_binding_hash` 和 `previous_seal`。`task_ref` 固定到真实 `TaskCreated` 事件 hash。该创建事件的作者 Node 对首个执行位置执行持久 CAS，两个调度器向不同目标并发派发也只能取得一份绑定。这个 Node 只负责该绑定的唯一确认，不是会话调度负责人。
 
 已有绑定不替代政策新鲜度。原创建 Node 或当前政策权威不可达时，只有仍满足新鲜度和资源授权的请求可以继续。新绑定无法取得唯一确认时拒绝派发，不能在另一台设备自行建立替代，也不临时创建另一份任务绕过确认。
 
+普通执行不合成内部任务，也不能借无 Task 分支使用已经具有显式绑定的会话。
+
 更换执行位置由本人调用 `rebind_execution`，原执行端先明确封存旧绑定，新代绑定引用前代证明。`unknown` 阻止封存和迁移，不用超时假定原执行已经停止。
 
 `expected_revision` 必须匹配执行 Node 当前会话版本。打开及发送操作将工作目录和额外资源规范化，检查本机父子目录重叠。控制操作不能申请额外资源。此机制不提供跨设备共享文件系统的全局锁。
+
+短命令复用同一操作账本、目录互斥和结果回送，不创建 `ExecutionSession`。输出有界，环境不继承 Node 或 Provider 凭证，实际文件读写受平台沙箱限制。缺少沙箱能力时拒绝执行，不降级为裸 shell。超时或取消后的副作用无法证明时保留 `unknown`。
+
+macOS 使用系统 `sandbox-exec`。Linux 要求支持 Landlock ABI 6 的内核及 seccomp，旧内核明确拒绝该工具；还会拒绝无法按目录约束的文件元数据修改。受限短命令不是完整开发环境，依赖受限进程操作的复杂工具需使用已有编码执行器。
+
+Bot 事件和可空 `session_id` 使用当前版本结构，不提供旧版本兼容。业务数据库直接使用 `user_version=3` 的最终初始 schema，不执行旧库升级。重新部署使用新数据目录及同版本节点，同版本重启仍保留执行账本并核对未知结果，不重放副作用。
 
 操作状态如下：
 
@@ -227,7 +301,7 @@ Event {
 
 `previous` 和 `sequence` 校验同一作者的来源链，`parents` 引用当前事件依据的因果前项。父引用和附件列表按序去重。`created_at_ms` 不决定唯一全局顺序，也不能覆盖并发分支。
 
-正文类型包括 `conversation_created`、`message_posted`、`task_created`、`task_changed`、`dispatch_recorded`、`execution_observed`、`decision_recorded`、`notification_raised`、`notification_acknowledged` 和 `context_checkpoint`。
+正文类型包括 `bot_created`、`conversation_created`、`message_posted`、`task_created`、`task_changed`、`dispatch_recorded`、`execution_observed`、`decision_recorded`、`notification_raised`、`notification_acknowledged` 和 `context_checkpoint`。
 
 投影前检查空间、资源、作者证书、签名、hash、来源链、授权依据、因果依赖及附件。`cause` 保留事件产生时的授权依据，导入历史不能凭作者身份重新授予权限。缺口和来源分叉分别保留在 `missing.events`、`missing.blobs` 与 `missing.conflicts`。必要历史未齐或冲突未处理时，禁止继续调度和执行。
 
@@ -253,15 +327,29 @@ request 与 response 指向特定 Node，响应必须来自原请求的预期 No
 
 加密通道的 `changed` 提醒用于刷新当前授权资源的视图。提醒不是唯一历史来源，重连后重新查询持久状态。客户端读取同一资源的 `notifications`，使用自己的稳定 `client_id` 确认 `notification_id`，同一客户端换路由后仍可去重。不同浏览器具有独立设备身份，各自确认。资源或身份不匹配的读取和 ACK 拒绝。
 
+管理进度包含 `conversation_id`、`trigger`、`invocation_id`、`source_node`、递增 `sequence` 和 `progress`。`progress.type` 为 `text_delta`、`text_snapshot`、`status` 或 `tool`。文字按 `item_id` 关联，delta 追加，snapshot 替换全文。执行进度关联原任务、目标、session、operation 和 native turn，不能串入其他任务。临时进度不逐 token 写 DAG，持久回答和执行结果仍来自账本及签名事件。
+
+客户端读取 `conversation` 时，入口为该已授权会话建立有界的只读观察，从原管理节点和执行节点读取进度。节点间 `progress_read` 校验空间、资源、来源和会话，响应包含 `version`、`cursor`、`reset` 和 `events`。游标缺口或源进程重启要求重新读取持久 snapshot，不生成重放写操作。连接关闭、权限撤销或观察租约过期后停止观察，代理进度不再次转发形成循环。
+
 普通进度、审批提醒和结果通知不调用管理模型。无人在线时保留通知，重新连接后读取。浏览器系统提醒是可选客户端功能，不等于网页关闭后的手机推送。
 
-本人授权自动后续后，产生结果的执行 Node 以 `(result_event_hash, policy_version)` 持久领取一次处理，可选择本机或其他可达调度 Node。委托结果未知时保留状态并查询原调用，不因超时再派给另一台。
+后续权限使用 `DecisionRecorded.tool_configuration` 中带类型的签名记录，类型为 `followup_intent_v1`、`task_origin_v1` 和 `task_followup_grant_v1`。自然语言或模型传入的参数不构成授权。
 
-`daily_decision_limit` 限制每个 Node 上、每个个人网络的 UTC 每日管理 SDK 调用次数。预算先预留，失败调用不保证退回；它不限制执行器自身调用，也不是 token 或账单上限。
+`message.report_results` 默认 `true`。汇报意图固定原消息 hash、空间、资源、会话和目标 Scheduler，普通执行通过签名请求中的 `manager_authority.trigger` 关联原消息，终态只触发只读总结，不创建隐藏 Task。`false` 保存明确的 `off` 意图，重试不能改变。原始结果与通知始终保留，模型不能借回调获得新的写权限。
+
+`set_followup` 仅本人可用，固定到现有任务的 `task_ref`。`off` 禁止自主后续，`report` 只允许读取结果并保存最终 assistant 回答，`continue` 允许在本任务范围内继续业务工作。稳定 grant ID 配合单调版本，`expected_version` 必须使用会话快照返回的当前 `followup_version`。并发或旧版本修改被拒绝，既有授权不能用重试改变目标。
+
+领取后续、签发工具权限及每次业务写入前都复核本机已验证的最新授权、任务状态和版本。撤销封存旧权限；离线节点尚未获知撤销时，不保证全网立即停止。审批、验收与未知确认始终由本人处理。
+
+产生结果的原执行 Node 保存 completion marker，验证原结果和政策后将同一 trigger 投递给授权固定的 Scheduler。结果早于补授权时仍可在授权可见后投递一次，不重做执行。委托结果未知时保留状态并查询原调用，不因超时再派给另一台。未授权模型后续不影响原始结果与通知保存。
+
+`daily_decision_limit` 只限制每个 Node 上、每个个人空间的 UTC 每日自主管理 SDK 调用。本人主动聊天不受这个额度限制。预算先预留，失败调用不保证退回；它不限制执行器自身调用，也不是 token 或账单上限。额度耗尽不把执行结果标为未知。
 
 每条用户消息在签名 `MessagePosted.scheduler_node` 中固定本次调度目标。客户端重试必须保留原 `message_id` 和 `scheduler_node`，网页将两者一同持久化。同一目标通过本地调用账本去重。已取得该消息的入口拒绝改写其目标；未同步节点之间没有全局消息唯一性共识，调用方不能用同一编号改换目标。切换入口后继续工作时提交一条新消息，可选择任意已授权调度节点。这个目标只属于该消息，不是会话或工单的负责人。
 
 `reconcile` 在目标执行节点确认账本不存在时返回 `state=not_found`、`operation=null` 和目标节点身份。节点不可达返回错误，不当作不存在。网页允许本人确认旧请求结束后解除本地待核对记录，不自动重发。
+
+消息请求中的 `entry_node` 固定为首次接收的 Gateway。未确认的同一消息只能回原入口核对或重试；换入口可只读查看历史，不能重签原请求。Node 在落盘前核对该字段。
 
 ## 本机存储格式
 

@@ -1,9 +1,11 @@
 import type { IdentityScope } from './scope'
 import { validEndpoint, validTarget } from '../../transport.js'
+import type { ChangedEvent } from './progress'
 import type { RemoteExecutionObservation, RemoteExecutionRequestInput, RemoteExecutionResolutionResult, TrustedRemoteExecution } from './remote-execution'
 import type { verifyScopedAuthentication } from './authorization'
 import type { AuthorizationTrust } from './authorization-trust'
 import type { RemoteExecutionPolicyUse } from './remote-execution-policy-ingress'
+import type { ExecutionWorkIntent, ProjectExecutionProof } from './execution-work'
 
 export type ConnectionEntry = { address: string; node_id: string; relay: boolean }
 export type ConnectionCard = { kind: 'connection'; entry: ConnectionEntry; nodePublicKey: string } | { kind: 'claim'; entry: ConnectionEntry; nodePublicKey: string; capability: string; claimNonce: string }
@@ -17,12 +19,22 @@ export type AccountDevice = { device_id: string; public_key: string; subject: { 
 export type AccountDeviceDirectory = { account_id: string; devices: AccountDevice[] }
 export type AuthorizedRequest = { body: Record<string, unknown>; invocation: unknown }
 export type AuthorizedReply = AuthorizedRequest & { result: unknown }
+export type ControlFacts = {
+  originalRequest: Record<string, unknown>
+  basisHeads: string[]
+  nativeSessionId: string
+  turnId: string
+  pendingRequests: { id: string | number; threadId: string; turnId: string }[]
+}
 export type RpcFacts = {
+  control?: ControlFacts
   authorizationId?: string
   taskRef?: string
   execution?: { sessionId: string; executorKind: string; canonicalCwd: string; bindingGeneration?: number }
   remote?: { authorization: TrustedRemoteExecution; targetDevice: string; sessionReceipt?: Record<string, unknown> }
-  projectExecutionMetadata?: { source: Record<string, unknown>; binding: Record<string, unknown> }
+  projectExecutionMetadata?: { source: Record<string, unknown>; binding: Record<string, unknown> | null }
+  projectWork?: { proof: ProjectExecutionProof; targetPublicKey: string; operationId: string }
+  executionWork?: ExecutionWorkIntent
 }
 export type ReadyConnection = {
   readonly generation: number
@@ -34,9 +46,12 @@ export type ReadyConnection = {
   readonly audiencePublicKey: string
   currentRemoteExecutionTrust(trust: AuthorizationTrust): AuthorizationTrust
   persistRemoteExecutionTrust(trust: AuthorizationTrust): Promise<AuthorizationTrust>
-  remote(value: TrustedRemoteExecution, context: Record<string, unknown>, action: string, use?: RemoteExecutionPolicyUse): Promise<ReturnType<ReturnType<typeof verifyScopedAuthentication>['remote']>>
+  remote(value: TrustedRemoteExecution, context: Record<string, unknown>, action: string, use?: RemoteExecutionPolicyUse, work?: ExecutionWorkIntent): Promise<ReturnType<ReturnType<typeof verifyScopedAuthentication>['remote']>>
+  observedExecutionResult: ReturnType<typeof verifyScopedAuthentication>['observedExecutionResult']
+  projectDispatchWork: ReturnType<typeof verifyScopedAuthentication>['projectDispatchWork']
+  projectExecutionResult: ReturnType<typeof verifyScopedAuthentication>['projectExecutionResult']
   projectExecutionMetadata: ReturnType<typeof verifyScopedAuthentication>['projectExecutionMetadata']
-  remoteExecutionResultHistory(remote: TrustedRemoteExecution, actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown>): Promise<RemoteExecutionObservation>
+  remoteExecutionResultHistory(remote: TrustedRemoteExecution, actual: Record<string, unknown>, original: AuthorizedRequest, binding: Record<string, unknown> | null): Promise<RemoteExecutionObservation>
   remoteResolutionHistory(remote: TrustedRemoteExecution, actual: Record<string, unknown>, original: AuthorizedRequest): Promise<RemoteExecutionResolutionResult>
   observeRemoteExecution(originalHandoff: Record<string, unknown>, remote: TrustedRemoteExecution, rawContext: Record<string, unknown>): Promise<unknown>
   callExecutionResource(remote: TrustedRemoteExecution, body: Record<string, unknown>, beforeSend?: (proof: AuthorizedRequest) => void, replay?: AuthorizedRequest): Promise<AuthorizedReply>
@@ -48,7 +63,7 @@ export type ReadyConnection = {
   request(method: string, params?: Record<string, unknown>): Promise<unknown>
   rpc(method: string, params?: Record<string, unknown>, facts?: RpcFacts): Promise<unknown>
   rpcWithProof(method: string, params: Record<string, unknown>, beforeSend?: (proof: AuthorizedRequest) => void, facts?: RpcFacts, replay?: AuthorizedRequest): Promise<AuthorizedReply>
-  subscribe(listener: () => void): () => void
+  subscribe(listener: (event: ChangedEvent) => void): () => void
   isCurrent(): boolean
 }
 

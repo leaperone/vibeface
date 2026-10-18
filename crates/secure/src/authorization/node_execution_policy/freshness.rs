@@ -241,6 +241,11 @@ mod tests {
                     version: AUTH_VERSION,
                     source_provenance: None,
                     source_project: project,
+                    work: ExecutionWorkIntent::TaskSession {
+                        task: context.task.clone().unwrap(),
+                        binding_generation: 1,
+                        execution_session: context.execution_session.clone().unwrap(),
+                    },
                     selection: RemoteExecutionPolicySelection {
                         execution_resource: resource.clone(),
                         target_public_key: target.clone(),

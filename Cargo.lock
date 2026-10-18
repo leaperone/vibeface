@@ -2476,7 +2476,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vibeface"
-version = "0.0.1-nightly.20261017.5"
+version = "0.0.1-nightly.20261018.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2486,6 +2486,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "libc",
  "mdns-sd",
  "p256",
  "rand 0.8.8",
@@ -2509,7 +2510,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-bridge"
-version = "0.0.1-nightly.20261017.5"
+version = "0.0.1-nightly.20261018.2"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2523,7 +2524,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-protocol"
-version = "0.0.1-nightly.20261017.5"
+version = "0.0.1-nightly.20261018.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2531,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-secure"
-version = "0.0.1-nightly.20261017.5"
+version = "0.0.1-nightly.20261018.2"
 dependencies = [
  "anyhow",
  "argon2",

@@ -2,10 +2,10 @@ use super::{storage::*, *};
 use crate::{binding::SignedBinding, crypto::LocalIdentity, store::Store};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use std::collections::BTreeSet;
+use std::{borrow::Cow, collections::BTreeSet};
 use vibeface_secure::{
     authorization::{
-        MAX_PROOF_BYTES, PolicyDomain, PublicKey,
+        ExecutionWork, MAX_PROOF_BYTES, PolicyDomain, PublicKey,
         execution_handoff::{
             ExecutionProofUsage, MAX_EXECUTION_HANDOFF_BYTES, SignedExecutionHandoff,
             SignedExecutionHandoffResolution,
@@ -217,14 +217,61 @@ pub(super) fn source_originals_in(
     Ok((header, wire))
 }
 
-pub(super) fn current_task(
+pub(super) fn current_work(
     connection: &Connection,
     scope: &TaskBusinessScope,
+    wire: &TaskBusinessWire,
     usage: &mut ExecutionProofUsage,
 ) -> Result<()> {
+    ensure!(
+        wire.scope()? == *scope,
+        "Task business source changed its complete work wire"
+    );
+    let original = match wire {
+        TaskBusinessWire::Submit(original) => Cow::Borrowed(original),
+        TaskBusinessWire::Resolve(value) => Cow::Borrowed(&value.resolution.observation.handoff),
+        TaskBusinessWire::Observe(value) => {
+            let target = &value.request.payload.intent.target;
+            let encoded = local_value(
+                connection,
+                scope.source_project.space.as_str(),
+                &format!("project-execution-handoff:{}", target.source.operation_id),
+                false,
+            )?;
+            let original: SignedExecutionHandoff = serde_json::from_str(&encoded)?;
+            ensure!(
+                original.hash()? == target.handoff_hash
+                    && original.handoff.source_statement()? == target.source,
+                "Task business observation changed its retained original work"
+            );
+            Cow::Owned(original)
+        }
+    };
+    let (dispatch, _, _) = super::super::execution_dispatch::retained_project_dispatch_in(
+        connection,
+        &scope.source_node_public_key,
+        original.as_ref(),
+    )?;
+    let source = original.handoff.source_statement()?;
+    ensure!(
+        source.project == scope.source_project
+            && source.work == scope.work
+            && source.target_public_key == scope.target_public_key,
+        "Task business source differs from its exact retained Project work"
+    );
+    usage.record_retained_event(&dispatch)?;
+    let ExecutionWork::TaskSession {
+        task,
+        binding_hash,
+        binding_generation,
+        execution_session,
+    } = &scope.work
+    else {
+        return Ok(());
+    };
     let space = scope.source_project.space.as_str();
     let current: String = connection.query_row("SELECT value FROM local_values WHERE space_id=? AND key=? AND length(CAST(value AS BLOB))<=?",
-        params![space,format!("task-binding-current:{}",scope.task_ref),MAX_PROOF_BYTES],|row|row.get(0))?;
+        params![space,format!("task-binding-current:{task}"),MAX_PROOF_BYTES],|row|row.get(0))?;
     let current: String = serde_json::from_str(&current)?;
     let binding: String = connection.query_row("SELECT value FROM local_values WHERE space_id=? AND key=? AND length(CAST(value AS BLOB))<=?",
         params![space,format!("task-binding-record:{current}"),MAX_PROOF_BYTES],|row|row.get(0))?;
@@ -233,10 +280,11 @@ pub(super) fn current_task(
     let value = &binding.binding;
     ensure!(
         crate::binding::binding_hash(value)? == current
+            && current == *binding_hash
             && value.network_id == space
-            && value.task_ref == scope.task_ref.as_str()
-            && value.generation == scope.binding_generation
-            && value.session_id == scope.execution_session.session_id
+            && value.task_ref == task.as_str()
+            && value.generation == *binding_generation
+            && value.session_id == execution_session.session_id
             && value.target_node == crate::crypto::fingerprint(scope.target_public_key.as_str())?,
         "Task business source changed its current Task binding"
     );
@@ -248,7 +296,7 @@ pub(super) fn current_task(
           AND json_extract(json_extract(envelope,'$.canonical_body'),'$.scope_id')=?4
           AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.type')='task_created'
           AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.task_id')=?5)",
-        params![space,scope.task_ref.as_str(),scope.source_project.resource.as_str(),value.conversation_id,value.task_id],|row|row.get(0))?;
+        params![space,task.as_str(),scope.source_project.resource.as_str(),value.conversation_id,value.task_id],|row|row.get(0))?;
     ensure!(
         ready,
         "Task business source Task is not the retained ready Project task"
@@ -331,7 +379,7 @@ impl Store {
         )?;
         super::super::foreign_execution_policy::check_task_policy_heads_in(&tx, current)?;
         let mut proof = exporter.proof_usage().clone();
-        current_task(&tx, exporter.scope(), &mut proof)?;
+        current_work(&tx, exporter.scope(), wire, &mut proof)?;
         let outbox = retained_outbox(&tx, wire)?;
         let snapshot = self.policy.accepted_journal_snapshot(&tx)?;
         usage(
@@ -380,7 +428,18 @@ impl Store {
         super::super::foreign_execution_policy::check_task_policy_heads_in(&tx, &context.current)?;
         check_outbox(&tx, &context.outbox)?;
         let mut proof = ExecutionProofUsage::default();
-        current_task(&tx, context.exporter.scope(), &mut proof)?;
+        let wire = match context.exporter.scope().purpose {
+            TaskBusinessPurpose::Submit => {
+                TaskBusinessWire::Submit(serde_json::from_str(&context.outbox.wire_json)?)
+            }
+            TaskBusinessPurpose::Observe => {
+                TaskBusinessWire::Observe(serde_json::from_str(&context.outbox.wire_json)?)
+            }
+            TaskBusinessPurpose::ResolveUnknown | TaskBusinessPurpose::ReconcileTerminal => {
+                TaskBusinessWire::Resolve(serde_json::from_str(&context.outbox.wire_json)?)
+            }
+        };
+        current_work(&tx, context.exporter.scope(), &wire, &mut proof)?;
         let mut staged = context.exporter.clone();
         let mut next_cursor = context.cursor.clone();
         let mut complete = context.journal_complete;

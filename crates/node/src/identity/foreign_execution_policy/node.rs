@@ -87,6 +87,21 @@ fn current_node_source_in(
         current == raw,
         "NeedPolicySync: Node reader source, Manager lease or binding changed"
     );
+    let context = request.context()?;
+    let mut source_context = raw.child_facts.context.clone();
+    source_context.sdk_session = None;
+    ensure!(
+        source_context == context.context && raw.child_facts.resource == *request.source_project(),
+        "Node policy source changed its signed reader context"
+    );
+    request
+        .work()
+        .validate_context(&context, &request.selection()?.target_public_key)?;
+    ensure!(
+        matches!(request.work(), ExecutionWorkIntent::TaskSession { .. })
+            || raw.current_binding.is_none(),
+        "ordinary Node policy source carries a Task binding"
+    );
     Ok(raw)
 }
 
@@ -97,42 +112,35 @@ fn current_trust_in(
     raw: &SdkPolicySourceProvenance,
     selection: &RemoteExecutionPolicySelection,
     context: &PrepareContext,
+    work: &ExecutionWorkIntent,
+    purpose: RemoteExecutionPolicyPurpose,
     usage: &mut ExecutionProofUsage,
 ) -> Result<VerifiedTaskExecutionTrust> {
-    let reference = if let Some(binding) = raw.current_binding.as_ref() {
-        binding_association_in(connection, primary, binding, usage)
+    work.validate_context(context, &selection.target_public_key)?;
+    let trust = if let Some(binding) = raw.current_binding.as_ref() {
+        ensure!(
+            matches!(work, ExecutionWorkIntent::TaskSession { .. }),
+            "ordinary SDK work cannot carry a Task binding"
+        );
+        let reference = binding_association_in(connection, primary, binding, usage)
             .context("SDK Node policy source original binding association")?
-            .approval_ref
+            .approval_ref;
+        load_task_execution_trust_in(connection, source, &reference)?
     } else {
-        let task = context
-            .context
-            .task
-            .as_ref()
-            .context("SDK policy source has no Task")?;
-        let prefix = task_approval_prefix(&raw.child_facts.resource, task)?;
-        let mut statement =
-            connection.prepare("SELECT value FROM identity_meta WHERE key GLOB ? ORDER BY key")?;
-        let references = statement
-            .query_map([format!("{prefix}*")], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut selected = None;
-        for value in references {
-            ensure!(
-                value.len() <= MAX_PROOF_BYTES,
-                "SDK Task approval index is too large"
-            );
-            let reference: ObjectHash = serde_json::from_str(&value)?;
-            let original: Signed<RemoteExecutionPolicyReadIntent> =
-                read_in(connection, &key("approved-intent", &reference))?
-                    .context("SDK Task approval original is missing")?;
-            if original.payload.selection == *selection && original.payload.context == *context {
-                selected = Some(reference);
-                break;
-            }
-        }
-        selected.context("NeedPolicySync: initial SDK Task choice has no independent approval")?
+        approved_execution_trust_in(
+            connection,
+            source,
+            &raw.child_facts.resource,
+            work,
+            selection,
+            context,
+            purpose,
+        )?
     };
-    let trust = load_task_execution_trust_in(connection, source, &reference)?;
+    ensure!(
+        trust.work().approves_intent(work),
+        "SDK Node policy changed its approved execution work"
+    );
     usage.record_signed(trust.original_intent())?;
     usage.record_signed(trust.approval())?;
     Ok(trust)
@@ -203,6 +211,7 @@ impl Store {
         facts: &RequestFacts,
         selection: &RemoteExecutionPolicySelection,
         context: &PrepareContext,
+        work: &ExecutionWorkIntent,
         purpose: RemoteExecutionPolicyPurpose,
         now: u64,
         expires: u64,
@@ -252,6 +261,8 @@ impl Store {
             &raw,
             selection,
             context,
+            work,
+            purpose,
             &mut usage,
         )
         .with_context(|| {
@@ -282,6 +293,7 @@ impl Store {
             facts,
             selection,
             context,
+            work,
             raw.current_binding.as_ref(),
             &raw,
             &signer,
@@ -532,11 +544,11 @@ impl Store {
         save_exact_in(&tx, &key("witness", &complete.witness_ref), witness)?;
         ingress::advance_floors_in(&tx, policy.pins(), policy.foreign_heads())?;
         save_exact_in(&tx, &key("completed-import", reference), &policy_ref)?;
-        let task_key = provenance::TaskExecutionPolicyProvenance::task_key(&policy)?;
+        let work_key = provenance::TaskExecutionPolicyProvenance::work_key(&policy)?;
         tx.commit()?;
         self.policy
             .task_execution_policy
-            .insert_current(task_key, policy_ref.clone(), policy);
+            .insert_current(work_key, policy_ref.clone(), policy);
         Ok(policy_ref)
     }
 }

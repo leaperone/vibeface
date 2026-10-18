@@ -11,7 +11,8 @@ use crate::{
         AdmissionProof, AgentSession, EventBody, EventCause, ExecutionSession, MAX_EVENT_BYTES,
         OperationRecord, OperationRequest, OperationState, StoredTransport,
     },
-    scheduler::{self, Invocation as SchedulerInvocation, InvocationState, LocalSession},
+    scheduler,
+    scheduling::{JobState, ManagerAttempt, SchedulerJob, scheduler_key},
     store::{
         Store, canonical_resource, closure_hashes, has_blob_from, heads_from_events,
         load_events_from, paths_overlap, validate_operation_binding_from,
@@ -34,7 +35,7 @@ pub(crate) struct AdmissionCheckpoints {
 }
 
 #[derive(Clone)]
-pub(super) struct LocalAdmissionCheckpoint {
+pub(crate) struct LocalAdmissionCheckpoint {
     proof: AdmissionProof,
     facts: RequestFacts,
     facts_hash: ObjectHash,
@@ -153,7 +154,7 @@ fn admission_anchor_envelopes_in(
 }
 
 impl AdmissionCheckpoints {
-    pub(super) fn insert(&mut self, checkpoint: LocalAdmissionCheckpoint) {
+    pub(crate) fn insert(&mut self, checkpoint: LocalAdmissionCheckpoint) {
         let invocation = &checkpoint.proof.invocation.payload;
         self.entries.insert(
             (
@@ -211,7 +212,10 @@ impl AdmissionCheckpoints {
         if let Some(snapshot) = snapshot {
             snapshot.commit()?;
         }
-        Ok(Some((checkpoint.admitted.clone(), checkpoint.admission_expires_at_ms)))
+        Ok(Some((
+            checkpoint.admitted.clone(),
+            checkpoint.admission_expires_at_ms,
+        )))
     }
 }
 
@@ -233,18 +237,28 @@ fn checkpoint_from_verified_in(
     for envelope in &anchors {
         let event: crate::model::Event = serde_json::from_str(&envelope.canonical_body)?;
         ensure!(
-            super::event_authorization::verify_event_envelope(connection, policy, &event.network_id, envelope)?
-                == event,
+            super::event_authorization::verify_event_envelope(
+                connection,
+                policy,
+                &event.network_id,
+                envelope
+            )? == event,
             "local admission checkpoint has an invalid event signature"
         );
         if allow_nonready_history {
             let dependencies = super::event_authorization::historical_event_dependencies_in(
-                connection, policy, &event.network_id, &event.resource_id,
-                &event.scope_id, std::slice::from_ref(&envelope.hash),
+                connection,
+                policy,
+                &event.network_id,
+                &event.resource_id,
+                &event.scope_id,
+                std::slice::from_ref(&envelope.hash),
             )?;
             all_ready &= dependencies.values().all(|stored| stored.status == "ready");
         } else {
-            super::event_authorization::validate_retained_event_dependencies_in(connection, envelope)?;
+            super::event_authorization::validate_retained_event_dependencies_in(
+                connection, envelope,
+            )?;
         }
     }
     if !all_ready {
@@ -265,7 +279,7 @@ fn checkpoint_from_verified_in(
     }))
 }
 
-pub(super) fn prepare_local_admission_checkpoint_in(
+pub(crate) fn prepare_local_admission_checkpoint_in(
     connection: &Connection,
     policy: &PolicyState,
     proof: &AdmissionProof,
@@ -818,13 +832,57 @@ pub(super) fn persisted_admission_facts(
     }
     let body = &proof.source_body;
     let method = manager_field(body, "method")?;
+    let manager_output = matches!(method, "agent_result" | "agent_notification");
+    let manager_control = matches!(method, "cancel_manager" | "resolve_manager_unknown");
+    if manager_control {
+        let saved: crate::scheduling::ManagerControlReceipt = crate::store::scheduler_load(
+            connection,
+            proof.invocation.payload.resource.space.as_str(),
+            &format!("manager-control:{}", proof.invocation.payload.operation_id),
+        )?
+        .context("manager control has no durable receipt")?;
+        ensure!(
+            saved.admission == *proof,
+            "manager control receipt differs from its admission"
+        );
+    }
     ensure!(
-        matches!(
-            method,
-            "agent_start" | "bind_execution" | "seal_execution" | "rebind_execution"
-        ),
+        manager_output
+            || manager_control
+            || matches!(
+                method,
+                "agent_start" | "bind_execution" | "seal_execution" | "rebind_execution"
+            ),
         "accepted authorization has no original business event"
     );
+    if manager_output {
+        let space = proof.invocation.payload.resource.space.as_str();
+        let scope = manager_field(body, "conversation_id")?;
+        let authority = &body["manager_authority"];
+        let trigger = manager_field(authority, "trigger")?;
+        let target = manager_field(authority, "scheduler_node")?;
+        let marker: crate::scheduling::SchedulerTerminalPublication = crate::store::scheduler_load(
+            connection,
+            space,
+            &scheduler_key("publication", scope, target, trigger),
+        )?
+        .context("manager output has no durable pending publication")?;
+        ensure!(
+            marker.admission == *proof
+                && marker.job.resource_id == proof.invocation.payload.resource.resource,
+            "pending manager output differs from its admission"
+        );
+        let current: SchedulerJob = crate::store::scheduler_load(
+            connection,
+            space,
+            &scheduler_key("job", scope, target, trigger),
+        )?
+        .context("pending manager output job is missing")?;
+        ensure!(
+            current == marker.job,
+            "pending manager output changed its attempt"
+        );
+    }
     let space = SpaceId::parse(manager_field(body, "space_id")?)?;
     let resource = ResourceId::parse(manager_field(body, "resource_id")?)?;
     let scope = manager_field(body, "conversation_id")?;
@@ -839,11 +897,15 @@ pub(super) fn persisted_admission_facts(
     );
     let reference = if method == "agent_start" {
         manager_field(body, "trigger")?
+    } else if manager_control {
+        manager_field(body, "trigger")?
+    } else if manager_output {
+        manager_field(&body["sdk_session"], "session_id")?
     } else {
         manager_field(body, "task_ref")?
     };
     let mut roots = vec![reference.to_owned()];
-    if method == "agent_start" && !body["basis_heads"].is_null() {
+    if (method == "agent_start" || manager_output) && !body["basis_heads"].is_null() {
         roots.extend(serde_json::from_value::<Vec<String>>(
             body["basis_heads"].clone(),
         )?);
@@ -885,7 +947,12 @@ pub(super) fn persisted_admission_facts(
         workspace_resource: Some(resource.clone()),
         ..Default::default()
     };
-    if method == "agent_start" {
+    if manager_control {
+        ensure!(
+            matches!(proof.invocation.payload.actor, Actor::Account(_)),
+            "historical manager control requires Account"
+        );
+    } else if method == "agent_start" || manager_output {
         let heads: Vec<String> = if body["basis_heads"].is_null() {
             vec![reference.to_owned()]
         } else {
@@ -903,7 +970,9 @@ pub(super) fn persisted_admission_facts(
         ensure!(
             origin.parent.invocation_hash().as_str() == manager_field(body, "parent_invocation")?
                 && origin.parent.actor() == &proof.invocation.payload.initiator
-                && proof.invocation.payload.operation_id == format!("manager:{reference}"),
+                && (manager_output
+                    || proof.invocation.payload.operation_id
+                        == format!("manager:{reference}:{}", manager_field(body, "attempt_id")?)),
             "historical manager delegation differs from its account origin"
         );
         context.task = origin.task.as_ref().map(|(_, reference)| reference.clone());
@@ -1127,41 +1196,32 @@ pub(crate) fn verified_admission_checkpoints_from(
             checkpoints.insert(checkpoint);
         }
         if stored.proof.source_body["method"] == "agent_start" {
-            let (claim, original, invocation) = load_manager_from(connection, &space, &id)?;
+            let (claim, original, job) = load_manager_from(connection, &space, &id)?;
             ensure!(
                 original.proof == stored.proof,
                 "manager index points to another admission"
             );
-            let session: LocalSession = local_from(
-                connection,
-                &space,
-                &scheduler::key("session", &claim.conversation_id, ""),
-            )?
-            .context("admitted manager has no local session")?;
-            let active = session
-                .active
-                .as_ref()
-                .filter(|active| active.trigger == claim.trigger);
-            ensure!(
-                !matches!(
-                    invocation.state,
-                    InvocationState::Running | InvocationState::Unknown
-                ) || active.is_some(),
-                "unresolved manager is missing from its active session"
-            );
-            if let Some(active) = active {
+            if !claim.retired_before_start {
+                let session = crate::store::load_scheduler_session(
+                    connection,
+                    &space,
+                    &claim.conversation_id,
+                    &claim.target_node,
+                )?;
                 ensure!(
-                    active.boot == invocation.boot
-                        && active.state == invocation.state
-                        && active.message_id == invocation.message_id
-                        && session.sdk_config.as_deref()
-                            == Some(manager_field(&stored.proof.source_body, "sdk_config")?),
-                    "manager active session differs from its original invocation"
+                    !matches!(
+                        job.state,
+                        JobState::Claimed { .. }
+                            | JobState::Running { .. }
+                            | JobState::Cancelling { .. }
+                    ) || session.active.as_deref() == Some(&claim.trigger),
+                    "active manager job is absent from its session"
                 );
             }
             manager_lease_from(connection, policy, &space, &id)?;
         }
     }
+
     let ledger = connection
         .prepare("SELECT space_id,operation_id FROM operations")?
         .query_map([], |row| {
@@ -1177,45 +1237,17 @@ pub(crate) fn verified_admission_checkpoints_from(
         !orphan_nonce,
         "invocation nonce has no accepted authorization"
     );
-    let locals = connection.prepare("SELECT space_id,key,value FROM local_values WHERE key LIKE 'manager-admission:%' OR key LIKE 'scheduler:invocation:%' OR key LIKE 'scheduler:session:%' OR key LIKE 'lease:%'")?
+    let locals = connection.prepare("SELECT space_id,key,value FROM local_values WHERE key LIKE 'manager-admission:%' OR key LIKE 'lease:%'")?
         .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?
         .collect::<std::result::Result<Vec<_>,_>>()?;
     for (space, key, encoded) in locals {
-        if let Some(trigger) = key.strip_prefix("manager-admission:") {
+        if let Some(manager_id) = key.strip_prefix("manager-admission:") {
             let claim: ManagerClaim = serde_json::from_str(&encoded)?;
             ensure!(
-                claim.trigger == trigger,
-                "manager claim is indexed by another trigger"
+                claim.manager_id == manager_id,
+                "manager claim is indexed by another attempt"
             );
-            let (_, stored, _) = load_manager_from(connection, &space, &claim.manager_id)?;
-            ensure!(
-                stored.proof.source_body["method"] == "agent_start",
-                "manager claim has no agent-start authorization"
-            );
-        } else if key.starts_with("scheduler:invocation:") {
-            let invocation: SchedulerInvocation = serde_json::from_str(&encoded)?;
-            let (claim, _, _) = load_manager_from(
-                connection,
-                &space,
-                &format!("manager:{}", invocation.trigger),
-            )?;
-            ensure!(
-                key == scheduler::key("invocation", &claim.conversation_id, &claim.trigger),
-                "scheduler invocation is indexed by another conversation or trigger"
-            );
-        } else if key.starts_with("scheduler:session:") {
-            let session: LocalSession = serde_json::from_str(&encoded)?;
-            if let Some(active) = session.active {
-                let (claim, _, invocation) =
-                    load_manager_from(connection, &space, &format!("manager:{}", active.trigger))?;
-                ensure!(
-                    key == scheduler::key("session", &claim.conversation_id, "")
-                        && active.boot == invocation.boot
-                        && active.state == invocation.state
-                        && active.message_id == invocation.message_id,
-                    "active scheduler session differs from its admitted invocation"
-                );
-            }
+            load_manager_from(connection, &space, manager_id)?;
         } else if let Some(id) = key.strip_prefix("lease:") {
             if operations.contains_key(&(space.clone(), id.to_owned())) {
                 lease_deadline_from(connection, policy, &space, id)?;
@@ -1232,7 +1264,7 @@ fn operation_from(
     space: &str,
     operation_id: &str,
 ) -> Result<Option<OperationRecord>> {
-    let row: Option<(String, String, String, String, String)> = connection
+    let row: Option<(String, String, String, String, Option<String>)> = connection
         .query_row(
             "SELECT request,state,result,target_node,session_id FROM operations WHERE space_id=? AND operation_id=?",
             params![space, operation_id],
@@ -1300,6 +1332,13 @@ fn checked_session_from(
     connection: &Connection,
     request: &OperationRequest,
 ) -> Result<Option<ExecutionSession>> {
+    let Some(session_id) = request.session_id.as_deref() else {
+        ensure!(
+            request.action["type"] == "command" && request.expected_revision == 0,
+            "only commands may omit an execution session"
+        );
+        return Ok(None);
+    };
     let row: Option<(u64, String)> = connection.query_row(
         "SELECT revision,record FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",
         params![request.network_id, request.target_node, request.session_id],
@@ -1311,7 +1350,7 @@ fn checked_session_from(
             ensure!(
                 session.network_id == request.network_id
                     && session.target_node == request.target_node
-                    && session.session_id == request.session_id
+                    && session.session_id == session_id
                     && session.revision == revision,
                 "execution session metadata does not match record"
             );
@@ -1494,7 +1533,7 @@ fn verify_lease_record(
 
 pub(crate) struct ManagerAdmission {
     pub(crate) manager_id: String,
-    pub(crate) invocation: SchedulerInvocation,
+    pub(crate) job: SchedulerJob,
     pub(crate) previous_native_id: Option<String>,
     pub(crate) fresh: bool,
     pub(crate) lease_expires_at_ms: u64,
@@ -1506,6 +1545,9 @@ struct ManagerClaim {
     manager_id: String,
     conversation_id: String,
     trigger: String,
+    target_node: String,
+    attempt: ManagerAttempt,
+    retired_before_start: bool,
 }
 
 fn local_from<T: DeserializeOwned>(
@@ -1564,7 +1606,7 @@ fn check_manager_parent(
     let conversation = manager_field(body, "conversation_id")?;
     let trigger = manager_field(body, "trigger")?;
     ensure!(
-        auth.operation_id() == format!("manager:{trigger}"),
+        auth.operation_id() == format!("manager:{trigger}:{}", manager_field(body, "attempt_id")?),
         "manager authorization does not identify its trigger"
     );
     let sdk_session: SessionRef = serde_json::from_value(body["sdk_session"].clone())?;
@@ -1624,43 +1666,169 @@ fn load_manager_from(
     connection: &Connection,
     space: &str,
     manager_id: &str,
-) -> Result<(ManagerClaim, StoredAdmission, SchedulerInvocation)> {
-    let trigger = manager_id
-        .strip_prefix("manager:")
-        .context("invalid manager authorization ID")?;
-    let claim: ManagerClaim =
-        local_from(connection, space, &format!("manager-admission:{trigger}"))?
-            .context("manager has no admitted trigger claim")?;
+) -> Result<(ManagerClaim, StoredAdmission, SchedulerJob)> {
+    let claim: ManagerClaim = local_from(
+        connection,
+        space,
+        &format!("manager-admission:{manager_id}"),
+    )?
+    .context("manager has no admitted attempt claim")?;
     ensure!(
-        claim.manager_id == manager_id && claim.trigger == trigger,
+        claim.manager_id == manager_id
+            && manager_id == format!("manager:{}:{}", claim.trigger, claim.attempt.id),
         "manager admission mapping mismatch"
     );
     let stored = load_authorization_from(connection, space, manager_id)?;
+    let body = &stored.proof.source_body;
     ensure!(
-        manager_field(&stored.proof.source_body, "conversation_id")? == claim.conversation_id
-            && manager_field(&stored.proof.source_body, "trigger")? == claim.trigger,
+        manager_field(body, "conversation_id")? == claim.conversation_id
+            && manager_field(body, "trigger")? == claim.trigger
+            && manager_field(body, "scheduler_node")? == claim.target_node
+            && manager_field(body, "attempt_id")? == claim.attempt.id,
         "manager admission source mismatch"
     );
-    let invocation: SchedulerInvocation = local_from(
+    let job: SchedulerJob = crate::store::scheduler_load(
         connection,
         space,
-        &scheduler::key("invocation", &claim.conversation_id, &claim.trigger),
+        &scheduler_key(
+            "job",
+            &claim.conversation_id,
+            &claim.target_node,
+            &claim.trigger,
+        ),
     )?
-    .context("manager invocation record is missing")?;
+    .context("manager job is missing")?;
     ensure!(
-        invocation.trigger == claim.trigger
-            && invocation.message_id
-                == format!(
-                    "scheduler-message-{}",
-                    crate::crypto::digest(&serde_json::to_vec(&(
-                        space,
-                        &claim.conversation_id,
-                        &claim.trigger
-                    ))?)
-                ),
-        "manager invocation metadata does not identify its admitted trigger"
+        job.resource_id == stored.proof.invocation.payload.resource.resource,
+        "manager job resource differs from admission"
     );
-    Ok((claim, stored, invocation))
+    ensure!(
+        claim.retired_before_start
+            || job
+                .state
+                .attempt()
+                .is_some_and(|attempt| attempt.id == claim.attempt.id),
+        "manager job no longer matches its admitted attempt"
+    );
+    Ok((claim, stored, job))
+}
+
+fn active_manager_id(connection: &Connection, space: &str, trigger: &str) -> Result<String> {
+    local_from(connection, space, &format!("manager-active:{trigger}"))?
+        .context("SDK session has no active admitted manager")
+}
+
+pub(crate) fn retire_queued_manager_in(
+    connection: &Connection,
+    space: &str,
+    trigger: &str,
+) -> Result<()> {
+    let Some(manager_id) =
+        local_from::<String>(connection, space, &format!("manager-active:{trigger}"))?
+    else {
+        return Ok(());
+    };
+    let key = format!("manager-admission:{manager_id}");
+    let mut claim: ManagerClaim =
+        local_from(connection, space, &key)?.context("queued manager claim is missing")?;
+    ensure!(
+        claim.trigger == trigger
+            && claim.manager_id == manager_id
+            && manager_id == format!("manager:{trigger}:{}", claim.attempt.id),
+        "queued manager claim differs from its trigger"
+    );
+    let job: SchedulerJob = crate::store::scheduler_load(
+        connection,
+        space,
+        &scheduler_key("job", &claim.conversation_id, &claim.target_node, trigger),
+    )?
+    .context("queued manager job is missing")?;
+    ensure!(
+        matches!(job.state, JobState::Queued),
+        "a started manager requires reconciliation"
+    );
+    claim.retired_before_start = true;
+    connection.execute(
+        "UPDATE local_values SET value=? WHERE space_id=? AND key=?",
+        params![serde_json::to_string(&claim)?, space, key],
+    )?;
+    Ok(())
+}
+
+fn check_manager_attempt_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    space: &str,
+    claim: &ManagerClaim,
+    job: &SchedulerJob,
+    write: bool,
+) -> Result<()> {
+    ensure!(
+        !claim.retired_before_start,
+        "manager attempt was retired before SDK start"
+    );
+    let session = crate::store::load_scheduler_session(
+        connection,
+        space,
+        &claim.conversation_id,
+        &claim.target_node,
+    )?;
+    let attempt = job.state.attempt().context("manager job has no attempt")?;
+    ensure!(
+        session.active.as_deref() == Some(&claim.trigger)
+            && attempt.id == claim.attempt.id
+            && attempt.permission_version == session.permission_version
+            && matches!(
+                job.state,
+                JobState::Claimed { .. } | JobState::Running { .. }
+            )
+            && (!write || (!attempt.read_only && session.unresolved.is_empty())),
+        "manager attempt has been fenced or cannot write"
+    );
+    if let Some(version) = attempt.followup_version {
+        let current = crate::store::followup::validate_followup_result_from(
+            connection,
+            policy,
+            space,
+            &claim.conversation_id,
+            &claim.trigger,
+            &claim.target_node,
+        )?;
+        ensure!(
+            current.version == version,
+            "manager follow-up version changed"
+        );
+        if write {
+            ensure!(
+                current.mode == crate::store::followup::FollowupMode::Continue,
+                "report-only manager cannot write"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_manager_start_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    space: &str,
+    trigger: &str,
+    attempt_id: &str,
+    now: u64,
+) -> Result<()> {
+    let id = active_manager_id(connection, space, trigger)?;
+    let (claim, _, job) = load_manager_from(connection, space, &id)?;
+    ensure!(
+        claim.attempt.id == attempt_id && matches!(job.state, JobState::Claimed { .. }),
+        "manager start attempt changed"
+    );
+    manager_authorization_from(connection, policy, space, &id, now)?;
+    check_manager_attempt_in(connection, policy, space, &claim, &job, false)?;
+    ensure!(
+        now < manager_lease_from(connection, policy, space, &id)?,
+        "manager start lease expired"
+    );
+    Ok(())
 }
 
 fn manager_lease_from(
@@ -1669,7 +1837,11 @@ fn manager_lease_from(
     space: &str,
     manager_id: &str,
 ) -> Result<u64> {
-    let snapshot = if connection.is_autocommit() { Some(connection.unchecked_transaction()?) } else { None };
+    let snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
     let (_, stored, _) = load_manager_from(connection, space, manager_id)?;
     let lease: LeaseRecord = local_from(connection, space, &format!("lease:{manager_id}"))?
         .context("manager lease is missing")?;
@@ -1681,7 +1853,9 @@ fn manager_lease_from(
         "manager lease has incorrect stage"
     );
     let deadline = verify_lease_record(connection, policy, &stored, &lease)?;
-    if let Some(snapshot) = snapshot { snapshot.commit()?; }
+    if let Some(snapshot) = snapshot {
+        snapshot.commit()?;
+    }
     Ok(deadline)
 }
 
@@ -1716,28 +1890,22 @@ fn manager_tool_authorization_from(
     now_ms: u64,
 ) -> Result<VerifiedAuthorization> {
     let auth = manager_authorization_from(connection, policy, space, manager_id, now_ms)?;
-    let (claim, stored, invocation) = load_manager_from(connection, space, manager_id)?;
+    let (claim, stored, job) = load_manager_from(connection, space, manager_id)?;
+    check_manager_attempt_in(connection, policy, space, &claim, &job, false)?;
     ensure!(
-        invocation.state == InvocationState::Running,
-        "manager is no longer running"
+        matches!(job.state, JobState::Running { .. }),
+        "manager is not running"
     );
-    let session: LocalSession = local_from(
+    let session = crate::store::load_scheduler_session(
         connection,
         space,
-        &scheduler::key("session", &claim.conversation_id, ""),
-    )?
-    .context("manager session is missing")?;
+        &claim.conversation_id,
+        &claim.target_node,
+    )?;
     ensure!(
-        session
-            .active
-            .as_ref()
-            .is_some_and(|active| active.trigger == invocation.trigger
-                && active.boot == invocation.boot
-                && active.message_id == invocation.message_id
-                && active.state == InvocationState::Running)
-            && session.sdk_config.as_deref()
-                == Some(manager_field(&stored.proof.source_body, "sdk_config")?),
-        "manager execution session changed before tool authorization"
+        session.sdk_config.as_deref()
+            == Some(manager_field(&stored.proof.source_body, "sdk_config")?),
+        "manager execution configuration changed"
     );
     ensure!(
         now_ms < manager_lease_from(connection, policy, space, manager_id)?,
@@ -1756,13 +1924,49 @@ pub(super) fn check_manager_tool_in(
     let TransportEvidence::LocalAgentAdapter { service, session } = transport else {
         return Ok(());
     };
-    let manager = manager_tool_authorization_from(
+    let manager_id = active_manager_id(
         connection,
-        policy,
         auth.resource().space.as_str(),
-        &format!("manager:{}", session.session_id),
-        now_ms,
+        &session.session_id,
     )?;
+    let manager = if auth.action() == Action::AgentStart {
+        let (claim, _, job) =
+            load_manager_from(connection, auth.resource().space.as_str(), &manager_id)?;
+        ensure!(
+            !claim.retired_before_start
+                && (matches!(
+                    job.state,
+                    JobState::Running { .. } | JobState::Cancelling { .. }
+                ) || (matches!(job.state, JobState::Unknown { .. })
+                    && crate::store::scheduler_load::<crate::scheduling::SchedulerKnownResult>(
+                        connection,
+                        auth.resource().space.as_str(),
+                        &scheduler_key(
+                            "known-result",
+                            &claim.conversation_id,
+                            &claim.target_node,
+                            &claim.trigger
+                        )
+                    )?
+                    .is_some())),
+            "manager output has no started attempt"
+        );
+        manager_authorization_from(
+            connection,
+            policy,
+            auth.resource().space.as_str(),
+            &manager_id,
+            now_ms,
+        )?
+    } else {
+        manager_tool_authorization_from(
+            connection,
+            policy,
+            auth.resource().space.as_str(),
+            &manager_id,
+            now_ms,
+        )?
+    };
     ensure!(
         manager.actor() == &Actor::Service(service.clone())
             && manager.resource() == auth.resource()
@@ -1776,6 +1980,24 @@ pub(super) fn check_manager_tool_in(
             && manager.initiator() == auth.initiator(),
         "tool invocation differs from its admitted manager"
     );
+    let manager_id = active_manager_id(
+        connection,
+        auth.resource().space.as_str(),
+        &session.session_id,
+    )?;
+    let (claim, _, job) =
+        load_manager_from(connection, auth.resource().space.as_str(), &manager_id)?;
+    let write = !auth.action().is_read() && auth.action() != Action::AgentStart;
+    if auth.action() != Action::AgentStart {
+        check_manager_attempt_in(
+            connection,
+            policy,
+            auth.resource().space.as_str(),
+            &claim,
+            &job,
+            write,
+        )?;
+    }
     if let Some(task) = &manager.signed_invocation().payload.context.task {
         ensure!(
             auth.signed_invocation().payload.context.task.as_ref() == Some(task)
@@ -1883,7 +2105,11 @@ pub(crate) fn sdk_policy_source_provenance_in(
             && now_ms < descriptor.expires_at_ms,
         "SDK policy source differs from its persisted service session"
     );
-    let manager_id = format!("manager:{}", sdk_session.session_id);
+    let manager_id = active_manager_id(
+        connection,
+        facts.resource.space.as_str(),
+        &sdk_session.session_id,
+    )?;
     let manager = manager_tool_authorization_from(
         connection,
         policy,
@@ -1897,6 +2123,16 @@ pub(crate) fn sdk_policy_source_provenance_in(
             && manager.initiator() == &descriptor.initiator,
         "SDK policy source differs from its current admitted Manager"
     );
+    let (claim, _, job) =
+        load_manager_from(connection, facts.resource.space.as_str(), &manager_id)?;
+    check_manager_attempt_in(
+        connection,
+        policy,
+        facts.resource.space.as_str(),
+        &claim,
+        &job,
+        !facts.action.is_read() && facts.action != Action::AgentStart,
+    )?;
     if let Some(task) = &manager.signed_invocation().payload.context.task {
         ensure!(
             facts.context.task.as_ref() == Some(task),
@@ -2050,6 +2286,43 @@ pub(crate) fn sdk_policy_source_provenance_in(
 }
 
 impl Store {
+    pub(crate) fn active_manager_authorization_id(
+        &self,
+        space: &str,
+        trigger: &str,
+    ) -> Result<String> {
+        active_manager_id(&self.connection, space, trigger)
+    }
+
+    pub(crate) fn existing_manager_admission(
+        &mut self,
+        space: &str,
+        conversation: &str,
+        trigger: &str,
+        target: &str,
+        boot: &str,
+    ) -> Result<Option<ManagerAdmission>> {
+        self.recover_scheduler_jobs(space, target, boot)?;
+        let Some(job) = self.scheduler_job(space, conversation, trigger, target)? else {
+            return Ok(None);
+        };
+        let Some(attempt) = job.state.attempt() else {
+            return Ok(None);
+        };
+        if matches!(job.state, JobState::Queued) {
+            return Ok(None);
+        }
+        let manager_id = format!("manager:{trigger}:{}", attempt.id);
+        let deadline = manager_lease_from(&self.connection, &self.policy, space, &manager_id)?;
+        Ok(Some(ManagerAdmission {
+            manager_id,
+            job,
+            previous_native_id: None,
+            fresh: false,
+            lease_expires_at_ms: deadline,
+        }))
+    }
+
     pub(crate) fn claim_authorized_manager(
         &mut self,
         auth: &VerifiedAuthorization,
@@ -2095,90 +2368,89 @@ impl Store {
         let space = auth.resource().space.as_str();
         let conversation = manager_field(source_body, "conversation_id")?;
         let trigger = manager_field(source_body, "trigger")?;
-        let invocation_key = scheduler::key("invocation", conversation, trigger);
-        let session_key = scheduler::key("session", conversation, "");
-        let manager_key = format!("manager-admission:{trigger}");
+        let target = manager_field(source_body, "scheduler_node")?;
+        let attempt_id = manager_field(source_body, "attempt_id")?;
+        let target_key: String = self.connection.query_row(
+            "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
+            params![space, target],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            vibeface_secure::authorization::DeviceId::from_key(
+                &vibeface_secure::authorization::PublicKey::parse(&target_key)?
+            ) == *auth.device(),
+            "scheduler queue target differs from its admitted service"
+        );
+        let manager_key = format!("manager-admission:{}", auth.operation_id());
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_policy_heads_in(&tx, self.policy.verified(), auth, now_ms)?;
         check_manager_parent(&tx, &self.policy, auth, source_body, now_ms)?;
         if local_from::<ManagerClaim>(&tx, space, &manager_key)?.is_some() {
-            let (claim, stored, mut previous) = load_manager_from(&tx, space, auth.operation_id())?;
+            let (_, stored, job) = load_manager_from(&tx, space, auth.operation_id())?;
             ensure!(
                 stored.proof.source_body == *source_body
                     && stored.transport == StoredTransport::from(transport),
-                "manager trigger was reused with a different request"
+                "manager attempt was reused with a different request"
             );
-            check_challenge_record(&tx, auth, proof, stored.proof.challenge == proof.challenge)?;
-            let deadline = manager_lease_from(&tx, &self.policy, space, &claim.manager_id)?;
-            if previous.state == InvocationState::Running && previous.boot != boot {
-                previous.state = InvocationState::Unknown;
-                set_local_in(&tx, space, &invocation_key, &previous)?;
-                let mut session: LocalSession =
-                    local_from(&tx, space, &session_key)?.context("manager session is missing")?;
-                if session
-                    .active
-                    .as_ref()
-                    .is_some_and(|active| active.trigger == trigger)
-                {
-                    session.active = Some(previous.clone());
-                    session.native_id = None;
-                    set_local_in(&tx, space, &session_key, &session)?;
-                }
-            }
+            let deadline = manager_lease_from(&tx, &self.policy, space, auth.operation_id())?;
             tx.commit()?;
             return Ok(ManagerAdmission {
-                manager_id: claim.manager_id,
-                invocation: previous,
+                manager_id: auth.operation_id().into(),
+                job,
                 previous_native_id: None,
                 fresh: false,
                 lease_expires_at_ms: deadline,
             });
         }
-        ensure!(
-            local_from::<SchedulerInvocation>(&tx, space, &invocation_key)?.is_none(),
-            "manager trigger exists without admitted authorization"
-        );
-        let mut session: LocalSession = local_from(&tx, space, &session_key)?.unwrap_or_default();
-        if auth.signed_invocation().payload.context.task.is_some()
-            && let Some(active) = &session.active
+        if let Some(previous_id) =
+            local_from::<String>(&tx, space, &format!("manager-active:{trigger}"))?
         {
-            let (_, _, old) =
-                load_manager_from(&tx, space, &format!("manager:{}", active.trigger))?;
+            let mut previous: ManagerClaim =
+                local_from(&tx, space, &format!("manager-admission:{previous_id}"))?
+                    .context("previous manager claim missing")?;
+            let previous_job: SchedulerJob = crate::store::scheduler_load(
+                &tx,
+                space,
+                &scheduler_key("job", conversation, target, trigger),
+            )?
+            .context("previous job missing")?;
             ensure!(
-                !matches!(
-                    old.state,
-                    InvocationState::Running | InvocationState::Unknown
-                ),
-                scheduler::ManagerBusy
+                matches!(previous_job.state, JobState::Queued),
+                "previous manager attempt requires reconciliation"
             );
+            previous.retired_before_start = true;
+            set_local_in(
+                &tx,
+                space,
+                &format!("manager-admission:{previous_id}"),
+                &previous,
+            )?;
         }
-        if let Some(active) = session.active.take() {
-            let old_id = format!("manager:{}", active.trigger);
-            let (_, _, mut old) = load_manager_from(&tx, space, &old_id)?;
-            if old.state == InvocationState::Running {
-                ensure!(
-                    old.boot != boot,
-                    "a manager invocation is already running for this conversation"
-                );
-                old.state = InvocationState::Unknown;
-                set_local_in(
-                    &tx,
-                    space,
-                    &scheduler::key("invocation", conversation, &old.trigger),
-                    &old,
-                )?;
-            }
-            if old.state == InvocationState::Unknown {
-                session.native_id = None;
-            }
-        }
-        if session.sdk_config.as_deref() != Some(sdk_config) {
-            session.native_id = None;
-            session.sdk_config = Some(sdk_config.into());
-        }
-        let admission = consume_authorization_in(
+        let claimed = crate::store::claim_next_in(
+            &tx,
+            &self.policy,
+            space,
+            conversation,
+            target,
+            boot,
+            sdk_config,
+            attempt_id,
+            trigger,
+        )?
+        .context(scheduler::ManagerBusy)?;
+        ensure!(
+            claimed.job.trigger == trigger && claimed.job.resource_id == auth.resource().resource,
+            "scheduler queue selected another trigger or resource"
+        );
+        let attempt = claimed
+            .job
+            .state
+            .attempt()
+            .context("claimed job has no attempt")?
+            .clone();
+        let admitted = consume_authorization_in(
             &tx,
             &self.policy,
             auth,
@@ -2188,19 +2460,6 @@ impl Store {
             None,
             now_ms,
         )?;
-        let invocation = SchedulerInvocation {
-            state: InvocationState::Running,
-            boot: boot.into(),
-            trigger: trigger.into(),
-            message_id: format!(
-                "scheduler-message-{}",
-                crate::crypto::digest(&serde_json::to_vec(&(space, conversation, trigger))?)
-            ),
-        };
-        let previous_native_id = session.native_id.clone();
-        session.active = Some(invocation.clone());
-        set_local_in(&tx, space, &invocation_key, &invocation)?;
-        set_local_in(&tx, space, &session_key, &session)?;
         set_local_in(
             &tx,
             space,
@@ -2209,41 +2468,26 @@ impl Store {
                 manager_id: auth.operation_id().into(),
                 conversation_id: conversation.into(),
                 trigger: trigger.into(),
+                target_node: target.into(),
+                attempt,
+                retired_before_start: false,
             },
+        )?;
+        set_local_in(
+            &tx,
+            space,
+            &format!("manager-active:{trigger}"),
+            &auth.operation_id(),
         )?;
         let deadline = freshness.expires_at_ms().min(auth.expires_at_ms());
         save_lease_in(&tx, space, auth.operation_id(), proof, now_ms, deadline)?;
-        if auth.signed_invocation().payload.context.task.is_some() {
-            let scheduler_node = manager_field(source_body, "scheduler_node")?;
-            let public_key: String = tx.query_row(
-                "SELECT public_key FROM node_certificates WHERE space_id=? AND node_id=?",
-                params![space, scheduler_node],
-                |row| row.get(0),
-            )?;
-            ensure!(
-                vibeface_secure::authorization::DeviceId::from_key(
-                    &vibeface_secure::authorization::PublicKey::parse(&public_key)?
-                ) == *auth.device(),
-                "continuation scheduler differs from its admitted service device"
-            );
-            let continuation = crate::model::ContinuationClaim {
-                result_event_hash: trigger.into(),
-                policy_version: "v2".into(),
-                scheduler_node: scheduler_node.into(),
-                state: "running".into(),
-                result: Value::Null,
-            };
-            ensure!(tx.execute("INSERT OR IGNORE INTO continuation_claims(space_id,result_event_hash,policy_version,record) VALUES(?,?,?,?)",
-                params![space, trigger, "v2", serde_json::to_string(&continuation)?])? == 1,
-                "continuation already has an admitted attempt; reconcile it");
-        }
-        let checkpoint = prepare_local_admission_checkpoint_in(&tx, &self.policy, &admission)?;
+        let checkpoint = prepare_local_admission_checkpoint_in(&tx, &self.policy, &admitted)?;
         tx.commit()?;
         self.policy.local_admissions.insert(checkpoint);
         Ok(ManagerAdmission {
             manager_id: auth.operation_id().into(),
-            invocation,
-            previous_native_id,
+            job: claimed.job,
+            previous_native_id: claimed.previous_native_id,
             fresh: true,
             lease_expires_at_ms: deadline,
         })
@@ -2278,29 +2522,13 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (claim, stored, invocation) = load_manager_from(&tx, space, manager_id)?;
+        let (claim, stored, job) = load_manager_from(&tx, space, manager_id)?;
         ensure!(
-            invocation.state == InvocationState::Running
+            matches!(job.state, JobState::Running { .. })
                 && stored.proof.invocation == *auth.signed_invocation(),
             "only the original running manager can renew its lease"
         );
-        let session: LocalSession = local_from(
-            &tx,
-            space,
-            &scheduler::key("session", &claim.conversation_id, ""),
-        )?
-        .context("manager session is missing")?;
-        ensure!(
-            session
-                .active
-                .as_ref()
-                .is_some_and(|active| active.trigger == invocation.trigger
-                    && active.boot == invocation.boot
-                    && active.state == InvocationState::Running)
-                && session.sdk_config.as_deref()
-                    == Some(manager_field(&stored.proof.source_body, "sdk_config")?),
-            "manager execution session changed before renewal"
-        );
+        check_manager_attempt_in(&tx, &self.policy, space, &claim, &job, false)?;
         ensure!(
             now_ms < manager_lease_from(&tx, &self.policy, space, manager_id)?,
             "manager lease already expired"
@@ -2399,8 +2627,12 @@ impl Store {
             "operation space mismatch"
         );
         ensure!(
-            !request.operation_id.is_empty() && !request.session_id.is_empty(),
-            "operation and session IDs are required"
+            !request.operation_id.is_empty()
+                && request
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|session| !session.is_empty()),
+            "operation and supplied session IDs must be nonempty"
         );
         ensure!(
             request.expected_revision < i64::MAX as u64,
@@ -2431,8 +2663,35 @@ impl Store {
         let action = request.action["type"]
             .as_str()
             .context("operation action is required")?;
-        let control = !matches!(action, "open" | "send");
-        if action != "open" {
+        let control = !matches!(action, "open" | "send" | "command");
+        let command = if action == "command" {
+            ensure!(
+                request.session_id.is_none()
+                    && request.task_id.is_none()
+                    && request.binding.is_none()
+                    && request.expected_revision == 0,
+                "command cannot carry a Task, session, binding or revision"
+            );
+            let mut fields = request.action.clone();
+            fields
+                .as_object_mut()
+                .context("invalid command action")?
+                .remove("type");
+            let command: crate::command::CommandSpec = serde_json::from_value(fields)?;
+            command.validate()?;
+            let cwd = command
+                .cwd
+                .to_str()
+                .context("command directory must be UTF-8")?;
+            ensure!(
+                canonical_resource(cwd)? == cwd && command.cwd.is_dir(),
+                "command directory is not canonical"
+            );
+            Some(command)
+        } else {
+            None
+        };
+        if !matches!(action, "open" | "command") {
             serde_json::from_value::<EngineAction>(request.action.clone())?.validate()?;
         }
         let resources = request
@@ -2484,7 +2743,10 @@ impl Store {
         }
         validate_basis_in(&tx, request, &auth.resource().resource)?;
         let session = checked_session_from(&tx, request)?;
-        let session = if action == "open" {
+        let session = if action == "command" {
+            ensure!(session.is_none(), "command cannot use an execution session");
+            None
+        } else if action == "open" {
             ensure!(session.is_none(), "execution session already exists");
             let fields = request.action.as_object().context("invalid open action")?;
             ensure!(
@@ -2503,10 +2765,13 @@ impl Store {
                 canonical_resource(cwd)? == cwd && std::path::Path::new(cwd).is_dir(),
                 "execution directory is not canonical"
             );
-            ExecutionSession {
+            Some(ExecutionSession {
                 network_id: request.network_id.clone(),
                 target_node: request.target_node.clone(),
-                session_id: request.session_id.clone(),
+                session_id: request
+                    .session_id
+                    .clone()
+                    .context("open requires a session")?,
                 revision: 0,
                 state: "opening".into(),
                 executor: serde_json::to_value(executor)?
@@ -2515,23 +2780,33 @@ impl Store {
                     .into(),
                 cwd: cwd.into(),
                 native_session_id: None,
-            }
+            })
         } else {
-            session.context("execution session is not open")?
+            Some(session.context("execution session is not open")?)
         };
         if !control {
+            let cwd = match (&session, &command) {
+                (Some(session), None) => session.cwd.as_str(),
+                (None, Some(command)) => command
+                    .cwd
+                    .to_str()
+                    .context("command directory must be UTF-8")?,
+                _ => anyhow::bail!("operation has no execution directory"),
+            };
             ensure!(
-                resources.iter().any(|resource| resource == &session.cwd),
+                resources.iter().any(|resource| resource == cwd),
                 "execution directory is not reserved"
             );
         }
-        crate::store::check_execution_session_in(
-            &tx,
-            &request.network_id,
-            &request.target_node,
-            &request.session_id,
-            control,
-        )?;
+        if let Some(session_id) = request.session_id.as_deref() {
+            crate::store::check_execution_session_in(
+                &tx,
+                &request.network_id,
+                &request.target_node,
+                session_id,
+                control,
+            )?;
+        }
         crate::store::check_execution_resources_in(&tx, &request.target_node, &resources)?;
         let admission = consume_request_authorization_in(
             &tx,
@@ -2552,6 +2827,7 @@ impl Store {
                 params![request.network_id, request.operation_id, request.target_node, resource])?;
         }
         if action == "open" {
+            let session = session.as_ref().context("open session is missing")?;
             tx.execute("INSERT INTO execution_sessions(space_id,target_node,session_id,revision,record) VALUES(?,?,?,?,?)",
                 params![request.network_id, request.target_node, request.session_id, session.revision, serde_json::to_string(&session)?])?;
         }
@@ -3152,9 +3428,16 @@ pub(crate) mod tests {
             );
             if sql == "UPDATE events SET status='conflict' WHERE hash=?" {
                 let checkpoints = verified_admission_checkpoints_from(&tx, &store.policy)?;
-                assert!(!checkpoints.entries.contains_key(&(network.space.to_string(), id.clone())));
+                assert!(
+                    !checkpoints
+                        .entries
+                        .contains_key(&(network.space.to_string(), id.clone()))
+                );
             } else {
-                assert!(verified_admission_checkpoints_from(&tx, &store.policy).is_err(), "{sql}");
+                assert!(
+                    verified_admission_checkpoints_from(&tx, &store.policy).is_err(),
+                    "{sql}"
+                );
             }
             tx.rollback()?;
             cached_without_crypto(&store, &proof, &facts)?;
@@ -3352,10 +3635,19 @@ pub(crate) mod tests {
     fn local_admission_cache_keeps_policy_time_and_current_revocation_gates() -> Result<()> {
         let (mut network, mut store, _, _, _, _) = local_cache_fixture(false)?;
         network.enroll_node(LocalIdentity::generate())?;
-        store.install_policy_journal(&network.bundle.journal, crate::identity::test_support::now())?;
-        let anchor = network.message(&mut store, "conversation", "after the accepted policy commit")?;
+        store.install_policy_journal(
+            &network.bundle.journal,
+            crate::identity::test_support::now(),
+        )?;
+        let anchor = network.message(
+            &mut store,
+            "conversation",
+            "after the accepted policy commit",
+        )?;
         let event: crate::model::Event = serde_json::from_str(&anchor.canonical_body)?;
-        let EventCause::Invocation { admission: proof } = event.cause else { unreachable!() };
+        let EventCause::Invocation { admission: proof } = event.cause else {
+            unreachable!()
+        };
         let facts = persisted_admission_facts(&store.connection, &store.policy, &proof)?;
         let transport = proof.transport.clone().existing_evidence()?;
         let admitted = cached_without_crypto(&store, &proof, &facts)?;
@@ -3883,6 +4175,7 @@ pub(crate) mod tests {
 mod manager_tests {
     use super::*;
     use crate::identity::test_support::{TestNetwork, now};
+    use crate::scheduling::SchedulerSession;
     use serde_json::json;
     use vibeface_secure::{
         Identity,
@@ -3971,7 +4264,16 @@ mod manager_tests {
             let service_grant = descriptor.grant_leaf.clone();
             let sdk_config = crate::crypto::digest(b"actual manager configuration");
             let mut body = network.body("agent_start", "conversation");
-            body["authorization_id"] = json!(format!("manager:{}", trigger.hash));
+            body["attempt_id"] = json!("fixture-attempt");
+            body["scheduler_node"] = json!(network.node.node_id()?);
+            body["authorization_id"] = json!(format!("manager:{}:fixture-attempt", trigger.hash));
+            store.admit_trigger(
+                network.space.as_str(),
+                "conversation",
+                &trigger.hash,
+                &network.node.node_id()?,
+                &network.node.node_id()?,
+            )?;
             body["trigger"] = json!(trigger.hash);
             body["sdk_session"] = json!(descriptor.sdk_session);
             body["parent_invocation"] = json!(descriptor.parent_invocation);
@@ -4025,7 +4327,12 @@ mod manager_tests {
         }
 
         fn claim(&mut self, boot: &str) -> Result<ManagerAdmission> {
-            self.store.claim_authorized_manager(
+            self.store.recover_scheduler_jobs(
+                self.network.space.as_str(),
+                &self.network.node.node_id()?,
+                boot,
+            )?;
+            let mut admitted = self.store.claim_authorized_manager(
                 &self.auth,
                 &self.proof,
                 &self.transport,
@@ -4033,7 +4340,18 @@ mod manager_tests {
                 boot,
                 &self.sdk_config,
                 now(),
-            )
+            )?;
+            if admitted.fresh {
+                let attempt = admitted.job.state.attempt().unwrap().id.clone();
+                admitted.job = self.store.mark_started(
+                    self.network.space.as_str(),
+                    "conversation",
+                    &self.network.node.node_id()?,
+                    &admitted.job.trigger,
+                    &attempt,
+                )?;
+            }
+            Ok(admitted)
         }
     }
 
@@ -4058,10 +4376,15 @@ mod manager_tests {
         assert_eq!(checkpoint.anchors[0].hash, trigger);
         super::tests::cached_without_crypto(&fixture.store, &stored.proof, &facts)?;
         super::tests::cached_without_crypto(&fixture.store, &stored.proof, &facts)?;
-        assert_eq!(manager_lease_from(
-            &fixture.store.connection, &fixture.store.policy,
-            fixture.network.space.as_str(), &first.manager_id,
-        )?, first.lease_expires_at_ms);
+        assert_eq!(
+            manager_lease_from(
+                &fixture.store.connection,
+                &fixture.store.policy,
+                fixture.network.space.as_str(),
+                &first.manager_id,
+            )?,
+            first.lease_expires_at_ms
+        );
         for (path, value) in [
             ("$.deadline", json!(first.lease_expires_at_ms + 1)),
             ("$.checked_at_ms", json!(stored.proof.admitted_at_ms + 1)),
@@ -4073,9 +4396,16 @@ mod manager_tests {
                 "UPDATE local_values SET value=json_set(value,?,json(?)) WHERE space_id=? AND key=?",
                 params![path, serde_json::to_string(&value)?, fixture.network.space.as_str(), format!("lease:{}", first.manager_id)],
             )?, 1);
-            assert!(manager_lease_from(
-                &tx, &fixture.store.policy, fixture.network.space.as_str(), &first.manager_id,
-            ).is_err(), "{path}");
+            assert!(
+                manager_lease_from(
+                    &tx,
+                    &fixture.store.policy,
+                    fixture.network.space.as_str(),
+                    &first.manager_id,
+                )
+                .is_err(),
+                "{path}"
+            );
             tx.rollback()?;
         }
         let trigger_envelope = fixture
@@ -4259,8 +4589,13 @@ mod manager_tests {
     {
         let mut fixture = Fixture::new_at(true)?;
         let first = fixture.claim("boot-before-restart")?;
-        let key = scheduler::key("session", "conversation", "");
-        let mut session: LocalSession = local_from(
+        let key = scheduler_key(
+            "session",
+            "conversation",
+            &fixture.network.node.node_id()?,
+            "",
+        );
+        let mut session: SchedulerSession = local_from(
             &fixture.store.connection,
             fixture.network.space.as_str(),
             &key,
@@ -4286,15 +4621,19 @@ mod manager_tests {
         } = fixture;
         drop(store);
         let mut reopened = Store::open(network.directory.join("node.sqlite3"))?;
-        let session: LocalSession =
+        reopened.recover_scheduler_jobs(
+            network.space.as_str(),
+            &network.node.node_id()?,
+            "boot-after-restart",
+        )?;
+        let session: SchedulerSession =
             local_from(&reopened.connection, network.space.as_str(), &key)?.unwrap();
         assert!(session.native_id.is_none());
         assert!(
             session
                 .active
                 .as_ref()
-                .is_some_and(|active| active.trigger == first.invocation.trigger
-                    && active.state == InvocationState::Unknown)
+                .is_some_and(|active| active == &first.job.trigger)
         );
         let replay = reopened.claim_authorized_manager(
             &auth,
@@ -4305,7 +4644,7 @@ mod manager_tests {
             &sdk_config,
             now(),
         )?;
-        assert!(!replay.fresh && replay.invocation.state == InvocationState::Unknown);
+        assert!(!replay.fresh && matches!(replay.job.state, JobState::Unknown { .. }));
         assert!(replay.previous_native_id.is_none());
         assert_eq!(reopened.connection.query_row(
             "SELECT (SELECT count(*) FROM accepted_authorizations),(SELECT count(*) FROM authorization_nonces)",[],|row| Ok((row.get::<_,u64>(0)?,row.get::<_,u64>(1)?)))?,counts);
@@ -4334,11 +4673,15 @@ mod manager_tests {
             "UPDATE events SET status='conflict'; DELETE FROM tasks; DELETE FROM conversations;",
         )?;
         validate_persisted_authorizations(&fixture.store.connection, &fixture.store.policy)?;
-        assert_eq!(verified_admission_checkpoints_from(
-            &fixture.store.connection, &fixture.store.policy,
-        )?.len(), 0);
+        assert_eq!(
+            verified_admission_checkpoints_from(&fixture.store.connection, &fixture.store.policy,)?
+                .len(),
+            0
+        );
         let stored = load_authorization_from(
-            &fixture.store.connection, fixture.network.space.as_str(), &first.manager_id,
+            &fixture.store.connection,
+            fixture.network.space.as_str(),
+            &first.manager_id,
         )?;
         let mut uncached = fixture.store.policy.clone();
         uncached.local_admissions = AdmissionCheckpoints::default();
@@ -4354,18 +4697,21 @@ mod manager_tests {
             .is_err()
         );
         let (hash, original): (String, String) = fixture.store.connection.query_row(
-            "SELECT hash,envelope FROM events ORDER BY hash LIMIT 1", [],
+            "SELECT hash,envelope FROM events ORDER BY hash LIMIT 1",
+            [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         fixture.store.connection.execute(
             "UPDATE events SET envelope=json_set(envelope,'$.signature',?) WHERE hash=?",
             params!["00".repeat(64), hash],
         )?;
-        assert!(verified_admission_checkpoints_from(
-            &fixture.store.connection, &fixture.store.policy,
-        ).is_err());
+        assert!(
+            verified_admission_checkpoints_from(&fixture.store.connection, &fixture.store.policy,)
+                .is_err()
+        );
         fixture.store.connection.execute(
-            "UPDATE events SET envelope=? WHERE hash=?", params![original, hash],
+            "UPDATE events SET envelope=? WHERE hash=?",
+            params![original, hash],
         )?;
         validate_persisted_authorizations(&fixture.store.connection, &fixture.store.policy)?;
         fixture.store.connection.execute("UPDATE local_values SET value=json_set(value,'$.deadline',?) WHERE space_id=? AND key=?",
@@ -4503,8 +4849,13 @@ mod manager_tests {
                 .manager_tool_authorization(space, &first.manager_id, first.lease_expires_at_ms)
                 .is_err()
         );
-        let key = scheduler::key("session", "conversation", "");
-        let mut session: LocalSession =
+        let key = scheduler_key(
+            "session",
+            "conversation",
+            &fixture.network.node.node_id()?,
+            "",
+        );
+        let mut session: SchedulerSession =
             local_from(&fixture.store.connection, space, &key)?.unwrap();
         session.sdk_config = Some("different-configuration".into());
         fixture
@@ -4517,7 +4868,7 @@ mod manager_tests {
                 .is_err()
         );
         session.sdk_config = Some(fixture.sdk_config.clone());
-        session.active.as_mut().unwrap().state = InvocationState::Unknown;
+        session.permission_version += 1;
         fixture
             .store
             .local_set(space, &key, &serde_json::to_value(&session)?)?;
@@ -4623,28 +4974,30 @@ mod manager_tests {
         assert!(
             !duplicate.fresh
                 && duplicate.manager_id == first.manager_id
-                && duplicate.invocation.state == InvocationState::Running
+                && matches!(duplicate.job.state, JobState::Running { .. })
         );
         let space = fixture.network.space.as_str();
-        let session_key = scheduler::key("session", "conversation", "");
-        let mut session: LocalSession =
+        let session_key = scheduler_key(
+            "session",
+            "conversation",
+            &fixture.network.node.node_id()?,
+            "",
+        );
+        let mut session: SchedulerSession =
             local_from(&fixture.store.connection, space, &session_key)?.unwrap();
         session.native_id = Some("native-manager".into());
         fixture
             .store
             .local_set(space, &session_key, &serde_json::to_value(session)?)?;
         let resumed = fixture.claim("boot-b")?;
-        assert!(!resumed.fresh && resumed.invocation.state == InvocationState::Unknown);
-        let session: LocalSession = local_from(
+        assert!(!resumed.fresh && matches!(resumed.job.state, JobState::Unknown { .. }));
+        let session: SchedulerSession = local_from(
             &fixture.store.connection,
             fixture.network.space.as_str(),
             &session_key,
         )?
         .unwrap();
-        assert!(
-            session.native_id.is_none()
-                && session.active.unwrap().state == InvocationState::Unknown
-        );
+        assert!(session.native_id.is_none() && session.active.is_some());
         assert_eq!(
             fixture.store.connection.query_row(
                 "SELECT count(*) FROM accepted_authorizations WHERE action='agent_start'",

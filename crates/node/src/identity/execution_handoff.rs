@@ -19,6 +19,7 @@ use vibeface_secure::authorization::{
     VerifiedAuthorization, VerifiedPolicySet,
     events::StoredTransport,
     execution_handoff::*,
+    execution_work::ExecutionWork,
     remote_execution_history::RemoteExecutionHistoryAcceptance,
     task_binding::SignedBinding,
     task_business_policy::{
@@ -466,26 +467,36 @@ fn check_handoff_checkpoint_usage_in(
 }
 
 fn clear_unknown_native_session_in(connection: &Connection, stored: &StoredHandoff) -> Result<()> {
+    if stored.request.session_id.is_none() {
+        ensure!(
+            matches!(
+                stored.wire.handoff.source_statement()?.work,
+                ExecutionWork::Command { .. }
+            ),
+            "session work has no session identifier"
+        );
+        return Ok(());
+    }
     let (execution, original, _) = scope(&stored.wire)?;
     let dispatch: Event =
         serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
-    let (mut session, binding) = session_from(
+    let (mut session, binding, work) = session_from(
         connection,
         &execution,
         &original,
         dispatch.resource_id.as_str(),
         &stored.request.target_node,
-        &stored.request.session_id,
+        stored.request.session_id.as_deref(),
     )?
     .context("Unknown execution session disappeared")?;
     ensure!(
-        stored.request.binding.as_ref() == Some(&binding),
+        stored.request.binding == binding && work == stored.wire.handoff.source_statement()?.work,
         "Unknown execution session changed its accepted binding"
     );
     session.state = "unknown".into();
     session.native_session_id = None;
     ensure!(connection.execute("UPDATE execution_handoff_sessions SET record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=? AND revision=?",
-        params![serde_json::to_string(&session)?,execution,original,dispatch.resource_id.as_str(),session.target_node,session.session_id,session.revision])? == 1,
+        params![session_record(&session, &stored.wire.handoff.source_statement()?.work)?,execution,original,dispatch.resource_id.as_str(),session.target_node,session.session_id,session.revision])? == 1,
         "Unknown execution session changed before commit");
     Ok(())
 }
@@ -528,41 +539,48 @@ fn original_capsule_authorization(
 ) -> Result<VerifiedAuthorization> {
     let source = current.verify_project_execution_source(&handoff, now_ms)?;
     let dispatch: Event = serde_json::from_str(&handoff.project_dispatch.canonical_body)?;
-    let task: Event = serde_json::from_str(&handoff.task_creation.canonical_body)?;
     let original = capsule_admission(&dispatch)?;
-    let task_proof = capsule_admission(&task)?;
-    ensure!(
-        task_proof.invocation.payload.audience == original.invocation.payload.audience
-            && dispatch.created_at_ms == original.admitted_at_ms as i64
-            && original.admitted_at_ms >= task_proof.admitted_at_ms,
-        "capsule task host or admission order changed"
-    );
     let project = original.invocation.payload.resource.clone();
-    capsule_facts(
-        &task_proof,
-        &project,
-        &task.scope_id,
-        None,
-        handoff.task_sdk_origin.as_ref(),
-    )?;
-    let crate::model::EventBody::TaskCreated {
-        task_id,
-        title,
-        goal,
-        acceptance,
-    } = &task.body
-    else {
-        anyhow::bail!("capsule task proof is not a creation")
-    };
-    ensure!(
-        task_proof.source_body["method"] == "create_task"
-            && task_proof.source_body["task_id"].as_str() == Some(task_id.as_str())
-            && task_proof.source_body["title"].as_str() == Some(title.as_str())
-            && task_proof.source_body["goal"].as_str() == Some(goal.as_str())
-            && task_proof.source_body["acceptance"].as_str() == Some(acceptance.as_str())
-            && task.created_at_ms == task_proof.admitted_at_ms as i64,
-        "task creation differs from its admitted input"
-    );
+    if let ExecutionOrigin::TaskSession { task_creation } = &handoff.origin {
+        let task: Event = serde_json::from_str(&task_creation.canonical_body)?;
+        let task_proof = capsule_admission(&task)?;
+        ensure!(
+            task_proof.invocation.payload.audience == original.invocation.payload.audience
+                && dispatch.created_at_ms == original.admitted_at_ms as i64
+                && original.admitted_at_ms >= task_proof.admitted_at_ms,
+            "capsule task host or admission order changed"
+        );
+        capsule_facts(
+            &task_proof,
+            &project,
+            &task.scope_id,
+            None,
+            handoff.task_sdk_origin.as_ref(),
+        )?;
+        let crate::model::EventBody::TaskCreated {
+            task_id,
+            title,
+            goal,
+            acceptance,
+        } = &task.body
+        else {
+            anyhow::bail!("capsule task proof is not a creation")
+        };
+        ensure!(
+            task_proof.source_body["method"] == "create_task"
+                && task_proof.source_body["task_id"].as_str() == Some(task_id.as_str())
+                && task_proof.source_body["title"].as_str() == Some(title.as_str())
+                && task_proof.source_body["goal"].as_str() == Some(goal.as_str())
+                && task_proof.source_body["acceptance"].as_str() == Some(acceptance.as_str())
+                && task.created_at_ms == task_proof.admitted_at_ms as i64,
+            "task creation differs from its admitted input"
+        );
+    } else {
+        ensure!(
+            handoff.task_sdk_origin.is_none(),
+            "non-Task work cannot carry a Task SDK origin"
+        );
+    }
     let operation: OperationRequest =
         serde_json::from_value(original.source_body["request"].clone())?;
     let facts = capsule_facts(
@@ -660,6 +678,7 @@ fn capsule_facts(
                 .as_str()
                 .context("original execution grant is missing")?,
         )?;
+        let source = handoff.source_statement()?;
         if !body["execution_session_receipt"].is_null() {
             let receipt: Signed<ExecutionHandoffReceipt> =
                 serde_json::from_value(body["execution_session_receipt"].clone())?;
@@ -669,27 +688,18 @@ fn capsule_facts(
                 .session
                 .as_ref()
                 .context("execution state receipt has no signed snapshot")?;
-            let confirmed = request
-                .binding
-                .as_ref()
-                .context("execution state has no task binding")?;
             ensure!(
                 receipt.issuer == handoff.target_public_key
                     && snapshot.original_project == *project
                     && snapshot.execution_resource == handoff.execution_resource
                     && snapshot.target == handoff.execution_audience.device
-                    && snapshot.session_id == request.session_id
+                    && Some(snapshot.session_id.as_str()) == request.session_id.as_deref()
                     && snapshot.revision == request.expected_revision
-                    && snapshot.task.as_str() == confirmed.binding.task_ref
-                    && snapshot.binding_hash == crate::binding::binding_hash(&confirmed.binding)?
-                    && snapshot.binding_generation == confirmed.binding.generation
-                    && confirmed.binding.open_spec["executor"].as_str()
-                        == Some(snapshot.executor.as_str())
-                    && confirmed.binding.open_spec["cwd"].as_str() == Some(snapshot.cwd.as_str())
+                    && snapshot.work == source.work
+                    && receipt.payload.work == source.work
                     && receipt.payload.original_space_id == project.space
                     && receipt.payload.execution_space_id == handoff.execution_resource.space
                     && receipt.payload.target == handoff.execution_audience.device
-                    && receipt.payload.session_id == request.session_id
                     && receipt.payload.issued_at_ms <= proof.admitted_at_ms
                     && proof.admitted_at_ms < snapshot.expires_at_ms
                     && snapshot.expires_at_ms - receipt.payload.issued_at_ms
@@ -698,8 +708,9 @@ fn capsule_facts(
             );
         } else {
             ensure!(
-                request.action["type"] == "open",
-                "non-open operation requires signed executor session state"
+                request.action["type"] == "open"
+                    || matches!(source.work, ExecutionWork::Command { .. }),
+                "non-open session operation requires signed executor session state"
             );
         }
         ensure!(
@@ -714,27 +725,12 @@ fn capsule_facts(
                     || body["basis_heads"] == serde_json::to_value(&request.basis_heads)?),
             "capsule operation scope changed"
         );
-        let binding = request
-            .binding
-            .as_ref()
-            .context("capsule operation has no binding")?;
         ensure!(
             body["task_ref"].is_null()
-                || body["task_ref"].as_str() == Some(handoff.task_creation.hash.as_str()),
+                || body["task_ref"].as_str() == source.work.task_ref().map(|task| task.as_str()),
             "capsule references another task"
         );
-        context.task = Some(EventRef::parse(&handoff.task_creation.hash)?);
-        context.execution_session = Some(SessionRef {
-            target: handoff.execution_audience.device.clone(),
-            session_id: request.session_id.clone(),
-        });
-        context.executor_kind = binding.binding.open_spec["executor"]
-            .as_str()
-            .map(str::to_owned);
-        ensure!(
-            request.action["type"] != "open" || request.action == binding.binding.open_spec,
-            "capsule open input differs from its binding"
-        );
+        context = handoff.execution_context()?;
     } else {
         ensure!(
             body["conversation_id"].as_str() == Some(conversation),
@@ -836,6 +832,27 @@ fn verify_local_handoff_checkpoint(connection: &Connection, stored: &StoredHando
         &StoredTransport::from(&stored.transport),
         stored.admitted_at_ms,
     )?;
+    let source = stored.wire.handoff.source_statement()?;
+    match session_from(
+        connection,
+        stored.wire.handoff.execution_resource.space.as_str(),
+        source.project.space.as_str(),
+        source.project.resource.as_str(),
+        &stored.request.target_node,
+        stored.request.session_id.as_deref(),
+    )? {
+        Some((session, binding, work)) => {
+            ensure!(
+                work == source.work,
+                "stored session changed its original work"
+            );
+            check_session_work(&work, &stored.request, &session, &binding)?;
+        }
+        None => ensure!(
+            matches!(source.work, ExecutionWork::Command { .. }),
+            "stored session work has no executor session"
+        ),
+    }
     Ok(())
 }
 
@@ -941,7 +958,7 @@ fn stored_from(
         invocation_hash: String,
         body_hash: String,
         target: String,
-        session: String,
+        session: Option<String>,
         control: bool,
         admission_receipt: String,
     }
@@ -1038,7 +1055,10 @@ fn stored_from(
 }
 
 fn is_control(request: &OperationRequest) -> bool {
-    !matches!(request.action["type"].as_str(), Some("open" | "send"))
+    !matches!(
+        request.action["type"].as_str(),
+        Some("open" | "send" | "command")
+    )
 }
 
 pub(super) fn verify_binding_seal_source_in(
@@ -1051,7 +1071,8 @@ pub(super) fn verify_binding_seal_source_in(
         session.execution_resource.space.as_str(),
         session.original_project.space.as_str(),
         &target.receipt.payload.operation_id,
-    )?.context("executor has not accepted the sealed operation")?;
+    )?
+    .context("executor has not accepted the sealed operation")?;
     verify_local_handoff_checkpoint(connection, &stored)?;
     let admission = verify_execution_handoff_admission_checkpoint(
         &stored.wire,
@@ -1065,9 +1086,7 @@ pub(super) fn verify_binding_seal_source_in(
     ensure!(
         stored.request.binding.as_ref() == Some(&target.binding)
             && source.project == session.original_project
-            && source.task == session.task
-            && source.binding_hash == session.binding_hash
-            && source.binding_generation == session.binding_generation
+            && source.work == session.work
             && stored.wire.handoff.execution_resource == session.execution_resource
             && stored.wire.handoff.target_public_key == target.target_public_key
             && serde_json::to_value(&stored.state)?
@@ -1235,33 +1254,139 @@ fn consume_freshness_with_policy_in(
     Ok(freshness.expires_at_ms())
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredExecutionSession {
+    #[serde(flatten)]
+    session: ExecutionSession,
+    work: ExecutionWork,
+}
+
+fn session_record(session: &ExecutionSession, work: &ExecutionWork) -> Result<String> {
+    Ok(serde_json::to_string(&StoredExecutionSession {
+        session: session.clone(),
+        work: work.clone(),
+    })?)
+}
+
 fn session_from(
     connection: &Connection,
     execution: &str,
     original: &str,
     project_resource: &str,
     target: &str,
-    session: &str,
-) -> Result<Option<(ExecutionSession, SignedBinding)>> {
-    let row: Option<(String, String, u64)> = connection.query_row(
+    session: Option<&str>,
+) -> Result<Option<(ExecutionSession, Option<SignedBinding>, ExecutionWork)>> {
+    let Some(session) = session else {
+        return Ok(None);
+    };
+    let row: Option<(String, Option<String>, u64)> = connection.query_row(
         "SELECT record,binding,revision FROM execution_handoff_sessions WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=?",
         params![execution, original, project_resource, target, session], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
     let Some((record, binding, revision)) = row else {
         return Ok(None);
     };
-    let record: ExecutionSession = serde_json::from_str(&record)?;
-    let binding: SignedBinding = serde_json::from_str(&binding)?;
+    let StoredExecutionSession {
+        session: record,
+        work,
+    } = serde_json::from_str(&record)?;
+    let binding: Option<SignedBinding> = binding
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?;
     ensure!(
         record.network_id == execution
             && record.target_node == target
             && record.session_id == session
             && record.revision == revision
-            && binding.binding.network_id == original
-            && binding.binding.target_node == target
-            && binding.binding.session_id == session,
-        "executor session projection differs from its binding"
+            && binding.as_ref().is_none_or(|binding| {
+                binding.binding.network_id == original
+                    && binding.binding.target_node == target
+                    && binding.binding.session_id == session
+            }),
+        "executor session projection differs from its original scope"
     );
-    Ok(Some((record, binding)))
+    let expected_session = work
+        .execution_session()
+        .context("command cannot own a session row")?;
+    ensure!(
+        expected_session.session_id == session,
+        "stored session work changed its session"
+    );
+    match &work {
+        ExecutionWork::TaskSession {
+            binding_hash,
+            binding_generation,
+            ..
+        } => {
+            let binding = binding
+                .as_ref()
+                .context("Task session has no persisted binding")?;
+            ensure!(
+                crate::binding::binding_hash(&binding.binding)? == *binding_hash
+                    && binding.binding.generation == *binding_generation,
+                "stored Task session work changed its binding"
+            );
+        }
+        ExecutionWork::ConversationSession {
+            executor,
+            canonical_cwd,
+            ..
+        } => {
+            ensure!(
+                binding.is_none() && record.executor == *executor && record.cwd == *canonical_cwd,
+                "stored conversation session work changed its Open"
+            );
+        }
+        ExecutionWork::Command { .. } => anyhow::bail!("command cannot own a session row"),
+    }
+    Ok(Some((record, binding, work)))
+}
+
+fn check_session_work(
+    work: &ExecutionWork,
+    operation: &OperationRequest,
+    session: &ExecutionSession,
+    binding: &Option<SignedBinding>,
+) -> Result<()> {
+    let expected = work
+        .execution_session()
+        .context("command cannot have an execution session")?;
+    ensure!(
+        operation.session_id.as_deref() == Some(expected.session_id.as_str())
+            && operation.target_node == expected.target.as_str()
+            && session.session_id == expected.session_id
+            && operation.binding == *binding,
+        "execution session differs from its original work"
+    );
+    match work {
+        ExecutionWork::TaskSession {
+            binding_hash,
+            binding_generation,
+            ..
+        } => {
+            let binding = binding.as_ref().context("Task session has no binding")?;
+            ensure!(
+                crate::binding::binding_hash(&binding.binding)? == *binding_hash
+                    && binding.binding.generation == *binding_generation
+                    && binding.binding.open_spec["executor"].as_str()
+                        == Some(session.executor.as_str())
+                    && binding.binding.open_spec["cwd"].as_str() == Some(session.cwd.as_str()),
+                "Task session changed its exact binding"
+            );
+        }
+        ExecutionWork::ConversationSession {
+            executor,
+            canonical_cwd,
+            ..
+        } => {
+            ensure!(
+                binding.is_none() && session.executor == *executor && session.cwd == *canonical_cwd,
+                "conversation session changed its original Open"
+            );
+        }
+        ExecutionWork::Command { .. } => anyhow::bail!("command cannot have an execution session"),
+    }
+    Ok(())
 }
 
 fn validate_execution_context(
@@ -1269,7 +1394,7 @@ fn validate_execution_context(
     identity: &LocalIdentity,
     handoff: &VerifiedExecutionHandoff,
     operation: &OperationRequest,
-) -> Result<(Vec<String>, ExecutionSession)> {
+) -> Result<(Vec<String>, Option<ExecutionSession>)> {
     let execution = &handoff.wire().handoff.execution_resource;
     ensure!(
         identity.public_key_hex()? == handoff.wire().handoff.target_public_key.as_str()
@@ -1291,10 +1416,17 @@ fn validate_execution_context(
         canonical_resource(&root)? == root && std::path::Path::new(&root).is_dir(),
         "execution mount mapping is not canonical"
     );
-    let binding = handoff.binding();
-    let cwd = binding.binding.open_spec["cwd"]
-        .as_str()
-        .context("binding has no execution directory")?;
+    let binding = match handoff.work() {
+        ExecutionWork::TaskSession { .. } => Some(handoff.binding()?),
+        _ => None,
+    };
+    let cwd = match handoff.work() {
+        ExecutionWork::TaskSession { .. } => binding.as_ref().unwrap().binding.open_spec["cwd"]
+            .as_str()
+            .context("binding has no execution directory")?,
+        ExecutionWork::ConversationSession { canonical_cwd, .. }
+        | ExecutionWork::Command { canonical_cwd, .. } => canonical_cwd,
+    };
     ensure!(
         canonical_resource(cwd)? == cwd
             && std::path::Path::new(cwd).is_dir()
@@ -1317,26 +1449,49 @@ fn validate_execution_context(
         resources.len() <= 128,
         "too many execution resource reservations"
     );
+    if !is_control(operation) {
+        ensure!(
+            resources.iter().any(|resource| resource == cwd),
+            "execution directory must be reserved"
+        );
+    }
+    if matches!(handoff.work(), ExecutionWork::Command { .. }) {
+        ensure!(
+            operation.session_id.is_none()
+                && operation.task_id.is_none()
+                && operation.binding.is_none()
+                && operation.expected_revision == 0,
+            "command cannot carry a session, Task or revision"
+        );
+        serde_json::from_value::<EngineAction>(operation.action.clone())?.validate()?;
+        return Ok((resources, None));
+    }
+    let session_id = operation
+        .session_id
+        .as_deref()
+        .context("session work has no session")?;
     let existing = session_from(
         connection,
         execution.space.as_str(),
         &operation.network_id,
         handoff.original().resource().resource.as_str(),
         &operation.target_node,
-        &operation.session_id,
+        Some(session_id),
     )?;
     let session = if operation.action["type"] == "open" {
         ensure!(
             existing.is_none()
                 && operation.expected_revision == 0
-                && operation.action == binding.binding.open_spec,
-            "execution open conflicts with an existing session or binding"
+                && binding
+                    .as_ref()
+                    .is_none_or(|binding| operation.action == binding.binding.open_spec),
+            "execution open conflicts with an existing session or Task binding"
         );
         let executor: ExecutorKind = serde_json::from_value(operation.action["executor"].clone())?;
-        ExecutionSession {
+        let session = ExecutionSession {
             network_id: execution.space.to_string(),
             target_node: operation.target_node.clone(),
-            session_id: operation.session_id.clone(),
+            session_id: session_id.to_owned(),
             revision: 0,
             state: "opening".into(),
             executor: serde_json::to_value(executor)?
@@ -1345,28 +1500,21 @@ fn validate_execution_context(
                 .to_owned(),
             cwd: cwd.to_owned(),
             native_session_id: None,
-        }
+        };
+        check_session_work(handoff.work(), operation, &session, &binding)?;
+        session
     } else {
         serde_json::from_value::<EngineAction>(operation.action.clone())?.validate()?;
-        let (session, previous_binding) = existing.context("executor session is not open")?;
+        let (session, previous_binding, work) = existing.context("executor session is not open")?;
+        ensure!(work == *handoff.work(), "session changed its original work");
+        check_session_work(handoff.work(), operation, &session, &previous_binding)?;
         ensure!(
-            previous_binding == *binding
-                && session.state != "resolved"
-                && session.revision == operation.expected_revision
-                && session.cwd == cwd
-                && binding.binding.open_spec["executor"].as_str()
-                    == Some(session.executor.as_str()),
-            "executor session revision or binding changed"
+            session.state != "resolved" && session.revision == operation.expected_revision,
+            "executor session revision changed"
         );
         session
     };
-    if !is_control(operation) {
-        ensure!(
-            resources.iter().any(|resource| resource == cwd),
-            "execution directory must be reserved"
-        );
-    }
-    Ok((resources, session))
+    Ok((resources, Some(session)))
 }
 
 fn signed_receipt(
@@ -1379,45 +1527,42 @@ fn signed_receipt(
         identity.public_key_hex()? == stored.wire.handoff.target_public_key.as_str(),
         "receipt signer is not this executor"
     );
-    let binding = stored
-        .request
-        .binding
-        .as_ref()
-        .context("handoff binding is missing")?;
     let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
         .map_err(anyhow::Error::msg)?;
-    let dispatch: Event =
-        serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
+    let source = stored.wire.handoff.source_statement()?;
     let session = session_from(
         connection,
         stored.wire.handoff.execution_resource.space.as_str(),
         &stored.request.network_id,
-        dispatch.resource_id.as_str(),
+        source.project.resource.as_str(),
         &stored.request.target_node,
-        &stored.request.session_id,
+        stored.request.session_id.as_deref(),
     )?
-    .map(|(session, _)| -> Result<ExecutionSessionSnapshot> {
-        Ok(ExecutionSessionSnapshot {
-            original_project: ResourceRef {
-                space: SpaceId::parse(&stored.request.network_id)?,
-                resource: dispatch.resource_id.clone(),
-            },
-            execution_resource: stored.wire.handoff.execution_resource.clone(),
-            task: vibeface_secure::authorization::EventRef::parse(&binding.binding.task_ref)?,
-            binding_hash: crate::binding::binding_hash(&binding.binding)?,
-            binding_generation: binding.binding.generation,
-            target: stored.wire.handoff.execution_audience.device.clone(),
-            session_id: session.session_id,
-            revision: session.revision,
-            executor: session.executor,
-            cwd: session.cwd,
-            state: session.state,
-            expires_at_ms: now_ms
-                .checked_add(vibeface_secure::authorization::EXECUTION_LEASE_MS)
-                .context("session snapshot expiry overflow")?,
-        })
-    })
+    .map(
+        |(session, binding, work)| -> Result<ExecutionSessionSnapshot> {
+            ensure!(work == source.work, "session changed its original work");
+            check_session_work(&source.work, &stored.request, &session, &binding)?;
+            Ok(ExecutionSessionSnapshot {
+                original_project: source.project.clone(),
+                execution_resource: stored.wire.handoff.execution_resource.clone(),
+                work: source.work.clone(),
+                target: stored.wire.handoff.execution_audience.device.clone(),
+                session_id: session.session_id,
+                revision: session.revision,
+                executor: session.executor,
+                cwd: session.cwd,
+                state: session.state,
+                expires_at_ms: now_ms
+                    .checked_add(vibeface_secure::authorization::EXECUTION_LEASE_MS)
+                    .context("session snapshot expiry overflow")?,
+            })
+        },
+    )
     .transpose()?;
+    ensure!(
+        matches!(source.work, ExecutionWork::Command { .. }) == session.is_none(),
+        "session work has no durable executor session"
+    );
     let receipt = Signed::sign(
         ExecutionHandoffReceipt {
             version: AUTH_VERSION,
@@ -1426,11 +1571,11 @@ fn signed_receipt(
             execution_space_id: stored.wire.handoff.execution_resource.space.clone(),
             handoff_hash: stored.wire.hash()?,
             target: stored.wire.handoff.execution_audience.device.clone(),
-            session_id: stored.request.session_id.clone(),
-            binding_generation: binding.binding.generation,
+            work: source.work,
             state: serde_json::from_value(serde_json::to_value(&stored.state)?)?,
             result_hash: ObjectHash::body(&stored.result)?,
             session,
+            control: None,
             issued_at_ms: now_ms,
         },
         &signer,
@@ -1496,7 +1641,7 @@ fn dto(
             &stored.request.network_id,
             dispatch.resource_id.as_str(),
             &stored.request.target_node,
-            &stored.request.session_id,
+            stored.request.session_id.as_deref(),
         )?
         .map(|session| session.0),
         state: stored.state.clone(),
@@ -1689,22 +1834,23 @@ fn ready_execution_source_events(
     let conversation = dispatch.event.scope_id.clone();
     let proof = capsule_admission(&dispatch.event)?;
     let request: OperationRequest = serde_json::from_value(proof.source_body["request"].clone())?;
-    let binding = request
-        .binding
-        .as_ref()
-        .context("dispatch has no Task binding")?;
-    let task =
-        ready_execution_source_event(connection, space, &binding.binding.task_ref, Some(&project))?;
-    let task_proof = capsule_admission(&task.event)?;
-    let mut events = BTreeMap::from([
-        (dispatch.envelope.hash.clone(), dispatch),
-        (task.envelope.hash.clone(), task),
-    ]);
+    let mut proofs = vec![proof];
+    let mut events = BTreeMap::from([(dispatch.envelope.hash.clone(), dispatch)]);
+    if let Some(binding) = &request.binding {
+        let task = ready_execution_source_event(
+            connection,
+            space,
+            &binding.binding.task_ref,
+            Some(&project),
+        )?;
+        proofs.push(capsule_admission(&task.event)?);
+        events.insert(task.envelope.hash.clone(), task);
+    }
     let mut loaded_bytes = events
         .values()
         .map(|stored| stored.envelope.canonical_body.len())
         .sum::<usize>();
-    for proof in [&proof, &task_proof] {
+    for proof in &proofs {
         if proof.source_body["sdk_session"].is_null() {
             continue;
         }
@@ -1763,6 +1909,63 @@ fn ready_execution_source_events(
     Ok(events)
 }
 
+pub(crate) fn accepted_conversation_open_in(
+    connection: &Connection,
+    project: &ResourceRef,
+    operation: &OperationRequest,
+) -> Result<ExecutionHandoffResult> {
+    let session = operation
+        .session_id
+        .as_deref()
+        .context("conversation work has no session")?;
+    let rows = connection.prepare("SELECT result FROM operations WHERE space_id=? AND target_node=? AND session_id=? AND json_extract(request,'$.conversation_id')=? AND json_extract(request,'$.task_id') IS NULL AND json_extract(request,'$.action.type')='open' LIMIT 2")?
+        .query_map(params![project.space.as_str(), operation.target_node, session, operation.conversation_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        rows.len() == 1,
+        "conversation session has missing or ambiguous accepted Open"
+    );
+    let accepted: ExecutionHandoffResult = serde_json::from_str(&rows[0])?;
+    verify_execution_handoff_receipt_signature(
+        &accepted.handoff,
+        &accepted.receipt,
+        &accepted.result,
+    )?;
+    let source = accepted.handoff.handoff.source_statement()?;
+    let snapshot = accepted
+        .receipt
+        .payload
+        .session
+        .as_ref()
+        .context("successful conversation Open has no session snapshot")?;
+    ensure!(
+        snapshot.session_id == session
+            && snapshot.work == source.work
+            && snapshot.revision > 0
+            && !matches!(
+                snapshot.state.as_str(),
+                "opening" | "unknown" | "resolved" | "failed" | "closed"
+            ),
+        "conversation Open did not create an available execution session"
+    );
+    ensure!(
+        matches!(
+            accepted.handoff.handoff.origin,
+            ExecutionOrigin::ConversationOpen
+        ) && matches!(
+            accepted.receipt.payload.state,
+            ExecutionHandoffState::Succeeded
+        ) && source.project == *project
+            && source.conversation == operation.conversation_id
+            && source
+                .work
+                .execution_session()
+                .is_some_and(|value| value.session_id == session),
+        "conversation session source is not its successful original Open"
+    );
+    Ok(accepted)
+}
+
 fn execution_handoff_payload_from(
     connection: &Connection,
     state: &VerifiedPolicySet,
@@ -1799,16 +2002,35 @@ fn execution_handoff_payload_from(
     }
     let operation: OperationRequest =
         serde_json::from_value(original.source_body["request"].clone())?;
-    let binding = operation
-        .binding
-        .as_ref()
-        .context("operation has no task binding")?;
-    let task = events
-        .get(&binding.binding.task_ref)
-        .context("operation task creation is missing")?;
-    let task_proof = capsule_admission(&task.event)?;
+    let (origin, task_sdk_origin) = if let Some(binding) = &operation.binding {
+        let task = events
+            .get(&binding.binding.task_ref)
+            .context("operation task creation is missing")?;
+        let task_proof = capsule_admission(&task.event)?;
+        (
+            ExecutionOrigin::TaskSession {
+                task_creation: task.envelope.clone(),
+            },
+            compact_sdk_from_events(&events, &task_proof)?,
+        )
+    } else if operation.action["type"] == "command" {
+        (ExecutionOrigin::Command, None)
+    } else if operation.action["type"] == "open" {
+        (ExecutionOrigin::ConversationOpen, None)
+    } else {
+        let accepted_open = accepted_conversation_open_in(
+            connection,
+            &original.invocation.payload.resource,
+            &operation,
+        )?;
+        (
+            ExecutionOrigin::ConversationSession {
+                accepted_open: Box::new(accepted_open),
+            },
+            None,
+        )
+    };
     let sdk_origin = compact_sdk_from_events(&events, &original)?;
-    let task_sdk_origin = compact_sdk_from_events(&events, &task_proof)?;
     ensure!(
         identity.node_id()? == dispatch.event.author,
         "source capsule signer is not the Project host"
@@ -1816,7 +2038,7 @@ fn execution_handoff_payload_from(
     let mut handoff = ExecutionHandoff {
         version: AUTH_VERSION,
         project_dispatch: dispatch.envelope.clone(),
-        task_creation: task.envelope.clone(),
+        origin,
         sdk_origin,
         task_sdk_origin,
         execution_resource,
@@ -2325,13 +2547,15 @@ impl Store {
             |row| row.get(0),
         )?;
         ensure!(!reused, "handoff reused a prior executor resolution nonce");
-        check_execution_session_in(
-            &tx,
-            &original_space,
-            &operation.target_node,
-            &operation.session_id,
-            is_control(&operation),
-        )?;
+        if let Some(session_id) = operation.session_id.as_deref() {
+            check_execution_session_in(
+                &tx,
+                &original_space,
+                &operation.target_node,
+                session_id,
+                is_control(&operation),
+            )?;
+        }
         check_execution_resources_in(&tx, &operation.target_node, &resources)?;
         consume_freshness_with_policy_in(
             &tx,
@@ -2364,10 +2588,10 @@ impl Store {
             tx.execute("INSERT INTO execution_handoff_reservations(execution_space_id,original_space_id,operation_id,target_node,resource) VALUES(?,?,?,?,?)",
                 params![execution, original_space, operation_id, operation.target_node, resource])?;
         }
-        if operation.action["type"] == "open" {
+        if let Some(session) = session.filter(|_| operation.action["type"] == "open") {
             tx.execute("INSERT INTO execution_handoff_sessions(execution_space_id,original_space_id,original_resource_id,target_node,session_id,revision,binding,record) VALUES(?,?,?,?,?,?,?,?)",
                 params![execution, original_space, verified.original().resource().resource.as_str(), operation.target_node, operation.session_id, session.revision,
-                    serde_json::to_string(verified.binding())?, serde_json::to_string(&session)?])?;
+                    operation.binding.as_ref().map(serde_json::to_string).transpose()?, session_record(&session, verified.work())?])?;
         }
         if matches!(current, HandoffPolicy::TaskBusiness(_)) {
             current.bind_original_in(
@@ -2615,7 +2839,7 @@ impl Store {
             original_project.space.as_str(),
             original_project.resource.as_str(),
             target,
-            session,
+            Some(session),
         )?
         .map(|session| session.0))
     }
@@ -2702,17 +2926,18 @@ impl Store {
         if matches!(authority, HandoffRunningAuthorization::OperationCurrent(_)) {
             super::execution_binding_seal::ensure_handoff_generation_open_in(&tx, auth.wire())?;
         }
-        let (mut session, binding) = session_from(
+        let (mut session, binding, work) = session_from(
             &tx,
             execution_space,
             original_project.space.as_str(),
             original_project.resource.as_str(),
             &stored.request.target_node,
-            &stored.request.session_id,
+            stored.request.session_id.as_deref(),
         )?
         .context("native execution session is missing")?;
         ensure!(
-            stored.request.binding.as_ref() == Some(&binding)
+            stored.request.binding == binding
+                && work == stored.wire.handoff.source_statement()?.work
                 && session.revision == stored.request.expected_revision,
             "native session binding or revision changed"
         );
@@ -2724,7 +2949,7 @@ impl Store {
         }
         session.native_session_id = Some(native_session_id.to_owned());
         tx.execute("UPDATE execution_handoff_sessions SET record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=? AND revision=?",
-            params![serde_json::to_string(&session)?,execution_space,original_project.space.as_str(),original_project.resource.as_str(),stored.request.target_node,stored.request.session_id,session.revision])?;
+            params![session_record(&session, &stored.wire.handoff.source_statement()?.work)?,execution_space,original_project.space.as_str(),original_project.resource.as_str(),stored.request.target_node,stored.request.session_id,session.revision])?;
         authority.check_usage_in(&tx, &stored, usage, None)?;
         tx.commit()?;
         Ok(())
@@ -2842,7 +3067,10 @@ impl Store {
                 verification.run(|| {
                     let stored = stored_from(&tx, &execution, &original, &operation)?
                         .context("recovery handoff disappeared")?;
-                    super::execution_binding_seal::ensure_handoff_generation_open_in(&tx,&stored.wire)?;
+                    super::execution_binding_seal::ensure_handoff_generation_open_in(
+                        &tx,
+                        &stored.wire,
+                    )?;
                     reconstruct_handoff(&tx, &self.policy, &stored)?;
                     dto(&tx, identity, &stored, now_ms)
                 })
@@ -2913,29 +3141,27 @@ impl Store {
             return Ok(value);
         }
         let dispatch: Event = serde_json::from_str(&wire.handoff.project_dispatch.canonical_body)?;
-        let (mut session, binding) = session_from(
+        stored.state = OperationState::Unknown;
+        stored.result = json!({"reason":reason});
+        if let Some((mut session, binding, work)) = session_from(
             &tx,
             &execution,
             &original,
             dispatch.resource_id.as_str(),
             &stored.request.target_node,
-            &stored.request.session_id,
-        )?
-        .context("Unknown execution session disappeared")?;
-        ensure!(
-            stored.request.binding.as_ref() == Some(&binding),
-            "Unknown execution session changed its accepted binding"
-        );
-        stored.state = OperationState::Unknown;
-        stored.result = public_execution_result(
-            json!({"reason":reason}),
-            session.native_session_id.as_deref(),
-        );
-        session.state = "unknown".into();
-        session.native_session_id = None;
-        ensure!(tx.execute("UPDATE execution_handoff_sessions SET record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=? AND revision=?",
-            params![serde_json::to_string(&session)?,execution,original,dispatch.resource_id.as_str(),session.target_node,session.session_id,session.revision])? == 1,
-            "Unknown execution session changed before commit");
+            stored.request.session_id.as_deref(),
+        )? {
+            check_session_work(&work, &stored.request, &session, &binding)?;
+            ensure!(
+                work == stored.wire.handoff.source_statement()?.work,
+                "Unknown execution changed its original work"
+            );
+            session.state = "unknown".into();
+            session.native_session_id = None;
+            ensure!(tx.execute("UPDATE execution_handoff_sessions SET record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=? AND revision=?",
+                params![session_record(&session, &work)?,execution,original,dispatch.resource_id.as_str(),session.target_node,session.session_id,session.revision])? == 1,
+                "Unknown execution session changed before commit");
+        }
         let receipt = signed_receipt(&tx, identity, &stored, now_ms)?;
         ensure!(tx.execute("UPDATE execution_handoffs SET state='unknown',result=?,result_receipt=? WHERE execution_space_id=? AND original_space_id=? AND operation_id=? AND state IN ('accepted','running') AND handoff_hash=?",
             params![serde_json::to_string(&stored.result)?,serde_json::to_string(&receipt)?,execution,original,operation,wire.hash()?.as_str()])? == 1,
@@ -3060,14 +3286,14 @@ impl Store {
             original,
             dispatch.resource_id.as_str(),
             &stored.request.target_node,
-            &stored.request.session_id,
+            stored.request.session_id.as_deref(),
         )?;
         let native = session
             .and_then(|session| session.native_session_id.as_deref())
             .or_else(|| {
                 local_session
                     .as_ref()
-                    .and_then(|(session, _)| session.native_session_id.as_deref())
+                    .and_then(|(session, _, _)| session.native_session_id.as_deref())
             });
         result = public_execution_result(result, native);
         if stored.state.terminal() {
@@ -3120,23 +3346,28 @@ impl Store {
             }
         }
         if let Some(updated) = session {
-            let (previous, binding) = session_from(
+            ensure!(
+                stored.request.session_id.is_some(),
+                "command completion cannot create a session"
+            );
+            let (previous, binding, work) = session_from(
                 &tx,
                 execution,
                 original,
                 dispatch.resource_id.as_str(),
                 &stored.request.target_node,
-                &stored.request.session_id,
+                stored.request.session_id.as_deref(),
             )?
             .context("execution session disappeared")?;
             ensure!(
                 updated.network_id == execution
                     && updated.target_node == stored.request.target_node
-                    && updated.session_id == stored.request.session_id
+                    && Some(updated.session_id.as_str()) == stored.request.session_id.as_deref()
                     && updated.cwd == previous.cwd
                     && updated.executor == previous.executor
                     && updated.revision >= previous.revision
-                    && stored.request.binding.as_ref() == Some(&binding),
+                    && stored.request.binding == binding
+                    && work == stored.wire.handoff.source_statement()?.work,
                 "execution completion changed its session namespace or binding"
             );
             let mut updated = updated.clone();
@@ -3154,15 +3385,15 @@ impl Store {
                 updated.native_session_id = None;
             }
             tx.execute("UPDATE execution_handoff_sessions SET revision=?,record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=?",
-                params![updated.revision, serde_json::to_string(&updated)?, execution, original, dispatch.resource_id.as_str(), stored.request.target_node, stored.request.session_id])?;
+                params![updated.revision, session_record(&updated, &stored.wire.handoff.source_statement()?.work)?, execution, original, dispatch.resource_id.as_str(), stored.request.target_node, stored.request.session_id])?;
         } else if state.terminal() {
-            if let Some((mut previous, _)) = session_from(
+            if let Some((mut previous, _, _)) = session_from(
                 &tx,
                 execution,
                 original,
                 dispatch.resource_id.as_str(),
                 &stored.request.target_node,
-                &stored.request.session_id,
+                stored.request.session_id.as_deref(),
             )? {
                 previous.revision = previous.revision.max(
                     stored
@@ -3172,7 +3403,7 @@ impl Store {
                         .context("execution revision overflow")?,
                 );
                 tx.execute("UPDATE execution_handoff_sessions SET revision=?,record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=?",
-                    params![previous.revision, serde_json::to_string(&previous)?, execution, original, dispatch.resource_id.as_str(), stored.request.target_node, stored.request.session_id])?;
+                    params![previous.revision, session_record(&previous, &stored.wire.handoff.source_statement()?.work)?, execution, original, dispatch.resource_id.as_str(), stored.request.target_node, stored.request.session_id])?;
             }
         }
         if state == OperationState::Unknown
@@ -3509,33 +3740,41 @@ fn resolution_original_observation_from(
     );
     let dispatch: Event =
         serde_json::from_str(&stored.wire.handoff.project_dispatch.canonical_body)?;
-    let (session, binding) = session_from(
+    let session = session_from(
         connection,
         &execution,
         &original,
         dispatch.resource_id.as_str(),
         &stored.request.target_node,
-        &stored.request.session_id,
-    )?
-    .context("unknown execution session disappeared")?;
-    let snapshot = wire
-        .resolution
-        .observation
-        .receipt
-        .payload
-        .session
-        .as_ref()
-        .context("unknown receipt has no signed session state")?;
-    ensure!(
-        stored.request.binding.as_ref() == Some(&binding)
-            && snapshot.revision == session.revision
-            && snapshot.session_id == session.session_id
-            && snapshot.target == stored.wire.handoff.execution_audience.device
-            && snapshot.cwd == session.cwd
-            && snapshot.executor == session.executor
-            && snapshot.state == session.state,
-        "unknown receipt differs from the executor's current session revision or binding"
-    );
+        stored.request.session_id.as_deref(),
+    )?;
+    let snapshot = wire.resolution.observation.receipt.payload.session.as_ref();
+    match (session, snapshot) {
+        (Some((session, binding, work)), Some(snapshot)) => {
+            ensure!(
+                work == stored.wire.handoff.source_statement()?.work && snapshot.work == work,
+                "unknown receipt changed its original work"
+            );
+            check_session_work(&work, &stored.request, &session, &binding)?;
+            ensure!(
+                snapshot.revision == session.revision
+                    && snapshot.session_id == session.session_id
+                    && snapshot.target == stored.wire.handoff.execution_audience.device
+                    && snapshot.cwd == session.cwd
+                    && snapshot.executor == session.executor
+                    && snapshot.state == session.state,
+                "unknown receipt differs from the executor's current session"
+            );
+        }
+        (None, None) => ensure!(
+            matches!(
+                stored.wire.handoff.source_statement()?.work,
+                ExecutionWork::Command { .. }
+            ),
+            "session work lost its signed session state"
+        ),
+        _ => anyhow::bail!("unknown receipt changed its session presence"),
+    }
     Ok(stored)
 }
 
@@ -4162,30 +4401,31 @@ impl Store {
         ensure!(tx.execute("UPDATE execution_handoffs SET state=?,result=? WHERE execution_space_id=? AND original_space_id=? AND operation_id=? AND state='unknown' AND handoff_hash=?",
             params![state_text(&stored.state)?,serde_json::to_string(&stored.result)?,execution,original,operation,stored.wire.hash()?.as_str()])?==1,
             "unknown handoff changed before the explicit resolution");
-        let (mut session, binding) = session_from(
+        if let Some((mut session, binding, work)) = session_from(
             &tx,
             &execution,
             &original,
             dispatch.resource_id.as_str(),
             &stored.request.target_node,
-            &stored.request.session_id,
-        )?
-        .context("resolved session disappeared")?;
-        ensure!(
-            stored.request.binding.as_ref() == Some(&binding),
-            "resolved session binding changed"
-        );
-        session.revision = session.revision.max(
-            stored
-                .request
-                .expected_revision
-                .checked_add(1)
-                .context("resolved session revision overflow")?,
-        );
-        session.native_session_id = None;
-        session.state = "resolved".into();
-        tx.execute("UPDATE execution_handoff_sessions SET revision=?,record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=?",
-            params![session.revision,serde_json::to_string(&session)?,execution,original,dispatch.resource_id.as_str(),session.target_node,session.session_id])?;
+            stored.request.session_id.as_deref(),
+        )? {
+            ensure!(
+                stored.request.binding == binding
+                    && work == stored.wire.handoff.source_statement()?.work,
+                "resolved session binding changed"
+            );
+            session.revision = session.revision.max(
+                stored
+                    .request
+                    .expected_revision
+                    .checked_add(1)
+                    .context("resolved session revision overflow")?,
+            );
+            session.native_session_id = None;
+            session.state = "resolved".into();
+            tx.execute("UPDATE execution_handoff_sessions SET revision=?,record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=?",
+            params![session.revision,session_record(&session, &stored.wire.handoff.source_statement()?.work)?,execution,original,dispatch.resource_id.as_str(),session.target_node,session.session_id])?;
+        }
         let handoff_receipt = signed_receipt(&tx, identity, &stored, now_ms)?;
         let signer = vibeface_secure::Identity::from_secret_hex(&identity.secret_key_hex)
             .map_err(anyhow::Error::msg)?;
@@ -4338,11 +4578,6 @@ pub(crate) fn validate_execution_handoff_storage(
         );
         if let Some(receipt) = &stored.receipt {
             receipt.verify_signature()?;
-            let binding = stored
-                .request
-                .binding
-                .as_ref()
-                .context("stored handoff binding is missing")?;
             let value = &receipt.payload;
             ensure!(
                 receipt.issuer == stored.wire.handoff.target_public_key
@@ -4352,8 +4587,7 @@ pub(crate) fn validate_execution_handoff_storage(
                     && value.operation_id == operation
                     && value.handoff_hash == stored.wire.hash()?
                     && value.target == stored.wire.handoff.execution_audience.device
-                    && value.session_id == stored.request.session_id
-                    && value.binding_generation == binding.binding.generation
+                    && value.work == stored.wire.handoff.source_statement()?.work
                     && serde_json::to_value(value.state)? == serde_json::to_value(&stored.state)?
                     && value.result_hash == ObjectHash::body(&stored.result)?
                     && value.issued_at_ms >= stored.admitted_at_ms,
@@ -4479,12 +4713,13 @@ pub(crate) mod tests {
                 conversation_id: "conversation".into(),
                 task_id: Some("task-handoff".into()),
                 target_node: executor.node.node_id()?,
-                session_id: "same-session".into(),
+                session_id: Some("same-session".into()),
                 expected_revision: 0,
                 basis_heads: vec![task.hash.clone()],
                 action: bound.binding.open_spec.clone(),
                 resources: vec![executor.project.to_str().unwrap().into()],
                 binding: Some(bound),
+                manager_authority: None,
             };
             let body = json!({"method":"operate","space_id":project.space,"resource_id":project.resource,"authorization_id":operation.operation_id,"request":operation});
             let mut expected = vec![
@@ -4513,7 +4748,10 @@ pub(crate) mod tests {
                 task: Some(EventRef::parse(&task.hash)?),
                 execution_session: Some(SessionRef {
                     target: target.device.clone(),
-                    session_id: operation.session_id.clone(),
+                    session_id: operation
+                        .session_id
+                        .clone()
+                        .context("fixture session is missing")?,
                 }),
                 executor_kind: Some(executor_kind.into()),
                 workspace_resource: Some(project.resource.clone()),
@@ -4614,7 +4852,9 @@ pub(crate) mod tests {
             let mut handoff = ExecutionHandoff {
                 version: AUTH_VERSION,
                 project_dispatch: dispatch,
-                task_creation: task,
+                origin: ExecutionOrigin::TaskSession {
+                    task_creation: task,
+                },
                 sdk_origin: None,
                 task_sdk_origin: None,
                 execution_resource: execution_resource.clone(),
@@ -5149,7 +5389,7 @@ pub(crate) mod tests {
             };
             let body = json!({"method":"resolve_unknown","resolution_purpose":purpose,"space_id":project.space,"resource_id":project.resource,
                 "authorization_id":"explicit-resolution","operation_id":"original-operation","conversation_id":"conversation",
-                "task_id":"task-handoff","task_ref":self.wire.handoff.task_creation.hash,"target_node":self.executor.node.node_id()?,
+                "task_id":"task-handoff","task_ref":self.wire.handoff.source_statement()?.work.task_ref().context("fixture Task missing")?,"target_node":self.executor.node.node_id()?,
                 "session_id":"same-session","outcome":outcome,"evidence":"verified stopped process and external side effects",
                 "execution_resource":self.wire.handoff.execution_resource,"target_public_key":self.wire.handoff.target_public_key,
                 "execution_grant":carrier_grant.hash()?,"original_handoff_hash":self.wire.hash()?,
@@ -5603,194 +5843,535 @@ pub(crate) mod tests {
 
         fn remote_seal_body(&self) -> Result<Value> {
             let observed = self.store.execution_handoff_status(
-                &self.executor.node, self.executor.space.as_str(),
-                self.project.space.as_str(), "original-operation", now() + 20,
+                &self.executor.node,
+                self.executor.space.as_str(),
+                self.project.space.as_str(),
+                "original-operation",
+                now() + 20,
             )?;
-            Ok(json!({"method":"seal_remote_execution","space_id":self.executor.space,
+            Ok(
+                json!({"method":"seal_remote_execution","space_id":self.executor.space,
                 "resource_id":self.wire.handoff.execution_resource.resource,
                 "authorization_id":"seal-generation-one","original_space_id":self.project.space,
                 "operation_id":"original-operation","binding":request(&self.wire)?.binding,
-                "execution_receipt":observed.receipt.context("C receipt is missing")?}))
+                "execution_receipt":observed.receipt.context("C receipt is missing")?}),
+            )
         }
 
         fn executor_seal_grant(&mut self, body: &Value) -> Result<ObjectHash> {
             let key = PublicKey::parse(&self.executor.node.public_key_hex()?)?;
             let (facts, _) = execution_binding_seal::execution_binding_seal_facts(
-                body, &self.wire.handoff.execution_audience, &key,
+                body,
+                &self.wire.handoff.execution_audience,
+                &key,
             )?;
-            let previous = self.store.policy.verified()
-                .head(&PolicyDomain::Space(self.executor.space.clone())).unwrap().clone();
-            let grant = Signed::sign(Grant {
-                execution_source: None,
-                version:AUTH_VERSION, owner_space:self.executor.space.clone(),
-                scope:ResourceScope::Exact(facts.resource),
-                grantee:Grantee::Actor(Actor::Account(self.executor.account.clone())),
-                actions:vec![Action::ExecutionRebind,Action::OperationStatusRead],
-                audience:facts.audience,
-                constraints:GrantConstraints {context:facts.context,..Default::default()},
-                parent:None,remaining_delegations:0,issued_under:previous.clone(),
-                not_before_ms:now(),expires_at_ms:now()+100_000,nonce:Nonce::random()?,
-            },&self.executor.root)?;
+            let previous = self
+                .store
+                .policy
+                .verified()
+                .head(&PolicyDomain::Space(self.executor.space.clone()))
+                .unwrap()
+                .clone();
+            let grant = Signed::sign(
+                Grant {
+                    execution_source: None,
+                    version: AUTH_VERSION,
+                    owner_space: self.executor.space.clone(),
+                    scope: ResourceScope::Exact(facts.resource),
+                    grantee: Grantee::Actor(Actor::Account(self.executor.account.clone())),
+                    actions: vec![Action::ExecutionRebind, Action::OperationStatusRead],
+                    audience: facts.audience,
+                    constraints: GrantConstraints {
+                        context: facts.context,
+                        ..Default::default()
+                    },
+                    parent: None,
+                    remaining_delegations: 0,
+                    issued_under: previous.clone(),
+                    not_before_ms: now(),
+                    expires_at_ms: now() + 100_000,
+                    nonce: Nonce::random()?,
+                },
+                &self.executor.root,
+            )?;
             let leaf = grant.hash()?;
-            let mut document = self.store.policy.verified().space(&self.executor.space).unwrap().clone();
-            document.previous=Some(previous);document.sequence+=1;
-            document.grants.push(leaf.clone());document.grants.sort();
-            self.store.install_policy_journal(&[
-                JournalEntry::Grant(grant),JournalEntry::Space(Signed::sign(document,&self.executor.root)?),
-            ],now()+20)?;
+            let mut document = self
+                .store
+                .policy
+                .verified()
+                .space(&self.executor.space)
+                .unwrap()
+                .clone();
+            document.previous = Some(previous);
+            document.sequence += 1;
+            document.grants.push(leaf.clone());
+            document.grants.sort();
+            self.store.install_policy_journal(
+                &[
+                    JournalEntry::Grant(grant),
+                    JournalEntry::Space(Signed::sign(document, &self.executor.root)?),
+                ],
+                now() + 20,
+            )?;
             Ok(leaf)
         }
 
         fn authorize_executor_seal(
-            &mut self, body: &Value, leaf: &ObjectHash,
-        ) -> Result<(VerifiedAuthorization,super::super::policy::FreshnessProof,TransportEvidence)> {
+            &mut self,
+            body: &Value,
+            leaf: &ObjectHash,
+        ) -> Result<(
+            VerifiedAuthorization,
+            super::super::policy::FreshnessProof,
+            TransportEvidence,
+        )> {
             let audience = self.wire.handoff.execution_audience.clone();
-            let facts = self.store.remote_execution_seal_facts(body,&audience,now()+21)?;
+            let facts = self
+                .store
+                .remote_execution_seal_facts(body, &audience, now() + 21)?;
             let device = DeviceId::from_key(&PublicKey::of(&self.executor.client));
-            let mut heads = [PolicyDomain::Account(self.executor.account.clone()),
-                PolicyDomain::Space(self.executor.space.clone())].iter()
-                .map(|domain| self.store.policy.verified().head(domain).unwrap().clone())
-                .collect::<Vec<_>>();
-            heads.sort_by(|left,right|left.domain.cmp(&right.domain));
-            let invocation = Signed::sign(Invocation {
-                version:AUTH_VERSION,actor:Actor::Account(self.executor.account.clone()),
-                device:device.clone(),initiator:Actor::Account(self.executor.account.clone()),
-                initiating_grant:None,resource:facts.resource.clone(),action:facts.action,
-                audience,presenter:device.clone(),operation_id:facts.operation_id.clone(),
-                body_hash:facts.body_hash.clone(),grant_leaf:leaf.clone(),expected_policies:heads,
-                context:facts.context.clone(),nonce:Nonce::random()?,not_before_ms:now()+21,
-                expires_at_ms:now()+10_000,
-            },&self.executor.client)?;
-            let transport=TransportEvidence::DirectNoise{device};
-            let auth=self.store.authorize_request(&invocation,&facts,&transport,now()+21)?;
-            let challenge=self.store.issue_freshness(&auth,CheckStage::Admit,now()+21)?;
-            let receipts=self.store.sign_current_receipts(&challenge,&self.executor.node,now()+21)?;
-            Ok((auth,super::super::policy::FreshnessProof{challenge,receipts},transport))
+            let mut heads = [
+                PolicyDomain::Account(self.executor.account.clone()),
+                PolicyDomain::Space(self.executor.space.clone()),
+            ]
+            .iter()
+            .map(|domain| self.store.policy.verified().head(domain).unwrap().clone())
+            .collect::<Vec<_>>();
+            heads.sort_by(|left, right| left.domain.cmp(&right.domain));
+            let invocation = Signed::sign(
+                Invocation {
+                    version: AUTH_VERSION,
+                    actor: Actor::Account(self.executor.account.clone()),
+                    device: device.clone(),
+                    initiator: Actor::Account(self.executor.account.clone()),
+                    initiating_grant: None,
+                    resource: facts.resource.clone(),
+                    action: facts.action,
+                    audience,
+                    presenter: device.clone(),
+                    operation_id: facts.operation_id.clone(),
+                    body_hash: facts.body_hash.clone(),
+                    grant_leaf: leaf.clone(),
+                    expected_policies: heads,
+                    context: facts.context.clone(),
+                    nonce: Nonce::random()?,
+                    not_before_ms: now() + 21,
+                    expires_at_ms: now() + 10_000,
+                },
+                &self.executor.client,
+            )?;
+            let transport = TransportEvidence::DirectNoise { device };
+            let auth = self
+                .store
+                .authorize_request(&invocation, &facts, &transport, now() + 21)?;
+            let challenge = self
+                .store
+                .issue_freshness(&auth, CheckStage::Admit, now() + 21)?;
+            let receipts =
+                self.store
+                    .sign_current_receipts(&challenge, &self.executor.node, now() + 21)?;
+            Ok((
+                auth,
+                super::super::policy::FreshnessProof {
+                    challenge,
+                    receipts,
+                },
+                transport,
+            ))
         }
     }
 
     #[tokio::test]
-    async fn compact_remote_seal_requires_current_exact_authority_and_persists_one_generation_fence() -> Result<()> {
+    async fn compact_remote_seal_requires_current_exact_authority_and_persists_one_generation_fence()
+    -> Result<()> {
         use super::super::execution_binding_seal::RemoteExecutionSealPreflight;
-        let mut fixture=Fixture::new()?;
+        let mut fixture = Fixture::new()?;
         fixture.accept()?;
-        let start=fixture.freshness(CheckStage::Start,now()+3)?;
-        let execution=fixture.store.execution_handoff_authorization(fixture.executor.space.as_str(),
-            fixture.project.space.as_str(),"original-operation",now()+4)?;
-        fixture.store.claim_execution_handoff(&fixture.executor.node,&execution,&start,now()+4)?;
-        let project=ResourceRef{space:fixture.project.space.clone(),resource:fixture.project.resource.clone()};
-        let mut session=fixture.store.execution_handoff_session(fixture.executor.space.as_str(),&project,
-            &fixture.executor.node.node_id()?,"same-session")?.context("C session is missing")?;
-        session.state="idle".into();session.native_session_id=Some("private-native-session".into());
-        fixture.store.finish_execution_handoff(&fixture.executor.node,fixture.executor.space.as_str(),
-            fixture.project.space.as_str(),"original-operation",OperationState::Succeeded,
-            json!({"done":true}),Some(&session),now()+5)?;
-        let body=fixture.remote_seal_body()?;
+        let start = fixture.freshness(CheckStage::Start, now() + 3)?;
+        let execution = fixture.store.execution_handoff_authorization(
+            fixture.executor.space.as_str(),
+            fixture.project.space.as_str(),
+            "original-operation",
+            now() + 4,
+        )?;
+        fixture.store.claim_execution_handoff(
+            &fixture.executor.node,
+            &execution,
+            &start,
+            now() + 4,
+        )?;
+        let project = ResourceRef {
+            space: fixture.project.space.clone(),
+            resource: fixture.project.resource.clone(),
+        };
+        let mut session = fixture
+            .store
+            .execution_handoff_session(
+                fixture.executor.space.as_str(),
+                &project,
+                &fixture.executor.node.node_id()?,
+                "same-session",
+            )?
+            .context("C session is missing")?;
+        session.state = "idle".into();
+        session.native_session_id = Some("private-native-session".into());
+        fixture.store.finish_execution_handoff(
+            &fixture.executor.node,
+            fixture.executor.space.as_str(),
+            fixture.project.space.as_str(),
+            "original-operation",
+            OperationState::Succeeded,
+            json!({"done":true}),
+            Some(&session),
+            now() + 5,
+        )?;
+        let body = fixture.remote_seal_body()?;
         assert!(body.get("execution_observation").is_none());
-        let broad=fixture.executor.bundle.grant_leaf.clone();
-        let (auth,proof,transport)=fixture.authorize_executor_seal(&body,&broad)?;
-        let before=fixture.store.connection.total_changes();
-        assert!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
-            &auth,&proof,&transport,&body,now()+22).is_err());
-        assert_eq!(fixture.store.connection.total_changes(),before);
-        let leaf=fixture.executor_seal_grant(&body)?;
-        let (auth,proof,transport)=fixture.authorize_executor_seal(&body,&leaf)?;
+        let broad = fixture.executor.bundle.grant_leaf.clone();
+        let (auth, proof, transport) = fixture.authorize_executor_seal(&body, &broad)?;
+        let before = fixture.store.connection.total_changes();
+        assert!(
+            fixture
+                .store
+                .authorize_remote_execution_seal_fence(
+                    &fixture.executor.node,
+                    &auth,
+                    &proof,
+                    &transport,
+                    &body,
+                    now() + 22
+                )
+                .is_err()
+        );
+        assert_eq!(fixture.store.connection.total_changes(), before);
+        let leaf = fixture.executor_seal_grant(&body)?;
+        let (auth, proof, transport) = fixture.authorize_executor_seal(&body, &leaf)?;
         fixture.store.connection.execute("INSERT INTO execution_handoff_reservations(execution_space_id,original_space_id,operation_id,target_node,resource) VALUES(?,?,?,?,?)",
             params![fixture.executor.space.as_str(),fixture.project.space.as_str(),"original-operation",fixture.executor.node.node_id()?,fixture.executor.project.to_str().unwrap()])?;
-        let before=fixture.store.connection.total_changes();
-        assert!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
-            &auth,&proof,&transport,&body,now()+22).is_err());
-        assert_eq!(fixture.store.connection.total_changes(),before);
-        fixture.store.connection.execute("DELETE FROM execution_handoff_reservations WHERE operation_id='original-operation'",[])?;
-        assert!(matches!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
-            &auth,&proof,&transport,&body,now()+22)?,RemoteExecutionSealPreflight::Fence(_)));
-        let wrong_stop=fixture.fence("another-operation").await?;
-        assert!(fixture.store.seal_remote_execution_authorized(&fixture.executor.node,
-            &auth,&proof,&transport,&body,&wrong_stop,now()+22).is_err());
-        let stopped=fixture.fence("original-operation").await?;
+        let before = fixture.store.connection.total_changes();
+        assert!(
+            fixture
+                .store
+                .authorize_remote_execution_seal_fence(
+                    &fixture.executor.node,
+                    &auth,
+                    &proof,
+                    &transport,
+                    &body,
+                    now() + 22
+                )
+                .is_err()
+        );
+        assert_eq!(fixture.store.connection.total_changes(), before);
+        fixture.store.connection.execute(
+            "DELETE FROM execution_handoff_reservations WHERE operation_id='original-operation'",
+            [],
+        )?;
+        assert!(matches!(
+            fixture.store.authorize_remote_execution_seal_fence(
+                &fixture.executor.node,
+                &auth,
+                &proof,
+                &transport,
+                &body,
+                now() + 22
+            )?,
+            RemoteExecutionSealPreflight::Fence(_)
+        ));
+        let wrong_stop = fixture.fence("another-operation").await?;
+        assert!(
+            fixture
+                .store
+                .seal_remote_execution_authorized(
+                    &fixture.executor.node,
+                    &auth,
+                    &proof,
+                    &transport,
+                    &body,
+                    &wrong_stop,
+                    now() + 22
+                )
+                .is_err()
+        );
+        let stopped = fixture.fence("original-operation").await?;
         fixture.store.connection.execute_batch("CREATE TRIGGER reject_generation_seal BEFORE INSERT ON execution_binding_seals BEGIN SELECT RAISE(ABORT,'injected seal failure'); END")?;
-        let failure=fixture.store.seal_remote_execution_authorized(&fixture.executor.node,
-            &auth,&proof,&transport,&body,&stopped,now()+22).expect_err("seal persistence must roll back");
-        assert!(format!("{failure:#}").contains("injected seal failure"),"{failure:#}");
-        let retained=fixture.store.execution_handoff_session(fixture.executor.space.as_str(),&project,
-            &fixture.executor.node.node_id()?,"same-session")?.unwrap();
-        assert_eq!(retained.state,"idle");
-        assert_eq!(retained.native_session_id.as_deref(),Some("private-native-session"));
-        assert_eq!(fixture.store.connection.query_row("SELECT COUNT(*) FROM execution_binding_seals",[],|row|row.get::<_,u64>(0))?,0);
-        fixture.store.connection.execute_batch("DROP TRIGGER reject_generation_seal")?;
-        let usage=vibeface_secure::signature_verification::SignatureVerification::new();
+        let failure = fixture
+            .store
+            .seal_remote_execution_authorized(
+                &fixture.executor.node,
+                &auth,
+                &proof,
+                &transport,
+                &body,
+                &stopped,
+                now() + 22,
+            )
+            .expect_err("seal persistence must roll back");
+        assert!(
+            format!("{failure:#}").contains("injected seal failure"),
+            "{failure:#}"
+        );
+        let retained = fixture
+            .store
+            .execution_handoff_session(
+                fixture.executor.space.as_str(),
+                &project,
+                &fixture.executor.node.node_id()?,
+                "same-session",
+            )?
+            .unwrap();
+        assert_eq!(retained.state, "idle");
+        assert_eq!(
+            retained.native_session_id.as_deref(),
+            Some("private-native-session")
+        );
+        assert_eq!(
+            fixture.store.connection.query_row(
+                "SELECT COUNT(*) FROM execution_binding_seals",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            0
+        );
+        fixture
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER reject_generation_seal")?;
+        let usage = vibeface_secure::signature_verification::SignatureVerification::new();
         usage.run(|| -> Result<()> {
-            let facts=fixture.store.remote_execution_seal_facts(&body,&fixture.wire.handoff.execution_audience,now()+22)?;
-            fixture.store.authorize_request(auth.signed_invocation(),&facts,&transport,now()+22)?;
-            assert!(matches!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
-                &auth,&proof,&transport,&body,now()+22)?,RemoteExecutionSealPreflight::Fence(_)));
+            let facts = fixture.store.remote_execution_seal_facts(
+                &body,
+                &fixture.wire.handoff.execution_audience,
+                now() + 22,
+            )?;
+            fixture.store.authorize_request(
+                auth.signed_invocation(),
+                &facts,
+                &transport,
+                now() + 22,
+            )?;
+            assert!(matches!(
+                fixture.store.authorize_remote_execution_seal_fence(
+                    &fixture.executor.node,
+                    &auth,
+                    &proof,
+                    &transport,
+                    &body,
+                    now() + 22
+                )?,
+                RemoteExecutionSealPreflight::Fence(_)
+            ));
             Ok(())
         })?;
-        let seal=usage.run(||fixture.store.seal_remote_execution_authorized(&fixture.executor.node,
-            &auth,&proof,&transport,&body,&stopped,now()+22))?;
-        println!("REMOTE_SEAL_SIGNATURE_USAGE {}",serde_json::to_string(&usage.counts())?);
-        binding::verify_seal(&seal,&fixture.executor.node.public_key_hex()?)?;
-        let verify=|revision:&str,project_key:&str,execution_key:&str| {
-            execution_binding_seal::verify_remote_execution_seal(&body["binding"].to_string(),
-                &serde_json::to_string(&seal).unwrap(),project_key,execution_key,revision)
+        let seal = usage.run(|| {
+            fixture.store.seal_remote_execution_authorized(
+                &fixture.executor.node,
+                &auth,
+                &proof,
+                &transport,
+                &body,
+                &stopped,
+                now() + 22,
+            )
+        })?;
+        println!(
+            "REMOTE_SEAL_SIGNATURE_USAGE {}",
+            serde_json::to_string(&usage.counts())?
+        );
+        binding::verify_seal(&seal, &fixture.executor.node.public_key_hex()?)?;
+        let verify = |revision: &str, project_key: &str, execution_key: &str| {
+            execution_binding_seal::verify_remote_execution_seal(
+                &body["binding"].to_string(),
+                &serde_json::to_string(&seal).unwrap(),
+                project_key,
+                execution_key,
+                revision,
+            )
         };
-        let project_key=fixture.project.node.public_key_hex()?;
-        let execution_key=fixture.executor.node.public_key_hex()?;
-        assert_eq!(serde_json::from_str::<binding::SignedSeal>(&verify(&seal.seal.final_revision.to_string(),
-            &project_key,&execution_key).map_err(anyhow::Error::msg)?)?,seal);
-        assert!(verify(&(seal.seal.final_revision+1).to_string(),&project_key,&execution_key).is_err());
-        assert!(verify(&seal.seal.final_revision.to_string(),&execution_key,&execution_key).is_err());
-        assert!(verify(&seal.seal.final_revision.to_string(),&project_key,&project_key).is_err());
-        assert!(verify("9007199254740992",&project_key,&execution_key).is_err());
-        assert!(verify("1.5",&project_key,&execution_key).is_err());
-        let closed=fixture.store.execution_handoff_session(fixture.executor.space.as_str(),&project,
-            &fixture.executor.node.node_id()?,"same-session")?.unwrap();
-        assert_eq!(closed.state,"closed");assert_eq!(closed.native_session_id,None);
-        let before=fixture.store.connection.total_changes();
-        assert!(matches!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
-            &auth,&proof,&transport,&body,now()+23)?,RemoteExecutionSealPreflight::Existing(ref saved) if saved==&seal));
-        assert_eq!(fixture.store.connection.total_changes(),before);
-        let (replacement,replacement_proof,replacement_transport)=fixture.authorize_executor_seal(&body,&leaf)?;
-        assert!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
-            &replacement,&replacement_proof,&replacement_transport,&body,now()+23).is_err());
-        let mut status=body.clone();status["method"]=json!("remote_execution_seal_status");
-        status["authorization_id"]=json!("read-seal-generation-one");
-        status["seal_invocation_hash"]=json!(auth.signed_invocation().hash()?);
-        let (reader,reader_proof,reader_transport)=fixture.authorize_executor_seal(&status,&leaf)?;
-        assert_eq!(fixture.store.remote_execution_seal_status_authorized(&fixture.executor.node,
-            &reader,&reader_proof,&reader_transport,&status,now()+23)?,Some(seal.clone()));
-        let mut wrong_status=status.clone();wrong_status["seal_invocation_hash"]=json!(replacement.signed_invocation().hash()?);
-        let (wrong_reader,wrong_proof,wrong_transport)=fixture.authorize_executor_seal(&wrong_status,&leaf)?;
-        assert!(fixture.store.remote_execution_seal_status_authorized(&fixture.executor.node,
-            &wrong_reader,&wrong_proof,&wrong_transport,&wrong_status,now()+23).is_err());
-        let mut replacement=fixture.wire.clone();
-        let mut invocation=replacement.invocation.payload.clone();
+        let project_key = fixture.project.node.public_key_hex()?;
+        let execution_key = fixture.executor.node.public_key_hex()?;
+        assert_eq!(
+            serde_json::from_str::<binding::SignedSeal>(
+                &verify(
+                    &seal.seal.final_revision.to_string(),
+                    &project_key,
+                    &execution_key
+                )
+                .map_err(anyhow::Error::msg)?
+            )?,
+            seal
+        );
+        assert!(
+            verify(
+                &(seal.seal.final_revision + 1).to_string(),
+                &project_key,
+                &execution_key
+            )
+            .is_err()
+        );
+        assert!(
+            verify(
+                &seal.seal.final_revision.to_string(),
+                &execution_key,
+                &execution_key
+            )
+            .is_err()
+        );
+        assert!(
+            verify(
+                &seal.seal.final_revision.to_string(),
+                &project_key,
+                &project_key
+            )
+            .is_err()
+        );
+        assert!(verify("9007199254740992", &project_key, &execution_key).is_err());
+        assert!(verify("1.5", &project_key, &execution_key).is_err());
+        let closed = fixture
+            .store
+            .execution_handoff_session(
+                fixture.executor.space.as_str(),
+                &project,
+                &fixture.executor.node.node_id()?,
+                "same-session",
+            )?
+            .unwrap();
+        assert_eq!(closed.state, "closed");
+        assert_eq!(closed.native_session_id, None);
+        let before = fixture.store.connection.total_changes();
+        assert!(
+            matches!(fixture.store.authorize_remote_execution_seal_fence(&fixture.executor.node,
+            &auth,&proof,&transport,&body,now()+23)?,RemoteExecutionSealPreflight::Existing(ref saved) if saved==&seal)
+        );
+        assert_eq!(fixture.store.connection.total_changes(), before);
+        let (replacement, replacement_proof, replacement_transport) =
+            fixture.authorize_executor_seal(&body, &leaf)?;
+        assert!(
+            fixture
+                .store
+                .authorize_remote_execution_seal_fence(
+                    &fixture.executor.node,
+                    &replacement,
+                    &replacement_proof,
+                    &replacement_transport,
+                    &body,
+                    now() + 23
+                )
+                .is_err()
+        );
+        let mut status = body.clone();
+        status["method"] = json!("remote_execution_seal_status");
+        status["authorization_id"] = json!("read-seal-generation-one");
+        status["seal_invocation_hash"] = json!(auth.signed_invocation().hash()?);
+        let (reader, reader_proof, reader_transport) =
+            fixture.authorize_executor_seal(&status, &leaf)?;
+        assert_eq!(
+            fixture.store.remote_execution_seal_status_authorized(
+                &fixture.executor.node,
+                &reader,
+                &reader_proof,
+                &reader_transport,
+                &status,
+                now() + 23
+            )?,
+            Some(seal.clone())
+        );
+        let mut wrong_status = status.clone();
+        wrong_status["seal_invocation_hash"] = json!(replacement.signed_invocation().hash()?);
+        let (wrong_reader, wrong_proof, wrong_transport) =
+            fixture.authorize_executor_seal(&wrong_status, &leaf)?;
+        assert!(
+            fixture
+                .store
+                .remote_execution_seal_status_authorized(
+                    &fixture.executor.node,
+                    &wrong_reader,
+                    &wrong_proof,
+                    &wrong_transport,
+                    &wrong_status,
+                    now() + 23
+                )
+                .is_err()
+        );
+        let mut replacement = fixture.wire.clone();
+        let mut invocation = replacement.invocation.payload.clone();
         for head in &mut invocation.expected_policies {
-            *head=fixture.store.policy.verified().head(&head.domain).unwrap().clone();
+            *head = fixture
+                .store
+                .policy
+                .verified()
+                .head(&head.domain)
+                .unwrap()
+                .clone();
         }
-        invocation.nonce=Nonce::random()?;
-        let signer=Identity::from_secret_hex(&fixture.project.node.secret_key_hex).map_err(anyhow::Error::msg)?;
-        replacement.invocation=Signed::sign(invocation,&signer)?;
-        let failure=fixture.store.issue_execution_handoff_challenge(&replacement,&fixture.transport,
-            CheckStage::Admit,now()+23).expect_err("sealed generation cannot issue another challenge");
-        assert!(format!("{failure:#}").contains("generation is sealed"),"{failure:#}");
-        assert!(fixture.store.renew_execution_handoff(&fixture.executor.node,&execution,&start,now()+23).is_err());
+        invocation.nonce = Nonce::random()?;
+        let signer = Identity::from_secret_hex(&fixture.project.node.secret_key_hex)
+            .map_err(anyhow::Error::msg)?;
+        replacement.invocation = Signed::sign(invocation, &signer)?;
+        let failure = fixture
+            .store
+            .issue_execution_handoff_challenge(
+                &replacement,
+                &fixture.transport,
+                CheckStage::Admit,
+                now() + 23,
+            )
+            .expect_err("sealed generation cannot issue another challenge");
+        assert!(
+            format!("{failure:#}").contains("generation is sealed"),
+            "{failure:#}"
+        );
+        assert!(
+            fixture
+                .store
+                .renew_execution_handoff(&fixture.executor.node, &execution, &start, now() + 23)
+                .is_err()
+        );
         fixture.executor.revoke_client(&mut fixture.store)?;
-        let before=fixture.store.connection.total_changes();
-        assert!(fixture.store.remote_execution_seal_status_authorized(&fixture.executor.node,
-            &reader,&reader_proof,&reader_transport,&status,now()+23).is_err());
-        assert_eq!(fixture.store.connection.total_changes(),before);
+        let before = fixture.store.connection.total_changes();
+        assert!(
+            fixture
+                .store
+                .remote_execution_seal_status_authorized(
+                    &fixture.executor.node,
+                    &reader,
+                    &reader_proof,
+                    &reader_transport,
+                    &status,
+                    now() + 23
+                )
+                .is_err()
+        );
+        assert_eq!(fixture.store.connection.total_changes(), before);
 
-        let mut uncertain=Fixture::new()?;
+        let mut uncertain = Fixture::new()?;
         uncertain.start_unknown()?;
-        let body=uncertain.remote_seal_body()?;
-        let leaf=uncertain.executor_seal_grant(&body)?;
-        let (auth,proof,transport)=uncertain.authorize_executor_seal(&body,&leaf)?;
-        let before=uncertain.store.connection.total_changes();
-        assert!(uncertain.store.authorize_remote_execution_seal_fence(&uncertain.executor.node,
-            &auth,&proof,&transport,&body,now()+22).is_err());
-        assert_eq!(uncertain.store.connection.total_changes(),before);
-        assert_eq!(uncertain.store.connection.query_row("SELECT COUNT(*) FROM execution_binding_seals",[],|row|row.get::<_,u64>(0))?,0);
+        let body = uncertain.remote_seal_body()?;
+        let leaf = uncertain.executor_seal_grant(&body)?;
+        let (auth, proof, transport) = uncertain.authorize_executor_seal(&body, &leaf)?;
+        let before = uncertain.store.connection.total_changes();
+        assert!(
+            uncertain
+                .store
+                .authorize_remote_execution_seal_fence(
+                    &uncertain.executor.node,
+                    &auth,
+                    &proof,
+                    &transport,
+                    &body,
+                    now() + 22
+                )
+                .is_err()
+        );
+        assert_eq!(uncertain.store.connection.total_changes(), before);
+        assert_eq!(
+            uncertain.store.connection.query_row(
+                "SELECT COUNT(*) FROM execution_binding_seals",
+                [],
+                |row| row.get::<_, u64>(0)
+            )?,
+            0
+        );
         Ok(())
     }
 
@@ -7425,11 +8006,13 @@ pub(crate) mod tests {
             Ok(())
         };
         let mut altered = fixture.wire.clone();
-        altered.handoff.task_creation = fixture.store.task_creation(
-            fixture.project.space.as_str(),
-            "conversation",
-            "other-task-secret-DO-NOT-DISCLOSE",
-        )?;
+        altered.handoff.origin = ExecutionOrigin::TaskSession {
+            task_creation: fixture.store.task_creation(
+                fixture.project.space.as_str(),
+                "conversation",
+                "other-task-secret-DO-NOT-DISCLOSE",
+            )?,
+        };
         altered.handoff.attest_source(&signer)?;
         let mut carrier = altered.invocation.payload.clone();
         carrier.body_hash = ObjectHash::body(&altered.handoff)?;
@@ -7475,11 +8058,14 @@ pub(crate) mod tests {
                 .is_err()
         );
         let mut altered = fixture.wire.clone();
-        let mut task: Event = serde_json::from_str(&altered.handoff.task_creation.canonical_body)?;
+        let ExecutionOrigin::TaskSession { task_creation } = &mut altered.handoff.origin else {
+            anyhow::bail!("fixture has no Task origin")
+        };
+        let mut task: Event = serde_json::from_str(&task_creation.canonical_body)?;
         if let EventBody::TaskCreated { goal, .. } = &mut task.body {
             *goal = "changed task input".into();
         }
-        altered.handoff.task_creation = fixture.project.node.sign_event(task)?;
+        *task_creation = fixture.project.node.sign_event(task)?;
         altered.handoff.attest_source(&signer)?;
         resign_carrier(&mut altered)?;
         assert!(
@@ -7762,8 +8348,11 @@ pub(crate) mod tests {
         };
         let source_event: Event =
             serde_json::from_str(&fixture.wire.handoff.project_dispatch.canonical_body)?;
-        let mut events =
-            load_events_from(&fixture.store.connection, &fixture.store.policy, fixture.project.space.as_str())?;
+        let mut events = load_events_from(
+            &fixture.store.connection,
+            &fixture.store.policy,
+            fixture.project.space.as_str(),
+        )?;
         events.insert(
             fixture.wire.handoff.project_dispatch.hash.clone(),
             StoredEvent {
@@ -7791,7 +8380,7 @@ pub(crate) mod tests {
                 operation_id: "original-operation".into(),
                 task_id: Some("task-handoff".into()),
                 target_node: fixture.executor.node.node_id()?,
-                session_id: "same-session".into(),
+                session_id: Some("same-session".into()),
                 status: "succeeded".into(),
                 detail: serde_json::to_value(&wrapper)?,
             },

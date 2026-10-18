@@ -14,7 +14,7 @@ function Home() {
 function ConnectedWorkspace() {
   const { ready } = useDevice()
   if (!ready) return <ConnectionScreen />
-  const key = `${projectScopeKey(ready.scope, ready.project.id, "workspace")}.${ready.generation}`
+  const key = projectScopeKey(ready.scope, ready.project.id, "workspace")
   return (
     <WorkspaceProvider key={key} connection={ready}>
       <WorkspaceShell />

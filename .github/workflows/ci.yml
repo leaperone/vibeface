@@ -240,6 +240,11 @@ jobs:
           databases=(.artifacts/ci-node/node-acceptance-*/direct-start/node.sqlite3)
           [[ "${#databases[@]}" == 1 ]]
           bash scripts/verify-schema.sh --database "${databases[0]}"
+      - name: Verify bot tools and startup event recovery
+        if: matrix.target == 'aarch64-apple-darwin'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-chat-agent --chat-agent
       - name: Verify packaged SDK lockfile without model calls
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         working-directory: ${{ steps.unpack.outputs.package }}/sidecars
@@ -267,6 +272,10 @@ jobs:
             .artifacts/ci-node/node-acceptance-*/B/process.log
             .artifacts/ci-node/node-acceptance-*/C/process.log
             .artifacts/ci-node/node-acceptance-*/R/process.log
+            .artifacts/ci-chat-agent/chat-agent-process-*/report.json
+            .artifacts/ci-chat-agent/chat-agent-process-*/A/process.log
+            .artifacts/ci-chat-agent/chat-agent-process-*/B/process.log
+            .artifacts/ci-chat-agent/chat-agent-process-*/C/process.log
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7

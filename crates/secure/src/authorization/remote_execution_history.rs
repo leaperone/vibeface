@@ -54,19 +54,21 @@ impl RemoteExecutionHistoryReference {
     pub fn context(&self) -> Result<PrepareContext> {
         let mut context = self.old_submission.payload.context.clone();
         require(
-            context.task.as_ref() == Some(&self.source.payload.task)
+            context.task.as_ref() == self.source.payload.work.task_ref()
                 && context.execution_session.as_ref()
-                    == Some(&self.source.payload.execution_session)
-                && context.conversation.is_some()
-                && context.executor_kind.is_some(),
+                    == self.source.payload.work.execution_session()
+                && context.conversation.as_deref()
+                    == Some(self.source.payload.conversation.as_str())
+                && (context.executor_kind.is_some()
+                    == self.source.payload.work.execution_session().is_some()),
             "historical reference changed its original task or session",
         )?;
         context.workspace_resource = Some(self.source.payload.project.resource.clone());
         context.sdk_session = None;
         Ok(PrepareContext {
             context,
-            binding_generation: Some(self.source.payload.binding_generation),
-            canonical_cwd: None,
+            binding_generation: self.source.payload.work.binding_generation(),
+            canonical_cwd: self.source.payload.work.canonical_cwd().map(str::to_owned),
             execution_target_public_key: Some(self.target_public_key.clone()),
         })
     }
@@ -177,16 +179,24 @@ pub(crate) fn derive_reference(
                     AuthorizationError::InvalidProof("invalid historical execution result")
                 })?;
             let proof = dispatch_proof(&actual.handoff.handoff)?;
-            let binding = binding.as_ref().ok_or(AuthorizationError::InvalidProof(
-                "historical execution result requires its original binding",
-            ))?;
-            require(
-                body["request"]["binding"]
-                    == serde_json::to_value(binding).map_err(|_| {
-                        AuthorizationError::InvalidProof("invalid historical binding")
-                    })?,
-                "historical execution result changed its original binding",
-            )?;
+            match &actual.handoff.handoff.source_statement()?.work {
+                ExecutionWork::TaskSession { .. } => {
+                    let binding = binding.as_ref().ok_or(AuthorizationError::InvalidProof(
+                        "historical Task result requires its original binding",
+                    ))?;
+                    require(
+                        body["request"]["binding"]
+                            == serde_json::to_value(binding).map_err(|_| {
+                                AuthorizationError::InvalidProof("invalid historical binding")
+                            })?,
+                        "historical execution result changed its original binding",
+                    )?;
+                }
+                _ => require(
+                    binding.is_none() && body["request"]["binding"].is_null(),
+                    "non-Task history carries a binding",
+                )?,
+            }
             (
                 RemoteExecutionHistoryKind::ExecutionResult,
                 actual.clone(),
@@ -292,8 +302,7 @@ fn check_reference(reference: &RemoteExecutionHistoryReference) -> Result<()> {
             && observation.original_space_id == source.project.space
             && observation.execution_space_id == submission.resource.space
             && observation.target == DeviceId::from_key(&reference.target_public_key)
-            && observation.session_id == source.execution_session.session_id
-            && observation.binding_generation == source.binding_generation
+            && observation.work == source.work
             && (reference.kind == RemoteExecutionHistoryKind::UnknownResolution
                 || observation.result_hash == reference.result_hash)
             && submission.actor
@@ -302,12 +311,16 @@ fn check_reference(reference: &RemoteExecutionHistoryReference) -> Result<()> {
             && submission.presenter == submission.device
             && submission.audience.service == ServiceId::from_key(&reference.target_public_key)
             && submission.audience.device == DeviceId::from_key(&reference.target_public_key)
-            && submission.context.task.as_ref() == Some(&source.task)
-            && submission.context.execution_session.as_ref() == Some(&source.execution_session)
+            && submission.context.task.as_ref() == source.work.task_ref()
+            && submission.context.execution_session.as_ref() == source.work.execution_session()
             && submission.context.workspace_resource.as_ref()
                 == Some(&submission.resource.resource)
-            && source.execution_session.target == submission.audience.device
-            && source.binding_generation > 0
+            && source
+                .work
+                .execution_session()
+                .is_none_or(|session| session.target == submission.audience.device)
+            && source.target_public_key == reference.target_public_key
+            && submission.context.conversation.as_deref() == Some(source.conversation.as_str())
             && source.operation_id.len() <= 1_024
             && !source.operation_id.is_empty()
             && !submission.expected_policies.is_empty()
@@ -320,6 +333,7 @@ fn check_reference(reference: &RemoteExecutionHistoryReference) -> Result<()> {
                 RemoteExecutionHistoryKind::ExecutionResult => {
                     submission.action == Action::ExecutionSubmit
                         && reference.expected_binding_hash.is_some()
+                            == matches!(source.work, ExecutionWork::TaskSession { .. })
                         && reference.resolution_hash.is_none()
                         && reference.freshness_hash.is_none()
                         && reference.terminal_freshness.is_none()
@@ -512,9 +526,7 @@ pub fn verify_remote_execution_history_acceptance(
                     && challenge.target_public_key == *local_c
                     && challenge.project_presenter == reference.old_submission.payload.presenter
                     && challenge.operation_id == reference.source.payload.operation_id
-                    && challenge.binding_hash == reference.source.payload.binding_hash
-                    && challenge.binding_generation == reference.source.payload.binding_generation
-                    && challenge.execution_session == reference.source.payload.execution_session,
+                    && challenge.work == reference.source.payload.work,
                 "historical execution acceptance changed its original signed checkpoint",
             )?;
             usage.record_signed(receipt)?;
@@ -569,10 +581,7 @@ pub fn verify_remote_execution_history_acceptance(
                     && observation.original_space_id == reference.source.payload.project.space
                     && observation.execution_space_id == reference.execution_resource().space
                     && observation.target == DeviceId::from_key(local_c)
-                    && observation.session_id
-                        == reference.source.payload.execution_session.session_id
-                    && observation.binding_generation
-                        == reference.source.payload.binding_generation
+                    && observation.work == reference.source.payload.work
                     && observation.result_hash == reference.result_hash
                     && matches!(
                         observation.state,

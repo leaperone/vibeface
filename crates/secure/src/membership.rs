@@ -19,12 +19,9 @@ pub enum NodeRole {
 pub fn validate_role_dependencies(roles: &[NodeRole]) -> anyhow::Result<()> {
     anyhow::ensure!(
         roles.contains(&NodeRole::Replica)
-            || !roles.iter().any(|role| {
-                matches!(
-                    role,
-                    NodeRole::Gateway | NodeRole::Scheduler
-                )
-            }),
+            || !roles
+                .iter()
+                .any(|role| { matches!(role, NodeRole::Gateway | NodeRole::Scheduler) }),
         "gateway and scheduler roles require replica"
     );
     Ok(())

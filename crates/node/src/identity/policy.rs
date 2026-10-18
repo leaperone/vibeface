@@ -151,7 +151,12 @@ pub(crate) fn authorize_request_invocation_for_body(
             && crate::model::authorization_action(body)? == facts.action,
         "request body differs from its parsed authorization facts"
     );
-    let destination = execution_destination_for_body(state, facts, body, now_ms)?;
+    let destination = execution_destination_for_body(state, facts, body, now_ms)?
+        .map(|destination| destination.bind_request(&invocation.payload, body))
+        .transpose()?;
+    if let Some(destination) = &destination {
+        destination.check_facts(facts)?;
+    }
     let authorization = match transport {
         RequestTransport::Existing(evidence) => match destination {
             Some(destination) => state.verify_invocation_with_execution_destination(
@@ -247,11 +252,17 @@ pub(crate) fn request_execution_dispatch_facts_from(
                 == serde_json::from_value(admission.source_body["request"].clone())?,
             "resolution observation differs from the durable operation request"
         );
-        destination.check_facts(&facts)?;
+        if facts.context.task.is_some() {
+            destination.check_facts(&facts)?;
+        }
         return Ok(facts);
     }
     let facts = request_facts_impl(connection, policies, body, audience, Some(destination))?;
-    destination.check_facts(&facts)?;
+    // Non-Task requests bind their complete body after a real Invocation exists.
+    // Admission revalidation must use that bound destination before any write.
+    if facts.context.task.is_some() {
+        destination.check_facts(&facts)?;
+    }
     Ok(facts)
 }
 
@@ -276,16 +287,47 @@ fn request_facts_impl(
     let action = crate::model::authorization_action(body)?;
     let method = text("method")?;
     let operation_id = text("authorization_id")?.to_owned();
+    let control =
+        method == "execution_control" || (method == "task_control" && body["action"] != "status");
     let mut request = if method == "operate" {
         Some(serde_json::from_value::<crate::model::OperationRequest>(
             body["request"].clone(),
         )?)
+    } else if control {
+        ensure!(
+            text("operation_id")? == operation_id,
+            "control operation and authorization ID differ"
+        );
+        let expected = text("expected_operation_id")?;
+        let encoded: String = connection.query_row(
+            "SELECT request FROM operations WHERE space_id=? AND operation_id=?",
+            params![space.as_str(), expected],
+            |row| row.get(0),
+        )?;
+        let original: crate::model::OperationRequest = serde_json::from_str(&encoded)?;
+        let admission =
+            super::admission::admission_for_operation_from(connection, space.as_str(), expected)?;
+        ensure!(
+            original.network_id == space.as_str()
+                && original.operation_id == expected
+                && body["conversation_id"].as_str() == Some(original.conversation_id.as_str())
+                && admission.source_body["method"] == "operate"
+                && serde_json::from_value::<crate::model::OperationRequest>(
+                    admission.source_body["request"].clone()
+                )? == original
+                && admission.invocation.payload.resource.space == space
+                && original.session_id.is_some()
+                && matches!(original.action["type"].as_str(), Some("open" | "send")),
+            "control changed its real admitted execution operation"
+        );
+        Some(original)
     } else {
         None
     };
     if let Some(request) = &request {
         ensure!(
-            request.network_id == space.as_str() && request.operation_id == operation_id,
+            request.network_id == space.as_str()
+                && (control || request.operation_id == operation_id),
             "operation and authorization scope differ"
         );
     }
@@ -369,16 +411,17 @@ fn request_facts_impl(
         );
     }
     if let Some(request) = &request {
-        for (field, expected) in [
-            ("target_node", request.target_node.as_str()),
-            ("session_id", request.session_id.as_str()),
-        ] {
-            if let Some(value) = body[field].as_str() {
-                ensure!(
-                    value == expected,
-                    "request session differs from admitted operation"
-                );
-            }
+        if let Some(target) = body["target_node"].as_str() {
+            ensure!(
+                target == request.target_node,
+                "request target differs from admitted operation"
+            );
+        }
+        if let Some(session) = body["session_id"].as_str() {
+            ensure!(
+                request.session_id.as_deref() == Some(session),
+                "request session differs from admitted operation"
+            );
         }
         if let Some(task) = body["task_id"].as_str() {
             ensure!(
@@ -485,11 +528,11 @@ fn request_facts_impl(
         }
     }
     if let Some(request) = &request {
-        context.execution_session = Some(SessionRef {
+        context.execution_session = request.session_id.as_ref().map(|session_id| SessionRef {
             target: destination
                 .map_or(&audience.device, |value| &value.audience().device)
                 .clone(),
-            session_id: request.session_id.clone(),
+            session_id: session_id.clone(),
         });
         context.executor_kind = request.action["executor"].as_str().map(str::to_owned);
         if context.executor_kind.is_none() && destination.is_some() {
@@ -499,7 +542,7 @@ fn request_facts_impl(
                 .and_then(|binding| binding.binding.open_spec["executor"].as_str())
                 .map(str::to_owned);
         }
-        if context.executor_kind.is_none() {
+        if context.executor_kind.is_none() && request.session_id.is_some() {
             let encoded: Option<String> = connection.query_row(
                 "SELECT record FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",
                 params![space.as_str(), request.target_node, request.session_id], |row| row.get(0)).optional()?;
@@ -508,7 +551,7 @@ fn request_facts_impl(
                 ensure!(
                     session.network_id == space.as_str()
                         && session.target_node == request.target_node
-                        && session.session_id == request.session_id,
+                        && Some(session.session_id.as_str()) == request.session_id.as_deref(),
                     "execution session projection mismatch"
                 );
                 context.executor_kind = Some(session.executor);
@@ -600,8 +643,8 @@ fn request_facts_impl(
                 _ => anyhow::bail!("continuation has no original execution admission"),
             };
             ensure!(
-                context.task.is_some()
-                    && context.task == source.invocation.payload.context.task
+                context.task == source.invocation.payload.context.task
+                    && context.conversation == source.invocation.payload.context.conversation
                     && method != "create_task",
                 "continuation request escaped its original task"
             );
@@ -610,7 +653,7 @@ fn request_facts_impl(
                     serde_json::from_value(source.source_body["request"].clone())?;
                 ensure!(
                     body["target_node"].as_str() == Some(original.target_node.as_str())
-                        && body["session_id"].as_str() == Some(original.session_id.as_str()),
+                        && body["session_id"].as_str() == original.session_id.as_deref(),
                     "continuation cannot read another execution session"
                 );
             }
@@ -1588,7 +1631,8 @@ impl crate::runtime::Runtime {
             | "cross_node_recovery_source_possession"
             | "cross_node_recovery_possession"
             | "cross_node_recovery_commit"
-            | "cross_node_recovery_install" | "cross_node_recovery_install_status" => store.cross_node_recovery_command(
+            | "cross_node_recovery_install"
+            | "cross_node_recovery_install_status" => store.cross_node_recovery_command(
                 &self.identity,
                 noise_public_key,
                 method,
@@ -1633,34 +1677,61 @@ impl crate::runtime::Runtime {
                 store.enrollment_policy_witness(&self.identity, noise_public_key, params, now_ms)
             }
             "foreign_execution_policy_selection" => store.foreign_execution_policy_selection(
-                &self.identity, noise_public_key, params, now_ms,
+                &self.identity,
+                noise_public_key,
+                params,
+                now_ms,
             ),
             "foreign_execution_policy_begin" => store.foreign_execution_policy_begin(
-                &self.identity, noise_public_key, params, now_ms,
+                &self.identity,
+                noise_public_key,
+                params,
+                now_ms,
             ),
             "foreign_execution_policy_page" => store.foreign_execution_policy_page(
-                &self.identity, noise_public_key, params, now_ms,
+                &self.identity,
+                noise_public_key,
+                params,
+                now_ms,
             ),
             "foreign_execution_policy_finish" => store.foreign_execution_policy_finish(
-                &self.identity, noise_public_key, params, now_ms,
+                &self.identity,
+                noise_public_key,
+                params,
+                now_ms,
             ),
             "foreign_execution_policy_approve" => store.foreign_execution_policy_approve(
-                &self.identity, noise_public_key, params, now_ms,
+                &self.identity,
+                noise_public_key,
+                params,
+                now_ms,
             ),
             "remote_execution_policy_delegate" => store.remote_execution_policy_delegate(
-                &self.identity, noise_public_key, params, now_ms,
+                &self.identity,
+                noise_public_key,
+                params,
+                now_ms,
             ),
             "remote_execution_policy_prepare" => store.remote_execution_policy_prepare(
-                &self.identity, noise_public_key, params, now_ms,
+                &self.identity,
+                noise_public_key,
+                params,
+                now_ms,
             ),
             "remote_execution_policy_page" => {
                 store.remote_execution_policy_page(&self.identity, noise_public_key, params, now_ms)
             }
             "remote_execution_policy_finish" => store.remote_execution_policy_finish(
-                &self.identity, noise_public_key, params, now_ms,
+                &self.identity,
+                noise_public_key,
+                params,
+                now_ms,
             ),
             "execution_share_policy_prepare" => store.execution_share_policy_prepare(
-                &self.identity, noise_public_key, params, now_ms,
+                &self.identity,
+                noise_public_key,
+                params,
+                now_ms,
             ),
             "execution_share_policy_page" => {
                 store.execution_share_policy_page(&self.identity, noise_public_key, params, now_ms)
@@ -1691,6 +1762,20 @@ impl crate::runtime::Runtime {
             "execution_service_select" => {
                 store.execution_service_select(&self.identity, noise_public_key, params, now_ms)
             }
+            "execution_service_install_challenge" => store.execution_service_install_challenge(
+                &self.identity,
+                noise_public_key,
+                params,
+                &self.config.roots,
+                now_ms,
+            ),
+            "execution_service_install" => store.execution_service_install(
+                &self.identity,
+                noise_public_key,
+                params,
+                &self.config.roots,
+                now_ms,
+            ),
             "passkey_prepare_registration"
             | "passkey_prepare_device"
             | "passkey_prepare_management"

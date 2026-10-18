@@ -23,6 +23,11 @@ use vibeface_secure::authorization::{
     Actor, DeviceId, DeviceUse, Invocation, InvocationContext, ObjectHash, PolicyDomain,
     PolicyStamp, PublicKey, RequestFacts, ResourceId, ResourceKind, ResourceRef, SessionRef,
     Signed, SpaceId, TransportEvidence, VerifiedAuthorization, VerifiedPolicySet,
+    execution_handoff::{
+        ExecutionHandoffResult, ExecutionHandoffState, ExecutionOrigin, ProjectDispatchOrigin,
+        ProjectExecutionResult, derive_project_dispatch_work,
+        verify_execution_handoff_receipt_signature, verify_project_execution_receipt_signature,
+    },
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,11 +92,11 @@ pub(super) fn audience_key(state: &VerifiedPolicySet, proof: &AdmissionProof) ->
     bail!("event audience device is missing from admitted policy")
 }
 
-fn execution_device(
+fn execution_key(
     state: &VerifiedPolicySet,
     proof: &AdmissionProof,
     node: &str,
-) -> Result<DeviceId> {
+) -> Result<PublicKey> {
     for stamp in &proof.challenge.policies {
         for hash in policy_devices(state, stamp).into_iter().flatten() {
             if let Some(certificate) = state.device(hash)
@@ -102,11 +107,19 @@ fn execution_device(
                         && certificate.payload.uses.contains(&DeviceUse::Noise),
                     "execution target is not a registered service device"
                 );
-                return Ok(DeviceId::from_key(&certificate.payload.public_key));
+                return Ok(certificate.payload.public_key.clone());
             }
         }
     }
     bail!("execution target is absent from admitted policy devices")
+}
+
+fn execution_device(
+    state: &VerifiedPolicySet,
+    proof: &AdmissionProof,
+    node: &str,
+) -> Result<DeviceId> {
+    Ok(DeviceId::from_key(&execution_key(state, proof, node)?))
 }
 
 pub(crate) fn verify_event_envelope(
@@ -148,33 +161,43 @@ fn expected_events(
         "create_conversation" => vec![plain(EventBody::ConversationCreated {
             title: text(body, "title")?.into(),
         })],
+        "create_bot" => {
+            ensure!(
+                matches!(actor, Actor::Account(_)),
+                "bot creation requires an account actor"
+            );
+            let (scope, bot) = crate::store::bots::bot_definition_from_body(body)?;
+            ensure!(
+                scope == source_scope(body)?,
+                "bot belongs to another conversation"
+            );
+            vec![
+                plain(EventBody::ConversationCreated {
+                    title: text(body, "name")?.into(),
+                }),
+                plain(bot),
+            ]
+        }
         "message" => vec![plain(EventBody::MessagePosted {
             message_id: text(body, "message_id")?.into(),
             role: "user".into(),
             text: text(body, "text")?.into(),
             scheduler_node: Some(text(body, "scheduler_node")?.into()),
         })],
-        "create_task" => {
-            let task = text(body, "task_id")?;
-            let mut events = vec![plain(EventBody::TaskCreated {
-                task_id: task.into(),
-                title: text(body, "title")?.into(),
-                goal: text(body, "goal")?.into(),
-                acceptance: text(body, "acceptance")?.into(),
-            })];
-            if body["auto_followup"].as_bool() == Some(true) {
-                ensure!(
-                    matches!(actor, Actor::Account(_)),
-                    "automatic follow-up requires an account actor"
-                );
-                events.push(plain(EventBody::DecisionRecorded {
-                    decision_id: format!("auto:{task}"),
-                    text: format!("User enabled bounded automatic follow-up for task {task}"),
-                    effective_constraints: vec![format!("auto_followup:{task}")],
-                    tool_configuration: json!({"auto_followup":task}),
-                }));
-            }
-            events
+        "create_task" => vec![plain(EventBody::TaskCreated {
+            task_id: text(body, "task_id")?.into(),
+            title: text(body, "title")?.into(),
+            goal: text(body, "goal")?.into(),
+            acceptance: text(body, "acceptance")?.into(),
+        })],
+        "set_followup" => {
+            ensure!(
+                matches!(actor, Actor::Account(_)),
+                "follow-up changes require an account actor"
+            );
+            vec![plain(crate::store::followup::grant_body_from_request(
+                body,
+            )?)]
         }
         "update_task" => vec![plain(EventBody::TaskChanged {
             task_id: text(body, "task_id")?.into(),
@@ -212,7 +235,11 @@ fn expected_events(
                 operation_id: text(body, "operation_id")?.into(),
                 task_id,
                 target_node: text(body, "target_node")?.into(),
-                session_id: text(body, "session_id")?.into(),
+                session_id: serde_json::from_value(
+                    body.get("session_id")
+                        .context("session_id is required")?
+                        .clone(),
+                )?,
                 status: status.into(),
                 detail: json!({"resolver":actor,"invocation_hash":invocation.hash()?,"evidence":text(body,"evidence")?}),
             })]
@@ -294,7 +321,325 @@ fn dependency_closure(
     Ok(Some(closure))
 }
 
+fn accepted_conversation_open_from_history(
+    connection: &Connection,
+    policy: &PolicyState,
+    proof: &AdmissionProof,
+    request: &OperationRequest,
+    events: &BTreeMap<String, StoredEvent>,
+    ancestors: &BTreeSet<String>,
+) -> Result<Option<ProjectDispatchOrigin>> {
+    let mut opens = ancestors.iter().filter_map(|hash| {
+        let prior = &events[hash];
+        let EventBody::DispatchRecorded {
+            task_id,
+            target_node,
+            session_id,
+            action,
+            ..
+        } = &prior.event.body
+        else {
+            return None;
+        };
+        (prior.event.scope_id == request.conversation_id
+            && prior.event.resource_id == proof.invocation.payload.resource.resource
+            && task_id.is_none()
+            && target_node == &request.target_node
+            && session_id == &request.session_id
+            && action["action"]["type"] == "open")
+            .then_some(prior)
+    });
+    let Some(open) = opens.next() else {
+        return Ok(None);
+    };
+    ensure!(
+        opens.next().is_none(),
+        "conversation session has conflicting initial Opens"
+    );
+    let open_proof = admission(&open.event);
+    let original = OriginalAdmissionView::load(connection, policy, open_proof)?;
+    ensure!(
+        verify_event_envelope(connection, policy, &open.event.network_id, &open.envelope)?
+            == open.event,
+        "conversation Open differs from its signed event"
+    );
+    ensure!(
+        validate_event_evidence(policy, connection, &open.event, events)?
+            == EventEvidenceStatus::Valid,
+        "conversation Open has incomplete original admission evidence"
+    );
+    let mut accepted: Option<ProjectDispatchOrigin> = None;
+    for hash in ancestors {
+        let observed = &events[hash];
+        let EventBody::ExecutionObserved {
+            operation_id,
+            task_id,
+            target_node,
+            session_id,
+            status,
+            detail,
+        } = &observed.event.body
+        else {
+            continue;
+        };
+        if operation_id != &open_proof.invocation.payload.operation_id
+            || task_id.is_some()
+            || target_node != &request.target_node
+            || session_id != &request.session_id
+            || status != "succeeded"
+        {
+            continue;
+        }
+        ensure!(
+            observed.event.scope_id == request.conversation_id
+                && observed.event.resource_id == open.event.resource_id
+                && matches!(&observed.event.cause, EventCause::Derived { admission, source }
+                    if admission == open_proof && source == &open.envelope.hash),
+            "conversation Open observation changed its original source"
+        );
+        let Some(observed_ancestors) = dependency_closure(&observed.event, events)? else {
+            return Ok(None);
+        };
+        ensure!(
+            observed_ancestors.contains(&open.envelope.hash),
+            "conversation Open is not causal to its observation"
+        );
+        ensure!(
+            verify_event_envelope(
+                connection,
+                policy,
+                &observed.event.network_id,
+                &observed.envelope
+            )? == observed.event,
+            "conversation Open observation differs from its signed event"
+        );
+        let value = if let Some(blob) = detail.get("result_blob") {
+            let blob: BlobRef = serde_json::from_value(blob.clone())?;
+            ensure!(
+                observed.event.blobs == vec![blob.clone()]
+                    && *detail == json!({"result_blob":blob}),
+                "conversation Open observation changed its attachment"
+            );
+            if !has_blob_from(connection, &observed.event.network_id, &blob)? {
+                return Ok(None);
+            }
+            let bytes: Vec<u8> = connection.query_row(
+                "SELECT content FROM blobs WHERE space_id=? AND hash=?",
+                params![observed.event.network_id, blob.hash],
+                |row| row.get(0),
+            )?;
+            serde_json::from_slice::<Value>(&bytes)?
+        } else {
+            ensure!(
+                observed.event.blobs.is_empty(),
+                "inline Open result has unexpected attachments"
+            );
+            detail.clone()
+        };
+        let accepted_open = if value.get("dispatch").is_some() {
+            let result: ProjectExecutionResult = serde_json::from_value(value)?;
+            ensure!(
+                result.dispatch == open.envelope
+                    && result.receipt.payload.state == ExecutionHandoffState::Succeeded
+                    && result.receipt.payload.issued_at_ms <= proof.admitted_at_ms
+                    && result.receipt.payload.issued_at_ms
+                        <= u64::try_from(observed.event.created_at_ms)?
+                    && result.receipt.payload.issued_at_ms >= open_proof.admitted_at_ms,
+                "conversation session has no prior successful local Open"
+            );
+            verify_project_execution_receipt_signature(
+                &result.dispatch,
+                &ProjectDispatchOrigin::ConversationOpen,
+                &result.receipt,
+                &result.result,
+            )?;
+            ProjectDispatchOrigin::LocalConversationSession {
+                accepted_open: Box::new(result),
+            }
+        } else {
+            let result: ExecutionHandoffResult = serde_json::from_value(value)?;
+            ensure!(
+                result.handoff.handoff.project_dispatch == open.envelope
+                    && matches!(
+                        result.handoff.handoff.origin,
+                        ExecutionOrigin::ConversationOpen
+                    )
+                    && result.receipt.payload.state == ExecutionHandoffState::Succeeded
+                    && result.receipt.payload.issued_at_ms <= proof.admitted_at_ms
+                    && result.receipt.payload.issued_at_ms
+                        <= u64::try_from(observed.event.created_at_ms)?
+                    && result.receipt.payload.issued_at_ms >= open_proof.admitted_at_ms
+                    && result.receipt.payload.issued_at_ms
+                        >= result.handoff.invocation.payload.not_before_ms,
+                "conversation session has no prior successful remote Open"
+            );
+            verify_execution_handoff_receipt_signature(
+                &result.handoff,
+                &result.receipt,
+                &result.result,
+            )?;
+            original.state().verify_execution_observation_source(
+                &result.handoff.handoff,
+                open_proof.admitted_at_ms,
+            )?;
+            ProjectDispatchOrigin::RemoteConversationSession {
+                accepted_open: Box::new(result),
+            }
+        };
+        ensure!(
+            accepted
+                .as_ref()
+                .is_none_or(|prior| prior == &accepted_open),
+            "conversation Open has conflicting successful receipts"
+        );
+        accepted = Some(accepted_open);
+    }
+    Ok(accepted)
+}
+
+fn historical_dispatch_origin(
+    connection: &Connection,
+    policy: &PolicyState,
+    state: &VerifiedPolicySet,
+    proof: &AdmissionProof,
+    request: &OperationRequest,
+    task_creation: Option<&StoredEvent>,
+    events: &BTreeMap<String, StoredEvent>,
+    ancestors: &BTreeSet<String>,
+) -> Result<Option<ProjectDispatchOrigin>> {
+    Ok(Some(
+        match (
+            request.task_id.as_deref(),
+            request.binding.as_ref(),
+            request.action["type"].as_str(),
+        ) {
+            (Some(_), Some(binding), Some(action)) if action != "command" => {
+                let creation =
+                    task_creation.context("Task execution requires an admitted task creation")?;
+                crate::binding::verify_binding(
+                    binding,
+                    audience_key(state, admission(&creation.event))?.as_str(),
+                )?;
+                ensure!(
+                    binding.binding.authority_node == creation.event.author,
+                    "Task binding differs from its admitted authority"
+                );
+                if action == "open" {
+                    ensure!(
+                        request.action == binding.binding.open_spec,
+                        "execution Open differs from confirmed Task binding"
+                    );
+                }
+                ProjectDispatchOrigin::TaskSession {
+                    task_creation: creation.envelope.clone(),
+                }
+            }
+            (None, None, Some("command")) => ProjectDispatchOrigin::Command,
+            (None, None, Some("open")) => ProjectDispatchOrigin::ConversationOpen,
+            (None, None, Some(_)) => {
+                let Some(accepted_open) = accepted_conversation_open_from_history(
+                    connection, policy, proof, request, events, ancestors,
+                )?
+                else {
+                    return Ok(None);
+                };
+                accepted_open
+            }
+            _ => bail!("execution task and binding do not match its work type"),
+        },
+    ))
+}
+
+pub(super) fn project_dispatch_origin_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    dispatch: &SignedEvent,
+) -> Result<ProjectDispatchOrigin> {
+    let event: Event = serde_json::from_str(&dispatch.canonical_body)?;
+    ensure!(
+        matches!(event.body, EventBody::DispatchRecorded { .. }),
+        "execution origin requires an original Dispatch"
+    );
+    ensure!(
+        verify_event_envelope(connection, policy, &event.network_id, dispatch)? == event,
+        "execution origin differs from its signed Dispatch"
+    );
+    let events = historical_event_dependencies_in(
+        connection,
+        policy,
+        &event.network_id,
+        &event.resource_id,
+        &event.scope_id,
+        std::slice::from_ref(&dispatch.hash),
+    )?;
+    ensure!(
+        validate_event_evidence(policy, connection, &event, &events)? == EventEvidenceStatus::Valid,
+        "execution origin has incomplete original admission evidence"
+    );
+    let proof = admission(&event);
+    let original = OriginalAdmissionView::load(connection, policy, proof)?;
+    let request: OperationRequest = serde_json::from_value(proof.source_body["request"].clone())?;
+    let ancestors =
+        dependency_closure(&event, &events)?.context("execution origin history is incomplete")?;
+    let creation = request
+        .binding
+        .as_ref()
+        .and_then(|binding| events.get(&binding.binding.task_ref));
+    historical_dispatch_origin(
+        connection,
+        policy,
+        original.state(),
+        proof,
+        &request,
+        creation,
+        &events,
+        &ancestors,
+    )?
+    .context("execution origin is incomplete")
+}
+
+fn historical_operation_context(
+    connection: &Connection,
+    policy: &PolicyState,
+    state: &VerifiedPolicySet,
+    dispatch: &Event,
+    request: &OperationRequest,
+    task_creation: Option<&StoredEvent>,
+    events: &BTreeMap<String, StoredEvent>,
+    ancestors: &BTreeSet<String>,
+) -> Result<Option<InvocationContext>> {
+    let proof = admission(dispatch);
+    let invocation = &proof.invocation.payload;
+    ensure!(
+        request.network_id == invocation.resource.space.as_str()
+            && request.operation_id == text(&proof.source_body, "authorization_id")?
+            && request.operation_id == invocation.operation_id
+            && Some(request.conversation_id.as_str()) == invocation.context.conversation.as_deref(),
+        "operation authorization scope mismatch"
+    );
+    let target = execution_key(state, proof, &request.target_node)?;
+    let Some(origin) = historical_dispatch_origin(
+        connection,
+        policy,
+        state,
+        proof,
+        request,
+        task_creation,
+        events,
+        ancestors,
+    )?
+    else {
+        return Ok(None);
+    };
+    derive_project_dispatch_work(dispatch, &origin, &target)?;
+    let mut context = invocation.context.clone();
+    context.sdk_session = None;
+    Ok(Some(context))
+}
+
 fn historical_facts(
+    connection: &Connection,
+    policy: &PolicyState,
     state: &VerifiedPolicySet,
     event: &Event,
     events: &BTreeMap<String, StoredEvent>,
@@ -330,7 +675,10 @@ fn historical_facts(
             && matches!(prior.event.body, EventBody::ConversationCreated { .. }))
         .then_some(&prior.event)
     });
-    if text(body, "method")? == "create_conversation" {
+    if text(body, "method")? == "create_conversation"
+        || (text(body, "method")? == "create_bot"
+            && matches!(event.body, EventBody::ConversationCreated { .. }))
+    {
         ensure!(
             creations.next().is_none(),
             "conversation already has a causal creation"
@@ -347,11 +695,17 @@ fn historical_facts(
             creation.resource_id == resource,
             "conversation resource differs from signed request"
         );
+        if text(body, "method")? == "create_bot" {
+            ensure!(
+                admission(creation) == proof,
+                "bot and conversation have different admissions"
+            );
+        }
     }
     let request = (text(body, "method")? == "operate")
         .then(|| serde_json::from_value::<OperationRequest>(body["request"].clone()))
         .transpose()?;
-    let mut resolution_request = None;
+    let mut resolution_source = None;
     if text(body, "method")? == "resolve_unknown" {
         let mut dispatches = ancestors.iter().filter_map(|hash| {
             let prior = &events[hash].event;
@@ -375,16 +729,13 @@ fn historical_facts(
                 && original.conversation_id == scope
                 && original.operation_id == text(body, "operation_id")?
                 && original.target_node == text(body, "target_node")?
-                && original.session_id == text(body, "session_id")?
+                && serde_json::to_value(&original.session_id)?
+                    == *body.get("session_id").context("session_id is required")?
                 && serde_json::to_value(&original.task_id)?
                     == *body.get("task_id").context("task_id is required")?,
             "resolution scope differs from admitted operation"
         );
-        ensure!(
-            original.target_node == crypto::fingerprint(audience_key(state, proof)?.as_str())?,
-            "resolution targets another service device"
-        );
-        resolution_request = Some(original);
+        resolution_source = Some((dispatch, original));
     }
     let mut context = InvocationContext {
         conversation: Some(scope.into()),
@@ -394,6 +745,11 @@ fn historical_facts(
     let task = request
         .as_ref()
         .and_then(|request| request.task_id.as_deref())
+        .or_else(|| {
+            resolution_source
+                .as_ref()
+                .and_then(|(_, request)| request.task_id.as_deref())
+        })
         .or_else(|| body["task_id"].as_str());
     let mut task_creation = None;
     if let Some(task) = task
@@ -422,90 +778,66 @@ fn historical_facts(
         )?);
         task_creation = Some(creation);
     }
-    if let Some(request) = request {
-        let creation = task_creation.context("execution requires an admitted task creation")?;
-        let binding = request
-            .binding
-            .as_ref()
-            .context("execution requires a confirmed task binding")?;
-        let b = &binding.binding;
-        ensure!(
-            b.network_id == request.network_id
-                && b.conversation_id == scope
-                && b.task_ref == creation.envelope.hash
-                && Some(b.task_id.as_str()) == request.task_id.as_deref()
-                && b.authority_node == creation.event.author
-                && b.target_node == request.target_node
-                && b.session_id == request.session_id,
-            "execution binding differs from its task creation or target"
-        );
-        crate::binding::verify_binding(
-            binding,
-            audience_key(state, admission(&creation.event))?.as_str(),
-        )?;
-        if request.action["type"] == "open" {
-            ensure!(
-                request.action == b.open_spec,
-                "execution open differs from confirmed task binding"
-            );
-        }
-        ensure!(
-            request.network_id == space.as_str()
-                && request.operation_id == text(body, "authorization_id")?,
-            "operation authorization scope mismatch"
-        );
-        context.execution_session = Some(SessionRef {
-            target: execution_device(state, proof, &request.target_node)?,
-            session_id: request.session_id.clone(),
-        });
-        context.executor_kind = request.action["executor"].as_str().map(str::to_owned);
-        if context.executor_kind.is_none() {
-            let executors: BTreeSet<_> = ancestors
-                .iter()
-                .filter_map(|hash| {
-                    let prior = &events[hash].event;
-                    let EventBody::DispatchRecorded {
-                        target_node,
-                        session_id,
-                        action,
-                        ..
-                    } = &prior.body
-                    else {
-                        return None;
+    if let Some(request) = request.as_ref() {
+        let dispatch = match &event.body {
+            EventBody::DispatchRecorded { .. } => event,
+            _ => {
+                let mut current = event;
+                let mut visited = BTreeSet::new();
+                loop {
+                    let EventCause::Derived { source, .. } = &current.cause else {
+                        bail!("operate event has no original dispatch")
                     };
-                    (prior.scope_id == scope
-                        && target_node == &request.target_node
-                        && session_id == &request.session_id
-                        && action["action"]["type"].as_str() == Some("open"))
-                    .then(|| action["action"]["executor"].as_str().map(str::to_owned))
-                    .flatten()
-                })
-                .collect();
-            ensure!(
-                executors.len() <= 1,
-                "execution session has conflicting executors"
-            );
-            context.executor_kind = executors.into_iter().next();
-            if context.executor_kind.is_none() {
-                return Ok(None);
+                    ensure!(
+                        visited.insert(source.clone()) && ancestors.contains(source),
+                        "derived operation has no causal original dispatch"
+                    );
+                    let Some(source) = events.get(source) else {
+                        return Ok(None);
+                    };
+                    ensure!(
+                        admission(&source.event) == proof,
+                        "derived operation changed its original admission"
+                    );
+                    current = &source.event;
+                    if matches!(current.body, EventBody::DispatchRecorded { .. }) {
+                        break current;
+                    }
+                }
             }
-        }
-    } else if let Some(original) = resolution_request {
-        let binding = original
-            .binding
-            .as_ref()
-            .context("resolved operation has no task binding")?;
-        context.execution_session = Some(SessionRef {
-            target: execution_device(state, proof, &original.target_node)?,
-            session_id: original.session_id,
-        });
-        context.executor_kind = binding.binding.open_spec["executor"]
-            .as_str()
-            .map(str::to_owned);
-        ensure!(
-            context.executor_kind.is_some(),
-            "resolved operation binding has no executor"
-        );
+        };
+        let Some(operation_context) = historical_operation_context(
+            connection,
+            policy,
+            state,
+            dispatch,
+            request,
+            task_creation,
+            events,
+            ancestors,
+        )?
+        else {
+            return Ok(None);
+        };
+        context = operation_context;
+    } else if let Some((dispatch, original_request)) = resolution_source {
+        let source_proof = admission(dispatch);
+        let original = OriginalAdmissionView::load(connection, policy, source_proof)?;
+        let Some(operation_context) = historical_operation_context(
+            connection,
+            policy,
+            original.state(),
+            dispatch,
+            &original_request,
+            task_creation,
+            events,
+            &dependency_closure(dispatch, events)?
+                .context("resolved operation history is incomplete")?,
+        )?
+        else {
+            return Ok(None);
+        };
+        context = operation_context;
     } else if matches!(text(body, "method")?, "bind_execution" | "rebind_execution") {
         context.execution_session = Some(SessionRef {
             target: execution_device(state, proof, text(body, "target_node")?)?,
@@ -577,6 +909,7 @@ fn event_slot(body: &EventBody) -> String {
             notification_id, ..
         } => format!("notification:{notification_id}"),
         EventBody::ConversationCreated { .. } => "conversation_created".into(),
+        EventBody::BotCreated { .. } => "bot_created".into(),
         EventBody::MessagePosted { .. } => "message_posted".into(),
         EventBody::TaskCreated { .. } => "task_created".into(),
         EventBody::TaskChanged { .. } => "task_changed".into(),
@@ -648,6 +981,7 @@ fn validate_derived(
     connection: &Connection,
     event: &Event,
     source: &StoredEvent,
+    events: &BTreeMap<String, StoredEvent>,
 ) -> Result<()> {
     let source_envelope = &source.envelope;
     let source = &source.event;
@@ -712,7 +1046,7 @@ fn validate_derived(
                         policy,
                         connection,
                         &signed,
-                        event.created_at_ms.try_into()?,
+                        u64::try_from(event.created_at_ms)?,
                     )?;
                     (
                         signed.reconciliation.resolution.observation.handoff,
@@ -749,6 +1083,63 @@ fn validate_derived(
                         && receipt.payload.issued_at_ms >= admission(source).admitted_at_ms,
                     "delegated execution result differs from its admitted source or state"
                 );
+            } else {
+                let value = if let Some(blob) = detail.get("result_blob") {
+                    let blob: BlobRef = serde_json::from_value(blob.clone())?;
+                    let bytes: Vec<u8> = connection.query_row(
+                        "SELECT content FROM blobs WHERE space_id=? AND hash=?",
+                        params![event.network_id, blob.hash],
+                        |row| row.get(0),
+                    )?;
+                    serde_json::from_slice::<Value>(&bytes)?
+                } else {
+                    detail.clone()
+                };
+                let result: ProjectExecutionResult = serde_json::from_value(value)?;
+                ensure!(
+                    result.dispatch == *source_envelope,
+                    "local execution result changed its original dispatch"
+                );
+                ensure!(
+                    validate_event_evidence(policy, connection, source, events)?
+                        == EventEvidenceStatus::Valid,
+                    "local execution result has incomplete original admission evidence"
+                );
+                let proof = admission(source);
+                let original = OriginalAdmissionView::load(connection, policy, proof)?;
+                let request: OperationRequest =
+                    serde_json::from_value(proof.source_body["request"].clone())?;
+                let ancestors = dependency_closure(source, events)?
+                    .context("local execution history is incomplete")?;
+                let creation = request
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| events.get(&binding.binding.task_ref));
+                let origin = historical_dispatch_origin(
+                    connection,
+                    policy,
+                    original.state(),
+                    proof,
+                    &request,
+                    creation,
+                    events,
+                    &ancestors,
+                )?
+                .context("local execution origin is incomplete")?;
+                verify_project_execution_receipt_signature(
+                    &result.dispatch,
+                    &origin,
+                    &result.receipt,
+                    &result.result,
+                )?;
+                ensure!(
+                    serde_json::to_value(result.receipt.payload.state)?.as_str()
+                        == Some(status.as_str())
+                        && result.receipt.payload.issued_at_ms
+                            <= u64::try_from(event.created_at_ms)?
+                        && result.receipt.payload.issued_at_ms >= proof.admitted_at_ms,
+                    "local execution result changed its observed state or time"
+                );
             }
             ensure!(
                 !(detail.get("resolver").is_some() && detail.get("invocation_hash").is_some()),
@@ -784,9 +1175,12 @@ fn validate_derived(
                 notification_id == &format!("result:{operation_id}:{status}")
                     && kind == status
                     && text
-                        == &format!(
-                            "执行会话 {session_id} 的本轮执行状态为 {status}。工单验收仍需本人确认。"
-                        ),
+                        == &match session_id {
+                            Some(session) => format!(
+                                "执行会话 {session} 的本轮执行状态为 {status}。工单验收仍需本人确认。"
+                            ),
+                            None => format!("执行命令 {operation_id} 的本轮执行状态为 {status}。"),
+                        },
                 "notification differs from its durable execution result"
             );
         }
@@ -823,7 +1217,8 @@ fn validate_event_evidence_in_state(
     let Some(ancestors) = dependency_closure(event, events)? else {
         return Ok(EventEvidenceStatus::Pending);
     };
-    let Some(facts) = historical_facts(state, event, events, &ancestors)? else {
+    let Some(facts) = historical_facts(connection, policy, state, event, events, &ancestors)?
+    else {
         return Ok(EventEvidenceStatus::Pending);
     };
     reconstruct_stored_admission(connection, policy, proof, &facts)?;
@@ -854,7 +1249,7 @@ fn validate_event_evidence_in_state(
                     return Ok(EventEvidenceStatus::Pending);
                 }
             }
-            validate_derived(policy, connection, event, source)?;
+            validate_derived(policy, connection, event, source, events)?;
         }
     }
     let invocation_hash = proof.invocation.hash()?;
@@ -920,7 +1315,7 @@ pub(crate) fn event_authorization_in_view(
         "event has incomplete authorization evidence"
     );
     let ancestors = dependency_closure(event, events)?.context("event history is incomplete")?;
-    let facts = historical_facts(historical, event, events, &ancestors)?
+    let facts = historical_facts(connection, policy, historical, event, events, &ancestors)?
         .context("event resource history is incomplete")?;
     let admitted = reconstruct_stored_admission(connection, policy, proof, &facts)?;
     Ok(state.verify_admitted_operation_authorization(&admitted, &facts, now_ms)?)
@@ -1039,8 +1434,15 @@ pub(crate) fn persisted_admission_facts(
         let state = original.state();
         let ancestors = dependency_closure(&stored.event, &events)?
             .context("accepted event causal history is missing")?;
-        let current = historical_facts(state, &stored.event, &events, &ancestors)?
-            .context("accepted event resource history is missing")?;
+        let current = historical_facts(
+            connection,
+            policy,
+            state,
+            &stored.event,
+            &events,
+            &ancestors,
+        )?
+        .context("accepted event resource history is missing")?;
         validate_sdk_parent(policy, connection, state, &stored.event, &events, &current)?;
         ensure!(
             facts.as_ref().is_none_or(|facts| facts == &current),
@@ -1078,7 +1480,7 @@ fn retained_scope_event_rows_in(
     Ok(events)
 }
 
-pub(super) fn retained_scope_events_in(
+pub(crate) fn retained_scope_events_in(
     connection: &Connection,
     space: &str,
     resource: &ResourceId,
@@ -1157,7 +1559,7 @@ fn retained_event_dependencies_at_readiness_in(
     Ok(events)
 }
 
-fn append_admitted_events_in(
+pub(crate) fn append_admitted_events_in(
     connection: &Connection,
     policy: &PolicyState,
     identity: &LocalIdentity,
@@ -1200,50 +1602,6 @@ fn append_admitted_events_in(
                 "task creation envelope differs from its admitted event"
             );
             expected.remove(0);
-            let mut missing = Vec::new();
-            for (body, blobs) in expected {
-                let mut authorized = false;
-                for prior in events.values().filter(|stored| {
-                    stored.status == "ready"
-                        && stored.event.scope_id == scope
-                        && &stored.event.resource_id == resource
-                        && stored.event.body == body
-                        && stored.event.blobs == blobs
-                }) {
-                    let EventCause::Invocation { admission } = &prior.event.cause else {
-                        continue;
-                    };
-                    let old = &admission.source_body;
-                    if !matches!(admission.invocation.payload.actor, Actor::Account(_))
-                        || old["method"] != "create_task"
-                        || old["auto_followup"] != true
-                        || ["task_id", "title", "goal", "acceptance"]
-                            .iter()
-                            .any(|key| old[*key] != proof.source_body[*key])
-                    {
-                        continue;
-                    }
-                    ensure!(
-                        verify_event_envelope(connection, policy, space, &prior.envelope)?
-                            == prior.event
-                            && validate_event_evidence(policy, connection, &prior.event, &events)?
-                                == EventEvidenceStatus::Valid,
-                        "existing task decision has incomplete authorization evidence"
-                    );
-                    authorized |= current_event_authorization(
-                        policy,
-                        connection,
-                        &prior.event,
-                        &events,
-                        now_ms,
-                    )
-                    .is_ok();
-                }
-                if !authorized {
-                    missing.push((body, blobs));
-                }
-            }
-            expected = missing;
         }
     }
     ensure!(
@@ -2165,8 +2523,8 @@ impl Store {
             } else {
                 serde_json::from_str(&result)?
             };
-            if detail.get("result_blob").is_some() {
-                let blob: BlobRef = serde_json::from_value(detail["result_blob"].clone())?;
+            let observed_result = if let Some(blob) = detail.get("result_blob") {
+                let blob: BlobRef = serde_json::from_value(blob.clone())?;
                 ensure!(
                     blobs == vec![blob.clone()] && has_blob_from(&tx, space, &blob)?,
                     "execution result blob is missing"
@@ -2174,19 +2532,53 @@ impl Store {
                 let bytes: Vec<u8> = tx.query_row(
                     "SELECT content FROM blobs WHERE space_id=? AND hash=?",
                     params![space, blob.hash],
-                    |r| r.get(0),
+                    |row| row.get(0),
                 )?;
-                ensure!(
-                    serde_json::from_slice::<Value>(&bytes)? == result,
-                    "execution result blob differs from durable operation result"
-                );
                 ensure!(
                     *detail == json!({"result_blob":blob}),
                     "execution result contains unsigned extra fields"
                 );
+                serde_json::from_slice::<Value>(&bytes)?
             } else {
                 ensure!(
-                    *detail == result && blobs.is_empty(),
+                    blobs.is_empty(),
+                    "inline execution result has unexpected attachments"
+                );
+                detail.clone()
+            };
+            if observed_result.get("dispatch").is_some() {
+                let signed: ProjectExecutionResult = serde_json::from_value(observed_result)?;
+                ensure!(
+                    signed.dispatch == source_envelope,
+                    "local execution receipt differs from the durable operation source"
+                );
+                let request: OperationRequest = serde_json::from_value(
+                    admission(&source_event.event).source_body["request"].clone(),
+                )?;
+                let native = if let Some(session) = &request.session_id {
+                    let record: Option<String> = tx.query_row(
+                        "SELECT record FROM execution_sessions WHERE space_id=? AND target_node=? AND session_id=?",
+                        params![space, request.target_node, session], |row| row.get(0)).optional()?;
+                    record
+                        .map(|record| {
+                            serde_json::from_str::<crate::model::ExecutionSession>(&record)
+                        })
+                        .transpose()?
+                        .and_then(|session| session.native_session_id)
+                } else {
+                    None
+                };
+                ensure!(
+                    signed.result
+                        == super::execution_handoff::public_execution_result(
+                            result,
+                            native.as_deref()
+                        ),
+                    "local execution observation differs from durable operation result"
+                );
+            } else {
+                ensure!(
+                    observed_result == result,
                     "execution observation differs from durable operation result"
                 );
             }
@@ -2543,6 +2935,8 @@ mod tests {
             OriginalAdmissionView::load(&fixture.connection, &fixture.policy, admission(&event))?;
         let historical = original_view.state();
         let facts = historical_facts(
+            &fixture.connection,
+            &fixture.policy,
             historical,
             &event,
             &events,
@@ -2584,6 +2978,123 @@ mod tests {
             validate_event_evidence(&fixture.policy, &fixture.connection, &forged, &events)
                 .is_err()
         );
+        Ok(())
+    }
+
+    fn append_signed_local_result_and_notification(
+        fixture: &Fixture,
+        original: &AdmissionProof,
+        dispatch: &SignedEvent,
+        request: &OperationRequest,
+    ) -> Result<()> {
+        use vibeface_secure::authorization::{
+            AUTH_VERSION, EventRef, execution_handoff::ProjectExecutionReceipt,
+        };
+        let event: Event = serde_json::from_str(&dispatch.canonical_body)?;
+        let target = PublicKey::parse(&fixture.node.public_key_hex()?)?;
+        let origin = ProjectDispatchOrigin::TaskSession {
+            task_creation: {
+                let task_ref = &request
+                    .binding
+                    .as_ref()
+                    .context("missing test binding")?
+                    .binding
+                    .task_ref;
+                let events =
+                    load_events_from(&fixture.connection, &fixture.policy, &request.network_id)?;
+                events
+                    .get(task_ref)
+                    .context("missing test Task")?
+                    .envelope
+                    .clone()
+            },
+        };
+        let work = derive_project_dispatch_work(&event, &origin, &target)?;
+        let signer =
+            Identity::from_secret_hex(&fixture.node.secret_key_hex).map_err(anyhow::Error::msg)?;
+        let receipt = Signed::sign(
+            ProjectExecutionReceipt {
+                version: AUTH_VERSION,
+                dispatch: EventRef::parse(&dispatch.hash)?,
+                project: original.invocation.payload.resource.clone(),
+                target_public_key: target,
+                operation_id: request.operation_id.clone(),
+                original_invocation_hash: original.invocation.hash()?,
+                original_admission_hash: ObjectHash::body(original)?,
+                work,
+                state: ExecutionHandoffState::Unknown,
+                result_hash: ObjectHash::body(&Value::Null)?,
+                session: None,
+                issued_at_ms: NOW,
+            },
+            &signer,
+        )?;
+        let result = ProjectExecutionResult {
+            dispatch: dispatch.clone(),
+            receipt,
+            result: Value::Null,
+        };
+        let observed = append_event_in(
+            &fixture.connection,
+            &fixture.policy,
+            &fixture.node,
+            original,
+            &request.conversation_id,
+            EventCause::Derived {
+                admission: original.clone(),
+                source: dispatch.hash.clone(),
+            },
+            EventBody::ExecutionObserved {
+                operation_id: request.operation_id.clone(),
+                task_id: request.task_id.clone(),
+                target_node: request.target_node.clone(),
+                session_id: request.session_id.clone(),
+                status: "unknown".into(),
+                detail: serde_json::to_value(&result)?,
+            },
+            vec![],
+            NOW,
+        )?;
+        let notice = append_event_in(
+            &fixture.connection,
+            &fixture.policy,
+            &fixture.node,
+            original,
+            &request.conversation_id,
+            EventCause::Derived {
+                admission: original.clone(),
+                source: observed.hash,
+            },
+            EventBody::NotificationRaised {
+                notification_id: format!("result:{}:unknown", request.operation_id),
+                kind: "unknown".into(),
+                text: "执行会话 s1 的本轮执行状态为 unknown。工单验收仍需本人确认。".into(),
+            },
+            vec![],
+            NOW,
+        )?;
+        let event: Event = serde_json::from_str(&notice.canonical_body)?;
+        let events = load_events_from(&fixture.connection, &fixture.policy, &request.network_id)?;
+        let view = OriginalAdmissionView::load(&fixture.connection, &fixture.policy, original)?;
+        let facts = historical_facts(
+            &fixture.connection,
+            &fixture.policy,
+            view.state(),
+            &event,
+            &events,
+            &dependency_closure(&event, &events)?
+                .context("test notification history is incomplete")?,
+        )?
+        .context("test notification has no original facts")?;
+        assert_eq!(
+            facts
+                .context
+                .execution_session
+                .as_ref()
+                .map(|session| session.session_id.as_str()),
+            Some("s1")
+        );
+        assert_eq!(facts.operation_id, request.operation_id);
         Ok(())
     }
 
@@ -2631,15 +3142,20 @@ mod tests {
             conversation_id: "chat".into(),
             task_id: Some("t1".into()),
             target_node: target.clone(),
-            session_id: "s1".into(),
+            session_id: Some("s1".into()),
             expected_revision: 0,
             basis_heads: heads_from_events(
-                &load_events_from(&fixture.connection, &fixture.policy, fixture.auth.resource().space.as_str())?,
+                &load_events_from(
+                    &fixture.connection,
+                    &fixture.policy,
+                    fixture.auth.resource().space.as_str(),
+                )?,
                 "chat",
             ),
             action: open_spec,
             resources: vec![execution_root],
             binding: Some(binding),
+            manager_authority: None,
         };
         fixture.body = json!({"method":"operate","space_id":fixture.auth.resource().space,"resource_id":fixture.auth.resource().resource,"authorization_id":"open_1","request":request});
         resign(&mut fixture)?;
@@ -2675,11 +3191,14 @@ mod tests {
             &request.network_id,
             &dispatch,
         )?;
-        let dispatch_events = load_events_from(&fixture.connection, &fixture.policy, &request.network_id)?;
+        let dispatch_events =
+            load_events_from(&fixture.connection, &fixture.policy, &request.network_id)?;
         let original_view =
             OriginalAdmissionView::load(&fixture.connection, &fixture.policy, &original)?;
         let historical = original_view.state();
         let dispatch_facts = historical_facts(
+            &fixture.connection,
+            &fixture.policy,
             historical,
             &dispatch_event,
             &dispatch_events,
@@ -2691,7 +3210,10 @@ mod tests {
             dispatch_facts.context.execution_session,
             Some(SessionRef {
                 target: DeviceId::from_key(&PublicKey::parse(&fixture.node.public_key_hex()?)?),
-                session_id: request.session_id.clone(),
+                session_id: request
+                    .session_id
+                    .clone()
+                    .context("test session is absent")?,
             })
         );
         let mut account_claiming_sdk = dispatch_event.clone();
@@ -2704,13 +3226,16 @@ mod tests {
         }
         assert!(
             historical_facts(
-                &historical,
+                &fixture.connection,
+                &fixture.policy,
+                historical,
                 &account_claiming_sdk,
                 &dispatch_events,
                 &dependency_closure(&dispatch_event, &dispatch_events)?.unwrap()
             )
             .is_err()
         );
+        append_signed_local_result_and_notification(&fixture, &original, &dispatch, &request)?;
         fixture.body = json!({"method":"resolve_unknown","space_id":fixture.auth.resource().space,"resource_id":fixture.auth.resource().resource,"authorization_id":"resolve_1",
             "conversation_id":"chat","operation_id":"open_1","target_node":target,"session_id":"s1","task_id":"t1","task_ref":task.hash,
             "outcome":"succeeded","evidence":"verified external process and side effects"});
@@ -3142,7 +3667,17 @@ mod tests {
             }
             _ => bail!("expected SDK invocation event"),
         }
-        assert!(historical_facts(historical, &changed, &events, &ancestors).is_err());
+        assert!(
+            historical_facts(
+                &store.connection,
+                &store.policy,
+                historical,
+                &changed,
+                &events,
+                &ancestors
+            )
+            .is_err()
+        );
         let mut tampered_parent_events = events.clone();
         let trigger_event = tampered_parent_events
             .get_mut(&facts.context.sdk_session.as_ref().unwrap().session_id)

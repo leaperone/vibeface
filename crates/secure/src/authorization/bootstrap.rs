@@ -161,6 +161,7 @@ fn initial_owner_grant(
             Action::TaskProgress,
             Action::TaskAccept,
             Action::TaskCancel,
+            Action::TaskFollowup,
             Action::ExecutionOpen,
             Action::ExecutionSend,
             Action::ExecutionCommand,
@@ -672,6 +673,7 @@ mod tests {
         assert!(grant.payload.actions.contains(&Action::GrantIssue));
         assert!(grant.payload.actions.contains(&Action::ExecutionCommand));
         assert!(grant.payload.actions.contains(&Action::AgentInterrupt));
+        assert!(grant.payload.actions.contains(&Action::TaskFollowup));
         assert!(
             grant
                 .payload
@@ -686,6 +688,7 @@ mod tests {
         assert_eq!(service.payload.actions.len(), 9);
         assert!(service.payload.actions.contains(&Action::ExecutionCommand));
         assert!(!service.payload.actions.contains(&Action::AgentInterrupt));
+        assert!(!service.payload.actions.contains(&Action::TaskFollowup));
         assert!(
             service
                 .payload

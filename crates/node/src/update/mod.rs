@@ -854,6 +854,12 @@ mod tests {
         assert_eq!(installed(&root).unwrap(), new);
         fs::write(
             old.join("BUILD-INFO.json"),
+            r#"{"version":"1.0.0","update_protocol":2,"data_epoch":2}"#,
+        )
+        .unwrap();
+        assert!(manifest(&old).is_err());
+        fs::write(
+            old.join("BUILD-INFO.json"),
             r#"{"version":"1.0.0","update_protocol":1,"data_epoch":3}"#,
         )
         .unwrap();

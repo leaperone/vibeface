@@ -16,6 +16,7 @@ import { AccountPasskeyControls } from './account-passkey-controls'
 import { NodeControls } from './node-controls'
 import { TeamWorkspaceControls } from './team-workspace-controls'
 import { GatewayControls } from './gateway-controls'
+import { LocalAccessControls } from './local-access-controls'
 
 const button = 'min-h-10'
 const input = 'min-h-10'
@@ -59,6 +60,7 @@ export function DeviceControls() {
   }
 
   return <div className="space-y-5">
+    <LocalAccessControls />
     {(busy || status) && <p role="status" className="text-sm text-muted-foreground">{busy ? '正在核对设备…' : status}</p>}
     {device.localProtectionNotice && <p role="status" className="rounded-lg border border-border p-3 text-sm">{device.localProtectionNotice}</p>}
     {error && <p role="alert" className="rounded-lg border border-destructive p-3 text-sm text-destructive">{error}</p>}

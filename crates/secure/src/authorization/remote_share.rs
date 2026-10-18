@@ -51,6 +51,7 @@ struct RemoteExecutionShareReference {
     kind: &'static str,
     purpose: RemoteSharePurpose,
     selection: RemoteExecutionShareSelection,
+    work: execution_work::ExecutionWorkIntent,
     context: InvocationContext,
     actions: Vec<Action>,
     source_project: ResourceRef,
@@ -89,7 +90,6 @@ pub fn prepare_remote_execution_share(
         let owner_snapshot = client_policy_import::require_confirmed_client_policy(owner)?;
         let merged = merge_same_head_snapshots(owner_snapshot, source.snapshot())?;
         let original = source.original().intent();
-        let task = &original.task_creation.payload;
         let resource = ResourceRef {
             space: owner.scope.space_id.clone(),
             resource: intent.execution_resource_id,
@@ -105,7 +105,10 @@ pub fn prepare_remote_execution_share(
                 && intent
                     .canonical_cwd
                     .as_ref()
-                    .is_none_or(|cwd| text(cwd, 4096)),
+                    .is_none_or(|cwd| text(cwd, 4096))
+                && original
+                    .canonical_cwd()
+                    .is_none_or(|cwd| intent.canonical_cwd.as_deref() == Some(cwd)),
             "execution sharing requires the current genuine owner and original policy reader",
         )?;
         let state = merged.state();
@@ -139,6 +142,7 @@ pub fn prepare_remote_execution_share(
         let execution_source = VerifiedExecutionSourcePolicy(ExecutionSourcePolicy {
             project: original.project.clone(),
             node_public_key: original.source_node_public_key.clone(),
+            work: original.work_intent(&target),
             pins: source
                 .snapshot()
                 .pins()
@@ -188,6 +192,7 @@ pub fn prepare_remote_execution_share(
                                 | Action::ExecutionInterrupt
                                 | Action::ExecutionRespondApproval
                                 | Action::ExecutionSubmit
+                                | Action::ExecutionCommand
                                 | Action::OperationStatusRead
                         )
                     }) && actions
@@ -199,6 +204,22 @@ pub fn prepare_remote_execution_share(
                     actions.push(Action::ExecutionSubmit);
                     actions.sort();
                 }
+                require(
+                    if original.is_command() {
+                        actions.contains(&Action::ExecutionCommand)
+                            && actions.iter().all(|action| {
+                                matches!(
+                                    action,
+                                    Action::ExecutionSubmit
+                                        | Action::ExecutionCommand
+                                        | Action::OperationStatusRead
+                                )
+                            })
+                    } else {
+                        !actions.contains(&Action::ExecutionCommand)
+                    },
+                    "sharing actions do not match the selected execution work",
+                )?;
                 Actor::Service(ServiceId::from_key(&original.source_node_public_key))
             }
             RemoteSharePurpose::Resolution => {
@@ -228,17 +249,7 @@ pub fn prepare_remote_execution_share(
             audience_node_public_key: target.clone(),
             constraints: GrantConstraints {
                 require_account_actor: original.purpose == RemoteSharePurpose::Rebind,
-                context: InvocationContext {
-                    conversation: Some(task.conversation_id.clone()),
-                    task: Some(task.task.clone()),
-                    sdk_session: None,
-                    execution_session: Some(SessionRef {
-                        target: DeviceId::from_key(&target),
-                        session_id: original.session_id.clone(),
-                    }),
-                    executor_kind: Some(original.executor_kind.clone()),
-                    workspace_resource: Some(resource.resource.clone()),
-                },
+                context: original.execution_context(&target, &resource)?,
                 ..Default::default()
             },
             remaining_delegations: 0,
@@ -396,6 +407,15 @@ pub fn finish_remote_execution_share(
         };
         usage.record_signed(&committed.commit)?;
         usage.record_metadata(&committed)?;
+        let work = &prepared
+            .grant
+            .payload
+            .execution_source
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "execution sharing has no approved work source",
+            ))?
+            .work;
         let reference = selection
             .as_ref()
             .map(|selection| RemoteExecutionShareReference {
@@ -403,6 +423,7 @@ pub fn finish_remote_execution_share(
                 kind: "vibeface-remote-execution",
                 purpose: prepared.purpose,
                 selection: selection.clone(),
+                work: work.clone(),
                 context: prepared.grant.payload.constraints.context.clone(),
                 actions: prepared.grant.payload.actions.clone(),
                 source_project: prepared.source_project.clone(),
@@ -662,6 +683,7 @@ mod tests {
         let mut actions = vec![
             Action::ExecutionOpen,
             Action::ExecutionSend,
+            Action::ExecutionCommand,
             Action::ExecutionSubmit,
             Action::ExecutionResolve,
             Action::ExecutionRebind,
@@ -738,6 +760,13 @@ mod tests {
             NOW,
         )
     }
+    fn intent_task_for_test(intent: &RemoteShareIntent) -> &Signed<RemoteShareTaskAttestation> {
+        match &intent.work {
+            RemoteShareWork::TaskSession { task_creation, .. } => task_creation,
+            _ => unreachable!(),
+        }
+    }
+
     fn source_request(
         purpose: RemoteSharePurpose,
         resource: &ResourceRef,
@@ -772,14 +801,17 @@ mod tests {
             version: AUTH_VERSION,
             purpose,
             project: project.clone(),
-            task_creation: attestation,
+            work: RemoteShareWork::TaskSession {
+                task_creation: attestation,
+                session_id: "selected-session".into(),
+                executor_kind: "codex".into(),
+                binding_generation: 1,
+            },
             source_node_public_key: PublicKey::of(&key(4)),
             requester: AccountId::from_root(&PublicKey::of(&key(1))),
             requester_device: DeviceId::from_key(&PublicKey::of(&key(3))),
             saved_pins: vec![],
             policy_heads: vec![],
-            session_id: "selected-session".into(),
-            executor_kind: "codex".into(),
             execution_resource: Some(resource.clone()),
             target_public_key: Some(PublicKey::of(&key(14))),
             old_binding: None,
@@ -787,6 +819,14 @@ mod tests {
             nonce: Nonce::random().unwrap(),
             issued_at_ms: NOW,
             expires_at_ms: NOW + 100_000,
+        };
+        let RemoteShareWork::TaskSession {
+            task_creation,
+            session_id,
+            ..
+        } = &intent.work
+        else {
+            unreachable!()
         };
         if purpose != RemoteSharePurpose::Execution {
             let binding = task_binding::TaskBinding {
@@ -797,7 +837,7 @@ mod tests {
                 authority_node: key(4).node_id(),
                 generation: 1,
                 target_node: key(14).node_id(),
-                session_id: intent.session_id.clone(),
+                session_id: session_id.clone(),
                 open_spec: serde_json::json!({"type":"open","executor":"codex","cwd":"/configured/workspace"}),
                 previous_binding_hash: None,
                 previous_seal: None,
@@ -819,24 +859,38 @@ mod tests {
                     execution_space_id: resource.space.clone(),
                     handoff_hash: ObjectHash::body(&"signed old handoff").unwrap(),
                     target: DeviceId::from_key(&PublicKey::of(&key(14))),
-                    session_id: intent.session_id.clone(),
-                    binding_generation: 1,
+                    work: execution_work::ExecutionWork::TaskSession {
+                        task: task_creation.payload.task.clone(),
+                        binding_hash: task_binding::binding_hash(&binding.binding).unwrap(),
+                        binding_generation: 1,
+                        execution_session: SessionRef {
+                            target: DeviceId::from_key(&PublicKey::of(&key(14))),
+                            session_id: session_id.clone(),
+                        },
+                    },
                     state: ExecutionHandoffState::Succeeded,
                     result_hash: ObjectHash::body(&"old result").unwrap(),
                     session: Some(ExecutionSessionSnapshot {
                         original_project: project.clone(),
                         execution_resource: resource.clone(),
-                        task: intent.task_creation.payload.task.clone(),
-                        binding_hash: task_binding::binding_hash(&binding.binding).unwrap(),
-                        binding_generation: 1,
+                        work: execution_work::ExecutionWork::TaskSession {
+                            task: task_creation.payload.task.clone(),
+                            binding_hash: task_binding::binding_hash(&binding.binding).unwrap(),
+                            binding_generation: 1,
+                            execution_session: SessionRef {
+                                target: DeviceId::from_key(&PublicKey::of(&key(14))),
+                                session_id: session_id.clone(),
+                            },
+                        },
                         target: DeviceId::from_key(&PublicKey::of(&key(14))),
-                        session_id: intent.session_id.clone(),
+                        session_id: session_id.clone(),
                         revision: 7,
                         executor: "codex".into(),
                         cwd: "/configured/workspace".into(),
                         state: "closed".into(),
                         expires_at_ms: NOW + EXECUTION_LEASE_MS,
                     }),
+                    control: None,
                     issued_at_ms: NOW,
                 },
                 &key(14),
@@ -901,9 +955,19 @@ mod tests {
             .is_err()
         );
         let mut substituted = request.payload.clone();
-        let mut task = substituted.intent.intent.task_creation.payload.clone();
-        task.task_id = "another-task".into();
-        substituted.intent.intent.task_creation = Signed::sign(task, &key(4)).unwrap();
+        match &mut substituted.intent.intent.work {
+            RemoteShareWork::TaskSession { task_creation, .. } => {
+                let mut task = task_creation.payload.clone();
+                task.task_id = "another-task".into();
+                *task_creation = Signed::sign(task, &key(4)).unwrap();
+            }
+            RemoteShareWork::ConversationSession { source, .. }
+            | RemoteShareWork::Command { source } => {
+                let mut statement = source.payload.clone();
+                statement.request["conversation_id"] = serde_json::json!("another-conversation");
+                *source = Signed::sign(statement, &key(4)).unwrap();
+            }
+        }
         let substituted = Signed::sign(substituted, reader).unwrap();
         assert!(
             verify_remote_share_policy_read(
@@ -1075,6 +1139,244 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn bounded_source_policy_keeps_commands_and_conversation_opens_distinct() {
+        use crate::authorization::execution_work::{ConversationOpenIntent, ExecutionWorkIntent};
+        let (pins, bundle, resource) = execution();
+        let owner = confirmed(&pins, &bundle, &resource, &key(13), &key(14));
+        for command in [true, false] {
+            let (source_pins, source_bundle, previous) =
+                source_request(RemoteSharePurpose::Execution, &resource);
+            let mut intent = previous.intent;
+            let target = PublicKey::of(&key(14));
+            let mut request = serde_json::json!({
+                "operation_id":"ordinary-share", "space_id":intent.project.space,
+                "conversation_id":"chat", "task_id":null, "target_node":key(14).node_id(),
+                "session_id":null,"expected_revision":0,"basis_heads":[],"resources":["workspace"],
+                "action":{"type":"command","command":"pwd","cwd":"/configured/workspace","timeout_secs":1}
+            });
+            let mut context = prepare::PrepareContext {
+                context: InvocationContext {
+                    conversation: Some("chat".into()),
+                    workspace_resource: Some(intent.project.resource.clone()),
+                    ..Default::default()
+                },
+                canonical_cwd: Some("/configured/workspace".into()),
+                execution_target_public_key: Some(target.clone()),
+                ..Default::default()
+            };
+            let work = if command {
+                ExecutionWorkIntent::Command {
+                    request_hash: ObjectHash::body(&request).unwrap(),
+                    canonical_cwd: "/configured/workspace".into(),
+                }
+            } else {
+                request["session_id"] = serde_json::json!("ordinary-session");
+                request["action"] = serde_json::json!({"type":"open","executor":"codex","cwd":"/configured/workspace"});
+                let session = SessionRef {
+                    target: DeviceId::from_key(&target),
+                    session_id: "ordinary-session".into(),
+                };
+                context.context.execution_session = Some(session.clone());
+                context.context.executor_kind = Some("codex".into());
+                ExecutionWorkIntent::ConversationSession {
+                    conversation: "chat".into(),
+                    execution_session: session,
+                    executor: "codex".into(),
+                    canonical_cwd: "/configured/workspace".into(),
+                    open: ConversationOpenIntent::Opening {
+                        operation_id: "ordinary-share".into(),
+                    },
+                }
+            };
+            let source = Signed::sign(
+                RemoteShareOperationAttestation {
+                    version: AUTH_VERSION,
+                    project: intent.project.clone(),
+                    work,
+                    context,
+                    request,
+                    source_node_public_key: PublicKey::of(&key(4)),
+                    issued_at_ms: NOW,
+                    expires_at_ms: NOW + 100_000,
+                },
+                &key(4),
+            )
+            .unwrap();
+            intent.work = if command {
+                RemoteShareWork::Command { source }
+            } else {
+                RemoteShareWork::ConversationSession {
+                    source,
+                    open: ConversationOpenEvidence::Opening,
+                }
+            };
+            let auth = confirmed(
+                &source_pins,
+                &source_bundle,
+                &intent.project,
+                &key(3),
+                &key(4),
+            );
+            let original: SignedRemoteShareIntent = serde_json::from_str(
+                &build_remote_share_intent(&encode(&intent).unwrap(), &auth, &key(3), NOW as f64)
+                    .unwrap(),
+            )
+            .unwrap();
+            let source = import_source(&source_pins, &source_bundle, &original, &key(13));
+            let actions = if command {
+                vec![Action::ExecutionCommand]
+            } else {
+                vec![Action::ExecutionOpen]
+            };
+            let prepared = prepare_remote_execution_share(
+                &share_intent(&resource, &actions),
+                &key(13),
+                &owner,
+                &source,
+                NOW as f64,
+            )
+            .unwrap();
+            assert!(prepared.grant.payload.constraints.context.task.is_none());
+            assert_eq!(
+                prepared
+                    .grant
+                    .payload
+                    .constraints
+                    .context
+                    .execution_session
+                    .is_none(),
+                command
+            );
+            assert!(
+                prepared
+                    .grant
+                    .payload
+                    .actions
+                    .contains(&Action::ExecutionSubmit)
+            );
+            assert!(prepared.grant.payload.actions.contains(&actions[0]));
+            assert!(
+                prepare_remote_execution_share(
+                    &share_intent(
+                        &resource,
+                        &[if command {
+                            Action::ExecutionOpen
+                        } else {
+                            Action::ExecutionCommand
+                        }]
+                    ),
+                    &key(13),
+                    &owner,
+                    &source,
+                    NOW as f64,
+                )
+                .is_err()
+            );
+            let committed = commit_share(&prepared, &owner);
+            let finished =
+                finish_remote_execution_share(&prepared, &committed, NOW as f64).unwrap();
+            assert_eq!(
+                finished.reference.as_ref().unwrap().work,
+                intent.work_intent(&target)
+            );
+            assert_eq!(
+                finished.selection.as_ref().unwrap().execution_grant,
+                prepared.grant.hash().unwrap()
+            );
+            assert_eq!(
+                prepared
+                    .grant
+                    .payload
+                    .execution_source
+                    .as_ref()
+                    .unwrap()
+                    .work,
+                intent.work_intent(&target)
+            );
+            let statement = match &original.intent.work {
+                RemoteShareWork::ConversationSession { source, .. }
+                | RemoteShareWork::Command { source } => &source.payload,
+                _ => unreachable!(),
+            };
+            let merged =
+                merge_same_head_snapshots(finished.change.snapshot(), source.snapshot()).unwrap();
+            let action = if command {
+                Action::ExecutionCommand
+            } else {
+                Action::ExecutionOpen
+            };
+            let destination = merged
+                .state()
+                .verify_execution_destination(
+                    &intent.project,
+                    &auth.audience,
+                    &resource,
+                    &target,
+                    &prepared.selection.execution_grant,
+                    &statement.context.context,
+                    action,
+                    NOW,
+                )
+                .unwrap();
+            let body = serde_json::json!({
+                "method":"operate", "space_id":intent.project.space, "resource_id":intent.project.resource,
+                "authorization_id":"ordinary-share", "request":statement.request,
+                "execution_resource":resource, "target_public_key":target,
+                "execution_grant":prepared.selection.execution_grant,
+            });
+            let mut invocation = original.invocation.payload.clone();
+            invocation.action = action;
+            invocation.operation_id = "ordinary-share".into();
+            invocation.context = statement.context.context.clone();
+            invocation.body_hash = ObjectHash::body(&body).unwrap();
+            let facts = RequestFacts {
+                resource: intent.project.clone(),
+                action,
+                audience: auth.audience.clone(),
+                operation_id: invocation.operation_id.clone(),
+                body_hash: invocation.body_hash.clone(),
+                context: invocation.context.clone(),
+            };
+            assert!(destination.check_facts(&facts).is_err());
+            assert!(
+                destination
+                    .clone()
+                    .bind_request(&invocation, &body)
+                    .unwrap()
+                    .check_facts(&facts)
+                    .is_ok()
+            );
+            let mut changed_body = body.clone();
+            if command {
+                changed_body["request"]["action"]["command"] = serde_json::json!("whoami");
+            } else {
+                changed_body["request"]["operation_id"] = serde_json::json!("another-open");
+            }
+            invocation.body_hash = ObjectHash::body(&changed_body).unwrap();
+            assert!(
+                destination
+                    .bind_request(&invocation, &changed_body)
+                    .is_err()
+            );
+            let mut changed = intent.clone();
+            match &mut changed.work {
+                RemoteShareWork::ConversationSession { source, .. }
+                | RemoteShareWork::Command { source } => {
+                    let mut statement = source.payload.clone();
+                    statement.context.context.task =
+                        Some(EventRef::parse(&"a".repeat(64)).unwrap());
+                    *source = Signed::sign(statement, &key(4)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                build_remote_share_intent(&encode(&changed).unwrap(), &auth, &key(3), NOW as f64)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn bounded_source_policy_keeps_original_account_and_exact_share_purposes() {
         let (pins, bundle, resource) = execution();
         let owner = confirmed(&pins, &bundle, &resource, &key(13), &key(14));
@@ -1093,7 +1395,7 @@ mod tests {
             );
             assert_eq!(
                 summary["taskRef"],
-                serde_json::to_value(&original.intent.task_creation.payload.task).unwrap()
+                serde_json::to_value(&intent_task_for_test(&original.intent).payload.task).unwrap()
             );
             assert!(summary.get("authorization").is_none());
             let actions = match purpose {
@@ -1152,7 +1454,7 @@ mod tests {
             assert_eq!(grant.payload.remaining_delegations, 0);
             assert_eq!(
                 grant.payload.constraints.context.task,
-                Some(original.intent.task_creation.payload.task.clone())
+                Some(intent_task_for_test(&original.intent).payload.task.clone())
             );
             assert_eq!(
                 grant.payload.constraints.context.workspace_resource,

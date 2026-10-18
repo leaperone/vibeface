@@ -15,11 +15,25 @@ pub struct BlobRef {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BotProject {
+    pub target_node: String,
+    pub cwd: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EventBody {
     ConversationCreated {
         title: String,
+    },
+    BotCreated {
+        bot_id: String,
+        name: String,
+        instructions: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<BotProject>,
     },
     MessagePosted {
         message_id: String,
@@ -43,14 +57,14 @@ pub enum EventBody {
         operation_id: String,
         task_id: Option<String>,
         target_node: String,
-        session_id: String,
+        session_id: Option<String>,
         action: Value,
     },
     ExecutionObserved {
         operation_id: String,
         task_id: Option<String>,
         target_node: String,
-        session_id: String,
+        session_id: Option<String>,
         status: String,
         detail: Value,
     },
@@ -270,6 +284,138 @@ fn validate_numbers(value: &Value) -> crate::Result<()> {
     Ok(())
 }
 
+pub fn validate_bot_definition(
+    bot_id: &str,
+    conversation_id: &str,
+    name: &str,
+    instructions: &str,
+    project: Option<&BotProject>,
+) -> crate::Result<()> {
+    let valid_id = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.:".contains(character))
+    };
+    if !valid_id(bot_id) || !valid_id(conversation_id) {
+        return Err("invalid Bot or conversation id".into());
+    }
+    if name.trim().is_empty() || name.len() > 512 || name.chars().any(char::is_control) {
+        return Err("invalid Bot name".into());
+    }
+    if instructions.len() > 8192
+        || serde_json::to_vec(&(name, instructions, project))
+            .map_err(|_| "invalid Bot definition")?
+            .len()
+            > 12_000
+    {
+        return Err("Bot definition exceeds its size limit".into());
+    }
+    if let Some(project) = project {
+        let path = std::path::Path::new(&project.cwd);
+        if !valid_id(&project.target_node)
+            || project.cwd.len() > 4096
+            || !path.is_absolute()
+            || project.cwd.chars().any(char::is_control)
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err("Bot project requires a target and an absolute directory".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn bot_creation_facts(event: &Event) -> super::Result<super::RequestFacts> {
+    use super::{Action, Actor, AuthorizationError, InvocationContext, RequestFacts, ResourceRef};
+    let EventBody::BotCreated {
+        bot_id,
+        name,
+        instructions,
+        project,
+    } = &event.body
+    else {
+        return Err(AuthorizationError::InvalidProof(
+            "event is not a Bot creation",
+        ));
+    };
+    let EventCause::Invocation { admission } = &event.cause else {
+        return Err(AuthorizationError::InvalidProof(
+            "Bot creation requires an original invocation",
+        ));
+    };
+    validate_bot_definition(
+        bot_id,
+        &event.scope_id,
+        name,
+        instructions,
+        project.as_ref(),
+    )
+    .map_err(|_| AuthorizationError::InvalidProof("invalid Bot definition"))?;
+    let body = &admission.source_body;
+    let fields = body.as_object().ok_or(AuthorizationError::InvalidProof(
+        "invalid Bot creation body",
+    ))?;
+    let invocation = &admission.invocation.payload;
+    let resource = ResourceRef {
+        space: SpaceId::parse(&event.network_id)?,
+        resource: event.resource_id.clone(),
+    };
+    let context = InvocationContext {
+        conversation: Some(event.scope_id.clone()),
+        workspace_resource: Some(event.resource_id.clone()),
+        ..Default::default()
+    };
+    if !fields.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "method"
+                | "space_id"
+                | "resource_id"
+                | "authorization_id"
+                | "bot_id"
+                | "conversation_id"
+                | "name"
+                | "instructions"
+                | "project"
+        )
+    }) || body["method"] != "create_bot"
+        || body["space_id"].as_str() != Some(event.network_id.as_str())
+        || body["resource_id"].as_str() != Some(event.resource_id.as_str())
+        || body["authorization_id"].as_str() != Some(invocation.operation_id.as_str())
+        || body["bot_id"].as_str() != Some(bot_id)
+        || body["conversation_id"].as_str() != Some(event.scope_id.as_str())
+        || body["name"].as_str() != Some(name)
+        || body["instructions"].as_str() != Some(instructions)
+        || body["project"]
+            != serde_json::to_value(project)
+                .map_err(|_| AuthorizationError::InvalidProof("invalid Bot project"))?
+        || invocation.resource != resource
+        || invocation.action != Action::ConversationCreate
+        || !matches!(invocation.actor, Actor::Account(_))
+        || invocation.body_hash != ObjectHash::body(body)?
+        || invocation.context != context
+        || !event.blobs.is_empty()
+    {
+        return Err(AuthorizationError::InvalidProof(
+            "Bot creation differs from its Account admission",
+        ));
+    }
+    Ok(RequestFacts {
+        resource,
+        action: Action::ConversationCreate,
+        audience: invocation.audience.clone(),
+        operation_id: invocation.operation_id.clone(),
+        body_hash: ObjectHash::body(body)?,
+        context,
+    })
+}
+
 pub fn validate_event_shape(event: &Event) -> crate::Result<()> {
     if event.version != EVENT_VERSION {
         return Err("unsupported event version".into());
@@ -301,6 +447,9 @@ pub fn validate_event_shape(event: &Event) -> crate::Result<()> {
         if blob.size > MAX_BLOB_BYTES {
             return Err("event blob is too large".into());
         }
+    }
+    if matches!(event.body, EventBody::BotCreated { .. }) {
+        bot_creation_facts(event).map_err(|error| error.to_string())?;
     }
     if let EventBody::ContextCheckpoint { covered_heads, .. } = &event.body
         && !covered_heads
@@ -346,6 +495,14 @@ pub fn verify_signed_event(
         return Err("event scope differs from trusted scope".into());
     }
     let public_key = PublicKey::parse(author_public_key).map_err(|e| e.to_string())?;
+    if matches!(event.body, EventBody::BotCreated { .. }) {
+        let facts = bot_creation_facts(&event).map_err(|error| error.to_string())?;
+        if facts.audience.device != super::DeviceId::from_key(&public_key)
+            || facts.audience.service != super::ServiceId::from_key(&public_key)
+        {
+            return Err("Bot author differs from its admitted Project host".into());
+        }
+    }
     let key_bytes = raw_hash(public_key.as_str())?;
     if event.author != hex::encode(Sha256::digest(key_bytes)) {
         return Err("event author differs from trusted device".into());
@@ -508,6 +665,231 @@ mod tests {
             event.resource_id.as_str(),
             &identity.public_key_hex(),
         )
+    }
+
+    fn admitted_bot() -> (Event, Identity, VerifiedPolicySet) {
+        let fixture = execution_observation::tests::retained_history_fixture();
+        let at = fixture.invocation.payload.not_before_ms;
+        let state = fixture.source.policy_snapshot.clone();
+        let project = fixture.invocation.payload.resource.clone();
+        let audience = fixture.invocation.payload.audience.clone();
+        let project_config = BotProject {
+            target_node: fixture.project_node.node_id(),
+            cwd: "/workspace/project".into(),
+        };
+        let body = json!({
+            "method":"create_bot", "space_id":project.space, "resource_id":project.resource,
+            "authorization_id":"create-review-bot", "bot_id":"review-bot",
+            "conversation_id":"bot-chat", "name":"Review", "instructions":"Check the requested changes.",
+            "project":project_config,
+        });
+        let context = InvocationContext {
+            conversation: Some("bot-chat".into()),
+            workspace_resource: Some(project.resource.clone()),
+            ..Default::default()
+        };
+        let facts = RequestFacts {
+            resource: project.clone(),
+            action: Action::ConversationCreate,
+            audience: audience.clone(),
+            operation_id: "create-review-bot".into(),
+            body_hash: ObjectHash::body(&body).unwrap(),
+            context: context.clone(),
+        };
+        let mut payload = fixture.invocation.payload.clone();
+        payload.operation_id = facts.operation_id.clone();
+        payload.action = facts.action;
+        payload.body_hash = facts.body_hash.clone();
+        payload.context = context;
+        payload.expected_policies.clear();
+        payload.nonce = Nonce::random().unwrap();
+        let transport = TransportEvidence::DirectNoise {
+            device: payload.device.clone(),
+        };
+        let initial = Signed::sign(payload.clone(), &fixture.client).unwrap();
+        let AuthorizationError::NeedPolicySync(heads) = state
+            .verify_invocation(&initial, &facts, &transport, at)
+            .unwrap_err()
+        else {
+            panic!("Bot fixture must discover current policy heads")
+        };
+        payload.expected_policies = heads;
+        let invocation = Signed::sign(payload, &fixture.client).unwrap();
+        let authorization = state
+            .verify_invocation(&invocation, &facts, &transport, at)
+            .unwrap();
+        let challenge = FreshnessChallenge::new(
+            &authorization,
+            CheckStage::Admit,
+            Nonce::random().unwrap(),
+            at,
+            at + 1000,
+        )
+        .unwrap();
+        let receipts = challenge
+            .policies
+            .iter()
+            .map(|current| {
+                let authority = match &current.domain {
+                    PolicyDomain::Account(id) => &state.account(id).unwrap().authority,
+                    PolicyDomain::Space(id) => &state.space(id).unwrap().authority,
+                };
+                assert_eq!(authority.public_key, PublicKey::of(&fixture.project_node));
+                Signed::sign(
+                    FreshnessReceipt {
+                        version: AUTH_VERSION,
+                        current: current.clone(),
+                        challenge_hash: challenge.hash().unwrap(),
+                        issued_at_ms: at,
+                        expires_at_ms: at + 1000,
+                    },
+                    &fixture.project_node,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let fresh = state
+            .verify_freshness(&authorization, &challenge, &receipts, at)
+            .unwrap();
+        state.admit_operation(&authorization, &fresh, at).unwrap();
+        let event = Event {
+            version: EVENT_VERSION,
+            network_id: project.space.as_str().into(),
+            resource_id: project.resource,
+            cause: EventCause::Invocation {
+                admission: AdmissionProof {
+                    invocation,
+                    source_body: body,
+                    challenge,
+                    receipts,
+                    admitted_at_ms: at,
+                    transport: StoredTransport::from(&transport),
+                },
+            },
+            scope_id: "bot-chat".into(),
+            author: fixture.project_node.node_id(),
+            sequence: 1,
+            previous: None,
+            parents: vec![],
+            created_at_ms: at as i64,
+            blobs: vec![],
+            body: EventBody::BotCreated {
+                bot_id: "review-bot".into(),
+                name: "Review".into(),
+                instructions: "Check the requested changes.".into(),
+                project: Some(project_config),
+            },
+        };
+        (event, fixture.project_node, state)
+    }
+
+    #[test]
+    fn bot_creation_preserves_its_real_account_admission() {
+        let (event, node, state) = admitted_bot();
+        let envelope = sign_bytes(serde_json::to_string(&event).unwrap(), &node);
+        let verified = verify(&event, &envelope, &node).unwrap();
+        let facts = bot_creation_facts(verified.event()).unwrap();
+        let EventCause::Invocation { admission } = &verified.event().cause else {
+            unreachable!()
+        };
+        state.verify_original_admission(admission, &facts).unwrap();
+        assert_eq!(facts.action, Action::ConversationCreate);
+        assert_eq!(facts.context.conversation.as_deref(), Some("bot-chat"));
+        assert!(facts.context.task.is_none());
+        assert!(facts.context.sdk_session.is_none());
+        assert!(facts.context.execution_session.is_none());
+    }
+
+    #[test]
+    fn bot_creation_rejects_changed_fields_wrong_scope_and_service_origins() {
+        let (event, node, state) = admitted_bot();
+        for field in [
+            "bot_id",
+            "name",
+            "instructions",
+            "project",
+            "scope",
+            "actor",
+            "method",
+            "derived",
+        ] {
+            let mut changed = event.clone();
+            let EventBody::BotCreated {
+                bot_id,
+                name,
+                instructions,
+                project,
+            } = &mut changed.body
+            else {
+                unreachable!()
+            };
+            match field {
+                "bot_id" => *bot_id = "other-bot".into(),
+                "name" => *name = "Other name".into(),
+                "instructions" => *instructions = "Different instructions".into(),
+                "project" => project.as_mut().unwrap().cwd = "/other".into(),
+                "scope" => changed.scope_id = "other-chat".into(),
+                "actor" => {
+                    let EventCause::Invocation { admission } = &mut changed.cause else {
+                        unreachable!()
+                    };
+                    admission.invocation.payload.actor =
+                        Actor::Service(ServiceId::from_key(&PublicKey::of(&node)));
+                }
+                "method" => {
+                    let EventCause::Invocation { admission } = &mut changed.cause else {
+                        unreachable!()
+                    };
+                    admission.source_body["method"] = json!("create_conversation");
+                }
+                "derived" => {
+                    let EventCause::Invocation { admission } = changed.cause else {
+                        unreachable!()
+                    };
+                    changed.cause = EventCause::Derived {
+                        admission,
+                        source: "scheduler".into(),
+                    };
+                }
+                _ => unreachable!(),
+            }
+            let signed = sign_bytes(serde_json::to_string(&changed).unwrap(), &node);
+            assert!(
+                verify(&changed, &signed, &node).is_err(),
+                "accepted changed {field}"
+            );
+        }
+        let mut forged = event.clone();
+        let EventBody::BotCreated { instructions, .. } = &mut forged.body else {
+            unreachable!()
+        };
+        *instructions = "Changed after the Account signed".into();
+        let EventCause::Invocation { admission } = &mut forged.cause else {
+            unreachable!()
+        };
+        admission.source_body["instructions"] = json!(instructions);
+        admission.invocation.payload.body_hash = ObjectHash::body(&admission.source_body).unwrap();
+        let facts = bot_creation_facts(&forged).unwrap();
+        let EventCause::Invocation { admission } = &forged.cause else {
+            unreachable!()
+        };
+        assert!(state.verify_original_admission(admission, &facts).is_err());
+        assert!(
+            validate_bot_definition(
+                "bot",
+                "chat",
+                "name",
+                "",
+                Some(&BotProject {
+                    target_node: node.node_id(),
+                    cwd: "/workspace/../other".into(),
+                })
+            )
+            .is_err()
+        );
+        let mut json = serde_json::to_value(&event).unwrap();
+        json["body"]["membership_role_proof"] = json!({});
+        assert!(serde_json::from_value::<Event>(json).is_err());
     }
 
     #[test]

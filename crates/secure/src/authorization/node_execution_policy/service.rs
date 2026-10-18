@@ -105,21 +105,7 @@ pub(super) fn check_sdk_read_context(
             && !sdk.session_id.is_empty()
             && read == context.context
             && context.context.workspace_resource.as_ref() == Some(&facts.resource.resource)
-            && context.context.task.is_some()
-            && context.context.conversation.is_some()
-            && context.context.executor_kind.is_some()
-            && context.execution_target_public_key.as_ref() == Some(&selection.target_public_key)
-            && context
-                .context
-                .execution_session
-                .as_ref()
-                .is_some_and(|session| {
-                    session.target == DeviceId::from_key(&selection.target_public_key)
-                        && !session.session_id.is_empty()
-                })
-            && context
-                .binding_generation
-                .is_some_and(|generation| generation > 0),
+            && context.execution_target_public_key.as_ref() == Some(&selection.target_public_key),
         "native policy source changed its SDK context, Task or executor",
     )
 }
@@ -127,15 +113,27 @@ pub(super) fn check_sdk_read_context(
 pub(super) fn check_binding(
     trust: &VerifiedTaskExecutionTrust,
     context: &prepare::PrepareContext,
+    work: &ExecutionWorkIntent,
     binding: Option<&SignedBinding>,
     local: &PublicKey,
     action: Action,
 ) -> Result<()> {
+    work.validate_context(context, &trust.selection().target_public_key)?;
+    require(
+        trust.work().approves_intent(work),
+        "native source work differs from its approved original",
+    )?;
+    if !matches!(work, ExecutionWorkIntent::TaskSession { .. }) {
+        return require(
+            binding.is_none() && action != Action::ExecutionRebind,
+            "non-Task work cannot claim a Task binding or rebind",
+        );
+    }
     let Some(binding) = binding else {
         return require(
             action == Action::ExecutionOpen
                 && context.binding_generation == Some(1)
-                && trust.binding_generation() == 1,
+                && trust.binding_generation() == Some(1),
             "only an initial execution open can read policy without a current binding",
         );
     };
@@ -194,6 +192,7 @@ pub fn verify_node_service_policy_source(
     child_facts: &RequestFacts,
     selection: &RemoteExecutionPolicySelection,
     read_context: &prepare::PrepareContext,
+    read_work: &ExecutionWorkIntent,
     current_binding: Option<&SignedBinding>,
     provenance: &SdkPolicySourceProvenance,
     identity: &Identity,
@@ -233,6 +232,7 @@ pub fn verify_node_service_policy_source(
     check_binding(
         trust,
         read_context,
+        read_work,
         current_binding,
         &local,
         child_facts.action,
@@ -266,6 +266,7 @@ pub fn verify_node_service_policy_source(
             source_project: child_facts.resource.clone(),
             selection: selection.clone(),
             context: read_context.clone(),
+            work: read_work.clone(),
             expected_action,
             purpose,
             execution_pins: trust.pins().to_vec(),
@@ -382,11 +383,21 @@ pub fn verify_node_history_policy_source(
         task_binding::verify_binding(binding, local.as_str()).map_err(|_| {
             AuthorizationError::InvalidProof("History source has another binding signer")
         })?;
+        let execution_work::ExecutionWork::TaskSession {
+            binding_hash,
+            binding_generation,
+            ..
+        } = &reference.source.payload.work
+        else {
+            return Err(AuthorizationError::InvalidProof(
+                "non-Task History has a Task binding",
+            ));
+        };
         require(
             task_binding::binding_hash(&binding.binding)
                 .map_err(|_| AuthorizationError::InvalidProof("invalid History binding"))?
-                == reference.source.payload.binding_hash
-                && binding.binding.generation == reference.source.payload.binding_generation
+                == *binding_hash
+                && binding.binding.generation == *binding_generation
                 && reference
                     .expected_binding_hash
                     .as_ref()

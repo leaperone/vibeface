@@ -18,7 +18,7 @@ import { newId } from "./storage"
 import { remoteExecutionProposal } from "@/lib/remote-execution"
 import { nodeFingerprint } from "../../../generated/vibeface_secure.js"
 import type { TrustedRemoteExecution } from "@/lib/remote-execution"
-import type { OperationRecord, PendingOperation, SessionRecord } from "./types"
+import type { OperationRecord, PendingOperation, TaskSessionRecord as SessionRecord } from "./types"
 
 const executors = [
   ["codex", "Codex"],
@@ -26,7 +26,7 @@ const executors = [
   ["cursor_agent", "Cursor Agent"],
 ] as const
 
-export function SessionsScreen() {
+export function AdvancedExecutions() {
   const workspace = useWorkspace()
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -36,7 +36,7 @@ export function SessionsScreen() {
   const devices = workspace.nodes.filter((node) => node.roles?.includes("executor"))
   const selected = devices.find((node) => node.node_id === executorId)
   const kinds = selected?.capabilities?.executors ?? []
-  const sessions = workspace.data?.sessions ?? []
+  const sessions = (workspace.data?.sessions ?? []).filter((session): session is SessionRecord => session.task_id !== null)
   const tasks = (workspace.data?.tasks ?? []).filter(task => task.binding === null && !["accepted", "cancelled"].includes(task.status))
   const operations = [...(workspace.data?.operations ?? [])].reverse()
   const unresolved = operations.filter((operation) => operation.state === "unknown")
@@ -59,7 +59,7 @@ export function SessionsScreen() {
   }, [tasks])
 
   return (
-    <section className="workspace-screen space-y-5" aria-label="执行会话" hidden={workspace.view !== "sessions"}>
+    <section className="workspace-screen space-y-5" aria-label="执行会话">
       <Collapsible open={open} onOpenChange={setOpen}>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-semibold">执行会话 <span className="text-sm font-normal text-muted-foreground">{sessions.length}</span></h2>
@@ -251,11 +251,12 @@ function RemoteExecutionCard({ remote }: { remote: TrustedRemoteExecution }) {
   const [busy, setBusy] = useState(false)
   const proposed = remoteExecutionProposal(remote)
   const alreadyBound = workspace.data?.tasks.some(task => task.binding !== null && record(record(task.binding).binding).task_ref === proposed.taskRef)
+  if (proposed.work.kind !== 'task_session') return <Card><CardHeader><CardTitle>{proposed.work.kind === 'command' ? '命令执行授权已导入' : '普通会话执行授权已导入'}</CardTitle></CardHeader><CardContent><DetailList pairs={[["执行设备公钥", remote.share.selection.target_public_key], ["会话", proposed.sessionId ?? undefined]]} /><p className="text-sm text-muted-foreground">在对应工作中读取结果和提交操作。</p></CardContent></Card>
   return (
     <Card>
       <CardHeader><CardTitle>{proposed.purpose === 'rebind' ? '原执行会话的 Rebind 授权' : proposed.purpose === 'resolution' ? '此远端会话的结果处理授权已导入' : alreadyBound ? '新执行目标的授权已导入' : '按已确认的远端授权打开执行会话'}</CardTitle></CardHeader>
       <CardContent>
-        <DetailList pairs={[["执行设备公钥", remote.share.selection.target_public_key], ["执行空间", remote.share.selection.execution_resource.space], ["会话", proposed.sessionId], ["执行器", proposed.executorKind]]} />
+        <DetailList pairs={[["执行设备公钥", remote.share.selection.target_public_key], ["执行空间", remote.share.selection.execution_resource.space], ["会话", proposed.sessionId ?? undefined], ["执行器", proposed.executorKind ?? undefined]]} />
         {proposed.purpose === 'rebind' ? <p className="mt-3 text-sm text-muted-foreground">在原执行会话中核对并准备重绑。此授权不能打开新执行或处理未知结果。</p> : proposed.purpose === 'resolution' ? <p className="mt-3 text-sm text-muted-foreground">此授权只用于原操作的结果核验和明确裁定。到下方未知操作中填写核查证据后使用。</p> : alreadyBound ? <p className="mt-3 text-sm text-muted-foreground">此任务已有执行绑定。请在原执行会话的重绑表单中选择这份新目标授权。</p> : <form className="mt-4" onSubmit={event => {
           event.preventDefault()
           const form = event.currentTarget

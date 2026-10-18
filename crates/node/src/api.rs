@@ -23,6 +23,7 @@ const CALLBACK: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 struct App {
     node: Arc<Runtime>,
     sites: Vec<Site>,
+    local: bool,
 }
 
 #[derive(Clone)]
@@ -98,6 +99,12 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         "non-loopback HTTP requires allow_insecure_lan; use HTTPS for public access"
     );
     let listener = TcpListener::bind(node.config.listen).await?;
+    let local = TcpListener::bind(node.config.local_access.listen).await?;
+    let local_address = local.local_addr()?;
+    node.local_access
+        .publish(local_address, node.identity.node_id()?)?;
+    let local_sites = vec![Site::parse(&format!("http://{local_address}"))?];
+    let local_router = local_router(node.clone(), local_sites);
     let tools = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let tool_url = format!("http://{}", tools.local_addr()?);
     let internal = tool_router(node.clone(), Site::parse(&tool_url)?);
@@ -118,6 +125,13 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
                 internal.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
+        },
+        async {
+            axum::serve(
+                local,
+                local_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
         }
     )?;
     Ok(())
@@ -127,6 +141,7 @@ fn tool_router(node: Arc<Runtime>, site: Site) -> Router {
     let app = App {
         node,
         sites: vec![site],
+        local: false,
     };
     Router::new()
         .route("/api/tools", post(tool))
@@ -156,7 +171,35 @@ pub fn router(node: Arc<Runtime>) -> Router {
 }
 
 fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
-    let app = App { sites, node };
+    let app = App {
+        sites,
+        node,
+        local: false,
+    };
+    common_router(app)
+}
+
+fn local_router(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
+    let app = App {
+        sites,
+        node,
+        local: true,
+    };
+    common_router(app.clone()).merge(
+        Router::new()
+            .route("/api/local/status", get(local_status))
+            .route("/api/local/launch", post(local_launch))
+            .route("/api/local/exchange", post(local_exchange))
+            .route("/api/local/session", post(local_session))
+            .route("/api/local/settings", post(local_settings))
+            .route("/api/local/network/ws", get(local_network))
+            .layer(DefaultBodyLimit::max(4096))
+            .layer(middleware::from_fn_with_state(app.clone(), boundary))
+            .with_state(app),
+    )
+}
+
+fn common_router(app: App) -> Router {
     Router::new()
         .route("/transport.js", get(transport_javascript))
         .route("/generated/vibeface_secure.js", get(crypto_javascript))
@@ -257,7 +300,9 @@ async fn check_boundary(
         }
         let is_tool = path == "/api/tools" || path == CALLBACK;
         let bearer_call = is_tool && bearer(headers).is_some();
+        let local_launch = app.local && path == "/api/local/launch" && bearer(headers).is_some();
         if !bearer_call
+            && !local_launch
             && !one_header(headers, header::ORIGIN.as_str())
                 .is_some_and(|origin| site.origin.eq_ignore_ascii_case(origin))
         {
@@ -309,6 +354,148 @@ async fn info(State(app): State<App>) -> Json<Value> {
     Json(app.node.info())
 }
 
+fn local_cookie(headers: &HeaderMap) -> ApiResult<&str> {
+    one_header(headers, header::COOKIE.as_str()).ok_or_else(ApiError::auth)
+}
+
+async fn local_status(State(app): State<App>, headers: HeaderMap) -> Json<Value> {
+    let authenticated = local_cookie(&headers)
+        .ok()
+        .is_some_and(|cookie| app.node.local_access.session(cookie).is_ok());
+    Json(
+        json!({"enabled":app.node.local_access.enabled(), "authenticated":authenticated, "node_id":app.node.identity.node_id().ok()}),
+    )
+}
+
+async fn local_launch(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let token = app
+        .node
+        .local_access
+        .launch(bearer(&headers).ok_or_else(ApiError::auth)?)
+        .map_err(|_| ApiError::auth())?;
+    Ok(Json(json!({"token":token})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalExchange {
+    token: String,
+}
+
+async fn local_exchange(
+    State(app): State<App>,
+    Json(input): Json<LocalExchange>,
+) -> ApiResult<Response> {
+    let cookie = app
+        .node
+        .local_access
+        .exchange(&input.token)
+        .map_err(|_| ApiError::auth())?;
+    Ok((
+        [(header::SET_COOKIE, cookie)],
+        Json(json!({"authenticated":true})),
+    )
+        .into_response())
+}
+
+async fn local_session(State(app): State<App>, headers: HeaderMap) -> ApiResult<Json<Value>> {
+    let session = app
+        .node
+        .local_access
+        .session(local_cookie(&headers)?)
+        .map_err(|_| ApiError::auth())?;
+    let capability = if app.node.store.lock().await.trusted_policy_pins().is_empty() {
+        Some(
+            app.node
+                .local_access
+                .bootstrap_capability()
+                .map_err(ApiError::bad)?,
+        )
+    } else {
+        None
+    };
+    let node_id = app.node.identity.node_id().map_err(ApiError::bad)?;
+    let mut card = json!({"url":app.sites[0].origin,"node_id":node_id,"node_public_key":app.node.identity.public_key_hex().map_err(ApiError::bad)?,"relay":false});
+    if let Some(capability) = capability {
+        card["capability"] = json!(capability);
+        card["claim_nonce"] = card["capability"].clone();
+    }
+    let unlock_key = app
+        .node
+        .local_access
+        .unlock_key(&session)
+        .map_err(|_| ApiError::auth())?;
+    Ok(Json(
+        json!({"enabled":unlock_key.is_some(), "unlock_key":unlock_key, "node_id":node_id, "generation":session.generation,"connection_card":card}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalSettings {
+    enabled: bool,
+}
+
+async fn local_settings(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(input): Json<LocalSettings>,
+) -> ApiResult<Json<Value>> {
+    let session = app
+        .node
+        .local_access
+        .session(local_cookie(&headers)?)
+        .map_err(|_| ApiError::auth())?;
+    app.node
+        .local_access
+        .set_enabled(&session, input.enabled)
+        .map_err(ApiError::bad)?;
+    Ok(Json(json!({"enabled":input.enabled})))
+}
+
+async fn local_network(
+    State(app): State<App>,
+    headers: HeaderMap,
+    websocket: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    let session = app
+        .node
+        .local_access
+        .session(local_cookie(&headers)?)
+        .map_err(|_| ApiError::auth())?;
+    if app
+        .node
+        .local_access
+        .unlock_key(&session)
+        .map_err(|_| ApiError::auth())?
+        .is_none()
+    {
+        return Err(ApiError::auth());
+    }
+    let permit = app
+        .node
+        .local_access
+        .sockets
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many local connections".into(),
+            )
+        })?;
+    Ok(websocket
+        .max_message_size(65535)
+        .max_frame_size(65535)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            if let Err(error) = crate::network::serve_local_client(app.node, socket, session).await
+            {
+                tracing::debug!(%error, "local client closed");
+            }
+        }))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolRequest {
@@ -352,10 +539,19 @@ async fn tool_callback(
             "args must be an object and agentId must be nonempty and bounded",
         ));
     }
-    // Executor writes still require the operation ID in args; this ID only identifies the callback.
-    let call_id = input
-        .tool_call_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let write = !matches!(
+        input.tool_name.as_str(),
+        "nodes" | "context" | "execution_status" | "call_lookup"
+    );
+    let call_id = match input.tool_call_id {
+        Some(id) => id,
+        None if !write => uuid::Uuid::new_v4().to_string(),
+        None => {
+            return Err(ApiError::bad(
+                "write tool callbacks require a stable toolCallId",
+            ));
+        }
+    };
     validate_tool_call(&input.tool_name, &call_id)?;
     let result = app
         .node

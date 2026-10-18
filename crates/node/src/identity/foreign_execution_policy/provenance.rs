@@ -18,54 +18,59 @@ use vibeface_secure::authorization::{
 pub(crate) struct TaskExecutionPolicyProvenance {
     pub(super) current: BTreeMap<ObjectHash, VerifiedTaskCurrentPolicy>,
     pub(super) history: BTreeMap<ObjectHash, VerifiedTaskHistoryPolicy>,
-    by_task: BTreeMap<ObjectHash, BTreeSet<ObjectHash>>,
+    by_work: BTreeMap<ObjectHash, BTreeSet<ObjectHash>>,
     original: BTreeMap<ObjectHash, CachedOriginal>,
     retained_floors: BTreeMap<String, vibeface_secure::authorization::PolicyPin>,
 }
 
 impl TaskExecutionPolicyProvenance {
-    pub(super) fn task_key(policy: &VerifiedTaskCurrentPolicy) -> Result<ObjectHash> {
-        let context = policy.request().context()?;
-        let task = context
-            .context
-            .task
-            .as_ref()
-            .context("completed foreign policy has no Task")?;
-        Ok(ObjectHash::body(&(
+    pub(super) fn work_key(policy: &VerifiedTaskCurrentPolicy) -> Result<ObjectHash> {
+        Ok(ObjectHash::body(&work_approval_prefix(
             policy.request().source_project(),
-            task,
-        ))?)
+            &policy.work(),
+        )?)?)
     }
 
     pub(super) fn insert_current(
         &mut self,
-        task_key: ObjectHash,
+        work_key: ObjectHash,
         reference: ObjectHash,
         policy: VerifiedTaskCurrentPolicy,
     ) {
-        self.by_task
-            .entry(task_key)
+        self.by_work
+            .entry(work_key)
             .or_default()
             .insert(reference.clone());
         self.current.insert(reference, policy);
     }
 
-    pub(super) fn current_for_task(
-        &self,
-        project: &vibeface_secure::authorization::ResourceRef,
-        task: &vibeface_secure::authorization::EventRef,
-    ) -> Result<Vec<&VerifiedTaskCurrentPolicy>> {
-        let key = ObjectHash::body(&(project, task))?;
-        self.by_task
+    fn current_for_key(&self, key: ObjectHash) -> Result<Vec<&VerifiedTaskCurrentPolicy>> {
+        self.by_work
             .get(&key)
             .into_iter()
             .flatten()
             .map(|reference| {
                 self.current
                     .get(reference)
-                    .context("Task policy index lost its genuine current provenance")
+                    .context("execution policy index lost its genuine current provenance")
             })
             .collect()
+    }
+
+    pub(crate) fn current_for_work(
+        &self,
+        project: &ResourceRef,
+        work: &ExecutionWorkIntent,
+    ) -> Result<Vec<&VerifiedTaskCurrentPolicy>> {
+        self.current_for_key(ObjectHash::body(&work_approval_prefix(project, work)?)?)
+    }
+
+    pub(super) fn current_for_task(
+        &self,
+        project: &ResourceRef,
+        task: &vibeface_secure::authorization::EventRef,
+    ) -> Result<Vec<&VerifiedTaskCurrentPolicy>> {
+        self.current_for_key(ObjectHash::body(&task_approval_prefix(project, task)?)?)
     }
 }
 
@@ -178,20 +183,20 @@ fn check_saved_carriers_in(
         ObjectHash::body(expected_witness)?,
     ))?;
     let (complete, imported) = completion_in(connection, &reference)?;
-    let request: TaskExecutionPolicyRequest =
+    let request: Box<TaskExecutionPolicyRequest> =
         read_in(connection, &key("request", &imported.request_ref))?
             .context("foreign policy original request is missing")?;
-    let snapshot: Signed<RemoteExecutionPolicySnapshot> =
+    let snapshot: Box<Signed<RemoteExecutionPolicySnapshot>> =
         read_in(connection, &key("snapshot", &imported.snapshot_ref))?
             .context("foreign policy original snapshot is missing")?;
-    let witness: Signed<RemoteExecutionPolicyWitness> =
+    let witness: Box<Signed<RemoteExecutionPolicyWitness>> =
         read_in(connection, &key("witness", &complete.witness_ref))?
             .context("foreign policy original witness is missing")?;
     ensure!(
-        expected_request == &request
+        expected_request == request.as_ref()
             && request.request_hash()? == imported.request_ref
-            && expected_snapshot == &snapshot
-            && expected_witness == &witness
+            && expected_snapshot == snapshot.as_ref()
+            && expected_witness == witness.as_ref()
             && imported.approval_ref == trust.approval().hash()?,
         "foreign policy original carrier differs from its verified provenance"
     );
@@ -199,10 +204,11 @@ fn check_saved_carriers_in(
         let reference = node
             .source_provenance()
             .context("Node policy has no signed SDK source provenance")?;
-        let raw: SdkPolicySourceProvenance = read_in(connection, &key("sdk-source", reference))?
-            .context("Node policy original SDK source is missing")?;
+        let raw: Box<SdkPolicySourceProvenance> =
+            read_in(connection, &key("sdk-source", reference))?
+                .context("Node policy original SDK source is missing")?;
         ensure!(
-            ObjectHash::body(&raw)? == *reference,
+            ObjectHash::body(raw.as_ref())? == *reference,
             "Node policy original SDK source changed"
         );
     }
@@ -211,26 +217,28 @@ fn check_saved_carriers_in(
         "foreign policy page count differs from its verified provenance"
     );
     for (index, expected) in page_hashes.iter().enumerate() {
-        let page: Signed<
-            vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPage,
+        let page: Box<
+            Signed<
+                vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPage,
+            >,
         > = read_in(
             connection,
             &ingress::page_key(&complete.import_ref, index as u64),
         )?
         .context("foreign policy original page is missing")?;
         ensure!(
-            ObjectHash::body(&page)? == *expected,
+            ObjectHash::body(page.as_ref())? == *expected,
             "foreign policy original signed page changed"
         );
     }
-    let original: Signed<RemoteExecutionPolicyReadIntent> =
+    let original: Box<Signed<RemoteExecutionPolicyReadIntent>> =
         read_in(connection, &key("approved-intent", &imported.approval_ref))?
             .context("foreign approval original intent is missing")?;
-    let approval: Signed<TaskExecutionTrustApproval> =
+    let approval: Box<Signed<TaskExecutionTrustApproval>> =
         read_in(connection, &key("approval", &imported.approval_ref))?
             .context("foreign approval original signature is missing")?;
     ensure!(
-        trust.original_intent() == &original && trust.approval() == &approval,
+        trust.original_intent() == original.as_ref() && trust.approval() == approval.as_ref(),
         "foreign policy approval differs from its verified provenance"
     );
     Ok(())
@@ -541,6 +549,51 @@ pub(crate) fn task_policy_candidates_in(
     Ok(candidates.into_values().collect())
 }
 
+pub(crate) fn execution_policy_candidates_in(
+    connection: &Connection,
+    primary: &super::super::journal::PolicyState,
+    source: &PublicKey,
+    project: &ResourceRef,
+    work: &ExecutionWorkIntent,
+    action: Action,
+    now: u64,
+) -> Result<Vec<VerifiedTaskCurrentPolicy>> {
+    ensure!(
+        !matches!(work, ExecutionWorkIntent::TaskSession { .. }),
+        "Task target discovery requires its actual Task creation and binding"
+    );
+    let mut selected: BTreeMap<ObjectHash, VerifiedTaskCurrentPolicy> = BTreeMap::new();
+    for policy in primary
+        .task_execution_policy
+        .current_for_work(project, work)?
+    {
+        if policy.request().source_node() != source
+            || policy.request().source_project() != project
+            || policy.request().purpose() != RemoteExecutionPolicyPurpose::Execution
+            || policy.request().expected_action() != action
+            || policy.work() != *work
+            || now >= policy.expires_at_ms()
+            || now < policy.snapshot().payload.issued_at_ms
+            || now < policy.witness().payload.issued_at_ms
+        {
+            continue;
+        }
+        if check_task_policy_heads_in(connection, policy).is_err() {
+            continue;
+        }
+        let mut usage = policy.proof_usage().clone();
+        check_current_anchor_in(connection, primary, source, policy, &mut usage, now)?;
+        usage.enforce_limits()?;
+        let reference = ObjectHash::body(policy.selection())?;
+        if selected.get(&reference).is_none_or(|previous| {
+            policy.snapshot().payload.issued_at_ms > previous.snapshot().payload.issued_at_ms
+        }) {
+            selected.insert(reference, policy.clone());
+        }
+    }
+    Ok(selected.into_values().collect())
+}
+
 pub(crate) fn current_task_prepare_policy_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
@@ -553,17 +606,7 @@ pub(crate) fn current_task_prepare_policy_in(
         return Ok(None);
     }
     let mut selected: Option<VerifiedTaskCurrentPolicy> = None;
-    let task = prepare
-        .payload
-        .request
-        .context
-        .task
-        .as_ref()
-        .context("remote prepare has no Task")?;
-    for policy in primary
-        .task_execution_policy
-        .current_for_task(&prepare.payload.request.resource, task)?
-    {
+    for policy in primary.task_execution_policy.current.values() {
         if policy.request().source_node() != source
             || policy.request().source_project() != &prepare.payload.request.resource
         {
@@ -599,7 +642,122 @@ pub(crate) fn current_task_prepare_policy_in(
     )?))
 }
 
-pub(super) fn check_current_anchor_in(
+pub(crate) fn check_local_original_source_in(
+    connection: &Connection,
+    primary: &super::super::journal::PolicyState,
+    source: &PublicKey,
+    original: &vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+    usage: &mut ExecutionProofUsage,
+) -> Result<vibeface_secure::authorization::execution_handoff::ProjectExecutionSource> {
+    let statement = original.handoff.source_statement()?;
+    let encoded: String = connection.query_row(
+        "SELECT value FROM local_values WHERE space_id=? AND key=?",
+        params![
+            statement.project.space.as_str(),
+            format!("project-execution-handoff:{}", statement.operation_id)
+        ],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        serde_json::from_str::<
+            vibeface_secure::authorization::execution_handoff::SignedExecutionHandoff,
+        >(&encoded)?
+            == *original,
+        "readonly original differs from the exact durable Project handoff"
+    );
+    let proof = super::super::admission::admission_for_operation_from(
+        connection,
+        statement.project.space.as_str(),
+        &statement.operation_id,
+    )?;
+    let dispatch: crate::model::Event =
+        serde_json::from_str(&original.handoff.project_dispatch.canonical_body)?;
+    ensure!(
+        matches!(&dispatch.cause, crate::model::EventCause::Invocation { admission } if admission == &proof),
+        "readonly original differs from its exact accepted admission"
+    );
+    let historical = super::super::task_execution_context::OriginalAdmissionView::load(
+        connection, primary, &proof,
+    )?;
+    let verified = historical
+        .state()
+        .verify_execution_observation_source(&original.handoff, proof.admitted_at_ms)?;
+    ensure!(
+        verified.capsule_hash() == &statement.capsule_hash
+            && original
+                .handoff
+                .source_attestation
+                .as_ref()
+                .is_some_and(|signed| signed.issuer == *source),
+        "readonly original changed its verified Project source"
+    );
+    if let Some(policy) = historical.task_policy() {
+        usage.record_signed(policy.trust().original_intent())?;
+        usage.record_signed(policy.trust().approval())?;
+        usage.record_metadata(&(
+            "execution-original-policy-reference-v1",
+            policy.proof_hash(),
+        ))?;
+    }
+    usage.record_signed(
+        original
+            .handoff
+            .source_attestation
+            .as_ref()
+            .context("original source attestation is missing")?,
+    )?;
+    usage.record_metadata(&(
+        "execution-original-reference-v1",
+        original.hash()?,
+        ObjectHash::body(&proof)?,
+        &statement.work,
+    ))?;
+    Ok(statement)
+}
+
+fn check_conversation_original_in(
+    connection: &Connection,
+    primary: &super::super::journal::PolicyState,
+    source: &PublicKey,
+    project: &ResourceRef,
+    work: &ExecutionWorkIntent,
+    usage: &mut ExecutionProofUsage,
+) -> Result<()> {
+    let ExecutionWorkIntent::ConversationSession {
+        open: ConversationOpenIntent::Existing { open },
+        ..
+    } = work
+    else {
+        return Ok(());
+    };
+    let encoded: String = connection.query_row(
+        "SELECT result FROM operations WHERE space_id=? AND operation_id=? AND json_extract(request,'$.action.type')='open' AND json_extract(request,'$.task_id') IS NULL",
+        params![project.space.as_str(), open.operation_id], |row| row.get(0),
+    )?;
+    let accepted: vibeface_secure::authorization::execution_handoff::ExecutionHandoffResult =
+        serde_json::from_str(&encoded)?;
+    vibeface_secure::authorization::execution_handoff::verify_execution_handoff_receipt_signature(
+        &accepted.handoff,
+        &accepted.receipt,
+        &accepted.result,
+    )?;
+    let statement =
+        check_local_original_source_in(connection, primary, source, &accepted.handoff, usage)?;
+    ensure!(
+        matches!(
+            accepted.handoff.handoff.origin,
+            vibeface_secure::authorization::execution_handoff::ExecutionOrigin::ConversationOpen
+        ) && accepted.receipt.payload.state
+            == vibeface_secure::authorization::execution_handoff::ExecutionHandoffState::Succeeded
+            && statement.project == *project
+            && statement.work.intent() == *work,
+        "current conversation work changed its successful original Open"
+    );
+    usage.record_metadata(&("conversation-open-result-v1", ObjectHash::body(&accepted)?))?;
+    Ok(())
+}
+
+pub(crate) fn check_current_anchor_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
     source: &PublicKey,
@@ -607,6 +765,32 @@ pub(super) fn check_current_anchor_in(
     usage: &mut ExecutionProofUsage,
     now: u64,
 ) -> Result<()> {
+    let work = policy.work();
+    if !matches!(work, ExecutionWorkIntent::TaskSession { .. }) {
+        let approved = approved_execution_trust_in(
+            connection,
+            source,
+            policy.request().source_project(),
+            &work,
+            policy.selection(),
+            policy.context(),
+            policy.request().purpose(),
+        )?;
+        ensure!(
+            approved.approval().hash()? == policy.trust().approval().hash()?,
+            "current work changed its independent destination approval"
+        );
+        check_conversation_original_in(
+            connection,
+            primary,
+            source,
+            policy.request().source_project(),
+            &work,
+            usage,
+        )?;
+        usage.record_signed(approved.original_intent())?;
+        usage.record_signed(approved.approval())?;
+    }
     if let Some(node) = policy.request().node_request() {
         ensure!(
             node.issuer() == source,
@@ -640,7 +824,7 @@ pub(super) fn check_current_anchor_in(
                 association.approval_ref == policy.trust().approval().hash()?,
                 "SDK Node reader changed its actual Task approval"
             );
-        } else {
+        } else if matches!(work, ExecutionWorkIntent::TaskSession { .. }) {
             ensure!(
                 node.expected_action() == Action::ExecutionOpen
                     && policy.context().binding_generation == Some(1)
@@ -655,6 +839,10 @@ pub(super) fn check_current_anchor_in(
         .request()
         .account_request()
         .context("unsupported Task policy reader")?;
+    if !matches!(work, ExecutionWorkIntent::TaskSession { .. }) {
+        check_read_trust(&reader.intent, policy.trust())?;
+        return Ok(());
+    }
     let binding = checked_source_task_binding_in(connection, &reader.intent, source, usage)?;
     let candidate = reader.intent.payload.purpose == RemoteExecutionPolicyPurpose::Execution
         && ((binding.is_none() && reader.intent.payload.expected_action == Action::ExecutionOpen)
@@ -692,16 +880,7 @@ pub(crate) fn current_task_execution_policy_in(
     let local = PublicKey::parse(&identity.public_key_hex()?)?;
     let actual = facts(invocation, body)?;
     let mut selected = None;
-    let task = invocation
-        .payload
-        .context
-        .task
-        .as_ref()
-        .context("remote invocation has no Task")?;
-    for policy in primary
-        .task_execution_policy
-        .current_for_task(&actual.resource, task)?
-    {
+    for policy in primary.task_execution_policy.current.values() {
         let reference = policy_reference(policy)?;
         if policy.request().source_node() != &local
             || policy.request().source_project() != &actual.resource
@@ -791,32 +970,7 @@ pub(crate) fn original_task_execution_policy_in(
             original.trust(),
             original.original_page_envelope_hashes(),
         )?;
-        let binding = retained_binding_in(
-            connection,
-            proof.invocation.payload.resource.space.as_str(),
-            &association.binding_hash,
-            source,
-        )?;
-        ensure!(
-            Some(binding.binding.generation) == original.request().context()?.binding_generation
-                && Some(binding.binding.task_ref.as_str())
-                    == proof
-                        .invocation
-                        .payload
-                        .context
-                        .task
-                        .as_ref()
-                        .map(|task| task.as_str())
-                && Some(binding.binding.session_id.as_str())
-                    == proof
-                        .invocation
-                        .payload
-                        .context
-                        .execution_session
-                        .as_ref()
-                        .map(|session| session.session_id.as_str()),
-            "original Task policy changed its retained binding"
-        );
+        check_original_work_in(connection, source, proof, &association, original.request())?;
         return Ok(Some(original.clone()));
     }
     let policy = primary
@@ -830,32 +984,60 @@ pub(crate) fn original_task_execution_policy_in(
         "original Task policy belongs to another source or approval"
     );
     check_originals_in(connection, policy)?;
-    let binding = retained_binding_in(
-        connection,
-        proof.invocation.payload.resource.space.as_str(),
-        &association.binding_hash,
-        source,
-    )?;
-    ensure!(
-        Some(binding.binding.task_ref.as_str())
-            == proof
-                .invocation
-                .payload
-                .context
-                .task
-                .as_ref()
-                .map(|task| task.as_str())
-            && Some(&binding.binding.session_id)
-                == proof
-                    .invocation
-                    .payload
-                    .context
-                    .execution_session
-                    .as_ref()
-                    .map(|session| &session.session_id),
-        "original Task policy binding differs from its original invocation"
-    );
+    check_original_work_in(connection, source, proof, &association, policy.request())?;
     Ok(Some(from_task_original_admission(policy.clone(), proof)?))
+}
+
+fn check_original_work_in(
+    connection: &Connection,
+    source: &PublicKey,
+    proof: &crate::model::AdmissionProof,
+    association: &AdmissionAssociation,
+    request: &TaskExecutionPolicyRequest,
+) -> Result<()> {
+    let work = request.work();
+    ensure!(
+        association.work == work,
+        "original policy changed its admitted work"
+    );
+    work.validate_context(&request.context()?, &request.selection()?.target_public_key)?;
+    match &work {
+        ExecutionWorkIntent::TaskSession {
+            task,
+            binding_generation,
+            execution_session,
+        } => {
+            let hash = association
+                .binding_hash
+                .as_deref()
+                .context("original Task policy has no retained binding hash")?;
+            let binding = retained_binding_in(
+                connection,
+                proof.invocation.payload.resource.space.as_str(),
+                hash,
+                source,
+            )?;
+            ensure!(
+                binding.binding.task_ref == task.as_str()
+                    && binding.binding.generation == *binding_generation
+                    && binding.binding.session_id == execution_session.session_id
+                    && proof.invocation.payload.context.task.as_ref() == Some(task)
+                    && proof.invocation.payload.context.execution_session.as_ref()
+                        == Some(execution_session),
+                "original Task policy changed its retained binding"
+            );
+        }
+        _ => {
+            ensure!(
+                association.binding_hash.is_none(),
+                "non-Task admission retained a Task binding"
+            );
+            if proof.source_body["method"] == "operate" {
+                work.validate_request(&proof.invocation.payload, &proof.source_body)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn bind_task_execution_policy_in(
@@ -880,6 +1062,29 @@ pub(crate) fn bind_task_execution_policy_in(
             && saved.admitted_at_ms == admitted_at,
         "Task policy association differs from its actual accepted admission"
     );
+    let work = policy.work();
+    if !matches!(work, ExecutionWorkIntent::TaskSession { .. }) {
+        ensure!(
+            new_binding.is_none(),
+            "non-Task policy cannot create a Task binding"
+        );
+        work.validate_context(policy.context(), &policy.selection().target_public_key)?;
+        let association = AdmissionAssociation {
+            policy_ref: policy_reference(policy)?,
+            approval_ref: policy.trust().approval().hash()?,
+            invocation_hash: invocation.hash()?,
+            authorization_id: authorization.operation_id().to_owned(),
+            body_hash: authorization.body_hash().clone(),
+            work,
+            binding_hash: None,
+            admitted_at_ms: admitted_at,
+        };
+        return save_exact_in(
+            connection,
+            &key("admission", &association.invocation_hash),
+            &association,
+        );
+    }
     let binding: SignedBinding = match new_binding {
         Some(binding) => {
             ensure!(
@@ -995,7 +1200,8 @@ pub(crate) fn bind_task_execution_policy_in(
         invocation_hash: invocation.hash()?,
         authorization_id: authorization.operation_id().to_owned(),
         body_hash: authorization.body_hash().clone(),
-        binding_hash,
+        work,
+        binding_hash: Some(binding_hash),
         admitted_at_ms: admitted_at,
     };
     save_exact_in(

@@ -13,7 +13,7 @@ cd vibeface-<version>-<target>
 ./vibeface --help
 ```
 
-包内包括 Rust 程序、SDK sidecar 源码、文档和用户级服务安装脚本，不包含模型凭证、Provider 程序或 npm 依赖。若使用 Codex SDK 管理 Agent，先安装 Node.js 18+，然后在 `sidecars/` 运行 `npm ci --omit=dev`。仅使用 Cursor SDK 管理 Agent 时，无需 Node.js。
+包内包括 Rust 程序、SDK sidecar 源码、文档、用户级服务安装脚本和执行镜像构建脚本，不包含模型凭证、Provider 程序或 npm 依赖。Codex SDK 管理 Agent 在固定 Docker 镜像内运行，镜像包含 Node.js 18+ 和锁定的 npm 依赖，见 [执行镜像说明](execution-image.md)。
 
 从源码生成包时，先构建同一 Rust 密码学模块的浏览器资源。发布包已包含资源，安装发布包不需要这些构建工具。
 
@@ -21,10 +21,13 @@ cd vibeface-<version>-<target>
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129 --locked
 bash scripts/build-web-crypto.sh
+bash scripts/build-web.sh
 ./scripts/package-node.sh
 ```
 
 `--target` 指定 Rust target，仍需本机具备相应工具链。此选项不保证跨平台编译成功。`--skip-build` 使用已有 release 程序，不能用于证明程序与当前源码一致。
+
+验收制品时，密码学资源、网页、Rust 程序和 SDK sidecar 必须来自同一提交。使用干净 checkout 重新构建，核对包内 `BUILD-INFO.json` 的 `source_commit` 与验收 SHA 一致。`source_commit` 为 `null` 的包不能证明这一点，网页能打开也不证明真实 SDK 调用及后台回报闭环可用。
 
 ## 初始化首台设备
 
@@ -53,70 +56,63 @@ bash scripts/build-web-crypto.sh
 
 `init` 不覆盖现有身份和配置。默认数据目录为 `$HOME/.vibeface`，包含本机身份、配置、一次性接入材料、格式标记和唯一数据库 `node.sqlite3`。身份授权与业务状态共用这个数据库。`data-epoch.json` 为 `{"format":"vibeface-node","data_epoch":3,"layout_version":1}`。不同 Node 使用独立数据目录，同一目录同时只允许运行一个进程。
 
+## 本机自动登录
+
+节点启动后，在同一台机器运行：
+
+```sh
+./vibeface open --data-dir "$HOME/.vibeface"
+```
+
+命令使用本机私有凭据打开独立的回环入口，不打印访问凭据。首次仍须创建或解锁浏览器设备配置，完成正常的账户授权。成功连接本机节点后，该浏览器保存独立加密的自动解锁材料，之后打开本机入口即可连接。新浏览器仍需首次授权。
+
+「允许本机自动登录」默认开启，可以在网页的连接页或设备设置页关闭。关闭后，本机会话失效、网页锁定，已启动的任务继续运行。原密码仓库保持可用。要重新开启，可再次运行 `vibeface open` 进入设置。
+
+也可以停止节点后修改 `config.json` 再启动：
+
+```json
+"local_access": {
+  "enabled": false,
+  "listen": "127.0.0.1:4791"
+}
+```
+
+`listen` 必须是与公开入口分开的回环地址。初次默认自动分配端口并写回配置，后续启动保留此端口；浏览器存储按地址隔离，修改端口后须重新设置该浏览器。公开入口不接收本机会话，反向代理从 `127.0.0.1` 转发也不会自动获得权限。
+
+纯 Relay 上的本机访问只管理 Relay 自身。它不会获得其他节点的账户或执行权限；访问 Mac mini 仍走 Mac mini 的正常授权。
+
 ## 配置管理 Agent
 
-管理 Agent 与执行器分开配置。管理 Agent 理解用户指令、使用 Node 工具创建工单和派发任务；执行器在目标设备的项目目录中工作。管理工作目录应单独建立，不作为项目编辑入口。
+聊天 Agent 理解指令，查询或调用受管命令，并按需委派编码执行器。编码执行器在明确授权的目标设备和项目目录中工作。调度 SDK 会话与共享业务聊天分开保存。
 
-初始化时选择一种管理 SDK。已有 Node 先停止进程，再修改 `config.json` 的 `manager` 并重启，保留原身份和数据库。字段说明见 [本机配置](node-protocol.md#本机配置)。
+`manager` 只选择 Provider 和模型，不接受宿主 SDK 程序路径。已有 Node 先停止进程，再修改配置并重启，保留原身份和数据库：
 
-### 使用 Cursor SDK
-
-从 [Cursor SDK Bridge v1.0.37 发布页](https://github.com/cursor/sdk-bridge/releases/tag/v1.0.37) 下载对应平台的 standalone 包，用发布页的校验文件核对后解压。可执行文件位于 `bin/cursor-sdk-bridge`。例如，Apple Silicon Mac 的包名是 `cursor-sdk-bridge-standalone-darwin-arm64.tar.gz`。
-
-在运行 Node 的环境中配置 `CURSOR_API_KEY`。不要把密钥写进命令行、URL、Git 或聊天记录。模型使用账户实际可用的名称。
-
-```sh
-./vibeface init \
-	--data-dir "$HOME/.vibeface" \
-	--root /absolute/path/to/projects \
-	--manager cursor_sdk \
-	--workspace /absolute/path/to/manager-workspace \
-	--model auto \
-	--cursor-sdk-bin /absolute/path/to/bin/cursor-sdk-bridge
+```json
+{
+  "manager": {
+    "provider": "codex_sdk",
+    "model": "your-model-id"
+  }
+}
 ```
 
-此命令用于尚未初始化的 Node。默认使用 `auto` 模型。SDK 程序在本机运行，模型请求仍发往 Cursor 服务，消耗 Cursor 额度。
+模型名称使用账户实际可用的值。省略模型时采用 Provider 默认值，默认值不承诺响应速度。
 
-Cursor 使用 SDK 原生自定义工具回调连接 Rust Node。产品链路不启动 MCP Server，也不要求 Bot 或浏览器支持 MCP。管理 Agent 只能使用限定到当前个人网络及业务会话的工具，不能替本人回答编码审批、授权自动后续或验收工单。
+管理 Agent 使用 `execution_isolation` 配置的固定 Docker 镜像和受信模型网关。按 [执行镜像说明](execution-image.md) 构建依赖并核对实际 image ID。宿主 Provider 密钥和 Node 工具回调凭据不进入管理进程，管理进程只挂载本次授权资源的项目目录。当前 Cursor SDK 管理配置会被拒绝，不会回退为宿主进程。
 
-### 使用 Codex SDK
+Codex sidecar 通过私有 Unix socket 向 Node 请求动态目录中列出的工具。所有写工具要求稳定 `call_ref`；丢回执时先查询同一引用，不能换 ID 重做。工具目录按本轮权限过滤，只读结果汇报不会获得写工具。Node 继续负责授权、执行账本、审批、撤销和恢复，SDK 不直接获得这些权限。
 
-Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它，需要 Node.js 18+、已安装的锁定 npm 依赖和已登录的 Codex CLI。
-
-```sh
-./vibeface init \
-	--data-dir "$HOME/.vibeface" \
-	--root /absolute/path/to/projects \
-	--manager codex_sdk \
-	--workspace /absolute/path/to/manager-workspace \
-	--node-bin /absolute/path/to/node \
-	--codex-sdk-script /absolute/path/to/sidecars/codex-manager.mjs
-```
-
-可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。源码运行时先在 `crates/node/sdk/` 安装依赖，将 `--codex-sdk-script` 指向该目录的入口。
-
-这个适配器通过本机 `vibeface tool` 命令调用受限工具，使用只读文件系统权限，保留 shell 和网络访问。Codex 子进程环境按变量名筛选，shell 只获得运行及当前会话工具所需的变量；Provider 凭证不放进 shell 环境。它没有 shell 命令白名单或已验证的外部域名隔离，不能当作隔离不可信模型或不可信插件的安全边界。Cursor SDK 与 Codex SDK 的工具运行方式不同，不承诺完全相同的权限隔离。
+Codex 编码执行器使用 App Server 协议。Hook 可辅助发现会话和上报事件，不代替签名授权、实际状态查询或恢复。管理 SDK 能力与编码执行器能力分别返回，以当前 Node 的真实能力为准。
 
 ## 添加自己的设备
 
-每个 Node 和每个客户端有独立密钥。本人设备列表来自已签名的成员目录，设备名称、IP 和中继返回的地址不证明所有权。
+每个 Node Service 和客户端设备都有独立密钥。设备名称、IP 和中继返回的地址不证明所有权。
 
-在已授权管理客户端选择**添加设备**，选择 Node 或客户端及其权限。将短期邀请通过可信途径交给新设备，核对个人网络和邀请端的完整指纹。新设备独立生成密钥并申请加入。管理客户端核对待加入的名称和指纹，再明确确认。
+另一台 Node 先在独立空数据目录初始化。使用已有账户的可信客户端核对新 Node 的连接卡、公钥和一次性认领信息，完成账户 Node Service 登记。协议使用 `account_node_possession`、`account_node_commit` 和 `account_node_install`，客户端保留并核验签名回执。中断后对原申请重试，不新建账户代替登记。详细字段见 [协议参考](node-protocol.md#http-与客户端通道)。
 
-添加另一台 Node 时，先在新设备用独立数据目录运行 `init`，再把完整邀请保存为私有 JSON 文件。邀请文件包含接入地址、钉住的 NodeID、签名邀请和一次性 capability，不公开分享。
+Service 登记只确认该 Node 属于账户，不自动授予 Project 历史、同步或执行权限。客户端必须分别提交资源的签名授权，执行 Node 还需满足本机目录和隔离配置。Agent 不能添加设备、扩大权限或撤销设备。
 
-```sh
-./vibeface pair \
-	--data-dir "$HOME/.vibeface" \
-	--invite-file /private/path/to/invitation.json \
-	--name "My Linux Node"
-```
-
-命令提交新设备持钥证明后等待管理客户端确认。核对名称、完整指纹和角色后批准，命令显示配对完成，再启动新 Node。连接中断时使用原邀请、目录和名称重试，CLI 保留待确认请求身份，不另建授权。
-
-Node 不代替客户端签署授权。Agent 不能添加设备、扩大权限或撤销设备。新设备加入后可同步本人已授权的上下文，在设备列表中显示名称、指纹、角色和在线状态。
-
-网页的**我的入口**可保存直连地址或公共中继地址。更换入口后使用同一客户端身份认证目标 Node，再补齐业务历史。跨 origin 的浏览器存储互相隔离，使用固定可信客户端来源可保留自己的设备密钥。
+连接卡可保存直连地址或公共中继地址。更换入口后仍核验原目标 Node 和资源授权，再读取业务历史。跨 origin 的浏览器存储互相隔离，使用固定可信客户端来源可保留自己的设备密钥。
 
 ## 开放局域网入口
 
@@ -162,33 +158,59 @@ Node 可启用局域网发现，从候选地址找到已知 NodeID。公网发�
 
 公网网页来源使用 HTTPS，WebSocket 使用 WSS。Node 本身可绑定回环 HTTP，由反向代理终止 TLS。代理保留公网 Host 与原始 Origin，并支持 `/api/network/ws` 的 WebSocket upgrade。中继不是可信网页发行者，使用本人信任的客户端代码来源。
 
-## 提交任务与处理结果
+## 创建机器人并处理结果
 
-连接自己的设备后，新建会话，选择可用的调度设备，发送目标。也可先在“工单”中填写目标和验收条件，再让管理 Agent 安排工作。在“执行会话”中打开指定 Node 上的执行器，查看原始进度、审批与操作记录。
+连接自己的设备后，创建一个有名称的机器人，按需填写职责和项目。进入机器人即可直接聊天，每个机器人保留自己的长期历史。创建机器人只保存定义，不启动模型；首次发消息时，程序选择已授权且可用的聊天 Agent。
+
+机器人定义、聊天历史和本机 SDK 会话分开保存。机器人项目配置只是执行偏好，不授予目录或设备权限；执行时仍检查 Node 真实授权。多个机器人可以使用同一 Node 的 SDK 配置，但不共用聊天历史或本机 SDK 缓存。设备、连接和恢复在设置中。
+
+普通查询可以直接回答，本机命令由受管工具执行，较长或远端工作才按需委派编码 Agent。日常操作不需要创建工单、打开执行会话或选择调度器。进展、本人审批、补充输入和结果都回到原机器人的聊天。
+
+发送后先看状态。`pending_delivery` 表示入口已保存消息，正在投递给原调度设备；只有目标持久入队后才是 `queued`。排队不表示模型已开始，`running` 才表示已跨过 SDK 启动边界。目标离线、能力不满足或回执丢失时，保留原目标与消息身份核对，不自动改派另一台设备。
+
+管理 Agent 忙时，追加消息进入持久队列。尚未开始的本人消息优先于自主后续，同一调度 Node 上的同一会话一次只运行一个管理轮。已派发的后台任务继续运行，普通聊天不必等待任务结束。关闭网页不会停止 Node 上的工作，但执行设备关机、休眠或断网会影响推进。
+
+需要停止时，区分以下动作：
+
+- **停止当前回复**只请求取消当前管理轮，并撤销该轮的 Node 工具权限。取消待确认时不能当作已经停止，也不停止已派发的后台任务。
+- **停止后台工作**作用于选中的实际执行。Node 从原签名派发找到执行设备和当前 turn，按执行器真实能力中断。不支持中断的执行不会显示可用的停止按钮。
+- 明确长期目标的自主继续权限仍由本人决定。撤销权限阻止新的自主派发，不证明当前外部进程已停止。
+
+Cursor SDK 和 Codex SDK 都提供进度和取消请求，当前都没有管理轮的原生 steer。立即调整须先核对取消结果，再提交新一轮。Cursor 需要匹配的 Provider 终态或受管进程退出证据才能确认取消。Codex CLI 退出仍不能证明已分离的工具进程全部退出，当前真实适配器将这种取消保留为 `unknown`。
 
 Codex 执行器支持打开、读取、发送、调整当前 turn、中断和回答原请求。Claude Code 与 Cursor CLI 只支持打开和发送，其他操作明确拒绝。CLI 遇到需要交互审批的工作不会自动放行；需要完整审批往返时使用 Codex。
 
-Node 默认尝试启动与本机身份关联的私有 `codex app-server`，socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix socket 路径长度限制。要连接已有实例，在 `config.json` 设置 `codex_socket`。`codex_bin`、`claude_bin`、`cursor_bin` 指向对应程序。启动网页成功不等于程序已安装、已登录或模型可用，应查看执行会话的实际状态。
+Node 默认尝试启动与本机身份关联的私有 `codex app-server`，socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix socket 路径长度限制。要连接已有实例，在 `config.json` 设置 `codex_socket`。`codex_bin`、`claude_bin`、`cursor_bin` 指向对应程序。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中后台工作的实际状态。
 
-勾选“完成执行后，让调度 Agent 继续检查”会授予该工单自动后续权限。普通内容片段和进度不调用管理模型；需要自动决策时才调用。`daily_decision_limit` 按个人网络限制当前 Node 的 UTC 每日管理调用次数，失败调用也可能消耗已预留次数。各 Node 分别记账，不构成全网 token 或费用硬上限。
+启动后，Node 恢复已知 Codex 线程的原生事件订阅，断线后重新订阅。完成、失败和待审批状态无需浏览器在线，也不要求修改用户全局 Codex hooks。恢复只读核对原线程，不重发旧指令，不自动批准审批。未由此 Node 接管的外部 CLI 会话不在该订阅范围内。
 
-编码执行器结束一轮后，管理 Agent 可将工单置为 `needs_review`，本人核对产物及验收条件后才设为 `accepted`。审批也必须本人回答，并对应仍有效的原执行请求。
+普通执行的终态结果自动送回原聊天，模型总结使用只读权限，不能借结果回调创建或派发新工作。明确长期目标的自主继续仍须本人授权，模型不能代授予。并发修改授权会要求刷新版本，已知撤销后旧权限不能继续写入；离线设备尚未收到撤销时不能宣称全网已经生效。
 
-已验收或取消的工单不能由 Agent 重新打开，也不能省略工单关联后继续派发。本人可以明确重新打开工单，或把同一执行会话用于新的活动工单。这不会自动停止已经运行的进程。
+普通进度和通知不调用管理模型。`daily_decision_limit` 只限制当前 Node、当前个人空间在 UTC 当天的自主管理调用，本人主动聊天不消耗这个额度。失败的自主调用也可能消耗已预留次数。各 Node 分别记账，不构成全网 token 或费用硬上限。没有模型汇报授权或额度耗尽时，原始结果和通知仍保留。
 
-“通知”保存每个客户端尚未确认的消息。普通通知不消耗模型调用；浏览器提醒取决于浏览器支持与权限。关闭网页后没有独立的手机推送服务。
+编码执行器结束一轮不等于交付目标已经达成。已有明确长期目标的历史保留目标和验收记录，本人核对产物后确认。审批必须由本人回答，并对应仍有效的原执行请求。
+
+已确认完成或取消的长期目标不能由 Agent 自行恢复。需要继续时，在机器人聊天中明确提出新要求。取消目标不会自动停止已经运行的进程，仍需核对后台工作的实际状态。
+
+未读提醒归属原机器人聊天。普通通知不消耗模型调用；浏览器提醒取决于浏览器支持与设置中的通知权限。关闭网页后没有独立的手机推送服务。
+
+从另一台入口打开原会话，可只读观察原管理节点和执行节点的临时进度。重连后读取持久状态，缺失的临时文字不会触发重做。缓存状态会标明新鲜度，离线时不能据此确认远端仍在运行。长文本结果可在聊天中展开或下载；尚未同步的附件需等待原副本可达，只有哈希不能补回正文。
 
 ## 核对未知结果
 
 网络断开或进程中断后，写操作可能已经执行，但回执未保存。Node 将这种情况保留为 `unknown`，不自动重发，也不释放该操作占用的执行资源。
 
-先在“执行会话”查看操作记录，使用“核对执行结果”查询原执行 Node。若仍无法判断，检查实际进程、项目产物和外部副作用，再附证据确认成功或失败。人工确认只解决原账本记录，不重放原操作。失联不能证明远端进程已停止。
+管理 SDK 已返回明确结果时，Node 先将最终结果保存到本机。历史依赖暂未补齐或最终事件暂时写入失败时，只补发最终记录，不重新调用 SDK。
+
+管理轮重启后也可能变为 `unknown`。原轮保留未知，不重跑原触发。Node 隔离旧工具权限并核对在途请求后，新的本人消息可进入独立的只读会话查询状态。恢复写入须由本人核对原操作并附证据确认；管理未知确认不会把执行未知改成成功，旧只读权限也不会自动升级。
+
+在原机器人的聊天中使用“核对执行结果”查询原执行 Node。若仍无法判断，检查实际进程、项目产物和外部副作用，再附证据确认成功或失败。人工确认只解决原账本记录，不重放原操作。失联不能证明远端进程已停止。
 
 A 已派发 B 后掉线时，从 C 打开原业务会话，等待 DAG 补齐，再核对 B 的实际执行状态。缺失历史、执行器不可达和结果未知分别显示，不能通过创建同名新任务代替恢复。
 
 同一 Node 检查会话版本，并对规范化工作目录及父子目录冲突进行本机互斥。不同 Node 之间没有全局文件锁。若两台设备挂载同一可写目录，使用独立 worktree 或独立根目录隔离。
 
-浏览器在当前入口的本地存储中保留尚未确认的消息正文、消息编号和原调度节点，确认后删除。刷新后重试须使用原内容和原目标；改写正文会被拒绝，避免把新目标误当成旧操作重试。
+浏览器在当前入口的本地存储中保留尚未确认的消息正文、消息编号和原调度节点，收到目标持久入队确认后删除。入口仅保存待投递消息不算这个确认。刷新后重试须使用原内容、汇报意图和原目标；改写正文会被拒绝，避免把新目标误当成旧操作重试。
 
 ## 作为后台应用运行
 
@@ -215,7 +237,7 @@ vibeface service restart --data-dir "$HOME/.vibeface"
 
 macOS 使用当前登录用户的 launchd agent，日志位于数据目录的 `service.stdout.log` 和 `service.stderr.log`。Linux 使用 `systemd --user`，Node 日志由用户 journal 保存。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
 
-后台服务不保证继承终端的 PATH 或临时环境变量。在 `config.json` 使用 Provider 和 sidecar 的绝对路径，并通过对应服务管理器配置模型凭证。安装脚本不保存或复制密钥。
+后台服务不保证继承终端的 PATH 或临时环境变量。执行镜像、宿主执行器和受信模型网关须使用服务能够访问的明确配置。安装脚本不保存或复制密钥。
 
 卸载同时移除 Node 服务和更新定时服务，不删除身份、配置和历史：
 
@@ -247,7 +269,7 @@ vibeface service uninstall --data-dir "$HOME/.vibeface"
 "$HOME/.local/share/vibeface/current/vibeface" update apply --data-dir "$HOME/.vibeface"
 ```
 
-`check` 只查询与校验版本信息。`apply` 仅安装声明与当前数据格式兼容的包，需要安全的空闲窗口。活动任务、管理 Agent 调用和结果未知的操作都会阻止安装，先完成或核对原任务，不需要关闭网页。升级不会调用模型或修改 Provider 密钥。
+`check` 只查询与校验版本信息。`apply` 仅安装声明与当前数据格式兼容的包，需要安全的空闲窗口。待投递消息、排队与活动管理轮、活动任务和结果未知的记录都会阻止安装，先完成或核对原任务，不需要关闭网页。升级不会调用模型或修改 Provider 密钥。
 
 开启自动更新会安装独立的用户定时服务。macOS 的 `com.leaperone.vibeface.update` 在载入时和每小时尝试更新；Linux 的 `vibeface-update.timer` 每小时启动一次独立 oneshot 服务。Linux 关机期间不能更新，用户服务能否在退出登录后运行取决于 lingering。更新日志位于数据目录的 `update.stdout.log` 与 `update.stderr.log`，文件权限为 600。`vibeface service status` 同时展示 Node 与更新服务的真实状态。
 
@@ -264,6 +286,8 @@ vibeface service uninstall --data-dir "$HOME/.vibeface"
 这会移除更新定时服务，手动 `check` 和 `apply` 仍可使用。`vibeface service install-updater` 和 `uninstall-updater` 可单独安装或移除定时服务，不改变已保存的更新策略。策略的 `automatic` 为 `false` 时，即使手动安装定时服务也不会自动更新。重新配置自动更新会重新安装或移除定时服务。
 
 更新器先核对包和存储兼容声明，再停止 Node 并切换 `current`。新进程健康检查失败时只恢复上一份程序入口，不自动还原数据库；会话、身份、配置和凭证仍保存在原数据目录。校验、网络和安装失败可通过 `update status` 与更新日志查看。
+
+新进程通过健康检查并开放接单后才消费队列。存在新版本未处理的调度记录时，不支持任意手动复制旧程序降级；受管回退限于尚未开放接单或已经安全排空的状态。DAG 同步和恢复只补历史、重算视图，不从历史重新生成执行。
 
 ## 备份与恢复
 

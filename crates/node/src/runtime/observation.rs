@@ -380,6 +380,11 @@ impl Runtime {
                 now_ms() as u64,
             )
         })?;
+        drop(store);
+        let actual = match actual {
+            Some(actual) => Some(self.attach_execution_control(actual).await?),
+            None => None,
+        };
         Ok(json!({"actual":actual}))
     }
 }

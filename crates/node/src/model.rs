@@ -64,6 +64,29 @@ pub struct Context {
     pub missing: MissingDependencies,
 }
 
+pub use vibeface_secure::authorization::events::BotProject;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BotCreateSpec {
+    pub bot_id: String,
+    pub conversation_id: ScopeId,
+    pub name: String,
+    pub instructions: String,
+    pub project: Option<BotProject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Bot {
+    pub bot_id: String,
+    pub conversation_id: ScopeId,
+    pub name: String,
+    pub instructions: String,
+    pub project: Option<BotProject>,
+    pub event_hash: EventHash,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Conversation {
     pub conversation_id: ScopeId,
@@ -92,6 +115,16 @@ pub struct Task {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct ManagerDispatchAuthority {
+    pub scheduler_node: NodeId,
+    pub trigger: EventHash,
+    pub followup_version: u64,
+    pub attempt_id: String,
+    pub permission_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct OperationRequest {
     pub operation_id: String,
     #[serde(rename = "space_id")]
@@ -99,13 +132,15 @@ pub struct OperationRequest {
     pub conversation_id: ScopeId,
     pub task_id: Option<String>,
     pub target_node: NodeId,
-    pub session_id: String,
+    pub session_id: Option<String>,
     pub expected_revision: u64,
     pub basis_heads: Vec<EventHash>,
     pub action: Value,
     pub resources: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<crate::binding::SignedBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_authority: Option<ManagerDispatchAuthority>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -178,9 +213,26 @@ pub fn authorization_action(
 
     Ok(match body["method"].as_str() {
         Some("context") if body["blob_hash"].is_string() => Action::AttachmentRead,
-        Some("conversations" | "conversation" | "context" | "execution_share_request") => Action::ConversationRead,
-        Some("nodes" | "session" | "operation") => Action::OperationStatusRead,
-        Some("create_conversation") => Action::ConversationCreate,
+        Some(
+            "bots"
+            | "conversations"
+            | "conversation"
+            | "context"
+            | "execution_share_request"
+            | "schedule"
+            | "manager_status",
+        ) => Action::ConversationRead,
+        Some("nodes" | "session" | "operation" | "execution_status") => Action::OperationStatusRead,
+        Some("create_conversation" | "create_bot") => Action::ConversationCreate,
+        Some("cancel_manager") => Action::AgentInterrupt,
+        Some("set_followup") => Action::TaskFollowup,
+        Some("resolve_manager_unknown") => Action::OperationResolve,
+        Some("read_artifact") => Action::AttachmentRead,
+        Some("execution_control") => execution_control_action(&body["action"]["type"])?,
+        Some("task_control") => match body["action"].as_str() {
+            Some("status") => Action::OperationStatusRead,
+            _ => execution_control_action(&body["action"])?,
+        },
         Some("bind_execution") => Action::ExecutionOpen,
         Some("replica_inventory" | "replica_event" | "replica_blob") => Action::ReplicaRead,
         Some("message") => Action::MessageAppend,
@@ -192,7 +244,9 @@ pub fn authorization_action(
             Some("open" | "working" | "blocked" | "needs_review") => Action::TaskProgress,
             _ => anyhow::bail!("invalid task status"),
         },
-        Some("seal_execution" | "rebind_execution" | "seal_remote_execution") => Action::ExecutionRebind,
+        Some("seal_execution" | "rebind_execution" | "seal_remote_execution") => {
+            Action::ExecutionRebind
+        }
         Some("remote_execution_seal_status") => Action::OperationStatusRead,
         Some("notifications") => Action::NotificationRead,
         Some("ack") => Action::NotificationAck,
@@ -203,6 +257,7 @@ pub fn authorization_action(
             Some("open") => Action::ExecutionOpen,
             Some("read") => Action::OperationStatusRead,
             Some("send") => Action::ExecutionSend,
+            Some("command") => Action::ExecutionCommand,
             Some("steer") => Action::ExecutionSteer,
             Some("interrupt") => Action::ExecutionInterrupt,
             Some("respond_request") => Action::ExecutionRespondApproval,
@@ -210,6 +265,18 @@ pub fn authorization_action(
         },
         _ => anyhow::bail!("unknown method"),
     })
+}
+
+fn execution_control_action(
+    kind: &Value,
+) -> anyhow::Result<vibeface_secure::authorization::Action> {
+    use vibeface_secure::authorization::Action;
+    match kind.as_str() {
+        Some("steer") => Ok(Action::ExecutionSteer),
+        Some("interrupt") => Ok(Action::ExecutionInterrupt),
+        Some("respond_request") => Ok(Action::ExecutionRespondApproval),
+        _ => anyhow::bail!("unknown execution control"),
+    }
 }
 
 #[cfg(test)]
@@ -259,6 +326,7 @@ mod tests {
             ("open", Action::ExecutionOpen),
             ("read", Action::OperationStatusRead),
             ("send", Action::ExecutionSend),
+            ("command", Action::ExecutionCommand),
             ("steer", Action::ExecutionSteer),
             ("interrupt", Action::ExecutionInterrupt),
             ("respond_request", Action::ExecutionRespondApproval),

@@ -13,13 +13,13 @@ export function readStorage<T>(key: string, fallback: T, required = false): T {
 
 export function writeStorage(key: string, value: unknown, required = false) {
   if (typeof window === "undefined") {
-    if (required) throw new Error("浏览器无法保存操作编号。请允许此站点使用本地存储后重试。")
+    if (required) throw new Error("浏览器无法保存待核对请求。请允许此站点使用本地存储后重试。")
     return
   }
   try {
     window.localStorage.setItem(`vibeface.${key}`, JSON.stringify(value))
   } catch {
-    if (required) throw new Error("浏览器无法保存操作编号。请允许此站点使用本地存储后重试。")
+    if (required) throw new Error("浏览器无法保存待核对请求。请允许此站点使用本地存储后重试。")
   }
 }
 

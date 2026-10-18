@@ -21,13 +21,12 @@ pub struct ProjectExecutionSource {
     pub version: u16,
     pub capsule_hash: ObjectHash,
     pub project: ResourceRef,
-    pub task: EventRef,
+    pub conversation: String,
+    pub target_public_key: PublicKey,
     pub operation_id: String,
     pub original_invocation_hash: ObjectHash,
     pub original_admission_hash: ObjectHash,
-    pub binding_hash: String,
-    pub binding_generation: u64,
-    pub execution_session: SessionRef,
+    pub work: ExecutionWork,
     pub sdk_origin_hash: Option<ObjectHash>,
     pub task_sdk_origin_hash: Option<ObjectHash>,
 }
@@ -124,11 +123,24 @@ fn admission_facts(invocation: &Invocation) -> RequestFacts {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutionOrigin {
+    TaskSession {
+        task_creation: SignedEvent,
+    },
+    ConversationOpen,
+    ConversationSession {
+        accepted_open: Box<ExecutionHandoffResult>,
+    },
+    Command,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionHandoff {
     pub version: u16,
     pub project_dispatch: SignedEvent,
-    pub task_creation: SignedEvent,
+    pub origin: ExecutionOrigin,
     pub sdk_origin: Option<CompactSdkOrigin>,
     pub task_sdk_origin: Option<CompactSdkOrigin>,
     pub execution_resource: ResourceRef,
@@ -139,12 +151,12 @@ pub struct ExecutionHandoff {
 
 impl ExecutionHandoff {
     pub fn source_statement(&self) -> Result<ProjectExecutionSource> {
-        let (event, proof, _, binding) = original_dispatch(self)?;
+        let (event, proof, _, work) = original_dispatch(self)?;
         #[derive(Serialize)]
         struct Capsule<'a> {
             version: u16,
             project_dispatch: &'a SignedEvent,
-            task_creation: &'a SignedEvent,
+            origin: &'a ExecutionOrigin,
             sdk_origin: &'a Option<CompactSdkOrigin>,
             task_sdk_origin: &'a Option<CompactSdkOrigin>,
             execution_resource: &'a ResourceRef,
@@ -156,7 +168,7 @@ impl ExecutionHandoff {
             capsule_hash: ObjectHash::body(&Capsule {
                 version: self.version,
                 project_dispatch: &self.project_dispatch,
-                task_creation: &self.task_creation,
+                origin: &self.origin,
                 sdk_origin: &self.sdk_origin,
                 task_sdk_origin: &self.task_sdk_origin,
                 execution_resource: &self.execution_resource,
@@ -167,16 +179,12 @@ impl ExecutionHandoff {
                 space: SpaceId::parse(&event.network_id)?,
                 resource: event.resource_id,
             },
-            task: EventRef::parse(&self.task_creation.hash)?,
+            conversation: event.scope_id.clone(),
+            target_public_key: self.target_public_key.clone(),
             operation_id: proof.invocation.payload.operation_id.clone(),
             original_invocation_hash: proof.invocation.hash()?,
             original_admission_hash: ObjectHash::body(&proof)?,
-            binding_hash: binding_hash(&binding.binding).map_err(invalid_shape)?,
-            binding_generation: binding.binding.generation,
-            execution_session: SessionRef {
-                target: self.execution_audience.device.clone(),
-                session_id: binding.binding.session_id,
-            },
+            work,
             sdk_origin_hash: self.sdk_origin.as_ref().map(ObjectHash::body).transpose()?,
             task_sdk_origin_hash: self
                 .task_sdk_origin
@@ -257,9 +265,7 @@ pub struct ExecutionHandoffChallenge {
     pub target_public_key: PublicKey,
     pub project_presenter: DeviceId,
     pub operation_id: String,
-    pub binding_hash: String,
-    pub binding_generation: u64,
-    pub execution_session: SessionRef,
+    pub work: ExecutionWork,
     pub policies: Vec<PolicyStamp>,
     pub nonce: Nonce,
     pub issued_at_ms: u64,
@@ -321,18 +327,7 @@ impl ExecutionHandoffChallenge {
             target_public_key: handoff.wire.handoff.target_public_key.clone(),
             project_presenter: handoff.submission.device().clone(),
             operation_id: handoff.original.operation_id().to_owned(),
-            binding_hash: handoff.binding_hash.clone(),
-            binding_generation: handoff.binding.binding.generation,
-            execution_session: handoff
-                .submission
-                .signed_invocation()
-                .payload
-                .context
-                .execution_session
-                .clone()
-                .ok_or(AuthorizationError::InvalidProof(
-                    "handoff is missing its execution session",
-                ))?,
+            work: handoff.work.clone(),
             policies: handoff.dependencies.clone(),
             nonce,
             issued_at_ms,
@@ -538,8 +533,7 @@ pub struct VerifiedExecutionHandoff {
     original: VerifiedAuthorization,
     submission: VerifiedAuthorization,
     original_request_hash: ObjectHash,
-    binding: SignedBinding,
-    binding_hash: String,
+    work: ExecutionWork,
     dependencies: Vec<PolicyStamp>,
     verified_at_ms: u64,
     usage: ExecutionProofUsage,
@@ -561,8 +555,11 @@ impl VerifiedExecutionHandoff {
     pub fn submission(&self) -> &VerifiedAuthorization {
         &self.submission
     }
-    pub fn binding(&self) -> &SignedBinding {
-        &self.binding
+    pub fn work(&self) -> &ExecutionWork {
+        &self.work
+    }
+    pub fn binding(&self) -> Result<SignedBinding> {
+        self.wire.handoff.task_binding()
     }
     pub fn dependencies(&self) -> &[PolicyStamp] {
         &self.dependencies
@@ -620,71 +617,106 @@ fn invalid_shape(_: impl std::fmt::Display) -> AuthorizationError {
     AuthorizationError::InvalidProof("invalid execution handoff business evidence")
 }
 
-fn original_dispatch(
+pub(super) fn check_execution_source_work(
+    leaf: &Grant,
+    project: &ResourceRef,
+    source_node: &PublicKey,
+    work: &ExecutionWork,
+) -> Result<()> {
+    match &leaf.execution_source {
+        Some(source) => {
+            require(
+                source.project == *project && source.node_public_key == *source_node,
+                "execution grant changed its source Project",
+            )?;
+            source.work.matches_work(work)
+        }
+        None => require(
+            matches!(work, ExecutionWork::TaskSession { .. }),
+            "ordinary execution requires an owner-approved work source",
+        ),
+    }
+}
+
+pub use super::execution_work::{
+    ProjectDispatchOrigin, ProjectExecutionReceipt, ProjectExecutionResult,
+    derive_project_dispatch_work, verify_project_execution_receipt_signature,
+};
+
+pub(super) fn original_dispatch(
     handoff: &ExecutionHandoff,
-) -> Result<(Event, AdmissionProof, Value, SignedBinding)> {
+) -> Result<(Event, AdmissionProof, Value, ExecutionWork)> {
     require(
-        handoff.version == AUTH_VERSION,
-        "invalid execution handoff version",
+        handoff.version == AUTH_VERSION
+            && handoff.execution_audience.device == DeviceId::from_key(&handoff.target_public_key)
+            && handoff.execution_audience.service
+                == ServiceId::from_key(&handoff.target_public_key),
+        "invalid execution handoff version or audience",
     )?;
     let event: Event =
         serde_json::from_str(&handoff.project_dispatch.canonical_body).map_err(invalid_shape)?;
-    let EventCause::Invocation { admission } = &event.cause else {
-        return Err(AuthorizationError::InvalidProof(
-            "handoff requires an admitted dispatch",
-        ));
-    };
-    let EventBody::DispatchRecorded {
-        operation_id,
-        task_id,
-        target_node,
-        session_id,
-        action,
-    } = &event.body
-    else {
-        return Err(AuthorizationError::InvalidProof(
-            "handoff source is not a dispatch",
-        ));
-    };
-    let source = &admission.source_body;
-    let request = source
-        .get("request")
-        .ok_or(AuthorizationError::InvalidProof("missing original request"))?;
-    require(
-        source["method"] == "operate"
-            && source["space_id"].as_str() == Some(event.network_id.as_str())
-            && source["resource_id"].as_str() == Some(event.resource_id.as_str())
-            && source["authorization_id"].as_str() == Some(operation_id.as_str())
-            && request == action
-            && request["space_id"].as_str() == Some(event.network_id.as_str())
-            && request["conversation_id"].as_str() == Some(event.scope_id.as_str())
-            && request["operation_id"].as_str() == Some(operation_id.as_str())
-            && request["target_node"].as_str() == Some(target_node.as_str())
-            && request["session_id"].as_str() == Some(session_id.as_str())
-            && request.get("task_id")
-                == Some(&serde_json::to_value(task_id).map_err(invalid_shape)?),
-        "handoff dispatch differs from the original signed request",
+    let (admission, request) =
+        execution_work::project_dispatch_request(&event, &handoff.target_public_key)?;
+    if let ExecutionOrigin::ConversationSession { accepted_open } = &handoff.origin {
+        require(
+            accepted_open.handoff.handoff.execution_resource == handoff.execution_resource
+                && accepted_open.handoff.handoff.execution_audience == handoff.execution_audience,
+            "conversation operation changed its accepted Open resource",
+        )?;
+    }
+    let work = execution_work::derive_remote_dispatch_work(
+        &event,
+        &handoff.origin,
+        &handoff.target_public_key,
     )?;
-    let binding: SignedBinding =
-        serde_json::from_value(request["binding"].clone()).map_err(invalid_shape)?;
-    validate_binding(&binding.binding).map_err(invalid_shape)?;
-    let b = &binding.binding;
-    require(
-        b.network_id == event.network_id
-            && b.conversation_id == event.scope_id
-            && Some(b.task_id.as_str()) == task_id.as_deref()
-            && b.target_node == *target_node
-            && b.session_id == *session_id,
-        "handoff binding does not match its original operation",
-    )?;
-    Ok((event.clone(), admission.clone(), request.clone(), binding))
+    Ok((event.clone(), admission.clone(), request.clone(), work))
+}
+
+fn required_text(value: &Value, max: usize) -> Result<String> {
+    let value = value
+        .as_str()
+        .filter(|v| !v.is_empty() && v.len() <= max)
+        .ok_or(AuthorizationError::InvalidProof(
+            "invalid execution work text",
+        ))?;
+    Ok(value.to_owned())
+}
+
+impl ExecutionHandoff {
+    pub fn task_binding(&self) -> Result<SignedBinding> {
+        require(
+            matches!(self.origin, ExecutionOrigin::TaskSession { .. }),
+            "execution work has no Task binding",
+        )?;
+        let (_, _, request, _) = original_dispatch(self)?;
+        serde_json::from_value(request["binding"].clone()).map_err(invalid_shape)
+    }
+
+    pub fn execution_context(&self) -> Result<InvocationContext> {
+        let (event, proof, _, work) = original_dispatch(self)?;
+        let executor_kind = match &work {
+            ExecutionWork::TaskSession { .. } => self.task_binding()?.binding.open_spec["executor"]
+                .as_str()
+                .map(str::to_owned),
+            ExecutionWork::ConversationSession { executor, .. } => Some(executor.clone()),
+            ExecutionWork::Command { .. } => None,
+        };
+        Ok(InvocationContext {
+            conversation: Some(event.scope_id),
+            task: work.task_ref().cloned(),
+            sdk_session: proof.invocation.payload.context.sdk_session.clone(),
+            execution_session: work.execution_session().cloned(),
+            executor_kind,
+            workspace_resource: Some(event.resource_id),
+        })
+    }
 }
 
 pub fn execution_submission_facts(
     handoff: &ExecutionHandoff,
     original: &VerifiedAuthorization,
 ) -> Result<RequestFacts> {
-    let (event, proof, request, binding) = original_dispatch(handoff)?;
+    let (event, proof, request, work) = original_dispatch(handoff)?;
     require(
         proof.invocation == *original.signed_invocation()
             && original.phase == AuthorizationPhase::Operation
@@ -693,21 +725,13 @@ pub fn execution_submission_facts(
             && original.resource().space.as_str() == event.network_id
             && original.resource().resource == event.resource_id
             && request["operation_id"].as_str() == Some(original.operation_id())
-            && original
-                .signed_invocation()
-                .payload
-                .context
-                .task
-                .as_ref()
-                .is_some_and(|task| task.as_str() == binding.binding.task_ref),
+            && original.signed_invocation().payload.context == handoff.execution_context()?,
         "handoff has a different original authorization",
     )?;
     let mut context = original.signed_invocation().payload.context.clone();
     require(
-        context.execution_session.as_ref().is_some_and(|session| {
-            session.target == handoff.execution_audience.device
-                && session.session_id == binding.binding.session_id
-        }) && DeviceId::from_key(&handoff.target_public_key) == handoff.execution_audience.device,
+        work.execution_session()
+            .is_none_or(|session| session.target == handoff.execution_audience.device),
         "handoff execution target differs from the original invocation",
     )?;
     context.sdk_session = None;
@@ -722,8 +746,9 @@ pub fn execution_submission_facts(
     })
 }
 
-fn execution_action(request: &Value) -> Result<Action> {
+pub(super) fn execution_action(request: &Value) -> Result<Action> {
     Ok(match request["action"]["type"].as_str() {
+        Some("command") => Action::ExecutionCommand,
         Some("open") => Action::ExecutionOpen,
         Some("read") => Action::OperationStatusRead,
         Some("send") => Action::ExecutionSend,
@@ -824,7 +849,12 @@ impl VerifiedPolicySet {
         let mut capsule_usage = ExecutionProofUsage::default();
         capsule_usage.record_capsule(handoff)?;
         capsule_usage.enforce_limits()?;
-        let (dispatch, proof, _, binding) = original_dispatch(handoff)?;
+        let (dispatch, proof, _, work) = original_dispatch(handoff)?;
+        require(
+            matches!(handoff.origin, ExecutionOrigin::TaskSession { .. })
+                || handoff.task_sdk_origin.is_none(),
+            "ordinary execution cannot carry a Task origin",
+        )?;
         let statement = handoff.source_statement()?;
         let signed =
             handoff
@@ -863,13 +893,6 @@ impl VerifiedPolicySet {
             &mut BTreeMap::new(),
             &mut BTreeSet::new(),
         )?;
-        let task = events::verify_signed_event(
-            &serde_json::to_string(&handoff.task_creation).map_err(invalid_shape)?,
-            statement.project.space.as_str(),
-            statement.project.resource.as_str(),
-            certificate.payload.public_key.as_str(),
-        )
-        .map_err(invalid_shape)?;
         events::verify_signed_event(
             &serde_json::to_string(&handoff.project_dispatch).map_err(invalid_shape)?,
             statement.project.space.as_str(),
@@ -877,35 +900,77 @@ impl VerifiedPolicySet {
             certificate.payload.public_key.as_str(),
         )
         .map_err(invalid_shape)?;
-        let EventBody::TaskCreated { task_id, .. } = &task.event().body else {
-            return Err(AuthorizationError::InvalidProof(
-                "capsule source is not a task creation",
-            ));
-        };
         require(
-            binding.binding.task_ref == handoff.task_creation.hash
-                && binding.binding.task_id == *task_id
-                && binding.binding.authority_node == task.event().author
-                && task.event().scope_id == dispatch.scope_id
-                && task.event().blobs.is_empty()
-                && dispatch.blobs.is_empty(),
-            "execution capsule belongs to another task",
+            dispatch.blobs.is_empty(),
+            "execution dispatch cannot carry blobs",
         )?;
-        verify_binding(&binding, certificate.payload.public_key.as_str()).map_err(invalid_shape)?;
         let mut usage = ExecutionProofUsage::default();
         usage.record_budget(&source_budget)?;
         usage.record_signed(signed)?;
-        let EventCause::Invocation {
-            admission: task_admission,
-        } = &task.event().cause
-        else {
-            return Err(AuthorizationError::InvalidProof(
-                "Task source has no admission",
-            ));
-        };
-        usage.record_event_signature(&handoff.task_creation, task.event(), task_admission)?;
+        match &handoff.origin {
+            ExecutionOrigin::TaskSession { task_creation } => {
+                let binding = handoff.task_binding()?;
+                let task = events::verify_signed_event(
+                    &serde_json::to_string(task_creation).map_err(invalid_shape)?,
+                    statement.project.space.as_str(),
+                    statement.project.resource.as_str(),
+                    certificate.payload.public_key.as_str(),
+                )
+                .map_err(invalid_shape)?;
+                let EventBody::TaskCreated { task_id, .. } = &task.event().body else {
+                    return Err(AuthorizationError::InvalidProof(
+                        "capsule source is not a task creation",
+                    ));
+                };
+                require(
+                    binding.binding.task_ref == task_creation.hash
+                        && binding.binding.task_id == *task_id
+                        && binding.binding.authority_node == task.event().author
+                        && task.event().scope_id == dispatch.scope_id
+                        && task.event().blobs.is_empty(),
+                    "execution capsule belongs to another task",
+                )?;
+                verify_binding(&binding, certificate.payload.public_key.as_str())
+                    .map_err(invalid_shape)?;
+                let EventCause::Invocation {
+                    admission: task_admission,
+                } = &task.event().cause
+                else {
+                    return Err(AuthorizationError::InvalidProof(
+                        "Task source has no admission",
+                    ));
+                };
+                usage.record_event_signature(task_creation, task.event(), task_admission)?;
+                usage.record_binding(&binding)?;
+            }
+            ExecutionOrigin::ConversationSession { accepted_open } => {
+                require(
+                    matches!(
+                        accepted_open.handoff.handoff.origin,
+                        ExecutionOrigin::ConversationOpen
+                    ),
+                    "conversation source is not an initial Open",
+                )?;
+                let accepted_source = self
+                    .verify_execution_observation_source(&accepted_open.handoff.handoff, now_ms)?;
+                require(
+                    accepted_open.handoff.handoff.source_statement()?.work == work,
+                    "conversation source changed its accepted Open",
+                )?;
+                super::execution_observation::ExecutionObservationTarget::from_original(
+                    &accepted_open.handoff,
+                )?;
+                usage.merge(accepted_source.proof_usage());
+                usage.record_signed(&accepted_open.receipt)?;
+            }
+            ExecutionOrigin::ConversationOpen | ExecutionOrigin::Command => {
+                require(
+                    handoff.task_sdk_origin.is_none(),
+                    "non-Task execution cannot carry a Task origin",
+                )?;
+            }
+        }
         usage.record_event_signature(&handoff.project_dispatch, &dispatch, &proof)?;
-        usage.record_binding(&binding)?;
         let original =
             self.verify_original_admission(&proof, &admission_facts(&proof.invocation.payload))?;
         usage.merge(original.proof_usage());
@@ -916,7 +981,8 @@ impl VerifiedPolicySet {
             original,
             sdk_parent: None,
         };
-        verified.sdk_parent = self.verify_compact_sdk_parent_admission(&verified, handoff, now_ms)?;
+        verified.sdk_parent =
+            self.verify_compact_sdk_parent_admission(&verified, handoff, now_ms)?;
         if let Some(parent) = &verified.sdk_parent {
             verified.usage.merge(parent.proof_usage());
             verified.usage.enforce_limits()?;
@@ -938,7 +1004,7 @@ impl VerifiedPolicySet {
         let source = self.verify_project_execution_source(&wire.handoff, now_ms)?;
         let hash = wire.hash()?;
         let facts = execution_submission_facts(&wire.handoff, original)?;
-        let (event, original_proof, request, binding) = original_dispatch(&wire.handoff)?;
+        let (event, original_proof, request, work) = original_dispatch(&wire.handoff)?;
         require(
             original_proof.source_body["execution_grant"].as_str()
                 == Some(wire.invocation.payload.grant_leaf.as_str()),
@@ -984,12 +1050,15 @@ impl VerifiedPolicySet {
             project_device.payload.public_key.as_str(),
         )
         .map_err(invalid_shape)?;
-        verify_binding(&binding, project_device.payload.public_key.as_str())
-            .map_err(invalid_shape)?;
-        require(
-            binding.binding.authority_node == event.author,
-            "handoff binding is not from its Project authority",
-        )?;
+        if let ExecutionWork::TaskSession { .. } = &work {
+            let binding = wire.handoff.task_binding()?;
+            verify_binding(&binding, project_device.payload.public_key.as_str())
+                .map_err(invalid_shape)?;
+            require(
+                binding.binding.authority_node == event.author,
+                "handoff binding is not from its Project authority",
+            )?;
+        }
         let submission = match admitted {
             Some(admitted) => {
                 require(
@@ -1028,6 +1097,7 @@ impl VerifiedPolicySet {
                             | Action::ExecutionSteer
                             | Action::ExecutionInterrupt
                             | Action::ExecutionRespondApproval
+                            | Action::ExecutionCommand
                             | Action::OperationStatusRead
                     )
                 })
@@ -1040,6 +1110,15 @@ impl VerifiedPolicySet {
                 && leaf.constraints.context.workspace_resource == facts.context.workspace_resource,
             "execution handoff grant must explicitly bind the action, task, and executor",
         )?;
+        require(
+            super::prepare::remote_context_matches(
+                &facts.context,
+                &facts.audience.device,
+                &leaf.actions,
+            ),
+            "execution grant combines incompatible work capabilities",
+        )?;
+        check_execution_source_work(leaf, original.resource(), &wire.invocation.issuer, &work)?;
         let mut dependencies = BTreeMap::new();
         for stamp in original
             .dependencies()
@@ -1072,8 +1151,7 @@ impl VerifiedPolicySet {
             original: original.clone(),
             submission,
             original_request_hash: ObjectHash::body(&request)?,
-            binding_hash: binding_hash(&binding.binding).map_err(invalid_shape)?,
-            binding,
+            work,
             dependencies: dependencies.into_values().collect(),
             verified_at_ms: now_ms,
             usage,
@@ -1214,9 +1292,7 @@ pub enum ExecutionHandoffState {
 pub struct ExecutionSessionSnapshot {
     pub original_project: ResourceRef,
     pub execution_resource: ResourceRef,
-    pub task: EventRef,
-    pub binding_hash: String,
-    pub binding_generation: u64,
+    pub work: ExecutionWork,
     pub target: DeviceId,
     pub session_id: String,
     pub revision: u64,
@@ -1228,6 +1304,60 @@ pub struct ExecutionSessionSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct ExecutionPendingRequest {
+    pub request_id: Value,
+    pub turn_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionControlState {
+    pub turn_id: Option<String>,
+    pub pending_requests: Vec<ExecutionPendingRequest>,
+    pub expires_at_ms: u64,
+}
+
+impl ExecutionControlState {
+    pub fn validate_for_session(
+        &self,
+        session: &ExecutionSessionSnapshot,
+        issued_at_ms: u64,
+    ) -> Result<()> {
+        require(
+            session.work.execution_session().is_some()
+                && self.expires_at_ms > issued_at_ms
+                && self.expires_at_ms <= session.expires_at_ms
+                && canonical(self)?.len() <= MAX_PROOF_BYTES,
+            "execution control has no live session lease",
+        )?;
+        if let Some(turn) = &self.turn_id {
+            require(
+                !turn.is_empty() && turn.len() <= 512,
+                "invalid execution control turn",
+            )?;
+        }
+        let mut requests = BTreeSet::new();
+        for pending in &self.pending_requests {
+            let valid_id = match &pending.request_id {
+                Value::String(value) => value.len() <= 512,
+                Value::Number(value) => value
+                    .as_i64()
+                    .is_some_and(|value| value.unsigned_abs() <= 9_007_199_254_740_991),
+                _ => false,
+            };
+            require(
+                valid_id
+                    && self.turn_id.as_ref() == Some(&pending.turn_id)
+                    && requests.insert(ObjectHash::body(&pending.request_id)?),
+                "execution control has an invalid request id or another turn",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionHandoffReceipt {
     pub version: u16,
     pub operation_id: String,
@@ -1235,11 +1365,12 @@ pub struct ExecutionHandoffReceipt {
     pub execution_space_id: SpaceId,
     pub handoff_hash: ObjectHash,
     pub target: DeviceId,
-    pub session_id: String,
-    pub binding_generation: u64,
+    pub work: ExecutionWork,
     pub state: ExecutionHandoffState,
     pub result_hash: ObjectHash,
     pub session: Option<ExecutionSessionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<ExecutionControlState>,
     pub issued_at_ms: u64,
 }
 impl sealed::Sealed for ExecutionHandoffReceipt {}
@@ -1253,30 +1384,29 @@ pub fn verify_execution_handoff_receipt_signature(
     result: &Value,
 ) -> Result<()> {
     receipt.verify_signature()?;
-    let (event, proof, _, binding) = original_dispatch(&wire.handoff)?;
+    wire.invocation.verify_signature()?;
+    let (event, proof, _, work) = original_dispatch(&wire.handoff)?;
     let value = &receipt.payload;
     if let Some(session) = &value.session {
+        verify_snapshot_work(session, &wire.handoff, &work)?;
         require(
-            session.original_project
-                == ResourceRef {
-                    space: SpaceId::parse(&event.network_id)?,
-                    resource: event.resource_id.clone(),
-                }
-                && session.execution_resource == wire.handoff.execution_resource
-                && session.task.as_str() == binding.binding.task_ref
-                && session.binding_hash == binding_hash(&binding.binding).map_err(invalid_shape)?
-                && session.binding_generation == binding.binding.generation
-                && session.target == wire.handoff.execution_audience.device
-                && session.session_id == binding.binding.session_id
-                && binding.binding.open_spec["executor"].as_str()
-                    == Some(session.executor.as_str())
-                && binding.binding.open_spec["cwd"].as_str() == Some(session.cwd.as_str())
-                && !session.state.is_empty()
-                && session.state.len() <= 128
-                && session.expires_at_ms > value.issued_at_ms
+            session.expires_at_ms > value.issued_at_ms
                 && session.expires_at_ms - value.issued_at_ms <= EXECUTION_LEASE_MS,
-            "signed executor session snapshot differs from its task binding",
+            "executor session snapshot has an invalid lease",
         )?;
+    }
+    if let Some(control) = &value.control {
+        require(
+            canonical(receipt)?.len() <= MAX_PROOF_BYTES,
+            "execution control receipt exceeds its proof budget",
+        )?;
+        let session = value
+            .session
+            .as_ref()
+            .ok_or(AuthorizationError::InvalidProof(
+                "execution control requires a session snapshot",
+            ))?;
+        control.validate_for_session(session, value.issued_at_ms)?;
     }
     require(
         receipt.issuer == wire.handoff.target_public_key
@@ -1287,10 +1417,100 @@ pub fn verify_execution_handoff_receipt_signature(
             && value.handoff_hash == wire.hash()?
             && value.target == wire.handoff.execution_audience.device
             && value.target == DeviceId::from_key(&receipt.issuer)
-            && value.session_id == binding.binding.session_id
-            && value.binding_generation == binding.binding.generation
+            && value.work == work
             && value.result_hash == ObjectHash::body(result)?,
         "execution handoff result signature mismatch",
+    )
+}
+
+pub fn sign_execution_handoff_receipt_with_control(
+    wire: &SignedExecutionHandoff,
+    mut receipt: ExecutionHandoffReceipt,
+    result: &Value,
+    control: Option<ExecutionControlState>,
+    signer: &Identity,
+) -> Result<Signed<ExecutionHandoffReceipt>> {
+    require(
+        PublicKey::of(signer) == wire.handoff.target_public_key
+            && receipt.result_hash == ObjectHash::body(result)?,
+        "execution control changed its executor or durable result",
+    )?;
+    receipt.control = control;
+    let receipt = Signed::sign(receipt, signer)?;
+    verify_execution_handoff_receipt_signature(wire, &receipt, result)?;
+    Ok(receipt)
+}
+
+pub fn verify_execution_control_state<'a>(
+    wire: &SignedExecutionHandoff,
+    receipt: &'a Signed<ExecutionHandoffReceipt>,
+    result: &Value,
+    expected_revision: u64,
+    now_ms: u64,
+) -> Result<&'a ExecutionControlState> {
+    verify_execution_handoff_receipt_signature(wire, receipt, result)?;
+    let session = receipt
+        .payload
+        .session
+        .as_ref()
+        .ok_or(AuthorizationError::InvalidProof(
+            "execution control requires a session snapshot",
+        ))?;
+    let control = receipt
+        .payload
+        .control
+        .as_ref()
+        .ok_or(AuthorizationError::InvalidProof(
+            "executor has no observed control state",
+        ))?;
+    require(
+        expected_revision <= 9_007_199_254_740_991
+            && session.revision == expected_revision
+            && receipt.payload.issued_at_ms >= wire.invocation.payload.not_before_ms
+            && receipt.payload.issued_at_ms <= now_ms
+            && now_ms < control.expires_at_ms,
+        "execution control revision or observation lease changed",
+    )?;
+    Ok(control)
+}
+
+fn verify_snapshot_work(
+    session: &ExecutionSessionSnapshot,
+    handoff: &ExecutionHandoff,
+    work: &ExecutionWork,
+) -> Result<()> {
+    let source = handoff.source_statement()?;
+    let expected_session = work
+        .execution_session()
+        .ok_or(AuthorizationError::InvalidProof(
+            "command cannot carry a session snapshot",
+        ))?;
+    let (executor, cwd) = match work {
+        ExecutionWork::TaskSession { .. } => {
+            let binding = handoff.task_binding()?;
+            (
+                required_text(&binding.binding.open_spec["executor"], 128)?,
+                required_text(&binding.binding.open_spec["cwd"], 4096)?,
+            )
+        }
+        ExecutionWork::ConversationSession {
+            executor,
+            canonical_cwd,
+            ..
+        } => (executor.clone(), canonical_cwd.clone()),
+        ExecutionWork::Command { .. } => unreachable!(),
+    };
+    require(
+        session.original_project == source.project
+            && session.execution_resource == handoff.execution_resource
+            && session.work == *work
+            && session.target == expected_session.target
+            && session.session_id == expected_session.session_id
+            && session.executor == executor
+            && session.cwd == cwd
+            && !session.state.is_empty()
+            && session.state.len() <= 128,
+        "signed executor session snapshot differs from its original work",
     )
 }
 
@@ -1375,8 +1595,7 @@ impl VerifiedPolicySet {
                 && value.execution_space_id == handoff.wire.handoff.execution_resource.space
                 && value.handoff_hash == handoff.hash
                 && value.target == handoff.wire.handoff.execution_audience.device
-                && value.session_id == handoff.binding.binding.session_id
-                && value.binding_generation == handoff.binding.binding.generation
+                && value.work == handoff.work
                 && value.result_hash == ObjectHash::body(result)?
                 && value.issued_at_ms <= now_ms,
             "execution handoff result receipt mismatch",
@@ -1408,16 +1627,22 @@ pub fn verify_execution_session_snapshot<'a>(
             && value.original_space_id == project.space
             && value.execution_space_id == execution.space
             && value.target == DeviceId::from_key(target_key)
-            && value.session_id == binding.binding.session_id
-            && value.binding_generation == binding.binding.generation
+            && value.work == session.work
             && session.original_project == *project
             && session.execution_resource == *execution
             && binding.binding.network_id == project.space.as_str()
             && binding.binding.authority_node
                 == node_fingerprint(project_key.as_str()).map_err(invalid_shape)?
-            && session.task.as_str() == binding.binding.task_ref
-            && session.binding_hash == binding_hash(&binding.binding).map_err(invalid_shape)?
-            && session.binding_generation == binding.binding.generation
+            && session.work
+                == ExecutionWork::TaskSession {
+                    task: EventRef::parse(&binding.binding.task_ref)?,
+                    binding_hash: binding_hash(&binding.binding).map_err(invalid_shape)?,
+                    binding_generation: binding.binding.generation,
+                    execution_session: SessionRef {
+                        target: value.target.clone(),
+                        session_id: binding.binding.session_id.clone(),
+                    },
+                }
             && session.target == value.target
             && binding.binding.target_node
                 == node_fingerprint(target_key.as_str()).map_err(invalid_shape)?
@@ -1480,7 +1705,7 @@ pub fn execution_resolution_account_facts(
         &unknown.receipt,
         &unknown.result,
     )?;
-    let (event, original, request, binding) = original_dispatch(&unknown.handoff.handoff)?;
+    let (event, original, request, work) = original_dispatch(&unknown.handoff.handoff)?;
     let proof = &value.account_admission;
     let body = &proof.source_body;
     let fields = body.as_object().ok_or(AuthorizationError::InvalidProof(
@@ -1547,9 +1772,9 @@ pub fn execution_resolution_account_facts(
                 == Some(original.invocation.payload.operation_id.as_str())
             && body["conversation_id"].as_str() == Some(event.scope_id.as_str())
             && body["task_id"] == request["task_id"]
-            && body["task_ref"].as_str() == Some(binding.binding.task_ref.as_str())
-            && body["target_node"].as_str() == Some(binding.binding.target_node.as_str())
-            && body["session_id"].as_str() == Some(binding.binding.session_id.as_str())
+            && body["task_ref"] == serde_json::to_value(work.task_ref()).map_err(invalid_shape)?
+            && body["target_node"] == request["target_node"]
+            && body["session_id"] == request["session_id"]
             && body["execution_resource"]
                 == serde_json::to_value(&unknown.handoff.handoff.execution_resource)
                     .map_err(invalid_shape)?
@@ -1566,19 +1791,8 @@ pub fn execution_resolution_account_facts(
         "resolution differs from the accepted operation, unknown receipt or Account intent",
     )?;
     ObjectHash::parse(body["execution_grant"].as_str().unwrap_or_default())?;
-    let context = InvocationContext {
-        conversation: Some(event.scope_id),
-        task: Some(EventRef::parse(&binding.binding.task_ref)?),
-        sdk_session: None,
-        execution_session: Some(SessionRef {
-            target: unknown.handoff.handoff.execution_audience.device.clone(),
-            session_id: binding.binding.session_id,
-        }),
-        executor_kind: binding.binding.open_spec["executor"]
-            .as_str()
-            .map(str::to_owned),
-        workspace_resource: Some(event.resource_id.clone()),
-    };
+    let mut context = unknown.handoff.handoff.execution_context()?;
+    context.sdk_session = None;
     Ok(RequestFacts {
         resource: ResourceRef {
             space: SpaceId::parse(&event.network_id)?,
@@ -2003,8 +2217,15 @@ impl VerifiedPolicySet {
                 && leaf.not_before_ms < leaf.expires_at_ms
                 && leaf.expires_at_ms < u64::MAX
                 && leaf.constraints.context == facts.context,
-            "executor resolution grant must bind only explicit resolution and this task/session",
+            "executor resolution grant must bind only explicit resolution and this work",
         )?;
+        let source = wire
+            .resolution
+            .observation
+            .handoff
+            .handoff
+            .source_statement()?;
+        check_execution_source_work(leaf, &source.project, &wire.invocation.issuer, &source.work)?;
         let mut dependencies = BTreeMap::new();
         for stamp in resolver
             .dependencies()
@@ -2448,12 +2669,14 @@ impl ExecutionProofUsage {
                 )?;
                 source["request"]["action"]["text"] = serde_json::json!({"payload_hash":ObjectHash::body(&text)?,"utf8_bytes":text.len()});
             }
-            let binding: SignedBinding =
-                serde_json::from_value(source["request"]["binding"].clone())
-                    .map_err(invalid_shape)?;
-            self.record_binding(&binding)?;
-            source["request"]["binding"] =
-                serde_json::json!({"signed_binding_hash":ObjectHash::body(&binding)?});
+            if !source["request"]["binding"].is_null() {
+                let binding: SignedBinding =
+                    serde_json::from_value(source["request"]["binding"].clone())
+                        .map_err(invalid_shape)?;
+                self.record_binding(&binding)?;
+                source["request"]["binding"] =
+                    serde_json::json!({"signed_binding_hash":ObjectHash::body(&binding)?});
+            }
             if !source["execution_session_receipt"].is_null() {
                 let receipt: Signed<ExecutionHandoffReceipt> =
                     serde_json::from_value(source["execution_session_receipt"].clone())
@@ -2552,7 +2775,22 @@ impl ExecutionProofUsage {
         self.record_capsule(&wire.handoff)
     }
     fn record_capsule(&mut self, handoff: &ExecutionHandoff) -> Result<()> {
-        self.record_event(&handoff.task_creation)?;
+        match &handoff.origin {
+            ExecutionOrigin::TaskSession { task_creation } => self.record_event(task_creation)?,
+            ExecutionOrigin::ConversationSession { accepted_open } => {
+                require(
+                    matches!(
+                        accepted_open.handoff.handoff.origin,
+                        ExecutionOrigin::ConversationOpen
+                    ),
+                    "execution capsule contains nested session origins",
+                )?;
+                self.record_handoff(&accepted_open.handoff)?;
+                self.record_signed(&accepted_open.receipt)?;
+                self.record_metadata(&accepted_open.result)?;
+            }
+            ExecutionOrigin::ConversationOpen | ExecutionOrigin::Command => {}
+        }
         self.record_event(&handoff.project_dispatch)?;
         if let Some(source) = &handoff.source_attestation {
             self.record_signed(source)?;

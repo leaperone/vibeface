@@ -545,8 +545,8 @@ mod tests {
         Identity,
         authorization::{
             Audience, ResourceRef, ServiceId,
-            client_policy_import::AuthorizationSelection,
             bootstrap::{self, VerifiedNodeClaim, recovery},
+            client_policy_import::AuthorizationSelection,
         },
         signature_verification::SignatureVerification,
     };

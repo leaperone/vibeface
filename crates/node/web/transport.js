@@ -11,6 +11,7 @@ let identity;
 let initializing;
 let identityGeneration = 0;
 let activeProfileId = null;
+let localNodeId = null;
 const pendingIdentities = new Map();
 const pendingVaultWrites = new Set();
 
@@ -261,6 +262,67 @@ export function lockClient() {
   identity = undefined;
   activeProfileId = null;
   initializing = undefined;
+}
+
+export function setLocalAccessNode(nodeId) {
+  localNodeId = nodeId === null ? null : validTarget(nodeId);
+}
+
+function localVaultRecord(key, value, generation = identityGeneration, activeNode, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new Error("本机自动解锁配置已取消。")); return; }
+    const opening = indexedDB.open("vibeface-local-vault-v1", 1);
+    opening.onupgradeneeded = () => opening.result.createObjectStore("keys");
+    opening.onerror = () => reject(new Error("无法读取本机自动解锁配置。"));
+    opening.onsuccess = () => {
+      const db = opening.result;
+      if (generation !== identityGeneration || signal?.aborted) { db.close(); reject(new Error("设备配置已锁定或操作已取消。")); return; }
+      const transaction = db.transaction("keys", value ? "readwrite" : "readonly");
+      const abort = () => { try { transaction.abort(); } catch {} };
+      const close = () => { signal?.removeEventListener("abort", abort); pendingVaultWrites.delete(transaction); db.close(); };
+      signal?.addEventListener("abort", abort, { once: true });
+      if (value) pendingVaultWrites.add(transaction);
+      const request = value ? transaction.objectStore("keys").put(value, key) : transaction.objectStore("keys").get(key);
+      if (activeNode) transaction.objectStore("keys").put(value.profileId, `active:${activeNode}`);
+      transaction.oncomplete = () => { close(); if (generation !== identityGeneration || signal?.aborted) reject(new Error("设备配置已锁定或操作已取消。")); else resolve(request.result); };
+      transaction.onerror = transaction.onabort = () => { close(); reject(new Error("本机自动解锁配置未保存。")); };
+    };
+  });
+}
+
+export async function bindLocalVault(nodeId, unlockKey, isCurrent = () => true, signal) {
+  requireSecureClient(); validTarget(nodeId); unhex(unlockKey, 32);
+  if (!isCurrent() || signal?.aborted) throw new Error("本机自动解锁配置已取消。");
+  if (!identity || !activeProfileId) throw new Error("请先解锁已保存的设备配置。临时会话不能自动解锁。");
+  const generation = identityGeneration;
+  const profileId = activeProfileId;
+  const publicKey = identity.publicKeyHex();
+  const key = `${nodeId}:${profileId}`;
+  const keyTag = hex(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(unlockKey))));
+  const previous = await localVaultRecord(key, undefined, generation, undefined, signal);
+  if (generation !== identityGeneration || profileId !== activeProfileId || !isCurrent() || signal?.aborted) throw new Error("设备配置已锁定或操作已取消。");
+  const vault = previous?.nodeId === nodeId && previous?.profileId === profileId && previous?.publicKey === publicKey && previous?.keyTag === keyTag ? previous.vault : await sealDeviceVault(identity.secretHex(), unlockKey);
+  if (generation !== identityGeneration || profileId !== activeProfileId || !isCurrent() || signal?.aborted) throw new Error("设备配置已锁定或操作已取消。");
+  await localVaultRecord(key, { nodeId, profileId, publicKey, keyTag, vault }, generation, nodeId, signal);
+}
+
+export async function unlockLocalVault(nodeId, unlockKey, isCurrent = () => true) {
+  requireSecureClient(); validTarget(nodeId); unhex(unlockKey, 32);
+  if (identity || initializing) throw new Error("设备配置正在使用。");
+  const generation = identityGeneration;
+  const profileId = await localVaultRecord(`active:${nodeId}`);
+  if (!profileId) return null;
+  if (typeof profileId !== "string" || !/^[a-f0-9-]{36}$/.test(profileId)) throw new Error("本机设备配置编号无效。");
+  const stored = await localVaultRecord(`${nodeId}:${profileId}`);
+  const profile = parseProfile(await vaultRecords(profileId));
+  if (!stored || stored.nodeId !== nodeId || stored.profileId !== profileId || stored.publicKey !== profile.public_key) throw new Error("本机自动解锁与原设备配置不一致。");
+  await init();
+  const secret = await openDeviceVault(stored.vault, unlockKey);
+  if (generation !== identityGeneration || identity || !isCurrent()) throw new Error("设备配置已切换。");
+  const candidate = Identity.fromSecretHex(secret);
+  if (candidate.publicKeyHex() !== profile.public_key) { candidate.free(); throw new Error("本机自动解锁密钥不一致。"); }
+  identity = candidate; activeProfileId = profileId;
+  return { nodeId: identity.nodeId(), publicKey: identity.publicKeyHex(), profileId };
 }
 
 export async function initClient(options) {
@@ -553,7 +615,8 @@ export async function connectDevice(entry, { onEvent, onClose, signal } = {}) {
   if (!identity) throw new Error("请先解锁设备仓库，或选择临时会话。");
   const target = validTarget(entry.node_id);
   const endpoint = validEndpoint(entry.address);
-  const url = new URL("/api/network/ws", endpoint);
+  const local = localNodeId === target && endpoint === location.origin && !entry.relay;
+  const url = new URL(local ? "/api/local/network/ws" : "/api/network/ws", endpoint);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(url);
   socket.binaryType = "arraybuffer";

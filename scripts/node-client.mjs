@@ -26,6 +26,9 @@ let recoveryRequest;
 let recoveryPreparation;
 let nodeEnrollment;
 let nodeEnrollmentCommit;
+const clientOffers = new Map();
+const clientEnrollments = new Map();
+const executionRegistrations = new Map();
 function sealedRecovery(material, password) {
   const plaintext = encoder.encode(material);
   try { return Buffer.from(crypto.recoverySeal(plaintext, password)).toString('hex'); }
@@ -39,20 +42,29 @@ const identity = name => {
 const exposed = key => ({ public_key: key.publicKeyHex(), node_id: key.nodeId(), device_id: crypto.deriveAuthorizationId('device', key.publicKeyHex()) });
 const actions = {
   conversations: 'conversation_read', conversation: 'conversation_read', context: 'conversation_read',
-  nodes: 'operation_status_read', session: 'operation_status_read', operation: 'operation_status_read',
+  nodes: 'operation_status_read', session: 'operation_status_read', operation: 'operation_status_read', execution_status: 'operation_status_read',
   create_conversation: 'conversation_create', message: 'message_append', create_task: 'task_create',
   bind_execution: 'execution_open', seal_execution: 'execution_rebind', rebind_execution: 'execution_rebind', notifications: 'notification_read',
   ack: 'notification_ack', export: 'export', reconcile: 'operation_reconcile', resolve_unknown: 'operation_resolve',
   replica_inventory: 'replica_read', replica_event: 'replica_read', replica_blob: 'replica_read',
   execution_share_request: 'conversation_read', seal_remote_execution: 'execution_rebind',
   remote_execution_seal_status: 'operation_status_read',
+  bots: 'conversation_read', create_bot: 'conversation_create', set_followup: 'task_followup',
+  cancel_manager: 'agent_interrupt', resolve_manager_unknown: 'operation_resolve', read_artifact: 'attachment_read',
 };
 const operationActions = {
-  open: 'execution_open', read: 'operation_status_read', send: 'execution_send', steer: 'execution_steer',
+  open: 'execution_open', read: 'operation_status_read', send: 'execution_send', command: 'execution_command', steer: 'execution_steer',
   interrupt: 'execution_interrupt', respond_request: 'execution_respond_approval',
 };
 function expectedAction(body) {
   if (body.method === 'context' && typeof body.blob_hash === 'string') return 'attachment_read';
+  if (body.method === 'execution_control' || body.method === 'task_control') {
+    if (body.method === 'task_control' && body.action === 'status') return 'operation_status_read';
+    const type = typeof body.action === 'string' ? body.action : body.action?.type;
+    const action = { steer: 'execution_steer', interrupt: 'execution_interrupt', respond_request: 'execution_respond_approval' }[type];
+    if (!action) throw new Error('unknown execution control action');
+    return action;
+  }
   if (body.method === 'operate') {
     const action = operationActions[body.request?.action?.type];
     if (!action) throw new Error('unknown execution action');
@@ -497,8 +509,16 @@ async function readRemotePolicy(input, connectionName) {
   const executionTrust = savedTrust(input.execution_trust_ref);
   assert.equal(executionTrust.scope.space_id, input.selection.execution_resource.space);
   const signer = identity(connections.get(sourceName).identityName);
+  let work = input.work;
+  if (!work) {
+    assert(input.raw_context.context.task && input.raw_context.context.execution_session
+      && Number.isSafeInteger(input.raw_context.binding_generation) && input.raw_context.binding_generation > 0,
+    'taskless remote policy requires an explicit verified execution Work intent');
+    work = { kind: 'task_session', task: input.raw_context.context.task,
+      binding_generation: input.raw_context.binding_generation, execution_session: input.raw_context.context.execution_session };
+  }
   const intent = JSON.parse(crypto.buildRemoteExecutionPolicyReadIntent(source.verified, JSON.stringify({
-    selection: input.selection, context: input.raw_context, expected_action: input.action,
+    selection: input.selection, context: input.raw_context, work, expected_action: input.action,
     purpose: input.purpose || 'execution', execution_pins: executionTrust.pins,
   }), signer, Date.now(), Date.now() + 60_000));
   const selected = await identityRequest(b, 'foreign_execution_policy_selection', intent);
@@ -598,7 +618,7 @@ async function command(input) {
     return { released: true };
   }
   if (input.op === 'verify_remote_seal') return JSON.parse(crypto.verifyRemoteExecutionSeal(
-    JSON.stringify(input.binding), JSON.stringify(input.seal), input.project_public_key,
+    JSON.stringify(input.binding ?? null), JSON.stringify(input.seal), input.project_public_key,
     input.execution_public_key, JSON.stringify(input.revision)));
   if (input.op === 'derive_authorization_id') return crypto.deriveAuthorizationId(input.kind, input.value);
   if (input.op === 'sign_gateway_route') return JSON.parse(crypto.signGatewayRouteApproval(JSON.stringify(input.payload), identity(input.identity || 'root')));
@@ -720,13 +740,154 @@ async function command(input) {
       nodeEnrollment.free(); nodeEnrollment = undefined; openedRecoveryMaterial = undefined;
     }
   }
+  if (input.op === 'create_client_enrollment_offer') {
+    assert(!clientOffers.has(input.handle), 'enrollment offer handle must be new');
+    const auth = authorizations.get(connectionName);
+    const connection = connections.get(connectionName);
+    assert(auth && connection, 'device enrollment needs a confirmed owner authorization');
+    const authorityExpiry = auth.policy.account_enrollment_expires_at_ms;
+    assert(Number.isSafeInteger(authorityExpiry) && authorityExpiry > Date.now(), 'owner enrollment authority must be current');
+    const offer = JSON.parse(crypto.createDeviceEnrollmentOffer(identity(connection.identityName),
+      auth.scope.account_id, connection.url, connection.nodePublicKey, JSON.stringify(input.rights || []),
+      Math.min(Date.now() + 3_600_000, authorityExpiry), auth.verified, Date.now()));
+    const descriptor = crypto.verifyDeviceEnrollmentOffer(JSON.stringify(offer), Date.now());
+    try {
+      const reference = { account_id: descriptor.accountId(), offer_hash: descriptor.offerHash(),
+        expires_at_ms: descriptor.expiresAtMs(), ...JSON.parse(descriptor.entryJson()) };
+      const published = await identityRequest(connection, 'enrollment_offer_publish', { offer });
+      assert.equal(published.offer_hash, reference.offer_hash, 'published offer changed its locally verified hash');
+      clientOffers.set(input.handle, { offer, reference, connectionName, expected: null });
+      return { offer, reference };
+    } finally { descriptor.free(); }
+  }
+  if (input.op === 'begin_client_enrollment') {
+    assert(!clientEnrollments.has(input.handle) && !trust, 'new device has no existing account trust');
+    const connection = connections.get(connectionName), device = identity(connection.identityName);
+    const descriptor = crypto.verifyDeviceEnrollmentOffer(JSON.stringify(input.offer), Date.now());
+    let importer, verified;
+    try {
+      const reference = input.reference;
+      assert.equal(descriptor.offerHash(), reference.offer_hash);
+      assert.equal(descriptor.accountId(), reference.account_id);
+      assert.equal(descriptor.expiresAtMs(), reference.expires_at_ms);
+      assert.deepEqual(JSON.parse(descriptor.entryJson()), { endpoint: reference.endpoint, node_public_key: reference.node_public_key });
+      assert.equal(connection.nodePublicKey, reference.node_public_key, 'enrollment remains on the independently pinned Node');
+      const request = JSON.parse(crypto.buildEnrollmentOfferPolicyReadRequest(descriptor, device, Date.now(), Math.min(reference.expires_at_ms, Date.now() + 60_000)));
+      const begun = await identityRequest(connection, 'enrollment_policy_read_begin', {
+        credential: { purpose: 'browser_device', credential: input.offer }, request,
+      });
+      importer = crypto.beginEnrollmentOfferImport(descriptor, JSON.stringify(request), JSON.stringify(begun.snapshot), device, connection.nodePublicKey, Date.now());
+      for (;;) {
+        const page = await identityRequest(connection, 'enrollment_policy_read_page', JSON.parse(importer.pageRequestJson()));
+        importer.appendPage(JSON.stringify(page.page), Date.now());
+        if (page.page.payload.complete) break;
+      }
+      const witnessed = await identityRequest(connection, 'enrollment_policy_read_witness', { ...JSON.parse(importer.pageRequestJson()), cursor: null });
+      verified = importer.finish(JSON.stringify(witnessed.witness), Date.now());
+      const intent = JSON.parse(crypto.createDeviceEnrollmentIntentFromOffer(verified, device, Date.now()));
+      assert.equal(intent.new_device_public_key, device.publicKeyHex());
+      const scope = { account_id: verified.accountId(), space_id: input.expected_space_id,
+        device_id: crypto.deriveAuthorizationId('device', device.publicKeyHex()) };
+      const pins = JSON.parse(verified.pinsJson());
+      assert(pins.some(pin => pin.domain.kind === 'space' && pin.domain.id === scope.space_id),
+        'new client Space must match the independently pinned Account offer');
+      const params = { account_id: reference.account_id, offer_hash: reference.offer_hash,
+        new_device_public_key: device.publicKeyHex(), intent };
+      const pending = await identityRequest(connection, 'enrollment_request', params);
+      assert.equal(pending.status, 'requested');
+      assert.equal(pending.new_device_public_key, device.publicKeyHex());
+      assert.deepEqual(pending.unsigned_intent, intent);
+      saveTrust('primary', { scope, pins });
+      clientEnrollments.set(input.handle, { verified, pending, reference, connectionName, certificate: null });
+      verified = null;
+      return { scope, pending };
+    } finally { verified?.free(); importer?.free(); descriptor.free(); }
+  }
+  if (input.op === 'approve_client_enrollment') {
+    const flow = clientOffers.get(input.handle), auth = authorizations.get(connectionName);
+    assert(flow && auth && flow.connectionName === connectionName, 'approval belongs to its original owner connection');
+    const connection = connections.get(connectionName), pending = input.pending;
+    const listed = await identityRequest(connection, 'enrollment_pending', flow.reference);
+    const current = listed.requests.find(item => item.request_id === pending.request_id);
+    assert.deepEqual(current, pending, 'owner approves the exact independently supplied new-device request');
+    assert.equal(pending.new_device_public_key, input.expected_public_key);
+    const descriptor = crypto.verifyDeviceEnrollmentOffer(JSON.stringify(flow.offer), Date.now());
+    try {
+      const checked = JSON.parse(crypto.verifyDeviceEnrollmentIntentForManager(auth.verified, descriptor,
+        flow.reference.offer_hash, JSON.stringify(pending.unsigned_intent), input.expected_public_key, Date.now()));
+      assert.deepEqual(checked, pending.unsigned_intent);
+      const intent = JSON.parse(crypto.signDeviceEnrollmentIntent(JSON.stringify(checked), identity(connection.identityName), auth.verified, Date.now()));
+      const approved = await identityRequest(connection, 'enrollment_approve', { ...flow.reference, request_id: pending.request_id, intent });
+      assert.equal(approved.status, 'approved');
+      assert.deepEqual(approved.intent, intent);
+      flow.expected = { ...pending, intent };
+      return approved;
+    } finally { descriptor.free(); }
+  }
+  if (input.op === 'possess_client_enrollment') {
+    const flow = clientEnrollments.get(input.handle), connection = connections.get(connectionName);
+    assert(flow && flow.connectionName === connectionName, 'possession stays with the original independent device');
+    const params = { ...flow.reference, request_id: flow.pending.request_id };
+    const approved = await identityRequest(connection, 'enrollment_status', params);
+    assert.equal(approved.status, 'approved');
+    assert.deepEqual(approved.unsigned_intent, flow.pending.unsigned_intent);
+    assert.equal(approved.nonce, flow.pending.nonce);
+    const qualified = crypto.verifyAccountEnrollmentFromOffer(JSON.stringify(approved.intent), flow.verified, Date.now());
+    try {
+      const certificate = JSON.parse(crypto.signDeviceEnrollmentPossession(qualified, identity(connection.identityName), flow.pending.nonce, Date.now()));
+      const possessed = await identityRequest(connection, 'enrollment_possession', { ...params, certificate });
+      assert.equal(possessed.status, 'possessed');
+      assert.deepEqual(possessed.certificate, certificate);
+      flow.certificate = certificate;
+      return possessed;
+    } finally { qualified.free(); }
+  }
+  if (input.op === 'commit_client_enrollment') {
+    const flow = clientOffers.get(input.handle), connection = connections.get(connectionName), auth = authorizations.get(connectionName);
+    assert(flow?.expected && auth && flow.connectionName === connectionName, 'commit requires the original owner approval');
+    const pending = await identityRequest(connection, 'enrollment_status', { ...flow.reference, request_id: flow.expected.request_id });
+    assert.equal(pending.status, 'possessed');
+    assert.deepEqual(pending.unsigned_intent, flow.expected.unsigned_intent);
+    assert.deepEqual(pending.intent, flow.expected.intent);
+    assert.equal(pending.nonce, flow.expected.nonce);
+    assert.equal(pending.certificate.public_key, flow.expected.new_device_public_key);
+    const qualified = crypto.verifyAccountEnrollment(JSON.stringify(pending.intent), auth.verified, Date.now());
+    let prepared, verified;
+    try {
+      prepared = crypto.prepareAccountDeviceEnrollment(qualified, JSON.stringify(pending.certificate), identity(connection.identityName), auth.verified, Date.now());
+      const request = JSON.parse(prepared.requestJson());
+      const response = await identityRequest(connection, 'account_device_commit', { request, request_id: pending.request_id });
+      verified = crypto.finishAccountDeviceChange(prepared, JSON.stringify(response.committed), Date.now());
+      const scope = JSON.parse(verified.scopeJson());
+      assert.equal(scope.account_id, auth.scope.account_id);
+      assert.equal(scope.space_id, auth.scope.space_id);
+      assert.equal(scope.device_id, crypto.deriveAuthorizationId('device', flow.expected.new_device_public_key));
+      saveTrust(auth.trustRef, { scope: auth.scope, pins: JSON.parse(verified.pinsJson()) });
+      return { scope, committed: response.committed, journal_delta: JSON.parse(verified.journalDeltaJson()), request_id: pending.request_id };
+    } finally { verified?.free(); prepared?.free(); qualified.free(); }
+  }
+  if (input.op === 'finish_client_enrollment') {
+    const flow = clientEnrollments.get(input.handle), connection = connections.get(connectionName);
+    assert(flow?.certificate && flow.connectionName === connectionName, 'new device must first prove possession');
+    const completed = await identityRequest(connection, 'enrollment_status', { ...flow.reference, request_id: flow.pending.request_id });
+    assert.equal(completed.status, 'completed');
+    assert.deepEqual(completed.unsigned_intent, flow.pending.unsigned_intent);
+    assert.equal(completed.nonce, flow.pending.nonce);
+    assert.deepEqual(completed.certificate, flow.certificate);
+    assert(completed.completion?.committed, 'completed enrollment must have a durable Account commit');
+    assert.deepEqual(completed.completion.committed, input.committed, 'new device observes the exact owner-verified Account commit');
+    assert.deepEqual(trust.scope, input.expected_scope, 'owner completion must identify this independently generated device');
+    const scope = structuredClone(trust.scope);
+    flow.verified.free(); clientEnrollments.delete(input.handle);
+    return { scope, request_id: completed.request_id };
+  }
   if (input.op === 'trust') {
     assert(!trust, 'local account trust is already established');
     trust = structuredClone(input.trust);
     return { saved: true };
   }
   if (input.op === 'verify_task_binding') {
-    const verified = JSON.parse(crypto.verifyTaskBinding(JSON.stringify(input.binding), input.authority_public_key, JSON.stringify(input.expected)));
+    const verified = JSON.parse(crypto.verifyTaskBinding(JSON.stringify(input.binding ?? null), input.authority_public_key, JSON.stringify(input.expected)));
     verifiedBindings.set(bindingKey({ method: 'bind_execution', ...verified.binding }), verified);
     return verified;
   }
@@ -765,10 +926,24 @@ async function command(input) {
     return checkedAuthorization(auth.verified, input.expected_host_public_key, savedTrust(auth.trustRef));
   }
   if (input.op === 'read_remote_policy') return readRemotePolicy(input, connectionName);
+  if (input.op === 'verify_manager_execution') {
+    const auth = authorizations.get(connectionName);
+    assert(auth, 'execution observation requires the independently confirmed Project');
+    const status = input.status, actual = status.actual;
+    assert(actual && status.operation, 'foreign execution status requires its C-signed result');
+    const verified = JSON.parse(crypto.verifyObservedExecutionResult(auth.verified, JSON.stringify(actual),
+      JSON.stringify(status.operation.request.binding ?? null), input.target_public_key, input.operation_id));
+    assert.deepEqual(verified.request, status.operation.request, 'status changed the admitted original request');
+    assert.equal(status.operation.state, actual.receipt.payload.state, 'status changed the signed execution state');
+    assert.deepEqual(status.operation.result, actual.result, 'status changed the signed execution result');
+    assert.deepEqual(status.execution_source, actual.handoff.handoff.source_attestation,
+      'status changed the signed Project source');
+    return verified;
+  }
   if (input.op === 'verify_project_metadata') {
     const auth = gateways.has(connectionName) ? gatewayBinding(connectionName).authorization : authorizations.get(connectionName);
     assert(auth, 'Project metadata requires a confirmed source authorization');
-    return JSON.parse(crypto.verifyProjectExecutionMetadata(auth.verified, JSON.stringify(input.source), JSON.stringify(input.binding)));
+    return JSON.parse(crypto.verifyProjectExecutionMetadata(auth.verified, JSON.stringify(input.source), JSON.stringify(input.binding ?? null)));
   }
   if (input.op === 'sign_observation_request') {
     assert(!gateways.has(connectionName), 'observations use the explicitly selected direct B connection');
@@ -778,7 +953,7 @@ async function command(input) {
       input.authorization_id, connection.nodePublicKey, identity(connection.identityName), Date.now()));
   }
   if (input.op === 'verify_observation') return JSON.parse(currentRemote(input, connectionName).observationJson(
-    JSON.stringify(input.actual), JSON.stringify(input.binding), Date.now()));
+    JSON.stringify(input.actual), JSON.stringify(input.binding ?? null), Date.now()));
   if (input.op === 'resolution_body') return JSON.parse(currentRemote(input, connectionName).resolutionBodyJson(
     JSON.stringify(input.actual), input.authorization_id, input.outcome, input.evidence, Date.now()));
   if (input.op === 'verify_resolution_result') return JSON.parse(currentRemote(input, connectionName).resolutionResultJson(
@@ -787,12 +962,12 @@ async function command(input) {
     const remote = remoteAuthorizations.get(input.handle);
     assert(remote, 'result verification requires its original remote authorization');
     return JSON.parse(remote.remote.resultJson(JSON.stringify(input.actual), JSON.stringify(input.original.body),
-      JSON.stringify(input.original.invocation), JSON.stringify(input.binding), Date.now()));
+      JSON.stringify(input.original.invocation), JSON.stringify(input.binding ?? null), Date.now()));
   }
   if (input.op === 'verify_remote_session') {
     const remote = remoteAuthorizations.get(input.handle);
     assert(remote, 'session verification requires its original remote authorization');
-    return JSON.parse(remote.remote.sessionJson(JSON.stringify(input.receipt), JSON.stringify(input.binding), Date.now()));
+    return JSON.parse(remote.remote.sessionJson(JSON.stringify(input.receipt), JSON.stringify(input.binding ?? null), Date.now()));
   }
   if (input.op === 'read_share_policy') return readSharePolicy(input, connectionName);
   if (input.op === 'build_share_intent') {
@@ -828,23 +1003,51 @@ async function command(input) {
     const auth = authorizations.get(connectionName);
     const owner = authorizations.get(input.owner_connection || connectionName);
     assert(auth && owner && openedRecoveryMaterial, 'registration needs current Project and owner authorizations plus private recovery material');
+    const target = input.target_node_public_key || connection.nodePublicKey;
+    const expiry = input.expires_at_ms || Math.min(Date.now() + 3_600_000, auth.policy.account_enrollment_expires_at_ms);
     let cursor = null;
     for (;;) {
-      const page = crypto.selectExecutionServiceManagement(auth.verified, JSON.stringify(input.source_project), connection.nodePublicKey, JSON.stringify(cursor), Date.now());
+      const page = crypto.selectExecutionServiceManagement(auth.verified, JSON.stringify(input.source_project), target, JSON.stringify(cursor), Date.now());
       try {
         const metadata = JSON.parse(page.metadataJson());
         const management = page.selection();
         if (management) {
           try {
             return retainPreparation(input, 'execution_service', crypto.prepareExecutionServiceRegistration(auth.verified,
-              management, owner.verified, openedRecoveryMaterial, identity(connection.identityName), connection.nodePublicKey,
-              Date.now(), Date.now() + 86_400_000), input.trust_ref);
+              management, owner.verified, openedRecoveryMaterial, identity(connection.identityName), target,
+              Date.now(), expiry), input.trust_ref);
           } finally { management.free(); }
         }
         assert(metadata.next_cursor && metadata.next_cursor !== cursor, 'Project has no execution management grant');
         cursor = metadata.next_cursor;
       } finally { page.free(); }
     }
+  }
+  if (input.op === 'prepare_execution_service_install') {
+    const registered = executionRegistrations.get(input.handle);
+    const connection = connections.get(connectionName);
+    assert(registered && connection, 'installation requires its retained verified registration');
+    assert.equal(connection.nodePublicKey, registered.registration.intent.payload.target_node_public_key,
+      'installation must reach the independently pinned target Node');
+    const challengeParams = {
+      registration: registered.registration, committed: registered.committed, canonical_root: input.canonical_root,
+    };
+    const challenge = await identityRequest(connection, 'execution_service_install_challenge', challengeParams);
+    const repeated = await identityRequest(connection, 'execution_service_install_challenge', challengeParams);
+    assert.deepEqual(repeated, challenge, 'repeated installation challenge preserves its original signed nonce');
+    const request = JSON.parse(registered.verified.prepareInstall(JSON.stringify(challenge), input.canonical_root,
+      identity(connection.identityName), Date.now()));
+    assert.deepEqual(request.registration, registered.registration);
+    assert.deepEqual(request.committed, registered.committed);
+    assert.equal(request.intent.payload.canonical_root, input.canonical_root);
+    return { request, resource_id: registered.verified.resourceId(),
+      request_hash: crypto.deriveAuthorizationBodyHash(JSON.stringify(request)) };
+  }
+  if (input.op === 'release_execution_registration') {
+    const registered = executionRegistrations.get(input.handle);
+    assert(registered, 'no retained execution registration');
+    registered.verified.free(); executionRegistrations.delete(input.handle);
+    return { released: true };
   }
   if (input.op === 'prepare_share') {
     const auth = authorizations.get(connectionName);
@@ -859,6 +1062,7 @@ async function command(input) {
     const finish = { governance: 'finishSpaceGovernanceChange', team: 'finishTeamCreation',
       execution_service: 'finishExecutionServiceRegistration', share: 'finishRemoteExecutionShare' }[pending.kind];
     const verified = crypto[finish](pending.prepared, JSON.stringify(input.receipt), Date.now());
+    let retained = false;
     try {
       const scope = JSON.parse(verified.scopeJson());
       assert(scope, 'committed policy removed this verification actor');
@@ -873,9 +1077,15 @@ async function command(input) {
       }
       if (pending.kind === 'share') result.share = JSON.parse(verified.referenceJson());
       if (input.password && typeof verified.recoveryMaterialJson === 'function') result.recovery_envelope = sealedRecovery(verified.recoveryMaterialJson(), input.password);
+      if (pending.kind === 'execution_service' && input.retain_registration) {
+        assert(!executionRegistrations.has(input.handle), 'execution registration handle is already retained');
+        executionRegistrations.set(input.handle, { verified,
+          registration: JSON.parse(pending.prepared.requestJson()), committed: structuredClone(input.receipt) });
+        retained = true;
+      }
       pending.prepared.free(); preparations.delete(input.handle);
       return result;
-    } finally { verified.free(); }
+    } finally { if (!retained) verified.free(); }
   }
   if (input.op === 'request') {
     if (gateways.has(connectionName) && input.method === 'rpc') {
@@ -946,4 +1156,6 @@ creation?.free();
 recoveryPreparation?.free();
 nodeEnrollment?.free();
 nodeEnrollmentCommit?.free();
+for (const enrollment of clientEnrollments.values()) enrollment.verified.free();
+for (const registration of executionRegistrations.values()) registration.verified.free();
 for (const key of keys.values()) key.free();

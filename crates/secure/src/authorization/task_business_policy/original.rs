@@ -680,7 +680,13 @@ mod tests {
             .is_err()
         );
         let mut changed_header = header.clone();
-        changed_header.payload.scope.binding_generation += 1;
+        let ExecutionWork::TaskSession {
+            binding_generation, ..
+        } = &mut changed_header.payload.scope.work
+        else {
+            panic!("fixture requires Task work");
+        };
+        *binding_generation += 1;
         assert!(
             begin_task_business_original_import(
                 &fixture.state,

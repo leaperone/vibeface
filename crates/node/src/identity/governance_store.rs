@@ -41,6 +41,22 @@ struct ExecutionServiceSelectParams {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ExecutionServiceInstallPrepare {
+    registration: ExecutionServiceRegistrationRequest,
+    committed: Committed<SpaceDocument>,
+    canonical_root: String,
+}
+
+fn installation_challenge_key(principal: &PublicKey, request_hash: &ObjectHash) -> String {
+    format!(
+        "execution-service-install-challenge:{}:{}",
+        DeviceId::from_key(principal),
+        request_hash
+    )
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExecutionServiceMapping {
     source_project: ResourceRef,
     management_parent: ObjectHash,
@@ -131,6 +147,55 @@ fn source_root(connection: &Connection, source: &ResourceRef) -> Result<PathBuf>
         "registered source project root changed"
     );
     Ok(root)
+}
+
+fn bind_execution_root_in(
+    connection: &Connection,
+    source: &ResourceRef,
+    execution: &ResourceRef,
+    parent: &ObjectHash,
+    root: &std::path::Path,
+) -> Result<()> {
+    ensure!(
+        root.is_absolute() && root.is_dir() && root.canonicalize()? == root,
+        "execution root is not a canonical directory"
+    );
+    let entries = [
+        (
+            source.space.as_str(),
+            format!("resource-root:{}", source.resource),
+            serde_json::to_string(root)?,
+        ),
+        (
+            execution.space.as_str(),
+            format!("resource-root:{}", execution.resource),
+            serde_json::to_string(root)?,
+        ),
+        (
+            execution.space.as_str(),
+            format!("execution-service-source:{}", execution.resource),
+            serde_json::to_string(&ExecutionServiceMapping {
+                source_project: source.clone(),
+                management_parent: parent.clone(),
+            })?,
+        ),
+    ];
+    for (space, key, value) in entries {
+        connection.execute(
+            "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?) ON CONFLICT(space_id,key) DO NOTHING",
+            params![space, key, value],
+        )?;
+        let actual: String = connection.query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![space, key],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            actual == value,
+            "execution resource is already mapped to another project or root"
+        );
+    }
+    Ok(())
 }
 
 fn verify_team_source(
@@ -365,6 +430,190 @@ impl Store {
         Ok(response)
     }
 
+    pub(crate) fn execution_service_install_challenge(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        roots: &[PathBuf],
+        now_ms: u64,
+    ) -> Result<Value> {
+        let _signature_scope = ScopedSignatureVerification::new();
+        ensure!(
+            serde_json::to_vec(params)?.len() <= MAX_PROOF_BYTES,
+            "execution installation preparation too large"
+        );
+        let request: ExecutionServiceInstallPrepare = serde_json::from_value(params.clone())?;
+        let principal = PublicKey::parse(principal)?;
+        let root = roots
+            .iter()
+            .find(|root| root.to_str() == Some(request.canonical_root.as_str()))
+            .context("execution installation root is not configured on this Node")?;
+        let signer =
+            Identity::from_secret_hex(&identity.secret_key_hex).map_err(anyhow::Error::msg)?;
+        let request_hash = ObjectHash::body(&request)?;
+        let key = installation_challenge_key(&principal, &request_hash);
+        let prefix = format!(
+            "execution-service-install-challenge:{}:",
+            DeviceId::from_key(&principal)
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let policy = journal::PolicyState::reload_verified(&tx, &self.policy)?;
+        let challenge = execution_service::issue_execution_service_install_challenge(
+            policy.verified(),
+            &request.registration,
+            &request.committed,
+            &principal,
+            &request.canonical_root,
+            &signer,
+            now_ms,
+        )?;
+        ensure!(
+            root.is_absolute() && root.is_dir() && root.canonicalize()? == *root,
+            "configured execution root changed"
+        );
+        if let Some(existing) =
+            receipt::<Signed<FreshnessChallenge>>(&tx, &key, &request_hash, &principal)?
+        {
+            if existing.payload.issued_at_ms <= now_ms
+                && now_ms < existing.payload.expires_at_ms
+                && existing
+                    .payload
+                    .expires_at_ms
+                    .saturating_sub(existing.payload.issued_at_ms)
+                    <= EXECUTION_LEASE_MS
+                && existing.payload.version == challenge.payload.version
+                && existing.payload.stage == challenge.payload.stage
+                && existing.payload.invocation_hash == challenge.payload.invocation_hash
+                && existing.payload.operation_id
+                    == format!("execution-service-install:{}", existing.payload.nonce)
+                && existing.payload.body_hash == challenge.payload.body_hash
+                && existing.payload.policies == challenge.payload.policies
+            {
+                existing.verify_signature()?;
+                ensure!(
+                    existing.issuer == PublicKey::of(&signer)
+                        && existing.payload.audience == challenge.payload.audience
+                        && existing.payload.presenter == challenge.payload.presenter,
+                    "stored installation challenge changed"
+                );
+                tx.commit()?;
+                self.policy = policy;
+                return Ok(serde_json::to_value(existing)?);
+            }
+        }
+        tx.execute("DELETE FROM identity_meta WHERE key=?", [&key])?;
+        tx.execute("DELETE FROM identity_meta WHERE key LIKE ? AND json_extract(value,'$.response.payload.expires_at_ms')<=?",
+            params![format!("{prefix}%"), now_ms])?;
+        let active: u64 = tx.query_row(
+            "SELECT COUNT(*) FROM identity_meta WHERE key LIKE ?",
+            [format!("{prefix}%")],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            active < 32,
+            "too many active execution installation challenges"
+        );
+        save_receipt(&tx, &key, request_hash, principal, &challenge)?;
+        tx.commit()?;
+        self.policy = policy;
+        Ok(serde_json::to_value(challenge)?)
+    }
+
+    pub(crate) fn execution_service_install(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        roots: &[PathBuf],
+        now_ms: u64,
+    ) -> Result<Value> {
+        let _signature_scope = ScopedSignatureVerification::new();
+        ensure!(
+            serde_json::to_vec(params)?.len() <= MAX_PROOF_BYTES,
+            "execution installation request too large"
+        );
+        let request: execution_service::ExecutionServiceInstallRequest =
+            serde_json::from_value(params.clone())?;
+        let principal = PublicKey::parse(principal)?;
+        ensure!(
+            request.intent.issuer == principal,
+            "execution installation differs from its Noise client"
+        );
+        request.intent.verify_signature()?;
+        let root = roots
+            .iter()
+            .find(|root| root.to_str() == Some(request.intent.payload.canonical_root.as_str()))
+            .context("execution installation root is not configured on this Node")?;
+        let node = PublicKey::parse(&identity.public_key_hex()?)?;
+        let request_hash = ObjectHash::body(&request)?;
+        let key = format!(
+            "execution-service-install:{}:{}",
+            request.registration.intent.payload.execution_resource.space,
+            request.intent.payload.nonce
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(response) = receipt::<Value>(&tx, &key, &request_hash, &principal)? {
+            tx.commit()?;
+            return Ok(response);
+        }
+        let prepared = ExecutionServiceInstallPrepare {
+            registration: request.registration.clone(),
+            committed: request.committed.clone(),
+            canonical_root: request.intent.payload.canonical_root.clone(),
+        };
+        let preparation_hash = ObjectHash::body(&prepared)?;
+        let challenge_key = installation_challenge_key(&principal, &preparation_hash);
+        let challenge: Signed<FreshnessChallenge> =
+            receipt(&tx, &challenge_key, &preparation_hash, &principal)?
+                .context("execution installation has no locally issued challenge")?;
+        ensure!(
+            challenge == request.challenge,
+            "execution installation changed the issued challenge"
+        );
+        let policy = journal::PolicyState::reload_verified(&tx, &self.policy)?;
+        let verified = execution_service::verify_execution_service_install(
+            policy.verified(),
+            &request,
+            &node,
+            root.to_str().context("execution root is not UTF-8")?,
+            now_ms,
+        )?;
+        let verified_root = std::path::Path::new(verified.canonical_root());
+        ensure!(
+            verified_root == root.as_path()
+                && verified_root.is_absolute()
+                && verified_root.is_dir()
+                && verified_root.canonicalize()? == verified_root,
+            "configured execution root changed"
+        );
+        ensure!(
+            verified.request_hash() == &request_hash,
+            "verified installation hash differs from the original request"
+        );
+        bind_execution_root_in(
+            &tx,
+            verified.source_project(),
+            verified.execution_resource(),
+            verified.management_parent(),
+            verified_root,
+        )?;
+        let response = serde_json::json!({"installed": true,
+            "execution_resource": verified.execution_resource(), "request_hash": request_hash});
+        save_receipt(&tx, &key, request_hash, principal, &response)?;
+        ensure!(
+            tx.execute("DELETE FROM identity_meta WHERE key=?", [&challenge_key])? == 1,
+            "execution installation challenge changed before consumption"
+        );
+        tx.commit()?;
+        self.policy = policy;
+        Ok(response)
+    }
+
     pub(crate) fn execution_service_registration_challenge(
         &mut self,
         identity: &LocalIdentity,
@@ -390,10 +639,12 @@ impl Store {
         let challenge = execution_service::execution_service_registration_challenge(
             policy.verified(),
             &request,
-            &node,
+            &request.intent.payload.target_node_public_key,
             now_ms,
         )?;
-        source_root(&tx, &request.intent.payload.source_project)?;
+        if request.intent.payload.target_node_public_key == node {
+            source_root(&tx, &request.intent.payload.source_project)?;
+        }
         tx.commit()?;
         Ok(challenge)
     }
@@ -571,7 +822,7 @@ impl Store {
                         let verified = execution_service::verify_execution_service_registration(
                             state,
                             registration,
-                            &node,
+                            &registration.intent.payload.target_node_public_key,
                             now_ms,
                         )?;
                         if let Some(proof) = registration_freshness {
@@ -580,7 +831,7 @@ impl Store {
                                 registration,
                                 &proof.challenge,
                                 &proof.receipts,
-                                &node,
+                                &registration.intent.payload.target_node_public_key,
                                 now_ms,
                             )?;
                         } else {
@@ -604,13 +855,15 @@ impl Store {
                                 return Err(AuthorizationError::NeedFreshness(remote).into());
                             }
                         }
-                        let root = source_root(&tx, &registration.intent.payload.source_project)?;
+                        let root = (registration.intent.payload.target_node_public_key == node)
+                            .then(|| source_root(&tx, &registration.intent.payload.source_project))
+                            .transpose()?;
                         (
                             verified.commit_heads().to_vec(),
                             verified
                                 .expires_at_ms()
                                 .min(registration.intent.payload.expires_at_ms),
-                            Some(root),
+                            root,
                         )
                     } else {
                         let verified =
@@ -704,7 +957,7 @@ impl Store {
                         &committed,
                         registration_freshness
                             .map(|proof| (&proof.challenge, proof.receipts.as_slice())),
-                        &node,
+                        &registration.intent.payload.target_node_public_key,
                         now_ms,
                     )?;
                 }
@@ -717,41 +970,23 @@ impl Store {
                 };
                 let policy = journal::commit_in(&tx, &update)?;
                 project_policy_in(&tx, &policy)?;
-                if let Some(registration) = &registration {
-                    let root = execution_root
-                        .as_ref()
-                        .context("execution root is missing")?;
+                if let (Some(registration), Some(root)) = (&registration, &execution_root) {
                     let resource = &registration.intent.payload.execution_resource;
-                    tx.execute(
-                        "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
-                        params![
-                            resource.space.as_str(),
-                            format!("resource-root:{}", resource.resource),
-                            serde_json::to_string(root)?
-                        ],
-                    )?;
                     let [JournalEntry::Resource(_), JournalEntry::Grant(parent)] =
                         registration.request.new_objects.as_slice()
                     else {
                         bail!("execution registration management parent is missing");
                     };
-                    tx.execute(
-                        "INSERT INTO local_values(space_id,key,value) VALUES(?,?,?)",
-                        params![
-                            resource.space.as_str(),
-                            format!("execution-service-source:{}", resource.resource),
-                            serde_json::to_string(&ExecutionServiceMapping {
-                                source_project: registration.intent.payload.source_project.clone(),
-                                management_parent: parent.hash()?,
-                            })?
-                        ],
+                    bind_execution_root_in(
+                        &tx,
+                        &registration.intent.payload.source_project,
+                        resource,
+                        &parent.hash()?,
+                        root,
                     )?;
                 }
                 save_receipt(&tx, &key, request_hash, principal, &response)?;
-                if let Some(registration) = &registration {
-                    let root = execution_root
-                        .as_ref()
-                        .context("execution root is missing")?;
+                if let (Some(registration), Some(root)) = (&registration, &execution_root) {
                     ensure!(
                         source_root(&tx, &registration.intent.payload.source_project)? == *root
                             && source_root(&tx, &registration.intent.payload.execution_resource)?
@@ -1162,6 +1397,25 @@ mod tests {
             );
             assert_eq!(selection.source_project, source);
             assert_eq!(selection.execution_resource, execution);
+            bind_execution_root_in(
+                &store.connection,
+                &source,
+                &execution,
+                &selection.management_parent,
+                &network.project,
+            )?;
+            assert_eq!(row_counts(&store)?, before_select);
+            let changed_root = network.directory.canonicalize()?;
+            let changed = bind_execution_root_in(
+                &store.connection,
+                &source,
+                &execution,
+                &selection.management_parent,
+                &changed_root,
+            )
+            .unwrap_err();
+            assert!(changed.to_string().contains("already mapped"), "{changed}");
+            assert_eq!(row_counts(&store)?, before_select);
             let selection_json = serde_json::to_string(&selection)?;
             assert!(!selection_json.contains(network.project.to_str().unwrap()));
             assert!(!selection_json.contains("secret"));

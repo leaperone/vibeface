@@ -1,4 +1,4 @@
-//! A source policy stream bound to one immutable Task business wire.
+//! A source policy stream bound to one immutable execution business wire.
 
 pub mod original;
 pub mod original_operation;
@@ -48,9 +48,7 @@ pub struct TaskBusinessScope {
     pub business_wire_hash: ObjectHash,
     pub source_project: ResourceRef,
     pub source_node_public_key: PublicKey,
-    pub task_ref: EventRef,
-    pub execution_session: SessionRef,
-    pub binding_generation: u64,
+    pub work: ExecutionWork,
     pub execution_resource: ResourceRef,
     pub execution_grant: ObjectHash,
     pub target_public_key: PublicKey,
@@ -113,10 +111,17 @@ impl TaskBusinessWire {
         } else {
             Action::ExecutionResolve
         };
+        source.work.validate_context(
+            &prepare::PrepareContext {
+                context: invocation.payload.context.clone(),
+                binding_generation: source.work.binding_generation(),
+                canonical_cwd: source.work.canonical_cwd().map(str::to_owned),
+                execution_target_public_key: Some(target.clone()),
+            },
+            &target,
+        )?;
         require(
-            source.binding_generation > 0
-                && source.execution_session.target == DeviceId::from_key(&target)
-                && invocation.payload.version == AUTH_VERSION
+            invocation.payload.version == AUTH_VERSION
                 && invocation.payload.action == expected_action
                 && invocation.payload.resource == resource
                 && invocation.payload.actor
@@ -125,19 +130,16 @@ impl TaskBusinessWire {
                 && invocation.payload.presenter == DeviceId::from_key(&invocation.issuer)
                 && invocation.payload.audience.service == ServiceId::from_key(&target)
                 && invocation.payload.audience.device == DeviceId::from_key(&target)
-                && invocation.payload.context.task.as_ref() == Some(&source.task)
-                && invocation.payload.context.execution_session.as_ref()
-                    == Some(&source.execution_session),
-            "Task business wire changed its source, target or Task binding",
+                && invocation.payload.context.conversation.as_ref() == Some(&source.conversation)
+                && source.target_public_key == target,
+            "execution business wire changed its source, target or work",
         )?;
         Ok(TaskBusinessScope {
             purpose,
             business_wire_hash: self.hash()?,
             source_project: source.project,
             source_node_public_key: invocation.issuer.clone(),
-            task_ref: source.task,
-            execution_session: source.execution_session,
-            binding_generation: source.binding_generation,
+            work: source.work,
             execution_resource: resource,
             execution_grant: invocation.payload.grant_leaf.clone(),
             target_public_key: target,
@@ -231,9 +233,7 @@ fn source_grant<'a>(
     usage: &mut ExecutionProofUsage,
 ) -> Result<(&'a ExecutionSourcePolicy, u64)> {
     require(
-        &scope.target_public_key == local_c
-            && scope.execution_session.target == DeviceId::from_key(local_c)
-            && scope.binding_generation > 0,
+        &scope.target_public_key == local_c,
         "Task business policy targets another executor",
     )?;
     let grant = primary
@@ -260,12 +260,30 @@ fn source_grant<'a>(
             && value.audience.service == ServiceId::from_key(local_c)
             && value.audience.device == DeviceId::from_key(local_c)
             && value.actions.contains(&expected_action)
-            && value.constraints.context.task.as_ref() == Some(&scope.task_ref)
+            && prepare::remote_actions(
+                &value.actions,
+                scope.purpose != TaskBusinessPurpose::Submit,
+            )
+            && prepare::remote_context_matches(
+                &value.constraints.context,
+                &DeviceId::from_key(local_c),
+                &value.actions,
+            )
+            && value.constraints.context.task.as_ref() == scope.work.task_ref()
             && value.constraints.context.execution_session.as_ref()
-                == Some(&scope.execution_session)
+                == scope.work.execution_session()
             && value.remaining_delegations == 0
             && value.expires_at_ms < u64::MAX,
         "Task business source requires the exact current executor grant",
+    )?;
+    scope.work.validate_context(
+        &prepare::PrepareContext {
+            context: value.constraints.context.clone(),
+            binding_generation: scope.work.binding_generation(),
+            canonical_cwd: scope.work.canonical_cwd().map(str::to_owned),
+            execution_target_public_key: Some(local_c.clone()),
+        },
+        local_c,
     )?;
     let source = value
         .execution_source
@@ -273,6 +291,7 @@ fn source_grant<'a>(
         .ok_or(AuthorizationError::InvalidProof(
             "executor grant has no approved source policy",
         ))?;
+    source.work.matches_work(&scope.work)?;
     require(
         source.project == scope.source_project
             && source.node_public_key == scope.source_node_public_key
@@ -901,10 +920,10 @@ pub fn build_task_business_policy_export(
             && current.selection().execution_resource == scope.execution_resource
             && current.selection().execution_grant == scope.execution_grant
             && current.selection().target_public_key == scope.target_public_key
-            && current.context().context.task.as_ref() == Some(&scope.task_ref)
+            && current.context().context.task.as_ref() == scope.work.task_ref()
             && current.context().context.execution_session.as_ref()
-                == Some(&scope.execution_session)
-            && current.context().binding_generation == Some(scope.binding_generation)
+                == scope.work.execution_session()
+            && current.context().binding_generation == scope.work.binding_generation()
             && heads
                 .iter()
                 .all(|head| current.state().head(&head.domain) == Some(head)),
@@ -981,16 +1000,20 @@ fn check_source_policy_scope(
     scope: &TaskBusinessScope,
     now: u64,
 ) -> Result<()> {
+    current.work().matches_work(&scope.work)?;
+    scope
+        .work
+        .validate_context(current.context(), &scope.target_public_key)?;
     require(
         current.request().source_project() == &scope.source_project
             && current.request().source_node() == &scope.source_node_public_key
             && current.selection().execution_resource == scope.execution_resource
             && current.selection().execution_grant == scope.execution_grant
             && current.selection().target_public_key == scope.target_public_key
-            && current.context().context.task.as_ref() == Some(&scope.task_ref)
+            && current.context().context.task.as_ref() == scope.work.task_ref()
             && current.context().context.execution_session.as_ref()
-                == Some(&scope.execution_session)
-            && current.context().binding_generation == Some(scope.binding_generation),
+                == scope.work.execution_session()
+            && current.context().binding_generation == scope.work.binding_generation(),
         "Task business source policy changed its exact wire scope",
     )?;
     match wire {
@@ -1010,8 +1033,8 @@ fn check_source_policy_scope(
             let request = &value.request.payload.request;
             let context = prepare::PrepareContext {
                 context: request.context.clone(),
-                binding_generation: Some(scope.binding_generation),
-                canonical_cwd: None,
+                binding_generation: scope.work.binding_generation(),
+                canonical_cwd: scope.work.canonical_cwd().map(str::to_owned),
                 execution_target_public_key: Some(scope.target_public_key.clone()),
             };
             current.check_business_observation_scope(
@@ -1438,13 +1461,60 @@ mod tests {
             .is_err()
         );
         let mut wrong_header = export.header().payload.clone();
-        wrong_header.scope.binding_generation += 1;
-        wrong_header.scope.task_ref = EventRef::parse(&"fe".repeat(32)).unwrap();
+        let ExecutionWork::TaskSession {
+            task,
+            binding_generation,
+            ..
+        } = &mut wrong_header.scope.work
+        else {
+            panic!("fixture requires Task work");
+        };
+        *binding_generation += 1;
+        *task = EventRef::parse(&"fe".repeat(32)).unwrap();
         let wrong_header = Signed::sign(wrong_header, &fixture.project_node).unwrap();
         assert!(
             begin_task_business_policy_import(c_primary, &peer, &wrong_header, &c_key, &[], now)
                 .is_err()
         );
+        let invocation = wire.invocation();
+        let different_work = [
+            ExecutionWork::Command {
+                request_hash: ObjectHash::body(&"another command").unwrap(),
+                canonical_cwd: "/tmp".into(),
+            },
+            ExecutionWork::ConversationSession {
+                conversation: invocation.payload.context.conversation.clone().unwrap(),
+                execution_session: invocation
+                    .payload
+                    .context
+                    .execution_session
+                    .clone()
+                    .unwrap(),
+                executor: invocation.payload.context.executor_kind.clone().unwrap(),
+                canonical_cwd: "/tmp".into(),
+                open: ConversationOpenRef {
+                    operation_id: invocation.payload.operation_id.clone(),
+                    invocation_hash: invocation.hash().unwrap(),
+                    admission_hash: ObjectHash::body(&"another admission").unwrap(),
+                },
+            },
+        ];
+        for work in different_work {
+            let mut changed_kind = export.header().payload.clone();
+            changed_kind.scope.work = work;
+            let changed_kind = Signed::sign(changed_kind, &fixture.project_node).unwrap();
+            assert!(
+                begin_task_business_policy_import(
+                    c_primary,
+                    &peer,
+                    &changed_kind,
+                    &c_key,
+                    &[],
+                    now
+                )
+                .is_err()
+            );
+        }
         let mut wrong_roots = export.pins().to_vec();
         wrong_roots[0].genesis_root = PublicKey::of(&fixture.client);
         assert!(

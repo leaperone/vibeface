@@ -82,6 +82,7 @@ impl Store {
             source_project: facts.resource,
             selection: task.selection().clone(),
             context,
+            work: task.work(),
             expected_action: invocation.action,
             purpose: task.request().purpose(),
             source_provenance: None,

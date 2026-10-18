@@ -83,15 +83,15 @@ enum SessionPurpose {
     TaskReceiptRead,
     GatewaySource,
     GatewayForward,
-    TaskBusiness(TaskBusinessPhase),
+    TaskBusiness(Box<TaskBusinessPhase>),
 }
 enum TaskBusinessPhase {
     AwaitingBegin,
-    Importing(TaskBusinessPolicyImportContext),
-    Ready(TaskBusinessPolicySession),
+    Importing(Box<TaskBusinessPolicyImportContext>),
+    Ready(Box<TaskBusinessPolicySession>),
     Pending {
-        session: TaskBusinessPolicySession,
-        original: TaskBusinessPending,
+        session: Box<TaskBusinessPolicySession>,
+        original: Box<TaskBusinessPending>,
     },
 }
 
@@ -188,7 +188,10 @@ impl TaskBusinessPhase {
             _ => unreachable!(),
         };
         *self = match pending {
-            Some(original) => Self::Pending { session, original },
+            Some(original) => Self::Pending {
+                session,
+                original: Box::new(original),
+            },
             None => Self::Ready(session),
         };
         Ok(())
@@ -214,7 +217,7 @@ impl SessionPurpose {
                 *self = if method == NODE_POLICY_READ_METHOD {
                     Self::NodePolicyRead
                 } else if method == TASK_BUSINESS_METHOD {
-                    Self::TaskBusiness(TaskBusinessPhase::AwaitingBegin)
+                    Self::TaskBusiness(Box::new(TaskBusinessPhase::AwaitingBegin))
                 } else if method == GATEWAY_SOURCE_METHOD {
                     Self::GatewaySource
                 } else if method == GATEWAY_FORWARD_METHOD {
@@ -258,31 +261,33 @@ impl Session {
         )
     }
 
-    async fn task_business(
-        &mut self,
-        node: &Arc<Runtime>,
-        request: TaskBusinessRequest,
-    ) -> Result<Value> {
+    fn task_business<'a>(
+        &'a mut self,
+        node: &'a Arc<Runtime>,
+        request: Box<TaskBusinessRequest>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
         let SessionPurpose::TaskBusiness(phase) = &mut self.purpose else {
-            bail!("task business session purpose is missing");
+            return Box::pin(async { bail!("task business session purpose is missing") });
         };
+        let phase = phase.as_mut();
         let now = crate::runtime::now_ms() as u64;
-        match request {
-            TaskBusinessRequest::SourceBegin { header } => {
+        let noise_peer = &self.noise_peer;
+        match *request {
+            TaskBusinessRequest::SourceBegin { header } => Box::pin(async move {
                 ensure!(
                     matches!(phase, TaskBusinessPhase::AwaitingBegin),
                     "task business source has already begun"
                 );
                 let (context, response) = node.store.lock().await.begin_task_business_import(
                     &node.identity,
-                    &self.noise_peer,
+                    noise_peer,
                     &header,
                     now,
                 )?;
-                *phase = TaskBusinessPhase::Importing(context);
+                *phase = TaskBusinessPhase::Importing(Box::new(context));
                 Ok(response)
-            }
-            TaskBusinessRequest::SourcePage { page } => {
+            }),
+            TaskBusinessRequest::SourcePage { page } => Box::pin(async move {
                 let TaskBusinessPhase::Importing(context) = phase else {
                     bail!("task business page requires an unfinished source import");
                 };
@@ -290,8 +295,8 @@ impl Session {
                     .lock()
                     .await
                     .append_task_business_policy(context, &page, now)
-            }
-            TaskBusinessRequest::SourceFinish { witness } => {
+            }),
+            TaskBusinessRequest::SourceFinish { witness } => Box::pin(async move {
                 let TaskBusinessPhase::Importing(context) = phase else {
                     bail!("task business finish requires an unfinished source import");
                 };
@@ -300,37 +305,35 @@ impl Session {
                     .lock()
                     .await
                     .finish_task_business_policy(context, &witness, now)?;
-                *phase = TaskBusinessPhase::Ready(ready);
+                *phase = TaskBusinessPhase::Ready(Box::new(ready));
                 Ok(response)
-            }
-            TaskBusinessRequest::Business(wire) => {
+            }),
+            TaskBusinessRequest::Business(wire) => Box::pin(async move {
                 let TaskBusinessPhase::Ready(ready) = phase else {
                     bail!("finish the exact task business source before executing business");
                 };
-                let response = node
-                    .task_business(ready, &self.noise_peer, wire.clone())
-                    .await?;
+                let response = node.task_business(ready, noise_peer, wire.clone()).await?;
                 phase.apply_response(wire, TaskBusinessKind::Business, &response)?;
                 Ok(serde_json::to_value(response)?)
-            }
-            TaskBusinessRequest::Status { wire } => {
+            }),
+            TaskBusinessRequest::Status { wire } => Box::pin(async move {
                 let TaskBusinessPhase::Ready(ready) = phase else {
                     bail!(
                         "task business status requires a completed source and no pending challenge"
                     );
                 };
                 let response = node
-                    .task_business_status(ready, &self.noise_peer, wire.clone())
+                    .task_business_status(ready, noise_peer, wire.clone())
                     .await?;
                 phase.apply_response(wire, TaskBusinessKind::Status, &response)?;
                 Ok(serde_json::to_value(response)?)
-            }
+            }),
             TaskBusinessRequest::Receipts {
                 source_context,
                 business_wire_hash,
                 challenge_hash,
                 receipts,
-            } => {
+            } => Box::pin(async move {
                 let TaskBusinessPhase::Pending { session, original } = phase else {
                     bail!("task business receipts require an exact pending challenge");
                 };
@@ -348,7 +351,7 @@ impl Session {
                 let response = node
                     .task_business_receipts(
                         session,
-                        &self.noise_peer,
+                        noise_peer,
                         wire.clone(),
                         original.challenge.clone(),
                         receipts,
@@ -356,7 +359,7 @@ impl Session {
                     .await?;
                 phase.apply_response(wire, kind, &response)?;
                 Ok(serde_json::to_value(response)?)
-            }
+            }),
         }
     }
 }
@@ -917,7 +920,7 @@ pub async fn serve(node: Arc<Runtime>, mut socket: NetworkSocket) -> Result<()> 
                     Ok(event) => {
                         let access = session.subscription.as_ref().context("subscription missing")?;
                         if node.subscription_allows(access, &event).await? {
-                            send_value(&mut socket, &mut channel, &json!({"type":"changed"})).await?;
+                            send_value(&mut socket, &mut channel, &event.payload).await?;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -1028,7 +1031,9 @@ async fn dispatch_request(
                 invocation.is_none(),
                 "task business transport does not accept an outer Invocation"
             );
-            Box::pin(session.task_business(node, serde_json::from_value(params)?)).await
+            session
+                .task_business(node, serde_json::from_value(params)?)
+                .await
         }
         NODE_POLICY_READ_METHOD => {
             ensure!(
@@ -1442,6 +1447,7 @@ mod tests {
                 source_project: original.source_selection.resource.clone(),
                 selection: original.selection.clone(),
                 context: original.context.clone(),
+                work: original.work.clone(),
                 expected_action: original.expected_action,
                 purpose: original.purpose,
                 source_provenance: None,
@@ -1910,6 +1916,21 @@ mod tests {
             },
             node_public_key: PublicKey::parse(&project.node.public_key_hex()?)?,
             pins,
+            work: vibeface_secure::authorization::ExecutionWorkIntent::TaskSession {
+                task: context
+                    .context
+                    .task
+                    .clone()
+                    .context("source Task is missing")?,
+                binding_generation: context
+                    .binding_generation
+                    .context("source generation is missing")?,
+                execution_session: context
+                    .context
+                    .execution_session
+                    .clone()
+                    .context("source session is missing")?,
+            },
         };
         let fixture = unseeded_fixture_with_source(
             project,
@@ -2648,10 +2669,8 @@ mod tests {
         ] {
             assert!(purpose.select_method(method, false).is_err(), "{method}");
         }
-        assert!(matches!(
-            purpose,
-            SessionPurpose::TaskBusiness(TaskBusinessPhase::AwaitingBegin)
-        ));
+        assert!(matches!(purpose, SessionPurpose::TaskBusiness(ref phase)
+            if matches!(phase.as_ref(), TaskBusinessPhase::AwaitingBegin)));
         Ok(())
     }
 

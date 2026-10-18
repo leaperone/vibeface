@@ -2,13 +2,16 @@ use super::*;
 use crate::{
     binding::SignedBinding,
     identity::{
-        foreign_execution_policy::{PendingNodeTaskRead, task_policy_candidates_in},
+        foreign_execution_policy::{
+            PendingNodeTaskRead, check_current_anchor_in, check_task_policy_heads_in,
+            task_policy_candidates_in,
+        },
         node_execution_policy::{NodeReadRequest, NodeReadResponse},
     },
 };
 use vibeface_secure::authorization::{
-    Action, AuthorizationError, EventRef, InvocationContext, RequestFacts, ResourceKind,
-    SessionRef,
+    Action, AuthorizationError, ConversationOpenIntent, EventRef, ExecutionWork,
+    ExecutionWorkIntent, InvocationContext, RequestFacts, ResourceKind, SessionRef,
     prepare::PrepareContext,
     remote_execution_policy::{
         RemoteExecutionPolicyPageRequest, RemoteExecutionPolicyPurpose,
@@ -21,6 +24,7 @@ struct SdkTaskPolicyInput {
     facts: RequestFacts,
     selection: RemoteExecutionPolicySelection,
     context: PrepareContext,
+    work: ExecutionWorkIntent,
     binding: Option<SignedBinding>,
 }
 
@@ -117,7 +121,7 @@ impl Runtime {
             ensure!(
                 original.binding.as_ref() == Some(&binding)
                     && original.target_node == binding.binding.target_node
-                    && original.session_id == binding.binding.session_id,
+                    && original.session_id.as_deref() == Some(binding.binding.session_id.as_str()),
                 "SDK continuation changed its original execution binding"
             );
         }
@@ -202,14 +206,169 @@ impl Runtime {
                     | Action::ExecutionSteer
                     | Action::ExecutionInterrupt
                     | Action::ExecutionRespondApproval
+                    | Action::ExecutionCommand
             ),
             "SDK policy refresh cannot rebind or resolve execution"
+        );
+        let selection = RemoteExecutionPolicySelection {
+            execution_resource: serde_json::from_value(body["execution_resource"].clone())?,
+            target_public_key: serde_json::from_value(body["target_public_key"].clone())?,
+            execution_grant: serde_json::from_value(body["execution_grant"].clone())?,
+        };
+        let target = crypto::fingerprint(selection.target_public_key.as_str())?;
+        if let Some(request) = request.as_ref().filter(|request| request.task_id.is_none()) {
+            ensure!(
+                body["task_id"].is_null()
+                    && body["task_ref"].is_null()
+                    && request.binding.is_none()
+                    && request.network_id == project.space.as_str()
+                    && request.conversation_id == session.conversation_id
+                    && request.operation_id == field(body, "authorization_id")?
+                    && request.target_node == target
+                    && origin.task.is_none(),
+                "ordinary SDK execution changed its Project, Task or executor"
+            );
+            let work = if action == Action::ExecutionCommand {
+                ensure!(
+                    request.session_id.is_none() && request.expected_revision == 0,
+                    "SDK command cannot claim a session or revision"
+                );
+                let mut fields = request.action.clone();
+                fields
+                    .as_object_mut()
+                    .context("invalid SDK command action")?
+                    .remove("type");
+                let command: crate::command::CommandSpec = serde_json::from_value(fields)?;
+                command.validate()?;
+                let cwd = field(&request.action, "cwd")?.to_owned();
+                crate::identity::execution_dispatch::validate_remote_resource_path(&cwd)?;
+                ExecutionWorkIntent::Command {
+                    request_hash: ObjectHash::body(&body["request"])?,
+                    canonical_cwd: cwd,
+                }
+            } else if action == Action::ExecutionOpen {
+                ensure!(
+                    request.expected_revision == 0,
+                    "SDK conversation Open cannot claim an existing revision"
+                );
+                let execution_session = SessionRef {
+                    target: DeviceId::from_key(&selection.target_public_key),
+                    session_id: request
+                        .session_id
+                        .as_ref()
+                        .filter(|value| !value.is_empty())
+                        .context("SDK conversation Open has no session")?
+                        .clone(),
+                };
+                let executor = field(&request.action, "executor")?.to_owned();
+                serde_json::from_value::<ExecutorKind>(Value::String(executor.clone()))?;
+                let cwd = field(&request.action, "cwd")?.to_owned();
+                crate::identity::execution_dispatch::validate_remote_resource_path(&cwd)?;
+                ExecutionWorkIntent::ConversationSession {
+                    conversation: session.conversation_id.clone(),
+                    execution_session,
+                    executor,
+                    canonical_cwd: cwd,
+                    open: ConversationOpenIntent::Opening {
+                        operation_id: request.operation_id.clone(),
+                    },
+                }
+            } else {
+                let accepted = crate::identity::execution_handoff::accepted_conversation_open_in(
+                    &store.connection,
+                    &project,
+                    request,
+                )?;
+                let event = store.verify_event(
+                    project.space.as_str(),
+                    &accepted.handoff.handoff.project_dispatch,
+                )?;
+                let EventCause::Invocation { admission } = &event.cause else {
+                    bail!("accepted conversation Open has no original admission");
+                };
+                let original =
+                    crate::identity::task_execution_context::OriginalAdmissionView::load(
+                        &store.connection,
+                        &store.policy,
+                        admission,
+                    )?;
+                let verified = original.state().verify_execution_observation_source(
+                    &accepted.handoff.handoff,
+                    admission.admitted_at_ms,
+                )?;
+                verified.original_admission(&accepted.handoff.handoff, admission.admitted_at_ms)?;
+                let source = accepted.handoff.handoff.source_statement()?;
+                ensure!(
+                    source.project == project
+                        && source.target_public_key == selection.target_public_key
+                        && accepted.handoff.handoff.execution_resource
+                            == selection.execution_resource
+                        && matches!(source.work, ExecutionWork::ConversationSession { .. }),
+                    "SDK conversation changed its verified original Open"
+                );
+                source.work.intent()
+            };
+            let (execution_session, executor_kind, cwd) = match &work {
+                ExecutionWorkIntent::ConversationSession {
+                    execution_session,
+                    executor,
+                    canonical_cwd,
+                    ..
+                } => (
+                    Some(execution_session.clone()),
+                    Some(executor.clone()),
+                    canonical_cwd.clone(),
+                ),
+                ExecutionWorkIntent::Command { canonical_cwd, .. } => {
+                    (None, None, canonical_cwd.clone())
+                }
+                ExecutionWorkIntent::TaskSession { .. } => {
+                    bail!("ordinary SDK work unexpectedly contains a Task")
+                }
+            };
+            let context = InvocationContext {
+                conversation: Some(session.conversation_id.clone()),
+                task: None,
+                execution_session,
+                executor_kind,
+                workspace_resource: Some(project.resource.clone()),
+                sdk_session: Some(session.sdk_session.clone()),
+            };
+            let facts = RequestFacts {
+                resource: project,
+                action,
+                audience,
+                operation_id: id(body, "authorization_id")?,
+                body_hash: ObjectHash::body(body)?,
+                context: context.clone(),
+            };
+            let mut read_context = context;
+            read_context.sdk_session = None;
+            let context = PrepareContext {
+                context: read_context,
+                binding_generation: None,
+                canonical_cwd: Some(cwd),
+                execution_target_public_key: Some(selection.target_public_key.clone()),
+            };
+            work.validate_context(&context, &selection.target_public_key)?;
+            return Ok(SdkTaskPolicyInput {
+                parent: origin.parent,
+                facts,
+                selection,
+                context,
+                work,
+                binding: None,
+            });
+        }
+        ensure!(
+            action != Action::ExecutionCommand,
+            "SDK command cannot claim a Task"
         );
         let task_id = request
             .as_ref()
             .and_then(|request| request.task_id.as_deref())
             .or_else(|| body["task_id"].as_str())
-            .context("SDK execution has no Task")?;
+            .context("SDK Task execution has no Task")?;
         let creation =
             store.task_creation(project.space.as_str(), &session.conversation_id, task_id)?;
         let event = store.verify_event(project.space.as_str(), &creation)?;
@@ -246,12 +405,6 @@ impl Runtime {
                 "SDK policy refresh requires its own Task or its initiator's confirmed binding"
             );
         }
-        let selection = RemoteExecutionPolicySelection {
-            execution_resource: serde_json::from_value(body["execution_resource"].clone())?,
-            target_public_key: serde_json::from_value(body["target_public_key"].clone())?,
-            execution_grant: serde_json::from_value(body["execution_grant"].clone())?,
-        };
-        let target = crypto::fingerprint(selection.target_public_key.as_str())?;
         let (execution_session, executor, cwd, generation) = if let Some(request) = &request {
             let binding = binding
                 .as_ref()
@@ -264,7 +417,7 @@ impl Runtime {
                     && request.operation_id == field(body, "authorization_id")?
                     && request.target_node == target
                     && request.binding.as_ref() == Some(binding)
-                    && request.session_id == binding.binding.session_id
+                    && request.session_id.as_deref() == Some(binding.binding.session_id.as_str())
                     && binding.binding.task_ref == creation.hash,
                 "SDK policy refresh changed its current execution binding"
             );
@@ -286,7 +439,10 @@ impl Runtime {
                 );
             }
             (
-                request.session_id.clone(),
+                request
+                    .session_id
+                    .clone()
+                    .context("SDK Task has no execution session")?,
                 executor,
                 cwd,
                 binding.binding.generation,
@@ -317,7 +473,7 @@ impl Runtime {
         crate::identity::execution_dispatch::validate_remote_resource_path(&cwd)?;
         let context = InvocationContext {
             conversation: Some(session.conversation_id.clone()),
-            task: Some(task),
+            task: Some(task.clone()),
             execution_session: Some(SessionRef {
                 target: DeviceId::from_key(&selection.target_public_key),
                 session_id: execution_session,
@@ -342,11 +498,22 @@ impl Runtime {
             canonical_cwd: Some(cwd),
             execution_target_public_key: Some(selection.target_public_key.clone()),
         };
+        let work = ExecutionWorkIntent::TaskSession {
+            task,
+            binding_generation: generation,
+            execution_session: context
+                .context
+                .execution_session
+                .clone()
+                .context("SDK Task policy has no execution session")?,
+        };
+        work.validate_context(&context, &selection.target_public_key)?;
         Ok(SdkTaskPolicyInput {
             parent: origin.parent,
             facts,
             selection,
             context,
+            work,
             binding,
         })
     }
@@ -357,6 +524,58 @@ impl Runtime {
         input: &SdkTaskPolicyInput,
         now: u64,
     ) -> Result<Option<VerifiedTaskCurrentPolicy>> {
+        if !matches!(input.work, ExecutionWorkIntent::TaskSession { .. }) {
+            let source = PublicKey::parse(&self.identity.public_key_hex()?)?;
+            let mut selected = None;
+            for policy in store
+                .policy
+                .task_execution_policy
+                .current_for_work(&input.facts.resource, &input.work)?
+            {
+                if policy.request().source_node() != &source
+                    || !policy.work().approves_intent(&input.work)
+                    || policy
+                        .check_scope(&input.facts, &input.selection, &input.context, now)
+                        .is_err()
+                    || check_task_policy_heads_in(&store.connection, policy).is_err()
+                {
+                    continue;
+                }
+                let mut usage = policy.proof_usage().clone();
+                if let Err(error) = check_current_anchor_in(
+                    &store.connection,
+                    &store.policy,
+                    &source,
+                    policy,
+                    &mut usage,
+                    now,
+                ) {
+                    if policy_sync_needed(&error) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if let Some(counts) = SignatureVerification::current_counts() {
+                    usage.record_actual_signature_counts(counts);
+                }
+                usage.enforce_limits()?;
+                if selected
+                    .as_ref()
+                    .is_none_or(|old: &VerifiedTaskCurrentPolicy| {
+                        (
+                            policy.snapshot().payload.issued_at_ms,
+                            policy.witness().payload.issued_at_ms,
+                        ) > (
+                            old.snapshot().payload.issued_at_ms,
+                            old.witness().payload.issued_at_ms,
+                        )
+                    })
+                {
+                    selected = Some(policy.clone());
+                }
+            }
+            return Ok(selected);
+        }
         let policies = task_policy_candidates_in(
             &store.connection,
             &store.policy,
@@ -442,6 +661,7 @@ impl Runtime {
                         &input.facts,
                         &input.selection,
                         &input.context,
+                        &input.work,
                         RemoteExecutionPolicyPurpose::Execution,
                         now,
                         now.checked_add(INVOCATION_MAX_AGE_MS)
