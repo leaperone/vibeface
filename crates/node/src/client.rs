@@ -969,13 +969,13 @@ async fn dispatch(
     request: Request,
 ) -> (String, Result<Value>) {
     let id = request.id;
-    let result = dispatch_request(
+    let result = Box::pin(dispatch_request(
         node,
         session,
         &request.method,
         request.params,
         request.invocation,
-    )
+    ))
     .await;
     (id, result)
 }
