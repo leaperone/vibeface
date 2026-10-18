@@ -772,7 +772,7 @@ mod tests {
             let mut store = Store {
                 connection: fixture.connection,
                 policy: fixture.policy,
-            target_recovery_import: None,
+                target_recovery_import: None,
             };
             store.append_authorized_event(
                 &fixture.node,
@@ -1103,6 +1103,7 @@ mod tests {
         fixture.store = Store {
             connection: reopened,
             policy,
+            target_recovery_import: None,
         };
         let refreshed = fixture
             .store

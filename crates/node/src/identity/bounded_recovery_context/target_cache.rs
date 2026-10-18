@@ -625,6 +625,7 @@ mod tests {
                 sequence: 0,
                 authority: AuthorityBinding::from_key(PublicKey::of(&fixture.target)),
                 recovery: RecoveryPolicy {
+                    generation: 1,
                     keys: vec![fixture.request.issuer.clone()],
                     threshold: 1,
                 },
