@@ -982,6 +982,173 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "requires the pinned isolation fixture image and a local Docker daemon"]
+    async fn ordinary_cleanup_serializes_a_real_replacement_and_rejects_stale_fencing() -> Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::process::Command;
+
+        async fn inspect(docker: &std::path::Path, id: &str) -> Result<Option<Value>> {
+            let output = tokio::time::timeout(
+                Duration::from_secs(15),
+                Command::new(docker)
+                    .args(["container", "inspect", id])
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await??;
+            if !output.status.success() {
+                let error = String::from_utf8_lossy(&output.stderr);
+                ensure!(
+                    error.contains("No such container") || error.contains("No such object"),
+                    "inspect test container failed: {error}"
+                );
+                return Ok(None);
+            }
+            let values: Vec<Value> = serde_json::from_slice(&output.stdout)?;
+            ensure!(
+                values.len() == 1,
+                "inspect must return the exact test container"
+            );
+            Ok(values.into_iter().next())
+        }
+
+        let root = PathBuf::from(std::env::var("VIBEFACE_ISOLATION_TEST_ROOT")?)
+            .join(uuid::Uuid::new_v4().to_string());
+        let data = root.join("node");
+        let project = root.join("project");
+        crate::config::private_dir(&data)?;
+        std::fs::create_dir(&project)?;
+        let docker = PathBuf::from(std::env::var("VIBEFACE_ISOLATION_TEST_DOCKER")?);
+        let wrapper = root.join("docker-cleanup-barrier");
+        let armed = root.join("block-cleanup");
+        let marker = root.join("cleanup-started");
+        let release = root.join("release-cleanup");
+        let quoted = |path: &std::path::Path| -> Result<String> {
+            Ok(format!(
+                "'{}'",
+                path.to_str()
+                    .context("test path must be UTF-8")?
+                    .replace('\'', "'\\''")
+            ))
+        };
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = rm ] && [ -f {} ]; then\n  : > {}\n  while [ ! -f {} ]; do sleep 0.01; done\nfi\nexec {} \"$@\"\n",
+                quoted(&armed)?,
+                quoted(&marker)?,
+                quoted(&release)?,
+                quoted(&docker)?,
+            ),
+        )?;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+        let (events, _) = mpsc::unbounded_channel();
+        let engine = Engine::new(
+            ExecutorConfig {
+                execution_isolation: Some(ExecutionIsolationConfig {
+                    image: std::env::var("VIBEFACE_ISOLATION_TEST_IMAGE")?,
+                    docker_bin: wrapper,
+                    egress: None,
+                }),
+                data_dir: Some(data),
+                ..ExecutorConfig::default()
+            },
+            events,
+        );
+        let mut context = personal_context();
+        context.shared = true;
+        context.lease_expires_at_ms = vibeface_protocol::now_ms() + 60_000;
+        let original = engine
+            .prepare_operation_for_test(&context, &project)
+            .await?;
+        let mut name = original.clone();
+        let mut completion = None;
+        let mut preparing = None;
+        let outcome = async {
+            let initial = inspect(&docker, &original).await?.context("original container missing")?;
+            name = initial["Name"].as_str().context("test container name missing")?
+                .trim_start_matches('/').to_owned();
+            ensure!(initial["State"]["Running"] == true, "original container must be running");
+            std::fs::write(&armed, b"armed")?;
+            let completing = engine.clone();
+            let old = context.clone();
+            completion = Some(tokio::spawn(async move { completing.complete_operation(&old).await }));
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await?;
+            let mut replacement = context.clone();
+            replacement.operation_id.push_str("-replacement");
+            replacement.lease_expires_at_ms = vibeface_protocol::now_ms() + 60_000;
+            let starting = engine.clone();
+            let next = replacement.clone();
+            let next_project = project.clone();
+            let (entered, started) = tokio::sync::oneshot::channel();
+            preparing = Some(tokio::spawn(async move {
+                let _ = entered.send(());
+                starting.prepare_operation_for_test(&next, &next_project).await
+            }));
+            started.await?;
+            if let Ok(result) =
+                tokio::time::timeout(Duration::from_millis(100), preparing.as_mut().unwrap()).await
+            {
+                preparing.take();
+                anyhow::bail!("replacement completed before ordinary cleanup was released: {result:?}");
+            }
+            std::fs::write(&release, b"release")?;
+            completion.take().unwrap().await??;
+            let replacement_id = preparing.take().unwrap().await??;
+            ensure!(replacement_id != original, "replacement reused the old container generation");
+            ensure!(inspect(&docker, &original).await?.is_none(), "ordinary cleanup left the old container");
+            let current = inspect(&docker, &replacement_id).await?.context("replacement container missing")?;
+            ensure!(current["State"]["Running"] == true, "ordinary cleanup stopped the replacement");
+            let failure = engine.fence_operation(&context).await.err().context("stale fence stopped a replacement")?;
+            ensure!(failure.to_string().contains("stale operation"), "unexpected stale fence error: {failure:#}");
+            engine.complete_operation(&context).await?;
+            let current = inspect(&docker, &replacement_id).await?.context("stale cleanup removed the replacement")?;
+            ensure!(current["State"]["Running"] == true, "stale fence stopped the replacement");
+            std::fs::remove_file(&armed)?;
+            engine.complete_operation(&replacement).await?;
+            ensure!(inspect(&docker, &replacement_id).await?.is_none(), "replacement cleanup did not finish");
+            println!("cleanup-concurrency-proof={{\"replacement_waited\":true,\"new_container_survived\":true,\"stale_fence_rejected\":true,\"both_generations_removed\":true}}");
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        let _ = std::fs::write(&release, b"release");
+        let _ = std::fs::remove_file(&armed);
+        if let Some(task) = completion {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = preparing {
+            task.abort();
+            let _ = task.await;
+        }
+        let cleanup = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new(&docker)
+                .args(["rm", "--force", &name])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await??;
+        if !cleanup.status.success() {
+            let error = String::from_utf8_lossy(&cleanup.stderr);
+            ensure!(
+                error.contains("No such container") || error.contains("No such object"),
+                "cleanup test container failed: {error}"
+            );
+        }
+        ensure!(
+            inspect(&docker, &name).await?.is_none(),
+            "test container survived final cleanup"
+        );
+        std::fs::remove_dir_all(&root)?;
+        outcome
+    }
+
+    #[tokio::test]
     async fn confirmed_fencing_blocks_a_concurrent_late_execution_generation() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("vff-{}", uuid::Uuid::new_v4()));
