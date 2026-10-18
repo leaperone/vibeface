@@ -930,25 +930,36 @@ pub(super) fn reference_closure(
     Ok((heads, hashes))
 }
 
-pub fn verify_remote_execution_policy_read(
+pub(super) struct ExecutionPolicyClosure {
+    pub(super) heads: Vec<PolicyStamp>,
+    pub(super) allowed_hashes: BTreeSet<ObjectHash>,
+    pub(super) usage: ExecutionProofUsage,
+}
+
+pub(super) fn verify_execution_policy_closure(
     state: &VerifiedPolicySet,
-    request: &RemoteExecutionPolicyReadRequest,
+    selection: &RemoteExecutionPolicySelection,
+    source_b: &PublicKey,
+    prepare_context: &PrepareContext,
+    action: Action,
+    purpose: RemoteExecutionPolicyPurpose,
+    independent_pins: &[PolicyPin],
     local_node: &PublicKey,
-    noise_client: &PublicKey,
     now: u64,
-) -> Result<VerifiedRemoteExecutionPolicyRead> {
+) -> Result<ExecutionPolicyClosure> {
     let _scope = ScopedSignatureVerification::new();
-    check_request(request, now)?;
-    let intent = &request.intent.payload;
     require(
-        intent.purpose != RemoteExecutionPolicyPurpose::History && intent.history.is_none(),
-        "history requires its independent read verifier",
+        purpose != RemoteExecutionPolicyPurpose::History
+            && &selection.target_public_key == local_node
+            && prepare_context.execution_target_public_key.as_ref() == Some(local_node)
+            && prepare_context
+                .context
+                .execution_session
+                .as_ref()
+                .is_some_and(|session| session.target == DeviceId::from_key(local_node)),
+        "current execution policy closure reached another purpose or target",
     )?;
-    let selection = &intent.selection;
-    require(
-        &request.intent.issuer == noise_client && &selection.target_public_key == local_node,
-        "execution policy request reached another Noise client or target",
-    )?;
+    pins(independent_pins)?;
     let record = state
         .resource(
             &selection.execution_resource.space,
@@ -967,8 +978,8 @@ pub fn verify_remote_execution_policy_read(
         .ok_or(AuthorizationError::InvalidProof(
             "selected execution grant is missing",
         ))?;
-    let expected_action = purpose_action(intent.purpose, intent.expected_action)?;
-    let mut context = intent.context.context.clone();
+    let expected_action = purpose_action(purpose, action)?;
+    let mut context = prepare_context.context.clone();
     context.workspace_resource = Some(selection.execution_resource.resource.clone());
     require(
         record.payload.kind == ResourceKind::ExecutionService
@@ -977,9 +988,7 @@ pub fn verify_remote_execution_policy_read(
             && target.payload.subject == Actor::Service(record.payload.host.clone())
             && leaf.payload.scope == ResourceScope::Exact(selection.execution_resource.clone())
             && leaf.payload.grantee
-                == Grantee::Actor(Actor::Service(ServiceId::from_key(
-                    &request.delegation.issuer,
-                )))
+                == Grantee::Actor(Actor::Service(ServiceId::from_key(source_b)))
             && leaf.payload.audience
                 == (Audience {
                     service: record.payload.host.clone(),
@@ -996,7 +1005,7 @@ pub fn verify_remote_execution_policy_read(
             && leaf.payload.actions.contains(&expected_action)
             && prepare::remote_actions(
                 &leaf.payload.actions,
-                intent.purpose != RemoteExecutionPolicyPurpose::Execution,
+                purpose != RemoteExecutionPolicyPurpose::Execution,
             ),
         "execution policy read exceeds the current exact Service grant or purpose",
     )?;
@@ -1014,28 +1023,66 @@ pub fn verify_remote_execution_policy_read(
     state.verify_grant_path(&chain, now, &mut budget, &mut dependencies, true)?;
     state.expand_authorities(now, &mut budget, &mut dependencies)?;
     let dependencies: Vec<_> = dependencies.into_values().collect();
-    let (heads, allowed_hashes) = reference_closure(state, &dependencies, &intent.execution_pins)?;
+    let (heads, allowed_hashes) = reference_closure(state, &dependencies, independent_pins)?;
     require(
         !heads.is_empty()
             && heads.iter().all(|head| {
-                intent
-                    .execution_pins
+                independent_pins
                     .iter()
                     .any(|pin| pin.domain == head.domain)
             }),
         "execution policy read needs independently pinned dependency domains",
     )?;
     let mut usage = ExecutionProofUsage::default();
-    usage.record_signed(&request.intent)?;
-    usage.record_signed(&request.delegation)?;
     usage.record_budget(&budget)?;
     usage.record_chain_depth(chain.len());
     finish_usage(&mut usage)?;
-    Ok(VerifiedRemoteExecutionPolicyRead {
-        request: request.clone(),
+    Ok(ExecutionPolicyClosure {
         heads,
         usage,
         allowed_hashes,
+    })
+}
+
+pub fn verify_remote_execution_policy_read(
+    state: &VerifiedPolicySet,
+    request: &RemoteExecutionPolicyReadRequest,
+    local_node: &PublicKey,
+    noise_client: &PublicKey,
+    now: u64,
+) -> Result<VerifiedRemoteExecutionPolicyRead> {
+    let _scope = ScopedSignatureVerification::new();
+    check_request(request, now)?;
+    let intent = &request.intent.payload;
+    require(
+        intent.purpose != RemoteExecutionPolicyPurpose::History && intent.history.is_none(),
+        "history requires its independent read verifier",
+    )?;
+    require(
+        &request.intent.issuer == noise_client
+            && &intent.selection.target_public_key == local_node,
+        "execution policy request reached another Noise client or target",
+    )?;
+    let closure = verify_execution_policy_closure(
+        state,
+        &intent.selection,
+        &request.delegation.issuer,
+        &intent.context,
+        intent.expected_action,
+        intent.purpose,
+        &intent.execution_pins,
+        local_node,
+        now,
+    )?;
+    let mut usage = closure.usage;
+    usage.record_signed(&request.intent)?;
+    usage.record_signed(&request.delegation)?;
+    finish_usage(&mut usage)?;
+    Ok(VerifiedRemoteExecutionPolicyRead {
+        request: request.clone(),
+        heads: closure.heads,
+        usage,
+        allowed_hashes: closure.allowed_hashes,
     })
 }
 
