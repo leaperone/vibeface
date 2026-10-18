@@ -1254,7 +1254,7 @@ fn remote_selection(body: &Value) -> Result<Option<(ResourceRef, PublicKey, Obje
     require(
         matches!(
             body["method"].as_str(),
-            Some("operate" | "bind_execution" | "resolve_unknown")
+            Some("operate" | "bind_execution" | "rebind_execution" | "resolve_unknown")
         ),
         "remote execution selection is not valid for this method",
     )?;
