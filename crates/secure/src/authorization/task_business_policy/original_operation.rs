@@ -663,6 +663,7 @@ mod tests {
                 .is_err()
         );
         let state = check.combined.clone();
+        let mut capabilities = Vec::new();
         for stage in [CheckStage::Start, CheckStage::Renew] {
             let challenge = check
                 .issue_challenge(stage, Nonce::random().unwrap(), now, now + 500)
@@ -696,6 +697,11 @@ mod tests {
             missing.receipts.pop();
             assert!(check.clone().finish(&missing, now).is_err());
             let cap = check.clone().finish(&proof, now).unwrap();
+            cap.check_current(&fixture.state, &c_key, &[], now).unwrap();
+            assert!(
+                cap.check_current(&fixture.state, &c_key, &[], now + 500)
+                    .is_err()
+            );
             assert_eq!(cap.wire(), &fixture.actual.handoff);
             assert_eq!(cap.deadline_ms(), now + 500);
             assert!(
@@ -730,6 +736,7 @@ mod tests {
                 )
                 .is_err()
             );
+            capabilities.push(cap);
         }
         let mut higher = original.pins().to_vec();
         higher[0].minimum_head.as_mut().unwrap().sequence += 1;
@@ -737,6 +744,12 @@ mod tests {
             begin_task_business_operation_current(&fixture.state, &original, &c_key, &higher, now,)
                 .is_err()
         );
+        for cap in &capabilities {
+            assert!(
+                cap.check_current(&fixture.state, &c_key, &higher, now)
+                    .is_err()
+            );
+        }
         let scope = original.scope();
         let mut document = fixture
             .state
@@ -759,6 +772,9 @@ mod tests {
             begin_task_business_operation_current(&fixture.state, &original, &c_key, &[], now,)
                 .is_err()
         );
+        for cap in &capabilities {
+            assert!(cap.check_current(&fixture.state, &c_key, &[], now).is_err());
+        }
         assert_eq!(
             original.accepted_at_ms(),
             fixture.invocation.payload.not_before_ms
