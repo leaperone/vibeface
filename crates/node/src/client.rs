@@ -1004,9 +1004,12 @@ async fn dispatch_request(
                 "gateway forward transport does not accept an outer Invocation"
             );
             let request: gateway_forward::GatewayForwardRequest = serde_json::from_value(params)?;
-            let reply = node
-                .gateway_target_request(&session.noise_peer, request.header, request.original)
-                .await?;
+            let reply = Box::pin(node.gateway_target_request(
+                &session.noise_peer,
+                request.header,
+                request.original,
+            ))
+            .await?;
             Ok(serde_json::to_value(reply)?)
         }
         TASK_RECEIPT_READ_METHOD => {
@@ -1025,9 +1028,7 @@ async fn dispatch_request(
                 invocation.is_none(),
                 "task business transport does not accept an outer Invocation"
             );
-            session
-                .task_business(node, serde_json::from_value(params)?)
-                .await
+            Box::pin(session.task_business(node, serde_json::from_value(params)?)).await
         }
         NODE_POLICY_READ_METHOD => {
             ensure!(
@@ -1150,7 +1151,7 @@ async fn dispatch_request(
                 session.subscription = Some(access);
                 Ok(json!({"subscribed":true}))
             } else {
-                node.rpc(access, params).await
+                Box::pin(node.rpc(access, params)).await
             }
         }
         "identity" => {

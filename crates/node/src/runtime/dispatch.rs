@@ -634,39 +634,10 @@ impl Runtime {
         wire: &SignedExecutionHandoff,
         submit: bool,
     ) -> Result<Value> {
-        let mut client = crate::client::TaskBusinessClient::connect(
-            &self.network,
-            &self.identity,
-            source.export(),
-        )
-        .await?;
+        let mut client = self.open_task_business_client(&mut source).await?;
         let header_hash = source.header().hash()?;
         let business = TaskBusinessWire::Submit(wire.clone());
         let wire_hash = business.hash()?;
-        client
-            .exchange(&TaskBusinessRequest::SourceBegin {
-                header: source.header().clone(),
-            })
-            .await?;
-        loop {
-            let chunk = {
-                let mut store = self.store.lock().await;
-                SignatureVerification::new().run(|| {
-                    store.next_task_business_source(&self.identity, &mut source, now_ms() as u64)
-                })?
-            };
-            if let Some(page) = chunk.page {
-                client
-                    .exchange(&TaskBusinessRequest::SourcePage { page })
-                    .await?;
-            }
-            if let Some(witness) = chunk.witness {
-                client
-                    .exchange(&TaskBusinessRequest::SourceFinish { witness })
-                    .await?;
-                break;
-            }
-        }
         let request = if submit {
             TaskBusinessRequest::Business(business.clone())
         } else {

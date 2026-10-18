@@ -1,5 +1,8 @@
 use super::*;
-use crate::identity::task_business_policy::{TaskBusinessPolicySession, TaskBusinessResponse};
+use crate::identity::task_business_policy::{
+    TaskBusinessPolicySession, TaskBusinessPolicySourceContext, TaskBusinessRequest,
+    TaskBusinessResponse,
+};
 use vibeface_secure::authorization::{
     execution_handoff::{
         ExecutionHandoffFreshness, ExecutionHandoffResolutionFreshness, ExecutionHandoffResult,
@@ -47,6 +50,43 @@ fn result(
 }
 
 impl Runtime {
+    pub(super) async fn open_task_business_client(
+        &self,
+        source: &mut TaskBusinessPolicySourceContext,
+    ) -> Result<crate::client::TaskBusinessClient> {
+        let mut client = crate::client::TaskBusinessClient::connect(
+            &self.network,
+            &self.identity,
+            source.export(),
+        )
+        .await?;
+        client
+            .exchange(&TaskBusinessRequest::SourceBegin {
+                header: source.header().clone(),
+            })
+            .await?;
+        loop {
+            let chunk = {
+                let mut store = self.store.lock().await;
+                SignatureVerification::new().run(|| {
+                    store.next_task_business_source(&self.identity, source, now_ms() as u64)
+                })?
+            };
+            if let Some(page) = chunk.page {
+                client
+                    .exchange(&TaskBusinessRequest::SourcePage { page })
+                    .await?;
+            }
+            if let Some(witness) = chunk.witness {
+                client
+                    .exchange(&TaskBusinessRequest::SourceFinish { witness })
+                    .await?;
+                break;
+            }
+        }
+        Ok(client)
+    }
+
     pub(super) async fn load_task_business_execution_original(
         &self,
         execution_space: &str,
@@ -503,7 +543,30 @@ impl Runtime {
                         peer, &request, now,
                     )
                 }
-                _ => bail!("NeedPolicySync: current readonly Task business source is unavailable"),
+                TaskBusinessWire::Observe(original) => {
+                    let (current, business) =
+                        store.current_task_business_observe(&self.identity, original, now)?;
+                    store.read_task_business_receipts(
+                        &self.identity,
+                        &current,
+                        vibeface_secure::authorization::task_business_policy::TaskBusinessAuthorization::Observe(&business),
+                        peer,
+                        &request,
+                        now,
+                    )
+                }
+                TaskBusinessWire::Resolve(original) => {
+                    let (current, business) =
+                        store.current_task_business_resolve(&self.identity, original, now)?;
+                    store.read_task_business_receipts(
+                        &self.identity,
+                        &current,
+                        vibeface_secure::authorization::task_business_policy::TaskBusinessAuthorization::Resolve(&business),
+                        peer,
+                        &request,
+                        now,
+                    )
+                }
             }
         })
     }
