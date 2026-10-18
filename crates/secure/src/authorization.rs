@@ -10,6 +10,7 @@ pub mod client_policy_import;
 pub mod directory;
 pub mod enrollment;
 pub mod execution_handoff;
+pub mod execution_binding_seal;
 pub mod execution_observation;
 pub mod execution_service;
 pub mod remote_share;
@@ -5802,6 +5803,12 @@ fn verify_client_policy_state_selected(
     )?;
     state.expand_authorities(now_ms, &mut budget, &mut dependencies)?;
     let mut resources = Vec::new();
+    let explicit_execution_control = matches!(leaf.scope, ResourceScope::Exact(_))
+        && leaf.remaining_delegations == 0
+        && leaf.expires_at_ms < u64::MAX
+        && !leaf.actions.is_empty()
+        && leaf.actions.iter().all(|action| matches!(action,
+            Action::ExecutionRebind | Action::OperationStatusRead));
     if let Some(selected) = selected {
         let record = state.resource(&selected.space, &selected.resource).ok_or(
             AuthorizationError::InvalidProof("missing selected client resource"),
@@ -5823,7 +5830,8 @@ fn verify_client_policy_state_selected(
             let Some(record) = state.resources.get(hash) else {
                 continue;
             };
-            if record.payload.kind == ResourceKind::Project
+            if (record.payload.kind == ResourceKind::Project
+                || (record.payload.kind == ResourceKind::ExecutionService && explicit_execution_control))
                 && record.payload.host == leaf.audience.service
                 && scope_covers(
                     &leaf.scope,

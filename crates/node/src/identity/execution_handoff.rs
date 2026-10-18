@@ -721,6 +721,42 @@ fn is_control(request: &OperationRequest) -> bool {
     !matches!(request.action["type"].as_str(), Some("open" | "send"))
 }
 
+pub(super) fn verify_binding_seal_source_in(
+    connection: &Connection,
+    target: &vibeface_secure::authorization::execution_binding_seal::ExecutionBindingSealTarget,
+) -> Result<ExecutionProofUsage> {
+    let session = &target.session;
+    let stored = stored_from(
+        connection,
+        session.execution_resource.space.as_str(),
+        session.original_project.space.as_str(),
+        &target.receipt.payload.operation_id,
+    )?.context("executor has not accepted the sealed operation")?;
+    verify_local_handoff_checkpoint(connection, &stored)?;
+    let admission = verify_execution_handoff_admission_checkpoint(
+        &stored.wire,
+        &stored.admission_receipt,
+        &stored.admission,
+        &StoredTransport::from(&stored.transport),
+        stored.admitted_at_ms,
+    )?;
+    verify_execution_handoff_receipt_signature(&stored.wire, &target.receipt, &stored.result)?;
+    let source = stored.wire.handoff.source_statement()?;
+    ensure!(
+        stored.request.binding.as_ref() == Some(&target.binding)
+            && source.project == session.original_project
+            && source.task == session.task
+            && source.binding_hash == session.binding_hash
+            && source.binding_generation == session.binding_generation
+            && stored.wire.handoff.execution_resource == session.execution_resource
+            && stored.wire.handoff.target_public_key == target.target_public_key
+            && serde_json::to_value(&stored.state)?
+                == serde_json::to_value(target.receipt.payload.state)?,
+        "seal receipt differs from the executor's exact accepted operation",
+    );
+    Ok(admission.proof_usage().clone())
+}
+
 fn state_text(state: &OperationState) -> Result<String> {
     Ok(serde_json::to_value(state)?
         .as_str()
@@ -1380,6 +1416,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_policy_heads_in(&tx, self.policy.verified(), verified.original(), now_ms)?;
         check_policy_heads_in(&tx, self.policy.verified(), verified.submission(), now_ms)?;
+        super::execution_binding_seal::ensure_handoff_generation_open_in(&tx, wire)?;
         tx.execute("INSERT INTO execution_handoff_challenges(execution_space_id,nonce,original_space_id,operation_id,handoff_hash,stage,challenge,expires_at_ms) VALUES(?,?,?,?,?,?,?,?)",
             params![execution, challenge.nonce.as_str(), source, operation, wire.hash()?.as_str(),
                 serde_json::to_value(stage)?.as_str().context("invalid handoff stage")?, serde_json::to_string(&challenge)?, challenge.expires_at_ms])?;
@@ -1514,6 +1551,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let duplicate:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM execution_handoffs WHERE original_space_id=? AND operation_id=?)",
             params![original_space,operation_id],|row|row.get(0))?;
+        super::execution_binding_seal::ensure_handoff_generation_open_in(&tx,wire)?;
         ensure!(
             !duplicate,
             "original operation is already admitted under another execution scope"
@@ -1638,6 +1676,7 @@ impl Store {
             tx.commit()?;
             return Ok((result, false, deadline));
         }
+        super::execution_binding_seal::ensure_handoff_generation_open_in(&tx,auth.wire())?;
         let deadline =
             consume_freshness_in(&tx, &self.policy, auth, proof, CheckStage::Start, now_ms)?;
         save_lease_in(&tx, identity, auth, proof, now_ms, deadline)?;
@@ -1665,6 +1704,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stored = stored_from(&tx, &execution, &original, &operation)?
             .context("unknown execution handoff")?;
+        super::execution_binding_seal::ensure_handoff_generation_open_in(&tx,auth.wire())?;
         ensure!(
             stored.wire == *auth.wire()
                 && stored.state == OperationState::Running
@@ -1847,6 +1887,7 @@ impl Store {
                 verification.run(|| {
                     let stored = stored_from(&tx, &execution, &original, &operation)?
                         .context("recovery handoff disappeared")?;
+                    super::execution_binding_seal::ensure_handoff_generation_open_in(&tx,&stored.wire)?;
                     reconstruct_handoff(&tx, &self.policy, &stored)?;
                     dto(&tx, identity, &stored, now_ms)
                 })

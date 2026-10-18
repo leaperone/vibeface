@@ -55,7 +55,7 @@ fn local_account_action(
     Ok(())
 }
 
-fn accepted_before(
+pub(super) fn accepted_before(
     connection: &Connection,
     auth: &VerifiedAuthorization,
     proof: &FreshnessProof,

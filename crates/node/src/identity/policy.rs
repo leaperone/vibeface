@@ -25,6 +25,10 @@ pub(crate) fn request_facts_from(
     body: &Value,
     audience: &Audience,
 ) -> Result<RequestFacts> {
+    if matches!(body["method"].as_str(),Some("seal_remote_execution"|"remote_execution_seal_status")) {
+        return super::execution_binding_seal::facts_from(connection,policies,body,audience,crate::runtime::now_ms() as u64)
+            .map(|(facts,_)|facts);
+    }
     ensure!(
         ["execution_resource", "target_public_key", "execution_grant"]
             .iter()

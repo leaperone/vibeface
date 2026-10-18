@@ -110,19 +110,17 @@ impl VerifiedPolicySet {
         action: Action,
         now_ms: u64,
     ) -> Result<VerifiedExecutionDestination> {
-        require(
-            matches!(
-                action,
+        let execution_action = match action {
+                Action::ExecutionRebind => Action::ExecutionOpen,
                 Action::ExecutionOpen
                     | Action::ExecutionSend
                     | Action::ExecutionSteer
                     | Action::ExecutionInterrupt
                     | Action::ExecutionRespondApproval
                     | Action::OperationStatusRead
-                    | Action::OperationResolve
-            ),
-            "unsupported remote execution action",
-        )?;
+                    | Action::OperationResolve => action,
+                _ => return Err(AuthorizationError::InvalidProof("unsupported remote execution action")),
+        };
         let project_record = self
             .resource(&project.space, &project.resource)
             .ok_or(AuthorizationError::InvalidProof("missing Project resource"))?;
@@ -171,7 +169,7 @@ impl VerifiedPolicySet {
                 && leaf.payload.audience == audience
                 && !leaf.payload.constraints.require_account_actor
                 && !leaf.payload.constraints.require_webauthn_uv
-                && leaf.payload.actions.contains(&action)
+                && leaf.payload.actions.contains(&execution_action)
                 && remote_actions(&leaf.payload.actions, action == Action::OperationResolve)
                 && leaf.payload.expires_at_ms < u64::MAX
                 && leaf.payload.constraints.context == execution_context,
@@ -1747,7 +1745,52 @@ fn raw_binding(value: Option<&Value>) -> Result<Option<task_binding::SignedBindi
         })
         .transpose()
 }
+
+fn check_raw_rebind(intent:&PrepareIntent,body:&Value,audience_key:&PublicKey)->Result<bool> {
+    if body["method"]!="rebind_execution" {return Ok(false);}
+    if remote_selection(body)?.is_none() {return Ok(false);}
+    let i=&intent.request;
+    let binding=raw_binding(body.get("binding"))?.ok_or(AuthorizationError::InvalidProof("rebind has no old binding"))?;
+    let seal:task_binding::SignedSeal=serde_json::from_value(body["previous_seal"].clone())
+        .map_err(|_|AuthorizationError::InvalidProof("invalid previous executor seal"))?;
+    let old_key:PublicKey=serde_json::from_value(body["previous_target_public_key"].clone())
+        .map_err(|_|AuthorizationError::InvalidProof("previous executor pin is missing"))?;
+    task_binding::verify_binding(&binding,audience_key.as_str())
+        .map_err(|_|AuthorizationError::InvalidProof("old binding has another Project authority"))?;
+    task_binding::verify_seal(&seal,old_key.as_str())
+        .map_err(|_|AuthorizationError::InvalidProof("old binding has no matching executor seal"))?;
+    let (_,new_key,_)=remote_selection(body)?.ok_or(AuthorizationError::InvalidProof("rebind needs its independent new execution destination"))?;
+    let generation=binding.binding.generation.checked_add(1)
+        .ok_or(AuthorizationError::InvalidProof("binding generation overflow"))?;
+    require(i.action==Action::ExecutionRebind && matches!(i.actor,Actor::Account(_))
+        && i.context.sdk_session.is_none()
+        && binding.binding.network_id==i.resource.space.as_str()
+        && node_fingerprint(old_key.as_str()).map_err(|_|AuthorizationError::InvalidProof("invalid previous executor pin"))?==binding.binding.target_node
+        && seal.seal.network_id==binding.binding.network_id
+        && seal.seal.binding_hash==task_binding::binding_hash(&binding.binding).map_err(|_|AuthorizationError::InvalidProof("invalid old binding"))?
+        && seal.seal.target_node==binding.binding.target_node
+        && body["task_ref"].as_str()==Some(binding.binding.task_ref.as_str())
+        && body["task_id"].as_str()==Some(binding.binding.task_id.as_str())
+        && body["conversation_id"].as_str()==Some(binding.binding.conversation_id.as_str())
+        && i.context.task.as_ref().map(EventRef::as_str)==Some(binding.binding.task_ref.as_str())
+        && i.context.conversation.as_deref()==Some(binding.binding.conversation_id.as_str())
+        && i.context.execution_session.as_ref().is_some_and(|session|
+            session.target==DeviceId::from_key(&new_key) && body["session_id"].as_str()==Some(session.session_id.as_str()))
+        && body["target_node"].as_str()==Some(node_fingerprint(new_key.as_str()).map_err(|_|AuthorizationError::InvalidProof("invalid new executor pin"))?.as_str())
+        && i.context.executor_kind.as_deref()==body["executor"].as_str()
+        && intent.binding_generation==Some(generation)
+        && intent.execution_target_public_key.as_ref()==Some(&new_key)
+        && intent.canonical_cwd.is_some()
+        && intent.canonical_cwd.as_deref()==body["cwd"].as_str(),
+        "rebind changed its sealed source or independently selected new target")?;
+    Ok(true)
+}
+
 fn check_raw_context(intent: &PrepareIntent, body: &Value, audience_key: &PublicKey) -> Result<()> {
+    if execution_binding_seal::check_client_seal_intent(intent, body, audience_key)? {
+        return Ok(());
+    }
+    if check_raw_rebind(intent,body,audience_key)? {return Ok(());}
     if check_raw_resolution(intent, body, audience_key)? {
         return Ok(());
     }

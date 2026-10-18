@@ -111,7 +111,7 @@ pub(super) fn dispatch_facts_from(
     ensure!(
         matches!(
             body["method"].as_str(),
-            Some("operate" | "bind_execution" | "resolve_unknown")
+            Some("operate" | "bind_execution" | "rebind_execution" | "resolve_unknown")
         ),
         "remote dispatch method is not supported"
     );
