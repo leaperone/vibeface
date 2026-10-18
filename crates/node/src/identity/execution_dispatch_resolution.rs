@@ -385,27 +385,7 @@ impl Store {
         Ok(pending_from(&self.connection, space, authorization)?.map(|saved| saved.wire))
     }
 
-    pub(crate) fn prepare_execution_dispatch_resolution(
-        &mut self,
-        identity: &LocalIdentity,
-        dispatch: &VerifiedDispatchFacts,
-        scoped: &TaskScopedAuthorization,
-        proof: &FreshnessProof,
-        transport: &TransportEvidence,
-        body: &Value,
-        now_ms: u64,
-    ) -> Result<(SignedExecutionHandoffResolution, bool)> {
-        self.prepare_execution_request_dispatch_resolution(
-            identity,
-            dispatch,
-            scoped,
-            proof,
-            &RequestTransport::Existing(transport.clone()),
-            body,
-            now_ms,
-        )
-    }
-
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare_execution_request_dispatch_resolution(
         &mut self,
         identity: &LocalIdentity,

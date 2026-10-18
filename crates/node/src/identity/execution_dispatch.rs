@@ -965,6 +965,8 @@ impl Store {
         Ok(dispatch)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn bind_execution_dispatch(
         &mut self,
         identity: &LocalIdentity,
@@ -986,6 +988,7 @@ impl Store {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind_execution_request_dispatch(
         &mut self,
         identity: &LocalIdentity,
@@ -1188,6 +1191,8 @@ fn check_remote_session(
 }
 
 impl Store {
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn accept_execution_dispatch(
         &mut self,
         identity: &LocalIdentity,
@@ -1211,6 +1216,7 @@ impl Store {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn accept_execution_request_dispatch(
         &mut self,
         identity: &LocalIdentity,
@@ -3213,6 +3219,7 @@ pub(crate) mod tests {
             )
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn imported_execution_policy(
             &mut self,
             source: &VerifiedClientAuthorization,

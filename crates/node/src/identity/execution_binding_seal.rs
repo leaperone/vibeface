@@ -15,9 +15,11 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
+#[cfg(test)]
+use vibeface_secure::authorization::TransportEvidence;
 use vibeface_secure::authorization::{
     Action, Actor, Audience, Grantee, ObjectHash, PublicKey, RequestFacts, ResourceScope,
-    TransportEvidence, VerifiedAuthorization, VerifiedPolicySet,
+    VerifiedAuthorization, VerifiedPolicySet,
     execution_binding_seal::{ExecutionBindingSealTarget, execution_binding_seal_facts},
     execution_handoff::SignedExecutionHandoff,
 };
@@ -77,6 +79,7 @@ pub(super) fn facts_from(
     Ok((facts, target))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn authorize_in(
     connection: &Connection,
     policy: &PolicyState,
@@ -296,27 +299,7 @@ pub(super) fn ensure_handoff_generation_open_in(
 }
 
 impl Store {
-    pub(crate) fn rebind_execution_dispatch_authorized(
-        &mut self,
-        identity: &LocalIdentity,
-        dispatch: &super::execution_dispatch::VerifiedDispatchFacts,
-        scoped: &super::task_execution_context::TaskScopedAuthorization,
-        proof: &FreshnessProof,
-        transport: &TransportEvidence,
-        body: &Value,
-        now: u64,
-    ) -> Result<crate::binding::SignedBinding> {
-        self.rebind_execution_dispatch_request_authorized(
-            identity,
-            dispatch,
-            scoped,
-            proof,
-            &RequestTransport::Existing(transport.clone()),
-            body,
-            now,
-        )
-    }
-
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn rebind_execution_dispatch_request_authorized(
         &mut self,
         identity: &LocalIdentity,
@@ -518,6 +501,7 @@ impl Store {
         .map(|(facts, _)| facts)
     }
 
+    #[cfg(test)]
     pub(crate) fn authorize_remote_execution_seal_fence(
         &self,
         identity: &LocalIdentity,
@@ -570,6 +554,8 @@ impl Store {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn seal_remote_execution_authorized(
         &mut self,
         identity: &LocalIdentity,
@@ -591,6 +577,7 @@ impl Store {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn seal_remote_execution_request_authorized(
         &mut self,
         identity: &LocalIdentity,
@@ -661,6 +648,7 @@ impl Store {
         Ok(seal)
     }
 
+    #[cfg(test)]
     pub(crate) fn remote_execution_seal_status_authorized(
         &self,
         identity: &LocalIdentity,

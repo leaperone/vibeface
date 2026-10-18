@@ -537,7 +537,7 @@ fn original_capsule_authorization(
     handoff: &ExecutionHandoff,
     now_ms: u64,
 ) -> Result<VerifiedAuthorization> {
-    let source = current.verify_project_execution_source(&handoff, now_ms)?;
+    let source = current.verify_project_execution_source(handoff, now_ms)?;
     let dispatch: Event = serde_json::from_str(&handoff.project_dispatch.canonical_body)?;
     let original = capsule_admission(&dispatch)?;
     let project = original.invocation.payload.resource.clone();
@@ -587,10 +587,10 @@ fn original_capsule_authorization(
         &original,
         &project,
         &dispatch.scope_id,
-        Some((&operation, &handoff)),
+        Some((&operation, handoff)),
         handoff.sdk_origin.as_ref(),
     )?;
-    let admitted = source.original_admission(&handoff, now_ms)?;
+    let admitted = source.original_admission(handoff, now_ms)?;
     let auth = current.verify_admitted_operation_authorization(&admitted, &facts, now_ms)?;
     Ok(auth)
 }
@@ -609,9 +609,7 @@ fn capsule_facts(
     operation: Option<(&OperationRequest, &ExecutionHandoff)>,
     origin: Option<&CompactSdkOrigin>,
 ) -> Result<vibeface_secure::authorization::RequestFacts> {
-    use vibeface_secure::authorization::{
-        Actor, EventRef, InvocationContext, RequestFacts, SessionRef,
-    };
+    use vibeface_secure::authorization::{Actor, InvocationContext, RequestFacts, SessionRef};
     let body = &proof.source_body;
     let fields = body
         .as_object()
@@ -1698,23 +1696,6 @@ impl Store {
         )
     }
 
-    pub(crate) fn execution_handoff_proof_usage_scoped(
-        &self,
-        view: &TaskBusinessScopedView,
-        wire: &SignedExecutionHandoff,
-        transport: &TransportEvidence,
-        freshness: Option<&ExecutionHandoffFreshness>,
-        now_ms: u64,
-    ) -> Result<ExecutionProofUsage> {
-        self.execution_handoff_proof_usage_with_policy(
-            HandoffPolicy::TaskBusiness(view),
-            wire,
-            transport,
-            freshness,
-            now_ms,
-        )
-    }
-
     fn execution_handoff_proof_usage_with_policy(
         &self,
         current: HandoffPolicy<'_>,
@@ -1760,23 +1741,6 @@ impl Store {
     ) -> Result<ExecutionProofUsage> {
         self.execution_handoff_resolution_proof_usage_with_policy(
             HandoffPolicy::Primary,
-            wire,
-            freshness,
-            transport,
-            now_ms,
-        )
-    }
-
-    pub(crate) fn execution_handoff_resolution_proof_usage_scoped(
-        &self,
-        view: &TaskBusinessScopedView,
-        wire: &SignedExecutionHandoffResolution,
-        freshness: Option<&ExecutionHandoffResolutionFreshness>,
-        transport: &TransportEvidence,
-        now_ms: u64,
-    ) -> Result<ExecutionProofUsage> {
-        self.execution_handoff_resolution_proof_usage_with_policy(
-            HandoffPolicy::TaskBusiness(view),
             wire,
             freshness,
             transport,
@@ -1997,6 +1961,7 @@ pub(crate) fn accepted_conversation_open_in(
     Ok(accepted)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execution_handoff_payload_from(
     connection: &Connection,
     state: &VerifiedPolicySet,
@@ -2084,6 +2049,7 @@ fn execution_handoff_payload_from(
     Ok(handoff)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execution_handoff_payload_in(
     connection: &Connection,
     policy: &PolicyState,
@@ -2111,6 +2077,7 @@ pub(crate) fn execution_handoff_payload_in(
 }
 
 impl Store {
+    #[allow(clippy::too_many_arguments)]
     pub fn execution_handoff_payload(
         &self,
         identity: &LocalIdentity,
@@ -2954,7 +2921,7 @@ impl Store {
         .context("unknown execution handoff")?;
         ensure!(
             stored.state == OperationState::Running
-                && now_ms < verified_lease_deadline(&tx, &self.policy, &stored, Some(&auth), None)?,
+                && now_ms < verified_lease_deadline(&tx, &self.policy, &stored, Some(auth), None)?,
             "native session update requires a running handoff and live lease"
         );
         authority.check_accepted(&stored)?;
@@ -3220,6 +3187,7 @@ impl Store {
         Ok(value)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn finish_execution_handoff(
         &mut self,
         identity: &LocalIdentity,
@@ -3274,6 +3242,7 @@ impl Store {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_execution_handoff_with_authority(
         &mut self,
         authority: Option<HandoffRunningAuthorization<'_>>,
@@ -3429,25 +3398,25 @@ impl Store {
             }
             tx.execute("UPDATE execution_handoff_sessions SET revision=?,record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=?",
                 params![updated.revision, session_record(&updated, &stored.wire.handoff.source_statement()?.work)?, execution, original, dispatch.resource_id.as_str(), stored.request.target_node, stored.request.session_id])?;
-        } else if state.terminal() {
-            if let Some((mut previous, _, _)) = session_from(
+        } else if state.terminal()
+            && let Some((mut previous, _, _)) = session_from(
                 &tx,
                 execution,
                 original,
                 dispatch.resource_id.as_str(),
                 &stored.request.target_node,
                 stored.request.session_id.as_deref(),
-            )? {
-                previous.revision = previous.revision.max(
-                    stored
-                        .request
-                        .expected_revision
-                        .checked_add(1)
-                        .context("execution revision overflow")?,
-                );
-                tx.execute("UPDATE execution_handoff_sessions SET revision=?,record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=?",
+            )?
+        {
+            previous.revision = previous.revision.max(
+                stored
+                    .request
+                    .expected_revision
+                    .checked_add(1)
+                    .context("execution revision overflow")?,
+            );
+            tx.execute("UPDATE execution_handoff_sessions SET revision=?,record=? WHERE execution_space_id=? AND original_space_id=? AND original_resource_id=? AND target_node=? AND session_id=?",
                     params![previous.revision, session_record(&previous, &stored.wire.handoff.source_statement()?.work)?, execution, original, dispatch.resource_id.as_str(), stored.request.target_node, stored.request.session_id])?;
-            }
         }
         if state == OperationState::Unknown
             && session.is_none()
@@ -4271,12 +4240,7 @@ impl Store {
             "only an explicit unknown resolution can fence execution"
         );
         resolution_original_observation_from(&self.connection, &self.policy, auth.wire())?;
-        current.check_resolution_authorizations_in(
-            &self.connection,
-            &self.policy,
-            &auth,
-            now_ms,
-        )?;
+        current.check_resolution_authorizations_in(&self.connection, &self.policy, auth, now_ms)?;
         current
             .state(&self.policy)
             .verify_execution_resolution_freshness(auth, proof, now_ms)?;
@@ -4327,12 +4291,7 @@ impl Store {
             "terminal reconciliation cannot resolve an unknown executor operation"
         );
         resolution_original_observation_from(&self.connection, &self.policy, auth.wire())?;
-        current.check_resolution_authorizations_in(
-            &self.connection,
-            &self.policy,
-            &auth,
-            now_ms,
-        )?;
+        current.check_resolution_authorizations_in(&self.connection, &self.policy, auth, now_ms)?;
         current
             .state(&self.policy)
             .verify_execution_resolution_freshness(auth, proof, now_ms)?;
@@ -4364,6 +4323,7 @@ impl Store {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve_execution_handoff_scoped(
         &mut self,
         view: &TaskBusinessScopedView,
@@ -4385,6 +4345,7 @@ impl Store {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_execution_handoff_with_policy(
         &mut self,
         current: HandoffPolicy<'_>,
@@ -7513,14 +7474,11 @@ pub(crate) mod tests {
             )?,
             0
         );
-        assert_eq!(
-            fixture.store.connection.query_row(
-                "SELECT consumed FROM execution_handoff_resolution_challenges",
-                [],
-                |r| r.get::<_, bool>(0)
-            )?,
-            false
-        );
+        assert!(!fixture.store.connection.query_row(
+            "SELECT consumed FROM execution_handoff_resolution_challenges",
+            [],
+            |r| r.get::<_, bool>(0)
+        )?);
         assert_eq!(
             fixture.store.connection.query_row(
                 "SELECT COUNT(*) FROM execution_handoff_reservations",
