@@ -118,7 +118,7 @@ pub fn commit_passkey_policy_at_authority(
             Signed::sign(
                 FreshnessReceipt {
                     version: AUTH_VERSION,
-                    current,
+                    currents: vec![current],
                     challenge_hash: challenge_hash.clone(),
                     issued_at_ms: now_ms,
                     expires_at_ms: expires,

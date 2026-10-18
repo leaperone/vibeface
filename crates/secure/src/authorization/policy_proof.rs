@@ -935,7 +935,7 @@ mod tests {
         let receipt = Signed::sign(
             FreshnessReceipt {
                 version: AUTH_VERSION,
-                current: previous,
+                currents: vec![previous],
                 challenge_hash: commit.challenge_hash().unwrap(),
                 issued_at_ms: 1000,
                 expires_at_ms: 2000,

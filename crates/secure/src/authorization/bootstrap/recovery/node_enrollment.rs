@@ -661,7 +661,7 @@ pub fn commit_account_node_enrollment_in_state(
     let receipt = Signed::sign(
         FreshnessReceipt {
             version: AUTH_VERSION,
-            current: previous,
+            currents: vec![previous],
             challenge_hash: commit.challenge_hash()?,
             issued_at_ms: now,
             expires_at_ms: expires,

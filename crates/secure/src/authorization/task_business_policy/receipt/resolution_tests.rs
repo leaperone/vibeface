@@ -38,7 +38,7 @@ fn signed_receipts(
             Signed::sign(
                 FreshnessReceipt {
                     version: AUTH_VERSION,
-                    current: head.clone(),
+                    currents: vec![head.clone()],
                     challenge_hash: challenge_hash.clone(),
                     issued_at_ms: now,
                     expires_at_ms: expires,

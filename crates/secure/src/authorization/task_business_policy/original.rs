@@ -529,7 +529,7 @@ mod tests {
                     Signed::sign(
                         FreshnessReceipt {
                             version: AUTH_VERSION,
-                            current: head.clone(),
+                            currents: vec![head.clone()],
                             challenge_hash: challenge.hash().unwrap(),
                             issued_at_ms: now,
                             expires_at_ms: now + 1_000,
