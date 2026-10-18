@@ -1,11 +1,10 @@
 use super::{
     admission::{
         admission_for_operation_from, check_operation_reservations_in,
-        consume_execution_dispatch_in, reconstruct_admission_at_current_heads,
+        consume_execution_dispatch_in,
         validate_persisted_admission,
     },
     execution_dispatch::{VerifiedDispatchFacts, check_destination_heads_in},
-    execution_handoff::resolution_resolver_from,
     journal::PolicyState,
     policy::FreshnessProof,
     task_execution_context::TaskScopedAuthorization,
@@ -522,6 +521,11 @@ impl Store {
                 previous_wire == *wire,
                 "completed resolution belongs to another Account decision"
             );
+            validate_persisted_admission(&tx, account)?;
+            let facts = execution_resolution_account_facts(&wire.resolution)?;
+            super::admission::reconstruct_admission(
+                &tx, &current, account, &facts, &account.transport.clone().into_evidence(),
+            )?;
             validate_released_operation_reservations_from(&tx, space, operation)?;
             tx.commit()?;
             self.policy = current;
@@ -540,22 +544,16 @@ impl Store {
         );
         validate_persisted_admission(&tx, account)?;
         let facts = execution_resolution_account_facts(&wire.resolution)?;
-        let transport = account.transport.clone().into_evidence();
-        let resolver = if let Some(admitted) =
-            reconstruct_admission_at_current_heads(&current, account, &facts, &transport)?
-        {
-            current
-                .verified()
-                .verify_operation_authorization(&admitted, &facts, &transport, now_ms)?
-        } else {
-            resolution_resolver_from(&tx, &current, current.verified(), wire, now_ms)?
-        };
+        let scoped = TaskScopedAuthorization::for_admitted_resolution_in(
+            &tx, &current, identity, account, &facts, now_ms,
+        )?;
+        let resolver = scoped.authorization();
+        let task_state = scoped.state(current.verified());
         let verified = match result {
             ResolutionResult::Unknown(result) => {
-                let verified = current
-                    .verified()
-                    .verify_execution_resolution_ack(result, &resolver, now_ms)?;
-                current.verified().verify_execution_resolution_freshness(
+                let verified = task_state
+                    .verify_execution_resolution_ack(result, resolver, now_ms)?;
+                task_state.verify_execution_resolution_freshness(
                     &verified,
                     &result.freshness,
                     now_ms,
@@ -563,9 +561,8 @@ impl Store {
                 VerifiedProjectResolution::Unknown(result, verified)
             }
             ResolutionResult::Terminal(result) => {
-                let verified = current
-                    .verified()
-                    .verify_execution_terminal_reconciliation(result, &resolver, now_ms)?;
+                let verified = task_state
+                    .verify_execution_terminal_reconciliation(result, resolver, now_ms)?;
                 VerifiedProjectResolution::Terminal(result, verified)
             }
         };
@@ -573,7 +570,10 @@ impl Store {
             VerifiedProjectResolution::Unknown(_, verified) => verified.dependencies(),
             VerifiedProjectResolution::Terminal(_, verified) => verified.dependencies(),
         };
-        check_destination_heads_in(&tx, dependencies)?;
+        scoped.check_current_in(&tx, current.verified(), &facts, now_ms)?;
+        if scoped.task_policy().is_none() {
+            check_destination_heads_in(&tx, dependencies)?;
+        }
         let state: OperationState = serde_json::from_value(account.source_body["outcome"].clone())?;
         ensure!(state.terminal(), "resolution requires a terminal state");
         ensure!(tx.execute(
