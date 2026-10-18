@@ -960,80 +960,71 @@ mod tests {
         project_bundle_json: &str,
         execution_pins_json: &str,
         execution_bundle_json: &str,
-        expected_gateway_public_key: &str,
+        source_node: &Identity,
+        project_node: &Identity,
+        execution_node: &Identity,
         now_ms: f64,
     ) -> crate::Result<String> {
         let original: SignedExecutionHandoff = serde_json::from_str(original_json).unwrap();
         let target = ExecutionObservationTarget::from_original(&original).unwrap();
         let bundle: ClientAuthorizationBundle = serde_json::from_str(project_bundle_json).unwrap();
-        let account = bundle
-            .journal
-            .iter()
-            .find_map(|entry| match entry {
-                JournalEntry::Device(certificate)
-                    if certificate.payload.public_key == PublicKey::of(signer) =>
-                {
-                    if let Actor::Account(account) = &certificate.payload.subject {
-                        Some(account.clone())
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            })
-            .unwrap();
-        let source_meter = crate::signature_verification::SignatureVerification::new();
-        let source = source_meter.run(|| {
-            verify_client_authorization(
-                project_bundle_json,
-                project_pins_json,
-                account.as_str(),
-                target.source.project.space.as_str(),
-                &signer.public_key_hex(),
-                now_ms,
-            )
-        })?;
-        let selection = serde_json::to_string(&serde_json::json!({
-            "execution_resource":target.execution_resource,"target_public_key":target.target_public_key,
-            "execution_grant":execution_grant,
-        })).unwrap();
-        let context = serde_json::to_string(&prepare::PrepareContext {
+        let project_pins: Vec<PolicyPin> = serde_json::from_str(project_pins_json).unwrap();
+        let execution_pins: Vec<PolicyPin> = serde_json::from_str(execution_pins_json).unwrap();
+        let execution_bundle: ClientAuthorizationBundle =
+            serde_json::from_str(execution_bundle_json).unwrap();
+        let source = remote_execution_policy::tests::confirmed_source(
+            &bundle,
+            &project_pins,
+            signer,
+            source_node,
+            &target.source.project,
+            now_ms as u64,
+        )?;
+        let selection = remote_execution_policy::RemoteExecutionPolicySelection {
+            execution_resource: target.execution_resource.clone(),
+            target_public_key: target.target_public_key.clone(),
+            execution_grant: ObjectHash::parse(execution_grant).unwrap(),
+        };
+        let context = prepare::PrepareContext {
             context: target.context(&target.source.project.resource),
             binding_generation: Some(target.source.binding_generation),
             canonical_cwd: None,
             execution_target_public_key: Some(target.target_public_key.clone()),
-        })
-        .unwrap();
+        };
+        let stream = remote_execution_policy::tests::remote_policy_stream(
+            &source,
+            signer,
+            project_node,
+            &execution_bundle,
+            &execution_pins,
+            execution_node,
+            &selection,
+            &context,
+            Action::OperationResolve,
+            remote_execution_policy::RemoteExecutionPolicyPurpose::ObservationRead,
+            now_ms as u64,
+        )?;
+        let policy = stream.import(&source, now_ms as u64)?;
         let import_meter = crate::signature_verification::SignatureVerification::new();
-        let handle = import_meter.run(|| {
-            prepare::verify_remote_execution(
-                &source,
-                project_bundle_json,
-                project_pins_json,
-                execution_bundle_json,
-                execution_pins_json,
-                &selection,
-                &context,
-                "operation_resolve",
-                now_ms,
-            )
-        })?;
+        let handle =
+            import_meter.run(|| prepare::verify_remote_execution(&source, &policy, now_ms))?;
         let sign_meter = crate::signature_verification::SignatureVerification::new();
         let result = sign_meter.run(|| {
             handle.sign_observation_request(
                 original_json,
                 authorization_id,
-                expected_gateway_public_key,
+                PublicKey::of(source_node).as_str(),
                 signer,
                 now_ms,
             )
         })?;
-        for meter in [&source_meter, &import_meter, &sign_meter] {
+        for meter in [&import_meter, &sign_meter] {
             assert!(meter.counts().actual_verifications > 0);
             assert!(meter.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
         }
         println!("observation_api_meters={}", serde_json::to_string(&json!({
-            "source":source_meter.counts(),"import":import_meter.counts(),"sign":sign_meter.counts(),
+            "source":serde_json::from_str::<Value>(&source.client_policy_proof_usage_json().unwrap()).unwrap(),
+            "import":import_meter.counts(),"sign":sign_meter.counts(),
         })).unwrap());
         Ok(result)
     }
@@ -1752,11 +1743,11 @@ mod tests {
             .state
             .install_device(certificate.clone(), NOW)
             .unwrap();
-        gateway.bundle.journal.push(JournalEntry::Account(document));
         gateway
             .bundle
             .journal
             .push(JournalEntry::Device(certificate));
+        gateway.bundle.journal.push(JournalEntry::Account(document));
         fixture
             .state
             .accounts
@@ -1797,7 +1788,9 @@ mod tests {
             &serde_json::to_string(&fixture.project.bundle).unwrap(),
             &serde_json::to_string(&fixture.executor.pins).unwrap(),
             &serde_json::to_string(&fixture.executor.bundle).unwrap(),
-            &gateway_device.public_key_hex(),
+            &gateway_device,
+            &fixture.project.node,
+            &fixture.executor.node,
             NOW as f64,
         )
         .unwrap();
@@ -1930,6 +1923,49 @@ mod tests {
         let mut fixture = Fixture::new();
         let (gateway, gateway_device) = add_gateway(&mut fixture);
         assert!(
+            remote_execution_policy::tests::confirmed_source(
+                &fixture.project.bundle,
+                &fixture.project.pins,
+                &fixture.project.client,
+                &gateway.client,
+                &fixture.project.project,
+                NOW,
+            )
+            .is_err()
+        );
+        let mut wrong_pins = fixture.project.pins.clone();
+        wrong_pins
+            .iter_mut()
+            .find(|pin| pin.domain == PolicyDomain::Account(gateway.account.clone()))
+            .unwrap()
+            .genesis_root = PublicKey::of(&fixture.project.root);
+        let selection = client_policy_import::AuthorizationSelection {
+            resource: fixture.project.project.clone(),
+            audience: fixture.project.audience(),
+            grant_leaf: fixture.resolver_grant.clone(),
+        };
+        let wrong_root_read = client_policy_import::build_client_policy_read_request(
+            fixture.project.account.as_str(),
+            fixture.project.project.space.as_str(),
+            &fixture.project.client,
+            PublicKey::of(&gateway_device).as_str(),
+            &serde_json::to_string(&wrong_pins).unwrap(),
+            &serde_json::to_string(&Some(selection)).unwrap(),
+            NOW as f64,
+            (NOW + 1_000) as f64,
+        )
+        .unwrap();
+        assert!(
+            client_policy_import::verify_client_policy_read(
+                &fixture.state,
+                &serde_json::from_str(&wrong_root_read).unwrap(),
+                &PublicKey::of(&gateway_device),
+                &PublicKey::of(&fixture.project.client),
+                NOW,
+            )
+            .is_err()
+        );
+        assert!(
             fixture
                 .state
                 .build_forwarded_execution_observation_request(
@@ -1973,10 +2009,24 @@ mod tests {
                 .is_none_or(|certificate| certificate.payload.device != revoked)
         });
         document.revoked_devices.sort();
+        let document = Signed::sign(document, &gateway.root).unwrap();
+        fixture.state.install_account(document.clone()).unwrap();
         fixture
-            .state
-            .install_account(Signed::sign(document, &gateway.root).unwrap())
-            .unwrap();
+            .project
+            .bundle
+            .journal
+            .push(JournalEntry::Account(document));
+        assert!(
+            remote_execution_policy::tests::confirmed_source(
+                &fixture.project.bundle,
+                &fixture.project.pins,
+                &fixture.project.client,
+                &gateway_device,
+                &fixture.project.project,
+                NOW,
+            )
+            .is_err()
+        );
         assert!(
             fixture
                 .state
@@ -1984,7 +2034,6 @@ mod tests {
                 .is_err()
         );
     }
-
     #[test]
     fn observation_uses_current_resolver_and_pair_after_old_execution_grants_are_gone() {
         let mut fixture = Fixture::new();
@@ -2392,6 +2441,184 @@ mod tests {
     }
 
     #[test]
+    fn bounded_remote_policy_imports_bind_each_purpose_and_failed_pages_do_not_advance() {
+        use remote_execution_policy::{RemoteExecutionPolicyPurpose as Purpose, tests::*};
+        let mut fixture = Fixture::new();
+        let source_execution_grant = fixture.project.bundle.grant_leaf.clone();
+        let target = ExecutionObservationTarget::from_original(&fixture.original).unwrap();
+        let context = prepare::PrepareContext {
+            context: target.context(&target.source.project.resource),
+            binding_generation: Some(target.source.binding_generation),
+            canonical_cwd: None,
+            execution_target_public_key: Some(target.target_public_key.clone()),
+        };
+        for (purpose, action, source_grant, execution_grant, name) in [
+            (
+                Purpose::Execution,
+                Action::ExecutionOpen,
+                source_execution_grant,
+                fixture.old_execution_grant.clone(),
+                "execution",
+            ),
+            (
+                Purpose::ObservationRead,
+                Action::OperationResolve,
+                fixture.resolver_grant.clone(),
+                fixture.execution_grant.clone(),
+                "observation_read",
+            ),
+            (
+                Purpose::Resolver,
+                Action::OperationResolve,
+                fixture.resolver_grant.clone(),
+                fixture.execution_grant.clone(),
+                "resolver",
+            ),
+        ] {
+            fixture.project.bundle.grant_leaf = source_grant;
+            let source = confirmed_source(
+                &fixture.project.bundle,
+                &fixture.project.pins,
+                &fixture.project.client,
+                &fixture.project.node,
+                &fixture.project.project,
+                NOW,
+            )
+            .unwrap();
+            let selection = remote_execution_policy::RemoteExecutionPolicySelection {
+                execution_resource: target.execution_resource.clone(),
+                target_public_key: target.target_public_key.clone(),
+                execution_grant,
+            };
+            let stream = remote_policy_stream(
+                &source,
+                &fixture.project.client,
+                &fixture.project.node,
+                &fixture.executor.bundle,
+                &fixture.executor.pins,
+                &fixture.executor.node,
+                &selection,
+                &context,
+                action,
+                purpose,
+                NOW,
+            )
+            .unwrap();
+            let mut import = stream.begin(&source, NOW).unwrap();
+            let before = import.page_request_json().unwrap();
+            let before_usage = import.proof_usage_json().unwrap();
+            let mut invalid = stream.pages[0].payload.clone();
+            invalid.entry = Some(fixture.project.bundle.journal[0].clone());
+            let invalid = Signed::sign(invalid, &fixture.executor.node).unwrap();
+            assert!(
+                import
+                    .append_page(&serde_json::to_string(&invalid).unwrap(), NOW as f64)
+                    .is_err()
+            );
+            assert_eq!(import.page_request_json().unwrap(), before);
+            assert_eq!(import.proof_usage_json().unwrap(), before_usage);
+            for page in &stream.pages {
+                import
+                    .append_page(&serde_json::to_string(page).unwrap(), NOW as f64)
+                    .unwrap();
+            }
+            let policy = import
+                .finish(&serde_json::to_string(&stream.witness).unwrap(), NOW as f64)
+                .unwrap();
+            let handle = prepare::verify_remote_execution(&source, &policy, NOW as f64).unwrap();
+            let metadata: Value = serde_json::from_str(&handle.metadata_json().unwrap()).unwrap();
+            assert_eq!(metadata["purpose"], name);
+            assert!(
+                prepare::verify_remote_execution(&source, &policy, (NOW + 1_000) as f64).is_err()
+            );
+            let original = serde_json::to_string(&fixture.original).unwrap();
+            if purpose == Purpose::ObservationRead {
+                let prepared = handle.prepare(
+                    &source,
+                    "{}",
+                    "{}",
+                    "operation_resolve",
+                    "readonly",
+                    PublicKey::of(&fixture.project.node).as_str(),
+                    &fixture.project.client,
+                    NOW as f64,
+                );
+                assert!(
+                    prepared
+                        .unwrap_err()
+                        .contains("observation policy cannot prepare")
+                );
+                let signed = handle.sign(
+                    &source,
+                    "{}",
+                    "{}",
+                    "operation_resolve",
+                    "readonly",
+                    PublicKey::of(&fixture.project.node).as_str(),
+                    &fixture.project.client,
+                    NOW as f64,
+                );
+                assert!(
+                    signed
+                        .unwrap_err()
+                        .contains("observation policy cannot sign")
+                );
+                assert!(
+                    handle
+                        .resolution_body_json("{}", "readonly", "unknown", "evidence", NOW as f64)
+                        .unwrap_err()
+                        .contains("resolution needs an independently verified resolver grant")
+                );
+                assert!(
+                    handle
+                        .resolution_result_json("{}", "{}", "{}", NOW as f64)
+                        .unwrap_err()
+                        .contains("invalid resolver result proof bounds")
+                );
+                handle
+                    .sign_observation_request(
+                        &original,
+                        "readonly",
+                        PublicKey::of(&fixture.project.node).as_str(),
+                        &fixture.project.client,
+                        NOW as f64,
+                    )
+                    .unwrap();
+            } else {
+                assert!(
+                    handle
+                        .sign_observation_request(
+                            &original,
+                            "wrong-purpose",
+                            PublicKey::of(&fixture.project.node).as_str(),
+                            &fixture.project.client,
+                            NOW as f64
+                        )
+                        .is_err()
+                );
+            }
+            let mut substituted = stream.request.clone();
+            substituted.intent.payload.purpose = if purpose == Purpose::ObservationRead {
+                Purpose::Resolver
+            } else {
+                Purpose::ObservationRead
+            };
+            substituted.intent =
+                Signed::sign(substituted.intent.payload, &fixture.project.client).unwrap();
+            assert!(
+                remote_execution_policy::begin_remote_execution_policy_import(
+                    &source,
+                    &serde_json::to_string(&substituted).unwrap(),
+                    &serde_json::to_string(&stream.header).unwrap(),
+                    &serde_json::to_string(&fixture.executor.pins).unwrap(),
+                    PublicKey::of(&fixture.executor.node).as_str(),
+                    NOW as f64
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
     fn wasm_entry_replays_two_independent_proofs_and_rejects_missing_executor_trust() {
         let mut fixture = Fixture::new();
         fixture.project.bundle.grant_leaf = fixture.resolver_grant.clone();
@@ -2410,7 +2637,9 @@ mod tests {
             &project_bundle,
             &execution_pins,
             &execution_bundle,
-            &fixture.project.node.public_key_hex(),
+            &fixture.project.node,
+            &fixture.project.node,
+            &fixture.executor.node,
             NOW as f64,
         )
         .unwrap();
@@ -2466,7 +2695,9 @@ mod tests {
                 &project_bundle,
                 "[]",
                 &execution_bundle,
-                &fixture.project.node.public_key_hex(),
+                &fixture.project.node,
+                &fixture.project.node,
+                &fixture.executor.node,
                 NOW as f64
             )
             .is_err()

@@ -1242,3 +1242,356 @@ impl VerifiedRemoteExecutionPolicy {
         encode(&self.usage.counts())
     }
 }
+
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::authorization::client_policy_import::*;
+    use serde_json::json;
+
+    fn wire<T: Serialize>(value: &T) -> String {
+        serde_json::to_string(value).unwrap()
+    }
+
+    fn domain(entry: &JournalEntry) -> PolicyDomain {
+        match entry {
+            JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => {
+                PolicyDomain::Account(value.payload.account.clone())
+            }
+            JournalEntry::AccountCommit(value) => {
+                PolicyDomain::Account(value.proposal.payload.account.clone())
+            }
+            JournalEntry::SpaceGenesis(value) | JournalEntry::Space(value) => {
+                PolicyDomain::Space(value.payload.space.clone())
+            }
+            JournalEntry::SpaceCommit(value) => {
+                PolicyDomain::Space(value.proposal.payload.space.clone())
+            }
+            JournalEntry::Device(value) => value.payload.owner.clone(),
+            JournalEntry::Resource(value) => PolicyDomain::Space(value.payload.space.clone()),
+            JournalEntry::Authenticator(value) => {
+                PolicyDomain::Account(value.payload.account.clone())
+            }
+            JournalEntry::Membership(value) => PolicyDomain::Space(value.payload.space.clone()),
+            JournalEntry::Grant(value) => PolicyDomain::Space(value.payload.owner_space.clone()),
+        }
+    }
+
+    pub(crate) fn confirmed_source(
+        bundle: &ClientAuthorizationBundle,
+        pins: &[PolicyPin],
+        client: &Identity,
+        noise_source: &Identity,
+        project: &ResourceRef,
+        now: u64,
+    ) -> crate::Result<VerifiedClientAuthorization> {
+        let state = replay_policies(pins, &bundle.journal).map_err(|error| error.to_string())?;
+        let account = match &state
+            .find_device(&DeviceId::from_key(&PublicKey::of(client)))
+            .map_err(|error| error.to_string())?
+            .payload
+            .subject
+        {
+            Actor::Account(account) => account.clone(),
+            _ => return Err("fixture client must be an Account".into()),
+        };
+        let selection = AuthorizationSelection {
+            resource: project.clone(),
+            audience: state
+                .grant(&bundle.grant_leaf)
+                .unwrap()
+                .payload
+                .audience
+                .clone(),
+            grant_leaf: bundle.grant_leaf.clone(),
+        };
+        let request_json = build_client_policy_read_request(
+            account.as_str(),
+            project.space.as_str(),
+            client,
+            PublicKey::of(noise_source).as_str(),
+            &wire(&pins),
+            &wire(&Some(&selection)),
+            now as f64,
+            (now + 1_000) as f64,
+        )?;
+        let request: Signed<ClientPolicyReadRequest> = serde_json::from_str(&request_json).unwrap();
+        let verified = verify_client_policy_read(
+            &state,
+            &request,
+            &PublicKey::of(noise_source),
+            &PublicKey::of(client),
+            now,
+        )
+        .map_err(|error| error.to_string())?;
+        let header = Signed::sign(
+            ClientPolicySnapshot {
+                version: AUTH_VERSION,
+                request_hash: request.hash().unwrap(),
+                snapshot_id: Nonce::random().unwrap(),
+                saved_pins_hash: client_policy_saved_pins_hash(pins).unwrap(),
+                target_heads: verified.heads().to_vec(),
+                selection: selection.clone(),
+                source_node_public_key: PublicKey::of(noise_source),
+                issued_at_ms: now,
+                expires_at_ms: now + 1_000,
+            },
+            noise_source,
+        )
+        .unwrap();
+        let mut import = begin_client_policy_import(
+            &wire(&pins),
+            &request_json,
+            &wire(&header),
+            client,
+            PublicKey::of(noise_source).as_str(),
+            now as f64,
+        )?;
+        let entries: Vec<_> = bundle
+            .journal
+            .iter()
+            .filter(|entry| verified.domains().contains(&domain(entry)))
+            .cloned()
+            .collect();
+        assert!(!entries.is_empty());
+        let mut previous = header.hash().unwrap();
+        for (index, entry) in entries.iter().enumerate() {
+            let request: ClientPolicyPageRequest =
+                serde_json::from_str(&import.page_request_json()?).unwrap();
+            let next =
+                (index + 1 < entries.len()).then(|| policy_import::entry_hash(entry).unwrap());
+            let page = Signed::sign(
+                ClientPolicyPage {
+                    version: AUTH_VERSION,
+                    request_hash: header.payload.request_hash.clone(),
+                    snapshot_id: header.payload.snapshot_id.clone(),
+                    target_heads_hash: client_policy_target_heads_hash(verified.heads()).unwrap(),
+                    page_index: index as u64,
+                    request_cursor: request.cursor,
+                    previous_page_hash: previous,
+                    entry: Some(entry.clone()),
+                    complete: next.is_none(),
+                    next_cursor: next,
+                },
+                noise_source,
+            )
+            .unwrap();
+            import.append_page(&wire(&page), now as f64)?;
+            previous = page.hash().unwrap();
+        }
+        let witness = Signed::sign(
+            ClientPolicyWitness {
+                version: AUTH_VERSION,
+                request_hash: header.payload.request_hash.clone(),
+                snapshot_id: header.payload.snapshot_id.clone(),
+                target_heads: verified.heads().to_vec(),
+                final_page_hash: previous,
+                page_count: entries.len() as u64,
+                entry_count: entries.len() as u64,
+                snapshot_hash: header.hash().unwrap(),
+                source_node_public_key: PublicKey::of(noise_source),
+                issued_at_ms: now,
+                expires_at_ms: now + 1_000,
+            },
+            noise_source,
+        )
+        .unwrap();
+        let authorization = import.finish(&wire(&witness), &wire(&selection), now as f64)?;
+        let confirm_json = build_client_policy_auth_confirm_request(
+            &authorization,
+            client,
+            now as f64,
+            (now + 1_000) as f64,
+        )?;
+        let confirm: Signed<ClientPolicyAuthConfirmRequest> =
+            serde_json::from_str(&confirm_json).unwrap();
+        verify_client_policy_auth_confirm(
+            &state,
+            &request,
+            &header,
+            &witness,
+            &confirm,
+            &PublicKey::of(noise_source),
+            &PublicKey::of(client),
+            now,
+        )
+        .map_err(|error| error.to_string())?;
+        let receipt = Signed::sign(
+            ClientPolicyAuthConfirmation {
+                version: AUTH_VERSION,
+                context: confirm.payload.context.clone(),
+                confirmation_request_hash: confirm.hash().unwrap(),
+                selection,
+                target_heads: verified.heads().to_vec(),
+                device_public_key: PublicKey::of(client),
+                source_node_public_key: PublicKey::of(noise_source),
+                accepted_at_ms: now,
+            },
+            noise_source,
+        )
+        .unwrap();
+        confirm_client_policy_authorization(
+            &authorization,
+            &confirm_json,
+            &wire(&receipt),
+            PublicKey::of(noise_source).as_str(),
+            now as f64,
+        )
+    }
+
+    pub(crate) struct RemotePolicyStream {
+        pub(crate) request: RemoteExecutionPolicyReadRequest,
+        pub(crate) header: Signed<RemoteExecutionPolicySnapshot>,
+        pub(crate) pages: Vec<Signed<RemoteExecutionPolicyPage>>,
+        pub(crate) witness: Signed<RemoteExecutionPolicyWitness>,
+    }
+
+    impl RemotePolicyStream {
+        pub(crate) fn begin(
+            &self,
+            source: &VerifiedClientAuthorization,
+            now: u64,
+        ) -> crate::Result<RemoteExecutionPolicyImport> {
+            begin_remote_execution_policy_import(
+                source,
+                &wire(&self.request),
+                &wire(&self.header),
+                &wire(&self.request.intent.payload.execution_pins),
+                self.header.issuer.as_str(),
+                now as f64,
+            )
+        }
+
+        pub(crate) fn import(
+            &self,
+            source: &VerifiedClientAuthorization,
+            now: u64,
+        ) -> crate::Result<VerifiedRemoteExecutionPolicy> {
+            let mut import = self.begin(source, now)?;
+            for page in &self.pages {
+                import.append_page(&wire(page), now as f64)?;
+            }
+            import.finish(&wire(&self.witness), now as f64)
+        }
+    }
+
+    pub(crate) fn remote_policy_stream(
+        source: &VerifiedClientAuthorization,
+        client: &Identity,
+        project_node: &Identity,
+        execution_bundle: &ClientAuthorizationBundle,
+        execution_pins: &[PolicyPin],
+        execution_node: &Identity,
+        selection: &RemoteExecutionPolicySelection,
+        context: &PrepareContext,
+        action: Action,
+        purpose: RemoteExecutionPolicyPurpose,
+        now: u64,
+    ) -> crate::Result<RemotePolicyStream> {
+        let intent_json = build_remote_execution_policy_read_intent(
+            source,
+            &wire(
+                &json!({"selection": selection, "context": context, "expected_action": action,
+                "purpose": purpose, "execution_pins": execution_pins}),
+            ),
+            client,
+            now as f64,
+            (now + 1_000) as f64,
+        )?;
+        let intent: Signed<RemoteExecutionPolicyReadIntent> =
+            serde_json::from_str(&intent_json).unwrap();
+        let source_gate = verify_remote_execution_policy_delegation_source(
+            require_confirmed_client_policy(source).unwrap().state(),
+            &intent,
+            &PublicKey::of(project_node),
+            &PublicKey::of(client),
+            now,
+        )
+        .map_err(|error| error.to_string())?;
+        let delegation =
+            sign_remote_execution_policy_read_delegation(&source_gate, project_node, now)
+                .map_err(|error| error.to_string())?;
+        let request = RemoteExecutionPolicyReadRequest { intent, delegation };
+        let execution_state = replay_policies(execution_pins, &execution_bundle.journal)
+            .map_err(|error| error.to_string())?;
+        let verified = verify_remote_execution_policy_read(
+            &execution_state,
+            &request,
+            &PublicKey::of(execution_node),
+            &PublicKey::of(client),
+            now,
+        )
+        .map_err(|error| error.to_string())?;
+        let header = Signed::sign(
+            RemoteExecutionPolicySnapshot {
+                version: AUTH_VERSION,
+                request_hash: ObjectHash::body(&request).unwrap(),
+                snapshot_id: Nonce::random().unwrap(),
+                saved_pins_hash: ObjectHash::body(&execution_pins).unwrap(),
+                target_heads: verified.target_heads().to_vec(),
+                source_node_public_key: PublicKey::of(execution_node),
+                issued_at_ms: now,
+                expires_at_ms: now + 1_000,
+            },
+            execution_node,
+        )
+        .unwrap();
+        let entries: Vec<_> = execution_bundle
+            .journal
+            .iter()
+            .filter(|entry| verified.allows_entry(entry).unwrap())
+            .cloned()
+            .collect();
+        assert!(!entries.is_empty());
+        let mut previous = header.hash().unwrap();
+        let mut cursor = None;
+        let mut pages = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let next =
+                (index + 1 < entries.len()).then(|| policy_import::entry_hash(entry).unwrap());
+            let page = Signed::sign(
+                RemoteExecutionPolicyPage {
+                    version: AUTH_VERSION,
+                    request_hash: header.payload.request_hash.clone(),
+                    snapshot_id: header.payload.snapshot_id.clone(),
+                    target_heads_hash: ObjectHash::body(&verified.target_heads()).unwrap(),
+                    page_index: index as u64,
+                    request_cursor: cursor,
+                    previous_page_hash: previous,
+                    entry: Some(entry.clone()),
+                    complete: next.is_none(),
+                    next_cursor: next.clone(),
+                },
+                execution_node,
+            )
+            .unwrap();
+            previous = page.hash().unwrap();
+            cursor = next;
+            pages.push(page);
+        }
+        let witness = Signed::sign(
+            RemoteExecutionPolicyWitness {
+                version: AUTH_VERSION,
+                request_hash: header.payload.request_hash.clone(),
+                snapshot_id: header.payload.snapshot_id.clone(),
+                target_heads: verified.target_heads().to_vec(),
+                final_page_hash: previous,
+                page_count: pages.len() as u64,
+                entry_count: entries.len() as u64,
+                snapshot_hash: header.hash().unwrap(),
+                source_node_public_key: PublicKey::of(execution_node),
+                issued_at_ms: now,
+                expires_at_ms: now + 1_000,
+            },
+            execution_node,
+        )
+        .unwrap();
+        Ok(RemotePolicyStream {
+            request,
+            header,
+            pages,
+            witness,
+        })
+    }
+}

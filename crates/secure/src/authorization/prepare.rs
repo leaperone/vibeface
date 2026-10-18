@@ -2437,7 +2437,7 @@ mod tests {
         f.state
             .install_space(Signed::sign(document, &f.root).unwrap())
             .unwrap();
-        let (auth, user, bundle, pins) = client_material(&f, None);
+        let (_, user, bundle, pins) = client_material(&f, None);
         let body = json!({"method":"operate","space_id":space,"resource_id":project.resource,
             "authorization_id":"prepare_1","conversation_id":"chat","task_ref":context.task,
             "execution_resource":execution,"target_public_key":execution_key,"execution_grant":leaf,
@@ -2462,18 +2462,26 @@ mod tests {
         assert_eq!(share["kind"], "vibeface-remote-execution");
         assert_eq!(share["selection"], selection);
         assert!(share.get("pins").is_none());
-        let handle = verify_remote_execution(
-            &auth,
-            &serde_json::to_string(&bundle).unwrap(),
-            &serde_json::to_string(&pins).unwrap(),
-            &serde_json::to_string(&execution_bundle).unwrap(),
-            &serde_json::to_string(&pins).unwrap(),
-            &selection.to_string(),
-            &serde_json::to_string(&raw).unwrap(),
-            "execution_send",
-            NOW as f64,
+        let auth = remote_execution_policy::tests::confirmed_source(
+            &bundle, &pins, &user, &f.node, &project, NOW,
         )
         .unwrap();
+        let stream = remote_execution_policy::tests::remote_policy_stream(
+            &auth,
+            &user,
+            &f.node,
+            &execution_bundle,
+            &pins,
+            &executor,
+            &serde_json::from_value(selection).unwrap(),
+            &raw,
+            Action::ExecutionSend,
+            remote_execution_policy::RemoteExecutionPolicyPurpose::Execution,
+            NOW,
+        )
+        .unwrap();
+        let policy = stream.import(&auth, NOW).unwrap();
+        let handle = verify_remote_execution(&auth, &policy, NOW as f64).unwrap();
         let signed: Signed<PrepareIntent> = serde_json::from_str(
             &handle
                 .prepare(
