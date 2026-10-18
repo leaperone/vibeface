@@ -698,6 +698,13 @@ impl Action {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct ExecutionSourcePolicy {
+    pub project: ResourceRef,
+    pub node_public_key: PublicKey,
+    pub pins: Vec<PolicyPin>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Grant {
     pub version: u16,
     pub owner_space: SpaceId,
@@ -706,6 +713,7 @@ pub struct Grant {
     pub actions: Vec<Action>,
     pub audience: Audience,
     pub constraints: GrantConstraints,
+    pub execution_source: Option<ExecutionSourcePolicy>,
     pub parent: Option<ObjectHash>,
     pub remaining_delegations: u8,
     pub issued_under: PolicyStamp,
@@ -3094,6 +3102,7 @@ mod tests {
                 )
                 .unwrap();
             let grant = Grant {
+                execution_source: None,
                 version: AUTH_VERSION,
                 owner_space: space.clone(),
                 scope: ResourceScope::Exact(resource.clone()),
@@ -4552,6 +4561,7 @@ mod tests {
             )
             .unwrap();
         let grant = Grant {
+            execution_source: None,
             version: AUTH_VERSION,
             owner_space: team.clone(),
             scope: ResourceScope::WholeSpace(team.clone()),
@@ -4668,6 +4678,7 @@ mod tests {
             resource: f.resource.resource.clone(),
         };
         let grant = Grant {
+            execution_source: None,
             version: AUTH_VERSION,
             owner_space: team.clone(),
             scope: ResourceScope::Exact(resource.clone()),

@@ -417,6 +417,7 @@ mod tests {
         fn grant(&mut self, scope: ResourceScope, grantee: Grantee) {
             let signed = Signed::sign(
                 Grant {
+                    execution_source: None,
                     version: AUTH_VERSION,
                     owner_space: self.space.clone(),
                     scope,

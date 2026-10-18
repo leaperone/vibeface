@@ -624,6 +624,7 @@ pub(crate) mod tests {
         )?;
         let grant = Signed::sign(
             Grant {
+                execution_source: None,
                 version: AUTH_VERSION,
                 owner_space: executor.space.clone(),
                 scope: ResourceScope::Exact(resource.clone()),

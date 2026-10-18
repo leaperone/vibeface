@@ -960,6 +960,7 @@ pub fn finish_cross_node_account_recovery(
             for resource in &r.source_read_resources {
                 let grant = Signed::sign(
                     Grant {
+                        execution_source: None,
                         version: AUTH_VERSION,
                         owner_space: r.space.clone(),
                         scope: ResourceScope::Exact(resource.clone()),

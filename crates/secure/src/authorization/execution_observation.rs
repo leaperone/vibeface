@@ -1581,6 +1581,7 @@ pub(crate) mod tests {
                 .push(JournalEntry::Resource(record.clone()));
             let pair = Signed::sign(
                 Grant {
+                    execution_source: None,
                     version: AUTH_VERSION,
                     owner_space: execution_resource.space.clone(),
                     scope: ResourceScope::Exact(execution_resource.clone()),

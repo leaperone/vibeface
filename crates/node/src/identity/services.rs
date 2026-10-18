@@ -795,6 +795,7 @@ mod tests {
                 Identity::from_secret_hex(&hex::encode([4; 32])).map_err(anyhow::Error::msg)?;
             let parent = Signed::sign(
                 Grant {
+                    execution_source: None,
                     version: AUTH_VERSION,
                     owner_space: resource.space.clone(),
                     scope: ResourceScope::Exact(resource.clone()),

@@ -66,6 +66,14 @@ pub struct PreparedRemoteExecutionShare {
     usage: ExecutionProofUsage,
 }
 
+pub(super) struct VerifiedExecutionSourcePolicy(ExecutionSourcePolicy);
+
+impl VerifiedExecutionSourcePolicy {
+    pub(super) fn into_policy(self) -> ExecutionSourcePolicy {
+        self.0
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = prepareRemoteExecutionShare))]
 pub fn prepare_remote_execution_share(
     intent_json: &str,
@@ -128,6 +136,29 @@ pub fn prepare_remote_execution_share(
             )?;
         }
         let mut usage = source.revalidate(now)?;
+        let execution_source = VerifiedExecutionSourcePolicy(ExecutionSourcePolicy {
+            project: original.project.clone(),
+            node_public_key: original.source_node_public_key.clone(),
+            pins: source
+                .snapshot()
+                .pins()
+                .iter()
+                .map(|pin| {
+                    Ok(PolicyPin {
+                        domain: pin.domain.clone(),
+                        genesis_root: pin.genesis_root.clone(),
+                        minimum_head: Some(
+                            source
+                                .snapshot()
+                                .state()
+                                .head(&pin.domain)
+                                .cloned()
+                                .ok_or(AuthorizationError::PolicyConflict)?,
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        });
         let mut authority_budget = Budget::default();
         state.governance_capability(
             &owner.grant_leaf,
@@ -213,8 +244,9 @@ pub fn prepare_remote_execution_share(
             remaining_delegations: 0,
             expires_at_ms: intent.expires_at,
         };
-        let prepared = prepare_directional_grant(
-            &encode(&directional).map_err(|_| AuthorizationError::PolicyConflict)?,
+        let prepared = prepare_execution_source_grant(
+            directional.clone(),
+            execution_source,
             signer,
             owner,
             now_ms,
@@ -642,6 +674,7 @@ mod tests {
         actions.sort();
         let parent = Signed::sign(
             Grant {
+                execution_source: None,
                 version: AUTH_VERSION,
                 owner_space: resource.space.clone(),
                 scope: ResourceScope::Exact(resource.clone()),
@@ -713,7 +746,10 @@ mod tests {
         ClientAuthorizationBundle,
         SignedRemoteShareIntent,
     ) {
-        let (pins, bundle, project) = personal(1);
+        let (mut pins, bundle, project) = personal(1);
+        for pin in &mut pins {
+            pin.minimum_head = None;
+        }
         let creation = task(&pins, &bundle, &project);
         let event: Event = serde_json::from_str(&creation.canonical_body).unwrap();
         let attestation = Signed::sign(
@@ -1082,6 +1118,30 @@ mod tests {
             let [JournalEntry::Grant(grant)] = request.new_objects.as_slice() else {
                 panic!("one exact sharing leaf")
             };
+            let execution_source = grant.payload.execution_source.as_ref().unwrap();
+            assert_eq!(execution_source.project, original.intent.project);
+            assert_eq!(
+                execution_source.node_public_key,
+                original.intent.source_node_public_key
+            );
+            let mut expected_pins = source_pins.clone();
+            for pin in &mut expected_pins {
+                pin.minimum_head =
+                    Some(source.snapshot().state().head(&pin.domain).unwrap().clone());
+            }
+            assert_eq!(execution_source.pins, expected_pins);
+            assert_ne!(execution_source.pins, original.intent.saved_pins);
+            assert!(
+                execution_source
+                    .pins
+                    .iter()
+                    .all(|pin| !pins.iter().any(|owner_pin| owner_pin.domain == pin.domain))
+            );
+            grant.verify_signature().unwrap();
+            let mut tampered = grant.clone();
+            tampered.payload.execution_source.as_mut().unwrap().pins[0].genesis_root =
+                PublicKey::of(&key(99));
+            assert!(tampered.verify_signature().is_err());
             let expected = if purpose == RemoteSharePurpose::Rebind {
                 Actor::Account(original.intent.requester.clone())
             } else {

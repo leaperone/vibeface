@@ -148,6 +148,7 @@ fn initial_owner_grant(
     nonce: Nonce,
 ) -> Grant {
     Grant {
+        execution_source: None,
         version: AUTH_VERSION,
         owner_space: space.clone(),
         scope: ResourceScope::WholeSpace(space.clone()),

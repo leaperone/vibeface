@@ -1728,6 +1728,7 @@ pub(crate) mod tests {
             )?;
             let parent = Signed::sign(
                 Grant {
+                    execution_source: None,
                     version: AUTH_VERSION,
                     owner_space: executor.space.clone(),
                     scope: ResourceScope::Exact(execution.clone()),
@@ -1842,6 +1843,7 @@ pub(crate) mod tests {
             };
             let grant = Signed::sign(
                 Grant {
+                    execution_source: None,
                     version: AUTH_VERSION,
                     owner_space: project.space.clone(),
                     scope: ResourceScope::Exact(ResourceRef {
@@ -2858,6 +2860,7 @@ pub(crate) mod tests {
             .clone();
         let read_grant = Signed::sign(
             Grant {
+                execution_source: None,
                 version: AUTH_VERSION,
                 owner_space: f.project.space.clone(),
                 scope: ResourceScope::Exact(compact.project),

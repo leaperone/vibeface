@@ -3245,6 +3245,7 @@ pub(crate) mod tests {
             )?;
             let parent = Signed::sign(
                 Grant {
+                    execution_source: None,
                     version: AUTH_VERSION,
                     owner_space: executor.space.clone(),
                     scope: ResourceScope::Exact(execution_resource.clone()),
@@ -3629,6 +3630,7 @@ pub(crate) mod tests {
                 .clone();
             let grant = Signed::sign(
                 Grant {
+                    execution_source: None,
                     version: AUTH_VERSION,
                     owner_space: owner.space.clone(),
                     scope: ResourceScope::Exact(resource),
@@ -4191,6 +4193,7 @@ pub(crate) mod tests {
             let previous = self.store.policy.verified()
                 .head(&PolicyDomain::Space(self.executor.space.clone())).unwrap().clone();
             let grant = Signed::sign(Grant {
+                execution_source: None,
                 version:AUTH_VERSION, owner_space:self.executor.space.clone(),
                 scope:ResourceScope::Exact(facts.resource),
                 grantee:Grantee::Actor(Actor::Account(self.executor.account.clone())),

@@ -1074,6 +1074,7 @@ pub fn prepare_execution_service_registration(
         )?;
         let parent = Signed::sign(
             Grant {
+                execution_source: None,
                 version: AUTH_VERSION,
                 owner_space: personal.clone(),
                 scope: ResourceScope::Exact(execution_resource.clone()),

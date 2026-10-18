@@ -2542,6 +2542,7 @@ pub(crate) mod tests {
             let grant_hash = state.install_grant(
                 Signed::sign(
                     Grant {
+                        execution_source: None,
                         version: AUTH_VERSION,
                         owner_space: space.clone(),
                         scope: ResourceScope::Exact(resource.clone()),

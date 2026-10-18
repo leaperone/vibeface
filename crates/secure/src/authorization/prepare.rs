@@ -2513,6 +2513,7 @@ mod tests {
         execution_context.workspace_resource = Some(execution.resource.clone());
         let grant = Signed::sign(
             Grant {
+                execution_source: None,
                 version: AUTH_VERSION,
                 owner_space: space.clone(),
                 scope: ResourceScope::Exact(execution.clone()),

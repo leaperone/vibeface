@@ -390,9 +390,29 @@ pub fn prepare_directional_grant(
     authorization: &VerifiedClientAuthorization,
     now_ms: f64,
 ) -> crate::Result<PreparedSpaceGovernanceChange> {
+    let intent = parse(intent_json).map_err(|error| error.to_string())?;
+    prepare_directional_grant_inner(intent, None, signer, authorization, now_ms)
+}
+
+pub(super) fn prepare_execution_source_grant(
+    intent: DirectionalGrantIntent,
+    source: super::remote_share::VerifiedExecutionSourcePolicy,
+    signer: &Identity,
+    authorization: &VerifiedClientAuthorization,
+    now_ms: f64,
+) -> crate::Result<PreparedSpaceGovernanceChange> {
+    prepare_directional_grant_inner(intent, Some(source), signer, authorization, now_ms)
+}
+
+fn prepare_directional_grant_inner(
+    intent: DirectionalGrantIntent,
+    execution_source: Option<super::remote_share::VerifiedExecutionSourcePolicy>,
+    signer: &Identity,
+    authorization: &VerifiedClientAuthorization,
+    now_ms: f64,
+) -> crate::Result<PreparedSpaceGovernanceChange> {
     let _signature_scope = ScopedSignatureVerification::new();
     let build = || -> Result<_> {
-        let intent: DirectionalGrantIntent = parse(intent_json)?;
         let now = time(now_ms)?;
         let (snapshot, current) = load(authorization, &PublicKey::of(signer), now)?;
         let state = snapshot.state();
@@ -418,6 +438,7 @@ pub fn prepare_directional_grant(
                     device: target.payload.device.clone(),
                 },
                 constraints: intent.constraints,
+                execution_source: execution_source.map(|source| source.into_policy()),
                 parent: Some(current.grant_leaf.clone()),
                 remaining_delegations: intent.remaining_delegations,
                 issued_under: state
@@ -1289,6 +1310,7 @@ pub fn prepare_team_creation(
         let target = state.find_device(&DeviceId::from_key(&node))?;
         let grant = Signed::sign(
             Grant {
+                execution_source: None,
                 version: AUTH_VERSION,
                 owner_space: space.clone(),
                 scope: ResourceScope::WholeSpace(space.clone()),
@@ -2700,6 +2722,18 @@ pub(crate) mod tests {
         let JournalEntry::Grant(grant) = &prepared.request.new_objects[0] else {
             panic!("missing directional grant")
         };
+        assert!(grant.payload.execution_source.is_none());
+        let mut untrusted_source = serde_json::to_value(&grant_intent).unwrap();
+        untrusted_source["execution_source"] = serde_json::json!({"pins": []});
+        assert!(
+            prepare_directional_grant(
+                &json(&untrusted_source).unwrap(),
+                &key(3),
+                &team.authorization(),
+                NOW as f64,
+            )
+            .is_err()
+        );
         let child = grant.hash().unwrap();
         let team = team.commit(&prepared);
         let mut recipient_bundle = team.bundle.clone();
