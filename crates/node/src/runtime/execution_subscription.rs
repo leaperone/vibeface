@@ -3,7 +3,7 @@ use super::*;
 impl Runtime {
     pub(super) async fn restore_execution_subscriptions(self: &Arc<Self>) -> Result<()> {
         let _work = self.maintenance.enter()?;
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let (threads, operations) = {
             let store = self.store.lock().await;
             let mut threads = BTreeSet::new();

@@ -20,7 +20,7 @@ export function ConversationScreen() {
   const sentDrafts = useRef(new Map<string, { message_id: string; text: string }>())
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
   const text = drafts.get(conversationId) ?? ''
-  const originalEntry = !messagePending || messagePending.entry_node === workspace.info.node_id
+  const originalEntry = !messagePending || messagePending.entry_node === workspace.info.peer_id
   const jobs = data?.scheduler?.jobs ?? []
   const activeJobs = jobs.filter((job) => ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling', 'unknown'].includes(job.state))
   const visibleJobs = activeJobs.length ? activeJobs : jobs.slice(-1)

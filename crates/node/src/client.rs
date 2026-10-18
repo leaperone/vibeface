@@ -49,7 +49,8 @@ struct RecoveryChallenge {
     network_id: String,
     owner_public_key: String,
     subject_id: String,
-    target_node_id: String,
+    #[serde(rename = "target_node_id")]
+    target_peer_id: String,
     genesis_hash: String,
     nonce: String,
     expires_at_ms: i64,
@@ -241,7 +242,7 @@ async fn dispatch(
     };
     match method {
         "info" => Ok(
-            json!({"initialized":node.has_membership().await?,"node_id":node.identity.node_id()?,"public_key":node.identity.public_key_hex()?,"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION")}),
+            json!({"initialized":node.has_membership().await?,"peer_id":node.identity.peer_id()?,"public_key":node.identity.public_key_hex()?,"roles":node.config.roles,"version":env!("CARGO_PKG_VERSION")}),
         ),
         "authenticate" => {
             let authenticated = authentication(node, session).await?;
@@ -759,7 +760,7 @@ fn session_member(
 }
 fn validate_local_node(node: &Runtime, state: &NetworkState, required: bool) -> Result<()> {
     let view = state.project()?;
-    let local = view.authorize_node(&node.identity.node_id()?, None);
+    let local = view.authorize_node(&node.identity.peer_id()?, None);
     if required || local.is_ok() {
         let member = local?;
         ensure!(
@@ -827,7 +828,7 @@ async fn recovery_challenge(
     let owner_public_key = text(params, "owner_public_key")?.to_owned();
     ensure!(
         crypto::fingerprint(&owner_public_key)? == network_id,
-        "recovery root fingerprint mismatch"
+        "recovery network ID mismatch"
     );
     let genesis = if node.has_membership().await? {
         node.membership_state().await?.genesis
@@ -844,7 +845,7 @@ async fn recovery_challenge(
         network_id,
         owner_public_key,
         subject_id: session.subject_id.clone(),
-        target_node_id: node.identity.node_id()?,
+        target_peer_id: node.identity.peer_id()?,
         genesis_hash: crypto::digest(&identity::canonical_json(&genesis)?),
         nonce: random_hex(),
         expires_at_ms: crate::runtime::now_ms() + 90_000,
@@ -1068,9 +1069,9 @@ mod tests {
             for correct_target in [false, true] {
                 let destination = LocalIdentity::generate();
                 let target = if correct_target {
-                    destination.node_id()?
+                    destination.peer_id()?
                 } else {
-                    LocalIdentity::generate().node_id()?
+                    LocalIdentity::generate().peer_id()?
                 };
                 let expected_target = target.clone();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

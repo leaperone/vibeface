@@ -66,7 +66,7 @@ pub async fn status(
     trigger: &str,
 ) -> Result<Value> {
     let _work = node.maintenance.enter()?;
-    let target = node.identity.node_id()?;
+    let target = node.identity.peer_id()?;
     let mut store = node.store.lock().await;
     store.recover_scheduler_jobs(network, &target, boot_id())?;
     Ok(
@@ -104,7 +104,7 @@ pub async fn run(
     };
     let sdk_config = digest(&serde_json::to_vec(&settings)?);
     let network = access.network_id.clone();
-    let target = node.identity.node_id()?;
+    let target = node.identity.peer_id()?;
     let claimed = {
         let mut store = node.store.lock().await;
         store.authorize_node(&network, &target, Some(NodeRole::Scheduler))?;
@@ -187,7 +187,7 @@ pub async fn run(
             let sequence = progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             progress_node.publish_progress(&progress_network, json!({
                 "type":"manager_progress", "conversation_id":progress_conversation,
-                "trigger":progress_trigger, "invocation_id":progress_attempt, "source":progress_node.identity.node_id().ok(), "source_node":progress_node.identity.node_id().ok(), "sequence":sequence, "progress":progress,
+                "trigger":progress_trigger, "invocation_id":progress_attempt, "source":progress_node.identity.peer_id().ok(), "source_node":progress_node.identity.peer_id().ok(), "sequence":sequence, "progress":progress,
             }));
             async { Ok(()) }
         }).await?;

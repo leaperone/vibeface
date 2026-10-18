@@ -266,7 +266,7 @@ mod tests {
     fn publication_and_cleanup_are_atomic_and_cleanup_is_local() -> Result<()> {
         let owner = LocalIdentity::generate();
         let network = owner.fixture_network_id()?;
-        let node = owner.node_id()?;
+        let node = owner.peer_id()?;
         let mut store = Store::open(":memory:")?;
         store.install_trust_bundle(
             &network,

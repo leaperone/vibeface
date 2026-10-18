@@ -50,7 +50,7 @@ fn invite_request(
     let payload = store.create_invite(InviteRequest {
         request_id: random_id(),
         network_id: view.network_id,
-        inviter_subject_id: admin.node_id()?,
+        inviter_subject_id: admin.peer_id()?,
         epoch: view.epoch,
         capability: capability.to_owned(),
         new_kind: IdentityKind::Client,
@@ -84,15 +84,15 @@ fn bootstrap_capability_is_private_one_time_and_requires_the_named_manager() -> 
     )?)?;
     assert!(
         store
-            .bootstrap_network(state.clone(), &cap.capability, &root.node_id()?)
+            .bootstrap_network(state.clone(), &cap.capability, &root.peer_id()?)
             .is_err()
     );
     assert!(
         store
-            .bootstrap_network(state.clone(), "00".repeat(32).as_str(), &admin.node_id()?)
+            .bootstrap_network(state.clone(), "00".repeat(32).as_str(), &admin.peer_id()?)
             .is_err()
     );
-    store.bootstrap_network(state, &cap.capability, &admin.node_id()?)?;
+    store.bootstrap_network(state, &cap.capability, &admin.peer_id()?)?;
     assert!(
         store
             .bootstrap_network(
@@ -101,7 +101,7 @@ fn bootstrap_capability_is_private_one_time_and_requires_the_named_manager() -> 
                     vec![Member::client(&admin, "admin", true)?]
                 )?)?,
                 &cap.capability,
-                &admin.node_id()?
+                &admin.peer_id()?
             )
             .is_err()
     );
@@ -142,7 +142,7 @@ fn invite_pair_review_and_grant_are_exact_and_capability_is_not_a_hash() -> Resu
             .accept_pair(review.clone(), new_signature.clone())
             .is_ok()
     );
-    assert!(!store.pending_pairs(&admin.node_id()?)?.is_empty());
+    assert!(!store.pending_pairs(&admin.peer_id()?)?.is_empty());
     let inviter_signature = admin.sign_payload("identity-pair-review", &review.signing_bytes()?)?;
     let proposal = store.confirm_pair(PairConfirm {
         review: review.clone(),

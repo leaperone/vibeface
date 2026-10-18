@@ -540,7 +540,7 @@ impl Runtime {
         let scope = field(input, "conversation_id")?;
         self.require_scope(access, scope).await?;
         let network = &access.network_id;
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let binding_error = self
             .cache_context_bindings(network, scope)
             .await
@@ -1057,7 +1057,7 @@ impl Runtime {
                 .find(|request| request.operation_id == operation_id)
                 .context("operation was not dispatched by this conversation")?;
             ensure!(
-                original.target_node == self.identity.node_id()?,
+                original.target_node == self.identity.peer_id()?,
                 "operation belongs to another executor"
             );
             store.authorize_node(network, &original.target_node, Some(NodeRole::Executor))?;
@@ -1163,7 +1163,7 @@ impl Runtime {
             &original.target_node,
             Some(NodeRole::Executor),
         )?;
-        let status = if original.target_node == self.identity.node_id()? {
+        let status = if original.target_node == self.identity.peer_id()? {
             self.chat_execution_status(network, scope, &original.operation_id)
                 .await?
         } else {
@@ -1468,7 +1468,7 @@ mod tests {
         let dir = super::super::tests::fixture()?;
         let node = Arc::new(Runtime::open(&dir).await?);
         let network = super::super::tests::conversation(&node).await?;
-        let target = node.identity.node_id()?;
+        let target = node.identity.peer_id()?;
         let trigger = node
             .append(
                 &network,

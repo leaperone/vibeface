@@ -55,16 +55,16 @@ pub struct SignedSeal {
 
 /// Validate the shape that is safe to sign or accept before store-level checks.
 pub fn validate_binding(binding: &TaskBinding) -> Result<()> {
-    validate_node_id(&binding.network_id, "network_id")?;
+    validate_peer_id(&binding.network_id, "network_id")?;
     validate_text(&binding.conversation_id, "conversation_id")?;
     validate_hash(&binding.task_ref, "task_ref")?;
     validate_text(&binding.task_id, "task_id")?;
-    validate_node_id(&binding.authority_node, "authority_node")?;
+    validate_peer_id(&binding.authority_node, "authority_node")?;
     ensure!(
         binding.generation > 0,
         "binding generation must be positive"
     );
-    validate_node_id(&binding.target_node, "target_node")?;
+    validate_peer_id(&binding.target_node, "target_node")?;
     validate_text(&binding.session_id, "session_id")?;
     validate_open_spec(&binding.open_spec)?;
 
@@ -97,7 +97,7 @@ pub fn binding_hash(binding: &TaskBinding) -> Result<String> {
 pub fn sign_binding(identity: &LocalIdentity, binding: &TaskBinding) -> Result<SignedBinding> {
     validate_binding(binding)?;
     ensure!(
-        identity.node_id()? == binding.authority_node,
+        identity.peer_id()? == binding.authority_node,
         "binding authority does not match signing identity"
     );
     let payload = serde_json::to_vec(binding)?;
@@ -112,7 +112,7 @@ pub fn verify_binding(proof: &SignedBinding, authority_public_key: &str) -> Resu
     validate_signature(&proof.signature)?;
     ensure!(
         fingerprint(authority_public_key)? == proof.binding.authority_node,
-        "binding authority fingerprint mismatch"
+        "binding authority Peer ID mismatch"
     );
     verify_payload(
         authority_public_key,
@@ -125,7 +125,7 @@ pub fn verify_binding(proof: &SignedBinding, authority_public_key: &str) -> Resu
 pub fn sign_seal(identity: &LocalIdentity, seal: &BindingSeal) -> Result<SignedSeal> {
     validate_seal(seal)?;
     ensure!(
-        identity.node_id()? == seal.target_node,
+        identity.peer_id()? == seal.target_node,
         "seal target does not match signing identity"
     );
     let payload = serde_json::to_vec(seal)?;
@@ -140,7 +140,7 @@ pub fn verify_seal(proof: &SignedSeal, target_public_key: &str) -> Result<()> {
     validate_signature(&proof.signature)?;
     ensure!(
         fingerprint(target_public_key)? == proof.seal.target_node,
-        "seal target fingerprint mismatch"
+        "seal target Peer ID mismatch"
     );
     verify_payload(
         target_public_key,
@@ -151,9 +151,9 @@ pub fn verify_seal(proof: &SignedSeal, target_public_key: &str) -> Result<()> {
 }
 
 pub fn validate_seal(seal: &BindingSeal) -> Result<()> {
-    validate_node_id(&seal.network_id, "network_id")?;
+    validate_peer_id(&seal.network_id, "network_id")?;
     validate_hash(&seal.binding_hash, "binding_hash")?;
-    validate_node_id(&seal.target_node, "target_node")?;
+    validate_peer_id(&seal.target_node, "target_node")?;
     Ok(())
 }
 
@@ -191,7 +191,7 @@ fn validate_text(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_node_id(value: &str, field: &str) -> Result<()> {
+fn validate_peer_id(value: &str, field: &str) -> Result<()> {
     ensure!(
         is_lower_hex_64(value),
         "{field} must be a 64-character hexadecimal id"
@@ -234,7 +234,7 @@ mod tests {
             conversation_id: "conversation".into(),
             task_ref: "c".repeat(64),
             task_id: "task-1".into(),
-            authority_node: authority.node_id().unwrap(),
+            authority_node: authority.peer_id().unwrap(),
             generation: 1,
             target_node: node,
             session_id: "session-1".into(),
@@ -265,7 +265,7 @@ mod tests {
         let seal = BindingSeal {
             network_id: "a".repeat(64),
             binding_hash: "c".repeat(64),
-            target_node: target.node_id()?,
+            target_node: target.peer_id()?,
             final_revision: 1,
         };
         let mut proof = sign_seal(&target, &seal)?;

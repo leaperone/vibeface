@@ -20,12 +20,12 @@ const roleLabels: Record<NodeRole, string> = {
 const nodeRoles: NodeRole[] = ['relay', 'replica', 'gateway', 'scheduler', 'executor']
 
 function entryKey(entry: ConnectionEntry) {
-  return `${entry.address}|${entry.node_id}|${entry.relay}`
+  return `${entry.address}|${entry.peer_id}|${entry.relay}`
 }
 
 function MemberDetails({ member, compact = false }: { member: Member; compact?: boolean }) {
   const fingerprints = <dl className="grid gap-3 text-xs">
-    <div className="space-y-1"><dt className="text-muted-foreground">完整设备指纹</dt><dd className="break-all font-mono">{member.subject_id}</dd></div>
+    <div className="space-y-1"><dt className="text-muted-foreground">完整设备编号</dt><dd className="break-all font-mono">{member.subject_id}</dd></div>
     <div className="space-y-1"><dt className="text-muted-foreground">公钥</dt><dd className="break-all font-mono">{member.public_key}</dd></div>
   </dl>
   return <div className="min-w-0 space-y-3">
@@ -36,7 +36,7 @@ function MemberDetails({ member, compact = false }: { member: Member; compact?: 
     </div>
     {member.kind === 'node' && <p className="text-xs text-muted-foreground">角色：{member.node_roles.map((role) => roleLabels[role]).join('、') || '无'}</p>}
     {compact ? <Collapsible>
-      <CollapsibleTrigger asChild><Button variant="ghost" className="h-auto min-h-9 gap-2 px-0 text-xs text-muted-foreground [&[data-state=open]>svg]:rotate-180" type="button">设备指纹与公钥<ChevronDown className="size-3 transition-transform" /></Button></CollapsibleTrigger>
+      <CollapsibleTrigger asChild><Button variant="ghost" className="h-auto min-h-9 gap-2 px-0 text-xs text-muted-foreground [&[data-state=open]>svg]:rotate-180" type="button">设备编号与公钥<ChevronDown className="size-3 transition-transform" /></Button></CollapsibleTrigger>
       <CollapsibleContent className="pt-2">{fingerprints}</CollapsibleContent>
     </Collapsible> : fingerprints}
   </div>
@@ -52,7 +52,7 @@ export function DeviceControls() {
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
   const [address, setAddress] = useState('')
-  const [nodeId, setNodeId] = useState('')
+  const [peerId, setPeerId] = useState('')
   const [relay, setRelay] = useState(false)
   const [inviteKind, setInviteKind] = useState<'client' | 'node'>('client')
   const [roles, setRoles] = useState<NodeRole[]>(['relay'])
@@ -117,7 +117,7 @@ export function DeviceControls() {
         {pairs.map((pair) => <li key={pair.request_id} className="space-y-4 rounded-lg bg-muted/40 p-4">
           <MemberDetails member={pair.review.new_member} />
           {!pair.new_subject_signature ? <p role="status" className="text-sm text-muted-foreground">等待新设备核对并确认。</p> : currentReview?.request_id === pair.request_id ? <div className="space-y-3">
-            <p className="text-sm">请与新设备核对完整指纹、类型和角色。</p>
+            <p className="text-sm">请与新设备核对完整设备编号、类型和角色。</p>
             <dl className="grid gap-3 text-xs"><div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono">{pair.review.network_id}</dd></div><div className="space-y-1"><dt className="text-muted-foreground">邀请管理设备</dt><dd className="break-all font-mono">{pair.review.inviter_subject_id}</dd></div></dl>
             <label className="flex min-h-11 items-start gap-2 text-sm"><input className="mt-1" type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.target.checked)} />我已通过可信渠道核对以上设备信息</label>
             <div className="flex flex-wrap gap-2">
@@ -181,7 +181,7 @@ export function DeviceControls() {
               <legend className="mb-2 text-sm font-medium">节点角色</legend>
               {nodeRoles.map((role) => <label key={role} className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" checked={roles.includes(role)} disabled={role === 'relay' || (role === 'replica' && needsReplica)} onChange={(event) => { toggleRole(role, event.target.checked); setInvitation('') }} />{roleLabels[role]}{role === 'relay' ? '（节点连接必需）' : role === 'replica' && needsReplica ? '（所选角色必需）' : ''}</label>)}
             </fieldset>}
-            <p className="text-xs text-muted-foreground">新设备不含管理权限。双方仍需核对指纹并确认配对。</p>
+            <p className="text-xs text-muted-foreground">新设备不含管理权限。双方仍需核对设备编号并确认配对。</p>
             <Button type="submit" className={button} disabled={busy}>生成邀请</Button>
           </form>
           {invitation && <div className="space-y-3 rounded-lg bg-muted/50 p-3">
@@ -201,7 +201,7 @@ export function DeviceControls() {
           {entries.length > 0 && <ul className="space-y-3">
             {entries.map((entry) => <li key={entryKey(entry)} className="space-y-3 rounded-lg bg-muted/50 p-3">
               <p className="break-all text-sm">{entry.address}<span className="ml-2 text-xs text-muted-foreground">{entry.relay ? '中继' : '直连'}</span></p>
-              <p className="break-all font-mono text-xs text-muted-foreground">{entry.node_id}</p>
+              <p className="break-all font-mono text-xs text-muted-foreground">{entry.peer_id}</p>
               <div className="flex flex-wrap gap-2">
                 <Button type="button" variant="outline" className={button} disabled={busy || (ready !== null && entryKey(entry) === entryKey(ready.entry))} onClick={() => void run(() => device.connect(entry))}>
                   {ready && entryKey(entry) === entryKey(ready.entry) ? '当前入口' : '连接'}
@@ -217,13 +217,13 @@ export function DeviceControls() {
             event.preventDefault()
             setError('')
             try {
-              device.saveEntry({ address: address.trim(), node_id: nodeId.trim(), relay })
-              setAddress(''); setNodeId(''); setRelay(false); setStatus('入口已保存。')
-            } catch (failure: unknown) { setError(failure instanceof Error ? failure.message : '无法保存入口，请检查地址和指纹。') }
+              device.saveEntry({ address: address.trim(), peer_id: peerId.trim(), relay })
+              setAddress(''); setPeerId(''); setRelay(false); setStatus('入口已保存。')
+            } catch (failure: unknown) { setError(failure instanceof Error ? failure.message : '无法保存入口，请检查地址和设备编号。') }
           }}>
             <h3 className="text-sm font-medium">添加入口</h3>
             <label className="grid gap-2 text-sm">入口地址<Input className={input} type="url" name="entry-address" autoComplete="url" required placeholder="http://192.168.0.99:4790" value={address} onChange={(event) => setAddress(event.target.value)} /></label>
-            <label className="grid gap-2 text-sm">目标节点完整指纹<Input className={`${input} font-mono`} name="entry-node-id" autoComplete="off" autoCapitalize="none" spellCheck={false} pattern="[a-f0-9]{64}" title="填写 64 位小写十六进制设备指纹" required value={nodeId} onChange={(event) => setNodeId(event.target.value)} /></label>
+            <label className="grid gap-2 text-sm">Peer ID<Input className={`${input} font-mono`} name="entry-peer-id" autoComplete="off" autoCapitalize="none" spellCheck={false} pattern="[a-f0-9]{64}" title="填写 64 位小写十六进制设备编号" required value={peerId} onChange={(event) => setPeerId(event.target.value)} /></label>
             <label className="flex min-h-11 items-center gap-2 text-sm"><input type="checkbox" checked={relay} onChange={(event) => setRelay(event.target.checked)} />通过入口中继到目标节点</label>
             <Button type="submit" className={button} disabled={busy}>保存入口</Button>
           </form>
@@ -238,11 +238,11 @@ export function DeviceControls() {
           <dl className="grid gap-3 text-xs">
             <div className="space-y-1"><dt className="text-muted-foreground">个人网络</dt><dd className="break-all font-mono">{directory?.network_id || ready?.principal.network_id || '尚未连接'}</dd></div>
             {directory && <div className="space-y-1"><dt className="text-muted-foreground">授权版本</dt><dd>{directory.epoch}</dd></div>}
-            <div className="space-y-1"><dt className="text-muted-foreground">此浏览器的设备指纹</dt><dd className="break-all font-mono">{identity?.nodeId || '正在读取'}</dd></div>
+            <div className="space-y-1"><dt className="text-muted-foreground">此浏览器的设备编号</dt><dd className="break-all font-mono">{identity?.peerId || '正在读取'}</dd></div>
             <div className="space-y-1"><dt className="text-muted-foreground">此浏览器的公钥</dt><dd className="break-all font-mono">{identity?.publicKey || '正在读取'}</dd></div>
             {ready && <>
               <div className="space-y-1"><dt className="text-muted-foreground">入口地址</dt><dd className="break-all">{ready.entry.address}{ready.entry.relay ? ' · 经中继连接' : ' · 直接连接'}</dd></div>
-              <div className="space-y-1"><dt className="text-muted-foreground">目标节点指纹</dt><dd className="break-all font-mono">{ready.entry.node_id}</dd></div>
+              <div className="space-y-1"><dt className="text-muted-foreground">Peer ID</dt><dd className="break-all font-mono">{ready.entry.peer_id}</dd></div>
             </>}
           </dl>
           {ready && <Button type="button" variant="outline" className={button} disabled={busy} onClick={() => device.disconnect()}>断开连接</Button>}

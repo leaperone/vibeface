@@ -374,7 +374,7 @@ impl Runtime {
     }
 
     async fn poll_watched_schedules(self: &Arc<Self>) -> Result<()> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let mut watched = Vec::new();
         {
             let mut store = self.store.lock().await;
@@ -470,7 +470,7 @@ impl Runtime {
     }
 
     async fn schedule_delivery_tick(self: &Arc<Self>) -> Result<()> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let networks = self.store.lock().await.networks()?;
         for network in networks {
             if self.config.roles.contains(&NodeRole::Scheduler) {
@@ -629,7 +629,7 @@ impl Runtime {
     }
 
     async fn drain_schedule(self: &Arc<Self>, network: &str, scope: &str) -> Result<()> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         loop {
             let Some(trigger) = self
                 .store
@@ -676,7 +676,7 @@ impl Runtime {
     }
 
     async fn select_chat_scheduler(&self, network: &str, scope: &str) -> Result<String> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let (preferred, local_available, mut candidates) = {
             let store = self.store.lock().await;
             let preferred = store
@@ -767,7 +767,7 @@ impl Runtime {
         self.require_scope(access, &scope).await?;
         self.require_role(network, NodeRole::Gateway).await?;
         let message_id = id(input, "message_id")?;
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         if let Some(entry) = input.get("entry_node") {
             ensure!(
                 entry.as_str() == Some(local.as_str()),
@@ -856,7 +856,7 @@ impl Runtime {
             input["version"].as_u64() == Some(u64::from(SCHEDULING_VERSION)),
             "reliable scheduling protocol version 1 is required; upgrade the sender"
         );
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         ensure!(
             input["target_node"].as_str() == Some(local.as_str()),
             "wrong scheduling target"
@@ -938,7 +938,7 @@ impl Runtime {
         trigger: &str,
     ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let mut store = self.store.lock().await;
         store.recover_scheduler_jobs(network, &local, crate::scheduler::boot_id())?;
         let mut jobs = Vec::new();
@@ -1247,7 +1247,7 @@ impl Runtime {
         network: &str,
         scope: &str,
     ) -> Result<Vec<Value>> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let mut store = self.store.lock().await;
         register_observation(&mut store, network, scope, now_ms())?;
         let mut jobs = store
@@ -1337,7 +1337,7 @@ impl Runtime {
         result_hash: &str,
     ) -> Result<bool> {
         let _work = self.maintenance.enter()?;
-        if request.target_node != self.identity.node_id()?
+        if request.target_node != self.identity.peer_id()?
             || (request.task_id.is_none() && request.manager_authority.is_none())
             || (request.task_id.is_none()
                 && request.action["type"] == "open"
@@ -1374,7 +1374,7 @@ impl Runtime {
     }
 
     async fn flush_followup_markers(self: &Arc<Self>, network: &str) -> Result<()> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let operations = self.store.lock().await.operations(network)?;
         for operation in operations.into_iter().filter(|operation| {
             operation.state.terminal() && operation.request.target_node == local
@@ -1401,7 +1401,7 @@ impl Runtime {
         request: &OperationRequest,
         result_hash: &str,
     ) -> Result<()> {
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         {
             let mut store = self.store.lock().await;
             let policy = store.execution_result_policy(
@@ -1509,8 +1509,8 @@ mod tests {
             let network = membership.genesis.network_id.clone();
             source.install_membership(membership.clone()).await?;
             target.install_membership(membership).await?;
-            let local = source.identity.node_id()?;
-            let target_id = target.identity.node_id()?;
+            let local = source.identity.peer_id()?;
+            let target_id = target.identity.peer_id()?;
             let entry = {
                 let mut store = source.store.lock().await;
                 store.append_event(
@@ -2009,7 +2009,7 @@ mod tests {
                 ],
             )?,
         )?;
-        let target = manager.node_id()?;
+        let target = manager.peer_id()?;
         store.append_event(
             &gateway,
             &network,
@@ -2033,7 +2033,7 @@ mod tests {
             vec![],
             2,
         )?;
-        let entries = observation_entries(&store, &network, "chat", &viewer.node_id()?)?;
+        let entries = observation_entries(&store, &network, "chat", &viewer.peer_id()?)?;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].trigger, message.hash);
         assert_eq!(entries[0].target_node, target);
@@ -2052,7 +2052,7 @@ mod tests {
             observed_job_value(&store, &entries[0], &job)?["message_id"],
             "human"
         );
-        job.target_node = viewer.node_id()?;
+        job.target_node = viewer.peer_id()?;
         assert!(observed_job_value(&store, &entries[0], &job).is_err());
         let mut revoked = gateway.certificate(vec![NodeRole::Gateway, NodeRole::Replica])?;
         revoked.revoked = true;
@@ -2069,10 +2069,10 @@ mod tests {
         )?;
         assert!(
             store
-                .authorize_node(&network, &gateway.node_id()?, None)
+                .authorize_node(&network, &gateway.peer_id()?, None)
                 .is_err()
         );
-        let historical = observation_entries(&store, &network, "chat", &viewer.node_id()?)?;
+        let historical = observation_entries(&store, &network, "chat", &viewer.peer_id()?)?;
         assert_eq!(historical[0].trigger, message.hash);
         job.target_node = target.clone();
         assert_eq!(

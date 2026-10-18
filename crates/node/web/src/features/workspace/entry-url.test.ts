@@ -34,16 +34,16 @@ test("missing integrity fields fail closed instead of authorizing writes", () =>
 })
 test("nodeName prefers rpc and directory names over truncated peer ids", () => {
   const id = "a".repeat(64)
-  assert.equal(nodeName(id, { nodes: [{ node_id: id, name: "Mac Studio", local: false, online: true, revoked: false, roles: [] }] }), "Mac Studio")
+  assert.equal(nodeName(id, { nodes: [{ peer_id: id, name: "Mac Studio", local: false, online: true, revoked: false, roles: [] }] }), "Mac Studio")
   assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, heads: [], members: [{ subject_id: id, public_key: id, kind: "node", name: "工作机", node_roles: [], manage: false }], revoked: [] } }), "工作机")
   assert.equal(nodeName(id), `${id.slice(0, 10)}…`)
 })
 
 test("capabilities parse the actual provider name and reject malformed node lists", () => {
-  const nodes = parseNodes({ nodes: [{ node_id: "n", name: "本机", local: true, online: true, revoked: false, roles: ["scheduler"], capabilities: { manager: "cursor_agent", executors: ["codex"], roots: ["/project"] } }] })
+  const nodes = parseNodes({ nodes: [{ peer_id: "n", name: "本机", local: true, online: true, revoked: false, roles: ["scheduler"], capabilities: { manager: "cursor_agent", executors: ["codex"], roots: ["/project"] } }] })
   assert.equal(nodes[0]?.name, "本机")
   assert.equal(nodes[0]?.capabilities?.manager, "cursor_agent")
-  assert.throws(() => parseNodes({ nodes: [{ node_id: "n" }] }))
+  assert.throws(() => parseNodes({ nodes: [{ peer_id: "n" }] }))
 })
 test("only the exact executor operation can settle a pending write", () => {
   const operation = { request, state: "succeeded", result: {} }
@@ -173,9 +173,9 @@ test("workspace persists exact bot creation, routed messages and execution appro
   let createMode: "unknown" | "rejected" | "success" = "unknown"
   let knownBots: ReturnType<typeof parseBot>[] = [bot]
   const connection: ReadyConnection = {
-    generation: 1, entry: { node_id: "gateway", address: "https://node.example", relay: false },
+    generation: 1, entry: { peer_id: "gateway", address: "https://node.example", relay: false },
     principal: { network_id: "network", subject_id: "client", epoch: 1, can_manage: true },
-    info: { node_id: "gateway", public_key: "key", version: "test", roles: ["gateway"], initialized: true },
+    info: { peer_id: "gateway", public_key: "key", version: "test", roles: ["gateway"], initialized: true },
     isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async () => { throw new Error("unexpected request") },
     async rpc(method, body = {}) {
       if (method === "nodes") return { nodes: [] }
@@ -248,9 +248,9 @@ test("workspace persists exact bot creation, routed messages and execution appro
     await state.sendMessage("work")
     assert.deepEqual(messages[1], { ...messages[0], scheduler_node: "chosen" })
     await assert.rejects(render().sendMessage("different work"), /原消息/)
-    connection.entry.node_id = "other-gateway"
+    connection.entry.peer_id = "other-gateway"
     await assert.rejects(render().sendMessage("work"), /原入口/)
-    connection.entry.node_id = "gateway"
+    connection.entry.peer_id = "gateway"
     await assert.rejects(state.executionControl("execution", { type: "respond_request", request_id: 7, response: { decision: "decline" } }), /connection lost/)
     state = render()
     assert.equal(state.pending.length, 1)
@@ -533,7 +533,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
   const workspace = () => { const owner = generation; return {
     generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [], pending: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
-    info: { node_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
+    info: { peer_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
   const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, './protocol': { canSend, composerHint } })
@@ -575,7 +575,7 @@ test("an old action completion cannot clear a new generation's busy state", asyn
 test("pending-operation results are shown only for the connection that checked the original ID", async () => {
   let generation = 1, work = pendingResult()
   const operation = { operation_id: 'original', target_node: 'executor', conversation_id: 'chat', session_id: 'session' }
-  const workspace = () => { const owner = generation; return { generation: owner, isCurrent: () => owner === generation, nodes: [{ node_id: 'executor', online: true, revoked: false }], connectionOnline: true,
+  const workspace = () => { const owner = generation; return { generation: owner, isCurrent: () => owner === generation, nodes: [{ peer_id: 'executor', online: true, revoked: false }], connectionOnline: true,
     reconcile: () => work.promise, run: (action: () => Promise<void>) => action() } }
   let currentWorkspace = workspace()
   const app = componentHarness('./execution-activity.tsx', { './context': { useWorkspace: () => currentWorkspace }, './reconcile': { reconcileDecision }, './labels': { stateLabel: (state: string) => state } })
@@ -595,8 +595,8 @@ test("pending-operation results are shown only for the connection that checked t
 test("connection form keeps current errors and busy ownership when an earlier connection is cancelled", async () => {
   let generation = 1, work = pendingResult(), synchronousFailure = false
   const device = {
-    connectionGeneration: () => generation, entries: [{ address: 'https://node.example', node_id: 'target', relay: true }], initialInvitation: '',
-    identity: { nodeId: 'browser' }, phase: 'disconnected', error: '',
+    connectionGeneration: () => generation, entries: [{ address: 'https://node.example', peer_id: 'target', relay: true }], initialInvitation: '',
+    identity: { peerId: 'browser' }, phase: 'disconnected', error: '',
     connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
   }
   const app = componentHarness('../identity/connection-screen.tsx', { './context': { useDevice: () => device }, './connection-lane': { primaryLane }, '@/lib/node': { messageOf: (cause: Error) => cause.message } })
@@ -644,7 +644,7 @@ test("artifact reads retain their offset while old responses cannot append or un
 for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears submitted fields before waiting and preserves replacement fields`, async () => {
   let generation = 1, work = pendingResult(), resets = 0
   class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
-  const fields = new Map(['bundle', 'password', 'old_password', 'confirmation', 'name', 'bootstrap', 'address', 'node_id', 'relay'].map(name => [name, new Input()]))
+  const fields = new Map(['bundle', 'password', 'old_password', 'confirmation', 'name', 'bootstrap', 'address', 'peer_id', 'relay'].map(name => [name, new Input()]))
   const form = { elements: { namedItem: (name: string) => fields.get(name) }, reset() { resets++; for (const field of fields.values()) field.value = '' } }
   const device = { connectionGeneration: () => generation, ready: null, review: null, entry: null,
     beginRecovery: () => { generation++; return work.promise }, reencrypt: () => work.promise }
@@ -677,7 +677,7 @@ for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears subm
 test("an outstanding clipboard permission cannot keep new device controls busy or release another action", async () => {
   let generation = 1, creation = pendingResult()
   const clipboard = pendingResult()
-  const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', node_id: 'target', relay: true } } }
+  const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', peer_id: 'target', relay: true } } }
   const device = { connectionGeneration: () => generation, ready: ready(), identity: null, entries: [], directory: null, pairs: [], refreshDirectory: async () => {}, createInvitation: () => creation.promise }
   const app = componentHarness('../identity/device-controls.tsx', { './context': { useDevice: () => device } }, { navigator: { clipboard: { writeText: () => clipboard.promise } } })
   const render = () => app.render('DeviceControls')
@@ -698,4 +698,23 @@ test("an outstanding clipboard permission cannot keep new device controls busy o
     assert.equal(button()?.disabled, false)
     assert.equal(render().some(({ props }) => props.children === '邀请已生成，请通过可信渠道发送。'), true)
   } finally { app.close() }
+})
+
+test("Peer ID boundaries read old connections and reject conflicting identifiers", () => {
+  const id = "ab".repeat(32), other = "cd".repeat(32)
+  const transportSource = readFileSync(new URL("../../../transport.js", import.meta.url), "utf8")
+    .replace(/^import[^\n]+\n/, "").replace(/\bexport /g, "")
+  const transport = new Script(`${transportSource}\n({readPeerId, validEndpoint, validTarget})`).runInNewContext({ TextEncoder, TextDecoder, URL, location: { protocol: "https:" } })
+  const source = readFileSync(new URL("../../lib/node.ts", import.meta.url), "utf8")
+  const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS } }).outputText
+  const parsers = new Script(`(function(require, exports) { ${compiled}\nreturn exports })`).runInNewContext()(() => transport, {})
+  for (const fields of [{ node_id: id }, { peer_id: id }, { node_id: id, peer_id: id }]) {
+    assert.equal(parsers.parseEntry({ address: "https://node.example", relay: false, ...fields }).peer_id, id)
+    assert.equal(parsers.parseInfo({ public_key: other, version: "1", roles: ["replica"], initialized: true, ...fields }).peer_id, id)
+    assert.equal(parsers.parseInvitation({ url: "https://node.example", capability: "bootstrap", ...fields }).entry.peer_id, id)
+    assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: ["replica"], ...fields }] })[0].peer_id, id)
+  }
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", relay: false, node_id: id, peer_id: other }), /设备编号不一致/)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", relay: false, peer_id: "invalid" }), /64 位/)
+  assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, roles: [], node_id: id, peer_id: other }] }), /设备编号不一致/)
 })

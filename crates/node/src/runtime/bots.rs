@@ -63,7 +63,7 @@ impl Runtime {
             "wrong personal network"
         );
         let store = self.store.lock().await;
-        store.authorize_node(&access.network_id, &self.identity.node_id()?, None)?;
+        store.authorize_node(&access.network_id, &self.identity.peer_id()?, None)?;
         let bots = store
             .bots(&access.network_id)?
             .into_iter()
@@ -94,7 +94,7 @@ impl Runtime {
                 }),
             "Bot project must use an absolute directory without parent components"
         );
-        if project.target_node == self.identity.node_id()? {
+        if project.target_node == self.identity.peer_id()? {
             ensure!(
                 self.config.roles.contains(&NodeRole::Executor),
                 "project Node execution capability is disabled"

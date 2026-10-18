@@ -273,7 +273,7 @@ pub(super) fn execution_progress(event: &Value) -> Value {
 impl Runtime {
     /// Only locally produced progress enters this ring. Proxied reads use events.send directly.
     pub(crate) fn publish_progress(&self, network: &str, mut payload: Value) {
-        let Ok(source) = self.identity.node_id() else {
+        let Ok(source) = self.identity.peer_id() else {
             return;
         };
         payload["source_node"] = json!(source);
@@ -320,7 +320,7 @@ impl Runtime {
     ) -> Result<ObservationGuard> {
         ensure!(access.human, "progress observation requires a client");
         self.require_scope(access, scope).await?;
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         let targets = targets
             .into_iter()
             .filter(|target| target != &local)
@@ -399,7 +399,7 @@ impl Runtime {
                 .is_none_or(|cursor| cursor.generation.len() <= 64),
             "invalid progress cursor"
         );
-        let source = self.identity.node_id()?;
+        let source = self.identity.peer_id()?;
         let mut state = self
             .observation
             .lock()
@@ -536,7 +536,7 @@ impl Runtime {
         {
             let store = self.store.lock().await;
             store.authorize_node(&stream.network, &stream.source, None)?;
-            store.authorize_node(&stream.network, &self.identity.node_id()?, None)?;
+            store.authorize_node(&stream.network, &self.identity.peer_id()?, None)?;
         }
         {
             let mut state = self

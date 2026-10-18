@@ -27,7 +27,7 @@ fn main() -> Result<()> {
                     if let Some(secret) = input.get("secret_hex").and_then(Value::as_str) {
                         identity = Identity::from_secret_hex(secret)?;
                     }
-                    json!({"public_key":identity.public_key_hex(),"node_id":identity.node_id()})
+                    json!({"public_key":identity.public_key_hex(),"peer_id":identity.peer_id()})
                 }
                 "recovery_seal" => json!(hex::encode(vibeface_secure::recovery_seal(
                     &bytes(&input)?,

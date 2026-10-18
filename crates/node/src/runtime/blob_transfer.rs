@@ -423,7 +423,7 @@ impl Runtime {
         );
         let view = self.identities.public_state()?.project()?;
         ensure!(view.network_id == network, "wrong personal network");
-        let local = self.identity.node_id()?;
+        let local = self.identity.peer_id()?;
         view.authorize_node(&local, Some(NodeRole::Replica))?;
         view.authorize_node(source, Some(NodeRole::Replica))?;
         store.authorize_node(network, &local, Some(NodeRole::Replica))?;
@@ -662,7 +662,7 @@ impl Runtime {
         let next = BlobTransfer::receiving(&previous.blob, source, offset);
         let mut store = self.store.lock().await;
         self.authorize_blob_source(&store, network, source)?;
-        store.advance_blob_transfer(network, &self.identity.node_id()?, previous, &next)?;
+        store.advance_blob_transfer(network, &self.identity.peer_id()?, previous, &next)?;
         test_boundary("offset_committed");
         tracing::trace!(network,hash=%previous.blob.hash,source,committed_offset=offset,part_length,"history blob committed");
         Ok(next)
@@ -707,7 +707,7 @@ impl Runtime {
                 let source = sources
                     .first()
                     .context("blob unavailable from authorized replicas")?;
-                self.reserve_blob_transfer(lease, blob, &source.node_id)
+                self.reserve_blob_transfer(lease, blob, &source.peer_id)
                     .await?
             }
         };
@@ -723,10 +723,10 @@ impl Runtime {
             let source = sources
                 .iter()
                 .find(|source| {
-                    self.authorize_blob_source_for_current(network, &source.node_id)
+                    self.authorize_blob_source_for_current(network, &source.peer_id)
                         .is_ok()
                 })
-                .map(|source| source.node_id.as_str())
+                .map(|source| source.peer_id.as_str())
                 .unwrap_or(&source_node_id);
             transfer = self
                 .commit_blob_progress(network, &transfer, source, offset, part_length)
@@ -740,7 +740,7 @@ impl Runtime {
         let mut ordered: Vec<_> = sources
             .iter()
             .filter(|source| !source.failed)
-            .map(|source| source.node_id.as_str())
+            .map(|source| source.peer_id.as_str())
             .collect();
         if let Some(index) = ordered.iter().position(|source| *source == bound_source) {
             ordered.rotate_left(index);
@@ -897,7 +897,7 @@ impl Runtime {
             self.authorize_blob_source(&store, network, &source)?;
             store.publish_blob_transfer(
                 network,
-                &self.identity.node_id()?,
+                &self.identity.peer_id()?,
                 blob,
                 &source,
                 &bytes,
@@ -916,7 +916,7 @@ impl Runtime {
             self.config.roles.contains(&NodeRole::Replica) && view.network_id == network,
             "replica network unavailable"
         );
-        view.authorize_node(&self.identity.node_id()?, Some(NodeRole::Replica))?;
+        view.authorize_node(&self.identity.peer_id()?, Some(NodeRole::Replica))?;
         view.authorize_node(source, Some(NodeRole::Replica))?;
         Ok(())
     }
@@ -948,7 +948,7 @@ mod tests {
         blob: &BlobRef,
     ) -> Result<(BlobLease, BlobTransfer)> {
         let lease = node.blob_staging.lease(BlobKey::new(network, blob)?).await;
-        node.reserve_blob_transfer(lease, blob, &node.identity.node_id()?)
+        node.reserve_blob_transfer(lease, blob, &node.identity.peer_id()?)
             .await
     }
 
@@ -992,7 +992,7 @@ mod tests {
     #[tokio::test]
     async fn staging_quota_counts_all_networks_and_cleanup_at_exact_byte_limit() -> Result<()> {
         let (dir, node, network) = node().await?;
-        let source = node.identity.node_id()?;
+        let source = node.identity.peer_id()?;
         let foreign = crypto::digest(b"former personal network");
         for index in 0..4 {
             let reserved = quota_blob(&format!("full-reservation-{index}"), MAX_BLOB_BYTES as u64);
@@ -1049,7 +1049,7 @@ mod tests {
                     &existing,
                     TransferPhase::Receiving {
                         committed_offset: 0,
-                        source_node_id: node.identity.node_id()?,
+                        source_node_id: node.identity.peer_id()?,
                     },
                 )
                 .await?;
@@ -1106,7 +1106,7 @@ mod tests {
                     &reserved,
                     TransferPhase::Receiving {
                         committed_offset: 0,
-                        source_node_id: node.identity.node_id()?,
+                        source_node_id: node.identity.peer_id()?,
                     },
                 )
                 .await?;
@@ -1303,7 +1303,7 @@ mod tests {
             .commit_blob_progress(
                 &network,
                 &manifest,
-                &node.identity.node_id()?,
+                &node.identity.peer_id()?,
                 split as u64,
                 length,
             )
@@ -1330,7 +1330,7 @@ mod tests {
             "short files are truncated, never zero-filled to old offset"
         );
         let _ = node
-            .commit_blob_progress(&network, &manifest, &node.identity.node_id()?, 0, length)
+            .commit_blob_progress(&network, &manifest, &node.identity.peer_id()?, 0, length)
             .await?;
         drop(writer);
         let path = dir
@@ -1378,7 +1378,7 @@ mod tests {
             let dir = super::super::tests::fixture_under("network-reliability")?;
             replicas.push(Arc::new(Runtime::open(&dir).await?));
         }
-        replicas.sort_by_key(|node| node.identity.node_id().unwrap());
+        replicas.sort_by_key(|node| node.identity.peer_id().unwrap());
         let receiver_dir = super::super::tests::fixture_under("network-reliability")?;
         let receiver = Arc::new(Runtime::open(&receiver_dir).await?);
         let owner = LocalIdentity::generate();
@@ -1405,7 +1405,7 @@ mod tests {
             .blob_staging
             .lease(BlobKey::new(&network, &blob)?)
             .await;
-        let retired_id = retired.node_id()?;
+        let retired_id = retired.peer_id()?;
         let (lease, manifest) = receiver
             .reserve_blob_transfer(lease, &blob, &retired_id)
             .await?;
@@ -1419,7 +1419,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "rebound".into(),
-            author: receiver.identity.node_id()?,
+            author: receiver.identity.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![],
@@ -1519,7 +1519,7 @@ mod tests {
         let mut updates = receiver.events.subscribe();
         let node = receiver.clone();
         let scope = network.clone();
-        let source_id = replicas[0].identity.node_id()?;
+        let source_id = replicas[0].identity.peer_id()?;
         let proof = tokio::spawn(async move {
             node.fetch_closure(&scope, "rebound", &source_id, &[event.hash])
                 .await
@@ -1682,16 +1682,16 @@ mod tests {
             .commit_blob_progress(
                 &network,
                 &manifest,
-                &node.identity.node_id()?,
+                &node.identity.peer_id()?,
                 blob.size,
                 length,
             )
             .await?;
         node.store.lock().await.publish_blob_transfer(
             &network,
-            &node.identity.node_id()?,
+            &node.identity.peer_id()?,
             &blob,
-            &node.identity.node_id()?,
+            &node.identity.peer_id()?,
             BODY,
         )?;
         let path = dir
@@ -1761,7 +1761,7 @@ mod tests {
             .commit_blob_progress(
                 &network,
                 &manifest,
-                &node.identity.node_id()?,
+                &node.identity.peer_id()?,
                 blob.size,
                 length,
             )

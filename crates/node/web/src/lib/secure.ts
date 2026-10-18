@@ -17,17 +17,17 @@ export function verifyAuthentication(value: unknown, own: PublicIdentity, expect
   const auth = record(value)
   const principal = parsePrincipal(auth.principal)
   const state = record(auth.state)
-  if (principal.subject_id !== own.nodeId || expected && principal.network_id !== expected.networkId) throw new Error('认证返回的个人网络或浏览器身份不一致。')
+  if (principal.subject_id !== own.peerId || expected && principal.network_id !== expected.networkId) throw new Error('认证返回的个人网络或浏览器身份不一致。')
   if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !same(state.checkpoint, expected.checkpoint))) throw new Error('认证返回的根授权与本地确认的记录不一致。')
   const owner = expected?.kind === 'root' ? expected.ownerPublicKey : text(record(state.genesis).owner_public_key)
   const view = verifiedView(state, expected?.networkId ?? principal.network_id, owner)
-  const member = view.members.find(item => item.subject_id === own.nodeId)
-  if (!member || view.revoked.includes(own.nodeId) || member.public_key !== own.publicKey || member.kind !== 'client' || principal.epoch !== view.epoch || principal.can_manage !== member.manage || !same(auth.view, view)) throw new Error('设备授权与已签名的成员记录不一致。')
+  const member = view.members.find(item => item.subject_id === own.peerId)
+  if (!member || view.revoked.includes(own.peerId) || member.public_key !== own.publicKey || member.kind !== 'client' || principal.epoch !== view.epoch || principal.can_manage !== member.manage || !same(auth.view, view)) throw new Error('设备授权与已签名的成员记录不一致。')
   return { auth, principal, view }
 }
 export function verifyRecoveryResult(value: unknown, expected: { networkId: string; ownerPublicKey: string; genesis: unknown; checkpoint: unknown; manager: Member }) {
   const epoch = integer(record(expected.checkpoint).epoch)
-  const { auth, principal, view } = verifyAuthentication(value, { nodeId: expected.manager.subject_id, publicKey: expected.manager.public_key }, { kind: 'root', ...expected })
+  const { auth, principal, view } = verifyAuthentication(value, { peerId: expected.manager.subject_id, publicKey: expected.manager.public_key }, { kind: 'root', ...expected })
   const manager = view.members.find(member => member.subject_id === expected.manager.subject_id)
   if (principal.epoch !== epoch || !principal.can_manage || !manager || !same(manager, expected.manager)) throw new Error('恢复响应的管理身份或授权版本不一致，未生成新的恢复包。')
   return { auth, epoch }
@@ -58,7 +58,7 @@ export async function openPackage(file: File, password: string) {
   let root: Identity | undefined
   try {
     root = Identity.fromSecretHex(text(payload.root_secret_key))
-    if (payload.version !== 1 || payload.network_id !== networkId || payload.recovery_epoch !== epoch || root.nodeId() !== networkId || !Array.isArray(payload.decryption_keys)) throw new Error('恢复包身份与加密内容不一致。')
+    if (payload.version !== 1 || payload.network_id !== networkId || payload.recovery_epoch !== epoch || root.peerId() !== networkId || !Array.isArray(payload.decryption_keys)) throw new Error('恢复包身份与加密内容不一致。')
     const state = { genesis: record(payload.genesis), checkpoint: null, events: [] }
     const verified = verifyState(state, networkId, root.publicKeyHex())
     verified.free()

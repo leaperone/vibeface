@@ -25,7 +25,7 @@ export function composerHint(input: Omit<SendGate, 'busy'>): string {
 export function prepareSend(input: {
   conversationId: string
   text: string
-  schedulerNodeId: string | null
+  schedulerPeerId: string | null
   entryNode: string
   pending: PendingMessage | null
   heads: string[]
@@ -42,7 +42,7 @@ export function prepareSend(input: {
   }
   const pending = input.pending ?? {
     message_id: newId(), conversation_id: input.conversationId, text,
-    scheduler_node: input.schedulerNodeId, entry_node: input.entryNode, basis_heads: [...input.heads],
+    scheduler_node: input.schedulerPeerId, entry_node: input.entryNode, basis_heads: [...input.heads],
     report_results: input.reportResults ?? true,
   }
   return { ok: true, pending, body: {

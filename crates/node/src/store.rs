@@ -148,27 +148,27 @@ impl Store {
     pub fn authorize_node(
         &self,
         network_id: &str,
-        node_id: &str,
+        peer_id: &str,
         role: Option<NodeRole>,
     ) -> Result<NodeCertificate> {
-        authorize_node_from(&self.connection, network_id, node_id, role)
+        authorize_node_from(&self.connection, network_id, peer_id, role)
     }
     pub fn save_local_identity(
         &mut self,
         network_id: &str,
         identity: &LocalIdentity,
     ) -> Result<()> {
-        let node_id = identity.node_id()?;
-        self.authorize_node(network_id, &node_id, None)?;
-        self.connection.execute("INSERT INTO local_identities(network_id,node_id,identity) VALUES(?,?,?) ON CONFLICT(network_id,node_id) DO UPDATE SET identity=excluded.identity",params![network_id,node_id,serde_json::to_string(identity)?])?;
+        let peer_id = identity.peer_id()?;
+        self.authorize_node(network_id, &peer_id, None)?;
+        self.connection.execute("INSERT INTO local_identities(network_id,node_id,identity) VALUES(?,?,?) ON CONFLICT(network_id,node_id) DO UPDATE SET identity=excluded.identity",params![network_id,peer_id,serde_json::to_string(identity)?])?;
         Ok(())
     }
-    pub fn local_identity(&self, network_id: &str, node_id: &str) -> Result<Option<LocalIdentity>> {
+    pub fn local_identity(&self, network_id: &str, peer_id: &str) -> Result<Option<LocalIdentity>> {
         optional_json(
             self.connection
                 .query_row(
                     "SELECT identity FROM local_identities WHERE network_id=? AND node_id=?",
-                    params![network_id, node_id],
+                    params![network_id, peer_id],
                     |r| r.get(0),
                 )
                 .optional()?,
@@ -313,7 +313,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        authorize_node_from(&tx, network, &identity.node_id()?, Some(NodeRole::Gateway))?;
+        authorize_node_from(&tx, network, &identity.peer_id()?, Some(NodeRole::Gateway))?;
         let previous: Option<String> = tx.query_row(
             "SELECT envelope FROM events WHERE network_id=? AND scope_id=? AND json_extract(envelope,'$.canonical_body') IS NOT NULL AND json_extract(json_extract(envelope,'$.canonical_body'),'$.body.message_id')=?",
             params![network, conversation, message_id], |r| r.get(0),
@@ -886,7 +886,7 @@ impl Store {
         created_at_ms: i64,
     ) -> Result<SchedulerJob> {
         ensure!(
-            identity.node_id()? == target,
+            identity.peer_id()? == target,
             "terminal publication requires its target scheduler identity"
         );
         let tx = self
@@ -960,7 +960,7 @@ impl Store {
         target: &str,
     ) -> Result<SchedulerPublicationBatch> {
         ensure!(
-            identity.node_id()? == target,
+            identity.peer_id()? == target,
             "terminal publication requires its target scheduler identity"
         );
         let mut statement = self.connection.prepare("SELECT value FROM local_values WHERE network_id=? AND key LIKE 'scheduler:v1:publication:%'")?;
@@ -1742,7 +1742,7 @@ impl Store {
         binding: &crate::binding::TaskBinding,
     ) -> Result<crate::binding::SignedBinding> {
         ensure!(
-            binding.authority_node == identity.node_id()?,
+            binding.authority_node == identity.peer_id()?,
             "this Node is not the task binding authority"
         );
         let authority = self.authorize_node(&binding.network_id, &binding.authority_node, None)?;
@@ -1777,7 +1777,7 @@ impl Store {
                 &binding.target_node,
                 &binding.session_id,
                 &binding.conversation_id,
-                &BTreeSet::from([identity.node_id()?]),
+                &BTreeSet::from([identity.peer_id()?]),
             )?;
         }
         let current: Option<String> = tx
@@ -1932,7 +1932,7 @@ impl Store {
         self.verify_binding_creation(proof)?;
         let binding = &proof.binding;
         ensure!(
-            binding.target_node == identity.node_id()?,
+            binding.target_node == identity.peer_id()?,
             "only the bound executor can seal execution"
         );
         let hash = crate::binding::binding_hash(binding)?;
@@ -2073,7 +2073,7 @@ impl Store {
             conversation_id: request.conversation_id.clone(),
             task_ref: creation.hash,
             task_id,
-            authority_node: identity.node_id()?,
+            authority_node: identity.peer_id()?,
             generation: 1,
             target_node: request.target_node.clone(),
             session_id: request
@@ -3117,7 +3117,7 @@ fn append_event_from(
     blobs: Vec<BlobRef>,
     created_at_ms: i64,
 ) -> Result<SignedEvent> {
-    let author = identity.node_id()?;
+    let author = identity.peer_id()?;
     authorize_node_from(connection, network_id, &author, None)?;
     let events = load_events_from(connection, network_id)?;
     let heads = heads_from_events(&events, scope_id);
@@ -3315,7 +3315,7 @@ fn rebuild_projections_from(connection: &Connection, network_id: &str) -> Result
 fn authorize_node_from(
     connection: &Connection,
     network_id: &str,
-    node_id: &str,
+    peer_id: &str,
     role: Option<NodeRole>,
 ) -> Result<NodeCertificate> {
     let encoded: String = connection
@@ -3332,7 +3332,7 @@ fn authorize_node_from(
         view.network_id == network_id,
         "stored membership network mismatch"
     );
-    view.authorize_node(node_id, role)?.certificate()
+    view.authorize_node(peer_id, role)?.certificate()
 }
 fn validate_operation_binding_from(
     connection: &Connection,
@@ -3878,7 +3878,7 @@ mod tests {
         std::fs::create_dir_all(&dir)?;
         let lock = Arc::new(crate::config::lock_data_dir(&dir)?);
         let owner = LocalIdentity::generate();
-        let node = owner.node_id()?;
+        let node = owner.peer_id()?;
         let network = owner.fixture_network_id()?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         store.attach_process_lock(lock.clone());
@@ -4028,7 +4028,7 @@ mod tests {
             version: 1,
             network_id: network.into(),
             scope_id: "conversation".into(),
-            author: owner.node_id()?,
+            author: owner.peer_id()?,
             sequence: author_sequence,
             previous,
             parents,
@@ -4061,7 +4061,7 @@ mod tests {
                 },
                 vec![],
                 2,
-                &identity.node_id()?,
+                &identity.peer_id()?,
                 target,
                 false,
             )?
@@ -4084,7 +4084,7 @@ mod tests {
     fn scheduler_admission_and_final_reply_are_crash_atomic_and_idempotent() -> Result<()> {
         let owner = LocalIdentity::generate();
         let network = owner.fixture_network_id()?;
-        let target = owner.node_id()?;
+        let target = owner.peer_id()?;
         let mut store = memory(&owner, None)?;
         conversation(&mut store, &owner)?;
         store.connection.execute_batch("CREATE TRIGGER reject_scheduler_admission BEFORE INSERT ON local_values WHEN NEW.key LIKE 'scheduler:v1:job:%' BEGIN SELECT RAISE(ABORT,'injected queue failure'); END;")?;
@@ -4299,7 +4299,7 @@ mod tests {
         let owner = LocalIdentity::generate();
         let peer = LocalIdentity::generate();
         let network = owner.fixture_network_id()?;
-        let target = owner.node_id()?;
+        let target = owner.peer_id()?;
         let mut store = Store::open(&db)?;
         store.install_trust_bundle(
             &network,
@@ -4320,7 +4320,7 @@ mod tests {
             version: WIRE_VERSION,
             network_id: network.clone(),
             scope_id: "conversation".into(),
-            author: peer.node_id()?,
+            author: peer.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![root.hash],
@@ -4336,7 +4336,7 @@ mod tests {
             version: WIRE_VERSION,
             network_id: network.clone(),
             scope_id: "conversation".into(),
-            author: peer.node_id()?,
+            author: peer.peer_id()?,
             sequence: 2,
             previous: Some(parent.hash.clone()),
             parents: vec![parent.hash.clone()],
@@ -4547,7 +4547,7 @@ mod tests {
         for cancelled in [false, true] {
             let owner = LocalIdentity::generate();
             let network = owner.fixture_network_id()?;
-            let target = owner.node_id()?;
+            let target = owner.peer_id()?;
             let mut store = memory(&owner, None)?;
             conversation(&mut store, &owner)?;
             let message = admitted_message(&mut store, &owner, "prestart", &target)?;
@@ -4629,7 +4629,7 @@ mod tests {
     {
         let owner = LocalIdentity::generate();
         let network = owner.fixture_network_id()?;
-        let target = owner.node_id()?;
+        let target = owner.peer_id()?;
         let mut store = memory(&owner, None)?;
         conversation(&mut store, &owner)?;
         let first = admitted_message(&mut store, &owner, "one", &target)?;
@@ -4709,7 +4709,7 @@ mod tests {
     -> Result<()> {
         let owner = LocalIdentity::generate();
         let network = owner.fixture_network_id()?;
-        let target = owner.node_id()?;
+        let target = owner.peer_id()?;
         let mut store = memory(&owner, None)?;
         conversation(&mut store, &owner)?;
         let first = admitted_message(&mut store, &owner, "one", &target)?;
@@ -4834,7 +4834,7 @@ mod tests {
         let owner = LocalIdentity::generate();
         let remote = LocalIdentity::generate();
         let network = owner.fixture_network_id()?;
-        let target = remote.node_id()?;
+        let target = remote.peer_id()?;
         let mut source = memory(&owner, Some(&remote))?;
         conversation(&mut source, &owner)?;
         let event = admitted_message(&mut source, &owner, "remote", &target)?;
@@ -4873,7 +4873,7 @@ mod tests {
         );
         assert!(
             source
-                .enqueue_trigger(&network, "conversation", &event.hash, &owner.node_id()?)
+                .enqueue_trigger(&network, "conversation", &event.hash, &owner.peer_id()?)
                 .is_err()
         );
         Ok(())
@@ -4883,7 +4883,7 @@ mod tests {
         for claim_first in [false, true] {
             let owner = LocalIdentity::generate();
             let network = owner.fixture_network_id()?;
-            let target = owner.node_id()?;
+            let target = owner.peer_id()?;
             let mut store = memory(&owner, None)?;
             conversation(&mut store, &owner)?;
             let event = admitted_message(&mut store, &owner, "cancel", &target)?;
@@ -4938,7 +4938,7 @@ mod tests {
     {
         let owner = LocalIdentity::generate();
         let network = owner.fixture_network_id()?;
-        let target = owner.node_id()?;
+        let target = owner.peer_id()?;
         let mut store = memory(&owner, None)?;
         conversation(&mut store, &owner)?;
         let event = admitted_message(&mut store, &owner, "one", &target)?;
@@ -5037,7 +5037,7 @@ mod tests {
     -> Result<()> {
         let owner = LocalIdentity::generate();
         let network = owner.fixture_network_id()?;
-        let target = owner.node_id()?;
+        let target = owner.peer_id()?;
         let mut store = memory(&owner, None)?;
         conversation(&mut store, &owner)?;
         for (message_id, state) in [("done", "completed"), ("uncertain", "running")] {
@@ -5091,7 +5091,7 @@ mod tests {
             let current = LocalIdentity::generate();
             let retired = LocalIdentity::generate();
             let network = current.fixture_network_id()?;
-            let target = current.node_id()?;
+            let target = current.peer_id()?;
             let mut store = memory(&current, Some(&retired))?;
             conversation(&mut store, &current)?;
             let mut legacy = Vec::new();
@@ -5127,7 +5127,7 @@ mod tests {
             )?;
             assert!(
                 store
-                    .authorize_node(&network, &retired.node_id()?, Some(NodeRole::Gateway))
+                    .authorize_node(&network, &retired.peer_id()?, Some(NodeRole::Gateway))
                     .is_err()
             );
             assert!(
@@ -5188,7 +5188,7 @@ mod tests {
             network_id: owner.fixture_network_id()?,
             conversation_id: "conversation".into(),
             task_id: None,
-            target_node: owner.node_id()?,
+            target_node: owner.peer_id()?,
             session_id: Some("session".into()),
             expected_revision: 0,
             basis_heads: heads,
@@ -5203,7 +5203,7 @@ mod tests {
     fn session(owner: &LocalIdentity, id: &str) -> Result<ExecutionSession> {
         Ok(ExecutionSession {
             network_id: owner.fixture_network_id()?,
-            target_node: owner.node_id()?,
+            target_node: owner.peer_id()?,
             session_id: id.into(),
             revision: 0,
             state: "idle".into(),
@@ -5285,7 +5285,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "b".into(),
-            author: owner.node_id()?,
+            author: owner.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![a.hash.clone()],
@@ -5582,7 +5582,7 @@ mod tests {
         revoked.revoked = true;
         let bundle = a.sign_network_fixture(2, vec![a.certificate(roles())?, revoked])?;
         store.install_trust_bundle(&network, &bundle)?;
-        assert!(store.authorize_node(&network, &b.node_id()?, None).is_err());
+        assert!(store.authorize_node(&network, &b.peer_id()?, None).is_err());
         assert_eq!(store.ingest_event(&network, &event)?.status, "ready");
         assert!(
             store
@@ -5724,16 +5724,16 @@ mod tests {
             conversation_id: "conversation".into(),
             task_ref: creation.hash,
             task_id: "task".into(),
-            authority_node: owner.node_id()?,
+            authority_node: owner.peer_id()?,
             generation: 1,
-            target_node: owner.node_id()?,
+            target_node: owner.peer_id()?,
             session_id: "first".into(),
             open_spec: json!({"type":"open","executor":"codex","cwd":"/tmp"}),
             previous_binding_hash: None,
             previous_seal: None,
         };
         let mut second = first.clone();
-        second.target_node = executor.node_id()?;
+        second.target_node = executor.peer_id()?;
         second.session_id = "second".into();
         drop(store);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -5935,7 +5935,7 @@ mod tests {
         )?;
         assert_eq!(
             store
-                .session(&network, &a.node_id()?, "session")?
+                .session(&network, &a.peer_id()?, "session")?
                 .unwrap()
                 .revision,
             1
@@ -5998,7 +5998,7 @@ mod tests {
             store.operation(&network, "send")?.unwrap().state,
             OperationState::Running
         );
-        let mut newer = store.session(&network, &a.node_id()?, "session")?.unwrap();
+        let mut newer = store.session(&network, &a.peer_id()?, "session")?.unwrap();
         newer.revision = 2;
         store.upsert_session(&network, &newer)?;
         assert!(store.claim_operation(&network, "steer").is_err());
@@ -6058,13 +6058,13 @@ mod tests {
         state.append(GovernanceEvent::revoke(
             &admin,
             &state.project()?,
-            &retired.node_id()?,
+            &retired.peer_id()?,
         )?)?;
         let event = retired.sign_event(Event {
             version: WIRE_VERSION,
             network_id: root.network_id()?,
             scope_id: "archive".into(),
-            author: retired.node_id()?,
+            author: retired.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![],
@@ -6078,7 +6078,7 @@ mod tests {
             .project()?
             .members
             .into_iter()
-            .filter(|member| member.subject_id != retired.node_id().unwrap())
+            .filter(|member| member.subject_id != retired.peer_id().unwrap())
             .collect();
         let checkpoint =
             RootCheckpoint::create_with_history(&root, 2, members, state.historical_nodes()?)?;
@@ -6089,7 +6089,7 @@ mod tests {
         assert_eq!(fresh.ingest_event(&network, &event)?.status, "ready");
         assert!(
             fresh
-                .authorize_node(&network, &retired.node_id()?, None)
+                .authorize_node(&network, &retired.peer_id()?, None)
                 .is_err()
         );
         Ok(())
@@ -6114,7 +6114,7 @@ mod tests {
             version: WIRE_VERSION,
             network_id: network.clone(),
             scope_id: "conversation".into(),
-            author: admin.node_id()?,
+            author: admin.peer_id()?,
             sequence: 1,
             previous: None,
             parents: vec![],
@@ -6127,12 +6127,12 @@ mod tests {
         assert!(store.ingest_event(&network, &forged).is_err());
         assert!(
             store
-                .authorize_node(&network, &admin.node_id()?, None)
+                .authorize_node(&network, &admin.peer_id()?, None)
                 .is_err()
         );
         assert!(
             store
-                .authorize_node(&network, &node.node_id()?, Some(NodeRole::Replica))
+                .authorize_node(&network, &node.peer_id()?, Some(NodeRole::Replica))
                 .is_ok()
         );
         Ok(())
@@ -6165,7 +6165,7 @@ mod tests {
                 .unwrap()
                 .request
                 .target_node,
-            a.node_id()?
+            a.peer_id()?
         );
         assert_eq!(
             store
@@ -6173,7 +6173,7 @@ mod tests {
                 .unwrap()
                 .request
                 .target_node,
-            b.node_id()?
+            b.peer_id()?
         );
         store.local_set(&na, "auth", &json!("a"))?;
         store.local_set(&nb, "auth", &json!("b"))?;
@@ -6203,7 +6203,7 @@ mod tests {
         let mut ra = request(&mut store, &a, "same-op", vec![ea.hash])?;
         ra.resources = vec!["/tmp/vibeface-shared-device".into()];
         let mut rb = request(&mut store, &b, "same-op", vec![eb.hash])?;
-        rb.target_node = a.node_id()?;
+        rb.target_node = a.peer_id()?;
         rb.task_id = Some("other-device-task".into());
         rb.binding = None;
         store.bind_test_operation(&b, &mut rb)?;
@@ -6228,7 +6228,7 @@ mod tests {
             EventBody::ExecutionObserved {
                 operation_id: "operation".into(),
                 task_id: None,
-                target_node: a.node_id()?,
+                target_node: a.peer_id()?,
                 session_id: Some("session".into()),
                 status: "completed".into(),
                 detail: json!({"turn":"finished"}),
@@ -6252,10 +6252,10 @@ mod tests {
         assert_eq!(store.reserve_budget(&network, "2026-10-16", 2, 3)?.used, 2);
         assert!(store.reserve_budget(&network, "2026-10-16", 2, 3).is_err());
         assert_eq!(store.budget_usage(&network, "2026-10-16", 3)?.used, 2);
-        store.claim_continuation(&network, &result.hash, "v1", &a.node_id()?)?;
+        store.claim_continuation(&network, &result.hash, "v1", &a.peer_id()?)?;
         assert!(
             store
-                .claim_continuation(&network, &result.hash, "v1", &a.node_id()?)
+                .claim_continuation(&network, &result.hash, "v1", &a.peer_id()?)
                 .is_err()
         );
         store.recover_running()?;
@@ -6268,14 +6268,14 @@ mod tests {
         );
         assert!(
             store
-                .claim_continuation(&network, &result.hash, "v1", &a.node_id()?)
+                .claim_continuation(&network, &result.hash, "v1", &a.peer_id()?)
                 .is_err()
         );
         store.finish_continuation(
             &network,
             &result.hash,
             "v1",
-            &a.node_id()?,
+            &a.peer_id()?,
             "completed",
             json!({"next":"ask_user"}),
         )?;
@@ -6406,7 +6406,7 @@ mod tests {
             network_id: network.clone(),
             conversation_id: "conversation".into(),
             task_id: None,
-            target_node: owner.node_id()?,
+            target_node: owner.peer_id()?,
             session_id: Some("ordinary-session".into()),
             expected_revision: 0,
             basis_heads: vec![creation.hash],
@@ -6471,7 +6471,7 @@ mod tests {
             network_id: network.clone(),
             conversation_id: "conversation".into(),
             task_id: None,
-            target_node: owner.node_id()?,
+            target_node: owner.peer_id()?,
             session_id: Some("private-native".into()),
             expected_revision: 0,
             basis_heads: vec![created.hash],
@@ -6517,9 +6517,9 @@ mod tests {
             conversation_id: "other-chat".into(),
             task_ref: task.hash.clone(),
             task_id: "task".into(),
-            authority_node: owner.node_id()?,
+            authority_node: owner.peer_id()?,
             generation: 1,
-            target_node: owner.node_id()?,
+            target_node: owner.peer_id()?,
             session_id: "private-native".into(),
             open_spec: open.action.clone(),
             previous_binding_hash: None,
@@ -6605,7 +6605,7 @@ mod tests {
             let executor = LocalIdentity::generate();
             let foreign_gateway = LocalIdentity::generate();
             let network = gateway.fixture_network_id()?;
-            let target = executor.node_id()?;
+            let target = executor.peer_id()?;
             let mut entry = Store::open(":memory:")?;
             entry.install_trust_bundle(
                 &network,
@@ -6691,7 +6691,7 @@ mod tests {
                 conversation_id: "other-chat".into(),
                 task_ref: task.hash.clone(),
                 task_id: "task-b".into(),
-                authority_node: gateway.node_id()?,
+                authority_node: gateway.peer_id()?,
                 generation: 1,
                 target_node: target,
                 session_id: "pending-native".into(),
@@ -6723,7 +6723,7 @@ mod tests {
                 version: 1,
                 network_id: network.clone(),
                 scope_id: "other-chat".into(),
-                author: foreign_gateway.node_id()?,
+                author: foreign_gateway.peer_id()?,
                 sequence: 1,
                 previous: None,
                 parents: rejected.basis_heads.clone(),
@@ -6789,7 +6789,7 @@ mod tests {
         let executor = LocalIdentity::generate();
         let foreign_gateway = LocalIdentity::generate();
         let network = gateway.fixture_network_id()?;
-        let target = executor.node_id()?;
+        let target = executor.peer_id()?;
         let mut entry = Store::open(":memory:")?;
         entry.install_trust_bundle(
             &network,
@@ -6919,7 +6919,7 @@ mod tests {
             conversation_id: "other-chat".into(),
             task_ref: task.hash.clone(),
             task_id: "task-b".into(),
-            authority_node: gateway.node_id()?,
+            authority_node: gateway.peer_id()?,
             generation: 1,
             target_node: target.clone(),
             session_id: "remote-native".into(),
@@ -6997,7 +6997,7 @@ mod tests {
             version: 1,
             network_id: network.clone(),
             scope_id: "other-chat".into(),
-            author: foreign_gateway.node_id()?,
+            author: foreign_gateway.peer_id()?,
             sequence: 1,
             previous: None,
             parents: entry.heads(&network, "other-chat")?,
@@ -7059,7 +7059,7 @@ mod tests {
             network_id: network.clone(),
             conversation_id: "conversation".into(),
             task_id: None,
-            target_node: owner.node_id()?,
+            target_node: owner.peer_id()?,
             session_id: None,
             expected_revision: 0,
             basis_heads: vec![event.hash],

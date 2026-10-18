@@ -1,15 +1,16 @@
 export type DeviceChannel = {
-  nodeId: string
+  peerId: string
   publicKey: string
   request(method: string, params?: Record<string, unknown>): Promise<unknown>
   close(): void
 }
-export function initClient(options?: { replaceLostKey?: boolean }): Promise<{ nodeId: string; publicKey: string }>
-export function connectDevice(entry: { address: string; node_id: string; relay: boolean }, options?: {
+export function initClient(options?: { replaceLostKey?: boolean }): Promise<{ peerId: string; publicKey: string }>
+export function connectDevice(entry: { address: string; peer_id: string; relay: boolean }, options?: {
   onEvent?: (event: unknown) => void
   onClose?: (error: unknown) => void
   signal?: AbortSignal
 }): Promise<DeviceChannel>
+export function readPeerId(value: { peer_id?: unknown; node_id?: unknown }): string
 export function validTarget(value: unknown): string
 export function validEndpoint(value: string): string
 export function readInvitation(value: string): unknown

@@ -53,9 +53,15 @@ impl Identity {
         hex::encode(self.key.verifying_key().as_bytes())
     }
 
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = peerId))]
+    pub fn peer_id(&self) -> String {
+        hex::encode(Sha256::digest(self.key.verifying_key().as_bytes()))
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), deprecated(note = "use peer_id"))]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = nodeId))]
     pub fn node_id(&self) -> String {
-        hex::encode(Sha256::digest(self.key.verifying_key().as_bytes()))
+        self.peer_id()
     }
 
     pub fn sign(&self, domain: &str, payload: &[u8]) -> Result<String> {
@@ -419,14 +425,14 @@ mod tests {
         let ah = Handshake::new(
             true,
             &a.secret_hex(),
-            Some(b.node_id()),
+            Some(b.peer_id()),
             b"vibeface:channel:v1",
         )
         .unwrap();
         let bh = Handshake::new(
             false,
             &b.secret_hex(),
-            Some(a.node_id()),
+            Some(a.peer_id()),
             b"vibeface:channel:v1",
         )
         .unwrap();
@@ -497,7 +503,7 @@ mod tests {
     fn identity_signatures_are_domain_bound_and_restorable() {
         let a = Identity::generate().unwrap();
         let restored = Identity::from_secret_hex(&a.secret_hex()).unwrap();
-        assert_eq!(a.node_id(), restored.node_id());
+        assert_eq!(a.peer_id(), restored.peer_id());
         let signature = a.sign("client-challenge", b"challenge").unwrap();
         verify(
             &a.public_key_hex(),

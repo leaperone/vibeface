@@ -444,7 +444,7 @@ impl Runtime {
                         .is_some_and(|roles| roles.contains(&json!("executor")))
                     && intent["target_node"]
                         .as_str()
-                        .is_none_or(|target| node["node_id"].as_str() == Some(target))
+                        .is_none_or(|target| node["peer_id"].as_str() == Some(target))
                     && node["capabilities"]["roots"]
                         .as_array()
                         .is_some_and(|roots| {
@@ -466,14 +466,14 @@ impl Runtime {
         candidates.sort_by_key(|node| {
             (
                 node["local"] != true,
-                node["node_id"].as_str().unwrap_or(""),
+                node["peer_id"].as_str().unwrap_or(""),
             )
         });
         Ok(field(
             candidates.first().context(
                 "no authorized reachable execution Node supports this directory and executor",
             )?,
-            "node_id",
+            "peer_id",
         )?
         .into())
     }
@@ -545,7 +545,7 @@ impl Runtime {
                 "prepared request differs from its original dispatch"
             );
         }
-        let operation = if expected.target_node == self.identity.node_id()? {
+        let operation = if expected.target_node == self.identity.peer_id()? {
             self.store
                 .lock()
                 .await
@@ -829,7 +829,7 @@ impl Runtime {
         let result = async {
             scope_access?;
             let store = self.store.lock().await;
-            let local = self.identity.node_id()?;
+            let local = self.identity.peer_id()?;
             let current = self.identities.public_state()?;
             ensure!(current.genesis.network_id == access.network_id, "wrong personal network");
             current.project()?.authorize_node(&local, None)?;
@@ -984,7 +984,7 @@ mod tests {
     }
 
     async fn managed_blob_access(node: &Runtime, access: &Access, name: &str) -> Result<Access> {
-        let target = node.identity.node_id()?;
+        let target = node.identity.peer_id()?;
         let scope = access.conversation_id.as_deref().unwrap();
         let (trigger, attempt) = {
             let mut store = node.store.lock().await;
@@ -1354,7 +1354,7 @@ mod tests {
             (Some(0), 1),
         ] {
             let mut intent =
-                json!({"command":"pwd","cwd":cwd,"target_node":node.identity.node_id()?});
+                json!({"command":"pwd","cwd":cwd,"target_node":node.identity.peer_id()?});
             if let Some(requested) = requested {
                 intent["timeout_secs"] = json!(requested);
             }

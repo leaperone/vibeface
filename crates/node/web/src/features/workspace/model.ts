@@ -41,8 +41,9 @@ export function parseNodes(value: unknown): NodeInfo[] {
   return list(record(value).nodes).map((item) => {
     const data = record(item)
     const capabilities = data.capabilities == null ? null : record(data.capabilities)
+    if (data.peer_id !== undefined && data.node_id !== undefined && data.peer_id !== data.node_id) throw new Error("设备编号不一致。")
     return {
-      node_id: text(data.node_id),
+      peer_id: text(data.peer_id ?? data.node_id),
       name: typeof data.name === "string" ? data.name : "",
       local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked), roles: texts(data.roles),
       capabilities: capabilities ? { manager: capabilities.manager === null ? null : text(capabilities.manager), executors: texts(capabilities.executors), roots: texts(capabilities.roots) } : undefined,
