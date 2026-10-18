@@ -1443,6 +1443,14 @@ pub(super) fn validate_retained_execution_scope_in(
     Ok(())
 }
 
+pub(super) fn validate_retained_event_scope_in(
+    connection: &Connection,
+    source: &SignedEvent,
+) -> Result<()> {
+    ready_observation_scope_in(connection, source, "", "")?;
+    Ok(())
+}
+
 fn ready_observation_scope_in(
     connection: &Connection,
     source: &SignedEvent,
