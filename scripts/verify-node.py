@@ -1584,6 +1584,9 @@ def dispatch(client, value, status=200):
         value["binding"] = binding
         if value["action"]["type"] == "send":
             value["resources"] = [binding["binding"]["open_spec"]["cwd"]]
+    original = client.signed_requests.get(value["operation_id"])
+    if original and original["body"]["request"] == value:
+        return client.call("rpc", original["body"], invocation=original["invocation"], status=status)
     return client.rpc("operate", request=value, status=status)
 
 
@@ -1910,13 +1913,13 @@ def enroll_account_node(authority, candidate):
             "the original additional-Node import begin is idempotent")
     import_context = progress["context"]
     while not progress.get("proof"):
-        page = client.identity_call("enrollment_policy_page", progress["page_request"])
+        page = client.identity_call("enrollment_policy_read_page", progress["page_request"])
         progress = client.identity_call("account_node_import_page", {
             "context": import_context, "page": page["page"]}, connection=connection)
         require(progress["context"] == import_context, "additional-Node import preserves its original purpose context")
         if page["page"]["payload"]["complete"]:
             break
-    witness = client.identity_call("enrollment_policy_witness", progress["page_request"])
+    witness = client.identity_call("enrollment_policy_read_witness", progress["page_request"])
     finish = {"context": import_context, "witness": witness["witness"]}
     possession = client.identity_call("account_node_import_finish", finish, connection=connection)
     require(client.identity_call("account_node_import_finish", finish, connection=connection) == possession,
