@@ -1768,6 +1768,208 @@ pub(super) fn check_manager_tool_in(
     Ok(())
 }
 
+pub(crate) fn sdk_policy_source_provenance_in(
+    connection: &Connection,
+    policy: &PolicyState,
+    source: &vibeface_secure::authorization::PublicKey,
+    service: &vibeface_secure::authorization::ServiceId,
+    service_grant: &ObjectHash,
+    facts: &RequestFacts,
+    now_ms: u64,
+) -> Result<vibeface_secure::authorization::node_execution_policy::SdkPolicySourceProvenance> {
+    use vibeface_secure::authorization::{
+        AUTH_VERSION, DeviceId, ServiceId,
+        node_execution_policy::{
+            SdkPolicyLease, SdkPolicySession, SdkPolicySourceFacts, SdkPolicySourceProvenance,
+            sdk_policy_source_heads,
+        },
+    };
+    let snapshot = if connection.is_autocommit() {
+        Some(connection.unchecked_transaction()?)
+    } else {
+        None
+    };
+    let sdk_session = facts
+        .context
+        .sdk_session
+        .as_ref()
+        .context("SDK policy source has no SDK session")?;
+    let descriptor: AgentSession = local_from(
+        connection,
+        facts.resource.space.as_str(),
+        &format!("agent-session:{}", sdk_session.session_id),
+    )?
+    .context("SDK policy source has no persisted AgentSession")?;
+    ensure!(
+        descriptor.space_id == facts.resource.space
+            && descriptor.resource_id == facts.resource.resource
+            && descriptor.service == *service
+            && *service == ServiceId::from_key(source)
+            && descriptor.device == DeviceId::from_key(source)
+            && descriptor.sdk_session == *sdk_session
+            && sdk_session.target == descriptor.device
+            && facts.context.conversation.as_deref() == Some(descriptor.conversation_id.as_str())
+            && facts.audience.service == *service
+            && facts.audience.device == descriptor.device
+            && now_ms < descriptor.expires_at_ms,
+        "SDK policy source differs from its persisted service session"
+    );
+    let manager_id = format!("manager:{}", sdk_session.session_id);
+    let manager = manager_tool_authorization_from(
+        connection,
+        policy,
+        facts.resource.space.as_str(),
+        &manager_id,
+        now_ms,
+    )?;
+    ensure!(
+        manager.actor() == &Actor::Service(service.clone())
+            && manager.resource() == &facts.resource
+            && manager.initiator() == &descriptor.initiator,
+        "SDK policy source differs from its current admitted Manager"
+    );
+    if let Some(task) = &manager.signed_invocation().payload.context.task {
+        ensure!(
+            facts.context.task.as_ref() == Some(task),
+            "SDK policy source escaped its Manager task"
+        );
+    }
+    let (_, stored, _) = load_manager_from(connection, facts.resource.space.as_str(), &manager_id)?;
+    let lease: LeaseRecord = local_from(
+        connection,
+        facts.resource.space.as_str(),
+        &format!("lease:{manager_id}"),
+    )?
+    .context("SDK policy source has no persisted Manager lease")?;
+    ensure!(
+        lease.checked_at_ms <= now_ms && now_ms < lease.deadline,
+        "SDK policy source Manager lease is not current"
+    );
+    let events = super::services::retained_agent_events(
+        connection,
+        facts.resource.space.as_str(),
+        &sdk_session.session_id,
+    )?;
+    let origin = super::services::resolve_current_agent_origin(
+        policy,
+        connection,
+        &events,
+        &sdk_session.session_id,
+        now_ms,
+    )?;
+    ensure!(
+        origin.parent.invocation_hash() == &descriptor.parent_invocation
+            && origin.parent.actor() == &descriptor.initiator
+            && origin.parent.resource() == &facts.resource
+            && origin.parent.audience() == &facts.audience,
+        "SDK policy source changed its current Account origin"
+    );
+    if let Some(request) = &origin.execution {
+        validate_operation_binding_from(connection, request)?;
+    }
+    let compact = super::execution_handoff::compact_sdk_from_events(&events, &stored.proof)?
+        .context("SDK policy source has no original Account message proof")?;
+    ensure!(
+        compact.invocation == *origin.parent.signed_invocation()
+            && compact.sdk_trigger.as_str() == sdk_session.session_id,
+        "SDK policy source changed its compact signed origin"
+    );
+    let task = facts
+        .context
+        .task
+        .as_ref()
+        .context("SDK policy source has no Task")?;
+    let creation = events
+        .get(task.as_str())
+        .context("SDK policy source Task is missing")?;
+    let EventBody::TaskCreated { task_id, .. } = &creation.event.body else {
+        anyhow::bail!("SDK policy source does not identify a TaskCreated event");
+    };
+    ensure!(
+        creation.status == "ready"
+            && creation.event.network_id == facts.resource.space.as_str()
+            && creation.event.resource_id == facts.resource.resource
+            && creation.event.scope_id == descriptor.conversation_id
+            && super::event_authorization::verify_event_envelope(
+                connection,
+                policy,
+                facts.resource.space.as_str(),
+                &creation.envelope,
+            )? == creation.event,
+        "SDK policy source Task changed its current resource or envelope"
+    );
+    super::event_authorization::validate_retained_event_dependencies_in(
+        connection,
+        &creation.envelope,
+    )?;
+    let current_binding = if let Some(hash) = local_from::<String>(
+        connection,
+        facts.resource.space.as_str(),
+        &format!("task-binding-current:{}", task.as_str()),
+    )? {
+        let binding: crate::binding::SignedBinding = local_from(
+            connection,
+            facts.resource.space.as_str(),
+            &format!("task-binding-record:{hash}"),
+        )?
+        .context("SDK policy source current binding record is missing")?;
+        crate::binding::verify_binding(&binding, source.as_str())?;
+        ensure!(
+            crate::binding::binding_hash(&binding.binding)? == hash
+                && binding.binding.network_id == facts.resource.space.as_str()
+                && binding.binding.task_ref == task.as_str()
+                && &binding.binding.task_id == task_id
+                && binding.binding.conversation_id == descriptor.conversation_id,
+            "SDK policy source changed its exact current Task binding"
+        );
+        Some(binding)
+    } else {
+        None
+    };
+    let source_heads = sdk_policy_source_heads(
+        policy.verified(),
+        &origin.parent,
+        service,
+        service_grant,
+        facts,
+        now_ms,
+    )?;
+    super::client_policy_read::check_heads_in(connection, policy, &source_heads)?;
+    let provenance = SdkPolicySourceProvenance {
+        version: AUTH_VERSION,
+        origin: compact,
+        session: SdkPolicySession {
+            space_id: descriptor.space_id,
+            resource_id: descriptor.resource_id,
+            service: descriptor.service,
+            device: descriptor.device,
+            conversation_id: descriptor.conversation_id,
+            sdk_session: descriptor.sdk_session,
+            grant_leaf: descriptor.grant_leaf,
+            initiator: descriptor.initiator,
+            initiating_grant: descriptor.initiating_grant,
+            parent_invocation: descriptor.parent_invocation,
+            expected_policies: descriptor.expected_policies,
+            expires_at_ms: descriptor.expires_at_ms,
+        },
+        manager_admission: stored.proof,
+        lease: SdkPolicyLease {
+            challenge: lease.proof.challenge,
+            receipts: lease.proof.receipts,
+            checked_at_ms: lease.checked_at_ms,
+            deadline: lease.deadline,
+        },
+        current_binding,
+        child_facts: SdkPolicySourceFacts::from(facts),
+        service_grant: service_grant.clone(),
+        source_heads,
+    };
+    if let Some(snapshot) = snapshot {
+        snapshot.commit()?;
+    }
+    Ok(provenance)
+}
+
 impl Store {
     pub(crate) fn claim_authorized_manager(
         &mut self,

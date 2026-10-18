@@ -684,7 +684,7 @@ fn verify_capsule_admission(
     Ok(admitted)
 }
 
-fn compact_sdk_from_events(
+pub(super) fn compact_sdk_from_events(
     events: &BTreeMap<String, StoredEvent>,
     proof: &crate::model::AdmissionProof,
 ) -> Result<Option<CompactSdkOrigin>> {
