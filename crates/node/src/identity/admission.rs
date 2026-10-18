@@ -2985,15 +2985,22 @@ pub(crate) mod tests {
 
     #[test]
     fn local_admission_cache_keeps_policy_time_and_current_revocation_gates() -> Result<()> {
-        let (network, mut store, _, _, proof, facts) = local_cache_fixture(false)?;
+        let (mut network, mut store, _, _, _, _) = local_cache_fixture(false)?;
+        network.enroll_node(LocalIdentity::generate())?;
+        store.install_policy_journal(&network.bundle.journal, crate::identity::test_support::now())?;
+        let anchor = network.message(&mut store, "conversation", "after the accepted policy commit")?;
+        let event: crate::model::Event = serde_json::from_str(&anchor.canonical_body)?;
+        let EventCause::Invocation { admission: proof } = event.cause else { unreachable!() };
+        let facts = persisted_admission_facts(&store.connection, &store.policy, &proof)?;
         let transport = proof.transport.clone().into_evidence();
         let admitted = cached_without_crypto(&store, &proof, &facts)?;
         let mut earlier = proof.clone();
-        let accepted_at: u64 = store.connection.query_row(
-            "SELECT accepted_at_ms FROM policy_journal WHERE entry_hash=?",
-            [proof.challenge.policies[0].head.as_str()], |row| row.get(0),
-        )?;
+        let accepted_at = network.bundle.journal.iter().filter_map(|entry| match entry {
+            vibeface_secure::authorization::JournalEntry::AccountCommit(value) => Some(value.commit.payload.accepted_at_ms),
+            _ => None,
+        }).max().context("fixture has no accepted policy commit")?;
         earlier.admitted_at_ms = accepted_at.checked_sub(1).context("fixture policy predates the clock")?;
+        assert!(store.policy.historical(&proof.challenge.policies, earlier.admitted_at_ms).is_err());
         assert!(
             reconstruct_admission_uncached(&store.policy, &earlier, &facts, &transport).is_err()
         );
