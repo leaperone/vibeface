@@ -654,10 +654,10 @@ impl Runtime {
             )
         };
         if complete {
-            if manifest.is_some() {
-                if let (_, Err(error)) = self.cleanup_blob_lease(lease, None).await {
-                    tracing::warn!(network,hash=%blob.hash,%error,"staging cleanup pending");
-                }
+            if manifest.is_some()
+                && let (_, Err(error)) = self.cleanup_blob_lease(lease, None).await
+            {
+                tracing::warn!(network,hash=%blob.hash,%error,"staging cleanup pending");
             }
             return Ok(false);
         }

@@ -568,10 +568,9 @@ mod tests {
                     .lock()
                     .await
                     .operation(&network, &request.operation_id)?
+                    && record.state == OperationState::Unknown
                 {
-                    if record.state == OperationState::Unknown {
-                        return Ok::<_, anyhow::Error>(record);
-                    }
+                    return Ok::<_, anyhow::Error>(record);
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
