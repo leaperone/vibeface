@@ -1259,11 +1259,6 @@ pub fn finish_execution_service_registration(
         usage.record_budget(&authorization.budget)?;
         usage.record_chain_depth(verified.max_depth);
         usage.record_metadata(&committed)?;
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "execution registration finish before_private={:?}",
-            usage.counts()
-        );
         let (owner_state, mut owner_pins, owner_journal) = owner_snapshot.into_parts();
         for pin in &mut owner_pins {
             pin.minimum_head = owner_state.head(&pin.domain).cloned();
@@ -1282,16 +1277,11 @@ pub fn finish_execution_service_registration(
             entry: prepared.material.entry.clone(),
             policy_checkpoint: None,
         };
-        bootstrap::recovery::compact_recovery_material_in_state(
+        bootstrap::recovery::checkpoint_recovery_material_in_state(
             &mut material,
             &owner_state,
             accepted,
         )?;
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "execution registration finish private_checkpoint={}",
-            material.policy_checkpoint.is_some()
-        );
         usage.merge(&bootstrap::recovery::recovery_material_usage(&material)?);
         let material_json =
             zeroize::Zeroizing::new(json(&material).map_err(|_| {
@@ -1303,14 +1293,6 @@ pub fn finish_execution_service_registration(
         )?;
         usage.record_metadata(&material)?;
         usage.record_metadata(&prepared.request)?;
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "execution registration finish combined={:?} material_bytes={} committed_bytes={} request_bytes={}",
-            usage.counts(),
-            material_json.len(),
-            committed_json.len(),
-            canonical(&prepared.request)?.len()
-        );
         let proof_counts = finish_native_usage(&mut usage)?;
         authorization.imported_snapshot = Some(snapshot);
         authorization.client_policy_usage = Some(usage);
