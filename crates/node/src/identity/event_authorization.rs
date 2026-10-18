@@ -62,7 +62,7 @@ fn policy_devices<'a>(
     }
 }
 
-fn audience_key(state: &VerifiedPolicySet, proof: &AdmissionProof) -> Result<PublicKey> {
+pub(super) fn audience_key(state: &VerifiedPolicySet, proof: &AdmissionProof) -> Result<PublicKey> {
     let audience = &proof.invocation.payload.audience;
     for stamp in &proof.challenge.policies {
         let devices = policy_devices(state, stamp);
