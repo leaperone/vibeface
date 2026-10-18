@@ -18,6 +18,7 @@ use vibeface_secure::authorization::{
     PublicKey, ResourceId, ResourceRef, ServiceId, Signed, SpaceId, TransportEvidence,
     VerifiedAuthorization, VerifiedPolicySet, events::StoredTransport, execution_handoff::*,
     task_binding::SignedBinding,
+    task_business_policy::{TaskBusinessScopedView, TaskBusinessWire},
 };
 
 #[path = "execution_observation.rs"]
@@ -57,6 +58,112 @@ struct StoredHandoff {
     result: Value,
     lease: Option<(ExecutionHandoffFreshness, u64, u64)>,
     receipt: Option<Signed<ExecutionHandoffReceipt>>,
+}
+
+#[derive(Clone, Copy)]
+enum HandoffPolicy<'a> {
+    Primary,
+    TaskBusiness(&'a TaskBusinessScopedView),
+}
+
+impl HandoffPolicy<'_> {
+    fn state<'a>(&'a self, primary: &'a PolicyState) -> &'a VerifiedPolicySet {
+        match self {
+            Self::Primary => primary.verified(),
+            Self::TaskBusiness(view) => view.state(),
+        }
+    }
+
+    fn check_wire_in(
+        &self,
+        connection: &Connection,
+        primary: &PolicyState,
+        wire: &SignedExecutionHandoff,
+        now_ms: u64,
+    ) -> Result<()> {
+        if let Self::TaskBusiness(view) = self {
+            super::task_business_policy::check_task_business_policy_view_in(
+                connection,
+                primary,
+                view,
+                &TaskBusinessWire::Submit(wire.clone()),
+                now_ms,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn check_authorizations_in(
+        &self,
+        connection: &Connection,
+        primary: &PolicyState,
+        handoff: &VerifiedExecutionHandoff,
+        now_ms: u64,
+    ) -> Result<()> {
+        match self {
+            Self::Primary => {
+                check_policy_heads_in(connection, primary.verified(), handoff.original(), now_ms)?;
+                check_policy_heads_in(
+                    connection,
+                    primary.verified(),
+                    handoff.submission(),
+                    now_ms,
+                )?;
+            }
+            Self::TaskBusiness(view) => {
+                self.check_wire_in(connection, primary, handoff.wire(), now_ms)?;
+                for auth in [handoff.original(), handoff.submission()] {
+                    view.state().check_current(auth, now_ms)?;
+                    ensure!(
+                        auth.dependencies()
+                            .iter()
+                            .all(|expected| view.primary_heads().contains(expected)
+                                || view.foreign_heads().contains(expected)),
+                        "handoff authorization escaped its exact Task business source"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_response_usage(
+        &self,
+        mut usage: ExecutionProofUsage,
+        proof: &ExecutionHandoffFreshness,
+        stored: &StoredHandoff,
+        result: &AdmittedExecutionHandoff,
+    ) -> Result<()> {
+        if matches!(self, Self::TaskBusiness(_)) {
+            usage.record_metadata(&proof.challenge)?;
+            for receipt in &proof.receipts {
+                usage.record_signed(receipt)?;
+            }
+            usage.record_signed(&stored.admission_receipt)?;
+            if let Some(receipt) = &result.receipt {
+                usage.record_signed(receipt)?;
+            }
+            self.check_usage(usage)?;
+        }
+        Ok(())
+    }
+
+    fn check_usage(&self, mut usage: ExecutionProofUsage) -> Result<ExecutionProofUsage> {
+        if let Self::TaskBusiness(view) = self {
+            usage.merge(view.proof_usage());
+            if let Some(counts) =
+                vibeface_secure::signature_verification::SignatureVerification::current_counts()
+            {
+                ensure!(
+                    counts.actual_verifications <= 32,
+                    "Task business handoff exceeded its crypto budget"
+                );
+                usage.record_actual_signature_counts(counts);
+            }
+            usage.enforce_limits()?;
+        }
+        Ok(usage)
+    }
 }
 
 fn scope(wire: &SignedExecutionHandoff) -> Result<(String, String, String)> {
@@ -804,15 +911,35 @@ fn consume_freshness_in(
     stage: CheckStage,
     now_ms: u64,
 ) -> Result<u64> {
+    consume_freshness_with_policy_in(
+        tx,
+        policy,
+        HandoffPolicy::Primary,
+        handoff,
+        proof,
+        stage,
+        now_ms,
+    )
+}
+
+fn consume_freshness_with_policy_in(
+    tx: &Transaction<'_>,
+    policy: &PolicyState,
+    current: HandoffPolicy<'_>,
+    handoff: &VerifiedExecutionHandoff,
+    proof: &ExecutionHandoffFreshness,
+    stage: CheckStage,
+    now_ms: u64,
+) -> Result<u64> {
     ensure!(
         proof.challenge.stage == stage,
         "incorrect execution handoff stage"
     );
-    check_policy_heads_in(tx, policy.verified(), handoff.original(), now_ms)?;
-    check_policy_heads_in(tx, policy.verified(), handoff.submission(), now_ms)?;
-    let freshness = policy
-        .verified()
+    current.check_authorizations_in(tx, policy, handoff, now_ms)?;
+    let freshness = current
+        .state(policy)
         .verify_execution_handoff_freshness(handoff, proof, now_ms)?;
+    current.check_usage(freshness.proof_usage().clone())?;
     verify_challenge_record(tx, handoff.wire(), proof, false)?;
     ensure!(tx.execute("UPDATE execution_handoff_challenges SET consumed=1 WHERE execution_space_id=? AND nonce=? AND consumed=0",
         params![handoff.wire().handoff.execution_resource.space.as_str(), proof.challenge.nonce.as_str()])? == 1,
@@ -1098,16 +1225,51 @@ impl Store {
         freshness: Option<&ExecutionHandoffFreshness>,
         now_ms: u64,
     ) -> Result<ExecutionProofUsage> {
+        self.execution_handoff_proof_usage_with_policy(
+            HandoffPolicy::Primary,
+            wire,
+            transport,
+            freshness,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn execution_handoff_proof_usage_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        wire: &SignedExecutionHandoff,
+        transport: &TransportEvidence,
+        freshness: Option<&ExecutionHandoffFreshness>,
+        now_ms: u64,
+    ) -> Result<ExecutionProofUsage> {
+        self.execution_handoff_proof_usage_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            wire,
+            transport,
+            freshness,
+            now_ms,
+        )
+    }
+
+    fn execution_handoff_proof_usage_with_policy(
+        &self,
+        current: HandoffPolicy<'_>,
+        wire: &SignedExecutionHandoff,
+        transport: &TransportEvidence,
+        freshness: Option<&ExecutionHandoffFreshness>,
+        now_ms: u64,
+    ) -> Result<ExecutionProofUsage> {
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
-        let current = self.policy.verified();
+        current.check_wire_in(&self.connection, &self.policy, wire, now_ms)?;
+        let state = current.state(&self.policy);
         let original =
-            original_authorization_from(&self.connection, &self.policy, current, wire, now_ms)?;
+            original_authorization_from(&self.connection, &self.policy, state, wire, now_ms)?;
         let (execution, space, operation) = scope(wire)?;
         let admission = stored_from(&self.connection, &execution, &space, &operation)?
             .map(|stored| reconstruct_handoff(&self.connection, &self.policy, &stored))
             .transpose()?;
-        let verified = current.verify_execution_handoff(
+        let verified = state.verify_execution_handoff(
             wire,
             &original,
             transport,
@@ -1115,14 +1277,14 @@ impl Store {
             now_ms,
         )?;
         let mut usage = match freshness {
-            Some(proof) => current
+            Some(proof) => state
                 .verify_execution_handoff_freshness(&verified, proof, now_ms)?
                 .proof_usage()
                 .clone(),
             None => verified.proof_usage().clone(),
         };
         usage.record_actual_signature_counts(_signature_scope.counts());
-        Ok(usage)
+        current.check_usage(usage)
     }
 
     pub fn execution_handoff_resolution_proof_usage(
@@ -1403,6 +1565,40 @@ impl Store {
         operation_id: &str,
         now_ms: u64,
     ) -> Result<VerifiedExecutionHandoff> {
+        self.execution_handoff_authorization_with_policy(
+            HandoffPolicy::Primary,
+            execution_space,
+            original_space,
+            operation_id,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn execution_handoff_authorization_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        execution_space: &str,
+        original_space: &str,
+        operation_id: &str,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionHandoff> {
+        self.execution_handoff_authorization_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            execution_space,
+            original_space,
+            operation_id,
+            now_ms,
+        )
+    }
+
+    fn execution_handoff_authorization_with_policy(
+        &self,
+        current: HandoffPolicy<'_>,
+        execution_space: &str,
+        original_space: &str,
+        operation_id: &str,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionHandoff> {
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
         let stored = stored_from(
@@ -1412,21 +1608,27 @@ impl Store {
             operation_id,
         )?
         .context("unknown execution handoff")?;
+        current.check_wire_in(&self.connection, &self.policy, &stored.wire, now_ms)?;
         let admission = reconstruct_handoff(&self.connection, &self.policy, &stored)?;
         let original = original_authorization_from(
             &self.connection,
             &self.policy,
-            self.policy.verified(),
+            current.state(&self.policy),
             &stored.wire,
             now_ms,
         )?;
-        Ok(self.policy.verified().verify_execution_handoff(
+        let auth = current.state(&self.policy).verify_execution_handoff(
             &stored.wire,
             &original,
             &stored.transport,
             Some(&admission),
             now_ms,
-        )?)
+        )?;
+        if matches!(current, HandoffPolicy::TaskBusiness(_)) {
+            current.check_authorizations_in(&self.connection, &self.policy, &auth, now_ms)?;
+        }
+        current.check_usage(auth.proof_usage().clone())?;
+        Ok(auth)
     }
 
     pub fn issue_execution_handoff_challenge(
@@ -1436,12 +1638,51 @@ impl Store {
         stage: CheckStage,
         now_ms: u64,
     ) -> Result<ExecutionHandoffChallenge> {
+        self.issue_execution_handoff_challenge_with_policy(
+            HandoffPolicy::Primary,
+            wire,
+            transport,
+            stage,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn issue_execution_handoff_challenge_scoped(
+        &mut self,
+        view: &TaskBusinessScopedView,
+        wire: &SignedExecutionHandoff,
+        transport: &TransportEvidence,
+        stage: CheckStage,
+        now_ms: u64,
+    ) -> Result<ExecutionHandoffChallenge> {
+        ensure!(
+            matches!(stage, CheckStage::Admit | CheckStage::RemoteRead),
+            "Task business source permits initial admission or current read only"
+        );
+        self.issue_execution_handoff_challenge_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            wire,
+            transport,
+            stage,
+            now_ms,
+        )
+    }
+
+    fn issue_execution_handoff_challenge_with_policy(
+        &mut self,
+        current: HandoffPolicy<'_>,
+        wire: &SignedExecutionHandoff,
+        transport: &TransportEvidence,
+        stage: CheckStage,
+        now_ms: u64,
+    ) -> Result<ExecutionHandoffChallenge> {
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        current.check_wire_in(&self.connection, &self.policy, wire, now_ms)?;
         let original = original_authorization_from(
             &self.connection,
             &self.policy,
-            self.policy.verified(),
+            current.state(&self.policy),
             wire,
             now_ms,
         )?;
@@ -1461,13 +1702,14 @@ impl Store {
                 &stored,
             )?)
         };
-        let verified = self.policy.verified().verify_execution_handoff(
+        let verified = current.state(&self.policy).verify_execution_handoff(
             wire,
             &original,
             transport,
             admitted.as_ref(),
             now_ms,
         )?;
+        current.check_usage(verified.proof_usage().clone())?;
         let challenge = ExecutionHandoffChallenge::new(
             &verified,
             stage,
@@ -1481,8 +1723,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_policy_heads_in(&tx, self.policy.verified(), verified.original(), now_ms)?;
-        check_policy_heads_in(&tx, self.policy.verified(), verified.submission(), now_ms)?;
+        current.check_authorizations_in(&tx, &self.policy, &verified, now_ms)?;
         super::execution_binding_seal::ensure_handoff_generation_open_in(&tx, wire)?;
         tx.execute("INSERT INTO execution_handoff_challenges(execution_space_id,nonce,original_space_id,operation_id,handoff_hash,stage,challenge,expires_at_ms) VALUES(?,?,?,?,?,?,?,?)",
             params![execution, challenge.nonce.as_str(), source, operation, wire.hash()?.as_str(),
@@ -1493,6 +1734,63 @@ impl Store {
 
     pub fn sign_execution_handoff_receipts(
         &self,
+        challenge: &ExecutionHandoffChallenge,
+        identity: &LocalIdentity,
+        now_ms: u64,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        self.sign_execution_handoff_receipts_with_policy(
+            HandoffPolicy::Primary,
+            challenge,
+            identity,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn sign_execution_handoff_receipts_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        wire: &SignedExecutionHandoff,
+        challenge: &ExecutionHandoffChallenge,
+        identity: &LocalIdentity,
+        now_ms: u64,
+    ) -> Result<Vec<Signed<FreshnessReceipt>>> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        ensure!(
+            matches!(challenge.stage, CheckStage::Admit | CheckStage::RemoteRead),
+            "Task business source permits initial admission or current read only"
+        );
+        ensure!(
+            identity.public_key_hex()? == wire.handoff.target_public_key.as_str(),
+            "Task business receipt signer is not this executor"
+        );
+        let current = HandoffPolicy::TaskBusiness(view);
+        let tx = self.connection.unchecked_transaction()?;
+        current.check_wire_in(&tx, &self.policy, wire, now_ms)?;
+        verify_challenge_record(
+            &tx,
+            wire,
+            &ExecutionHandoffFreshness {
+                challenge: challenge.clone(),
+                receipts: Vec::new(),
+            },
+            false,
+        )?;
+        let receipts =
+            self.sign_execution_handoff_receipts_with_policy(current, challenge, identity, now_ms)?;
+        let mut usage = ExecutionProofUsage::default();
+        usage.record_metadata(challenge)?;
+        for receipt in &receipts {
+            usage.record_signed(receipt)?;
+        }
+        current.check_usage(usage)?;
+        tx.commit()?;
+        Ok(receipts)
+    }
+
+    fn sign_execution_handoff_receipts_with_policy(
+        &self,
+        current: HandoffPolicy<'_>,
         challenge: &ExecutionHandoffChallenge,
         identity: &LocalIdentity,
         now_ms: u64,
@@ -1523,22 +1821,20 @@ impl Store {
         let mut receipts = Vec::new();
         for stamp in &challenge.policies {
             ensure!(
-                self.policy.verified().head(&stamp.domain) == Some(stamp),
+                current.state(&self.policy).head(&stamp.domain) == Some(stamp),
                 "handoff freshness policy changed"
             );
             let authority = match &stamp.domain {
                 PolicyDomain::Account(account) => {
-                    &self
-                        .policy
-                        .verified()
+                    &current
+                        .state(&self.policy)
                         .account(account)
                         .context("missing account authority")?
                         .authority
                 }
                 PolicyDomain::Space(space) => {
-                    &self
-                        .policy
-                        .verified()
+                    &current
+                        .state(&self.policy)
                         .space(space)
                         .context("missing space authority")?
                         .authority
@@ -1573,8 +1869,47 @@ impl Store {
         transport: &TransportEvidence,
         now_ms: u64,
     ) -> Result<AdmittedExecutionHandoff> {
+        self.accept_execution_handoff_with_policy(
+            HandoffPolicy::Primary,
+            identity,
+            wire,
+            proof,
+            transport,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn accept_execution_handoff_scoped(
+        &mut self,
+        view: &TaskBusinessScopedView,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionHandoff,
+        proof: &ExecutionHandoffFreshness,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<AdmittedExecutionHandoff> {
+        self.accept_execution_handoff_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            identity,
+            wire,
+            proof,
+            transport,
+            now_ms,
+        )
+    }
+
+    fn accept_execution_handoff_with_policy(
+        &mut self,
+        current: HandoffPolicy<'_>,
+        identity: &LocalIdentity,
+        wire: &SignedExecutionHandoff,
+        proof: &ExecutionHandoffFreshness,
+        transport: &TransportEvidence,
+        now_ms: u64,
+    ) -> Result<AdmittedExecutionHandoff> {
         let _signature_scope =
             vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        current.check_wire_in(&self.connection, &self.policy, wire, now_ms)?;
         let (execution, original_space, operation_id) = scope(wire)?;
         if let Some(stored) =
             stored_from(&self.connection, &execution, &original_space, &operation_id)?
@@ -1585,32 +1920,34 @@ impl Store {
                     && stored.admission == *proof,
                 "handoff operation ID was reused with another signed request"
             );
-            self.execution_handoff_authorization(
+            let auth = self.execution_handoff_authorization_with_policy(
+                current,
                 &execution,
                 &original_space,
                 &operation_id,
                 now_ms,
             )?;
             verify_challenge_record(&self.connection, wire, proof, true)?;
-            return dto(&self.connection, identity, &stored, now_ms);
+            let result = dto(&self.connection, identity, &stored, now_ms)?;
+            current.check_response_usage(auth.proof_usage().clone(), proof, &stored, &result)?;
+            return Ok(result);
         }
         let original = original_authorization_from(
             &self.connection,
             &self.policy,
-            self.policy.verified(),
+            current.state(&self.policy),
             wire,
             now_ms,
         )?;
-        let verified = self
-            .policy
-            .verified()
+        let verified = current
+            .state(&self.policy)
             .verify_execution_handoff(wire, &original, transport, None, now_ms)?;
-        let freshness = self
-            .policy
-            .verified()
+        let freshness = current
+            .state(&self.policy)
             .verify_execution_handoff_freshness(&verified, proof, now_ms)?;
-        self.policy
-            .verified()
+        current.check_usage(freshness.proof_usage().clone())?;
+        current
+            .state(&self.policy)
             .admit_execution_handoff(&verified, &freshness, now_ms)?;
         let operation = request(wire)?;
         let tx = self
@@ -1618,7 +1955,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let duplicate:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM execution_handoffs WHERE original_space_id=? AND operation_id=?)",
             params![original_space,operation_id],|row|row.get(0))?;
-        super::execution_binding_seal::ensure_handoff_generation_open_in(&tx,wire)?;
+        super::execution_binding_seal::ensure_handoff_generation_open_in(&tx, wire)?;
         ensure!(
             !duplicate,
             "original operation is already admitted under another execution scope"
@@ -1639,9 +1976,10 @@ impl Store {
             is_control(&operation),
         )?;
         check_execution_resources_in(&tx, &operation.target_node, &resources)?;
-        consume_freshness_in(
+        consume_freshness_with_policy_in(
             &tx,
             &self.policy,
+            current,
             &verified,
             proof,
             CheckStage::Admit,
@@ -1674,6 +2012,19 @@ impl Store {
                 params![execution, original_space, verified.original().resource().resource.as_str(), operation.target_node, operation.session_id, session.revision,
                     serde_json::to_string(verified.binding())?, serde_json::to_string(&session)?])?;
         }
+        if matches!(current, HandoffPolicy::TaskBusiness(_)) {
+            let stored = stored_from(&tx, &execution, &original_space, &operation_id)?
+                .context("accepted handoff was not persisted")?;
+            let result = dto(&tx, identity, &stored, now_ms)?;
+            current.check_response_usage(
+                freshness.proof_usage().clone(),
+                proof,
+                &stored,
+                &result,
+            )?;
+            tx.commit()?;
+            return Ok(result);
+        }
         tx.commit()?;
         let stored = stored_from(&self.connection, &execution, &original_space, &operation_id)?
             .context("accepted handoff was not persisted")?;
@@ -1682,6 +2033,36 @@ impl Store {
 
     pub fn authorize_execution_handoff_read(
         &self,
+        auth: &VerifiedExecutionHandoff,
+        proof: &ExecutionHandoffFreshness,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.authorize_execution_handoff_read_with_policy(
+            HandoffPolicy::Primary,
+            auth,
+            proof,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn authorize_execution_handoff_read_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        auth: &VerifiedExecutionHandoff,
+        proof: &ExecutionHandoffFreshness,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.authorize_execution_handoff_read_with_policy(
+            HandoffPolicy::TaskBusiness(view),
+            auth,
+            proof,
+            now_ms,
+        )
+    }
+
+    fn authorize_execution_handoff_read_with_policy(
+        &self,
+        current: HandoffPolicy<'_>,
         auth: &VerifiedExecutionHandoff,
         proof: &ExecutionHandoffFreshness,
         now_ms: u64,
@@ -1700,21 +2081,11 @@ impl Store {
             "handoff read changed its original request"
         );
         reconstruct_handoff(&self.connection, &self.policy, &stored)?;
-        check_policy_heads_in(
-            &self.connection,
-            self.policy.verified(),
-            auth.original(),
-            now_ms,
-        )?;
-        check_policy_heads_in(
-            &self.connection,
-            self.policy.verified(),
-            auth.submission(),
-            now_ms,
-        )?;
-        self.policy
-            .verified()
+        current.check_authorizations_in(&self.connection, &self.policy, auth, now_ms)?;
+        let freshness = current
+            .state(&self.policy)
             .verify_execution_handoff_freshness(auth, proof, now_ms)?;
+        current.check_usage(freshness.proof_usage().clone())?;
         verify_challenge_record(&self.connection, auth.wire(), proof, false)
     }
 
@@ -1932,6 +2303,36 @@ impl Store {
         .context("unknown execution handoff")?;
         reconstruct_handoff(&self.connection, &self.policy, &stored)?;
         dto(&self.connection, identity, &stored, now_ms)
+    }
+
+    pub(crate) fn execution_handoff_status_scoped(
+        &self,
+        view: &TaskBusinessScopedView,
+        identity: &LocalIdentity,
+        auth: &VerifiedExecutionHandoff,
+        proof: &ExecutionHandoffFreshness,
+        now_ms: u64,
+    ) -> Result<AdmittedExecutionHandoff> {
+        let _signature_scope =
+            vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+        let tx = self.connection.unchecked_transaction()?;
+        self.authorize_execution_handoff_read_scoped(view, auth, proof, now_ms)?;
+        let (execution, original, operation) = scope(auth.wire())?;
+        let stored = stored_from(&tx, &execution, &original, &operation)?
+            .context("handoff read has no prior acceptance")?;
+        ensure!(
+            stored.wire == *auth.wire(),
+            "handoff status changed its accepted request"
+        );
+        let result = dto(&tx, identity, &stored, now_ms)?;
+        HandoffPolicy::TaskBusiness(view).check_response_usage(
+            auth.proof_usage().clone(),
+            proof,
+            &stored,
+            &result,
+        )?;
+        tx.commit()?;
+        Ok(result)
     }
 
     pub fn load_execution_handoffs_for_recovery(
