@@ -533,13 +533,20 @@ impl Store {
             &key("completed-import", &input.import_ref),
             &policy_ref,
         )?;
+        let task_key = match &complete_policy {
+            CompletedPolicy::Current(policy) => Some(
+                super::provenance::TaskExecutionPolicyProvenance::task_key(policy)?,
+            ),
+            CompletedPolicy::History(_) => None,
+        };
         tx.commit()?;
         match complete_policy {
             CompletedPolicy::Current(policy) => {
-                self.policy
-                    .task_execution_policy
-                    .current
-                    .insert(policy_ref, policy);
+                self.policy.task_execution_policy.insert_current(
+                    task_key.context("current policy lost its Task index")?,
+                    policy_ref,
+                    policy,
+                );
             }
             CompletedPolicy::History(policy) => {
                 self.policy

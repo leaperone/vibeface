@@ -33,7 +33,7 @@ pub(crate) use provenance::{
     TaskExecutionPolicyProvenance, bind_task_execution_policy_in, check_task_policy_heads_in,
     current_task_execution_policy_in, current_task_prepare_policy_in,
     original_task_execution_policy_in, rehydrate_task_execution_policy_in,
-    task_policy_for_binding_in, validate_task_execution_policy_links_in,
+    task_policy_candidates_in, task_policy_for_binding_in, validate_task_execution_policy_links_in,
 };
 
 #[derive(Serialize, Deserialize)]

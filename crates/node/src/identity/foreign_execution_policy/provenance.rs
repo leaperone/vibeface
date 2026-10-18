@@ -1,6 +1,6 @@
 use super::ingress::{CompletionRecord, ImportRecord};
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use vibeface_secure::authorization::{
     Invocation, PolicyDomain, PolicyStamp, RequestFacts, VerifiedAuthorization,
     node_execution_policy::{
@@ -18,8 +18,55 @@ use vibeface_secure::authorization::{
 pub(crate) struct TaskExecutionPolicyProvenance {
     pub(super) current: BTreeMap<ObjectHash, VerifiedTaskCurrentPolicy>,
     pub(super) history: BTreeMap<ObjectHash, VerifiedTaskHistoryPolicy>,
+    by_task: BTreeMap<ObjectHash, BTreeSet<ObjectHash>>,
     original: BTreeMap<ObjectHash, CachedOriginal>,
     retained_floors: BTreeMap<String, vibeface_secure::authorization::PolicyPin>,
+}
+
+impl TaskExecutionPolicyProvenance {
+    pub(super) fn task_key(policy: &VerifiedTaskCurrentPolicy) -> Result<ObjectHash> {
+        let context = policy.request().context()?;
+        let task = context
+            .context
+            .task
+            .as_ref()
+            .context("completed foreign policy has no Task")?;
+        Ok(ObjectHash::body(&(
+            policy.request().source_project(),
+            task,
+        ))?)
+    }
+
+    pub(super) fn insert_current(
+        &mut self,
+        task_key: ObjectHash,
+        reference: ObjectHash,
+        policy: VerifiedTaskCurrentPolicy,
+    ) {
+        self.by_task
+            .entry(task_key)
+            .or_default()
+            .insert(reference.clone());
+        self.current.insert(reference, policy);
+    }
+
+    fn current_for_task(
+        &self,
+        project: &vibeface_secure::authorization::ResourceRef,
+        task: &vibeface_secure::authorization::EventRef,
+    ) -> Result<Vec<&VerifiedTaskCurrentPolicy>> {
+        let key = ObjectHash::body(&(project, task))?;
+        self.by_task
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .map(|reference| {
+                self.current
+                    .get(reference)
+                    .context("Task policy index lost its genuine current provenance")
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -289,10 +336,18 @@ pub(crate) fn task_policy_for_binding_in(
     usage.record_binding(binding)?;
     let association = binding_association_in(connection, primary, binding, &mut usage)?;
     let mut selected: Option<VerifiedTaskCurrentPolicy> = None;
-    for policy in primary.task_execution_policy.current.values() {
+    let task_ref = vibeface_secure::authorization::EventRef::parse(&binding.binding.task_ref)?;
+    for policy in primary
+        .task_execution_policy
+        .current_for_task(project, &task_ref)?
+    {
         let context = policy.context();
         if policy.request().source_node() != source
             || policy.request().source_project() != project
+            || !matches!(
+                policy.request().purpose(),
+                RemoteExecutionPolicyPurpose::Execution | RemoteExecutionPolicyPurpose::Resolver
+            )
             || policy.request().expected_action() != action
             || policy.selection() != selection
             || policy.trust().approval().hash()? != association.approval_ref
@@ -350,6 +405,102 @@ fn facts(invocation: &Signed<Invocation>, body: &Value) -> Result<RequestFacts> 
     })
 }
 
+pub(crate) fn task_policy_candidates_in(
+    connection: &Connection,
+    primary: &super::super::journal::PolicyState,
+    source: &PublicKey,
+    project: &vibeface_secure::authorization::ResourceRef,
+    task: &vibeface_secure::authorization::EventRef,
+    conversation: &str,
+    executor: &str,
+    action: Action,
+    binding: Option<&SignedBinding>,
+    now: u64,
+) -> Result<Vec<VerifiedTaskCurrentPolicy>> {
+    if let Some(binding) = binding {
+        ensure!(
+            binding.binding.task_ref == task.as_str()
+                && binding.binding.network_id == project.space.as_str()
+                && binding.binding.conversation_id == conversation
+                && binding.binding.open_spec["executor"].as_str() == Some(executor),
+            "Task candidates changed the actual binding scope"
+        );
+        let mut usage = ExecutionProofUsage::default();
+        let association = binding_association_in(connection, primary, binding, &mut usage)?;
+        let original_source = association_source(primary, &association)?;
+        ensure!(
+            original_source == *source,
+            "Task candidates changed the actual source Node"
+        );
+        let proof = super::super::admission::load_admission_in(
+            connection,
+            project.space.as_str(),
+            &association.authorization_id,
+        )?;
+        let original = original_task_execution_policy_in(connection, primary, source, &proof)?
+            .context("Task candidates have no original approved writer")?;
+        let policy = task_policy_for_binding_in(
+            connection,
+            primary,
+            source,
+            binding,
+            project,
+            original.trust().selection(),
+            action,
+            now,
+        )?;
+        return Ok(vec![policy]);
+    }
+    let current: Option<String> = connection
+        .query_row(
+            "SELECT value FROM local_values WHERE space_id=? AND key=?",
+            params![
+                project.space.as_str(),
+                format!("task-binding-current:{task}")
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    ensure!(
+        current.is_none(),
+        "Task candidates omitted the actual current binding"
+    );
+    let mut candidates: BTreeMap<ObjectHash, VerifiedTaskCurrentPolicy> = BTreeMap::new();
+    for policy in primary
+        .task_execution_policy
+        .current_for_task(project, task)?
+    {
+        let context = policy.context();
+        if policy.request().source_node() != source
+            || policy.request().source_project() != project
+            || policy.request().purpose() != RemoteExecutionPolicyPurpose::Execution
+            || policy.request().expected_action() != Action::ExecutionOpen
+            || action != Action::ExecutionOpen
+            || context.binding_generation != Some(1)
+            || context.context.conversation.as_deref() != Some(conversation)
+            || context.context.executor_kind.as_deref() != Some(executor)
+            || now >= policy.expires_at_ms()
+            || now < policy.snapshot().payload.issued_at_ms
+            || now < policy.witness().payload.issued_at_ms
+        {
+            continue;
+        }
+        if check_task_policy_heads_in(connection, policy).is_err() {
+            continue;
+        }
+        let mut usage = policy.proof_usage().clone();
+        check_current_anchor_in(connection, primary, source, policy, &mut usage)?;
+        usage.enforce_limits()?;
+        let selection = ObjectHash::body(policy.selection())?;
+        if candidates.get(&selection).is_none_or(|prior| {
+            policy.snapshot().payload.issued_at_ms > prior.snapshot().payload.issued_at_ms
+        }) {
+            candidates.insert(selection, policy.clone());
+        }
+    }
+    Ok(candidates.into_values().collect())
+}
+
 pub(crate) fn current_task_prepare_policy_in(
     connection: &Connection,
     primary: &super::super::journal::PolicyState,
@@ -362,7 +513,17 @@ pub(crate) fn current_task_prepare_policy_in(
         return Ok(None);
     }
     let mut selected: Option<VerifiedTaskCurrentPolicy> = None;
-    for policy in primary.task_execution_policy.current.values() {
+    let task = prepare
+        .payload
+        .request
+        .context
+        .task
+        .as_ref()
+        .context("remote prepare has no Task")?;
+    for policy in primary
+        .task_execution_policy
+        .current_for_task(&prepare.payload.request.resource, task)?
+    {
         if policy.request().source_node() != source
             || policy.request().source_project() != &prepare.payload.request.resource
         {
@@ -446,7 +607,17 @@ pub(crate) fn current_task_execution_policy_in(
     let local = PublicKey::parse(&identity.public_key_hex()?)?;
     let actual = facts(invocation, body)?;
     let mut selected = None;
-    for (reference, policy) in &primary.task_execution_policy.current {
+    let task = invocation
+        .payload
+        .context
+        .task
+        .as_ref()
+        .context("remote invocation has no Task")?;
+    for policy in primary
+        .task_execution_policy
+        .current_for_task(&actual.resource, task)?
+    {
+        let reference = policy_reference(policy)?;
         if policy.request().source_node() != &local
             || policy.request().source_project() != &actual.resource
         {
