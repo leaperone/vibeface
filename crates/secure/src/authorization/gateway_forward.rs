@@ -317,8 +317,15 @@ impl GatewayClientPolicyImport {
             now,
         )?;
         let snapshot = require_confirmed_client_policy(&auth)?;
-        let mut floors = Vec::with_capacity(self.route.update.minimum_pins.len());
-        for pin in &self.route.update.minimum_pins {
+        let mut floors = Vec::with_capacity(auth.heads.len());
+        for current in &auth.heads {
+            let pin = self
+                .route
+                .update
+                .minimum_pins
+                .iter()
+                .find(|pin| pin.domain == current.domain)
+                .ok_or(AuthorizationError::PolicyConflict)?;
             let approved = self
                 .route
                 .update
@@ -336,11 +343,6 @@ impl GatewayClientPolicyImport {
                     return Err(AuthorizationError::NeedPolicySync(vec![minimum.clone()]));
                 }
             }
-            let current = auth
-                .heads
-                .iter()
-                .find(|head| head.domain == pin.domain)
-                .ok_or(AuthorizationError::PolicyConflict)?;
             floors.push(PolicyPin {
                 domain: pin.domain.clone(),
                 genesis_root: pin.genesis_root.clone(),
@@ -370,6 +372,12 @@ impl VerifiedGatewayClientSource {
             .update
             .minimum_pins
             .iter()
+            .filter(|pin| {
+                self.authorization
+                    .heads
+                    .iter()
+                    .any(|head| head.domain == pin.domain)
+            })
             .filter_map(|pin| pin.minimum_head.as_ref())
         {
             if !snapshot.state().roots.contains_key(minimum) {
@@ -1363,6 +1371,15 @@ mod tests {
     fn signed_transcript_import_keeps_a_independent_and_retains_exact_source_floors() {
         let a = account_fixture(110);
         let b = account_fixture(120);
+        let mut source_pins = b.pins.clone();
+        let unused_pin = a
+            .pins
+            .iter()
+            .find(|pin| matches!(pin.domain, PolicyDomain::Account(_)))
+            .unwrap()
+            .clone();
+        source_pins.push(unused_pin.clone());
+        source_pins.sort_by(|left, right| left.domain.cmp(&right.domain));
         let b_account = AccountId::from_root(&PublicKey::of(&b.root));
         let selection = AuthorizationSelection {
             resource: b.resource.clone(),
@@ -1386,7 +1403,7 @@ mod tests {
                 target_key: PublicKey::of(&b.node),
                 resource: b.resource.clone(),
                 allowed_actions: vec![Action::MessageAppend],
-                source_pins: b.pins.clone(),
+                source_pins: source_pins.clone(),
                 state: GatewayRouteState::Active,
                 issued_at_ms: NOW,
                 expires_at_ms: NOW + 60_000,
@@ -1400,7 +1417,7 @@ mod tests {
             &PublicKey::of(&a.node),
             &approval,
             1,
-            &b.pins,
+            &source_pins,
             NOW,
         )
         .unwrap();
@@ -1411,7 +1428,7 @@ mod tests {
                 space: b.resource.space.clone(),
                 device_public_key: PublicKey::of(&b.client),
                 node_public_key: PublicKey::of(&b.node),
-                saved_pins: b.pins.clone(),
+                saved_pins: source_pins.clone(),
                 selection: Some(selection.clone()),
                 nonce: Nonce::from_bytes([126; 32]),
                 issued_at_ms: NOW,
@@ -1433,7 +1450,7 @@ mod tests {
                 version: AUTH_VERSION,
                 request_hash: request.hash().unwrap(),
                 snapshot_id: Nonce::from_bytes([127; 32]),
-                saved_pins_hash: client_policy_saved_pins_hash(&b.pins).unwrap(),
+                saved_pins_hash: client_policy_saved_pins_hash(&source_pins).unwrap(),
                 target_heads: current.heads().to_vec(),
                 selection: selection.clone(),
                 source_node_public_key: PublicKey::of(&b.node),
@@ -1540,6 +1557,33 @@ mod tests {
             .unwrap();
         assert_eq!(source.reference(), independent_clone.reference());
         source.check_route(&route, NOW).unwrap();
+        assert_eq!(source.floors().len(), current.heads().len());
+        assert!(
+            !source
+                .floors()
+                .iter()
+                .any(|pin| pin.domain == unused_pin.domain)
+        );
+        let mut unused_advanced = source_pins.clone();
+        unused_advanced
+            .iter_mut()
+            .find(|pin| pin.domain == unused_pin.domain)
+            .unwrap()
+            .minimum_head
+            .as_mut()
+            .unwrap()
+            .sequence += 100;
+        let unused_advanced = verify_gateway_route(
+            &a.state,
+            &AccountId::from_root(&PublicKey::of(&a.root)),
+            &PublicKey::of(&a.node),
+            &approval,
+            1,
+            &unused_advanced,
+            NOW,
+        )
+        .unwrap();
+        source.check_route(&unused_advanced, NOW).unwrap();
         assert_eq!(source.reference(), &reference);
         assert!(
             a.state
@@ -1625,8 +1669,15 @@ mod tests {
             )
             .is_err()
         );
-        let mut high_pins = b.pins.clone();
-        high_pins[0].minimum_head.as_mut().unwrap().sequence += 100;
+        let mut high_pins = source_pins.clone();
+        high_pins
+            .iter_mut()
+            .find(|pin| pin.domain == current.heads()[0].domain)
+            .unwrap()
+            .minimum_head
+            .as_mut()
+            .unwrap()
+            .sequence += 100;
         let high_route = verify_gateway_route(
             &a.state,
             &AccountId::from_root(&PublicKey::of(&a.root)),
