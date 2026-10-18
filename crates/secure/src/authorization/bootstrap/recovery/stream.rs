@@ -210,3 +210,58 @@ impl SignedObject for RecoveryContextWitness {
 pub fn recovery_target_heads_hash(heads: &[PolicyStamp]) -> Result<ObjectHash> {
     ObjectHash::body(&heads)
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryContextReference {
+    pub snapshot_id: Nonce,
+    pub request_hash: ObjectHash,
+    pub snapshot_hash: ObjectHash,
+    pub witness_hash: ObjectHash,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamedRecoveryNodeRequest {
+    pub context: RecoveryContextReference,
+    pub request: RecoveryNodeRequest,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamedRecoveryCommitRequest {
+    pub context: RecoveryContextReference,
+    pub request_hash: ObjectHash,
+    pub expected_account_head: PolicyStamp,
+    pub expected_space_head: PolicyStamp,
+    pub journal_delta: Vec<JournalEntry>,
+    pub grant_leaf: ObjectHash,
+    pub new_device_public_key: PublicKey,
+    pub claim_nonce: Nonce,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryCompletionReceipt {
+    pub version: u16,
+    pub context: RecoveryContextReference,
+    pub request_hash: ObjectHash,
+    pub input_hash: ObjectHash,
+    pub committed_account_head: PolicyStamp,
+    pub committed_space_head: PolicyStamp,
+    pub grant_leaf: ObjectHash,
+    pub new_device_public_key: PublicKey,
+    pub source_node_public_key: PublicKey,
+    pub accepted_at_ms: u64,
+}
+impl sealed::Sealed for RecoveryCompletionReceipt {}
+impl SignedObject for RecoveryCompletionReceipt {
+    const DOMAIN: &'static str = "recovery-context-completion-v2";
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryCompletionStatusRequest {
+    pub context: RecoveryContextReference,
+    pub input_hash: ObjectHash,
+}
