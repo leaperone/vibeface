@@ -872,6 +872,479 @@ mod tests {
     }
 
     #[test]
+    fn remote_policy_three_accounts_preserve_the_gateway_presenter_and_execution_heads()
+    -> Result<()> {
+        use crate::identity::test_support::TestNetwork;
+        use vibeface_secure::authorization::{
+            Actor, AuthorizationError, Invocation, TransportEvidence,
+            prepare::{PrepareIntent, verify_remote_execution},
+            remote_execution_policy::begin_remote_execution_policy_import,
+        };
+
+        fn checked<T>(phase: &str, action: impl FnOnce() -> Result<T>) -> Result<T> {
+            let signatures = SignatureVerification::new();
+            let result = signatures.run(action);
+            println!(
+                "three_account_probe phase={phase} signatures={:?} accepted={}",
+                signatures.counts(),
+                result.is_ok(),
+            );
+            ensure!(
+                signatures.counts().actual_verifications <= 32,
+                "three-account phase {phase} exceeded its crypto budget"
+            );
+            result.with_context(|| format!("three-account phase {phase}"))
+        }
+
+        let mut fixture = Fixture::new()?;
+        let gateway_network = TestNetwork::new()?;
+        assert_ne!(gateway_network.account, fixture.project.account);
+        assert_ne!(gateway_network.account, fixture.executor.account);
+        assert_ne!(fixture.project.account, fixture.executor.account);
+        let gateway_key = PublicKey::parse(&gateway_network.node.public_key_hex()?)?;
+        let gateway_device = DeviceId::from_key(&gateway_key);
+        let gateway_certificate = gateway_network
+            .bundle
+            .journal
+            .iter()
+            .find_map(|entry| match entry {
+                JournalEntry::Device(certificate)
+                    if certificate.payload.device == gateway_device =>
+                {
+                    Some(certificate)
+                }
+                _ => None,
+            })
+            .context("independent Gateway certificate is missing")?;
+        assert_eq!(
+            gateway_certificate.payload.owner,
+            PolicyDomain::Account(gateway_network.account.clone()),
+        );
+        assert_eq!(
+            gateway_certificate.payload.subject,
+            Actor::Service(vibeface_secure::authorization::ServiceId::from_key(
+                &gateway_key
+            )),
+        );
+        let mut gateway = gateway_network.memory()?;
+        fixture.project.install(&mut gateway)?;
+        gateway_network.install(&mut fixture.store)?;
+        let gateway_domain = PolicyDomain::Account(gateway_network.account.clone());
+        let mut source_pins = fixture.project.pins.clone();
+        source_pins.extend(
+            gateway_network
+                .pins
+                .iter()
+                .filter(|pin| pin.domain == gateway_domain)
+                .cloned(),
+        );
+        source_pins.sort_by(|left, right| left.domain.cmp(&right.domain));
+        let selection = AuthorizationSelection {
+            resource: ResourceRef {
+                space: fixture.project.space.clone(),
+                resource: fixture.project.resource.clone(),
+            },
+            audience: fixture.audience.clone(),
+            grant_leaf: fixture.project.bundle.grant_leaf.clone(),
+        };
+        let source = verified_client_policy_for_test(
+            &mut gateway,
+            &gateway_network.node,
+            &fixture.project.client,
+            &fixture.project.account,
+            selection.clone(),
+            &source_pins,
+            now(),
+        )
+        .context("three-account phase genuine_source_on_independent_gateway")?;
+        println!(
+            "three_account_probe source_usage={}",
+            source
+                .client_policy_proof_usage_json()
+                .map_err(anyhow::Error::msg)?
+        );
+        assert!(
+            source
+                .heads()
+                .iter()
+                .any(|head| head.domain == gateway_domain)
+        );
+        let target_key = PublicKey::parse(&fixture.executor.node.public_key_hex()?)?;
+        let context = PrepareContext {
+            context: InvocationContext {
+                conversation: Some("conversation".into()),
+                task: Some(EventRef::parse(&fixture.task.hash)?),
+                execution_session: Some(SessionRef {
+                    target: DeviceId::from_key(&target_key),
+                    session_id: "remote-session".into(),
+                }),
+                executor_kind: Some("codex".into()),
+                workspace_resource: Some(fixture.project.resource.clone()),
+                sdk_session: None,
+            },
+            binding_generation: Some(1),
+            canonical_cwd: Some(fixture.project.project.to_string_lossy().into_owned()),
+            execution_target_public_key: Some(target_key.clone()),
+        };
+        let policy_input = json!({
+            "selection":{
+                "execution_resource":fixture.execution,
+                "target_public_key":target_key,
+                "execution_grant":fixture.grant,
+            },
+            "context":context,
+            "expected_action":Action::ExecutionOpen,
+            "purpose":RemoteExecutionPolicyPurpose::Execution,
+            "execution_pins":fixture.executor.pins,
+        });
+        let intent = checked("policy_intent", || {
+            build_remote_execution_policy_read_intent(
+                &source,
+                &policy_input.to_string(),
+                &fixture.project.client,
+                now() as f64,
+                (now() + 60_000) as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let intent: Signed<RemoteExecutionPolicyReadIntent> = serde_json::from_str(&intent)?;
+        let delegation = checked("project_delegate", || {
+            fixture.store.remote_execution_policy_delegate(
+                &fixture.project.node,
+                &fixture.project.client.public_key_hex(),
+                &serde_json::to_value(&intent)?,
+                now(),
+            )
+        })?;
+        let delegation = serde_json::from_value(delegation["delegation"].clone())?;
+        let request = RemoteExecutionPolicyReadRequest { intent, delegation };
+        let principal = fixture.project.client.public_key_hex();
+        let mut target = fixture.executor.memory()?;
+        target.install_policy_journal(&fixture.journal, now())?;
+        assert!(
+            target
+                .policy
+                .verified()
+                .account(&gateway_network.account)
+                .is_none()
+        );
+        assert!(
+            target
+                .remote_execution_policy_prepare(
+                    &fixture.executor.node,
+                    &gateway_network.client.public_key_hex(),
+                    &serde_json::to_value(&request)?,
+                    now(),
+                )
+                .is_err()
+        );
+        let prepared = checked("executor_policy_prepare", || {
+            target.remote_execution_policy_prepare(
+                &fixture.executor.node,
+                &principal,
+                &serde_json::to_value(&request)?,
+                now(),
+            )
+        })?;
+        let request_json = serde_json::to_string(&request)?;
+        let snapshot_json = prepared["snapshot"].to_string();
+        let executor_pins_json = serde_json::to_string(&fixture.executor.pins)?;
+        let mut import = checked("begin_finite_execution_policy", || {
+            begin_remote_execution_policy_import(
+                &source,
+                &request_json,
+                &snapshot_json,
+                &executor_pins_json,
+                target_key.as_str(),
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let mut pages = 0;
+        loop {
+            ensure!(pages < 128, "three-account policy stream did not finish");
+            let params =
+                serde_json::from_str(&import.page_request_json().map_err(anyhow::Error::msg)?)?;
+            let response = checked("executor_policy_page", || {
+                target.remote_execution_policy_page(
+                    &fixture.executor.node,
+                    &principal,
+                    &params,
+                    now(),
+                )
+            })?;
+            let page: Signed<RemoteExecutionPolicyPage> =
+                serde_json::from_value(response["page"].clone())?;
+            checked("append_finite_execution_page", || {
+                import
+                    .append_page(&serde_json::to_string(&page)?, now() as f64)
+                    .map_err(anyhow::Error::msg)
+            })?;
+            pages += 1;
+            if page.payload.complete {
+                break;
+            }
+        }
+        let params =
+            serde_json::from_str(&import.page_request_json().map_err(anyhow::Error::msg)?)?;
+        let response = checked("executor_policy_finish", || {
+            target.remote_execution_policy_finish(
+                &fixture.executor.node,
+                &principal,
+                &params,
+                now(),
+            )
+        })?;
+        let policy = checked("finish_finite_execution_policy", || {
+            import
+                .finish(&response["witness"].to_string(), now() as f64)
+                .map_err(anyhow::Error::msg)
+        })?;
+        let remote = checked("three_argument_remote_execution", || {
+            verify_remote_execution(&source, &policy, now() as f64).map_err(anyhow::Error::msg)
+        })?;
+        let operation_id = "three-account-bind";
+        let mut body = fixture.selection("bind_execution", operation_id)?;
+        body["conversation_id"] = json!("conversation");
+        body["task_id"] = json!("remote-task");
+        body["task_ref"] = json!(fixture.task.hash);
+        body["target_node"] = json!(fixture.executor.node.node_id()?);
+        body["session_id"] = json!("remote-session");
+        body["executor"] = json!("codex");
+        body["cwd"] = json!(fixture.project.project);
+        let signed_prepare = checked("native_signed_prepare", || {
+            remote
+                .prepare(
+                    &source,
+                    &body.to_string(),
+                    &serde_json::to_string(&context)?,
+                    "execution_open",
+                    operation_id,
+                    gateway_key.as_str(),
+                    &fixture.project.client,
+                    now() as f64,
+                )
+                .map_err(anyhow::Error::msg)
+        })?;
+        let signed_prepare: Signed<PrepareIntent> = serde_json::from_str(&signed_prepare)?;
+        for domain in [
+            gateway_domain.clone(),
+            PolicyDomain::Account(fixture.project.account.clone()),
+            PolicyDomain::Space(fixture.project.space.clone()),
+            PolicyDomain::Account(fixture.executor.account.clone()),
+            PolicyDomain::Space(fixture.executor.space.clone()),
+        ] {
+            assert!(
+                signed_prepare
+                    .payload
+                    .request
+                    .expected_policies
+                    .iter()
+                    .any(|head| head.domain == domain)
+            );
+        }
+        assert_eq!(signed_prepare.payload.request.presenter, gateway_device);
+        assert_eq!(signed_prepare.payload.request.audience, fixture.audience);
+        let peer = TransportEvidence::VerifiedPeer {
+            origin: gateway_device.clone(),
+        };
+        let gateway_transport = TransportEvidence::GatewayNoise {
+            device: DeviceId::from_key(&PublicKey::of(&fixture.project.client)),
+            gateway: gateway_device.clone(),
+        };
+        let checked_prepare = checked("project_verify_prepare", || {
+            fixture
+                .store
+                .policy
+                .verified()
+                .verify_prepare_intent(
+                    &signed_prepare,
+                    &body,
+                    Action::ExecutionOpen,
+                    &fixture.audience,
+                    &peer,
+                    now(),
+                )
+                .map_err(anyhow::Error::from)
+        })?;
+        assert!(checked_prepare.execution_destination().is_some());
+        checked("gateway_verify_prepare", || {
+            fixture
+                .store
+                .policy
+                .verified()
+                .verify_prepare_intent(
+                    &signed_prepare,
+                    &body,
+                    Action::ExecutionOpen,
+                    &fixture.audience,
+                    &gateway_transport,
+                    now(),
+                )
+                .map_err(anyhow::Error::from)
+        })?;
+        let invocation = checked("native_signed_invocation", || {
+            remote
+                .sign(
+                    &source,
+                    &serde_json::to_string(&signed_prepare.payload.request)?,
+                    &body.to_string(),
+                    "execution_open",
+                    operation_id,
+                    gateway_key.as_str(),
+                    &fixture.project.client,
+                    now() as f64,
+                )
+                .map_err(anyhow::Error::msg)
+        })?;
+        let invocation: Signed<Invocation> = serde_json::from_str(&invocation)?;
+        assert_eq!(
+            invocation.payload.expected_policies,
+            signed_prepare.payload.request.expected_policies
+        );
+        let facts = fixture
+            .store
+            .execution_dispatch_facts(&body, &fixture.audience, now())?;
+        let accepted = checked("project_body_aware_intake", || {
+            fixture.store.authorize_request_for_body(
+                &invocation,
+                facts.facts(),
+                &peer,
+                &body,
+                now(),
+            )
+        })?;
+        assert_eq!(accepted.signed_invocation(), &invocation);
+        checked("gateway_body_aware_intake", || {
+            fixture.store.authorize_request_for_body(
+                &invocation,
+                facts.facts(),
+                &gateway_transport,
+                &body,
+                now(),
+            )
+        })?;
+        let wrong_peer = TransportEvidence::VerifiedPeer {
+            origin: DeviceId::from_key(&target_key),
+        };
+        assert!(
+            fixture
+                .store
+                .authorize_request_for_body(&invocation, facts.facts(), &wrong_peer, &body, now(),)
+                .is_err()
+        );
+        for missing_domain in [
+            gateway_domain.clone(),
+            PolicyDomain::Space(fixture.executor.space.clone()),
+        ] {
+            let mut missing = signed_prepare.payload.clone();
+            missing
+                .request
+                .expected_policies
+                .retain(|head| head.domain != missing_domain);
+            assert!(matches!(
+                fixture.store.policy.verified().verify_prepare_intent(
+                    &Signed::sign(missing, &fixture.project.client)?,
+                    &body,
+                    Action::ExecutionOpen,
+                    &fixture.audience,
+                    &peer,
+                    now(),
+                ),
+                Err(AuthorizationError::NeedPolicySync(_))
+            ));
+        }
+        let missing_gateway_pin = verified_client_policy_for_test(
+            &mut gateway,
+            &gateway_network.node,
+            &fixture.project.client,
+            &fixture.project.account,
+            selection.clone(),
+            &fixture.project.pins,
+            now(),
+        )
+        .err()
+        .context("missing Gateway root was accepted")?;
+        ensure!(
+            format!("{missing_gateway_pin:#}").contains("NeedPolicySync"),
+            "missing Gateway root returned another error"
+        );
+        let mut missing_executor_pin = policy_input.clone();
+        missing_executor_pin["execution_pins"] = serde_json::to_value(
+            fixture
+                .executor
+                .pins
+                .iter()
+                .filter(|pin| pin.domain != PolicyDomain::Account(fixture.executor.account.clone()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )?;
+        let missing_intent = build_remote_execution_policy_read_intent(
+            &source,
+            &missing_executor_pin.to_string(),
+            &fixture.project.client,
+            now() as f64,
+            (now() + 60_000) as f64,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let missing_intent: Signed<RemoteExecutionPolicyReadIntent> =
+            serde_json::from_str(&missing_intent)?;
+        let missing_delegation = delegate(&mut fixture, &missing_intent)?;
+        let missing_request = RemoteExecutionPolicyReadRequest {
+            intent: missing_intent,
+            delegation: missing_delegation,
+        };
+        let missing_executor_pin = target
+            .remote_execution_policy_prepare(
+                &fixture.executor.node,
+                &principal,
+                &serde_json::to_value(&missing_request)?,
+                now(),
+            )
+            .err()
+            .context("missing Executor root was accepted")?;
+        ensure!(
+            format!("{missing_executor_pin:#}").contains("NeedPolicySync"),
+            "missing Executor root returned another error"
+        );
+        gateway_network.revoke_node(&mut gateway)?;
+        assert!(
+            verified_client_policy_for_test(
+                &mut gateway,
+                &gateway_network.node,
+                &fixture.project.client,
+                &fixture.project.account,
+                selection,
+                &source_pins,
+                now() + 1,
+            )
+            .is_err()
+        );
+        let revoked_gateway = gateway
+            .policy
+            .verified()
+            .account(&gateway_network.account)
+            .context("revoked Gateway account is missing")?
+            .clone();
+        fixture.store.install_policy_journal(
+            &[JournalEntry::Account(Signed::sign(
+                revoked_gateway,
+                &gateway_network.root,
+            )?)],
+            now() + 1,
+        )?;
+        assert!(
+            fixture
+                .store
+                .authorize_request_for_body(&invocation, facts.facts(), &peer, &body, now() + 1,)
+                .is_err()
+        );
+        fixture.project.revoke_client(&mut fixture.store)?;
+        assert!(delegate(&mut fixture, &request.intent).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn remote_policy_history_imports_an_unapplied_result_after_writer_revocation() -> Result<()> {
         use std::collections::BTreeMap;
         use vibeface_secure::authorization::{
