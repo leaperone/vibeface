@@ -3227,6 +3227,7 @@ def chat_agent_acceptance(options):
     except BaseException as error:
         report["status"] = "failed"
         report["failure"] = {"type": type(error).__name__, "message": str(error)}
+        report["traceback"] = traceback.format_exc()
         raise
     finally:
         for directory_name in ("chat-command-restart", "chat-startup-subscription"):
@@ -3546,6 +3547,7 @@ def phase1_acceptance(options):
     except BaseException as error:
         report["status"] = "failed"
         report["failure"] = {"type": type(error).__name__, "message": str(error)}
+        report["traceback"] = traceback.format_exc()
         raise
     finally:
         for node in reversed(nodes):
