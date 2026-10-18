@@ -244,6 +244,17 @@ function saveTrust(ref, value) {
     for (const pin of previous.pins) {
       const next = value.pins.find(item => JSON.stringify(item.domain) === JSON.stringify(pin.domain));
       assert(next && next.genesis_root === pin.genesis_root, 'trust update changed an independently pinned root');
+      if (pin.minimum_head) {
+        const before = pin.minimum_head;
+        const after = next.minimum_head;
+        assert(after, 'trust update removed a saved policy floor');
+        assert.deepEqual(after.domain, before.domain, 'trust update changed a policy floor domain');
+        const sameVersion = after.authority_epoch === before.authority_epoch && after.sequence === before.sequence;
+        assert(after.authority_epoch > before.authority_epoch
+          || after.authority_epoch === before.authority_epoch && after.sequence >= before.sequence,
+        'trust update lowered a saved policy floor');
+        if (sameVersion) assert.deepEqual(after, before, 'trust update forked a saved policy floor');
+      }
     }
   }
   if (ref === 'primary') trust = structuredClone(value);
