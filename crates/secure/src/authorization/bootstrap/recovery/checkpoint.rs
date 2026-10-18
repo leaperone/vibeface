@@ -177,10 +177,14 @@ pub(crate) fn compact_recovery_material_in_state(
     {
         return Ok(());
     }
-    require(
-        material.policy_checkpoint.is_none(),
-        "private recovery checkpoint exceeds its proof budget",
-    )?;
+    checkpoint_recovery_material_in_state(material, state, now)
+}
+
+pub(crate) fn checkpoint_recovery_material_in_state(
+    material: &mut RecoveryMaterial,
+    state: &VerifiedPolicySet,
+    now: u64,
+) -> Result<()> {
     let root = Identity::from_secret_hex(&material.root_secret_hex)
         .map_err(|_| AuthorizationError::InvalidProof("invalid checkpoint root"))?;
     let recovery = Identity::from_secret_hex(&material.recovery_secret_hex)
@@ -197,7 +201,17 @@ pub(crate) fn compact_recovery_material_in_state(
         account.payload.current_root == PublicKey::of(&root)
             && account.payload.recovery.threshold == 1
             && account.payload.recovery.keys == [PublicKey::of(&recovery)]
-            && material.pins.len() == 2,
+            && material.pins.len() == 2
+            && material
+                .pins
+                .windows(2)
+                .all(|pins| pins[0].domain < pins[1].domain)
+            && material.pins.iter().all(|pin| {
+                (pin.domain == PolicyDomain::Account(material.scope.account_id.clone())
+                    || pin.domain == PolicyDomain::Space(material.scope.space_id.clone()))
+                    && pin.genesis_root == account.payload.genesis_root
+                    && pin.minimum_head.as_ref() == state.head(&pin.domain)
+            }),
         "private checkpoint needs current Root and RecoveryKey approval",
     )?;
     let mut budget = Budget::default();
@@ -322,18 +336,20 @@ pub(crate) fn compact_recovery_material_in_state(
         )?,
     };
     let old_bundle = std::mem::replace(&mut material.bundle, bundle);
-    material.policy_checkpoint = Some(RecoveryPolicyCheckpoint {
-        snapshot,
-        recovery_approval,
-    });
-    let validate = material_state(material).and_then(|_| {
+    let old_checkpoint = material
+        .policy_checkpoint
+        .replace(RecoveryPolicyCheckpoint {
+            snapshot,
+            recovery_approval,
+        });
+    let validate = recovery_material_usage(material).and_then(|_| {
         require(
             zeroize::Zeroizing::new(canonical(material)?).len() <= MAX_RECOVERY_MATERIAL_BYTES,
             "private recovery checkpoint exceeds 64 KiB",
         )
     });
     if let Err(error) = validate {
-        material.policy_checkpoint = None;
+        material.policy_checkpoint = old_checkpoint;
         material.bundle = old_bundle;
         return Err(error);
     }
