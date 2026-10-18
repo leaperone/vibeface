@@ -846,7 +846,13 @@ fn verify_local_handoff_checkpoint(connection: &Connection, stored: &StoredHando
                 work == source.work,
                 "stored session changed its original work"
             );
-            check_session_work(&work, &stored.request, &session, &binding)?;
+            check_session_work(
+                &work,
+                &stored.wire.handoff.target_public_key,
+                &stored.request,
+                &session,
+                &binding,
+            )?;
         }
         None => ensure!(
             matches!(source.work, ExecutionWork::Command { .. }),
@@ -1344,6 +1350,7 @@ fn session_from(
 
 fn check_session_work(
     work: &ExecutionWork,
+    target_public_key: &PublicKey,
     operation: &OperationRequest,
     session: &ExecutionSession,
     binding: &Option<SignedBinding>,
@@ -1351,9 +1358,13 @@ fn check_session_work(
     let expected = work
         .execution_session()
         .context("command cannot have an execution session")?;
+    let target_node = vibeface_secure::authorization::node_fingerprint(target_public_key.as_str())
+        .map_err(anyhow::Error::msg)?;
     ensure!(
         operation.session_id.as_deref() == Some(expected.session_id.as_str())
-            && operation.target_node == expected.target.as_str()
+            && expected.target == DeviceId::from_key(target_public_key)
+            && operation.target_node == target_node
+            && session.target_node == target_node
             && session.session_id == expected.session_id
             && operation.binding == *binding,
         "execution session differs from its original work"
@@ -1501,13 +1512,25 @@ fn validate_execution_context(
             cwd: cwd.to_owned(),
             native_session_id: None,
         };
-        check_session_work(handoff.work(), operation, &session, &binding)?;
+        check_session_work(
+            handoff.work(),
+            &handoff.wire().handoff.target_public_key,
+            operation,
+            &session,
+            &binding,
+        )?;
         session
     } else {
         serde_json::from_value::<EngineAction>(operation.action.clone())?.validate()?;
         let (session, previous_binding, work) = existing.context("executor session is not open")?;
         ensure!(work == *handoff.work(), "session changed its original work");
-        check_session_work(handoff.work(), operation, &session, &previous_binding)?;
+        check_session_work(
+            handoff.work(),
+            &handoff.wire().handoff.target_public_key,
+            operation,
+            &session,
+            &previous_binding,
+        )?;
         ensure!(
             session.state != "resolved" && session.revision == operation.expected_revision,
             "executor session revision changed"
@@ -1541,7 +1564,13 @@ fn signed_receipt(
     .map(
         |(session, binding, work)| -> Result<ExecutionSessionSnapshot> {
             ensure!(work == source.work, "session changed its original work");
-            check_session_work(&source.work, &stored.request, &session, &binding)?;
+            check_session_work(
+                &source.work,
+                &stored.wire.handoff.target_public_key,
+                &stored.request,
+                &session,
+                &binding,
+            )?;
             Ok(ExecutionSessionSnapshot {
                 original_project: source.project.clone(),
                 execution_resource: stored.wire.handoff.execution_resource.clone(),
@@ -3151,7 +3180,13 @@ impl Store {
             &stored.request.target_node,
             stored.request.session_id.as_deref(),
         )? {
-            check_session_work(&work, &stored.request, &session, &binding)?;
+            check_session_work(
+                &work,
+                &stored.wire.handoff.target_public_key,
+                &stored.request,
+                &session,
+                &binding,
+            )?;
             ensure!(
                 work == stored.wire.handoff.source_statement()?.work,
                 "Unknown execution changed its original work"
@@ -3755,7 +3790,13 @@ fn resolution_original_observation_from(
                 work == stored.wire.handoff.source_statement()?.work && snapshot.work == work,
                 "unknown receipt changed its original work"
             );
-            check_session_work(&work, &stored.request, &session, &binding)?;
+            check_session_work(
+                &work,
+                &stored.wire.handoff.target_public_key,
+                &stored.request,
+                &session,
+                &binding,
+            )?;
             ensure!(
                 snapshot.revision == session.revision
                     && snapshot.session_id == session.session_id

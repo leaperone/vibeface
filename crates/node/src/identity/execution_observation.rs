@@ -150,7 +150,13 @@ fn check_local_checkpoint_in(connection: &Connection, stored: &StoredHandoff) ->
                 *work == source.work,
                 "observation changed its original work"
             );
-            check_session_work(work, &stored.request, session, binding)?;
+            check_session_work(
+                work,
+                &stored.wire.handoff.target_public_key,
+                &stored.request,
+                session,
+                binding,
+            )?;
             session.native_session_id.as_deref()
         }
         None => {
