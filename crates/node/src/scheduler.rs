@@ -313,7 +313,6 @@ fn publish_job(node: &Runtime, network: &str, conversation: &str, job: &Schedule
 }
 
 fn known_facts(store: &Store, context: &Context) -> Result<Value> {
-    let mut latest = BTreeMap::new();
     let mut dispatched = BTreeMap::new();
     let mut terminal = std::collections::BTreeSet::new();
     for event in &context.events {
@@ -322,43 +321,34 @@ fn known_facts(store: &Store, context: &Context) -> Result<Value> {
         }
         match &event.body {
             EventBody::DispatchRecorded {
-                target_node,
-                session_id,
                 operation_id,
                 action,
                 ..
             } => {
-                latest.insert(
-                    (
-                        target_node.clone(),
-                        session_id.clone().unwrap_or_else(|| operation_id.clone()),
-                    ),
-                    operation_id.clone(),
-                );
                 dispatched.insert(operation_id.clone(), action["action"]["type"].clone());
             }
             EventBody::ExecutionObserved {
                 operation_id,
+                target_node,
                 status,
                 ..
-            } if matches!(status.as_str(), "succeeded" | "failed" | "rejected") => {
+            } if event.author == *target_node
+                && matches!(
+                    status.as_str(),
+                    "succeeded" | "failed" | "rejected" | "completed" | "interrupted"
+                ) =>
+            {
                 terminal.insert(operation_id.clone());
             }
             _ => {}
         }
     }
-    let mut selected = latest
-        .into_values()
-        .collect::<std::collections::BTreeSet<_>>();
-    selected.extend(
-        dispatched
-            .keys()
-            .filter(|operation| !terminal.contains(*operation))
-            .cloned(),
-    );
+    let selected = dispatched
+        .keys()
+        .filter(|operation| !terminal.contains(*operation));
     let mut work = Vec::new();
     for reference in selected {
-        let record = store.operation(&context.network_id, &reference)?;
+        let record = store.operation(&context.network_id, reference)?;
         let state = record
             .as_ref()
             .map(|record| serde_json::to_value(&record.state))

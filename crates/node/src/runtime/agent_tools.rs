@@ -630,6 +630,27 @@ impl Runtime {
             .lock()
             .await
             .context(&access.network_id, scope, &[])?;
+        let terminal = context
+            .events
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::ExecutionObserved {
+                    operation_id,
+                    target_node,
+                    status,
+                    ..
+                } if event.scope_id == scope
+                    && event.author == *target_node
+                    && matches!(
+                        status.as_str(),
+                        "succeeded" | "failed" | "rejected" | "completed" | "interrupted"
+                    ) =>
+                {
+                    Some(operation_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
         let mut work = BTreeMap::new();
         for event in context.events {
             if event.scope_id != scope {
@@ -642,7 +663,10 @@ impl Runtime {
             } = event.body
             {
                 let request: OperationRequest = serde_json::from_value(action)?;
-                if request.network_id == access.network_id && request.conversation_id == scope {
+                if request.network_id == access.network_id
+                    && request.conversation_id == scope
+                    && !terminal.contains(&operation_id)
+                {
                     work.insert(operation_id.clone(), json!({"work_ref":operation_id,"target_node":request.target_node,"session_id":request.session_id,"action":request.action["type"]}));
                 }
             }

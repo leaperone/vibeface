@@ -3568,9 +3568,11 @@ impl Runtime {
                 if event.scope_id == scope
                     && let EventBody::ExecutionObserved {
                         operation_id,
+                        target_node,
                         status,
                         ..
                     } = &event.body
+                    && event.author == *target_node
                     && matches!(
                         status.as_str(),
                         "succeeded" | "failed" | "rejected" | "completed" | "interrupted"
