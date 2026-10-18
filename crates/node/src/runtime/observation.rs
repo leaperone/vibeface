@@ -7,6 +7,7 @@ use vibeface_secure::authorization::{
         ExecutionObservationChallenge, ExecutionObservationFreshness, ExecutionObservationPurpose,
         ExecutionObservationRequest, SignedExecutionObservation,
     },
+    task_business_policy::{TaskBusinessAuthorization, TaskBusinessWire},
 };
 
 #[derive(Deserialize)]
@@ -163,16 +164,10 @@ impl Runtime {
             },
             "observation presenter differs from the authenticated client transport"
         );
-        let (wire, original, target) = {
-            let store = self.store.lock().await;
+        let (wire, original, target, policy_source) = {
+            let mut store = self.store.lock().await;
             verification.run(|| -> Result<_> {
-                let wire = store.prepare_execution_dispatch_observation(
-                    &self.identity,
-                    &request.observation_request,
-                    &transport,
-                    now_ms() as u64,
-                )?;
-                let target = &wire.request.payload.intent.target;
+                let target = &request.observation_request.payload.intent.target;
                 let original = store
                     .execution_dispatch_handoff(
                         target.source.project.space.as_str(),
@@ -180,17 +175,53 @@ impl Runtime {
                     )?
                     .context("observation has no durable original handoff")?;
                 let peer = crypto::fingerprint(target.target_public_key.as_str())?;
-                Ok((wire, original, peer))
+                let (wire, policy_source) =
+                    if store.execution_dispatch_uses_task_policy(&self.identity, &original)? {
+                        let (wire, current, authorization) = store
+                            .prepare_task_execution_dispatch_observation(
+                                &self.identity,
+                                &request.observation_request,
+                                &transport,
+                                now_ms() as u64,
+                            )?;
+                        let source = store.begin_task_business_source(
+                            &self.identity,
+                            &current,
+                            TaskBusinessAuthorization::Observe(&authorization),
+                            &TaskBusinessWire::Observe(wire.clone()),
+                            now_ms() as u64,
+                        )?;
+                        (wire, Some(source))
+                    } else {
+                        (
+                            store.prepare_execution_dispatch_observation(
+                                &self.identity,
+                                &request.observation_request,
+                                &transport,
+                                now_ms() as u64,
+                            )?,
+                            None,
+                        )
+                    };
+                Ok((wire, original, peer, policy_source))
             })?
         };
+        let task_scoped = policy_source.is_some();
         let source = &wire.request.payload.intent.target.source;
-        let response = self
-            .peer_request(
+        let response = if let Some(policy_source) = policy_source {
+            self.request_task_readonly_business(
+                policy_source,
+                &TaskBusinessWire::Observe(wire.clone()),
+            )
+            .await?
+        } else {
+            self.peer_request(
                 source.project.space.as_str(),
                 &target,
                 json!({"type":"execution_handoff_observe","observation":wire}),
             )
-            .await?;
+            .await?
+        };
         ensure!(
             response.get("actual").is_some(),
             "executor did not return an observation result"
@@ -203,12 +234,16 @@ impl Runtime {
         let response: ObservationResult = serde_json::from_value(response)?;
         let store = self.store.lock().await;
         verification.run(|| -> Result<Value> {
-            store.prepare_execution_dispatch_observation(
-                &self.identity,
-                &request.observation_request,
-                &transport,
-                now_ms() as u64,
-            )?;
+            if task_scoped {
+                store.current_task_business_observe(&self.identity, &wire, now_ms() as u64)?;
+            } else {
+                store.prepare_execution_dispatch_observation(
+                    &self.identity,
+                    &request.observation_request,
+                    &transport,
+                    now_ms() as u64,
+                )?;
+            }
             ensure!(
                 store
                     .execution_dispatch_handoff(

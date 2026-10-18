@@ -1,6 +1,9 @@
 use super::*;
 use crate::identity::execution_handoff::AdmittedExecutionHandoff;
-use crate::identity::task_business_policy::TaskBusinessPolicySession;
+use crate::identity::task_business_policy::{
+    TaskBusinessPolicySession, TaskBusinessPolicySourceContext, TaskBusinessRequest,
+    TaskBusinessResponse,
+};
 use vibeface_secure::authorization::execution_handoff::{
     ExecutionHandoffChallenge, ExecutionHandoffFreshness, ExecutionHandoffResolutionChallenge,
     ExecutionHandoffResolutionFreshness, ExecutionHandoffResolutionResult, ExecutionHandoffResult,
@@ -10,7 +13,7 @@ use vibeface_secure::authorization::execution_handoff::{
 use vibeface_secure::authorization::{
     remote_execution_history::RemoteExecutionHistoryAcceptance,
     task_business_policy::{
-        TaskBusinessWire, VerifiedTaskBusinessOriginalSource,
+        TaskBusinessAuthorization, TaskBusinessWire, VerifiedTaskBusinessOriginalSource,
         original_operation::VerifiedTaskBusinessOperationCurrent,
         receipt::{TaskBusinessChallenge, TaskBusinessReceiptRead},
     },
@@ -118,6 +121,176 @@ fn provider_result(mut value: Value, native: Option<&str>) -> Value {
 }
 
 impl Runtime {
+    pub(super) async fn request_execution_dispatch_resolution(
+        &self,
+        wire: &SignedExecutionHandoffResolution,
+    ) -> Result<Value> {
+        let source = {
+            let mut store = self.store.lock().await;
+            SignatureVerification::new().run(|| -> Result<_> {
+                if !store.execution_dispatch_uses_task_policy(
+                    &self.identity,
+                    &wire.resolution.observation.handoff,
+                )? {
+                    return Ok(None);
+                }
+                let (current, authorization) =
+                    store.current_task_business_resolve(&self.identity, wire, now_ms() as u64)?;
+                Ok(Some(store.begin_task_business_source(
+                    &self.identity,
+                    &current,
+                    TaskBusinessAuthorization::Resolve(&authorization),
+                    &TaskBusinessWire::Resolve(wire.clone()),
+                    now_ms() as u64,
+                )?))
+            })?
+        };
+        let result = if let Some(source) = source {
+            self.request_task_readonly_business(source, &TaskBusinessWire::Resolve(wire.clone()))
+                .await
+        } else {
+            let (project, _) = original(&wire.resolution.observation.handoff)?;
+            let target = crypto::fingerprint(
+                wire.resolution
+                    .observation
+                    .handoff
+                    .handoff
+                    .target_public_key
+                    .as_str(),
+            )?;
+            self.peer_request(
+                project.space.as_str(),
+                &target,
+                json!({"type":"execution_handoff_resolve","resolution":wire}),
+            )
+            .await
+        };
+        result.context(
+            "remote resolution outcome is unconfirmed; reconcile its original authorization before retrying",
+        )
+    }
+
+    pub(super) async fn request_task_readonly_business(
+        &self,
+        mut source: TaskBusinessPolicySourceContext,
+        wire: &TaskBusinessWire,
+    ) -> Result<Value> {
+        ensure!(
+            matches!(
+                wire,
+                TaskBusinessWire::Observe(_) | TaskBusinessWire::Resolve(_)
+            ),
+            "readonly Task business requires an observation or resolution"
+        );
+        let source_context = source.header().hash()?;
+        let business_wire_hash = wire.hash()?;
+        let mut client = self.open_task_business_client(&mut source).await?;
+        let mut response = if matches!(wire, TaskBusinessWire::Resolve(_)) {
+            match client
+                .exchange(&TaskBusinessRequest::Status { wire: wire.clone() })
+                .await?
+            {
+                TaskBusinessResponse::Status(value) if value == json!({"state":"not_found"}) => {
+                    client
+                        .exchange(&TaskBusinessRequest::Business(wire.clone()))
+                        .await?
+                }
+                TaskBusinessResponse::Status(value) => TaskBusinessResponse::Status(value),
+                _ => bail!("resolution reconciliation returned an unexpected response"),
+            }
+        } else {
+            client
+                .exchange(&TaskBusinessRequest::Business(wire.clone()))
+                .await?
+        };
+        ensure!(
+            matches!(
+                (wire, &response),
+                (
+                    TaskBusinessWire::Observe(_),
+                    TaskBusinessResponse::Challenge {
+                        challenge: TaskBusinessChallenge::Observe(_),
+                        ..
+                    }
+                ) | (
+                    TaskBusinessWire::Resolve(_),
+                    TaskBusinessResponse::Challenge {
+                        challenge: TaskBusinessChallenge::Resolve(_),
+                        ..
+                    }
+                ) | (
+                    TaskBusinessWire::Resolve(_),
+                    TaskBusinessResponse::Status(_)
+                )
+            ),
+            "Task business response skipped its required challenge"
+        );
+        if let TaskBusinessResponse::Challenge {
+            source_context: returned_source,
+            business_wire_hash: returned_wire,
+            challenge,
+        } = &response
+        {
+            ensure!(
+                *returned_source == source_context && *returned_wire == business_wire_hash,
+                "readonly Task business challenge changed its original source or wire"
+            );
+            let challenge_hash = challenge.hash()?;
+            let receipts = {
+                let store = self.store.lock().await;
+                SignatureVerification::new().run(|| match (wire, challenge) {
+                    (TaskBusinessWire::Observe(original), TaskBusinessChallenge::Observe(_)) => {
+                        let (current, authorization) = store.current_task_business_observe(
+                            &self.identity,
+                            original,
+                            now_ms() as u64,
+                        )?;
+                        store.task_business_challenge_receipts(
+                            &self.identity,
+                            &current,
+                            TaskBusinessAuthorization::Observe(&authorization),
+                            wire,
+                            &source_context,
+                            challenge,
+                            now_ms() as u64,
+                        )
+                    }
+                    (TaskBusinessWire::Resolve(original), TaskBusinessChallenge::Resolve(_)) => {
+                        let (current, authorization) = store.current_task_business_resolve(
+                            &self.identity,
+                            original,
+                            now_ms() as u64,
+                        )?;
+                        store.task_business_challenge_receipts(
+                            &self.identity,
+                            &current,
+                            TaskBusinessAuthorization::Resolve(&authorization),
+                            wire,
+                            &source_context,
+                            challenge,
+                            now_ms() as u64,
+                        )
+                    }
+                    _ => bail!("readonly Task business returned another challenge purpose"),
+                })?
+            };
+            response = client
+                .exchange(&TaskBusinessRequest::Receipts {
+                    source_context,
+                    business_wire_hash,
+                    challenge_hash,
+                    receipts,
+                })
+                .await?;
+        }
+        match (wire, response) {
+            (TaskBusinessWire::Observe(_), TaskBusinessResponse::Status(value))
+            | (TaskBusinessWire::Resolve(_), TaskBusinessResponse::Business(value))
+            | (TaskBusinessWire::Resolve(_), TaskBusinessResponse::Status(value)) => Ok(value),
+            _ => bail!("readonly Task business has no final result for its original request"),
+        }
+    }
+
     async fn handoff_execution_policy(
         &self,
         value: &AdmittedExecutionHandoff,
