@@ -423,6 +423,7 @@ pub fn build_remote_execution_policy_read_intent(
 pub struct VerifiedRemoteExecutionPolicySourceIntent {
     intent: Signed<RemoteExecutionPolicyReadIntent>,
     source_node_public_key: PublicKey,
+    source_heads: Vec<PolicyStamp>,
     verified_at_ms: u64,
     usage: ExecutionProofUsage,
 }
@@ -434,7 +435,7 @@ impl VerifiedRemoteExecutionPolicySourceIntent {
         &self.usage
     }
     pub fn source_heads(&self) -> &[PolicyStamp] {
-        &self.intent.payload.source_heads
+        &self.source_heads
     }
 }
 
@@ -488,6 +489,7 @@ pub fn verify_remote_execution_policy_delegation_source(
     Ok(VerifiedRemoteExecutionPolicySourceIntent {
         intent: intent.clone(),
         source_node_public_key: current.audience_public_key,
+        source_heads: current.heads,
         verified_at_ms: now,
         usage,
     })
