@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use vibeface_secure::authorization::{
     PolicyPin, PolicyStamp,
     node_execution_policy::{
-        PolicyCarrierOrigin, TaskExecutionPolicyImport, VerifiedTaskCurrentPolicy,
+        PolicyCarrierOrigin, TaskExecutionPolicyRequest, VerifiedTaskCurrentPolicy,
         VerifiedTaskHistoryPolicy, VerifiedTaskPolicySource, begin_task_policy_import,
         task_policy_source_from_current,
     },
@@ -19,7 +19,7 @@ pub(crate) struct ForeignExecutionPolicyCache {
 }
 
 struct CachedImport {
-    importer: TaskExecutionPolicyImport,
+    importer: super::node::TaskPolicyImport,
     page_hashes: Vec<ObjectHash>,
     ready_for_finish: bool,
 }
@@ -232,14 +232,17 @@ fn request_in(
     connection: &Connection,
     record: &ImportRecord,
 ) -> Result<RemoteExecutionPolicyReadRequest> {
-    let request: RemoteExecutionPolicyReadRequest =
+    let request: TaskExecutionPolicyRequest =
         read_in(connection, &key("request", &record.request_ref))?
             .context("foreign policy original request is missing")?;
     ensure!(
-        ObjectHash::body(&request)? == record.request_ref,
+        request.request_hash()? == record.request_ref,
         "foreign policy original request changed"
     );
-    Ok(request)
+    request
+        .account_request()
+        .cloned()
+        .context("foreign transcript RPC requires its original Account request")
 }
 
 impl Store {
@@ -285,7 +288,7 @@ impl Store {
             &snapshot_ref,
         ))?;
         let floors = floors_in(&tx, &input.request.intent.payload.execution_pins)?;
-        let importer = begin_task_policy_import(
+        let importer = super::node::TaskPolicyImport::Account(begin_task_policy_import(
             &trust,
             &source,
             &input.request,
@@ -293,7 +296,7 @@ impl Store {
             &floors,
             PolicyCarrierOrigin::SignedTranscript,
             now,
-        )?;
+        )?);
         usage.merge(importer.proof_usage());
         let fresh = CachedImport {
             importer,
@@ -323,7 +326,11 @@ impl Store {
         } else {
             save_exact_in(&tx, &key("import", &reference), &initial)?;
         }
-        save_exact_in(&tx, &key("request", &initial.request_ref), &input.request)?;
+        save_exact_in(
+            &tx,
+            &key("request", &initial.request_ref),
+            &TaskExecutionPolicyRequest::Account(input.request.clone()),
+        )?;
         save_exact_in(
             &tx,
             &key("snapshot", &initial.snapshot_ref),

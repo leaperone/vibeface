@@ -28,6 +28,7 @@ const PREFIX: &str = "task-execution-policy-v2";
 
 mod ingress;
 pub(crate) use ingress::ForeignExecutionPolicyCache;
+mod node;
 mod provenance;
 pub(crate) use provenance::{
     TaskExecutionPolicyProvenance, bind_task_execution_policy_in, check_task_policy_heads_in,

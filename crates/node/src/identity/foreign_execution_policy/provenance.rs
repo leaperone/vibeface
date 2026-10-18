@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use vibeface_secure::authorization::{
     Invocation, PolicyDomain, PolicyStamp, RequestFacts, VerifiedAuthorization,
     node_execution_policy::{
-        PolicyCarrierOrigin, VerifiedTaskCurrentPolicy, VerifiedTaskHistoryPolicy,
-        VerifiedTaskOriginalAdmissionPolicy, begin_task_policy_import,
-        from_task_original_admission, task_policy_source_from_retained,
+        PolicyCarrierOrigin, SdkPolicySourceProvenance, TaskExecutionPolicyRequest,
+        VerifiedTaskCurrentPolicy, VerifiedTaskHistoryPolicy, VerifiedTaskOriginalAdmissionPolicy,
+        begin_task_policy_import, from_task_original_admission, task_policy_source_from_retained,
     },
     remote_execution_policy::{
         RemoteExecutionPolicyReadRequest, RemoteExecutionPolicySnapshot,
@@ -178,7 +178,7 @@ fn check_saved_carriers_in(
         ObjectHash::body(expected_witness)?,
     ))?;
     let (complete, imported) = completion_in(connection, &reference)?;
-    let request: RemoteExecutionPolicyReadRequest =
+    let request: TaskExecutionPolicyRequest =
         read_in(connection, &key("request", &imported.request_ref))?
             .context("foreign policy original request is missing")?;
     let snapshot: Signed<RemoteExecutionPolicySnapshot> =
@@ -188,12 +188,24 @@ fn check_saved_carriers_in(
         read_in(connection, &key("witness", &complete.witness_ref))?
             .context("foreign policy original witness is missing")?;
     ensure!(
-        expected_request.account_request() == Some(&request)
+        expected_request == &request
+            && request.request_hash()? == imported.request_ref
             && expected_snapshot == &snapshot
             && expected_witness == &witness
             && imported.approval_ref == trust.approval().hash()?,
         "foreign policy original carrier differs from its verified provenance"
     );
+    if let Some(node) = request.node_request() {
+        let reference = node
+            .source_provenance()
+            .context("Node policy has no signed SDK source provenance")?;
+        let raw: SdkPolicySourceProvenance = read_in(connection, &key("sdk-source", reference))?
+            .context("Node policy original SDK source is missing")?;
+        ensure!(
+            ObjectHash::body(&raw)? == *reference,
+            "Node policy original SDK source changed"
+        );
+    }
     ensure!(
         page_hashes.len() as u64 == imported.page_count,
         "foreign policy page count differs from its verified provenance"
@@ -489,7 +501,7 @@ pub(crate) fn task_policy_candidates_in(
             continue;
         }
         let mut usage = policy.proof_usage().clone();
-        check_current_anchor_in(connection, primary, source, policy, &mut usage)?;
+        check_current_anchor_in(connection, primary, source, policy, &mut usage, now)?;
         usage.enforce_limits()?;
         let selection = ObjectHash::body(policy.selection())?;
         if candidates.get(&selection).is_none_or(|prior| {
@@ -564,7 +576,7 @@ pub(crate) fn current_task_prepare_policy_in(
             continue;
         }
         let mut usage = policy.proof_usage().clone();
-        check_current_anchor_in(connection, primary, source, policy, &mut usage)?;
+        check_current_anchor_in(connection, primary, source, policy, &mut usage, now)?;
         usage.record_signed(prepare)?;
         if let Some(counts) = SignatureVerification::current_counts() {
             usage.record_actual_signature_counts(counts);
@@ -593,7 +605,52 @@ fn check_current_anchor_in(
     source: &PublicKey,
     policy: &VerifiedTaskCurrentPolicy,
     usage: &mut ExecutionProofUsage,
+    now: u64,
 ) -> Result<()> {
+    if let Some(node) = policy.request().node_request() {
+        ensure!(
+            node.issuer() == source,
+            "Node policy current source changed"
+        );
+        let reference = node
+            .source_provenance()
+            .context("SDK Node read has no signed source provenance")?;
+        let raw: SdkPolicySourceProvenance = read_in(connection, &key("sdk-source", reference))?
+            .context("SDK Node read original source is missing")?;
+        ensure!(
+            ObjectHash::body(&raw)? == *reference,
+            "SDK Node read original source changed"
+        );
+        let current = super::super::admission::sdk_policy_source_provenance_in(
+            connection,
+            primary,
+            source,
+            &raw.session.service,
+            &raw.service_grant,
+            &raw.child_facts.request_facts(),
+            now,
+        )?;
+        ensure!(
+            current == raw,
+            "NeedPolicySync: SDK Node reader source, lease or binding changed"
+        );
+        if let Some(binding) = raw.current_binding.as_ref() {
+            let association = binding_association_in(connection, primary, binding, usage)?;
+            ensure!(
+                association.approval_ref == policy.trust().approval().hash()?,
+                "SDK Node reader changed its actual Task approval"
+            );
+        } else {
+            ensure!(
+                node.expected_action() == Action::ExecutionOpen
+                    && policy.context().binding_generation == Some(1)
+                    && policy.trust().original_binding().is_none(),
+                "SDK Node reader changed its initial Task choice"
+            );
+        }
+        usage.record_metadata(&("sdk-source-reference-v2", reference))?;
+        return Ok(());
+    }
     let reader = policy
         .request()
         .account_request()
@@ -660,23 +717,12 @@ pub(crate) fn current_task_execution_policy_in(
         if check_task_policy_heads_in(connection, policy).is_err() {
             continue;
         }
-        let reader = policy
-            .request()
-            .account_request()
-            .context("unsupported Task policy reader")?;
-        let mut usage = ExecutionProofUsage::default();
-        let trust = trust_for_read_in(
-            connection,
-            primary,
-            identity,
-            &reader.intent,
-            Some(&policy.trust().approval().hash()?),
-            &mut usage,
-        )?;
-        ensure!(
-            trust.approval() == policy.trust().approval(),
-            "Task policy changed its original approval"
-        );
+        let mut usage = policy.proof_usage().clone();
+        check_current_anchor_in(connection, primary, &local, policy, &mut usage, now)?;
+        if let Some(counts) = SignatureVerification::current_counts() {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
         if selected
             .as_ref()
             .is_none_or(|(_, prior): &(ObjectHash, VerifiedTaskCurrentPolicy)| {
@@ -1010,7 +1056,7 @@ pub(crate) fn rehydrate_task_execution_policy_in(
         if approval.issuer != *source {
             continue;
         }
-        let request: RemoteExecutionPolicyReadRequest =
+        let request: TaskExecutionPolicyRequest =
             read_in(connection, &key("request", &imported.request_ref))?
                 .context("foreign policy retained request is missing")?;
         let snapshot: Signed<RemoteExecutionPolicySnapshot> =
@@ -1020,7 +1066,7 @@ pub(crate) fn rehydrate_task_execution_policy_in(
             read_in(connection, &key("witness", &complete.witness_ref))?
                 .context("foreign policy retained witness is missing")?;
         ensure!(
-            ObjectHash::body(&request)? == imported.request_ref
+            request.request_hash()? == imported.request_ref
                 && ObjectHash::body(&snapshot)? == imported.snapshot_ref
                 && ObjectHash::body(&witness)? == complete.witness_ref,
             "foreign policy retained envelope hash changed"
@@ -1051,13 +1097,7 @@ pub(crate) fn rehydrate_task_execution_policy_in(
         {
             let proof = super::super::admission::load_admission_in(
                 connection,
-                request
-                    .intent
-                    .payload
-                    .source_selection
-                    .resource
-                    .space
-                    .as_str(),
+                request.source_project().space.as_str(),
                 &association.authorization_id,
             )?;
             ensure!(
@@ -1117,26 +1157,42 @@ fn rebuild_retained_import_in(
     source: &PublicKey,
     imported: &ImportRecord,
     import_ref: &ObjectHash,
-    request: &RemoteExecutionPolicyReadRequest,
+    request: &TaskExecutionPolicyRequest,
     snapshot: &Signed<RemoteExecutionPolicySnapshot>,
     clock: u64,
-) -> Result<vibeface_secure::authorization::node_execution_policy::TaskExecutionPolicyImport> {
+) -> Result<super::node::TaskPolicyImport> {
     ensure!(
         SignatureVerification::current_counts().is_none(),
         "retained import rebuild must run outside a network carrier"
     );
-    let historical = primary.historical(&request.intent.payload.source_heads, clock)?;
+    let raw_node = if let Some(node) = request.node_request() {
+        let digest = node
+            .source_provenance()
+            .context("retained Node read has no signed SDK source provenance")?;
+        let raw: SdkPolicySourceProvenance = read_in(connection, &key("sdk-source", digest))?
+            .context("retained Node read original SDK source is missing")?;
+        ensure!(
+            ObjectHash::body(&raw)? == *digest,
+            "retained Node read SDK source changed"
+        );
+        Some(raw)
+    } else {
+        None
+    };
+    let heads = match request {
+        TaskExecutionPolicyRequest::Account(value) => &value.intent.payload.source_heads,
+        TaskExecutionPolicyRequest::Node(_) => {
+            &raw_node
+                .as_ref()
+                .context("Node source original is missing")?
+                .source_heads
+        }
+    };
+    let historical = primary.historical(heads, clock)?;
     let pins: Vec<_> = primary
         .pins()
         .iter()
-        .filter(|pin| {
-            request
-                .intent
-                .payload
-                .source_heads
-                .iter()
-                .any(|head| head.domain == pin.domain)
-        })
+        .filter(|pin| heads.iter().any(|head| head.domain == pin.domain))
         .map(|pin| vibeface_secure::authorization::PolicyPin {
             domain: pin.domain.clone(),
             genesis_root: pin.genesis_root.clone(),
@@ -1146,22 +1202,20 @@ fn rebuild_retained_import_in(
     let (trust, retained) = {
         let _carrier = ScopedSignatureVerification::new();
         let trust = load_task_execution_trust_in(connection, source, &imported.approval_ref)?;
-        let retained =
-            task_policy_source_from_retained(&trust, &historical, &pins, request, clock)?;
+        let retained=match request {
+            TaskExecutionPolicyRequest::Account(value)=>task_policy_source_from_retained(&trust,&historical,&pins,value,clock)?,
+            TaskExecutionPolicyRequest::Node(value)=>vibeface_secure::authorization::node_execution_policy::node_task_policy_source_from_retained(
+                &historical,&pins,&trust,raw_node.as_ref().context("Node source original is missing")?,value,clock)?,
+        };
         ensure_actual_budget()?;
         (trust, retained)
     };
     let mut importer = {
         let _carrier = ScopedSignatureVerification::new();
-        let importer = begin_task_policy_import(
-            &trust,
-            &retained,
-            request,
-            snapshot,
-            &[],
-            PolicyCarrierOrigin::SignedTranscript,
-            clock,
-        )?;
+        let importer=match request {
+            TaskExecutionPolicyRequest::Account(value)=>super::node::TaskPolicyImport::Account(begin_task_policy_import(&trust,&retained,value,snapshot,&[],PolicyCarrierOrigin::SignedTranscript,clock)?),
+            TaskExecutionPolicyRequest::Node(value)=>super::node::TaskPolicyImport::Node(vibeface_secure::authorization::node_execution_policy::begin_retained_node_task_policy_import(&trust,&retained,value,snapshot,clock)?),
+        };
         importer.proof_usage().enforce_limits()?;
         ensure_actual_budget()?;
         importer
