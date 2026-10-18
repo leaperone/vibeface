@@ -571,8 +571,10 @@ function useWorkspaceState(connection: ReadyConnection) {
     const creation = verifyTask(task, request.conversation_id)
     const remote = pendingBinding.remote ? currentRemoteTrust(pendingBinding.remote) : undefined
     if (!remote && request.target_node !== nodeFingerprint(connection.audiencePublicKey)) throw new Error("原绑定缺少独立确认的远端授权，已保留待核对记录。")
-    const facts: RpcFacts = { taskRef: creation.taskRef, execution: { sessionId: request.session_id, executorKind: request.action.executor, canonicalCwd: request.action.cwd } }
-    let executionPublicKey = connection.audiencePublicKey
+    let executionPublicKey = remote?.share.selection.target_public_key ?? connection.audiencePublicKey
+    const bindingGeneration = currentTask.binding === null ? 1 : integer(record(verifyExecutionBinding(connection, currentTask, request, request.action,
+      currentTask.binding, executionPublicKey, previousExecutionKey(currentTask.binding)).binding).generation)
+    const facts: RpcFacts = { taskRef: creation.taskRef, execution: { sessionId: request.session_id, executorKind: request.action.executor, canonicalCwd: request.action.cwd, bindingGeneration } }
     if (remote) {
       facts.remote = { authorization: remote, targetDevice: remoteExecutionProposal(remote).targetDevice }
       const rawContext = prepareContext({ conversation_id: request.conversation_id, task_id: task.task_id, session_id: request.session_id }, connection.audience.device, connection.project.id, facts)
@@ -669,9 +671,21 @@ function useWorkspaceState(connection: ReadyConnection) {
       if (!task || proposed.conversationId !== activeId.current) throw new Error("分享未精确授权当前会话的一张已验证任务。")
       const canonicalCwd = inputText(cwd, "远端规范工作目录", 4096)
       const candidate = remote
-      const facts: RpcFacts = { taskRef: proposed.taskRef, execution: { sessionId: proposed.sessionId, executorKind: proposed.executorKind, canonicalCwd }, remote: { authorization: candidate, targetDevice: proposed.targetDevice } }
+      let bindingGeneration = 1, action = proposed.purpose === 'resolution' ? "operation_resolve" : "execution_open"
+      if (task.binding !== null) {
+        const current = verifyBoundExecutionSelection(connection, activeId.current, task, previousExecutionKey(task.binding))
+        const binding = record(task.binding.binding), open = record(binding.open_spec)
+        bindingGeneration = integer(binding.generation)
+        if (proposed.purpose === 'execution' && (binding.target_node !== nodeFingerprint(candidate.share.selection.target_public_key)
+          || current.sessionId !== proposed.sessionId || current.executorKind !== proposed.executorKind || open.cwd !== canonicalCwd)) {
+          bindingGeneration += 1
+          if (!Number.isSafeInteger(bindingGeneration)) throw new Error("新绑定代次超过此客户端支持范围。")
+          action = "execution_rebind"
+        }
+      }
+      const facts: RpcFacts = { taskRef: proposed.taskRef, execution: { sessionId: proposed.sessionId, executorKind: proposed.executorKind, canonicalCwd, bindingGeneration }, remote: { authorization: candidate, targetDevice: proposed.targetDevice } }
       const rawContext = prepareContext({ conversation_id: activeId.current, task_id: task.task_id, session_id: proposed.sessionId }, connection.audience.device, connection.project.id, facts)
-      const { authorization: trusted, verified } = await verifyRemoteScope(candidate, rawContext, proposed.purpose === 'resolution' ? "operation_resolve" : "execution_open")
+      const { authorization: trusted, verified } = await verifyRemoteScope(candidate, rawContext, action)
       try {
         const original = remotesRef.current.find(item => item.share.selection.execution_grant === share.selection.execution_grant)
         if (original && !same(original.share, share)) throw new Error("同一远端 Grant 的分享内容发生变化，请保留原授权并核对。")
