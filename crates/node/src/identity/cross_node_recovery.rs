@@ -871,6 +871,18 @@ pub(crate) mod tests {
         let (_, request) = fixture.commit_request()?;
         let response = fixture.source_commit(&request, now())?;
         fixture.install(&response["committed"], now())?;
+        let (read, facts, transport) = fixture.read_invocation("conversation")?;
+        fixture
+            .source
+            .authorize_request(&read, &facts, &transport, now())?;
+        let (write, facts, transport) = fixture.read_invocation("message")?;
+        ensure!(
+            fixture
+                .source
+                .authorize_request(&write, &facts, &transport, now())
+                .is_err(),
+            "source read grant authorized a fresh message"
+        );
         Ok((fixture.network, fixture.source, fixture.target))
     }
 

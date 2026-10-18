@@ -3158,6 +3158,15 @@ mod tests {
             Some(root.hash.clone()),
             vec![root.hash.clone()],
         )?;
+        let old_event = store.verify_event(space, &old)?;
+        let events = load_events_from(&store.connection, space)?;
+        crate::identity::event_authorization::current_event_authorization(
+            &store.policy,
+            &store.connection,
+            &old_event,
+            &events,
+            now(),
+        )?;
         let (network, mut store, target) =
             crate::identity::cross_node_recovery::tests::recover_existing_source(
                 network,
@@ -3171,7 +3180,7 @@ mod tests {
         assert!(
             store
                 .authorize_node(space, &network.node.node_id()?, None)
-                .is_err()
+                .is_ok()
         );
         assert_eq!(store.ingest_event(space, &old)?.status, "ready");
         assert!(
@@ -3180,6 +3189,17 @@ mod tests {
                 .is_err()
         );
         assert!(store.verify_event(space, &old).is_ok());
+        let events = load_events_from(&store.connection, space)?;
+        assert!(
+            crate::identity::event_authorization::current_event_authorization(
+                &store.policy,
+                &store.connection,
+                &old_event,
+                &events,
+                now(),
+            )
+            .is_err()
+        );
         let mut fresh = Store::initialize(Path::new(":memory:"))?;
         let update = fresh
             .policy
@@ -3196,7 +3216,23 @@ mod tests {
         assert!(
             fresh
                 .authorize_node(space, &network.node.node_id()?, None)
+                .is_ok()
+        );
+        assert!(
+            network
+                .message(&mut fresh, "conversation", "denied")
                 .is_err()
+        );
+        let fresh_events = load_events_from(&fresh.connection, space)?;
+        assert!(
+            crate::identity::event_authorization::current_event_authorization(
+                &fresh.policy,
+                &fresh.connection,
+                &old_event,
+                &fresh_events,
+                now(),
+            )
+            .is_err()
         );
         assert_eq!(fresh.messages(space, "conversation")?.len(), 1);
         Ok(())
