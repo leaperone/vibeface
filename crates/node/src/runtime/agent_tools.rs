@@ -267,6 +267,15 @@ impl Runtime {
             }
             "continue_execution" | "stop_execution" => {
                 let original = original.context("original work is required")?;
+                let (_, receipt) = self.agent_receipt(access, &original).await?;
+                let receipt = receipt.context("original work has no confirmed execution receipt; reconcile it before controlling a session")?;
+                ensure!(
+                    !matches!(
+                        receipt.state,
+                        OperationState::Unknown | OperationState::Rejected
+                    ),
+                    "reconcile the original execution before controlling it"
+                );
                 let session_id = original
                     .session_id
                     .as_deref()
@@ -559,11 +568,17 @@ impl Runtime {
             let request = self.agent_work(access, reference).await?;
             let (_, record) = self.agent_receipt(access, &request).await?;
             let session = match request.session_id.as_deref() {
-                Some(session) => Some(
-                    self.session_fact(&access.network_id, &request.target_node, session)
-                        .await?,
-                ),
-                None => None,
+                Some(session)
+                    if record
+                        .as_ref()
+                        .is_some_and(|record| record.state != OperationState::Rejected) =>
+                {
+                    Some(
+                        self.session_fact(&access.network_id, &request.target_node, session)
+                            .await?,
+                    )
+                }
+                _ => None,
             };
             return Ok(json!({"work_ref":reference,"operation":record,"session":session}));
         }
