@@ -423,9 +423,317 @@ mod tests {
         execution_handoff::{
             ExecutionHandoffFreshness, verify_execution_handoff_admission_checkpoint,
         },
-        execution_observation::tests::retained_history_fixture_with_execution_source,
+        execution_observation::tests::{
+            RetainedHistoryFixture, retained_history_fixture_with_execution_source,
+        },
+        node_execution_policy::{
+            PolicyCarrierOrigin, VerifiedTaskExecutionTrust, begin_task_policy_import,
+            task_policy_source_from_current,
+        },
         remote_execution_history::RemoteExecutionHistoryAcceptance,
+        remote_execution_policy::{
+            RemoteExecutionPolicyPurpose, RemoteExecutionPolicySelection,
+            tests::remote_policy_stream, verify_remote_execution_policy_delegation_source,
+        },
     };
+
+    pub(super) fn readonly_policy(
+        fixture: &RetainedHistoryFixture,
+        trust: &VerifiedTaskExecutionTrust,
+        purpose: RemoteExecutionPolicyPurpose,
+        now: u64,
+    ) -> VerifiedTaskCurrentPolicy {
+        let source = require_confirmed_client_policy(&fixture.source).unwrap();
+        let leaf = fixture
+            .state
+            .grants
+            .values()
+            .find(|grant| {
+                grant.payload.actions == [Action::ExecutionResolve, Action::OperationResolve]
+                    && grant.payload.grantee
+                        == Grantee::Actor(Actor::Service(ServiceId::from_key(&PublicKey::of(
+                            &fixture.project_node,
+                        ))))
+            })
+            .unwrap();
+        let ResourceScope::Exact(resource) = &leaf.payload.scope else {
+            panic!("fixture reader grant is not exact")
+        };
+        let selection = RemoteExecutionPolicySelection {
+            execution_resource: resource.clone(),
+            target_public_key: PublicKey::of(&fixture.executor),
+            execution_grant: leaf.hash().unwrap(),
+        };
+        let mut context = leaf.payload.constraints.context.clone();
+        context.workspace_resource = Some(
+            trust
+                .original_intent()
+                .payload
+                .source_selection
+                .resource
+                .resource
+                .clone(),
+        );
+        let context = prepare::PrepareContext {
+            context,
+            binding_generation: Some(1),
+            canonical_cwd: (purpose == RemoteExecutionPolicyPurpose::Resolver).then(|| {
+                fixture.binding.binding.open_spec["cwd"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            }),
+            execution_target_public_key: Some(PublicKey::of(&fixture.executor)),
+        };
+        let stream = remote_policy_stream(
+            &fixture.source,
+            &fixture.client,
+            &fixture.project_node,
+            &fixture.execution_bundle,
+            &fixture.pins,
+            &fixture.executor,
+            &selection,
+            &context,
+            Action::OperationResolve,
+            purpose,
+            now,
+        )
+        .unwrap();
+        let authority = verify_remote_execution_policy_delegation_source(
+            source.state(),
+            &stream.request.intent,
+            &PublicKey::of(&fixture.project_node),
+            &PublicKey::of(&fixture.client),
+            now,
+        )
+        .unwrap();
+        let source = task_policy_source_from_current(&authority, source.pins(), now).unwrap();
+        let mut import = begin_task_policy_import(
+            trust,
+            &source,
+            &stream.request,
+            &stream.header,
+            &[],
+            PolicyCarrierOrigin::SignedTranscript,
+            now,
+        )
+        .unwrap();
+        for page in &stream.pages {
+            import.append_page(page, now).unwrap();
+        }
+        import.finish_current(&stream.witness, now).unwrap()
+    }
+
+    pub(super) fn revoke_writer(
+        fixture: &mut RetainedHistoryFixture,
+        current: &VerifiedTaskCurrentPolicy,
+    ) -> VerifiedPolicySet {
+        let mut state = current.state().clone();
+        let resource = &fixture.actual.handoff.handoff.execution_resource;
+        let mut space = state.space(&resource.space).unwrap().clone();
+        space.previous = state
+            .head(&PolicyDomain::Space(resource.space.clone()))
+            .cloned();
+        space.sequence += 1;
+        space
+            .grants
+            .retain(|hash| hash != &fixture.actual.handoff.invocation.payload.grant_leaf);
+        let document = Signed::sign(space, &fixture.root).unwrap();
+        state.install_space(document.clone()).unwrap();
+        fixture.state.install_space(document.clone()).unwrap();
+        fixture
+            .execution_bundle
+            .journal
+            .push(JournalEntry::Space(document));
+        state
+    }
+
+    #[test]
+    fn task_business_observation_receipts_survive_revoked_writer_without_renewing_it() {
+        let mut fixture = retained_history_fixture_with_execution_source();
+        let now = fixture.invocation.payload.not_before_ms;
+        let writer = current_policy(&fixture);
+        let state = revoke_writer(&mut fixture, &writer);
+        let readonly = readonly_policy(
+            &fixture,
+            writer.trust(),
+            RemoteExecutionPolicyPurpose::ObservationRead,
+            now,
+        );
+        let pair = readonly.selection().execution_grant.clone();
+        let request = state
+            .build_execution_observation_request(
+                &fixture.actual.handoff,
+                &fixture.client,
+                &fixture.source.grant_leaf,
+                &pair,
+                "readonly-after-revocation",
+                now,
+                now + 500,
+            )
+            .unwrap();
+        let wire = state
+            .sign_execution_observation(
+                &request,
+                &fixture.actual.handoff,
+                &fixture.project_node,
+                now,
+                now + 500,
+            )
+            .unwrap();
+        let transport = TransportEvidence::VerifiedPeer {
+            origin: DeviceId::from_key(&PublicKey::of(&fixture.project_node)),
+        };
+        let business = readonly
+            .state()
+            .verify_execution_observation_current(&wire, &transport, now)
+            .unwrap();
+        let challenge =
+            ExecutionObservationChallenge::new(&business, Nonce::random().unwrap(), now, now + 400)
+                .unwrap();
+        let typed = TaskBusinessChallenge::Observe(challenge.clone());
+        assert_eq!(typed.hash().unwrap(), challenge.hash().unwrap());
+        let source = require_confirmed_client_policy(&fixture.source).unwrap();
+        let business_wire = TaskBusinessWire::Observe(wire.clone());
+        let authority = authorize_task_business_challenge(
+            source.state(),
+            &readonly,
+            TaskBusinessAuthorization::Observe(&business),
+            &business_wire,
+            &typed,
+            &PublicKey::of(&fixture.project_node),
+            now,
+        )
+        .unwrap();
+        let mut receipts = authority.sign_receipts(&fixture.project_node, now).unwrap();
+        assert!(!receipts.is_empty());
+        for head in &challenge.policies {
+            if !authority.signing_heads().contains(head) {
+                receipts.push(
+                    Signed::sign(
+                        FreshnessReceipt {
+                            version: AUTH_VERSION,
+                            current: head.clone(),
+                            challenge_hash: challenge.hash().unwrap(),
+                            issued_at_ms: now,
+                            expires_at_ms: authority.expires_at_ms(),
+                        },
+                        &fixture.executor,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        readonly
+            .state()
+            .verify_execution_observation_current_freshness(
+                &business,
+                &super::super::super::execution_observation::ExecutionObservationFreshness {
+                    challenge: challenge.clone(),
+                    receipts,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(
+            !readonly
+                .state()
+                .space(&fixture.actual.handoff.handoff.execution_resource.space)
+                .unwrap()
+                .grants
+                .contains(&fixture.actual.handoff.invocation.payload.grant_leaf)
+        );
+        let mut wrong = challenge.clone();
+        wrong.observation_hash = ObjectHash::body(&"other observation").unwrap();
+        assert!(
+            authorize_task_business_challenge(
+                source.state(),
+                &readonly,
+                TaskBusinessAuthorization::Observe(&business),
+                &business_wire,
+                &TaskBusinessChallenge::Observe(wrong),
+                &PublicKey::of(&fixture.project_node),
+                now
+            )
+            .is_err()
+        );
+        let submit_challenge = TaskBusinessChallenge::Submit(ExecutionHandoffChallenge {
+            version: AUTH_VERSION,
+            stage: CheckStage::Renew,
+            handoff_hash: fixture.actual.handoff.hash().unwrap(),
+            original_invocation_hash: fixture.invocation.hash().unwrap(),
+            submission_invocation_hash: fixture.actual.handoff.invocation.hash().unwrap(),
+            original_body_hash: fixture.invocation.payload.body_hash.clone(),
+            original_request_hash: ObjectHash::body(&fixture.body["request"]).unwrap(),
+            original_resource: fixture.invocation.payload.resource.clone(),
+            execution_resource: fixture.actual.handoff.handoff.execution_resource.clone(),
+            execution_audience: fixture.actual.handoff.handoff.execution_audience.clone(),
+            target_public_key: PublicKey::of(&fixture.executor),
+            project_presenter: fixture.actual.handoff.invocation.payload.presenter.clone(),
+            operation_id: fixture.invocation.payload.operation_id.clone(),
+            binding_hash: task_binding::binding_hash(&fixture.binding.binding).unwrap(),
+            binding_generation: 1,
+            execution_session: fixture
+                .actual
+                .handoff
+                .invocation
+                .payload
+                .context
+                .execution_session
+                .clone()
+                .unwrap(),
+            policies: challenge.policies.clone(),
+            nonce: Nonce::random().unwrap(),
+            issued_at_ms: now,
+            expires_at_ms: now + 300,
+        });
+        assert!(
+            authorize_task_business_challenge(
+                source.state(),
+                &readonly,
+                TaskBusinessAuthorization::Observe(&business),
+                &business_wire,
+                &submit_challenge,
+                &PublicKey::of(&fixture.project_node),
+                now
+            )
+            .is_err()
+        );
+        let export = build_task_business_policy_export(
+            &readonly,
+            TaskBusinessAuthorization::Observe(&business),
+            &business_wire,
+            &fixture.project_node,
+            now,
+        )
+        .unwrap();
+        let actual_c = noise_peer(&fixture.executor, &fixture.project_node);
+        let read = Signed::sign(
+            TaskBusinessReceiptRead {
+                version: AUTH_VERSION,
+                source_header_hash: export.header().hash().unwrap(),
+                business_wire_hash: business_wire.hash().unwrap(),
+                challenge: typed,
+                nonce: Nonce::random().unwrap(),
+                issued_at_ms: now,
+                expires_at_ms: now + 300,
+            },
+            &fixture.executor,
+        )
+        .unwrap();
+        verify_task_business_receipt_read(
+            source.state(),
+            &readonly,
+            TaskBusinessAuthorization::Observe(&business),
+            export.header(),
+            &business_wire,
+            &actual_c,
+            &read,
+            &PublicKey::of(&fixture.project_node),
+            now,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn task_business_receipts_keep_typed_anchors_and_require_current_writer() {
