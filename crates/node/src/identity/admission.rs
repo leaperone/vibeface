@@ -863,34 +863,41 @@ fn operation_from(
     .transpose()
 }
 
-pub(crate) fn validate_basis_in(connection: &Connection, request: &OperationRequest) -> Result<()> {
+pub(crate) fn validate_basis_in(
+    connection: &Connection,
+    request: &OperationRequest,
+    resource: &ResourceId,
+) -> Result<()> {
     validate_operation_binding_from(connection, request)?;
-    let events = load_events_from(connection, &request.network_id)?;
     let heads = if request.basis_heads.is_empty() {
+        let events = super::event_authorization::retained_scope_events_in(
+            connection,
+            &request.network_id,
+            resource,
+            &request.conversation_id,
+        )?;
         heads_from_events(&events, &request.conversation_id)
     } else {
         request.basis_heads.clone()
     };
-    for head in &heads {
+    for hash in heads {
+        let encoded: String = connection
+            .query_row(
+                "SELECT envelope FROM events WHERE space_id=? AND hash=?",
+                params![request.network_id, hash],
+                |row| row.get(0),
+            )
+            .context("operation basis is incomplete")?;
+        let source: crate::model::SignedEvent = serde_json::from_str(&encoded)?;
+        let event: crate::model::Event = serde_json::from_str(&source.canonical_body)?;
         ensure!(
-            events
-                .get(head)
-                .is_some_and(|event| event.event.scope_id == request.conversation_id),
-            "operation basis is outside its conversation"
+            source.hash == hash
+                && event.network_id == request.network_id
+                && event.resource_id == *resource
+                && event.scope_id == request.conversation_id,
+            "operation basis is outside its conversation or resource"
         );
-    }
-    for hash in closure_hashes(&events, &heads) {
-        let event = events.get(&hash).context("operation basis is incomplete")?;
-        ensure!(
-            event.status == "ready",
-            "operation basis is incomplete or conflicting"
-        );
-        for blob in &event.event.blobs {
-            ensure!(
-                has_blob_from(connection, &request.network_id, blob)?,
-                "operation basis content is incomplete"
-            );
-        }
+        super::event_authorization::validate_retained_event_dependencies_in(connection, &source)?;
     }
     Ok(())
 }
@@ -1174,7 +1181,10 @@ fn check_manager_parent(
         "manager invocation differs from its persisted delegation"
     );
     let events = super::event_authorization::retained_scope_events_in(
-        connection, space, &auth.resource().resource, conversation,
+        connection,
+        space,
+        &auth.resource().resource,
+        conversation,
     )?;
     let origin = super::services::resolve_current_agent_origin(
         policy, connection, &events, trigger, now_ms,
@@ -1756,7 +1766,7 @@ impl Store {
             tx.commit()?;
             return Ok(old);
         }
-        validate_basis_in(&tx, request)?;
+        validate_basis_in(&tx, request, &auth.resource().resource)?;
         let session = checked_session_from(&tx, request)?;
         let session = if action == "open" {
             ensure!(session.is_none(), "execution session already exists");
@@ -1902,7 +1912,7 @@ impl Store {
             "operation is not accepted or was already claimed"
         );
         check_operation_authorization_in(&tx, self.policy.verified(), &auth, &operation)?;
-        validate_basis_in(&tx, &operation.request)?;
+        validate_basis_in(&tx, &operation.request, &auth.resource().resource)?;
         let session = checked_session_from(&tx, &operation.request)?
             .context("accepted operation has no execution session")?;
         ensure!(

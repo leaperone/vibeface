@@ -882,6 +882,16 @@ impl PolicyState {
         self.prepare(pins, journal, now_ms, true)
     }
 
+    pub(crate) fn prepare_account_recovery_update(
+        &self,
+        verified: vibeface_secure::authorization::bootstrap::recovery::stream::VerifiedStreamedRecoveryCommit,
+        now_ms: u64,
+    ) -> Result<PreparedPolicyUpdate> {
+        let expected = verified.expected_heads().to_vec();
+        let (state, pins, delta) = verified.into_store_parts();
+        self.prepare_verified_recovery_delta(state, &pins, &delta, &expected, now_ms)
+    }
+
     pub(crate) fn prepare_cross_recovery_commit(
         &self,
         verified: vibeface_secure::authorization::bootstrap::recovery::stream::VerifiedStreamedCrossNodeRecoveryCommit,

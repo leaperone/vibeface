@@ -822,7 +822,7 @@ impl Store {
                 result: serde_json::from_str(&result)?,
             });
         }
-        validate_basis_in(&tx, request)?;
+        validate_basis_in(&tx, request, &auth.resource().resource)?;
         check_remote_session(
             body,
             request,
