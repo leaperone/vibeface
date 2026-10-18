@@ -3071,7 +3071,8 @@ mod tests {
     #[test]
     fn root_recovery_preserves_revoked_authors_without_restoring_authority() -> Result<()> {
         let (network, mut store) = setup()?;
-        let space = network.space.as_str();
+        let space_id = network.space.to_string();
+        let space = space_id.as_str();
         let root = network.conversation(&mut store, "conversation")?;
         let old = network.signed_message(
             &mut store,
@@ -3080,60 +3081,16 @@ mod tests {
             Some(root.hash.clone()),
             vec![root.hash.clone()],
         )?;
-        let material = recovery::build_account_recovery_material(
-            &network.created,
-            &network.root,
-            &network.recovery,
-            "http://localhost:12345",
-            now() as f64,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let next_root = Identity::generate().map_err(anyhow::Error::msg)?;
-        let next_client = Identity::generate().map_err(anyhow::Error::msg)?;
-        let node = Identity::generate().map_err(anyhow::Error::msg)?;
-        let nonce = Nonce::random()?;
-        let recovered_at = (now() + 10) as f64;
-        let claim = bootstrap::create_node_claim(
-            &node,
-            nonce.as_str(),
-            recovered_at,
-            recovered_at + 100_000.0,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let claim = bootstrap::verify_node_claim(
-            &claim,
-            &node.public_key_hex(),
-            nonce.as_str(),
-            recovered_at,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let bundle = serde_json::to_string(&network.bundle)?;
-        let pins = serde_json::to_string(&network.pins)?;
-        let prepared = recovery::prepare_account_recovery(
-            &material,
-            &bundle,
-            &next_root,
-            &next_client,
-            &claim,
-            recovered_at + 10_000_000.0,
-            recovered_at,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let possession = recovery::sign_recovery_node_possession(
-            &prepared.node_request_json().map_err(anyhow::Error::msg)?,
-            &node,
-            &pins,
-            &bundle,
-            nonce.as_str(),
-            recovered_at,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let recovered =
-            recovery::finish_account_recovery(&prepared, &next_root, &possession, recovered_at)
-                .map_err(anyhow::Error::msg)?;
-        let recovered: ClientAuthorizationBundle =
-            serde_json::from_str(&recovered.bundle_json().map_err(anyhow::Error::msg)?)?;
-        store.install_policy_journal(&recovered.journal, recovered_at as u64)?;
+        let (network, mut store, target) =
+            crate::identity::cross_node_recovery::tests::recover_existing_source(
+                network,
+                store,
+                old.clone(),
+            )?;
+        let snapshot = target
+            .policy
+            .accepted_journal_snapshot(&target.connection)?;
+        let recovered_journal = target.policy.accepted_journal_prefix(&snapshot)?;
         assert!(
             store
                 .authorize_node(space, &network.node.node_id()?, None)
@@ -3147,11 +3104,9 @@ mod tests {
         );
         assert!(store.verify_event(space, &old).is_ok());
         let mut fresh = Store::initialize(Path::new(":memory:"))?;
-        let update = fresh.policy.prepare_bootstrap(
-            &network.pins,
-            &recovered.journal,
-            recovered_at as u64,
-        )?;
+        let update = fresh
+            .policy
+            .prepare_bootstrap(&network.pins, &recovered_journal, now())?;
         let tx = fresh
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

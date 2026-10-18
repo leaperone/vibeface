@@ -414,7 +414,7 @@ impl Store {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::identity::{
         local::BootstrapCapability,
@@ -452,6 +452,14 @@ mod tests {
             let mut source = network.at(&network.directory.join("source.sqlite3"))?;
             network.conversation(&mut source, "archive")?;
             let original_event = network.message(&mut source, "archive", "preserved")?;
+            Self::from_source(network, source, original_event)
+        }
+
+        fn from_source(
+            network: TestNetwork,
+            source: Store,
+            original_event: crate::model::SignedEvent,
+        ) -> Result<Self> {
             let mut target = Store::initialize(&network.directory.join("target.sqlite3"))?;
             let target_node = LocalIdentity::generate();
             let target_signer = Identity::from_secret_hex(&target_node.secret_key_hex)
@@ -816,6 +824,18 @@ mod tests {
             )?;
             Ok((signed, facts, TransportEvidence::DirectNoise { device }))
         }
+    }
+
+    pub(crate) fn recover_existing_source(
+        network: TestNetwork,
+        source: Store,
+        historical_event: crate::model::SignedEvent,
+    ) -> Result<(TestNetwork, Store, Store)> {
+        let mut fixture = Fixture::from_source(network, source, historical_event)?;
+        let (_, request) = fixture.commit_request()?;
+        let response = fixture.source_commit(&request, now())?;
+        fixture.install(&response["committed"], now())?;
+        Ok((fixture.network, fixture.source, fixture.target))
     }
 
     fn journal_count(store: &Store) -> Result<u64> {
