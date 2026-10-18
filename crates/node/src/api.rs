@@ -352,10 +352,19 @@ async fn tool_callback(
             "args must be an object and agentId must be nonempty and bounded",
         ));
     }
-    // Executor writes still require the operation ID in args; this ID only identifies the callback.
-    let call_id = input
-        .tool_call_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let write = !matches!(
+        input.tool_name.as_str(),
+        "nodes" | "context" | "execution_status" | "call_lookup"
+    );
+    let call_id = match input.tool_call_id {
+        Some(id) => id,
+        None if !write => uuid::Uuid::new_v4().to_string(),
+        None => {
+            return Err(ApiError::bad(
+                "write tool callbacks require a stable toolCallId",
+            ));
+        }
+    };
     validate_tool_call(&input.tool_name, &call_id)?;
     let result = app
         .node

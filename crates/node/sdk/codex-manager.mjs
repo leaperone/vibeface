@@ -34,6 +34,7 @@ const INIT_FIELDS = new Set([
   "codex_path",
   "tool_cli",
   "tool_env",
+  "custom_tools",
 ]);
 
 class InputClosedError extends Error {}
@@ -145,7 +146,18 @@ function validateInit(value) {
     codexPath: value.codex_path,
     toolCli,
     toolEnv: validateEnv(value.tool_env, "tool_env"),
+    customTools: validateTools(value.custom_tools),
   };
+}
+
+function validateTools(value) {
+  if (value === undefined) return {};
+  if (!isObject(value) || Object.keys(value).length > 32 || bytes(JSON.stringify(value)) > MAX_EVENT_BYTES) throw new ProtocolError("custom_tools must be a bounded tool catalog");
+  for (const [name, spec] of Object.entries(value)) {
+    if (!/^[a-z][a-z0-9_]{0,127}$/.test(name) || !isObject(spec) || !isObject(spec.inputSchema) || spec.inputSchema.type !== "object") throw new ProtocolError("invalid custom tool schema");
+    if (spec.description !== undefined && typeof spec.description !== "string") throw new ProtocolError("invalid custom tool description");
+  }
+  return value;
 }
 
 function redactString(text, secrets) {
@@ -271,20 +283,11 @@ function childEnvironment(input) {
   return env;
 }
 
-function managerPrompt(prompt, toolCli) {
+function managerPrompt(prompt, toolCli, tools) {
   if (toolCli === undefined) return prompt;
   const executable = `'${toolCli.replaceAll("'", "'\"'\"'")}'`;
-  const tools = [
-    ["nodes", {}, "List reachable execution nodes, capabilities and allowed roots."],
-    ["context", { offset: 0, limit: 20 }, "Page original conversation events. For referenced blobs, add blob_hash; offset counts bytes and limit counts KiB."],
-    ["create_task", { task_id: "stable-id", title: "title", goal: "goal", acceptance: "human acceptance criteria" }, "Create a task. Reuse its task_id when retrying."],
-    ["open_execution", { operation_id: "stable-id", session_id: "stable-id", target_node: "node-id", executor: "codex", cwd: "/allowed/root" }, "Open an execution session. executor is codex, cursor_agent or claude_code. task_id is optional."],
-    ["send_execution", { operation_id: "stable-id", session_id: "existing-id", target_node: "node-id", expected_revision: 0, text: "task instructions" }, "Send to an existing session at its current revision. task_id is optional. Reconcile unknown results before any resend."],
-    ["execution_status", { target_node: "node-id", session_id: "existing-id" }, "Read actual execution status without sending work or approving anything."],
-    ["update_task", { task_id: "existing-id", status: "working", detail: "progress" }, "Record progress. status is open, working, blocked or needs_review. Only the human may accept or cancel tasks."],
-  ];
-  const catalog = tools.map(([name, args, description]) => `${name} ${JSON.stringify(args)}\n${description}`).join("\n\n");
-  const result = `Node tool access is available through your command-execution tool. Run this executable with a tool name and one shell-quoted JSON object:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor example, run ${executable} tool nodes --json '{}'. The CLI reads its scoped loopback connection from the existing environment and prints a JSON result. Do not read or print credential variables. Use these Node tools to manage tasks and execution; do not use MCP, edit project files or launch executors directly. Conversation and network scope are supplied by the CLI. Use the real results and report errors instead of claiming a failed call succeeded.\n\nAvailable tool arguments and meanings follow. Replace example values with the requested values.\n${catalog}\n\n${prompt}`;
+  const catalog = Object.entries(tools).map(([name, spec]) => `${name}\n${spec.description || ""}\nJSON schema: ${JSON.stringify(spec.inputSchema)}`).join("\n\n");
+  const result = `Node tools are available through your command-execution tool. Run:\n${executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor every write tool, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {"call_ref":"THE_SAME_REFERENCE"}; never replace an uncertain call with a new reference. Different authorized intentions need different references, even when their command text is equal. Returned work_ref values select existing work without exposing SDK session bookkeeping.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Use only the listed Node tools for execution; do not edit project files or launch executors directly. Report failed calls honestly. Conversation and network scope come from the CLI.\n\nAvailable tools for this invocation:\n${catalog}\n\n${prompt}`;
   if (bytes(result) > MAX_PROMPT_BYTES) throw new ProtocolError("management prompt with Node tool instructions exceeded the size limit");
   return result;
 }
@@ -455,7 +458,7 @@ async function run(input, reader, secrets) {
   const cwd = await validateCwd(input.cwd);
   const codexPath = await validateExecutable(input.codexPath, "codex_path");
   const toolCli = input.toolCli === undefined ? undefined : await validateExecutable(input.toolCli, "tool_cli");
-  const prompt = managerPrompt(input.prompt, toolCli);
+  const prompt = managerPrompt(input.prompt, toolCli, input.customTools);
 
   const codex = new Codex({
     codexPathOverride: codexPath,

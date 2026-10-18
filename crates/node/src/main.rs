@@ -66,6 +66,9 @@ enum Action {
         name: String,
         #[arg(long)]
         json: String,
+        /// Stable reference for a write intent; reuse it after a timeout or partial result.
+        #[arg(long)]
+        call_ref: Option<String>,
     },
 }
 
@@ -218,7 +221,11 @@ async fn main() -> Result<()> {
         Action::Service(options) => service::run(options).await,
         Action::Update(options) => update::run(options).await,
         Action::Pair(options) => pair(options).await,
-        Action::Tool { name, json } => call_tool(name, json).await,
+        Action::Tool {
+            name,
+            json,
+            call_ref,
+        } => call_tool(name, json, call_ref).await,
     }
 }
 
@@ -764,13 +771,35 @@ async fn pair(options: Pair) -> Result<()> {
     }
 }
 
-async fn call_tool(name: String, arguments: String) -> Result<()> {
+async fn call_tool(name: String, arguments: String, call_ref: Option<String>) -> Result<()> {
     ensure!(!name.is_empty() && name.len() <= 128, "invalid tool name");
     let arguments: Value =
         serde_json::from_str(&arguments).context("invalid tool arguments JSON")?;
     ensure!(
         arguments.is_object(),
         "tool arguments must be a JSON object"
+    );
+    let write = !matches!(
+        name.as_str(),
+        "nodes" | "context" | "execution_status" | "call_lookup"
+    );
+    let argument_ref = arguments["call_ref"].as_str();
+    ensure!(
+        call_ref
+            .as_deref()
+            .zip(argument_ref)
+            .is_none_or(|(flag, argument)| flag == argument),
+        "--call-ref must match arguments.call_ref"
+    );
+    let call_ref = call_ref.or_else(|| argument_ref.map(String::from));
+    ensure!(
+        !write || call_ref.is_some(),
+        "write tools require --call-ref; keep it and query call_lookup after any uncertain result"
+    );
+    let call_id = call_ref.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    ensure!(
+        !call_id.is_empty() && call_id.len() <= 256 && !call_id.chars().any(char::is_control),
+        "invalid call reference"
     );
     let url =
         origin(&std::env::var("VIBEFACE_NODE_URL").context("VIBEFACE_NODE_URL is required")?)?;
@@ -786,14 +815,15 @@ async fn call_tool(name: String, arguments: String) -> Result<()> {
         .build()?
         .post(url.join("api/tools")?)
         .bearer_auth(token)
-        .json(&json!({"name": name, "arguments": arguments, "call_id": uuid::Uuid::new_v4().to_string()}))
+        .json(&json!({"name": name, "arguments": arguments, "call_id": call_id}))
         .send()
         .await
-        .context("reach local node tool API")?;
+        .with_context(|| format!("reach local node tool API; preserve call_ref {call_id} and query call_lookup before retrying"))?;
     ensure!(
         response.status().is_success(),
-        "node tool rejected with HTTP {}",
-        response.status()
+        "node tool rejected with HTTP {}; preserve call_ref {}",
+        response.status(),
+        call_id
     );
     let result: Value = serde_json::from_slice(&bounded_body(response).await?)
         .context("invalid node tool response")?;
