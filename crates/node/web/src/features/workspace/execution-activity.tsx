@@ -9,15 +9,18 @@ import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Textarea } from "@/components/ui/textarea"
 import { Artifact } from "../chat/elements/artifact"
+import { useDevice } from "../identity/context"
 import { useWorkspace } from "./context"
-import { nodeName, stateLabel } from "./labels"
+import { stateLabel } from "./labels"
 import { ActionButton, DetailList, StatusBadge, SubmitButton } from "./present"
 import { reconcileDecision } from "./reconcile"
 import type { ExecutionActivityRecord, HumanRequest, OperationRecord, PendingOperation } from "./types"
 
 export function ExecutionActivity({ execution, conversationId }: { execution: ExecutionActivityRecord; conversationId: string }) {
   const workspace = useWorkspace()
+  const { directory } = useDevice()
   const id = useId()
+  const deviceName = directory?.members.find((member) => member.subject_id === execution.target_node)?.name || (workspace.nodes.some((node) => node.node_id === execution.target_node && node.local) ? "本机" : "执行设备")
   const [steerBusy, setSteerBusy] = useState(false)
   const targetOnline = workspace.nodes.some((node) => node.node_id === execution.target_node && node.online && !node.revoked)
   const pending = workspace.pending.filter((item) => item.conversation_id === conversationId && (item.execution_control?.expected_operation_id === execution.operation_id || item.target_node === execution.target_node && execution.session_id !== null && item.session_id === execution.session_id))
@@ -29,7 +32,7 @@ export function ExecutionActivity({ execution, conversationId }: { execution: Ex
       <StatusBadge value={execution.state} />
     </CardHeader>
     <CardContent className="space-y-3">
-      <p className="text-xs text-muted-foreground">{nodeName(execution.target_node)} · {execution.freshness === "cached" ? "上次核对的进展" : execution.freshness === "local_ledger" ? "执行设备已记录" : "等待核对进展"}{execution.checked_at_ms ? ` · ${new Date(execution.checked_at_ms).toLocaleString("zh-CN")}` : ""}</p>
+      <p className="text-xs text-muted-foreground">{deviceName} · {execution.freshness === "cached" ? "上次核对的进展" : execution.freshness === "local_ledger" ? "执行设备已记录" : "等待核对进展"}{execution.checked_at_ms ? ` · ${new Date(execution.checked_at_ms).toLocaleString("zh-CN")}` : ""}</p>
       {execution.latest_progress ? <p className="whitespace-pre-wrap break-words text-sm">{execution.latest_progress}</p> : null}
       {execution.detail && execution.detail !== execution.latest_progress ? <p className="whitespace-pre-wrap break-words text-sm">{execution.detail}</p> : null}
       {!targetOnline ? <p role="status" className="text-sm text-muted-foreground">设备恢复连接后可核对最新进展。</p> : null}
@@ -96,7 +99,9 @@ export function PendingExecutionControl({ operation }: { operation: PendingOpera
 }
 
 export function UnknownOperationActivity({ operation }: { operation: OperationRecord }) {
-  return <Card><CardHeader><CardTitle>结果待核查 · {nodeName(operation.request.target_node)}</CardTitle></CardHeader><CardContent className="space-y-3"><p className="text-sm">先确认原进程和外部结果，避免重复执行。</p><ResolveForm targetNode={operation.request.target_node} operationId={operation.request.operation_id} /></CardContent></Card>
+  const { directory } = useDevice()
+  const deviceName = directory?.members.find((member) => member.subject_id === operation.request.target_node)?.name || "执行设备"
+  return <Card><CardHeader><CardTitle>结果待核查 · {deviceName}</CardTitle></CardHeader><CardContent className="space-y-3"><p className="text-sm">先确认原进程和外部结果，避免重复执行。</p><ResolveForm targetNode={operation.request.target_node} operationId={operation.request.operation_id} /></CardContent></Card>
 }
 
 function ResolveForm({ targetNode, operationId }: { targetNode: string; operationId: string }) {
