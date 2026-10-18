@@ -19,6 +19,74 @@ pub struct FreshnessProof {
     pub receipts: Vec<Signed<FreshnessReceipt>>,
 }
 
+pub(crate) fn execution_destination_for_body(
+    state: &VerifiedPolicySet,
+    facts: &RequestFacts,
+    body: &Value,
+    now_ms: u64,
+) -> Result<Option<vibeface_secure::authorization::prepare::VerifiedExecutionDestination>> {
+    let remote_method = matches!(
+        body["method"].as_str(),
+        Some(
+            "operate"
+                | "bind_execution"
+                | "rebind_execution"
+                | "claim_execution"
+                | "resolve_unknown"
+        )
+    );
+    if !remote_method
+        || ["execution_resource", "target_public_key", "execution_grant"]
+            .iter()
+            .all(|field| body.get(*field).is_none())
+    {
+        return Ok(None);
+    }
+    let resource: ResourceRef = serde_json::from_value(body["execution_resource"].clone())?;
+    let key: PublicKey = serde_json::from_value(body["target_public_key"].clone())?;
+    let grant: ObjectHash = serde_json::from_value(body["execution_grant"].clone())?;
+    Ok(Some(state.verify_execution_destination(
+        &facts.resource,
+        &facts.audience,
+        &resource,
+        &key,
+        &grant,
+        &facts.context,
+        facts.action,
+        now_ms,
+    )?))
+}
+
+pub(crate) fn authorize_invocation_for_body(
+    state: &VerifiedPolicySet,
+    invocation: &Signed<Invocation>,
+    facts: &RequestFacts,
+    transport: &TransportEvidence,
+    body: &Value,
+    now_ms: u64,
+) -> Result<VerifiedAuthorization> {
+    let _verification = vibeface_secure::signature_verification::ScopedSignatureVerification::new();
+    invocation.verify_signature()?;
+    ensure!(
+        facts.body_hash == ObjectHash::body(body)?
+            && body["space_id"].as_str() == Some(facts.resource.space.as_str())
+            && body["resource_id"].as_str() == Some(facts.resource.resource.as_str())
+            && body["authorization_id"].as_str() == Some(facts.operation_id.as_str())
+            && crate::model::authorization_action(body)? == facts.action,
+        "request body differs from its parsed authorization facts"
+    );
+    match execution_destination_for_body(state, facts, body, now_ms)? {
+        Some(destination) => Ok(state.verify_invocation_with_execution_destination(
+            invocation,
+            facts,
+            transport,
+            &destination,
+            now_ms,
+        )?),
+        None => Ok(state.verify_invocation(invocation, facts, transport, now_ms)?),
+    }
+}
+
 pub(crate) fn request_facts_from(
     connection: &Connection,
     policies: &VerifiedPolicySet,
@@ -1028,6 +1096,24 @@ impl Store {
             .policy
             .verified()
             .verify_invocation(invocation, facts, transport, now_ms)?)
+    }
+
+    pub fn authorize_request_for_body(
+        &self,
+        invocation: &Signed<Invocation>,
+        facts: &RequestFacts,
+        transport: &TransportEvidence,
+        body: &Value,
+        now_ms: u64,
+    ) -> Result<VerifiedAuthorization> {
+        authorize_invocation_for_body(
+            self.policy.verified(),
+            invocation,
+            facts,
+            transport,
+            body,
+            now_ms,
+        )
     }
 
     pub fn issue_freshness(
