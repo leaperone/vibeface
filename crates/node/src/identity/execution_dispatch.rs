@@ -3768,20 +3768,21 @@ pub(crate) mod tests {
         let execution_domain = PolicyDomain::Space(f.execution.space.clone());
         let execution_head = f.store.policy.verified().head(&execution_domain).unwrap();
         assert!(
-            signed_prepare
+            !signed_prepare
                 .payload
                 .request
                 .expected_policies
-                .contains(execution_head)
+                .iter()
+                .any(|head| head.domain == execution_domain)
         );
-        let mut missing_execution_head = signed_prepare.payload.clone();
-        missing_execution_head
+        let mut missing_executor_account = signed_prepare.payload.clone();
+        missing_executor_account
             .request
             .expected_policies
-            .retain(|head| head.domain != execution_domain);
+            .retain(|head| head.domain != PolicyDomain::Account(f.executor.account.clone()));
         assert!(matches!(
             f.store.policy.verified().verify_prepare_intent(
-                &Signed::sign(missing_execution_head, &f.project.client)?,
+                &Signed::sign(missing_executor_account, &f.project.client)?,
                 &intent["body"],
                 Action::OperationResolve,
                 &f.audience,
@@ -3815,6 +3816,7 @@ pub(crate) mod tests {
         let destination = prepared
             .execution_destination()
             .context("resolver destination missing")?;
+        assert!(destination.heads().contains(execution_head));
         let verified_resolution = f
             .store
             .policy
@@ -3827,22 +3829,41 @@ pub(crate) mod tests {
                 now() + 3,
             )?;
         assert!(verified_resolution.dependencies().contains(execution_head));
-        let mut missing_execution_head = signed_resolution.payload;
+        let challenge = FreshnessChallenge::new(
+            &verified_resolution,
+            CheckStage::Admit,
+            Nonce::random()?,
+            now() + 3,
+            now() + 10_000,
+        )?;
+        assert!(challenge.policies.contains(execution_head));
+        let mut receipts = f
+            .store
+            .sign_current_receipts(&challenge, &f.project.node, now() + 3)?;
+        receipts.extend(
+            f.store
+                .sign_current_receipts(&challenge, &f.executor.node, now() + 3)?,
+        );
+        f.store.policy.verified().verify_freshness(
+            &verified_resolution,
+            &challenge,
+            &receipts,
+            now() + 3,
+        )?;
+        let mut missing_execution_head = challenge;
         missing_execution_head
-            .expected_policies
+            .policies
             .retain(|head| head.domain != execution_domain);
         assert!(matches!(
-            f.store
-                .policy
-                .verified()
-                .verify_invocation_with_execution_destination(
-                    &Signed::sign(missing_execution_head, &f.project.client)?,
-                    &resolution_facts,
-                    &transport,
-                    destination,
-                    now() + 3,
-                ),
-            Err(AuthorizationError::NeedPolicySync(_))
+            f.store.policy.verified().verify_freshness(
+                &verified_resolution,
+                &missing_execution_head,
+                &receipts,
+                now() + 3,
+            ),
+            Err(AuthorizationError::InvalidProof(
+                "freshness challenge mismatch"
+            ))
         ));
         let resolver_facts =
             f.store
