@@ -69,6 +69,7 @@ pub async fn status(
     conversation: &str,
     trigger: &str,
 ) -> Result<Value> {
+    let _work = node.maintenance.enter()?;
     let target = node.identity.node_id()?;
     let mut store = node.store.lock().await;
     store.recover_scheduler_jobs(space, &target, boot_id())?;

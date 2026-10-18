@@ -1134,6 +1134,17 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let receipt_key = format!("manager-control:{}", auth.operation_id());
+        if let Some(receipt) = scheduler_load::<ManagerControlReceipt>(&tx, space, &receipt_key)? {
+            ensure!(
+                receipt.admission.invocation == *auth.signed_invocation()
+                    && receipt.admission.source_body == *body
+                    && receipt.admission.transport == transport.stored(),
+                "manager control retry changed its original authorization"
+            );
+            crate::identity::admission::validate_persisted_admission(&tx, &receipt.admission)?;
+            tx.commit()?;
+            return Ok(receipt.job);
+        }
         let admission = crate::identity::admission::consume_request_authorization_in(
             &tx,
             &self.policy,
@@ -1144,14 +1155,6 @@ impl Store {
             None,
             now,
         )?;
-        if let Some(receipt) = scheduler_load::<ManagerControlReceipt>(&tx, space, &receipt_key)? {
-            ensure!(
-                receipt.admission == admission,
-                "manager control retry changed its original authorization"
-            );
-            tx.commit()?;
-            return Ok(receipt.job);
-        }
         let key = scheduler_key("job", scope, target, trigger);
         let mut job: SchedulerJob =
             scheduler_load(&tx, space, &key)?.context("scheduler job missing")?;

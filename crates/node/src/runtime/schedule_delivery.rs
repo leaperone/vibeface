@@ -1366,7 +1366,7 @@ mod tests {
         let entry = OutboxEntry {
             version: 1,
             space_id: "personal".into(),
-            resource_id: vibeface_secure::authorization::ResourceId::parse("project:test")?,
+            resource_id: vibeface_secure::authorization::ResourceId::random()?,
             conversation_id: "chat".into(),
             trigger: "result".into(),
             target_node: "original".into(),
@@ -1389,7 +1389,7 @@ mod tests {
         assert!(validate_reply(&entry, &json!({"state":"accepted"})).is_err());
         for key in [
             "version",
-            "network_id",
+            "space_id",
             "conversation_id",
             "trigger",
             "target_node",

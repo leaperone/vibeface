@@ -217,6 +217,7 @@ pub fn authorization_action(
             "bots"
             | "conversations"
             | "conversation"
+            | "progress_read"
             | "context"
             | "execution_share_request"
             | "schedule"

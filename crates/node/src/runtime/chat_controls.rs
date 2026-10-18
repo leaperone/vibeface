@@ -1932,26 +1932,27 @@ mod tests {
 
     #[test]
     fn prepared_control_reuses_frozen_body_and_is_network_scoped() -> Result<()> {
-        let mut store = Store::initialize(std::path::Path::new(":memory:"))?;
+        let network = crate::identity::test_support::TestNetwork::new()?;
+        let mut store = network.memory()?;
         let intent =
             json!({"action":"interrupt","expected_operation_id":"send","expected_revision":1});
         let request: OperationRequest = serde_json::from_value(
-            json!({"operation_id":"control","space_id":"network","conversation_id":"chat","task_id":"task","target_node":"executor","session_id":"session","expected_revision":1,"basis_heads":["old-head"],"action":{"type":"interrupt","turn_id":"turn"},"resources":[]}),
+            json!({"operation_id":"control","space_id":network.space,"conversation_id":"chat","task_id":"task","target_node":"executor","session_id":"session","expected_revision":1,"basis_heads":["old-head"],"action":{"type":"interrupt","turn_id":"turn"},"resources":[]}),
         )?;
         store.local_set(
-            "network",
+            network.space.as_str(),
             &control_key("control"),
             &json!({"intent":intent,"request":request,"status":null}),
         )?;
         assert_eq!(
-            prepared_request(&store, "network", Some("control"), &intent)?,
+            prepared_request(&store, network.space.as_str(), Some("control"), &intent)?,
             Some(request.clone())
         );
         assert!(prepared_request(&store, "other-network", Some("control"), &intent)?.is_none());
         assert!(
             prepared_request(
                 &store,
-                "network",
+                network.space.as_str(),
                 Some("control"),
                 &json!({"action":"steer"})
             )
@@ -1962,6 +1963,7 @@ mod tests {
         assert!(same_business_request(&admitted, &request));
         admitted.action = json!({"type":"interrupt","turn_id":"other"});
         assert!(!same_business_request(&admitted, &request));
+        std::fs::remove_dir_all(network.directory)?;
         Ok(())
     }
 
