@@ -534,12 +534,18 @@ pub(crate) mod tests {
         test_support::{TestNetwork, now},
     };
     use vibeface_secure::authorization::{
-        AUTH_VERSION, Actor, Audience, DeviceId, EventRef, Grant, GrantConstraints, Grantee,
-        InvocationContext, JournalEntry, Nonce, PolicyDomain, ResourceId, ResourceKind,
-        ResourceRecord, ResourceRef, ResourceScope, ServiceId, SessionRef,
-        VerifiedClientAuthorization, client_policy_import::AuthorizationSelection,
-        prepare::PrepareContext,
-        remote_execution_policy::build_remote_execution_policy_read_intent,
+        AUTH_VERSION, Actor, Audience, CheckStage, DeviceId, EventRef, Grant, GrantConstraints,
+        Grantee, Invocation, InvocationContext, JournalEntry, Nonce, PolicyDomain, RequestFacts,
+        ResourceId, ResourceKind, ResourceRecord, ResourceRef, ResourceScope, ServiceId,
+        SessionRef, TransportEvidence, VerifiedClientAuthorization,
+        client_policy_import::AuthorizationSelection,
+        prepare::{
+            PrepareContext, PrepareIntent, VerifiedRemoteExecution, verify_remote_execution,
+        },
+        remote_execution_policy::{
+            RemoteExecutionPolicyPage, RemoteExecutionPolicyReadRequest,
+            begin_remote_execution_policy_import, build_remote_execution_policy_read_intent,
+        },
     };
 
     pub(crate) struct UnseededFixture {
@@ -711,6 +717,383 @@ pub(crate) mod tests {
             "foreign approval carrier exceeded its crypto budget"
         );
         Ok(result)
+    }
+
+    fn import_current_policy(fixture: &mut UnseededFixture) -> Result<VerifiedRemoteExecution> {
+        let principal = fixture.project.client.public_key_hex();
+        let approved = carrier(|| {
+            fixture.store.foreign_execution_policy_approve(
+                &fixture.project.node,
+                &principal,
+                &serde_json::to_value(&fixture.intent)?,
+                now(),
+            )
+        })?;
+        let delegated = carrier(|| {
+            fixture.store.remote_execution_policy_delegate(
+                &fixture.project.node,
+                &principal,
+                &serde_json::to_value(&fixture.intent)?,
+                now(),
+            )
+        })?;
+        let request = RemoteExecutionPolicyReadRequest {
+            intent: fixture.intent.clone(),
+            delegation: serde_json::from_value(delegated["delegation"].clone())?,
+        };
+        let prepared = carrier(|| {
+            fixture.target.remote_execution_policy_prepare(
+                &fixture.executor.node,
+                &principal,
+                &serde_json::to_value(&request)?,
+                now(),
+            )
+        })?;
+        let mut client_import = carrier(|| {
+            begin_remote_execution_policy_import(
+                &fixture.source,
+                &serde_json::to_string(&request)?,
+                &prepared["snapshot"].to_string(),
+                &serde_json::to_string(&fixture.executor.pins)?,
+                &fixture.executor.node.public_key_hex()?,
+                now() as f64,
+            )
+            .map_err(anyhow::Error::msg)
+        })?;
+        let begun = carrier(|| {
+            fixture.store.foreign_execution_policy_begin(
+                &fixture.project.node,
+                &principal,
+                &json!({"request":request,"snapshot":prepared["snapshot"],
+                    "approval_ref":approved["approval_ref"]}),
+                now(),
+            )
+        })?;
+        let import_ref: ObjectHash = serde_json::from_value(begun["import_ref"].clone())?;
+        let mut pages = 0;
+        loop {
+            ensure!(
+                pages < 128,
+                "foreign cold-start policy stream did not finish"
+            );
+            let params = serde_json::from_str(
+                &client_import
+                    .page_request_json()
+                    .map_err(anyhow::Error::msg)?,
+            )?;
+            let response = carrier(|| {
+                fixture.target.remote_execution_policy_page(
+                    &fixture.executor.node,
+                    &principal,
+                    &params,
+                    now(),
+                )
+            })?;
+            let page: Signed<RemoteExecutionPolicyPage> =
+                serde_json::from_value(response["page"].clone())?;
+            carrier(|| {
+                fixture.store.foreign_execution_policy_page(
+                    &fixture.project.node,
+                    &principal,
+                    &json!({"import_ref":import_ref,"page":page}),
+                    now(),
+                )
+            })?;
+            carrier(|| {
+                client_import
+                    .append_page(&serde_json::to_string(&page)?, now() as f64)
+                    .map_err(anyhow::Error::msg)
+            })?;
+            pages += 1;
+            if page.payload.complete {
+                break;
+            }
+        }
+        let params = serde_json::from_str(
+            &client_import
+                .page_request_json()
+                .map_err(anyhow::Error::msg)?,
+        )?;
+        let finished = carrier(|| {
+            fixture.target.remote_execution_policy_finish(
+                &fixture.executor.node,
+                &principal,
+                &params,
+                now(),
+            )
+        })?;
+        carrier(|| {
+            fixture.store.foreign_execution_policy_finish(
+                &fixture.project.node,
+                &principal,
+                &json!({"import_ref":import_ref,"witness":finished["witness"]}),
+                now(),
+            )
+        })?;
+        let policy = carrier(|| {
+            client_import
+                .finish(&finished["witness"].to_string(), now() as f64)
+                .map_err(anyhow::Error::msg)
+        })?;
+        carrier(|| {
+            verify_remote_execution(&fixture.source, &policy, now() as f64)
+                .map_err(anyhow::Error::msg)
+        })
+    }
+
+    #[test]
+    fn cold_original_policy_cannot_authorize_a_new_current_request() -> Result<()> {
+        let mut fixture = unseeded_fixture()?;
+        let remote = import_current_policy(&mut fixture)?;
+        let context = &fixture.intent.payload.context;
+        let local = PublicKey::parse(&fixture.project.node.public_key_hex()?)?;
+        let audience = fixture.intent.payload.source_selection.audience.clone();
+        let body = json!({
+            "method":"bind_execution",
+            "space_id":fixture.project.space,
+            "resource_id":fixture.project.resource,
+            "authorization_id":"foreign-original-bind",
+            "execution_resource":fixture.intent.payload.selection.execution_resource,
+            "target_public_key":fixture.intent.payload.selection.target_public_key,
+            "execution_grant":fixture.intent.payload.selection.execution_grant,
+            "conversation_id":"foreign-conversation",
+            "task_id":"foreign-task",
+            "task_ref":context.context.task,
+            "target_node":fixture.executor.node.node_id()?,
+            "session_id":"foreign-session",
+            "executor":"codex",
+            "cwd":fixture.project.project,
+        });
+        let sign = |body: &Value| -> Result<(Signed<PrepareIntent>, Signed<Invocation>)> {
+            let operation_id = body["authorization_id"]
+                .as_str()
+                .context("authorization ID missing")?;
+            let prepared = carrier(|| {
+                remote
+                    .prepare(
+                        &fixture.source,
+                        &body.to_string(),
+                        &serde_json::to_string(context)?,
+                        "execution_open",
+                        operation_id,
+                        local.as_str(),
+                        &fixture.project.client,
+                        now() as f64,
+                    )
+                    .map_err(anyhow::Error::msg)
+            })?;
+            let prepared: Signed<PrepareIntent> = serde_json::from_str(&prepared)?;
+            let invocation = carrier(|| {
+                remote
+                    .sign(
+                        &fixture.source,
+                        &serde_json::to_string(&prepared.payload.request)?,
+                        &body.to_string(),
+                        "execution_open",
+                        operation_id,
+                        local.as_str(),
+                        &fixture.project.client,
+                        now() as f64,
+                    )
+                    .map_err(anyhow::Error::msg)
+            })?;
+            Ok((prepared, serde_json::from_str(&invocation)?))
+        };
+        let (prepared, invocation) = sign(&body)?;
+        let current = carrier(|| {
+            current_task_prepare_policy_in(
+                &fixture.store.connection,
+                &fixture.store.policy,
+                &local,
+                &prepared,
+                &body,
+                now(),
+            )?
+            .context("fresh prepare lost its completed foreign policy")
+        })?;
+        assert_eq!(current.request().source_node(), &local);
+        let signed = &invocation.payload;
+        let facts = RequestFacts {
+            resource: signed.resource.clone(),
+            action: signed.action,
+            audience: signed.audience.clone(),
+            operation_id: signed.operation_id.clone(),
+            body_hash: signed.body_hash.clone(),
+            context: signed.context.clone(),
+        };
+        let transport = TransportEvidence::DirectNoise {
+            device: DeviceId::from_key(&PublicKey::of(&fixture.project.client)),
+        };
+        let scoped = carrier(|| {
+            fixture.store.authorize_scoped_request_for_body(
+                &fixture.project.node,
+                &invocation,
+                &facts,
+                &transport,
+                &body,
+                now(),
+            )
+        })?;
+        let dispatch = carrier(|| {
+            fixture
+                .store
+                .execution_dispatch_facts_in_scope(&scoped, &body, &audience, now())
+        })?;
+        let challenge = carrier(|| {
+            fixture
+                .store
+                .issue_scoped_freshness(&scoped, CheckStage::Admit, now())
+        })?;
+        let mut receipts = carrier(|| {
+            fixture
+                .store
+                .sign_current_receipts(&challenge, &fixture.project.node, now())
+        })?;
+        receipts.extend(carrier(|| {
+            fixture
+                .target
+                .sign_current_receipts(&challenge, &fixture.executor.node, now())
+        })?);
+        let binding = carrier(|| {
+            fixture.store.bind_execution_dispatch(
+                &fixture.project.node,
+                &dispatch,
+                &scoped,
+                &crate::identity::policy::FreshnessProof {
+                    challenge,
+                    receipts,
+                },
+                &transport,
+                &body,
+                now(),
+            )
+        })?;
+        assert_eq!(binding.binding.generation, 1);
+        let proof = crate::identity::admission::load_admission_in(
+            &fixture.store.connection,
+            fixture.project.space.as_str(),
+            "foreign-original-bind",
+        )?;
+        assert_eq!(proof.invocation, invocation);
+        assert_eq!(proof.admitted_at_ms, now());
+        assert!(
+            fixture
+                .store
+                .policy
+                .verified()
+                .account(&fixture.executor.account)
+                .is_none()
+        );
+        let request = crate::model::OperationRequest {
+            operation_id: "foreign-new-open".into(),
+            network_id: fixture.project.space.to_string(),
+            conversation_id: "foreign-conversation".into(),
+            task_id: Some("foreign-task".into()),
+            target_node: fixture.executor.node.node_id()?,
+            session_id: "foreign-session".into(),
+            expected_revision: 0,
+            basis_heads: vec![binding.binding.task_ref.clone()],
+            action: binding.binding.open_spec.clone(),
+            resources: vec![
+                binding.binding.open_spec["cwd"]
+                    .as_str()
+                    .context("binding cwd missing")?
+                    .into(),
+            ],
+            binding: Some(binding),
+        };
+        let next_body = json!({
+            "method":"operate",
+            "space_id":fixture.project.space,
+            "resource_id":fixture.project.resource,
+            "authorization_id":"foreign-new-open",
+            "execution_resource":fixture.intent.payload.selection.execution_resource,
+            "target_public_key":fixture.intent.payload.selection.target_public_key,
+            "execution_grant":fixture.intent.payload.selection.execution_grant,
+            "request":request,
+        });
+        let (_, warm_invocation) = sign(&next_body)?;
+        let signed = &warm_invocation.payload;
+        let next_facts = RequestFacts {
+            resource: signed.resource.clone(),
+            action: signed.action,
+            audience: signed.audience.clone(),
+            operation_id: signed.operation_id.clone(),
+            body_hash: signed.body_hash.clone(),
+            context: signed.context.clone(),
+        };
+        let warm_scope = carrier(|| {
+            fixture.store.authorize_scoped_request_for_body(
+                &fixture.project.node,
+                &warm_invocation,
+                &next_facts,
+                &transport,
+                &next_body,
+                now(),
+            )
+        })?;
+        let warm_dispatch = carrier(|| {
+            fixture.store.execution_dispatch_facts_in_scope(
+                &warm_scope,
+                &next_body,
+                &audience,
+                now(),
+            )
+        })?;
+        assert_eq!(warm_dispatch.facts().operation_id, "foreign-new-open");
+        let path = fixture.project.directory.join("foreign-approval.sqlite3");
+        drop(fixture.store);
+        let reopened = Store::open(&path)?;
+        let original = carrier(|| {
+            original_task_execution_policy_in(
+                &reopened.connection,
+                &reopened.policy,
+                &local,
+                &proof,
+            )?
+            .context("cold start lost the original accepted foreign admission")
+        })?;
+        assert_eq!(original.signed_invocation_hash(), &invocation.hash()?);
+        assert_eq!(original.admitted_at_ms(), now());
+
+        let (next_prepare, next_invocation) = sign(&next_body)?;
+        assert_ne!(next_invocation.payload.nonce, invocation.payload.nonce);
+        assert_ne!(next_invocation.payload.nonce, warm_invocation.payload.nonce);
+        assert_ne!(next_invocation.hash()?, invocation.hash()?);
+        assert_ne!(next_invocation.hash()?, warm_invocation.hash()?);
+        let prepare_error = carrier(|| {
+            current_task_prepare_policy_in(
+                &reopened.connection,
+                &reopened.policy,
+                &local,
+                &next_prepare,
+                &next_body,
+                now(),
+            )
+        })
+        .err()
+        .context("cold original authorized a new prepare")?;
+        assert!(
+            prepare_error.to_string().contains("NeedPolicySync"),
+            "{prepare_error:#}"
+        );
+        let invocation_error = carrier(|| {
+            current_task_execution_policy_in(
+                &reopened.connection,
+                &reopened.policy,
+                &fixture.project.node,
+                &next_invocation,
+                &next_body,
+                now(),
+            )
+        })
+        .err()
+        .context("cold original authorized a new invocation")?;
+        assert!(
+            invocation_error.to_string().contains("NeedPolicySync"),
+            "{invocation_error:#}"
+        );
+        Ok(())
     }
 
     #[test]
