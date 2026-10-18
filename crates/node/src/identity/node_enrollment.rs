@@ -129,6 +129,9 @@ impl Store {
             }
             "account_node_commit" => self.account_node_commit(identity, principal, params, now),
             "account_node_status" => self.account_node_status(identity, principal, params, now),
+            "account_node_install_status" => {
+                self.account_node_install_status(identity, principal, params, now)
+            }
             "account_node_install" => self.account_node_install(identity, principal, params, now),
             _ => bail!("unknown node enrollment method"),
         }
@@ -313,6 +316,91 @@ impl Store {
         Ok(response)
     }
 
+    fn account_node_install_status(
+        &mut self,
+        identity: &LocalIdentity,
+        principal: &str,
+        params: &Value,
+        now: u64,
+    ) -> Result<Value> {
+        let input: InstallationRequest = serde_json::from_value(params.clone())?;
+        let installation = &input.installation;
+        require_principal(&installation.request, principal)?;
+        let local = PublicKey::parse(&identity.public_key_hex()?)?;
+        ensure!(
+            installation
+                .request
+                .intent
+                .payload
+                .claim
+                .payload
+                .node_public_key
+                == local,
+            "installation status belongs to another local Node"
+        );
+        let input_hash = ObjectHash::body(params)?;
+        let request_hash = ObjectHash::body(&installation.request.intent)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let saved: PossessionRecord = serde_json::from_str(
+            &metadata(&tx, "node_possession")?.context("Node possession is missing")?,
+        )?;
+        import_cache::verify_saved_possession(&saved)?;
+        ensure!(
+            saved.request_hash == request_hash
+                && saved.context == input.context
+                && saved.principal == principal
+                && saved.credential.intent == installation.request.intent
+                && saved.credential.descriptor == installation.request.descriptor
+                && installation
+                    .request
+                    .certificate
+                    .payload
+                    .possession
+                    .as_ref()
+                    .map(|proof| proof.as_str())
+                    == Some(saved.proof.as_str()),
+            "installation status differs from this Node's approved request and possession"
+        );
+        let response = if let Some(receipt) = metadata(&tx, "account_node_installation")? {
+            let receipt: Value = serde_json::from_str(&receipt)?;
+            ensure!(
+                receipt["request_hash"] == request_hash.as_str()
+                    && receipt["input_hash"] == input_hash.as_str()
+                    && receipt["principal"] == principal,
+                "installation status changed its original input or Noise client"
+            );
+            let current = journal::PolicyState::reload_verified(&tx, &self.policy)?;
+            current.verified().verify_account_client_device(
+                &installation.request.intent.payload.account,
+                &installation.request.intent.payload.requesting_device,
+                now,
+            )?;
+            current
+                .verified()
+                .verify_transport_device(&DeviceId::from_key(&local), now)?;
+            json!({"state":"committed","response":receipt["response"]})
+        } else {
+            check_claim_in(&tx, &installation.request.intent.payload.claim)?;
+            json!({"state":"not_observed"})
+        };
+        let response = bounded_response(params, response)?;
+        let mut usage =
+            vibeface_secure::authorization::execution_handoff::ExecutionProofUsage::default();
+        import_cache::record_installation_usage(&mut usage, installation)?;
+        usage.record_signed(&saved.approval)?;
+        usage.record_metadata(params)?;
+        usage.record_metadata(&response)?;
+        if let Some(counts) =
+            vibeface_secure::signature_verification::SignatureVerification::current_counts()
+        {
+            usage.record_actual_signature_counts(counts);
+        }
+        usage.enforce_limits()?;
+        tx.commit()?;
+        Ok(response)
+    }
     fn account_node_install(
         &mut self,
         identity: &LocalIdentity,
@@ -953,6 +1041,193 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn installation_status_reads_original_receipt_after_consumption_and_reopen() -> Result<()> {
+        let mut f = Fixture::new()?;
+        let (prepared, _, response) = committed(&mut f)?;
+        let installation = f.installation(&finish(&prepared, &response, now())?)?;
+        let principal = f.network.client.public_key_hex();
+        let importer = f.fresh.account_node_enrollment_import.take();
+        let before = f.fresh.connection.total_changes();
+        assert_eq!(
+            f.fresh.node_enrollment_command(
+                &f.node,
+                &principal,
+                "account_node_install_status",
+                &installation,
+                now(),
+            )?,
+            json!({"state":"not_observed"})
+        );
+        assert_eq!(f.fresh.connection.total_changes(), before);
+        assert!(metadata(&f.fresh.connection, "account_node_installation")?.is_none());
+        f.fresh
+            .verify_bootstrap_capability(&f.capability.capability)?;
+        assert!(f.fresh.account_node_enrollment_import.is_none());
+        f.fresh.account_node_enrollment_import = importer;
+        let installed = f.fresh.node_enrollment_command(
+            &f.node,
+            &principal,
+            "account_node_install",
+            &installation,
+            now(),
+        )?;
+        let expected = json!({"state":"committed","response":installed});
+        let receipt = metadata(&f.fresh.connection, "account_node_installation")?;
+        let bootstrap = metadata(&f.fresh.connection, "bootstrap_capability_hash")?;
+        assert!(f.fresh.account_node_enrollment_import.is_none());
+        let before = f.fresh.connection.total_changes();
+        for at in [now(), now() + 1] {
+            let signatures = SignatureVerification::new();
+            assert_eq!(
+                signatures.run(|| f.fresh.node_enrollment_command(
+                    &f.node,
+                    &principal,
+                    "account_node_install_status",
+                    &installation,
+                    at,
+                ))?,
+                expected
+            );
+            assert!(
+                signatures.counts().actual_verifications
+                    <= vibeface_secure::authorization::MAX_PROOF_SIGNATURES
+            );
+            assert_eq!(f.fresh.connection.total_changes(), before);
+            assert_eq!(
+                metadata(&f.fresh.connection, "account_node_installation")?,
+                receipt
+            );
+            assert_eq!(
+                metadata(&f.fresh.connection, "bootstrap_capability_hash")?,
+                bootstrap
+            );
+        }
+        let path = f.network.directory.join("new-node.sqlite3");
+        drop(f.fresh);
+        let mut reopened = Store::open(&path)?;
+        assert!(reopened.account_node_enrollment_import.is_none());
+        let before = reopened.connection.total_changes();
+        assert_eq!(
+            reopened.node_enrollment_command(
+                &f.node,
+                &principal,
+                "account_node_install_status",
+                &installation,
+                now() + 2,
+            )?,
+            expected
+        );
+        assert_eq!(reopened.connection.total_changes(), before);
+        assert_eq!(
+            metadata(&reopened.connection, "account_node_installation")?,
+            receipt
+        );
+        assert_eq!(
+            metadata(&reopened.connection, "bootstrap_capability_hash")?,
+            bootstrap
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn installation_status_rejects_changed_input_principal_node_and_current_revocation()
+    -> Result<()> {
+        let mut f = Fixture::new()?;
+        let (prepared, _, response) = committed(&mut f)?;
+        let installation = f.installation(&finish(&prepared, &response, now())?)?;
+        let principal = f.network.client.public_key_hex();
+        let other_node = LocalIdentity::generate();
+        for installed in [false, true] {
+            if installed {
+                f.fresh.node_enrollment_command(
+                    &f.node,
+                    &principal,
+                    "account_node_install",
+                    &installation,
+                    now(),
+                )?;
+            }
+            let before = f.fresh.connection.total_changes();
+            for change in 0..3 {
+                let mut wrong = installation.clone();
+                match change {
+                    0 => wrong["context"] = json!(ObjectHash::body(&"another context")?),
+                    1 => wrong["installation"]["request"]["descriptor"]["pins"] = json!([]),
+                    _ => {
+                        wrong["installation"]["request"]["certificate"]["payload"]["possession"] =
+                            json!("00".repeat(64));
+                    }
+                }
+                assert!(
+                    f.fresh
+                        .node_enrollment_command(
+                            &f.node,
+                            &principal,
+                            "account_node_install_status",
+                            &wrong,
+                            now(),
+                        )
+                        .is_err()
+                );
+            }
+            assert!(
+                f.fresh
+                    .node_enrollment_command(
+                        &f.node,
+                        &f.network.root.public_key_hex(),
+                        "account_node_install_status",
+                        &installation,
+                        now(),
+                    )
+                    .is_err()
+            );
+            assert!(
+                f.fresh
+                    .node_enrollment_command(
+                        &other_node,
+                        &principal,
+                        "account_node_install_status",
+                        &installation,
+                        now(),
+                    )
+                    .is_err()
+            );
+            assert_eq!(f.fresh.connection.total_changes(), before);
+        }
+        let mut wrong = installation.clone();
+        wrong["installation"]["committed"]["commit"]["payload"]["proposal_hash"] =
+            json!(ObjectHash::body(&"different committed input")?);
+        let before = f.fresh.connection.total_changes();
+        assert!(
+            f.fresh
+                .node_enrollment_command(
+                    &f.node,
+                    &principal,
+                    "account_node_install_status",
+                    &wrong,
+                    now(),
+                )
+                .is_err()
+        );
+        assert_eq!(f.fresh.connection.total_changes(), before);
+        let mut independent = Store::open(f.network.directory.join("new-node.sqlite3"))?;
+        f.network.revoke_client(&mut independent)?;
+        let before = f.fresh.connection.total_changes();
+        assert!(
+            f.fresh
+                .node_enrollment_command(
+                    &f.node,
+                    &principal,
+                    "account_node_install_status",
+                    &installation,
+                    now() + 2,
+                )
+                .is_err()
+        );
+        assert_eq!(f.fresh.connection.total_changes(), before);
+        Ok(())
+    }
     #[test]
     fn bounded_node_enrollment_installs_and_retries_after_reopen() -> Result<()> {
         let mut f = Fixture::new()?;
