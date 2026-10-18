@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use vibeface_secure::authorization::{
-    AUTH_VERSION, Nonce, ObjectHash, Signed,
+    AUTH_VERSION, AuthorityBinding, Nonce, ObjectHash, PolicyDomain, Signature, Signed,
     bootstrap::recovery::{cross_node::CrossNodeRecoveryRequest, stream::*},
 };
 
@@ -13,6 +13,14 @@ const MAX_CACHE_ROW_BYTES: usize = 65_536;
 pub(crate) struct UntrustedTargetRecoveryHeader {
     pub(crate) request: RecoveryReadRequest,
     pub(crate) snapshot: Signed<RecoveryContextSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UntrustedTargetRecoveryApproval {
+    pub(crate) possession: StreamedCrossNodeRecoveryPossessionRequest,
+    pub(crate) proof: Signature,
+    pub(crate) approval: Signed<CrossNodeRecoveryImportApproval>,
 }
 
 /// Stored carriers do not authorize recovery. The native importer must consume each page again.
@@ -130,6 +138,46 @@ impl UntrustedTargetRecoveryCache {
         Ok(witness)
     }
 
+    pub(crate) fn store_approval(
+        &self,
+        connection: &Connection,
+        approval: &UntrustedTargetRecoveryApproval,
+    ) -> Result<()> {
+        self.check_approval(connection, approval)?;
+        write_immutable(connection, &self.approval_key(), approval)
+    }
+
+    pub(crate) fn load_approval(
+        &self,
+        connection: &Connection,
+    ) -> Result<Option<UntrustedTargetRecoveryApproval>> {
+        let approval = read_json(connection, &self.approval_key())?;
+        if let Some(approval) = &approval {
+            self.check_approval(connection, approval)?;
+        }
+        Ok(approval)
+    }
+
+    pub(crate) fn store_committed(
+        &self,
+        connection: &Connection,
+        committed: &StreamedCrossNodeRecoveryCommitted,
+    ) -> Result<()> {
+        self.check_committed(connection, committed)?;
+        write_immutable(connection, &self.committed_key(), committed)
+    }
+
+    pub(crate) fn load_committed(
+        &self,
+        connection: &Connection,
+    ) -> Result<Option<StreamedCrossNodeRecoveryCommitted>> {
+        let committed = read_json(connection, &self.committed_key())?;
+        if let Some(committed) = &committed {
+            self.check_committed(connection, committed)?;
+        }
+        Ok(committed)
+    }
+
     fn header_key(&self) -> String {
         format!("{}:header", self.scope_key)
     }
@@ -140,6 +188,14 @@ impl UntrustedTargetRecoveryCache {
 
     fn witness_key(&self) -> String {
         format!("{}:witness", self.scope_key)
+    }
+
+    fn approval_key(&self) -> String {
+        format!("{}:approval", self.scope_key)
+    }
+
+    fn committed_key(&self) -> String {
+        format!("{}:committed", self.scope_key)
     }
 
     fn required_header(&self, connection: &Connection) -> Result<UntrustedTargetRecoveryHeader> {
@@ -242,6 +298,108 @@ impl UntrustedTargetRecoveryCache {
         );
         Ok(())
     }
+
+    fn check_reference(
+        &self,
+        connection: &Connection,
+        header: &UntrustedTargetRecoveryHeader,
+        reference: &RecoveryContextReference,
+    ) -> Result<()> {
+        let witness: Signed<RecoveryContextWitness> =
+            read_json(connection, &self.witness_key())?
+                .context("target recovery witness is missing")?;
+        self.check_witness(connection, header, &witness)?;
+        ensure!(
+            reference.snapshot_id == self.snapshot_id
+                && reference.request_hash == self.request.hash()?
+                && reference.snapshot_hash == header.snapshot.hash()?
+                && reference.witness_hash == witness.hash()?,
+            "target recovery carrier changed its completed context"
+        );
+        Ok(())
+    }
+
+    fn check_approval(
+        &self,
+        connection: &Connection,
+        carrier: &UntrustedTargetRecoveryApproval,
+    ) -> Result<()> {
+        let header = self.required_header(connection)?;
+        let possession = &carrier.possession;
+        self.check_reference(connection, &header, &possession.context)?;
+        let original = &self.request.payload;
+        let node = &possession.node_request;
+        let target = &original.target_claim.payload.node_public_key;
+        let approval = &carrier.approval.payload;
+        ensure!(
+            possession.request == self.request
+                && node.claim == original.target_claim
+                && node.expected_account_head.domain
+                    == PolicyDomain::Account(original.account.clone())
+                && node.expected_space_head.domain == PolicyDomain::Space(original.space.clone())
+                && header.snapshot.payload.target_heads
+                    == [
+                        node.expected_account_head.clone(),
+                        node.expected_space_head.clone()
+                    ]
+                && node.account_recovery.payload.account == original.account
+                && node.account_recovery.payload.current_root == original.new_root_public_key
+                && node.account_recovery.issuer == self.request.issuer
+                && node.account_recovery.payload.authority
+                    == AuthorityBinding::from_key(target.clone())
+                && node.node_certificate.public_key == *target
+                && possession.source_certificate.public_key == original.source_node_public_key
+                && carrier.approval.issuer == *target
+                && approval.version == AUTH_VERSION
+                && approval.context == possession.context
+                && approval.account == original.account
+                && approval.space == original.space
+                && approval.new_device_public_key == original.new_device_public_key
+                && approval.new_root_public_key == original.new_root_public_key
+                && approval.source_node_public_key == original.source_node_public_key
+                && approval.target_node_public_key == *target
+                && approval.possession_hash == ObjectHash::body(possession)?
+                && approval.claim_hash == original.target_claim.hash()?
+                && approval.expires_at_ms == original.expires_at_ms,
+            "target recovery approval changed its original possession or scope"
+        );
+        node.account_recovery.verify_signature()?;
+        carrier.approval.verify_signature()?;
+        Ok(())
+    }
+
+    fn check_committed(
+        &self,
+        connection: &Connection,
+        committed: &StreamedCrossNodeRecoveryCommitted,
+    ) -> Result<()> {
+        let approval = self
+            .load_approval(connection)?
+            .context("target recovery approval is missing")?;
+        let original = &self.request.payload;
+        let receipt = &committed.receipt.payload;
+        let node = &committed.request.possession.node_request;
+        ensure!(
+            committed.request.possession == approval.possession
+                && committed.receipt.issuer == original.source_node_public_key
+                && receipt.version == AUTH_VERSION
+                && receipt.context == approval.possession.context
+                && receipt.request_hash == self.request.hash()?
+                && receipt.input_hash == ObjectHash::body(&committed.request)?
+                && receipt.expected_account_head == node.expected_account_head
+                && receipt.expected_space_head == node.expected_space_head
+                && receipt.committed_account_head.domain
+                    == PolicyDomain::Account(original.account.clone())
+                && receipt.committed_space_head.domain
+                    == PolicyDomain::Space(original.space.clone())
+                && receipt.target_node_public_key == original.target_claim.payload.node_public_key
+                && receipt.new_device_public_key == original.new_device_public_key
+                && receipt.grant_leaf == committed.request.grant_leaf,
+            "target recovery completion changed its original approval or input"
+        );
+        committed.receipt.verify_signature()?;
+        Ok(())
+    }
 }
 
 fn read_json<T: DeserializeOwned>(connection: &Connection, key: &str) -> Result<Option<T>> {
@@ -296,13 +454,16 @@ mod tests {
     use vibeface_secure::{
         Identity,
         authorization::{
-            AccountId, PolicyDomain, PolicyPin, PolicyStamp, PublicKey, SpaceId,
-            bootstrap::NodeClaim,
+            AccountDocument, AccountId, Actor, DeviceCertificate, DeviceId, DeviceUse, PolicyPin,
+            PolicyStamp, PublicKey, RecoveryPolicy, ServiceId, SpaceId,
+            bootstrap::{NodeClaim, recovery::RecoveryNodeRequest},
         },
     };
 
     struct Fixture {
         source: Identity,
+        target: Identity,
+        recovery: Identity,
         request: Signed<CrossNodeRecoveryRequest>,
         snapshot: Signed<RecoveryContextSnapshot>,
     }
@@ -385,6 +546,8 @@ mod tests {
             )?;
             Ok(Self {
                 source,
+                target,
+                recovery,
                 request,
                 snapshot,
             })
@@ -441,6 +604,140 @@ mod tests {
                 &self.source,
             )?)
         }
+    }
+
+    fn approval_fixture(
+        fixture: &Fixture,
+        witness: &Signed<RecoveryContextWitness>,
+    ) -> Result<UntrustedTargetRecoveryApproval> {
+        let original = &fixture.request.payload;
+        let account_head = fixture.snapshot.payload.target_heads[0].clone();
+        let space_head = fixture.snapshot.payload.target_heads[1].clone();
+        let account_recovery = Signed::sign(
+            AccountDocument {
+                version: AUTH_VERSION,
+                account: original.account.clone(),
+                genesis_root: original.saved_pins[0].genesis_root.clone(),
+                current_root: original.new_root_public_key.clone(),
+                root_generation: 1,
+                previous: Some(account_head.clone()),
+                authority_epoch: 1,
+                sequence: 0,
+                authority: AuthorityBinding::from_key(PublicKey::of(&fixture.target)),
+                recovery: RecoveryPolicy {
+                    keys: vec![fixture.request.issuer.clone()],
+                    threshold: 1,
+                },
+                enrollment: Vec::new(),
+                devices: Vec::new(),
+                revoked_devices: Vec::new(),
+                authenticators: Vec::new(),
+                authenticator_approval: None,
+                device_enrollment: None,
+                root_acceptance: None,
+                recovery_approvals: Vec::new(),
+            },
+            &fixture.recovery,
+        )?;
+        let node_certificate = DeviceCertificate {
+            version: AUTH_VERSION,
+            owner: PolicyDomain::Account(original.account.clone()),
+            subject: Actor::Service(ServiceId::from_key(&PublicKey::of(&fixture.target))),
+            device: DeviceId::from_key(&PublicKey::of(&fixture.target)),
+            public_key: PublicKey::of(&fixture.target),
+            uses: vec![DeviceUse::Noise, DeviceUse::ServiceInvocation],
+            possession: None,
+            enrollment_grant: None,
+            issued_under: account_head.clone(),
+            nonce: original.nonce.clone(),
+            not_before_ms: 3,
+            expires_at_ms: 2_000,
+        };
+        let proof = Signature::parse(
+            &fixture
+                .target
+                .sign(
+                    "device-possession-v2",
+                    &node_certificate.possession_bytes()?,
+                )
+                .map_err(anyhow::Error::msg)?,
+        )?;
+        let mut source_certificate = node_certificate.clone();
+        source_certificate.subject =
+            Actor::Service(ServiceId::from_key(&PublicKey::of(&fixture.source)));
+        source_certificate.device = DeviceId::from_key(&PublicKey::of(&fixture.source));
+        source_certificate.public_key = PublicKey::of(&fixture.source);
+        let context = RecoveryContextReference {
+            snapshot_id: fixture.snapshot.payload.snapshot_id.clone(),
+            request_hash: fixture.request.hash()?,
+            snapshot_hash: fixture.snapshot.hash()?,
+            witness_hash: witness.hash()?,
+        };
+        let possession = StreamedCrossNodeRecoveryPossessionRequest {
+            context: context.clone(),
+            request: fixture.request.clone(),
+            node_request: RecoveryNodeRequest {
+                claim: original.target_claim.clone(),
+                expected_account_head: account_head,
+                expected_space_head: space_head,
+                account_recovery,
+                node_certificate,
+            },
+            source_certificate,
+        };
+        let approval = Signed::sign(
+            CrossNodeRecoveryImportApproval {
+                version: AUTH_VERSION,
+                context,
+                account: original.account.clone(),
+                space: original.space.clone(),
+                new_device_public_key: original.new_device_public_key.clone(),
+                new_root_public_key: original.new_root_public_key.clone(),
+                source_node_public_key: PublicKey::of(&fixture.source),
+                target_node_public_key: PublicKey::of(&fixture.target),
+                possession_hash: ObjectHash::body(&possession)?,
+                claim_hash: original.target_claim.hash()?,
+                approved_at_ms: 4,
+                expires_at_ms: original.expires_at_ms,
+            },
+            &fixture.target,
+        )?;
+        Ok(UntrustedTargetRecoveryApproval {
+            possession,
+            proof,
+            approval,
+        })
+    }
+
+    fn committed_fixture(
+        fixture: &Fixture,
+        approval: &UntrustedTargetRecoveryApproval,
+    ) -> Result<StreamedCrossNodeRecoveryCommitted> {
+        let node = &approval.possession.node_request;
+        let request = StreamedCrossNodeRecoveryCommitRequest {
+            possession: approval.possession.clone(),
+            pins: fixture.request.payload.saved_pins.clone(),
+            journal_delta: Vec::new(),
+            grant_leaf: ObjectHash::body(&"recovered grant")?,
+        };
+        let receipt = Signed::sign(
+            StreamedCrossNodeRecoveryCommitReceipt {
+                version: AUTH_VERSION,
+                context: approval.possession.context.clone(),
+                request_hash: fixture.request.hash()?,
+                input_hash: ObjectHash::body(&request)?,
+                expected_account_head: node.expected_account_head.clone(),
+                expected_space_head: node.expected_space_head.clone(),
+                committed_account_head: node.expected_account_head.clone(),
+                committed_space_head: node.expected_space_head.clone(),
+                target_node_public_key: PublicKey::of(&fixture.target),
+                new_device_public_key: fixture.request.payload.new_device_public_key.clone(),
+                grant_leaf: request.grant_leaf.clone(),
+                accepted_at_ms: 5,
+            },
+            &fixture.source,
+        )?;
+        Ok(StreamedCrossNodeRecoveryCommitted { request, receipt })
     }
 
     fn database() -> Result<Connection> {
@@ -559,6 +856,53 @@ mod tests {
         )?;
         assert!(cache.load_page(&connection, 0).is_err());
         assert_eq!(cache.load_page(&connection, 1)?, Some(final_page));
+        Ok(())
+    }
+
+    #[test]
+    fn approval_and_completion_preserve_exact_original_carriers() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let cache = fixture.cache()?;
+        let connection = database()?;
+        cache.store_header(&connection, &fixture.snapshot)?;
+        let page = fixture.page(0, fixture.snapshot.hash()?, true)?;
+        cache.store_page(&connection, &page)?;
+        let witness = fixture.witness(&page)?;
+        cache.store_witness(&connection, &witness)?;
+        let approval = approval_fixture(&fixture, &witness)?;
+        let committed = committed_fixture(&fixture, &approval)?;
+        assert!(cache.store_committed(&connection, &committed).is_err());
+        let mut wrong_approval = approval.clone();
+        wrong_approval.approval.payload.possession_hash = ObjectHash::body(&"other possession")?;
+        wrong_approval.approval = Signed::sign(wrong_approval.approval.payload, &fixture.target)?;
+        assert!(cache.store_approval(&connection, &wrong_approval).is_err());
+        let mut wrong_context = approval.clone();
+        wrong_context.possession.context.witness_hash = ObjectHash::body(&"other witness")?;
+        wrong_context.approval.payload.context = wrong_context.possession.context.clone();
+        wrong_context.approval.payload.possession_hash =
+            ObjectHash::body(&wrong_context.possession)?;
+        wrong_context.approval = Signed::sign(wrong_context.approval.payload, &fixture.target)?;
+        assert!(cache.store_approval(&connection, &wrong_context).is_err());
+        assert!(cache.load_approval(&connection)?.is_none());
+
+        cache.store_approval(&connection, &approval)?;
+        cache.store_approval(&connection, &approval)?;
+        assert_eq!(cache.load_approval(&connection)?, Some(approval.clone()));
+        let mut changed_proof = approval.clone();
+        changed_proof.proof = fixture.snapshot.signature.clone();
+        assert!(cache.store_approval(&connection, &changed_proof).is_err());
+
+        let mut changed_input = committed.clone();
+        changed_input.request.pins.reverse();
+        assert!(cache.store_committed(&connection, &changed_input).is_err());
+        let mut wrong_client = committed.clone();
+        wrong_client.receipt.payload.new_device_public_key = PublicKey::of(&fixture.source);
+        wrong_client.receipt = Signed::sign(wrong_client.receipt.payload, &fixture.source)?;
+        assert!(cache.store_committed(&connection, &wrong_client).is_err());
+        assert!(cache.load_committed(&connection)?.is_none());
+        cache.store_committed(&connection, &committed)?;
+        cache.store_committed(&connection, &committed)?;
+        assert_eq!(cache.load_committed(&connection)?, Some(committed));
         Ok(())
     }
 }
