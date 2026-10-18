@@ -10,6 +10,7 @@ pub mod client_policy_import;
 pub mod gateway_forward;
 pub mod gateway_client;
 pub mod gateway_original;
+pub mod gateway_owner;
 use gateway_original::{AcceptedGatewayOriginal, AdmittedDestination, AdmissionOrigin, OriginalGatewayTransport, RequestOrigin};
 pub mod directory;
 pub mod enrollment;
