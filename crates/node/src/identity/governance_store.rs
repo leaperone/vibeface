@@ -967,6 +967,22 @@ mod tests {
         .collect()
     }
 
+    fn cached_policy_heads(store: &Store) -> Result<Vec<PolicyStamp>> {
+        store
+            .policy
+            .pins()
+            .iter()
+            .map(|pin| {
+                store
+                    .policy
+                    .verified()
+                    .head(&pin.domain)
+                    .cloned()
+                    .context("cached policy head is missing")
+            })
+            .collect()
+    }
+
     fn prepare_execution_registration(
         network: &TestNetwork,
         store: &mut Store,
@@ -1296,6 +1312,55 @@ mod tests {
                 source_root(&reopened.connection, &execution)?,
                 network.project
             );
+            if team_source {
+                let cached_heads = cached_policy_heads(&reopened)?;
+                let mut independent = Store::open(&path)?;
+                let personal = SpaceId::personal(&network.account);
+                let mut document = independent
+                    .policy
+                    .verified()
+                    .space(&personal)
+                    .unwrap()
+                    .clone();
+                document.previous = independent
+                    .policy
+                    .verified()
+                    .head(&PolicyDomain::Space(personal))
+                    .cloned();
+                document.sequence += 1;
+                document
+                    .grants
+                    .retain(|leaf| leaf != result_authorization.grant_leaf());
+                independent.install_policy_journal(
+                    &[JournalEntry::Space(Signed::sign(document, &network.root)?)],
+                    now() + 3,
+                )?;
+                let after_revoke = row_counts(&independent)?;
+                let error = reopened
+                    .execution_service_select(
+                        &network.node,
+                        &network.client.public_key_hex(),
+                        &selection_params,
+                        now() + 4,
+                    )
+                    .unwrap_err();
+                assert!(error.to_string().contains("policy_changed"), "{error}");
+                assert_eq!(cached_policy_heads(&reopened)?, cached_heads);
+                assert_eq!(row_counts(&reopened)?, after_revoke);
+                drop(reopened);
+                let mut refreshed = Store::open(&path)?;
+                assert!(
+                    refreshed
+                        .execution_service_select(
+                            &network.node,
+                            &network.client.public_key_hex(),
+                            &selection_params,
+                            now() + 4
+                        )
+                        .is_err()
+                );
+                assert_eq!(row_counts(&refreshed)?, after_revoke);
+            }
         }
         Ok(())
     }
@@ -1440,15 +1505,25 @@ mod tests {
                 .as_object_mut()
                 .unwrap()
                 .remove("execution_resource");
+            let listed = store.execution_service_select(
+                &network.node,
+                &network.client.public_key_hex(),
+                &list_params,
+                now() + 2,
+            )?;
+            assert_eq!(listed["selections"], selected["selections"]);
             assert_eq!(
-                store.execution_service_select(
-                    &network.node,
-                    &network.client.public_key_hex(),
-                    &list_params,
-                    now() + 2,
-                )?,
-                selected
+                listed["next_cursor"],
+                serde_json::to_value(&resource.resource)?
             );
+            list_params["cursor"] = listed["next_cursor"].clone();
+            let tail = store.execution_service_select(
+                &network.node,
+                &network.client.public_key_hex(),
+                &list_params,
+                now() + 2,
+            )?;
+            assert_eq!(tail, json!({"selections":[],"next_cursor":null}));
             let verified = execution_service::verify_execution_service_selection(
                 &selection_authorization,
                 &serde_json::to_string(&selection)?,
@@ -1509,6 +1584,7 @@ mod tests {
                     .is_err()
             );
             assert_eq!(row_counts(&store)?, before);
+            let cached_heads = cached_policy_heads(&store)?;
             let mut independent = Store::open(&path)?;
             match revoke {
                 "client" => network.revoke_client(&mut independent)?,
@@ -1540,18 +1616,33 @@ mod tests {
                 _ => unreachable!(),
             }
             let after_revoke = row_counts(&independent)?;
+            let error = store
+                .execution_service_select(
+                    &network.node,
+                    &network.client.public_key_hex(),
+                    &params,
+                    now() + 4,
+                )
+                .unwrap_err();
             assert!(
-                store
+                error.to_string().contains("policy_changed"),
+                "{revoke}: {error}"
+            );
+            assert_eq!(cached_policy_heads(&store)?, cached_heads);
+            assert_eq!(row_counts(&store)?, after_revoke);
+            drop(store);
+            let mut refreshed = Store::open(&path)?;
+            assert!(
+                refreshed
                     .execution_service_select(
                         &network.node,
                         &network.client.public_key_hex(),
                         &params,
-                        now() + 4,
+                        now() + 4
                     )
-                    .is_err(),
-                "stale selection accepted {revoke} revocation"
+                    .is_err()
             );
-            assert_eq!(row_counts(&store)?, after_revoke);
+            assert_eq!(row_counts(&refreshed)?, after_revoke);
         }
         Ok(())
     }
