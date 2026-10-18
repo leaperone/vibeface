@@ -1881,7 +1881,7 @@ fn check_raw_rebind(intent:&PrepareIntent,body:&Value,audience_key:&PublicKey)->
     Ok(true)
 }
 
-fn check_raw_context(intent: &PrepareIntent, body: &Value, audience_key: &PublicKey) -> Result<()> {
+pub(super) fn check_raw_context(intent: &PrepareIntent, body: &Value, audience_key: &PublicKey) -> Result<()> {
     if execution_binding_seal::check_client_seal_intent(intent, body, audience_key)? {
         return Ok(());
     }
