@@ -20,6 +20,7 @@ from pathlib import Path
 import shutil
 import signal
 import select
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -182,7 +183,7 @@ def verify_live_access(node, operation_id):
     access = json.loads(result.stdout)
     require(access["url"] == node.url and access["node_id"] == node.node_id
             and access["node_public_key"] == node.node_public_key
-            and access["capability"] is None and access["claim_nonce"] is None,
+            and "capability" not in access and "claim_nonce" not in access,
             "initialized access returns the pinned entry and no bootstrap claim secrets")
     require(operation(node.client, node, operation_id) == before,
             "access CLI leaves the running operation and its deduplication record unchanged")
@@ -2192,6 +2193,204 @@ def unknown_record(client, node, operation_id):
     return record if record and record["state"] == "unknown" else None
 
 
+class PortableCli:
+    def __init__(self, arguments):
+        values = [str(value) for value in arguments]
+        command = (["script", "-q", "/dev/null", *values] if sys.platform == "darwin"
+                   else ["script", "-qefc", shlex.join(values), "/dev/null"])
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, bufsize=0, start_new_session=True)
+        self.fd = self.process.stdout.fileno()
+        self.output = ""
+        self.exit_code = None
+
+    def read(self):
+        if select.select([self.fd], [], [], 0.05)[0]:
+            try:
+                self.output += os.read(self.fd, 65536).decode(errors="replace")
+            except OSError:
+                pass
+        self.exit_code = self.process.poll()
+        return self.output
+
+    def until(self, text):
+        wait_for("CLI prompt or completion", lambda: text in self.read())
+
+    def send(self, value):
+        self.process.stdin.write((value + "\n").encode())
+        self.process.stdin.flush()
+
+    def unlock(self, password, new=False):
+        self.until("New CLI profile passphrase: " if new else "CLI profile passphrase: ")
+        self.send(password)
+        if new:
+            self.until("Repeat passphrase: ")
+            self.send(password)
+
+    def finish(self, expected=0):
+        wait_for("CLI exit", lambda: self.read() is not None and self.exit_code is not None)
+        require((self.exit_code == 0) == (expected == 0), "portable CLI command exit matches expectation: " + self.output[-2000:])
+        return self.output
+
+    def close(self):
+        if self.process.poll() is None:
+            os.killpg(self.process.pid, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.process.pid, signal.SIGKILL)
+                self.process.wait(timeout=5)
+        self.process.stdin.close()
+        self.process.stdout.close()
+
+
+def portable_access_acceptance(options):
+    binary = options.binary.resolve(strict=True)
+    module = options.crypto_module.resolve(strict=True)
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    run = options.artifacts.resolve() / ("portable-access-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    fixture = run / "unused-executor"
+    fixture.write_text("#!/bin/sh\nexit 1\n")
+    fixture.chmod(0o700)
+    helper = Path(__file__).resolve().with_name("node-client.mjs")
+    nodes, commands = [], []
+    checks = []
+    password = "portable-access-fixture-passphrase"
+
+    def passed(description):
+        checks.append(description)
+        print("PASS " + description, flush=True)
+
+    def cli(arguments, profile, new=False):
+        command = PortableCli([binary, *arguments, "--profile", profile, "--profiles-dir", run / "profiles"])
+        commands.append(command)
+        command.unlock(password, new)
+        return command
+
+    def pending(node, reference):
+        return node.client.identity_call("enrollment_pending", {"account_id": reference["account_id"], "offer_hash": reference["offer_hash"]})["requests"]
+
+    try:
+        relay = Node(run, "relay", binary, workspace, fixture, helper, module)
+        target = Node(run, "target", binary, workspace, fixture, helper, module)
+        nodes.extend([target, relay])
+        relay.configure(roles=["relay"], network={"bootstrap_urls": [], "advertise_urls": [], "mdns": False, "relay_enabled": True}, codex_bin=str(fixture))
+        target.configure(network={"bootstrap_urls": [relay.url.replace("http://", "ws://") + "/api/network/ws"], "advertise_urls": [], "mdns": False, "relay_enabled": False}, codex_bin=str(fixture))
+        relay.start()
+        target.start()
+        target.bootstrap()
+        card = run / "node.vibeface.json"
+        result = subprocess.run([binary, "access", "--data-dir", target.directory, "--via", relay.url, "--out", card], capture_output=True, timeout=20)
+        require(result.returncode == 0, "CLI exports a verified relay connection: " + result.stderr.decode(errors="replace"))
+        connection = json.loads(card.read_text())
+        require(connection["relay"] is True and connection["node_id"] == target.node_id and connection["node_public_key"] == target.node_public_key, "connection pins the private target behind the relay")
+        require("capability" not in connection and "claim_nonce" not in connection, "claimed node exports no bootstrap material")
+        require(card.stat().st_mode & 0o077 == 0, "connection export uses private file permissions")
+        previous_card = card.read_bytes()
+        repeated = subprocess.run([binary, "access", "--data-dir", target.directory, "--via", relay.url, "--out", card], capture_output=True, timeout=20)
+        require(repeated.returncode != 0 and card.read_bytes() == previous_card, "access refuses to overwrite a connection file")
+        wrong_kind = subprocess.run([binary, "client", "enroll", "--invitation-file", card, "--profile", "invalid", "--profiles-dir", run / "profiles"], capture_output=True, timeout=10)
+        require(wrong_kind.returncode != 0 and not (run / "profiles" / "invalid").exists(), "public cards cannot enroll devices or create a CLI profile")
+        passed("access file pins the private node through a separate relay")
+
+        browser_reference = target.client.command("create_device_invitation", endpoint=relay.url, relay=True, rights=[])
+        lost = target.client.command("browser_enrollment", reference=browser_reference, drop_response=True)
+        require(lost["status"] == "response_lost" and lost["writes"] == 1, "browser request was committed before its response was dropped")
+        resumed = target.client.command("browser_enrollment", reference=browser_reference)
+        require(resumed["status"] == "requested" and resumed["request_id"] == lost["request_id"] and resumed["writes"] == 1,
+                "production browser enrollment restores its original request without another write")
+        require(len(pending(target, browser_reference)) == 1, "browser response loss creates exactly one enrollment request")
+        target.client.command("approve_device", reference=browser_reference, request_id=resumed["request_id"])
+        target.client.command("browser_possession")
+        target.client.command("complete_device", reference=browser_reference, request_id=resumed["request_id"])
+        completed = target.client.command("browser_enrollment", reference=browser_reference)
+        require(completed["status"] == "completed" and completed["writes"] == 1, "browser completion resumes without publishing another request")
+        target.client.authenticate()
+        passed("production browser protocol resumes lost responses and completed enrollment")
+
+        reference = target.client.command("create_device_invitation", endpoint=relay.url, relay=True, rights=["enroll_device", "revoke_device"])
+        owner_invite = run / "owner-invitation.vibeface.json"
+        private_json(owner_invite, reference)
+        owner = cli(["client", "enroll", "--connection-file", owner_invite], "owner", new=True)
+        requests = wait_for("CLI enrollment request", lambda: pending(target, reference) or None)
+        request_id = requests[0]["request_id"]
+        owner.close()
+        commands.remove(owner)
+        owner = cli(["client", "enroll", "--connection-file", owner_invite], "owner")
+        requests = wait_for("resumed CLI request", lambda: pending(target, reference) or None)
+        require(len(requests) == 1 and requests[0]["request_id"] == request_id, "restarted CLI keeps the original enrollment request")
+        target.client.command("approve_device", reference=reference, request_id=request_id)
+        wait_for("CLI possession", lambda: any(item["status"] == "possessed" for item in pending(target, reference)))
+        target.client.command("complete_device", reference=reference, request_id=request_id)
+        owner.finish()
+        require(password not in owner.output, "CLI passphrase never appears in terminal output")
+        passed("CLI enrollment survives restart and uses its own manager key")
+
+        target.client.close()
+        phone_invite = run / "phone-invitation.vibeface.json"
+        created = cli(["invite", "create", "--data-dir", target.directory, "--via", relay.url, "--out", phone_invite], "owner")
+        created.finish()
+        phone_reference = json.loads(phone_invite.read_text())
+        require(phone_reference["relay"] is True and phone_reference["node_public_key"] == target.node_public_key, "CLI invitation binds the same relay target")
+        passed("enrolled CLI creates invitations after original manager closes")
+
+        phone = cli(["client", "enroll", "--connection-file", phone_invite], "phone", new=True)
+        phone.until("Confirm this device in your existing management client.")
+        request_line = next(line for line in phone.read().splitlines() if line.startswith("Request: "))
+        phone_request = request_line.removeprefix("Request: ").strip()
+        listing = cli(["invite", "pending"], "owner")
+        require(phone_request in listing.finish(), "CLI lists the real device request")
+        denied = cli(["invite", "approve", phone_request], "owner")
+        denied.until("Type yes: ")
+        denied.send("no")
+        require("approval cancelled" in denied.finish(expected=1), "declining approval is explicit")
+        unchanged = cli(["invite", "pending"], "owner")
+        require(phone_request + " requested " in unchanged.finish(), "cancelled approval leaves the request unauthorized")
+        approving = cli(["invite", "approve", phone_request], "owner")
+        approving.until("Type yes: ")
+        approving.send("yes")
+        approving.until("Approved. Waiting for the new device")
+        approving.close()
+        commands.remove(approving)
+        approving = cli(["invite", "approve", phone_request], "owner")
+        approving.finish()
+        require("Type yes:" not in approving.output, "resumed approval uses the saved exact request")
+        phone.finish()
+        for command in commands:
+            require(password not in command.output, "CLI output does not expose its unlock password")
+        passed("CLI explicitly approves an independent device through the relay")
+        passed("cancelled approval grants nothing and an interrupted approved request resumes")
+
+        profile_path = run / "profiles" / "owner" / "profile.json"
+        require(profile_path.parent.stat().st_mode & 0o077 == 0, "CLI profile directory is private")
+        profile_path.chmod(0o644)
+        insecure = subprocess.run([binary, "invite", "pending", "--profile", "owner", "--profiles-dir", run / "profiles"], capture_output=True, timeout=10)
+        profile_path.chmod(0o600)
+        require(insecure.returncode != 0 and b"private regular file" in insecure.stderr, "CLI refuses an exposed profile before requesting its password")
+        wrong_password = PortableCli([binary, "invite", "pending", "--profile", "owner", "--profiles-dir", run / "profiles"])
+        commands.append(wrong_password)
+        wrong_password.unlock("incorrect-fixture-passphrase")
+        wrong_password.finish(expected=1)
+        require("incorrect-fixture-passphrase" not in wrong_password.output, "incorrect passwords are hidden too")
+        passed("CLI rejects exposed profiles and incorrect passwords")
+
+        raw = json.loads((run / "profiles" / "phone" / "profile.json").read_text())
+        require(raw["public_key"] != target.node_public_key, "phone profile does not copy the node identity")
+        require(raw["public_key"] != json.loads((run / "profiles" / "owner" / "profile.json").read_text())["public_key"], "device profiles have separate keys")
+        report = {"ok": True, "checks": checks, "provider_calls": 0, "binary_sha256": file_sha256(binary), "wasm_sha256": file_sha256(module.with_name("vibeface_secure_bg.wasm")), "not_checked": ["rendered browser", "real phone browser", "public HTTPS relay"], "run": str(run)}
+        private_json(run / "report.json", report)
+        print(json.dumps(report), flush=True)
+    finally:
+        for command in commands:
+            command.close()
+        for node in nodes:
+            node.client.close()
+            node.stop()
+
+
 if __name__ == "__main__":
     os.umask(0o077)
     if "--fixture-executor" in sys.argv:
@@ -2205,9 +2404,13 @@ if __name__ == "__main__":
         parser.add_argument("--skip-codex", action="store_true", help="omit real Codex transport checks and report that omission")
         parser.add_argument("--gateway-topology", action="store_true", help="run owner-approved independent A Gateway to B Project to C Executor checks")
         parser.add_argument("--remote-topology", action="store_true", help="also run independent-account B/C execution and Team isolation checks")
+        parser.add_argument("--portable-access", action="store_true", help="verify relay files and independent CLI enrollment without provider calls")
         arguments = parser.parse_args()
         try:
-            acceptance(arguments)
+            if arguments.portable_access:
+                portable_access_acceptance(arguments)
+            else:
+                acceptance(arguments)
         except Exception as error:
             print(f"FAIL {type(error).__name__}: {error}", file=sys.stderr)
             sys.exit(1)

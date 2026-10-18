@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
+import { stripTypeScriptTypes } from 'node:module';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -26,6 +27,18 @@ let recoveryRequest;
 let recoveryPreparation;
 let nodeEnrollment;
 let nodeEnrollmentCommit;
+let browserEnrollment;
+
+async function browserLibrary(name) {
+  const sourceUrl = new URL(`../crates/node/web/src/lib/${name}.ts`, import.meta.url);
+  let source = stripTypeScriptTypes(await readFile(sourceUrl, 'utf8'));
+  for (const match of [...source.matchAll(/from ['"]([^'"]+)['"]/g)]) {
+    const path = match[1];
+    const target = path.endsWith('.js') ? new URL(path, sourceUrl).href : await browserLibrary(path.replace('./', ''));
+    source = source.replace(match[0], `from ${JSON.stringify(target)}`);
+  }
+  return `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
+}
 function sealedRecovery(material, password) {
   const plaintext = encoder.encode(material);
   try { return Buffer.from(crypto.recoverySeal(plaintext, password)).toString('hex'); }
@@ -588,6 +601,50 @@ async function readSharePolicy(input, connectionName) {
 }
 
 async function command(input) {
+  if (input.op === 'browser_enrollment') {
+    if (!browserEnrollment) {
+      const generated = new URL('../crates/node/web/generated/vibeface_secure.js', import.meta.url);
+      const native = await import(generated.href);
+      await native.default({ module_or_path: await readFile(new URL('./vibeface_secure_bg.wasm', generated)) });
+      Object.defineProperty(globalThis, 'isSecureContext', { configurable: true, value: true });
+      Object.defineProperty(globalThis, 'location', { configurable: true, value: new URL(input.reference.endpoint) });
+      const transport = await import(new URL('../crates/node/web/transport.js', import.meta.url).href);
+      const own = await transport.initClient({ mode: 'temporary' });
+      browserEnrollment = { native, transport, own, library: await import(await browserLibrary('enrollment')), saved: null, pending: null, channel: null, writes: 0 };
+    }
+    const state = browserEnrollment;
+    state.pending?.release(); state.pending = null; state.channel?.close();
+    const reference = input.reference;
+    state.channel = await state.transport.connectDevice({ address: reference.endpoint, node_id: state.native.nodeFingerprint(reference.node_public_key), relay: reference.relay });
+    try {
+      state.pending = await state.library.requestDeviceEnrollment({ reference, ownPublicKey: state.own.publicKey, signal: new AbortController().signal, saved: state.saved,
+        save(request) { state.saved = JSON.parse(JSON.stringify(request)); },
+        async call(method, params) {
+          const result = await state.channel.request('identity', { method, params });
+          if (method === 'enrollment_request') {
+            state.writes++;
+            if (input.drop_response) throw new Error('discarded enrollment response');
+          }
+          return result;
+        },
+      });
+      return { status: state.pending.status.status, request_id: state.pending.requestId, public_key: state.own.publicKey, writes: state.writes };
+    } catch (error) {
+      if (!input.drop_response || error.message !== 'discarded enrollment response') throw error;
+      return { status: 'response_lost', request_id: state.saved.requestId, public_key: state.own.publicKey, writes: state.writes };
+    }
+  }
+  if (input.op === 'browser_possession') {
+    const state = browserEnrollment, original = state.pending;
+    const lookup = { account_id: original.reference.account_id, offer_hash: original.reference.offer_hash, request_id: original.requestId };
+    const status = state.library.verifyEnrollmentStatus(await state.channel.request('identity', { method: 'enrollment_status', params: lookup }), original);
+    assert.equal(status.status, 'approved');
+    const qualified = state.native.verifyAccountEnrollmentFromOffer(JSON.stringify(status.intent), original.offer, Date.now());
+    try {
+      const certificate = JSON.parse(state.transport.signClientEnrollmentPossession(qualified, original.nonce));
+      return await state.channel.request('identity', { method: 'enrollment_possession', params: { ...lookup, certificate } });
+    } finally { qualified.free(); }
+  }
   const connectionName = input.connection || 'main';
   if (input.op === 'identity') return exposed(identity(input.identity));
   if (input.op === 'get_trust') return structuredClone(savedTrust(input.trust_ref));
@@ -755,6 +812,49 @@ async function command(input) {
     assert.equal(gateways.get(connectionName), binding, 'Gateway selection changed during reconnect');
     connections.set(connectionName, channel);
     return { connected: true, source_ref: binding.sourceRef };
+  }
+  if (input.op === 'create_device_invitation') {
+    const auth = authorizations.get(connectionName);
+    assert(auth, 'device invitation requires current manager authorization');
+    assert.equal(typeof input.endpoint, 'string', 'device invitation requires an explicit reachable origin');
+    const encoded = crypto.createDeviceEnrollmentOffer(identity(), trust.scope.account_id,
+      input.endpoint, connection.nodePublicKey, input.relay === true,
+      JSON.stringify(input.rights || []), auth.policy.account_enrollment_expires_at_ms, auth.verified, Date.now());
+    const offered = JSON.parse(encoded);
+    const published = await identityRequest(connection, 'enrollment_offer_publish', { offer: offered });
+    const reference = JSON.parse(crypto.parseDeviceEnrollmentReference(JSON.stringify(published.reference), Date.now()));
+    assert.equal(reference.offer_hash, published.offer_hash);
+    assert.equal(reference.account_id, trust.scope.account_id);
+    assert.equal(reference.node_public_key, connection.nodePublicKey);
+    return reference;
+  }
+  if (input.op === 'approve_device' || input.op === 'complete_device') {
+    const auth = authorizations.get(connectionName);
+    assert(auth, 'device approval requires current manager authorization');
+    const reference = input.reference;
+    const params = { account_id: reference.account_id, offer_hash: reference.offer_hash, request_id: input.request_id };
+    const response = await identityRequest(connection, 'enrollment_offer_get', params);
+    const descriptor = crypto.verifyDeviceEnrollmentOffer(JSON.stringify(response.offer), Date.now());
+    const request = await identityRequest(connection, 'enrollment_status', params);
+    try {
+      crypto.verifyDeviceEnrollmentIntentForManager(auth.verified, descriptor, reference.offer_hash,
+        JSON.stringify(request.unsigned_intent), request.new_device_public_key, Date.now());
+      if (input.op === 'approve_device') {
+        const intent = JSON.parse(crypto.signDeviceEnrollmentIntent(JSON.stringify(request.unsigned_intent), identity(), auth.verified, Date.now()));
+        return await identityRequest(connection, 'enrollment_approve', { ...params, intent });
+      }
+      assert.equal(request.status, 'possessed', 'new device must prove possession before completion');
+      const qualified = crypto.verifyAccountEnrollment(JSON.stringify(request.intent), auth.verified, Date.now());
+      let prepared;
+      let completed;
+      try {
+        prepared = crypto.prepareAccountDeviceEnrollment(qualified, JSON.stringify(request.certificate), identity(), auth.verified, Date.now());
+        const receipt = await identityRequest(connection, 'account_device_commit', { request: JSON.parse(prepared.requestJson()), request_id: input.request_id });
+        completed = crypto.finishAccountDeviceChange(prepared, JSON.stringify(receipt.committed), Date.now());
+        trust.pins = JSON.parse(completed.pinsJson());
+        return { completed: true };
+      } finally { completed?.free(); prepared?.free(); qualified.free(); }
+    } finally { descriptor.free(); }
   }
   if (input.op === 'gateway_pending') return [...gatewayPending.values()].map(pending => ({
     authorization_id: pending.original.body.authorization_id, operation_id: pending.original.body.operation_id
@@ -942,6 +1042,9 @@ for (const auth of authorizations.values()) auth.verified.free();
 for (const pending of preparations.values()) pending.prepared.free();
 for (const pending of gatewayPending.values()) pending.handle.free();
 for (const remote of remoteAuthorizations.values()) remote.remote.free();
+browserEnrollment?.pending?.release();
+browserEnrollment?.channel?.close();
+browserEnrollment?.transport.lockClient();
 creation?.free();
 recoveryPreparation?.free();
 nodeEnrollment?.free();

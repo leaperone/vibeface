@@ -53,6 +53,56 @@ bash scripts/build-web-crypto.sh
 
 `init` 不覆盖现有身份和配置。默认数据目录为 `$HOME/.vibeface`，包含本机身份、配置、一次性接入材料、格式标记和唯一数据库 `node.sqlite3`。身份授权与业务状态共用这个数据库。`data-epoch.json` 为 `{"format":"vibeface-node","data_epoch":3,"layout_version":1}`。不同 Node 使用独立数据目录，同一目录同时只允许运行一个进程。
 
+## 从手机接入自有节点
+
+私网 Node 没有公网 IP 时，让它主动连接一台可访问的 Relay。先按下文[发现与公共中继](#发现与公共中继)配置路径，再从实际运行的数据目录导出连接文件：
+
+```sh
+./vibeface access --data-dir /absolute/path/to/node-data \
+	--via https://relay.example --out my-node.vibeface.json
+```
+
+命令通过 Noise 连接 Relay 后的目标 Node，并核对目标公钥。文件包含 Node 公钥、由公钥计算的 NodeID、入口地址和中继选项。已经认领的节点只导出公开连接信息。没有可用中继时，命令拒绝把 localhost 文件当成手机入口。
+
+连接卡用于已有授权的设备。新手机需要设备邀请：
+
+1. 在已授权网页的“新增自己的设备”选择手机可访问的入口。通常选择 HTTPS Relay。
+2. 保持“允许新设备新增和撤销其他设备”关闭，生成普通手机邀请。复制邀请、下载 JSON 或展示二维码。
+3. 在手机上打开可信 HTTPS 客户端，为手机创建独立设备配置。选择邀请文件或粘贴邀请，核对目标、公钥、账户、权限和期限，再确认申请。
+4. 在原管理网页刷新设备申请，核对手机完整公钥，批准该设备。手机继续提供持钥证明，原网页再确认加入账户。
+5. 手机检查加入结果。后续解锁同一设备配置即可连接，无需重新导入邀请。
+
+文件由浏览器本地读取。选择文件不会上传整个文件；确认后客户端才提交对应的协议请求。邀请不包含节点、账户根或已有设备的私钥。只打开 Relay 网页或导入普通连接卡不会取得账户权限。
+
+网页保存尚未确认的邀请和原申请。断线或刷新后，解锁原设备配置会核对同一申请；不要清除浏览器数据。不同网站的设备配置分别保存，使用固定的可信客户端地址。
+
+## 用 CLI 管理手机邀请
+
+CLI 使用独立加密 profile。首次需要已有管理设备授权，Node 服务本身没有签发账户设备权限。
+
+1. 在已授权网页生成一个允许新增和撤销设备的邀请，保存为 `owner-invitation.vibeface.json`。
+2. 在可交互终端登记 CLI，然后在原管理网页完成上述批准与持钥确认流程：
+
+```sh
+./vibeface client enroll --profile owner \
+	--invitation-file owner-invitation.vibeface.json
+```
+
+3. CLI 显示授权已核验后，可关闭原网页。使用该 profile 为手机生成普通邀请：
+
+```sh
+./vibeface invite create --profile owner \
+	--via https://relay.example --out phone.vibeface.json
+./vibeface invite pending --profile owner
+./vibeface invite approve REQUEST_ID --profile owner
+```
+
+`approve` 显示账户、目标、新设备完整公钥、权限和期限。核对后输入 `yes`，CLI 等待手机持钥证明并提交设备证书。不给手机管理权限时，不传 `--manage-devices`。`--data-dir` 可额外核对 profile 的目标是否为指定本机 Node。
+
+profile 默认保存在 `$XDG_CONFIG_HOME/vibeface/clients/NAME`，未设置 XDG 时使用 `$HOME/.config/vibeface/clients/NAME`。`--profiles-dir` 可指定独立目录。目录权限为 0700，profile 文件为 0600。解锁口令只在终端隐藏输入，不通过命令参数或环境变量传入。
+
+首次登记接受设备邀请，不能用 `access` 导出的普通连接卡替代。`--connection-file` 是 `--invitation-file` 的同义选项。登记中断时，用原 profile 和原邀请重跑；批准中断时，重跑同一 `REQUEST_ID`。CLI 先查询原记录，再决定是否提交，不换设备密钥或申请编号。输出文件已有其他内容时拒绝覆盖。
+
 ## 配置管理 Agent
 
 管理 Agent 与执行器分开配置。管理 Agent 理解用户指令、使用 Node 工具创建工单和派发任务；执行器在目标设备的项目目录中工作。管理工作目录应单独建立，不作为项目编辑入口。

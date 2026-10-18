@@ -104,7 +104,21 @@ Project 的宿主为 B、入口为 A 时，客户端分别保存 A 的 Noise 公
 
 政策安装使用 `identity` 的 `policy_commit`，参数为 `{journal}`。签名更新必须通过已有 pins 和当前授权验证；新根不能从这条入口自行取得信任。设备登记、撤销与恢复使用新的签名政策记录，旧 `NetworkState`、邀请和 checkpoint 恢复格式不受支持。
 
-本机 `access --json` 输出含入口 URL、NodeID、公钥及首次认领使用的 capability 和 claim nonce。认领后的输出不再包含可用的安装授权。capability 不放入服务日志、公共目录或 DAG。知道 Node 地址或公开身份不能抢占初始化，也不能取得私人网络权限。
+本机 `access --json` 输出含入口 URL、NodeID、公钥及首次认领使用的 capability 和 claim nonce。认领后的输出省略两个 claim 字段，不输出 null。capability 不放入服务日志、公共目录或 DAG。知道 Node 地址或公开身份不能抢占初始化，也不能取得私人网络权限。
+
+### 连接文件与设备邀请
+
+Rust `connection` 模块同时为 CLI 和 WASM 解析入口。`ConnectionRoute` 包含规范化的 HTTP 或 HTTPS origin、目标 `node_public_key` 和 `relay`。公网 Relay 必须使用 HTTPS；回环 HTTP 允许本机验证。URL 不能包含用户名、口令、路径、query 或 fragment。
+
+普通连接卡包含 `{url,node_id,node_public_key,relay}`，NodeID 必须等于目标公钥的 SHA-256。首次认领卡另外包含相同的 `capability` 与 `claim_nonce`。用途不能混合，普通卡不接受空值 claim 字段或未知字段。两种文件均限制为 64 KiB。
+
+设备邀请使用 `{version:2,kind:"vibeface-device-enrollment",endpoint,node_public_key,relay,account_id,offer_hash,expires_at_ms}`。这个引用用于读取权威 Node 上的签名 `EnrollmentOffer`。offer 的签名同时保护目标公钥、路由模式、入口、账户、权限、政策头和有效期。引用与签名内容必须一致，展示名称不是身份证明。
+
+`enrollment_offer_publish` 验证当前管理设备后返回 `{offer_hash,reference}`。`enrollment_offer_get` 查询不到时返回包含原账户和摘要的 `status:"not_found"`。`enrollment_status` 查询不到对应申请时返回原账户、offer 摘要和申请编号，不把损坏记录当成不存在。
+
+`request_id` 由 offer 摘要和完整未签名 `DeviceEnrollmentIntent` 计算。新设备在第一次提交前保存该意图。重连先用同一编号查状态；只有 Node 明确确认不存在时才重发原意图。已有管理设备签署批准、新设备签署持钥证明，最后由权威 Node 原子提交设备证书、邀请消费状态和完成回执。相同请求返回原记录，另一申请不能再次消费已完成的邀请。
+
+Web 将待核对的公开邀请与意图限定到原设备配置、账户和目标。CLI 将独立设备私钥、已验证政策和待核对请求保存在加密 profile 中。两端继续使用有限政策读取与验证，不通过恢复包、Node 私钥或 Relay 登录绕过授权。
 
 管理 SDK 的工具调用走隔离 sidecar 的受信通道，绑定账户、空间、资源、原发起人和当前 SDK 会话。它不提供外部 Bot 可保存的长期身份，不能添加或撤销设备、回答审批或验收工单。
 
