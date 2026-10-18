@@ -79,6 +79,7 @@ pub(crate) enum TaskBusinessResponse {
     Status(Value),
 }
 
+#[derive(Clone)]
 pub(crate) struct TaskBusinessPolicySession {
     source: VerifiedTaskBusinessSource,
 }
