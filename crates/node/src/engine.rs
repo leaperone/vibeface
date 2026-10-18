@@ -462,6 +462,7 @@ impl Engine {
     }
 
     pub async fn complete_operation(&self, context: &ExecutionContext) -> Result<()> {
+        let _fenced = self.fenced_operations.lock().await;
         if let Some(isolation) = &self.isolation {
             isolation.complete(context).await?;
         }

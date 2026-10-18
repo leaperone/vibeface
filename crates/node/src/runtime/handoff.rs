@@ -490,6 +490,7 @@ impl Runtime {
             let proof = self
                 .handoff_freshness(&wire, &transport, CheckStage::Admit, verification)
                 .await?;
+            let _admission = self.handoff_resolution_lock.lock().await;
             let mut store = self.store.lock().await;
             verification.run(|| {
                 store.accept_execution_handoff(
@@ -641,6 +642,7 @@ impl Runtime {
                 self.allowed_path(resource)?;
             }
             let (value, fresh, _) = {
+                let _start = self.handoff_resolution_lock.lock().await;
                 let mut store = self.store.lock().await;
                 verification.run(|| {
                     store.claim_execution_handoff(&self.identity, &auth, &proof, now_ms() as u64)
@@ -843,6 +845,7 @@ impl Runtime {
                             &verification,
                         )
                         .await?;
+                    let _renewal = node.handoff_resolution_lock.lock().await;
                     let deadline = {
                         let mut store = node.store.lock().await;
                         verification.run(|| {
