@@ -575,10 +575,28 @@ mod tests {
             child_facts: &RequestFacts,
             lease_deadline: u64,
         ) -> node_execution_policy::SdkPolicySourceProvenance {
+            self.sdk_source_provenance_with_adapter(
+                parent,
+                child_facts,
+                lease_deadline,
+                &self.node,
+                &self.service_grant,
+            )
+        }
+
+        fn sdk_source_provenance_with_adapter(
+            &self,
+            parent: &VerifiedAuthorization,
+            child_facts: &RequestFacts,
+            lease_deadline: u64,
+            adapter: &Identity,
+            service_grant: &ObjectHash,
+        ) -> node_execution_policy::SdkPolicySourceProvenance {
             use node_execution_policy::{
                 SdkPolicyLease, SdkPolicySession, SdkPolicySourceFacts, SdkPolicySourceProvenance,
                 sdk_policy_source_heads,
             };
+            let service = ServiceId::from_key(&PublicKey::of(adapter));
             let (_, origin) =
                 self.parent_with_admission(&parent.signed_invocation().payload.grant_leaf, NOW);
             assert_eq!(&origin.invocation, parent.signed_invocation());
@@ -596,18 +614,12 @@ mod tests {
             facts.body_hash = ObjectHash::body(&body).unwrap();
             let delegation = self
                 .state
-                .verify_service_delegation(
-                    parent,
-                    &self.audience().service,
-                    &self.service_grant,
-                    &facts,
-                    NOW,
-                )
+                .verify_service_delegation(parent, &service, service_grant, &facts, NOW)
                 .unwrap();
             let invocation = Signed::sign(
                 Invocation {
                     version: AUTH_VERSION,
-                    actor: Actor::Service(self.audience().service),
+                    actor: Actor::Service(service.clone()),
                     device: delegation.device().clone(),
                     initiator: delegation.initiator().clone(),
                     initiating_grant: delegation.initiating_grant().cloned(),
@@ -624,11 +636,11 @@ mod tests {
                     not_before_ms: NOW,
                     expires_at_ms: NOW + 10_000,
                 },
-                &self.node,
+                adapter,
             )
             .unwrap();
             let transport = TransportEvidence::LocalAgentAdapter {
-                service: self.audience().service,
+                service: service.clone(),
                 session: sdk.clone(),
             };
             let manager = self
@@ -647,6 +659,16 @@ mod tests {
                 .dependencies()
                 .iter()
                 .map(|current| {
+                    let authority = match &current.domain {
+                        PolicyDomain::Account(id) => &self.state.account(id).unwrap().authority,
+                        PolicyDomain::Space(id) => &self.state.space(id).unwrap().authority,
+                    };
+                    let signer = if authority.public_key == PublicKey::of(adapter) {
+                        adapter
+                    } else {
+                        &self.node
+                    };
+                    assert_eq!(authority.public_key, PublicKey::of(signer));
                     Signed::sign(
                         FreshnessReceipt {
                             version: AUTH_VERSION,
@@ -655,7 +677,7 @@ mod tests {
                             issued_at_ms: NOW,
                             expires_at_ms: lease_deadline,
                         },
-                        &self.node,
+                        signer,
                     )
                     .unwrap()
                 })
@@ -679,7 +701,7 @@ mod tests {
                 session: SdkPolicySession {
                     space_id: self.space.clone(),
                     resource_id: self.resource.resource.clone(),
-                    service: self.audience().service,
+                    service: service.clone(),
                     device: delegation.device().clone(),
                     conversation_id: "chat".into(),
                     sdk_session: sdk,
@@ -690,7 +712,7 @@ mod tests {
                     expected_policies: delegation.heads().to_vec(),
                     expires_at_ms: delegation.expires_at_ms(),
                 },
-                service_grant: self.service_grant.clone(),
+                service_grant: service_grant.clone(),
                 manager_admission: events::AdmissionProof {
                     invocation,
                     source_body: body,
@@ -710,8 +732,8 @@ mod tests {
                 source_heads: sdk_policy_source_heads(
                     &self.state,
                     parent,
-                    &self.audience().service,
-                    &self.service_grant,
+                    &service,
+                    service_grant,
                     child_facts,
                     NOW,
                 )
@@ -1352,6 +1374,94 @@ mod tests {
                     .all(|primary| primary.domain != pin.domain)
             );
         }
+    }
+
+    #[test]
+    fn sdk_history_rejects_a_genuine_other_adapter_on_the_local_project() {
+        use node_execution_policy::{
+            verify_node_history_policy_source, verify_sdk_source_provenance,
+        };
+        let mut fixture = Fixture::new();
+        let remote = Fixture::with_keys(20, NOW + 1_000);
+        let (trust, _, _, _) = fixture.task_policy_source(&remote);
+        let adapter = Fixture::with_keys(40, NOW + 1_000_000);
+        fixture
+            .state
+            .accounts
+            .extend(adapter.state.accounts.clone());
+        fixture.state.devices.extend(adapter.state.devices.clone());
+        fixture.state.roots.extend(adapter.state.roots.clone());
+        let service = adapter.audience().service;
+        let mut grant = fixture
+            .state
+            .grant(&fixture.service_grant)
+            .unwrap()
+            .payload
+            .clone();
+        grant.grantee = Grantee::Actor(Actor::Service(service.clone()));
+        grant.nonce = Nonce::from_bytes([96; 32]);
+        let grant = fixture
+            .state
+            .install_grant(Signed::sign(grant, &fixture.user).unwrap(), NOW)
+            .unwrap();
+        fixture.update_space(|document| document.grants.push(grant.clone()));
+        let parent = fixture.parent(&fixture.owner_grant, NOW);
+        let mut facts = fixture.agent_facts();
+        facts.action = Action::OperationStatusRead;
+        facts.context.sdk_session.as_mut().unwrap().target = adapter.audience().device;
+        facts.operation_id = "sdk-history-read".into();
+        facts.body_hash = ObjectHash::body(&serde_json::json!({
+            "method":"operation_status","space_id":fixture.space,"resource_id":fixture.resource.resource,
+            "authorization_id":facts.operation_id,"conversation_id":"chat",
+            "sdk_session":facts.context.sdk_session,"parent_invocation":parent.invocation_hash(),
+        })).unwrap();
+        let provenance = fixture.sdk_source_provenance_with_adapter(
+            &parent,
+            &facts,
+            NOW + 400,
+            &adapter.node,
+            &grant,
+        );
+        let verified = verify_sdk_source_provenance(
+            &fixture.state,
+            &parent,
+            &provenance,
+            &service,
+            &grant,
+            &facts,
+            None,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(verified.facts(), &facts);
+        assert_ne!(provenance.session.service, fixture.audience().service);
+        assert_ne!(provenance.session.device, fixture.audience().device);
+        let history = execution_observation::tests::retained_history_fixture();
+        let reference = remote_execution_history::derive_reference(
+            &serde_json::to_string(&history.actual).unwrap(),
+            &serde_json::to_string(&history.body).unwrap(),
+            &serde_json::to_string(&history.invocation).unwrap(),
+            &serde_json::to_string(&history.binding).unwrap(),
+        )
+        .unwrap();
+        remote_execution_history::validate_remote_execution_history_reference(&reference).unwrap();
+        assert!(matches!(
+            verify_node_history_policy_source(
+                &fixture.state,
+                &fixture.pins,
+                &trust,
+                &parent,
+                &reference,
+                Some(&history.binding),
+                Some(&provenance),
+                &fixture.node,
+                NOW,
+                NOW + 200,
+            ),
+            Err(AuthorizationError::InvalidProof(
+                "native History SDK source is not this Node's service delegation"
+            ))
+        ));
     }
 
     #[test]
