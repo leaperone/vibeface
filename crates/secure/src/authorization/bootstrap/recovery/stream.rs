@@ -26,6 +26,10 @@ pub use cross::{
     verify_cross_node_recovery_stream_commit_with_source_proof,
     verify_cross_node_recovery_stream_installation,
 };
+#[cfg(test)]
+pub(super) use import::tests::{
+    confirmed_client, confirmed_client_with_evidence, import_account_history, measured,
+};
 pub use import::{
     RecoveryContextImport, VerifiedRecoveryPolicyContext, begin_cross_node_recovery_context_import,
     begin_cross_node_recovery_policy_import, begin_recovery_context_import,

@@ -20,13 +20,6 @@ pub struct RecoveryProofUsage {
 }
 
 impl RecoveryProofUsage {
-    #[cfg(test)]
-    pub(crate) fn diagnostic_counts(&self) -> RecoveryProofCounts {
-        RecoveryProofCounts {
-            carrier_bytes: self.carrier_bytes,
-            proof: self.usage.counts(),
-        }
-    }
     pub fn new(carrier_bytes: usize) -> Result<Self> {
         require(
             carrier_bytes <= MAX_PROOF_BYTES,

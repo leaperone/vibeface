@@ -9,6 +9,7 @@ pub(crate) struct BoundedPolicyImport {
     journal: Vec<JournalEntry>,
     entry_index: BTreeMap<ObjectHash, usize>,
     nonces: BTreeMap<(PolicyDomain, Nonce), ObjectHash>,
+    authenticator_generations: BTreeSet<(AccountId, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -19,6 +20,16 @@ pub(crate) struct VerifiedPolicySnapshot {
     journal: Vec<JournalEntry>,
     entry_index: BTreeMap<ObjectHash, usize>,
     nonces: BTreeMap<(PolicyDomain, Nonce), ObjectHash>,
+    authenticator_generations: BTreeSet<(AccountId, u64)>,
+}
+
+fn registered_generation(entry: &JournalEntry) -> Option<(AccountId, u64)> {
+    let account = match entry {
+        JournalEntry::AccountGenesis(value) | JournalEntry::Account(value) => &value.payload,
+        JournalEntry::AccountCommit(value) => &value.proposal.payload,
+        _ => return None,
+    };
+    (!account.authenticators.is_empty()).then(|| (account.account.clone(), account.root_generation))
 }
 
 fn allowed(pins: &[PolicyPin], domain: &PolicyDomain) -> Result<()> {
@@ -372,6 +383,7 @@ impl BoundedPolicyImport {
             journal: Vec::new(),
             entry_index: BTreeMap::new(),
             nonces: BTreeMap::new(),
+            authenticator_generations: BTreeSet::new(),
         })
     }
 
@@ -422,6 +434,9 @@ impl BoundedPolicyImport {
             }
         }
         self.state = staged;
+        if let Some(generation) = registered_generation(&entry) {
+            self.authenticator_generations.insert(generation);
+        }
         if let Some(nonce) = nonce {
             self.nonces.insert(nonce, hash.clone());
         }
@@ -455,6 +470,7 @@ impl BoundedPolicyImport {
             journal: self.journal,
             entry_index: self.entry_index,
             nonces: self.nonces,
+            authenticator_generations: self.authenticator_generations,
         })
     }
 }
@@ -471,6 +487,14 @@ impl VerifiedPolicySnapshot {
     }
     pub(crate) fn journal(&self) -> &[JournalEntry] {
         &self.journal
+    }
+    pub(crate) fn has_registered_authenticator(
+        &self,
+        account: &AccountId,
+        generation: u64,
+    ) -> bool {
+        self.authenticator_generations
+            .contains(&(account.clone(), generation))
     }
     pub(crate) fn with_independent_pins(&self, incoming: &[PolicyPin]) -> Result<Self> {
         require(
@@ -520,6 +544,7 @@ impl VerifiedPolicySnapshot {
             journal: self.journal,
             entry_index: self.entry_index,
             nonces: self.nonces,
+            authenticator_generations: self.authenticator_generations,
         }
     }
 
@@ -580,6 +605,9 @@ impl VerifiedPolicySnapshot {
             &approval.account().payload,
             None,
         )?;
+        if let Some(generation) = registered_generation(first) {
+            import.authenticator_generations.insert(generation);
+        }
         if let Some(head) = import.state.head(&entry_domain(first)) {
             if import.required_heads.contains(head) {
                 import.seen_heads.insert(head.clone());
@@ -1004,6 +1032,9 @@ pub(crate) fn merge_same_head_snapshots(
     merge_map(&mut merged.state.roots, &right.state.roots)?;
     merge_map(&mut merged.state.commits, &right.state.commits)?;
     merge_map(&mut merged.nonces, &right.nonces)?;
+    merged
+        .authenticator_generations
+        .extend(right.authenticator_generations.iter().cloned());
     for (hash, floor) in &right.state.authenticator_states {
         if let Some(previous) = merged.state.authenticator_states.get_mut(hash) {
             if previous.sign_count == floor.sign_count {

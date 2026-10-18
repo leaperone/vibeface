@@ -414,6 +414,7 @@ pub(super) fn prepare_account_recovery_from_bundle(
     )
 }
 
+#[cfg(test)]
 fn prepare_account_recovery_preserving_source(
     material_json: &str,
     latest_bundle_json: &str,
@@ -727,8 +728,8 @@ impl PreparedAccountRecovery {
     }
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = signRecoveryNodePossession))]
-pub fn sign_recovery_node_possession(
+#[cfg(test)]
+pub(super) fn sign_recovery_node_possession(
     request_json: &str,
     node: &Identity,
     trusted_pins_json: &str,
@@ -1494,83 +1495,245 @@ mod tests {
     #[test]
     fn first_authenticator_material_stays_private_and_receipt_advances_the_pin() {
         use crate::authorization::enrollment::AuthenticatorEnrollmentIntent;
+        use crate::signature_verification::SignatureVerification;
         use crate::webauthn::*;
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         use coset::cbor::Value;
         use registration::*;
-        let created = account();
+        fn registration_sample(
+            intent: &Signed<AuthenticatorEnrollmentIntent>,
+            nonce_byte: u8,
+            credential_byte: u8,
+            flags: u8,
+            counter: u32,
+            now: u64,
+        ) -> (
+            PendingPasskey,
+            RegistrationResponse,
+            VerifiedPasskeyRegistration,
+        ) {
+            let pending = PendingPasskey::prepare(
+                EnrollmentEnvelope {
+                    version: AUTH_VERSION,
+                    purpose: PasskeyPurpose::RegisterAuthenticator,
+                    account: intent.payload.account.clone(),
+                    device_public_key: intent.payload.requesting_device_public_key.clone(),
+                    rights: vec![AccountRight::ManageAuthenticators],
+                    target: intent.payload.target.clone(),
+                    enrollment_hash: ObjectHash::body(&intent.payload).unwrap(),
+                    expected_heads: intent.payload.expected_heads.clone(),
+                    nonce: Nonce::from_bytes([nonce_byte; 32]),
+                    not_before_ms: now,
+                    expires_at_ms: now + 10_000,
+                },
+                RelyingParty::new("client.example", "https://client.example").unwrap(),
+                &[7; 32],
+                AuthenticationCeremony::IdentifiedAccount,
+                vec![],
+                now,
+            )
+            .unwrap();
+            let mut auth = crate::webauthn::tests::auth(&pending, flags, counter);
+            auth.extend([0; 16]);
+            auth.extend(32u16.to_be_bytes());
+            auth.extend([credential_byte; 32]);
+            auth.extend(crate::webauthn::tests::cose());
+            let object = Value::Map(vec![
+                (Value::Text("fmt".into()), Value::Text("none".into())),
+                (Value::Text("authData".into()), Value::Bytes(auth)),
+                (Value::Text("attStmt".into()), Value::Map(vec![])),
+            ]);
+            let mut bytes = Vec::new();
+            coset::cbor::ser::into_writer(&object, &mut bytes).unwrap();
+            let response = RegistrationResponse {
+                id: URL_SAFE_NO_PAD.encode([credential_byte; 32]),
+                raw_id: URL_SAFE_NO_PAD.encode([credential_byte; 32]),
+                credential_type: "public-key".into(),
+                response: AttestationResponse {
+                    client_data_json: URL_SAFE_NO_PAD
+                        .encode(crate::webauthn::tests::client(&pending, "webauthn.create")),
+                    attestation_object: URL_SAFE_NO_PAD.encode(bytes),
+                    transports: vec![],
+                },
+                client_extension_results: serde_json::json!({}),
+            };
+            let verified = verify_passkey_registration(&pending, &response, now).unwrap();
+            (pending, response, verified)
+        }
+        fn registration_commit(
+            proposal: Signed<AccountDocument>,
+            nonce_byte: u8,
+            now: u64,
+        ) -> Committed<AccountDocument> {
+            let previous = proposal.payload.previous.clone().unwrap();
+            let commit = Signed::sign(
+                PolicyCommit {
+                    version: AUTH_VERSION,
+                    previous: previous.clone(),
+                    proposal_hash: proposal.hash().unwrap(),
+                    accepted_at_ms: now,
+                    issued_at_ms: now,
+                    expires_at_ms: now + 10_000,
+                    nonce: Nonce::from_bytes([nonce_byte; 32]),
+                    dependencies: vec![previous.clone()],
+                },
+                &key(4),
+            )
+            .unwrap();
+            let receipt = Signed::sign(
+                FreshnessReceipt {
+                    version: AUTH_VERSION,
+                    current: previous,
+                    challenge_hash: commit.challenge_hash().unwrap(),
+                    issued_at_ms: now,
+                    expires_at_ms: now + 10_000,
+                },
+                &key(4),
+            )
+            .unwrap();
+            Committed {
+                proposal,
+                commit,
+                receipts: vec![receipt],
+            }
+        }
+        let created = account_with_enrolled_nodes(12);
+        assert!(created.bundle_json().unwrap().len() > MAX_PROOF_BYTES);
         let backup = material(&created);
-        let pins = created.pins_json().unwrap();
-        let bundle = created.bundle_json().unwrap();
-        let signed_intent =
-            build_first_authenticator_enrollment_intent(&backup, &pins, &bundle, &key(3), NOW, END)
-                .unwrap();
+        let mut stages = Vec::new();
+        let record_stage = |stages: &mut Vec<serde_json::Value>,
+                            name: &str,
+                            carrier_bytes: usize,
+                            signatures: &SignatureVerification,
+                            usage_json: &str| {
+            let usage: serde_json::Value = serde_json::from_str(usage_json).unwrap();
+            assert!(carrier_bytes <= MAX_PROOF_BYTES);
+            assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
+            assert!(usage["authorization_bytes"].as_u64().unwrap() <= MAX_PROOF_BYTES as u64);
+            assert!(usage["unique_signed_objects"].as_u64().unwrap() <= MAX_PROOF_OBJECTS as u64);
+            assert!(usage["unique_signatures"].as_u64().unwrap() <= MAX_PROOF_SIGNATURES as u64);
+            assert!(usage["max_chain_depth"].as_u64().unwrap() <= MAX_DELEGATION_DEPTH as u64);
+            stages.push(
+                serde_json::json!({"stage":name,"carrier_bytes":carrier_bytes,
+                "usage":usage,"actual":signatures.counts()}),
+            );
+        };
+        let (current, client_policy) = stream::confirmed_client_with_evidence(
+            &created,
+            &key(3),
+            &key(4),
+            NOW as u64,
+            NOW as u64 + 30_000,
+            &mut stages,
+        );
+        assert!(client_policy["pages"].as_array().unwrap().len() >= 34);
+        let build_signatures = SignatureVerification::new();
+        let signed_intent = build_signatures
+            .run(|| {
+                build_first_authenticator_enrollment_intent(&backup, &current, &key(3), NOW, END)
+            })
+            .unwrap();
         let intent: Signed<AuthenticatorEnrollmentIntent> =
             serde_json::from_str(&signed_intent).unwrap();
+        let mut build_usage = recovery_material_usage(&read_material(&backup).unwrap()).unwrap();
+        build_usage.record_budget(&current.budget).unwrap();
+        let grant_depth = current
+            .policy_snapshot
+            .grant_chain(Some(&current.grant_leaf))
+            .unwrap()
+            .len();
+        assert!(grant_depth <= MAX_DELEGATION_DEPTH);
+        build_usage.record_chain_depth(grant_depth);
+        build_usage.record_signed(&intent).unwrap();
+        build_usage.record_actual_signature_counts(build_signatures.counts());
+        record_stage(
+            &mut stages,
+            "first_authenticator_build",
+            backup.len() + signed_intent.len(),
+            &build_signatures,
+            &encode(&build_usage.counts()).unwrap(),
+        );
         assert!(
-            build_first_authenticator_enrollment_intent(&backup, &pins, &bundle, &key(4), NOW, END)
+            build_first_authenticator_enrollment_intent(&backup, &current, &key(4), NOW, END)
                 .is_err()
         );
         assert!(
-            build_first_authenticator_enrollment_intent(&backup, "[]", &bundle, &key(3), NOW, END)
-                .is_err()
+            build_first_authenticator_enrollment_intent(
+                &backup,
+                &created.authorization,
+                &key(3),
+                NOW,
+                END
+            )
+            .is_err()
         );
-        let pending = PendingPasskey::prepare(
-            EnrollmentEnvelope {
-                version: AUTH_VERSION,
-                purpose: PasskeyPurpose::RegisterAuthenticator,
-                account: intent.payload.account.clone(),
-                device_public_key: intent.payload.requesting_device_public_key.clone(),
-                rights: vec![AccountRight::ManageAuthenticators],
-                target: intent.payload.target.clone(),
-                enrollment_hash: ObjectHash::body(&intent.payload).unwrap(),
-                expected_heads: intent.payload.expected_heads.clone(),
-                nonce: Nonce::from_bytes([96; 32]),
-                not_before_ms: NOW as u64,
-                expires_at_ms: NOW as u64 + 10_000,
-            },
-            RelyingParty::new("client.example", "https://client.example").unwrap(),
-            &[7; 32],
-            AuthenticationCeremony::IdentifiedAccount,
-            vec![],
-            NOW as u64,
-        )
-        .unwrap();
-        let mut auth = crate::webauthn::tests::auth(&pending, 0x5d, 7);
-        auth.extend([0; 16]);
-        auth.extend(32u16.to_be_bytes());
-        auth.extend([9; 32]);
-        auth.extend(crate::webauthn::tests::cose());
-        let object = Value::Map(vec![
-            (Value::Text("fmt".into()), Value::Text("none".into())),
-            (Value::Text("authData".into()), Value::Bytes(auth)),
-            (Value::Text("attStmt".into()), Value::Map(vec![])),
-        ]);
-        let mut bytes = Vec::new();
-        coset::cbor::ser::into_writer(&object, &mut bytes).unwrap();
-        let response = RegistrationResponse {
-            id: URL_SAFE_NO_PAD.encode([9; 32]),
-            raw_id: URL_SAFE_NO_PAD.encode([9; 32]),
-            credential_type: "public-key".into(),
-            response: AttestationResponse {
-                client_data_json: URL_SAFE_NO_PAD
-                    .encode(crate::webauthn::tests::client(&pending, "webauthn.create")),
-                attestation_object: URL_SAFE_NO_PAD.encode(bytes),
-                transports: vec![],
-            },
-            client_extension_results: serde_json::json!({}),
-        };
-        let verified = verify_passkey_registration(&pending, &response, NOW as u64).unwrap();
-        let prepared = prepare_first_authenticator_registration(
-            &backup,
-            &pins,
-            &bundle,
-            &signed_intent,
-            &verified,
+        let other_prepared =
+            prepare_account_creation(&key(70), &key(71), &key(72), &claim(73, 74, NOW), END, NOW)
+                .unwrap();
+        let other_possession = sign_node_possession(
+            &other_prepared.node_request_json().unwrap(),
+            &key(73),
+            &nonce(74),
             NOW,
         )
         .unwrap();
+        let other =
+            finish_account_creation(&other_prepared, &key(70), &other_possession, NOW).unwrap();
+        let other_current = stream::confirmed_client(
+            &other,
+            &key(72),
+            &key(73),
+            NOW as u64,
+            NOW as u64 + 30_000,
+            &mut stages,
+        );
+        assert!(
+            build_first_authenticator_enrollment_intent(
+                &backup,
+                &other_current,
+                &key(72),
+                NOW,
+                END,
+            )
+            .is_err()
+        );
+        let (pending, response, verified) =
+            registration_sample(&intent, 96, 9, 0x5d, 7, NOW as u64);
+        for unapproved in [&created.authorization, &other_current] {
+            assert!(
+                prepare_first_authenticator_registration(
+                    &backup,
+                    unapproved,
+                    &signed_intent,
+                    &verified,
+                    NOW,
+                )
+                .is_err()
+            );
+        }
+        let prepare_signatures = SignatureVerification::new();
+        let prepared = prepare_signatures
+            .run(|| {
+                prepare_first_authenticator_registration(
+                    &backup,
+                    &current,
+                    &signed_intent,
+                    &verified,
+                    NOW,
+                )
+            })
+            .unwrap();
         let request = prepared.request_json().unwrap();
+        let prepare_usage: serde_json::Value =
+            serde_json::from_str(&prepared.proof_usage_json().unwrap()).unwrap();
+        assert!(prepare_usage["max_chain_depth"].as_u64().unwrap() >= grant_depth as u64);
+        record_stage(
+            &mut stages,
+            "first_authenticator_prepare",
+            backup.len() + signed_intent.len() + request.len(),
+            &prepare_signatures,
+            &prepared.proof_usage_json().unwrap(),
+        );
         assert!(!request.contains("secret_hex"));
         let wire: serde_json::Value = serde_json::from_str(&request).unwrap();
         let record: Signed<AuthenticatorRecord> =
@@ -1585,47 +1748,23 @@ mod tests {
         assert_eq!(record.payload.nonce, pending.envelope().nonce);
         let proposal: Signed<AccountDocument> =
             serde_json::from_value(wire["proposal"].clone()).unwrap();
-        let previous = proposal.payload.previous.clone().unwrap();
-        let commit = Signed::sign(
-            PolicyCommit {
-                version: AUTH_VERSION,
-                previous: previous.clone(),
-                proposal_hash: proposal.hash().unwrap(),
-                accepted_at_ms: NOW as u64,
-                issued_at_ms: NOW as u64,
-                expires_at_ms: NOW as u64 + 10_000,
-                nonce: Nonce::from_bytes([97; 32]),
-                dependencies: vec![previous.clone()],
-            },
-            &key(4),
-        )
-        .unwrap();
-        let receipt = Signed::sign(
-            FreshnessReceipt {
-                version: AUTH_VERSION,
-                current: previous,
-                challenge_hash: commit.challenge_hash().unwrap(),
-                issued_at_ms: NOW as u64,
-                expires_at_ms: NOW as u64 + 10_000,
-            },
-            &key(4),
-        )
-        .unwrap();
-        let mut committed = Committed {
-            proposal,
-            commit,
-            receipts: vec![receipt],
-        };
+        let mut committed = registration_commit(proposal, 97, NOW as u64);
         let delta = vec![
             JournalEntry::Authenticator(record.clone()),
             JournalEntry::AccountCommit(committed.clone()),
         ];
-        let finished = finish_first_authenticator_registration(
-            &prepared,
-            &serde_json::to_string(&delta).unwrap(),
-            NOW,
-        )
-        .unwrap();
+        let delta_json = serde_json::to_string(&delta).unwrap();
+        let finish_signatures = SignatureVerification::new();
+        let finished = finish_signatures
+            .run(|| finish_first_authenticator_registration(&prepared, &delta_json, NOW))
+            .unwrap();
+        record_stage(
+            &mut stages,
+            "first_authenticator_finish",
+            delta_json.len(),
+            &finish_signatures,
+            &finished.proof_usage_json().unwrap(),
+        );
         let late = finish_first_authenticator_registration(
             &prepared,
             &serde_json::to_string(&delta).unwrap(),
@@ -1643,9 +1782,17 @@ mod tests {
         );
         let updated_pins: Vec<PolicyPin> =
             serde_json::from_str(&finished.pins_json().unwrap()).unwrap();
-        let updated_bundle: ClientAuthorizationBundle =
-            serde_json::from_str(&finished.bundle_json().unwrap()).unwrap();
-        let state = replay_policies(&updated_pins, &updated_bundle.journal).unwrap();
+        let snapshot = finished.snapshot();
+        let updated_bundle = ClientAuthorizationBundle {
+            journal: snapshot.journal().to_vec(),
+            grant_leaf: created.bundle.grant_leaf.clone(),
+        };
+        assert_eq!(snapshot.pins(), updated_pins);
+        assert_eq!(
+            &updated_bundle.journal[created.bundle.journal.len()..],
+            delta
+        );
+        let state = snapshot.state();
         assert_eq!(
             state
                 .verify_authenticator(&record, NOW as u64)
@@ -1662,11 +1809,32 @@ mod tests {
                 .as_ref(),
             state.head(&PolicyDomain::Account(intent.payload.account.clone()))
         );
+        let updated = CreatedAccount {
+            pins: updated_pins.clone(),
+            bundle: updated_bundle.clone(),
+            authorization: verify_client_policy_state(
+                state.clone(),
+                &updated_bundle,
+                &updated_pins,
+                created.authorization.scope.account_id.clone(),
+                created.authorization.scope.space_id.clone(),
+                PublicKey::of(&key(3)),
+                NOW as u64,
+            )
+            .unwrap(),
+        };
+        let updated_current = stream::confirmed_client(
+            &updated,
+            &key(3),
+            &key(4),
+            NOW as u64,
+            NOW as u64 + 30_000,
+            &mut stages,
+        );
         assert!(
             build_first_authenticator_enrollment_intent(
                 &backup,
-                &finished.pins_json().unwrap(),
-                &finished.bundle_json().unwrap(),
+                &updated_current,
                 &key(3),
                 NOW,
                 END
@@ -1681,23 +1849,7 @@ mod tests {
             )
             .is_err()
         );
-        let registered = enroll_nodes(
-            CreatedAccount {
-                pins: updated_pins.clone(),
-                bundle: updated_bundle.clone(),
-                authorization: verify_client_policy_state(
-                    state.clone(),
-                    &updated_bundle,
-                    &updated_pins,
-                    created.authorization.scope.account_id.clone(),
-                    created.authorization.scope.space_id.clone(),
-                    PublicKey::of(&key(3)),
-                    NOW as u64,
-                )
-                .unwrap(),
-            },
-            12,
-        );
+        let registered = updated;
         let registered_material = material(&registered);
         let private = material_state(&read_material(&registered_material).unwrap()).unwrap();
         assert_eq!(
@@ -1756,16 +1908,248 @@ mod tests {
                     doc.payload.root_generation == 0 && !doc.payload.authenticators.is_empty()
                 })
         );
+        let removed_current = stream::confirmed_client(
+            &removed,
+            &key(3),
+            &key(4),
+            NOW as u64,
+            NOW as u64 + 30_000,
+            &mut stages,
+        );
         assert!(
             build_first_authenticator_enrollment_intent(
                 &removed_material,
-                &removed.pins_json().unwrap(),
-                &removed.bundle_json().unwrap(),
+                &removed_current,
                 &key(3),
                 NOW,
                 END,
             )
             .is_err()
+        );
+        let mut new_stages = Vec::new();
+        let (recovery_context, recovery_pages) = stream::import_account_history(
+            &removed,
+            &removed_material,
+            &key(50),
+            RESTORE,
+            RESTORE + 30_000.0,
+            86,
+            &mut new_stages,
+        );
+        assert!(
+            recovery_context
+                .policy()
+                .has_registered_authenticator(&intent.payload.account, 0)
+        );
+        let recovery_prepared = stream::measured(&mut new_stages, "recovery_prepare", || {
+            prepare_account_recovery(
+                &removed_material,
+                &recovery_context,
+                &key(51),
+                &key(50),
+                END,
+                RESTORE,
+            )
+        });
+        let recovery_approved: stream::StreamedRecoveryNodeRequest =
+            serde_json::from_str(&recovery_prepared.node_request_json().unwrap()).unwrap();
+        let recovery_prefix = ObjectHash::body(&(
+            "fixed-native-accepted-prefix",
+            removed.bundle.journal.len(),
+            ObjectHash::body(removed.bundle.journal.last().unwrap()).unwrap(),
+        ))
+        .unwrap();
+        let (recovery_possession, recovery_approval) =
+            stream::measured(&mut new_stages, "recovery_possession", || {
+                stream::approve_recovery_source_proposal(
+                    &recovery_approved,
+                    recovery_context.request(),
+                    recovery_context.snapshot(),
+                    recovery_context.witness(),
+                    &removed.authorization.policy_snapshot,
+                    &key(4),
+                    recovery_context.request().nonce(),
+                    &recovery_prefix,
+                    RESTORE as u64,
+                )
+            });
+        let new_generation = stream::measured(&mut new_stages, "recovery_finish", || {
+            finish_account_recovery(
+                &recovery_prepared,
+                &key(51),
+                recovery_possession.as_str(),
+                RESTORE,
+            )
+        });
+        let recovery_commit: stream::StreamedRecoveryCommitRequest =
+            serde_json::from_str(&recovery_prepared.commit_json(&new_generation).unwrap()).unwrap();
+        let recovery_committed = stream::measured(&mut new_stages, "recovery_commit", || {
+            let approval = stream::verify_recovery_source_proposal_approval(
+                &recovery_approval,
+                recovery_context.request(),
+                &recovery_approved.context,
+                &ObjectHash::body(&recovery_approved)?,
+                &recovery_approved.request.account_recovery,
+                &recovery_possession,
+                &removed.authorization.policy_snapshot,
+                &PublicKey::of(&key(4)),
+                &recovery_prefix,
+                RESTORE as u64,
+            )?;
+            stream::verify_recovery_stream_commit_with_source_approval(
+                &recovery_commit,
+                &recovery_approved,
+                recovery_context.request(),
+                &removed.authorization.policy_snapshot,
+                &approval,
+                RESTORE as u64,
+            )
+        });
+        let recovery_usage = recovery_committed.proof_usage();
+        assert!(recovery_usage.carrier_bytes <= MAX_PROOF_BYTES);
+        assert!(recovery_usage.proof.unique_signed_objects <= MAX_PROOF_OBJECTS);
+        assert!(recovery_usage.proof.unique_signatures <= MAX_PROOF_SIGNATURES);
+        assert!(recovery_usage.proof.max_chain_depth <= MAX_DELEGATION_DEPTH);
+        new_stages.last_mut().unwrap()["usage"] = serde_json::to_value(recovery_usage).unwrap();
+        assert_eq!(
+            recovery_committed.committed_heads(),
+            new_generation
+                .pins
+                .iter()
+                .filter_map(|pin| pin.minimum_head.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            recovery_committed.authorization().scope,
+            new_generation.authorization.scope
+        );
+        let new_material = stream::measured(&mut new_stages, "recovery_backup", || {
+            build_recovered_account_recovery_material(
+                &new_generation,
+                &key(51),
+                &removed_material,
+                ENDPOINT,
+                RESTORE,
+            )
+        });
+        assert!(new_material.len() <= MAX_RECOVERY_MATERIAL_BYTES);
+        let new_backup_usage =
+            recovery_material_usage(&read_material(&new_material).unwrap()).unwrap();
+        new_stages.last_mut().unwrap()["usage"] =
+            serde_json::to_value(new_backup_usage.counts()).unwrap();
+        let (new_current, new_client_policy) = stream::confirmed_client_with_evidence(
+            &new_generation,
+            &key(50),
+            &key(4),
+            RESTORE as u64,
+            RESTORE as u64 + 30_000,
+            &mut new_stages,
+        );
+        let new_snapshot =
+            crate::authorization::client_policy_import::require_confirmed_client_policy(
+                &new_current,
+            )
+            .unwrap();
+        let new_account = new_snapshot
+            .state()
+            .account(&intent.payload.account)
+            .unwrap();
+        assert_eq!(new_account.root_generation, 1);
+        assert_eq!(new_account.current_root, PublicKey::of(&key(51)));
+        assert!(new_account.authenticators.is_empty());
+        assert!(new_snapshot.has_registered_authenticator(&intent.payload.account, 0));
+        assert!(!new_snapshot.has_registered_authenticator(&intent.payload.account, 1));
+        let new_signed_intent =
+            stream::measured(&mut new_stages, "first_authenticator_build", || {
+                build_first_authenticator_enrollment_intent(
+                    &new_material,
+                    &new_current,
+                    &key(50),
+                    RESTORE,
+                    END,
+                )
+            });
+        let new_intent: Signed<AuthenticatorEnrollmentIntent> =
+            serde_json::from_str(&new_signed_intent).unwrap();
+        assert_eq!(new_intent.issuer, PublicKey::of(&key(51)));
+        assert_eq!(new_intent.payload.account, intent.payload.account);
+        let (new_pending, new_response, new_verified) =
+            registration_sample(&new_intent, 98, 10, 0x4d, 11, RESTORE as u64);
+        let new_prepare_signatures = SignatureVerification::new();
+        let new_prepared = new_prepare_signatures
+            .run(|| {
+                prepare_first_authenticator_registration(
+                    &new_material,
+                    &new_current,
+                    &new_signed_intent,
+                    &new_verified,
+                    RESTORE,
+                )
+            })
+            .unwrap();
+        let new_request = new_prepared.request_json().unwrap();
+        record_stage(
+            &mut new_stages,
+            "first_authenticator_prepare",
+            new_material.len() + new_signed_intent.len() + new_request.len(),
+            &new_prepare_signatures,
+            &new_prepared.proof_usage_json().unwrap(),
+        );
+        let new_wire: serde_json::Value = serde_json::from_str(&new_request).unwrap();
+        let new_record: Signed<AuthenticatorRecord> =
+            serde_json::from_value(new_wire["record"].clone()).unwrap();
+        assert_ne!(
+            new_record.payload.credential_id,
+            record.payload.credential_id
+        );
+        assert_eq!(new_record.payload.nonce, new_pending.envelope().nonce);
+        assert_eq!(
+            new_record.payload.initial_state,
+            AuthenticatorState {
+                sign_count: 11,
+                backup_state: false,
+            }
+        );
+        let new_proposal: Signed<AccountDocument> =
+            serde_json::from_value(new_wire["proposal"].clone()).unwrap();
+        let new_delta = vec![
+            JournalEntry::Authenticator(new_record.clone()),
+            JournalEntry::AccountCommit(registration_commit(new_proposal, 99, RESTORE as u64)),
+        ];
+        let new_delta_json = serde_json::to_string(&new_delta).unwrap();
+        let new_finish_signatures = SignatureVerification::new();
+        let new_finished = new_finish_signatures
+            .run(|| {
+                finish_first_authenticator_registration(&new_prepared, &new_delta_json, RESTORE)
+            })
+            .unwrap();
+        record_stage(
+            &mut new_stages,
+            "first_authenticator_finish",
+            new_delta_json.len(),
+            &new_finish_signatures,
+            &new_finished.proof_usage_json().unwrap(),
+        );
+        let final_snapshot = new_finished.snapshot();
+        assert!(final_snapshot.has_registered_authenticator(&intent.payload.account, 0));
+        assert!(final_snapshot.has_registered_authenticator(&intent.payload.account, 1));
+        let final_account = final_snapshot
+            .state()
+            .account(&intent.payload.account)
+            .unwrap();
+        assert_eq!(final_account.root_generation, 1);
+        assert_eq!(final_account.current_root, PublicKey::of(&key(51)));
+        assert_eq!(
+            final_account.authenticators,
+            vec![new_record.hash().unwrap()]
+        );
+        assert_eq!(
+            final_snapshot
+                .state()
+                .verify_authenticator(&new_record, RESTORE as u64)
+                .unwrap()
+                .state_floor(),
+            new_record.payload.initial_state
         );
         committed.receipts.clear();
         let failed = vec![
@@ -1781,7 +2165,33 @@ mod tests {
             .is_err()
         );
         if let Ok(path) = std::env::var("VIBEFACE_FIRST_REGISTRATION_VECTOR") {
-            std::fs::write(path, serde_json::to_vec(&serde_json::json!({"now":NOW,"end":END,"material":backup,"pins":created.pins,"bundle":created.bundle,"intent":intent,"pending":pending,"response":response,"request":wire,"committed_journal":delta,"updated_pins":updated_pins,"updated_bundle":updated_bundle})).unwrap()).unwrap();
+            let value = serde_json::json!({"now":NOW,"end":END,"material":backup,
+                "client_policy":client_policy,"intent":intent,"pending":pending,
+                "response":response,"request":wire,"committed_journal":delta,
+                "updated_pins":updated_pins,"stages":stages,
+                "new_generation":{"now":RESTORE,"end":END,"previous_material":removed_material,
+                    "recovery":{"request":match recovery_context.request() { stream::RecoveryReadRequest::Account(request) => request, _ => unreachable!() },
+                        "snapshot":recovery_context.snapshot(),"pages":recovery_pages,"witness":recovery_context.witness(),
+                        "node_request":recovery_approved,"node_possession":recovery_possession,
+                        "source_approval":recovery_approval,"prefix_commitment":recovery_prefix,"commit":recovery_commit},
+                    "material":new_material,"client_policy":new_client_policy,"intent":new_intent,
+                    "pending":new_pending,"response":new_response,"request":new_wire,
+                    "committed_journal":new_delta,"updated_pins":final_snapshot.pins(),"stages":new_stages}});
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            std::io::Write::write_all(&mut file, &serde_json::to_vec(&value).unwrap()).unwrap();
         }
     }
 
@@ -1957,542 +2367,6 @@ mod tests {
         }
         if let Ok(path) = std::env::var("VIBEFACE_NODE_ENROLLMENT_VECTOR") {
             std::fs::write(path, serde_json::to_vec(&serde_json::json!({"now":NOW,"end":END,"material":backup,"pins":original.pins,"bundle":original.bundle,"claim":new_claim.claim,"request":serde_json::from_str::<serde_json::Value>(&request).unwrap(),"possession":possession,"commit_request":serde_json::from_str::<serde_json::Value>(&public).unwrap(),"delta":serde_json::from_str::<serde_json::Value>(&delta).unwrap(),"installation":serde_json::from_str::<serde_json::Value>(&installation).unwrap(),"updated_pins":result.pins(),"updated_bundle":result.bundle()})).unwrap()).unwrap();
-        }
-    }
-
-    #[test]
-    fn cross_node_recovery_requires_live_source_cas_two_possessions_and_exact_read_only_history() {
-        use super::cross_node::{CrossNodeRecoveryRequest, legacy::*};
-        let mut original = account();
-        let backup = material(&original);
-        let mut source_state = replay_policies(&original.pins, &original.bundle.journal).unwrap();
-        let original_space = original.authorization.scope.space_id.clone();
-        let first_hash = source_state.space(&original_space).unwrap().resources[0].clone();
-        let first_resource = source_state
-            .resources
-            .get(&first_hash)
-            .unwrap()
-            .payload
-            .resource
-            .clone();
-        let next_resource = ResourceId::random().unwrap();
-        let record = (0..128)
-            .find_map(|_| {
-                let record = Signed::sign(
-                    ResourceRecord {
-                        version: AUTH_VERSION,
-                        space: original_space.clone(),
-                        resource: next_resource.clone(),
-                        kind: ResourceKind::Project,
-                        host: ServiceId::from_key(&PublicKey::of(&key(4))),
-                        issued_under: source_state
-                            .head(&PolicyDomain::Space(original_space.clone()))
-                            .unwrap()
-                            .clone(),
-                        nonce: Nonce::random().unwrap(),
-                    },
-                    &key(1),
-                )
-                .unwrap();
-                (record.hash().unwrap().cmp(&first_hash) != next_resource.cmp(&first_resource))
-                    .then_some(record)
-            })
-            .expect("fixture must put ObjectHash and ResourceId in opposite orders");
-        let hash = source_state.install_resource(record.clone()).unwrap();
-        let mut space = source_state.space(&original_space).unwrap().clone();
-        space.previous = source_state
-            .head(&PolicyDomain::Space(original_space.clone()))
-            .cloned();
-        space.sequence += 1;
-        space.resources.push(hash);
-        space.resources.sort();
-        let space = Signed::sign(space, &key(1)).unwrap();
-        let head = source_state.install_space(space.clone()).unwrap();
-        original
-            .bundle
-            .journal
-            .extend([JournalEntry::Resource(record), JournalEntry::Space(space)]);
-        original
-            .pins
-            .iter_mut()
-            .find(|pin| pin.domain == head.domain)
-            .unwrap()
-            .minimum_head = Some(head.clone());
-        let old_state = replay_policies(&original.pins, &original.bundle.journal).unwrap();
-        let inspected: serde_json::Value =
-            serde_json::from_str(&inspect_cross_node_recovery_sources(&backup, RESTORE).unwrap())
-                .unwrap();
-        assert_eq!(inspected["source_projects"].as_array().unwrap().len(), 1);
-        let mut current_resources: Vec<_> = old_state
-            .space(&original_space)
-            .unwrap()
-            .resources
-            .iter()
-            .filter_map(|hash| old_state.resources.get(hash))
-            .map(|record| ResourceRef {
-                space: record.payload.space.clone(),
-                resource: record.payload.resource.clone(),
-            })
-            .collect();
-        current_resources.sort_by(|a, b| a.resource.cmp(&b.resource));
-        assert_eq!(current_resources.len(), 2);
-        let resources = encode(&current_resources).unwrap();
-        let original_request = build_cross_node_recovery_request(
-            &backup,
-            &key(5),
-            &key(6),
-            &claim(7, 44, RESTORE),
-            &resources,
-            END - 1000.0,
-            RESTORE,
-            RESTORE + 100_000.0,
-        )
-        .unwrap();
-        let signed: Signed<CrossNodeRecoveryRequest> =
-            serde_json::from_str(&original_request).unwrap();
-        let missing_resources = encode(&vec![ResourceRef {
-            space: original_space.clone(),
-            resource: ResourceId::from_bytes([199; 32]),
-        }])
-        .unwrap();
-        let missing_request: Signed<CrossNodeRecoveryRequest> = serde_json::from_str(
-            &build_cross_node_recovery_request(
-                &backup,
-                &key(5),
-                &key(6),
-                &claim(7, 44, RESTORE),
-                &missing_resources,
-                END - 1000.0,
-                RESTORE,
-                RESTORE + 100_000.0,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(
-            create_cross_node_recovery_witness(
-                &old_state,
-                &missing_request,
-                &original.bundle,
-                &key(4),
-                RESTORE as u64
-            )
-            .is_err()
-        );
-        let alien = encode(&vec![ResourceRef {
-            space: SpaceId::personal(&AccountId::from_root(&PublicKey::of(&key(8)))),
-            resource: current_resources[0].resource.clone(),
-        }])
-        .unwrap();
-        assert!(
-            build_cross_node_recovery_request(
-                &backup,
-                &key(5),
-                &key(6),
-                &claim(7, 44, RESTORE),
-                &alien,
-                END - 1000.0,
-                RESTORE,
-                RESTORE + 100_000.0
-            )
-            .is_err()
-        );
-        let context = create_cross_node_recovery_witness(
-            &old_state,
-            &signed,
-            &original.bundle,
-            &key(4),
-            RESTORE as u64,
-        )
-        .unwrap();
-        let verified = verify_cross_node_recovery_context(
-            &encode(&context).unwrap(),
-            &original_request,
-            RESTORE,
-        )
-        .unwrap();
-        let prepared =
-            prepare_cross_node_account_recovery(&backup, &verified, &key(5), &key(6), END, RESTORE)
-                .unwrap();
-        let possession: CrossNodeRecoveryPossessionRequest =
-            serde_json::from_str(&prepared.possession_request_json().unwrap()).unwrap();
-        let c_proof = sign_cross_node_recovery_possession(
-            &possession,
-            &key(7),
-            &Nonce::parse(&nonce(44)).unwrap(),
-            RESTORE as u64,
-        )
-        .unwrap();
-        let b_proof = sign_cross_node_recovery_source_possession(
-            &old_state,
-            &possession,
-            &key(4),
-            RESTORE as u64,
-        )
-        .unwrap();
-        let mut pending = finish_cross_node_account_recovery(
-            &prepared,
-            &key(5),
-            c_proof.as_str(),
-            b_proof.as_str(),
-            RESTORE,
-        )
-        .unwrap();
-        let pending_material = pending
-            .recovery_material_json(&key(5), &backup, "https://target.example", RESTORE)
-            .unwrap();
-        assert!(pending_material.len() > 64 * 1024);
-        let sealed = crate::recovery::recovery_seal(
-            pending_material.as_bytes(),
-            "synthetic recovery package password",
-        )
-        .unwrap();
-        let opened =
-            crate::recovery::recovery_open(&sealed, "synthetic recovery package password").unwrap();
-        assert_eq!(opened, pending_material.as_bytes());
-        let restored =
-            restore_prepared_cross_node_recovery_commit(&pending_material, RESTORE + 200_000.0)
-                .unwrap();
-        assert_eq!(
-            restored.request_json().unwrap(),
-            pending.request_json().unwrap()
-        );
-        assert_eq!(
-            restored.client_identity().unwrap().public_key_hex(),
-            key(6).public_key_hex()
-        );
-        let resume: serde_json::Value =
-            serde_json::from_str(&restored.resume_context_json().unwrap()).unwrap();
-        assert_eq!(resume["source"]["node_public_key"], key(4).public_key_hex());
-        assert_eq!(resume["target"]["node_public_key"], key(7).public_key_hex());
-        let request: CrossNodeRecoveryCommitRequest =
-            serde_json::from_str(&pending.request_json().unwrap()).unwrap();
-        let verified_commit = verify_cross_node_recovery_commit(
-            &old_state,
-            &request,
-            &PublicKey::of(&key(4)),
-            RESTORE as u64,
-        )
-        .unwrap();
-        assert_eq!(
-            verified_commit.request_hash().unwrap(),
-            ObjectHash::body(&signed).unwrap()
-        );
-        assert_eq!(
-            verified_commit.possession_hash().unwrap(),
-            ObjectHash::body(&possession).unwrap()
-        );
-        let committed =
-            accept_cross_node_recovery_commit(&verified_commit, &key(4), RESTORE as u64).unwrap();
-        let committed_json = encode(&committed).unwrap();
-        let request_wire = serde_json::json!({"id":"cross-native","method":"identity/cross_node_recovery_commit","params":request});
-        let committed_wire =
-            serde_json::json!({"id":"cross-native","result":{"committed":committed}});
-        assert!(canonical(&request_wire).unwrap().len() <= MAX_PROOF_BYTES);
-        assert!(canonical(&committed_wire).unwrap().len() <= MAX_PROOF_BYTES);
-        let completed =
-            finish_cross_node_recovery_commit(&restored, &committed_json, RESTORE + 200_000.0)
-                .unwrap();
-        assert_eq!(
-            completed.pins_json().unwrap(),
-            encode(&request.pins).unwrap()
-        );
-        let final_material = completed
-            .final_recovery_material_json("https://target.example", RESTORE + 200_000.0)
-            .unwrap();
-        inspect_account_recovery_material(&final_material, RESTORE + 200_000.0).unwrap();
-        let installed = verify_cross_node_recovery_installation(
-            &committed,
-            &PublicKey::of(&key(7)),
-            &Nonce::parse(&nonce(44)).unwrap(),
-            RESTORE as u64,
-        )
-        .unwrap();
-        let after = replay_policies(installed.pins(), &installed.bundle().journal).unwrap();
-        let recovered_scope: ClientScope =
-            serde_json::from_str(&completed.scope_json().unwrap()).unwrap();
-        let c_projection = after
-            .client_authorization_projection(
-                installed.pins(),
-                &installed.bundle().journal,
-                &recovered_scope.account_id,
-                &recovered_scope.space_id,
-                &PublicKey::of(&key(6)),
-                &installed.bundle().grant_leaf,
-                RESTORE as u64,
-            )
-            .unwrap();
-        let c_auth = verify_client_authorization(
-            &encode(&c_projection).unwrap(),
-            &completed.pins_json().unwrap(),
-            recovered_scope.account_id.as_str(),
-            recovered_scope.space_id.as_str(),
-            &key(6).public_key_hex(),
-            RESTORE,
-        )
-        .unwrap();
-        assert_eq!(c_auth.audience_public_key(), &PublicKey::of(&key(7)));
-        assert_eq!(c_auth.resources().len(), 1);
-        assert_eq!(
-            c_auth.resources()[0].payload.host,
-            ServiceId::from_key(&PublicKey::of(&key(7)))
-        );
-        let selections: serde_json::Value =
-            serde_json::from_str(&completed.source_read_selections_json().unwrap()).unwrap();
-        assert_eq!(selections.as_array().unwrap().len(), 2);
-        let source_bundle: ClientAuthorizationBundle =
-            serde_json::from_value(selections[0]["authorization"].clone()).unwrap();
-        let old_scope = original.authorization.scope();
-        let source_auth = verify_client_authorization(
-            &encode(&source_bundle).unwrap(),
-            &completed.pins_json().unwrap(),
-            old_scope.account_id.as_str(),
-            old_scope.space_id.as_str(),
-            &key(6).public_key_hex(),
-            RESTORE,
-        )
-        .unwrap();
-        assert_eq!(source_auth.audience_public_key(), &PublicKey::of(&key(4)));
-        let resource: ResourceRef =
-            serde_json::from_value(selections[0]["project"].clone()).unwrap();
-        let mut invocation = Invocation {
-            version: AUTH_VERSION,
-            actor: Actor::Account(old_scope.account_id.clone()),
-            device: source_auth.scope.device_id.clone(),
-            initiator: Actor::Account(old_scope.account_id.clone()),
-            initiating_grant: None,
-            resource: resource.clone(),
-            action: Action::ConversationRead,
-            audience: source_auth.audience.clone(),
-            presenter: source_auth.scope.device_id.clone(),
-            operation_id: "synthetic-source-read".to_owned(),
-            body_hash: ObjectHash::body(&serde_json::json!({})).unwrap(),
-            grant_leaf: source_bundle.grant_leaf.clone(),
-            expected_policies: source_auth.heads.clone(),
-            context: InvocationContext::default(),
-            nonce: Nonce::from_bytes([55; 32]),
-            not_before_ms: RESTORE as u64,
-            expires_at_ms: RESTORE as u64 + 1000,
-        };
-        let transport = TransportEvidence::DirectNoise {
-            device: source_auth.scope.device_id.clone(),
-        };
-        let facts = |value: &Invocation| RequestFacts {
-            resource: value.resource.clone(),
-            action: value.action,
-            audience: value.audience.clone(),
-            operation_id: value.operation_id.clone(),
-            body_hash: value.body_hash.clone(),
-            context: value.context.clone(),
-        };
-        let read = after
-            .verify_invocation(
-                &Signed::sign(invocation.clone(), &key(6)).unwrap(),
-                &facts(&invocation),
-                &transport,
-                RESTORE as u64,
-            )
-            .unwrap();
-        assert_eq!(read.dependencies().len(), 2);
-        for action in [
-            Action::MessageAppend,
-            Action::TaskCreate,
-            Action::AgentStart,
-            Action::ExecutionOpen,
-            Action::MemberManage,
-            Action::AttachmentWrite,
-            Action::OperationResolve,
-        ] {
-            invocation.action = action;
-            assert!(
-                after
-                    .verify_invocation(
-                        &Signed::sign(invocation.clone(), &key(6)).unwrap(),
-                        &facts(&invocation),
-                        &transport,
-                        RESTORE as u64
-                    )
-                    .is_err()
-            );
-        }
-        assert_eq!(
-            source_auth
-                .policy_json()
-                .unwrap()
-                .contains("message_append"),
-            false
-        );
-        assert_eq!(
-            after
-                .account(&old_scope.account_id)
-                .unwrap()
-                .authority
-                .public_key,
-            PublicKey::of(&key(7))
-        );
-        assert_eq!(after.space(&old_scope.space_id).unwrap().resources.len(), 3);
-        assert!(
-            after
-                .verify_account_client_device(
-                    &old_scope.account_id,
-                    &DeviceId::from_key(&PublicKey::of(&key(3))),
-                    RESTORE as u64
-                )
-                .is_err()
-        );
-        assert!(
-            verify_cross_node_recovery_commit(
-                &after,
-                &request,
-                &PublicKey::of(&key(4)),
-                RESTORE as u64
-            )
-            .is_err()
-        );
-        for domain in [
-            PolicyDomain::Account(old_scope.account_id.clone()),
-            PolicyDomain::Space(old_scope.space_id.clone()),
-        ] {
-            let mut advanced = old_state.clone();
-            match domain {
-                PolicyDomain::Account(account) => {
-                    let mut document = advanced.account(&account).unwrap().clone();
-                    document.previous = advanced.head(&PolicyDomain::Account(account)).cloned();
-                    document.sequence += 1;
-                    advanced
-                        .install_account(Signed::sign(document, &key(1)).unwrap())
-                        .unwrap();
-                }
-                PolicyDomain::Space(space) => {
-                    let mut document = advanced.space(&space).unwrap().clone();
-                    document.previous = advanced.head(&PolicyDomain::Space(space)).cloned();
-                    document.sequence += 1;
-                    advanced
-                        .install_space(Signed::sign(document, &key(1)).unwrap())
-                        .unwrap();
-                }
-            }
-            assert!(
-                verify_cross_node_recovery_commit(
-                    &advanced,
-                    &request,
-                    &PublicKey::of(&key(4)),
-                    RESTORE as u64
-                )
-                .is_err()
-            );
-        }
-        assert!(
-            sign_cross_node_recovery_possession(
-                &possession,
-                &key(4),
-                &Nonce::parse(&nonce(44)).unwrap(),
-                RESTORE as u64
-            )
-            .is_err()
-        );
-        assert!(
-            sign_cross_node_recovery_possession(
-                &possession,
-                &key(7),
-                &Nonce::parse(&nonce(45)).unwrap(),
-                RESTORE as u64
-            )
-            .is_err()
-        );
-        assert!(
-            sign_cross_node_recovery_source_possession(
-                &old_state,
-                &possession,
-                &key(7),
-                RESTORE as u64
-            )
-            .is_err()
-        );
-        assert!(
-            finish_cross_node_account_recovery(
-                &prepared,
-                &key(5),
-                b_proof.as_str(),
-                c_proof.as_str(),
-                RESTORE
-            )
-            .is_err()
-        );
-        assert!(
-            finish_cross_node_recovery_commit(&restored, &committed_json, RESTORE - 1.0).is_err()
-        );
-        assert!(
-            verify_cross_node_recovery_installation(
-                &committed,
-                &PublicKey::of(&key(7)),
-                &Nonce::parse(&nonce(44)).unwrap(),
-                END as u64 + 1
-            )
-            .is_err()
-        );
-        let expired =
-            finish_cross_node_recovery_commit(&restored, &committed_json, END + 1.0).unwrap();
-        assert_eq!(expired.scope_json().unwrap(), "null");
-        for mutation in 0..5 {
-            let mut changed = context.clone();
-            match mutation {
-                0 => {
-                    changed.witness =
-                        Signed::sign(changed.witness.payload.clone(), &key(7)).unwrap()
-                }
-                1 => changed.request.payload.new_device_public_key = PublicKey::of(&key(8)),
-                2 => changed.bundle.journal.pop().map(|_| ()).unwrap(),
-                3 => changed.request.payload.saved_pins[0].genesis_root = PublicKey::of(&key(8)),
-                4 => changed.witness.payload.expected_account_head.sequence += 1,
-                _ => unreachable!(),
-            }
-            assert!(
-                verify_cross_node_recovery_context(
-                    &encode(&changed).unwrap(),
-                    &original_request,
-                    RESTORE
-                )
-                .is_err()
-            );
-        }
-        let mut changed = request.clone();
-        changed.journal_delta.retain(|entry| !matches!(entry,JournalEntry::Device(c) if c.payload.public_key==PublicKey::of(&key(4)) && c.issuer==PublicKey::of(&key(5))));
-        assert!(
-            verify_cross_node_recovery_commit(
-                &old_state,
-                &changed,
-                &PublicKey::of(&key(4)),
-                RESTORE as u64
-            )
-            .is_err()
-        );
-        let mut oversized = request.clone();
-        oversized
-            .journal_delta
-            .extend(std::iter::repeat_n(request.journal_delta[0].clone(), 200));
-        assert!(matches!(
-            verify_cross_node_recovery_commit(
-                &old_state,
-                &oversized,
-                &PublicKey::of(&key(4)),
-                RESTORE as u64
-            ),
-            Err(AuthorizationError::InvalidProof(
-                "cross-node recovery requires a bounded checkpoint"
-            ))
-        ));
-        let mut pending_value: serde_json::Value = serde_json::from_str(&pending_material).unwrap();
-        pending_value["client_secret_hex"] = key(8).secret_hex().into();
-        assert!(
-            restore_prepared_cross_node_recovery_commit(&pending_value.to_string(), RESTORE)
-                .is_err()
-        );
-        if let Ok(path) = std::env::var("VIBEFACE_CROSS_NODE_RECOVERY_VECTOR") {
-            std::fs::write(path,encode(&serde_json::json!({"material":backup,"original_bundle":original.bundle,"original_pins":original.pins,
-                "request":signed,"context":context,"possession":possession,"commit_request":request,"committed":committed,
-                "pending_material":pending_material,"read_selections":selections,"now_ms":RESTORE,"expires_at_ms":END,
-                "request_wire_bytes":canonical(&request_wire).unwrap().len(),"committed_wire_bytes":canonical(&committed_wire).unwrap().len()})).unwrap()).unwrap();
         }
     }
 }

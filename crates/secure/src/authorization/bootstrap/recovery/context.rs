@@ -163,8 +163,8 @@ pub fn build_recovery_context_request(
     encode(&build().map_err(|e| e.to_string())?)
 }
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen(js_name = verifyRecoveryContextRequest))]
-pub fn verify_recovery_context_request_json(
+#[cfg(test)]
+pub(super) fn verify_recovery_context_request_json(
     request_json: &str,
     trusted_pins_json: &str,
     trusted_bundle_json: &str,

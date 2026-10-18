@@ -522,7 +522,7 @@ impl VerifiedRecoveryPolicyContext {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::signature_verification::SignatureVerification;
 
@@ -532,46 +532,247 @@ mod tests {
         Identity::from_secret_hex(&hex::encode([byte; 32])).unwrap()
     }
 
-    #[test]
-    fn twelve_node_history_imports_with_exact_heads_and_bounded_individual_calls() {
-        let original = super::super::super::tests::account_with_enrolled_nodes(12);
-        let material = build_account_recovery_material(
-            &original,
-            &key(1),
-            &key(2),
-            "https://node.example",
-            10_000.0,
+    pub(in crate::authorization::bootstrap::recovery) fn measured<T, E: std::fmt::Debug>(
+        stages: &mut Vec<serde_json::Value>,
+        name: &str,
+        run: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> T {
+        let signatures = SignatureVerification::new();
+        let result = signatures.run(run).unwrap();
+        assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
+        stages.push(serde_json::json!({"stage":name,"actual":signatures.counts()}));
+        result
+    }
+
+    pub(in crate::authorization::bootstrap::recovery) fn confirmed_client(
+        created: &CreatedAccount,
+        client: &Identity,
+        node: &Identity,
+        now: u64,
+        expiry: u64,
+        stages: &mut Vec<serde_json::Value>,
+    ) -> VerifiedClientAuthorization {
+        confirmed_client_with_evidence(created, client, node, now, expiry, stages).0
+    }
+
+    pub(in crate::authorization::bootstrap::recovery) fn confirmed_client_with_evidence(
+        created: &CreatedAccount,
+        client: &Identity,
+        node: &Identity,
+        now: u64,
+        expiry: u64,
+        stages: &mut Vec<serde_json::Value>,
+    ) -> (VerifiedClientAuthorization, serde_json::Value) {
+        use crate::authorization::client_policy_import as auth;
+        let resource = created.authorization.resources.first().unwrap();
+        let selection = auth::AuthorizationSelection {
+            resource: ResourceRef {
+                space: resource.payload.space.clone(),
+                resource: resource.payload.resource.clone(),
+            },
+            audience: created.authorization.audience.clone(),
+            grant_leaf: created.bundle.grant_leaf.clone(),
+        };
+        let request_json = measured(stages, "normal_read_request", || {
+            auth::build_client_policy_read_request(
+                created.authorization.scope.account_id.as_str(),
+                created.authorization.scope.space_id.as_str(),
+                client,
+                &node.public_key_hex(),
+                &encode(&created.pins).unwrap(),
+                &encode(&Some(selection.clone())).unwrap(),
+                now as f64,
+                expiry as f64,
+            )
+        });
+        let request: Signed<auth::ClientPolicyReadRequest> =
+            serde_json::from_str(&request_json).unwrap();
+        let verified = measured(stages, "normal_source_read", || {
+            auth::verify_client_policy_read(
+                &created.authorization.policy_snapshot,
+                &request,
+                &PublicKey::of(node),
+                &PublicKey::of(client),
+                now,
+            )
+        });
+        let snapshot = Signed::sign(
+            auth::ClientPolicySnapshot {
+                version: AUTH_VERSION,
+                request_hash: request.hash().unwrap(),
+                snapshot_id: Nonce::from_bytes([94; 32]),
+                saved_pins_hash: auth::client_policy_saved_pins_hash(&created.pins).unwrap(),
+                target_heads: verified.heads().to_vec(),
+                selection: selection.clone(),
+                source_node_public_key: PublicKey::of(node),
+                issued_at_ms: now,
+                expires_at_ms: expiry,
+            },
+            node,
         )
         .unwrap();
-        let request_json = context::build_recovery_context_request(
-            &material,
-            &key(50),
-            &key(4).public_key_hex(),
-            NOW,
-            EXPIRY,
+        let mut import = measured(stages, "normal_import_begin", || {
+            auth::begin_client_policy_import(
+                &encode(&created.pins).unwrap(),
+                &request_json,
+                &encode(&snapshot).unwrap(),
+                client,
+                &node.public_key_hex(),
+                now as f64,
+            )
+        });
+        let mut previous = snapshot.hash().unwrap();
+        let mut pages = Vec::new();
+        for (index, entry) in created.bundle.journal.iter().enumerate() {
+            let complete = index + 1 == created.bundle.journal.len();
+            let page = Signed::sign(
+                auth::ClientPolicyPage {
+                    version: AUTH_VERSION,
+                    request_hash: request.hash().unwrap(),
+                    snapshot_id: snapshot.payload.snapshot_id.clone(),
+                    target_heads_hash: auth::client_policy_target_heads_hash(verified.heads())
+                        .unwrap(),
+                    page_index: index as u64,
+                    previous_page_hash: previous,
+                    entry: Some(entry.clone()),
+                    next_cursor: (!complete)
+                        .then(|| ObjectHash::body(&("normal-cursor", index)).unwrap()),
+                    complete,
+                },
+                node,
+            )
+            .unwrap();
+            previous = page.hash().unwrap();
+            measured(stages, "normal_import_page", || {
+                import.append_page(&encode(&page).unwrap(), now as f64)
+            });
+            pages.push(page);
+        }
+        let witness = Signed::sign(
+            auth::ClientPolicyWitness {
+                version: AUTH_VERSION,
+                request_hash: request.hash().unwrap(),
+                snapshot_id: snapshot.payload.snapshot_id.clone(),
+                target_heads: verified.heads().to_vec(),
+                final_page_hash: previous,
+                page_count: created.bundle.journal.len() as u64,
+                entry_count: created.bundle.journal.len() as u64,
+                snapshot_hash: snapshot.hash().unwrap(),
+                source_node_public_key: PublicKey::of(node),
+                issued_at_ms: now,
+                expires_at_ms: expiry,
+            },
+            node,
         )
         .unwrap();
+        let imported = measured(stages, "normal_import_finish", || {
+            import.finish(
+                &encode(&witness).unwrap(),
+                &encode(&selection).unwrap(),
+                now as f64,
+            )
+        });
+        let confirm_json = measured(stages, "normal_confirm_request", || {
+            auth::build_client_policy_auth_confirm_request(
+                &imported,
+                client,
+                now as f64,
+                expiry as f64,
+            )
+        });
+        let confirm: Signed<auth::ClientPolicyAuthConfirmRequest> =
+            serde_json::from_str(&confirm_json).unwrap();
+        let confirmation = measured(stages, "normal_source_confirm", || {
+            auth::verify_client_policy_auth_confirm(
+                &created.authorization.policy_snapshot,
+                &request,
+                &snapshot,
+                &witness,
+                &confirm,
+                &PublicKey::of(node),
+                &PublicKey::of(client),
+                now,
+            )?;
+            Signed::sign(
+                auth::ClientPolicyAuthConfirmation {
+                    version: AUTH_VERSION,
+                    context: confirm.payload.context.clone(),
+                    confirmation_request_hash: confirm.hash()?,
+                    selection: selection.clone(),
+                    target_heads: verified.heads().to_vec(),
+                    device_public_key: PublicKey::of(client),
+                    source_node_public_key: PublicKey::of(node),
+                    accepted_at_ms: now,
+                },
+                node,
+            )
+        });
+        let confirmed = measured(stages, "normal_client_confirm", || {
+            auth::confirm_client_policy_authorization(
+                &imported,
+                &confirm_json,
+                &encode(&confirmation).unwrap(),
+                &node.public_key_hex(),
+                now as f64,
+            )
+        });
+        (
+            confirmed,
+            serde_json::json!({"now":now,"expiry":expiry,"request":request,
+                "snapshot":snapshot,"pages":pages,"witness":witness,
+                "selection":selection,"confirm_request":confirm,"confirmation":confirmation}),
+        )
+    }
+
+    fn assert_usage(usage: &RecoveryProofCounts) {
+        assert!(usage.carrier_bytes <= MAX_PROOF_BYTES);
+        assert!(usage.proof.unique_signed_objects <= MAX_PROOF_OBJECTS);
+        assert!(usage.proof.unique_signatures <= MAX_PROOF_SIGNATURES);
+        assert!(usage.proof.max_chain_depth <= MAX_DELEGATION_DEPTH);
+    }
+
+    pub(in crate::authorization::bootstrap::recovery) fn import_account_history(
+        before: &CreatedAccount,
+        material: &str,
+        client: &Identity,
+        now: f64,
+        expiry: f64,
+        snapshot_nonce: u8,
+        stages: &mut Vec<serde_json::Value>,
+    ) -> (
+        VerifiedRecoveryPolicyContext,
+        Vec<Signed<RecoveryContextPage>>,
+    ) {
+        let request_json = measured(stages, "read_request", || {
+            context::build_recovery_context_request(
+                material,
+                client,
+                &key(4).public_key_hex(),
+                now,
+                expiry,
+            )
+        });
         let request: Signed<RecoveryContextRequest> = serde_json::from_str(&request_json).unwrap();
         let read = RecoveryReadRequest::Account(request.clone());
         let claim_json =
-            create_node_claim(&key(4), request.payload.nonce.as_str(), NOW, EXPIRY).unwrap();
+            create_node_claim(&key(4), request.payload.nonce.as_str(), now, expiry).unwrap();
         let claim: Signed<NodeClaim> = serde_json::from_str(&claim_json).unwrap();
         let snapshot = Signed::sign(
             RecoveryContextSnapshot {
                 version: AUTH_VERSION,
                 kind: RecoveryContextKind::Account,
                 request_hash: read.request_hash().unwrap(),
-                snapshot_id: Nonce::from_bytes([90; 32]),
+                snapshot_id: Nonce::from_bytes([snapshot_nonce; 32]),
                 saved_pins_hash: read.saved_pins_hash().unwrap(),
-                target_heads: original
+                target_heads: before
                     .pins
                     .iter()
                     .filter_map(|pin| pin.minimum_head.clone())
                     .collect(),
                 source_node_public_key: PublicKey::of(&key(4)),
                 claim,
-                issued_at_ms: NOW as u64,
-                expires_at_ms: EXPIRY as u64,
+                issued_at_ms: now as u64,
+                expires_at_ms: expiry as u64,
             },
             &key(4),
         )
@@ -579,16 +780,15 @@ mod tests {
         let snapshot_json = encode(&snapshot).unwrap();
         let signatures = SignatureVerification::new();
         let mut import = signatures
-            .run(|| begin_recovery_context_import(&material, &request_json, &snapshot_json, NOW))
+            .run(|| begin_recovery_context_import(material, &request_json, &snapshot_json, now))
             .unwrap();
         assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
-        let mut stages = vec![
-            serde_json::json!({"stage":"begin","usage":import.last_usage,"actual":signatures.counts()}),
-        ];
+        assert_usage(import.last_usage.as_ref().unwrap());
+        stages.push(serde_json::json!({"stage":"begin","usage":import.last_usage,"actual":signatures.counts()}));
         let mut previous = snapshot.hash().unwrap();
         let mut pages = Vec::new();
-        for (index, entry) in original.bundle.journal.iter().enumerate() {
-            let complete = index + 1 == original.bundle.journal.len();
+        for (index, entry) in before.bundle.journal.iter().enumerate() {
+            let complete = index + 1 == before.bundle.journal.len();
             let page = Signed::sign(
                 RecoveryContextPage {
                     version: AUTH_VERSION,
@@ -625,8 +825,8 @@ mod tests {
                 entry_count: pages.len() as u64,
                 claim_hash: snapshot.payload.claim.hash().unwrap(),
                 source_node_public_key: PublicKey::of(&key(4)),
-                issued_at_ms: NOW as u64,
-                expires_at_ms: EXPIRY as u64,
+                issued_at_ms: now as u64,
+                expires_at_ms: expiry as u64,
             },
             &key(4),
         )
@@ -634,19 +834,19 @@ mod tests {
         assert!(
             import
                 .clone()
-                .finish_native(witness.clone(), NOW as u64)
+                .finish_native(witness.clone(), now as u64)
                 .is_err()
         );
         let mut wrong = pages[0].payload.clone();
-        wrong.snapshot_id = Nonce::from_bytes([91; 32]);
+        wrong.snapshot_id = Nonce::from_bytes([snapshot_nonce + 1; 32]);
         assert!(
             import
-                .append(Signed::sign(wrong, &key(4)).unwrap(), NOW as u64)
+                .append(Signed::sign(wrong, &key(4)).unwrap(), now as u64)
                 .is_err()
         );
         assert_eq!(import.page_count, 0);
         let mut wrong = pages[0].payload.clone();
-        wrong.entry = original
+        wrong.entry = before
             .bundle
             .journal
             .iter()
@@ -655,26 +855,23 @@ mod tests {
             .cloned();
         assert!(
             import
-                .append(Signed::sign(wrong, &key(4)).unwrap(), NOW as u64)
+                .append(Signed::sign(wrong, &key(4)).unwrap(), now as u64)
                 .is_err()
         );
         assert_eq!(import.page_count, 0);
         for (index, page) in pages.iter().enumerate() {
             let signatures = SignatureVerification::new();
             signatures
-                .run(|| import.append_page(&encode(page).unwrap(), NOW))
+                .run(|| import.append_page(&encode(page).unwrap(), now))
                 .unwrap();
             let usage = import.last_usage.as_ref().unwrap();
-            assert!(usage.carrier_bytes <= MAX_PROOF_BYTES);
-            assert!(usage.proof.unique_signed_objects <= MAX_PROOF_OBJECTS);
-            assert!(usage.proof.unique_signatures <= MAX_PROOF_SIGNATURES);
-            assert!(usage.proof.max_chain_depth <= MAX_DELEGATION_DEPTH);
+            assert_usage(usage);
             assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
             stages.push(serde_json::json!({"stage":"page","index":index,"usage":usage,"actual":signatures.counts()}));
             if index == 0 {
                 let signatures = SignatureVerification::new();
                 signatures
-                    .run(|| import.append_page(&encode(page).unwrap(), NOW))
+                    .run(|| import.append_page(&encode(page).unwrap(), now))
                     .unwrap();
                 assert_eq!(signatures.counts().actual_verifications, 0);
                 assert_eq!(import.page_count, 1);
@@ -682,15 +879,41 @@ mod tests {
         }
         let signatures = SignatureVerification::new();
         let context = signatures
-            .run(|| import.finish(&encode(&witness).unwrap(), NOW))
+            .run(|| import.finish(&encode(&witness).unwrap(), now))
             .unwrap();
         assert_eq!(context.policy.heads(), snapshot.payload.target_heads);
-        assert_eq!(context.policy.journal(), original.bundle.journal);
+        assert_eq!(context.policy.journal(), before.bundle.journal);
         assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
+        assert_usage(&context.usage);
         stages.push(serde_json::json!({"stage":"finish","usage":context.usage,"actual":signatures.counts()}));
+        (context, pages)
+    }
+
+    #[test]
+    fn twelve_node_history_imports_with_exact_heads_and_bounded_individual_calls() {
+        let original = super::super::super::tests::account_with_enrolled_nodes(12);
+        let material = build_account_recovery_material(
+            &original,
+            &key(1),
+            &key(2),
+            "https://node.example",
+            10_000.0,
+        )
+        .unwrap();
+        let mut stages = Vec::new();
+        let (context, pages) =
+            import_account_history(&original, &material, &key(50), NOW, EXPIRY, 90, &mut stages);
+        let read = context.request().clone();
+        let RecoveryReadRequest::Account(request) = read.clone() else {
+            unreachable!()
+        };
+        let snapshot = context.snapshot().clone();
+        let witness = context.witness().clone();
         let signatures = SignatureVerification::new();
         let prepared = signatures
-            .run(|| prepare_account_recovery(&material, &context, &key(51), &key(50), EXPIRY, NOW))
+            .run(|| {
+                prepare_account_recovery(&material, &context, &key(51), &key(50), 1_000_000.0, NOW)
+            })
             .unwrap();
         assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
         stages.push(serde_json::json!({"stage":"prepare","actual":signatures.counts()}));
@@ -817,18 +1040,204 @@ mod tests {
         stages.push(
             serde_json::json!({"stage":"pending_restore","actual":signatures_restore.counts()}),
         );
+        let current = confirmed_client(
+            &recovered,
+            &key(50),
+            &key(4),
+            EXPIRY as u64 + 1,
+            EXPIRY as u64 + 30_000,
+            &mut stages,
+        );
+        let completed_heads = committed.committed_heads();
+        let receipt = Signed::sign(
+            RecoveryCompletionReceipt {
+                version: AUTH_VERSION,
+                context: commit.context.clone(),
+                request_hash: commit.request_hash.clone(),
+                input_hash: ObjectHash::body(&commit).unwrap(),
+                committed_account_head: completed_heads[0].clone(),
+                committed_space_head: completed_heads[1].clone(),
+                grant_leaf: commit.grant_leaf.clone(),
+                new_device_public_key: commit.new_device_public_key.clone(),
+                source_node_public_key: PublicKey::of(&key(4)),
+                accepted_at_ms: NOW as u64,
+            },
+            &key(4),
+        )
+        .unwrap();
+        let confirmed = measured(&mut stages, "pending_confirm_current_auth", || {
+            restored.confirm_completion(&encode(&receipt).unwrap(), &current, EXPIRY + 1.0)
+        });
+        assert_eq!(
+            confirmed.authorization().scope_json().unwrap(),
+            current.scope_json().unwrap()
+        );
+        assert_eq!(
+            confirmed.client_identity().unwrap().public_key_hex(),
+            key(50).public_key_hex()
+        );
+        let second_now = EXPIRY + 2.0;
+        let second_expiry = second_now + 30_000.0;
+        let mut second_stages = Vec::new();
+        let (second_context, second_pages) = import_account_history(
+            &recovered,
+            &next_material,
+            &key(53),
+            second_now,
+            second_expiry,
+            92,
+            &mut second_stages,
+        );
+        assert_eq!(second_context.request().saved_pins(), recovered.pins);
+        assert_eq!(second_context.policy.heads(), committed.committed_heads());
+        assert_eq!(
+            second_context
+                .verified_state()
+                .account(&recovered.authorization.scope.account_id)
+                .unwrap()
+                .current_root,
+            PublicKey::of(&key(51))
+        );
+        let second_prepared = measured(&mut second_stages, "prepare", || {
+            prepare_account_recovery(
+                &next_material,
+                &second_context,
+                &key(52),
+                &key(53),
+                1_000_000.0,
+                second_now,
+            )
+        });
+        let second_approved: StreamedRecoveryNodeRequest =
+            serde_json::from_str(&second_prepared.node_request_json().unwrap()).unwrap();
+        let second_prefix_commitment = ObjectHash::body(&(
+            "fixed-native-accepted-prefix",
+            recovered.bundle.journal.len(),
+            ObjectHash::body(recovered.bundle.journal.last().unwrap()).unwrap(),
+        ))
+        .unwrap();
+        let (second_possession, second_source_approval) =
+            measured(&mut second_stages, "possession", || {
+                approve_recovery_source_proposal(
+                    &second_approved,
+                    second_context.request(),
+                    second_context.snapshot(),
+                    second_context.witness(),
+                    &recovered.authorization.policy_snapshot,
+                    &key(4),
+                    second_context.request().nonce(),
+                    &second_prefix_commitment,
+                    second_now as u64,
+                )
+            });
+        let second_recovered = measured(&mut second_stages, "recovery_finish", || {
+            finish_account_recovery(
+                &second_prepared,
+                &key(52),
+                second_possession.as_str(),
+                second_now,
+            )
+        });
+        let second_commit: StreamedRecoveryCommitRequest =
+            serde_json::from_str(&second_prepared.commit_json(&second_recovered).unwrap()).unwrap();
+        let second_committed = measured(&mut second_stages, "commit", || {
+            let source = verify_recovery_source_proposal_approval(
+                &second_source_approval,
+                second_context.request(),
+                &second_approved.context,
+                &ObjectHash::body(&second_approved)?,
+                &second_approved.request.account_recovery,
+                &second_possession,
+                &recovered.authorization.policy_snapshot,
+                &PublicKey::of(&key(4)),
+                &second_prefix_commitment,
+                second_now as u64,
+            )?;
+            verify_recovery_stream_commit_with_source_approval(
+                &second_commit,
+                &second_approved,
+                second_context.request(),
+                &recovered.authorization.policy_snapshot,
+                &source,
+                second_now as u64,
+            )
+        });
+        assert_usage(second_committed.proof_usage());
+        second_stages.last_mut().unwrap()["usage"] =
+            serde_json::to_value(second_committed.proof_usage()).unwrap();
+        assert_eq!(
+            second_committed.authorization().scope,
+            second_recovered.authorization.scope
+        );
+        assert_eq!(
+            second_committed.committed_heads(),
+            second_recovered
+                .pins
+                .iter()
+                .filter_map(|pin| pin.minimum_head.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(second_recovered.authorization.imported_snapshot.is_some());
+        assert_eq!(
+            second_recovered
+                .authorization
+                .policy_snapshot
+                .account(&recovered.authorization.scope.account_id)
+                .unwrap()
+                .current_root,
+            PublicKey::of(&key(52))
+        );
+        let second_material = measured(&mut second_stages, "backup", || {
+            build_recovered_account_recovery_material(
+                &second_recovered,
+                &key(52),
+                &next_material,
+                "https://node.example",
+                second_now,
+            )
+        });
+        let mut material_usage = RecoveryProofUsage::new(second_material.len()).unwrap();
+        material_usage.merge_usage(
+            &recovery_material_usage(&read_material(&second_material).unwrap()).unwrap(),
+        );
+        let material_usage = material_usage.finish().unwrap();
+        assert_usage(&material_usage);
+        second_stages.last_mut().unwrap()["usage"] = serde_json::to_value(material_usage).unwrap();
+        let third_request_json = measured(&mut second_stages, "third_read_request", || {
+            context::build_recovery_context_request(
+                &second_material,
+                &key(54),
+                &key(4).public_key_hex(),
+                second_now + 1.0,
+                second_expiry,
+            )
+        });
+        let third_request: Signed<RecoveryContextRequest> =
+            serde_json::from_str(&third_request_json).unwrap();
+        assert_eq!(third_request.payload.saved_pins, second_recovered.pins);
+        assert_ne!(third_request.payload.saved_pins, recovered.pins);
+        assert_eq!(third_request.payload.account, request.payload.account);
+        assert_eq!(third_request.payload.space, request.payload.space);
+        assert_eq!(
+            third_request.payload.node_public_key,
+            PublicKey::of(&key(4))
+        );
+        assert_eq!(third_request.issuer, PublicKey::of(&key(2)));
         let max_actual = stages
             .iter()
+            .chain(&second_stages)
             .filter_map(|stage| stage["actual"]["actual_verifications"].as_u64())
             .max()
             .unwrap();
         let max_objects = stages
             .iter()
+            .chain(&second_stages)
             .filter_map(|stage| stage["usage"]["proof"]["unique_signed_objects"].as_u64())
             .max()
             .unwrap();
         let max_bytes = stages
             .iter()
+            .chain(&second_stages)
             .filter_map(|stage| stage["usage"]["carrier_bytes"].as_u64())
             .max()
             .unwrap();
@@ -836,6 +1245,7 @@ mod tests {
             "bounded recovery import evidence: {}",
             serde_json::json!({"root_approved_node_enrollments":12,
             "full_public_bundle_bytes":original.bundle_json().unwrap().len(),"pages":pages.len(),
+            "recovery_rounds":2,"second_round_pages":second_pages.len(),"third_read_ready":true,
             "max_actual":max_actual,"max_objects":max_objects,"max_carrier_bytes":max_bytes})
         );
         if let Ok(path) = std::env::var("VIBEFACE_BOUNDED_RECOVERY_VECTOR") {
@@ -843,7 +1253,14 @@ mod tests {
                 "request":request,"snapshot":snapshot,"pages":pages,"witness":witness,
                 "expected":{"scope":original.authorization.scope,"heads":context.policy.heads()},
                 "node_request":approved,"node_possession":possession,"source_approval":source_approval,"prefix_commitment":prefix_commitment,"commit":commit,
-                "next_material":next_material,"pending":*pending_json,"stages":stages});
+                "next_material":next_material,"pending":*pending_json,"stages":stages,
+                "second_round":{"now":second_now,"expiry":second_expiry,
+                    "request":match second_context.request() { RecoveryReadRequest::Account(request) => request, _ => unreachable!() },
+                    "snapshot":second_context.snapshot(),"pages":second_pages,"witness":second_context.witness(),
+                    "node_request":second_approved,"node_possession":second_possession,
+                    "source_approval":second_source_approval,"prefix_commitment":second_prefix_commitment,
+                    "commit":second_commit,"next_material":second_material,
+                    "third_read_request":third_request,"stages":second_stages}});
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create(true).truncate(true);
             #[cfg(unix)]
@@ -852,6 +1269,12 @@ mod tests {
                 options.mode(0o600);
             }
             let mut file = options.open(path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
             std::io::Write::write_all(&mut file, &serde_json::to_vec(&value).unwrap()).unwrap();
         }
     }

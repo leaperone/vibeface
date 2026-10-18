@@ -595,11 +595,6 @@ fn approved_commit_usage(
     let mut metadata = ExecutionProofUsage::default();
     metadata.record_metadata(&(&input.pins, &input.grant_leaf))?;
     usage.merge_usage(&metadata);
-    #[cfg(test)]
-    eprintln!(
-        "cross approved proposal usage: {}",
-        serde_json::to_string(&usage.diagnostic_counts()).unwrap()
-    );
     let mut staged = before.clone();
     for (index, entry) in input.journal_delta.iter().enumerate() {
         if index == 0 {
@@ -617,19 +612,9 @@ fn approved_commit_usage(
                 &input.possession.node_request.expected_account_head,
             )?;
         } else {
-            let part = policy_entry_usage_with_cache(&staged, entry, cached);
-            #[cfg(test)]
-            if let Err(error) = &part {
-                eprintln!("cross approved delta {index} error: {error:?}");
-            }
-            usage.merge_usage(&part?);
+            usage.merge_usage(&policy_entry_usage_with_cache(&staged, entry, cached)?);
             apply_policy_entry(&mut staged, &input.pins, entry.clone())?;
         }
-        #[cfg(test)]
-        eprintln!(
-            "cross approved delta {index} usage: {}",
-            serde_json::to_string(&usage.diagnostic_counts()).unwrap()
-        );
     }
     Ok(usage)
 }
@@ -718,11 +703,6 @@ pub fn verify_cross_node_recovery_stream_commit_with_source_approval(
         Some(source_approval.cache_for_current(before)?),
     )?;
     source_approval.record_proof_usage_into(&mut verified.proof)?;
-    #[cfg(test)]
-    eprintln!(
-        "cross source approval union usage: {}",
-        serde_json::to_string(&verified.proof.diagnostic_counts()).unwrap()
-    );
     verified.proof_usage = verified.proof.clone().finish()?;
     Ok(verified)
 }
@@ -1086,6 +1066,11 @@ mod tests {
     use super::*;
     use crate::signature_verification::SignatureVerification;
 
+    thread_local! {
+        static STAGE_USAGE: std::cell::RefCell<Vec<serde_json::Value>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     const NOW: u64 = 20_000;
     const EXPIRY: u64 = 80_000;
     const END: u64 = 1_000_000;
@@ -1108,7 +1093,19 @@ mod tests {
             "cross stream {label}: {}",
             serde_json::to_string(&signatures.counts()).unwrap()
         );
+        STAGE_USAGE.with(|stages| {
+            stages.borrow_mut().push(serde_json::json!({
+                "stage": label,
+                "actual": signatures.counts(),
+            }));
+        });
         value
+    }
+
+    fn record_stage_proof(proof: impl serde::Serialize) {
+        STAGE_USAGE.with(|stages| {
+            stages.borrow_mut().last_mut().unwrap()["proof"] = serde_json::to_value(proof).unwrap();
+        });
     }
 
     struct Fixture {
@@ -1123,25 +1120,106 @@ mod tests {
     impl Fixture {
         fn new(nodes: u8) -> Self {
             let original = super::super::super::tests::account_with_enrolled_nodes(nodes);
-            let material = checked("material", || {
+            let material = Self::material(&original);
+            Self::from_backup(original, material)
+        }
+
+        fn material(original: &CreatedAccount) -> String {
+            checked("material", || {
                 build_account_recovery_material(
-                    &original,
+                    original,
                     &key(1),
                     &key(2),
                     "https://source.example",
                     10_000.0,
                 )
+            })
+        }
+
+        fn with_later_source_project() -> Self {
+            let mut original = super::super::super::tests::account_with_enrolled_nodes(0);
+            let material = Self::material(&original);
+            let mut state = original.authorization.policy_snapshot.clone();
+            let space_id = original.authorization.scope.space_id.clone();
+            let first = state
+                .resources
+                .values()
+                .find(|record| record.payload.kind == ResourceKind::Project)
+                .unwrap();
+            let first_hash = first.hash().unwrap();
+            let first_resource = first.payload.resource.clone();
+            let resource = ResourceId::from_bytes([199; 32]);
+            assert_ne!(resource, first_resource);
+            let record = (0..128)
+                .find_map(|index| {
+                    let record = Signed::sign(
+                        ResourceRecord {
+                            version: AUTH_VERSION,
+                            space: space_id.clone(),
+                            resource: resource.clone(),
+                            kind: ResourceKind::Project,
+                            host: ServiceId::from_key(&PublicKey::of(&key(4))),
+                            issued_under: state
+                                .head(&PolicyDomain::Space(space_id.clone()))
+                                .unwrap()
+                                .clone(),
+                            nonce: Nonce::from_bytes([index; 32]),
+                        },
+                        &key(1),
+                    )
+                    .unwrap();
+                    (record.hash().unwrap().cmp(&first_hash) != resource.cmp(&first_resource))
+                        .then_some(record)
+                })
+                .expect("fixture must put ObjectHash and ResourceId in opposite orders");
+            let hash = state.install_resource(record.clone()).unwrap();
+            let mut space = state.space(&space_id).unwrap().clone();
+            space.previous = state.head(&PolicyDomain::Space(space_id.clone())).cloned();
+            space.sequence += 1;
+            space.resources.push(hash);
+            space.resources.sort();
+            let space = Signed::sign(space, &key(1)).unwrap();
+            let head = state.install_space(space.clone()).unwrap();
+            original
+                .bundle
+                .journal
+                .extend([JournalEntry::Resource(record), JournalEntry::Space(space)]);
+            original
+                .pins
+                .iter_mut()
+                .find(|pin| pin.domain == head.domain)
+                .unwrap()
+                .minimum_head = Some(head.clone());
+            original.authorization = checked("latest_source_policy", || {
+                verify_client_policy_state(
+                    state,
+                    &original.bundle,
+                    &original.pins,
+                    original.authorization.scope.account_id.clone(),
+                    space_id,
+                    PublicKey::of(&key(3)),
+                    NOW,
+                )
             });
-            let project = original
+            Self::from_backup(original, material)
+        }
+
+        fn from_backup(original: CreatedAccount, material: String) -> Self {
+            let mut projects = original
                 .authorization
                 .policy_snapshot
                 .resources
                 .values()
-                .find(|record| {
+                .filter(|record| {
                     record.payload.kind == ResourceKind::Project
                         && record.payload.host == ServiceId::from_key(&PublicKey::of(&key(4)))
                 })
-                .unwrap();
+                .map(|record| ResourceRef {
+                    space: record.payload.space.clone(),
+                    resource: record.payload.resource.clone(),
+                })
+                .collect::<Vec<_>>();
+            projects.sort_by(|left, right| left.resource.cmp(&right.resource));
             let nonce = Nonce::from_bytes([44; 32]);
             let claim_json =
                 create_node_claim(&key(7), nonce.as_str(), NOW as f64, EXPIRY as f64).unwrap();
@@ -1158,11 +1236,7 @@ mod tests {
                     &key(51),
                     &key(50),
                     &claim,
-                    &encode(&vec![ResourceRef {
-                        space: project.payload.space.clone(),
-                        resource: project.payload.resource.clone(),
-                    }])
-                    .unwrap(),
+                    &encode(&projects).unwrap(),
                     (END - 1000) as f64,
                     NOW as f64,
                     EXPIRY as f64,
@@ -1259,14 +1333,27 @@ mod tests {
                     at,
                 )
             });
+            record_stage_proof(
+                serde_json::from_str::<serde_json::Value>(&import.proof_usage_json().unwrap())
+                    .unwrap(),
+            );
             for page in &self.pages {
                 checked("import_page", || {
                     import.append_page(&encode(page).unwrap(), at as f64)
                 });
+                record_stage_proof(
+                    serde_json::from_str::<serde_json::Value>(&import.proof_usage_json().unwrap())
+                        .unwrap(),
+                );
             }
-            checked("import_finish", || {
+            let context = checked("import_finish", || {
                 import.finish(&encode(&self.witness).unwrap(), at as f64)
-            })
+            });
+            record_stage_proof(
+                serde_json::from_str::<serde_json::Value>(&context.proof_usage_json().unwrap())
+                    .unwrap(),
+            );
+            context
         }
 
         fn prepare(
@@ -1294,14 +1381,27 @@ mod tests {
                     at as f64,
                 )
             });
+            record_stage_proof(
+                serde_json::from_str::<serde_json::Value>(&import.proof_usage_json().unwrap())
+                    .unwrap(),
+            );
             for page in &self.pages {
                 checked("client_import_page", || {
                     import.append_page(&encode(page).unwrap(), at as f64)
                 });
+                record_stage_proof(
+                    serde_json::from_str::<serde_json::Value>(&import.proof_usage_json().unwrap())
+                        .unwrap(),
+                );
             }
-            checked("client_import_finish", || {
+            let context = checked("client_import_finish", || {
                 import.finish(&encode(&self.witness).unwrap(), at as f64)
-            })
+            });
+            record_stage_proof(
+                serde_json::from_str::<serde_json::Value>(&context.proof_usage_json().unwrap())
+                    .unwrap(),
+            );
+            context
         }
 
         fn prefix_commitment(&self) -> ObjectHash {
@@ -1342,6 +1442,16 @@ mod tests {
                     NOW,
                 )
             });
+            assert!(
+                cross_node::finish_cross_node_account_recovery(
+                    &prepared,
+                    &key(51),
+                    source_proof.as_str(),
+                    target_proof.as_str(),
+                    NOW as f64,
+                )
+                .is_err()
+            );
             let pending = checked("finish", || {
                 cross_node::finish_cross_node_account_recovery(
                     &prepared,
@@ -1360,53 +1470,49 @@ mod tests {
             input: &StreamedCrossNodeRecoveryCommitRequest,
             source_approval: &Signed<RecoverySourceProposalApproval>,
         ) -> StreamedCrossNodeRecoveryCommitted {
-            let signatures = SignatureVerification::new();
-            let committed = signatures
-                .run(|| {
-                    let source_proof = input
-                        .journal_delta
-                        .iter()
-                        .find_map(|entry| match entry {
-                            JournalEntry::Device(value)
-                                if value.payload.public_key
-                                    == *self.read.source_node_public_key() =>
-                            {
-                                value.payload.possession.as_ref()
-                            }
-                            _ => None,
-                        })
-                        .unwrap();
-                    let approved = verify_recovery_source_proposal_approval(
-                        source_approval,
-                        &self.read,
-                        &input.possession.context,
-                        &ObjectHash::body(&input.possession).unwrap(),
-                        &input.possession.node_request.account_recovery,
-                        source_proof,
-                        &self.original.authorization.policy_snapshot,
-                        &PublicKey::of(&key(4)),
-                        &self.prefix_commitment(),
-                        NOW,
-                    )?;
-                    let verified = verify_cross_node_recovery_stream_commit_with_source_approval(
-                        input,
-                        &self.read,
-                        &self.snapshot,
-                        &self.witness,
-                        &self.original.authorization.policy_snapshot,
-                        &approved,
-                        &PublicKey::of(&key(4)),
-                        NOW,
-                    )
+            let (committed, proof_usage) = checked("source_commit", || {
+                let source_proof = input
+                    .journal_delta
+                    .iter()
+                    .find_map(|entry| match entry {
+                        JournalEntry::Device(value)
+                            if value.payload.public_key == *self.read.source_node_public_key() =>
+                        {
+                            value.payload.possession.as_ref()
+                        }
+                        _ => None,
+                    })
                     .unwrap();
-                    accept_cross_node_recovery_stream_commit(&verified, &key(4), NOW)
-                })
+                let approved = verify_recovery_source_proposal_approval(
+                    source_approval,
+                    &self.read,
+                    &input.possession.context,
+                    &ObjectHash::body(&input.possession).unwrap(),
+                    &input.possession.node_request.account_recovery,
+                    source_proof,
+                    &self.original.authorization.policy_snapshot,
+                    &PublicKey::of(&key(4)),
+                    &self.prefix_commitment(),
+                    NOW,
+                )?;
+                let verified = verify_cross_node_recovery_stream_commit_with_source_approval(
+                    input,
+                    &self.read,
+                    &self.snapshot,
+                    &self.witness,
+                    &self.original.authorization.policy_snapshot,
+                    &approved,
+                    &PublicKey::of(&key(4)),
+                    NOW,
+                )
                 .unwrap();
-            assert!(signatures.counts().actual_verifications <= MAX_PROOF_SIGNATURES);
-            eprintln!(
-                "cross stream source commit: {}",
-                serde_json::to_string(&signatures.counts()).unwrap()
-            );
+                let committed = accept_cross_node_recovery_stream_commit(&verified, &key(4), NOW)?;
+                let mut usage = RecoveryProofUsage::new(canonical(&committed)?.len())?;
+                verified.record_proof_usage_into(&mut usage);
+                usage.record_cross_completion(&committed.receipt)?;
+                Ok::<_, AuthorizationError>((committed, usage.finish()?))
+            });
+            record_stage_proof(proof_usage);
             committed
         }
     }
@@ -1615,6 +1721,256 @@ mod tests {
         checked("inspect_final", || {
             inspect_account_recovery_material(&material, (EXPIRY + 1) as f64)
         });
+    }
+
+    #[test]
+    fn streamed_cross_uses_latest_source_projects_in_resource_order() {
+        STAGE_USAGE.with(|stages| stages.borrow_mut().clear());
+        let fixture = Fixture::with_later_source_project();
+        let old_sources: serde_json::Value = serde_json::from_str(
+            &cross_node::inspect_cross_node_recovery_sources(&fixture.material, NOW as f64)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(old_sources["source_projects"].as_array().unwrap().len(), 1);
+        let read = cross_request(&fixture.read).unwrap();
+        assert_eq!(read.payload.source_read_resources.len(), 2);
+        assert!(
+            read.payload.source_read_resources[0].resource
+                < read.payload.source_read_resources[1].resource
+        );
+        let before = &fixture.original.authorization.policy_snapshot;
+        let hash_order = before
+            .space(fixture.read.space())
+            .unwrap()
+            .resources
+            .iter()
+            .filter_map(|hash| before.resources.get(hash))
+            .filter(|record| record.payload.kind == ResourceKind::Project)
+            .map(|record| record.payload.resource.clone())
+            .collect::<Vec<_>>();
+        assert_ne!(
+            hash_order,
+            read.payload
+                .source_read_resources
+                .iter()
+                .map(|resource| resource.resource.clone())
+                .collect::<Vec<_>>()
+        );
+        let mut missing = read.payload.clone();
+        missing.source_read_resources = vec![ResourceRef {
+            space: fixture.read.space().clone(),
+            resource: ResourceId::from_bytes([198; 32]),
+        }];
+        assert!(
+            cross_node::verify_cross_node_recovery_request(
+                before,
+                &Signed::sign(missing, &key(2)).unwrap(),
+                &PublicKey::of(&key(4)),
+                NOW,
+            )
+            .is_err()
+        );
+        let claim = verify_node_claim(
+            &encode(&read.payload.target_claim).unwrap(),
+            &key(7).public_key_hex(),
+            Nonce::from_bytes([44; 32]).as_str(),
+            NOW as f64,
+        )
+        .unwrap();
+        assert!(
+            cross_node::build_cross_node_recovery_request(
+                &fixture.material,
+                &key(51),
+                &key(50),
+                &claim,
+                &encode(&vec![ResourceRef {
+                    space: SpaceId::personal(&AccountId::from_root(&PublicKey::of(&key(8)))),
+                    resource: read.payload.source_read_resources[0].resource.clone(),
+                }])
+                .unwrap(),
+                (END - 1000) as f64,
+                NOW as f64,
+                EXPIRY as f64,
+            )
+            .is_err()
+        );
+        let (input, approval, source_approval, mut pending) = fixture.commit();
+        let committed = fixture.accept(&input, &source_approval);
+        let context = fixture.import(NOW);
+        let token = checked("target_install", || {
+            verify_cross_node_recovery_stream_installation(
+                context,
+                &approval,
+                &committed,
+                &PublicKey::of(&key(7)),
+                &Nonce::from_bytes([44; 32]),
+                NOW,
+            )
+        });
+        record_stage_proof(token.proof_usage());
+        let (after, pins, journal) = token.into_store_parts();
+        assert_eq!(
+            after.space(fixture.read.space()).unwrap().resources.len(),
+            3
+        );
+        for resource in &read.payload.source_read_resources {
+            assert_eq!(
+                after.resource(&resource.space, &resource.resource),
+                before.resource(&resource.space, &resource.resource)
+            );
+        }
+        let source_grants = input
+            .journal_delta
+            .iter()
+            .filter_map(|entry| match entry {
+                JournalEntry::Grant(value)
+                    if value.payload.audience.device
+                        == DeviceId::from_key(&PublicKey::of(&key(4))) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(source_grants.len(), 2);
+        for (grant, resource) in source_grants
+            .iter()
+            .zip(&read.payload.source_read_resources)
+        {
+            assert_eq!(grant.payload.scope, ResourceScope::Exact(resource.clone()));
+            assert_eq!(grant.payload.actions, cross_node::source_read_actions());
+            assert_eq!(grant.payload.remaining_delegations, 0);
+            let authorization = checked("source_read", || {
+                verify_client_policy_state(
+                    after.clone(),
+                    &ClientAuthorizationBundle {
+                        journal: journal.clone(),
+                        grant_leaf: grant.hash().unwrap(),
+                    },
+                    &pins,
+                    fixture.read.account().clone(),
+                    fixture.read.space().clone(),
+                    PublicKey::of(&key(50)),
+                    NOW,
+                )
+            });
+            assert_eq!(authorization.audience_public_key(), &PublicKey::of(&key(4)));
+            assert_eq!(authorization.resources().len(), 1);
+            assert_eq!(
+                authorization.resources()[0].payload.resource,
+                resource.resource
+            );
+        }
+        let pending_material = checked("pending_material", || {
+            pending.recovery_material_json(
+                &key(51),
+                &fixture.material,
+                "https://target.example",
+                NOW as f64,
+            )
+        });
+        assert!(
+            cross_node::finish_cross_node_recovery_commit(
+                &pending,
+                &encode(&committed).unwrap(),
+                (NOW - 1) as f64,
+            )
+            .is_err()
+        );
+        let completed = checked("client_receipt", || {
+            cross_node::finish_cross_node_recovery_commit(
+                &pending,
+                &encode(&committed).unwrap(),
+                NOW as f64,
+            )
+        });
+        let authorization = checked("target_authorization", || completed.authorization());
+        assert_eq!(authorization.audience_public_key(), &PublicKey::of(&key(7)));
+        assert_eq!(authorization.resources().len(), 1);
+        assert_eq!(
+            authorization.resources()[0].payload.host,
+            ServiceId::from_key(&PublicKey::of(&key(7)))
+        );
+        let selections: serde_json::Value =
+            serde_json::from_str(&completed.source_read_selections_json().unwrap()).unwrap();
+        assert_eq!(selections.as_array().unwrap().len(), 2);
+        for (selection, resource) in selections
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(&read.payload.source_read_resources)
+        {
+            assert_eq!(
+                selection["project"],
+                serde_json::to_value(resource).unwrap()
+            );
+            assert!(selection.get("authorization").is_none());
+            assert!(selection.get("bundle").is_none());
+        }
+        let after_material = checked("final_material", || {
+            completed.final_recovery_material_json("https://target.example", NOW as f64)
+        });
+        checked("inspect_final", || {
+            inspect_account_recovery_material(&after_material, NOW as f64)
+        });
+        assert!(
+            verify_cross_node_recovery_stream_commit_in_state(
+                &input,
+                &fixture.read,
+                &fixture.snapshot,
+                &fixture.witness,
+                &after,
+                &PublicKey::of(&key(4)),
+                NOW,
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        if let Ok(path) = std::env::var("VIBEFACE_CROSS_NODE_RECOVERY_VECTOR") {
+            use std::io::Write;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let stages = STAGE_USAGE.with(|stages| stages.borrow().clone());
+            let vector = serde_json::json!({
+                "format": "vibeface-cross-node-recovery-stream-vector",
+                "version": AUTH_VERSION,
+                "now_ms": NOW,
+                "expires_at_ms": EXPIRY,
+                "device_expires_at_ms": END,
+                "material_before": fixture.material,
+                "material_after": after_material,
+                "pending_material": pending_material,
+                "independent_pins": fixture.original.pins,
+                "request": read,
+                "snapshot": fixture.snapshot,
+                "pages": fixture.pages,
+                "witness": fixture.witness,
+                "target_approval": approval,
+                "source_approval": source_approval,
+                "source_prefix_commitment": fixture.prefix_commitment(),
+                "possession": input.possession,
+                "commit_request": input,
+                "committed": committed,
+                "expected_scope": authorization.scope(),
+                "expected_heads": authorization.heads,
+                "source_read_selections": selections,
+                "stage_usage": stages,
+                "synthetic_keys": {
+                    "next_root_secret_hex": key(51).secret_hex(),
+                    "next_client_secret_hex": key(50).secret_hex(),
+                },
+            });
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap();
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            file.write_all(encode(&vector).unwrap().as_bytes()).unwrap();
+        }
     }
 
     #[test]
@@ -1845,12 +2201,13 @@ mod tests {
             .cloned();
         account.sequence += 1;
         account.recovery.keys = vec![PublicKey::of(&key(9))];
+        account.recovery.generation += 1;
         account.root_acceptance = None;
         account.recovery_approvals.clear();
+        account.approve_recovery(&key(2)).unwrap();
         let recovery_policy = account.recovery.clone();
-        rotated
-            .install_account(Signed::sign(account, &key(1)).unwrap())
-            .unwrap();
+        let account = Signed::sign(account, &key(1)).unwrap();
+        rotated.install_account(account.clone()).unwrap();
         let mut space = rotated.space(fixture.read.space()).unwrap().clone();
         space.previous = rotated
             .head(&PolicyDomain::Space(space.space.clone()))
@@ -1859,18 +2216,85 @@ mod tests {
         space.recovery = recovery_policy;
         space.root_acceptance = None;
         space.recovery_approvals.clear();
-        rotated
-            .install_space(Signed::sign(space, &key(1)).unwrap())
-            .unwrap();
-        let fresh = Signed::sign(read.payload.clone(), &key(9)).unwrap();
+        let space = Signed::sign(space, &key(1)).unwrap();
+        rotated.install_space(space.clone()).unwrap();
+        let mut rotated_created = fixture.original.clone();
+        rotated_created
+            .bundle
+            .journal
+            .extend([JournalEntry::Account(account), JournalEntry::Space(space)]);
+        for pin in &mut rotated_created.pins {
+            pin.minimum_head = rotated.head(&pin.domain).cloned();
+        }
+        rotated_created.authorization = checked("rotated_policy", || {
+            verify_client_policy_state(
+                rotated.clone(),
+                &rotated_created.bundle,
+                &rotated_created.pins,
+                fixture.read.account().clone(),
+                fixture.read.space().clone(),
+                PublicKey::of(&key(3)),
+                NOW,
+            )
+        });
+        let rotated_material = checked("rotated_material", || {
+            build_account_recovery_material(
+                &rotated_created,
+                &key(1),
+                &key(9),
+                "https://source.example",
+                NOW as f64,
+            )
+        });
+        let rotated_fixture = Fixture::from_backup(rotated_created, rotated_material);
+        let fresh = cross_request(&rotated_fixture.read).unwrap();
         cross_node::verify_cross_node_recovery_request(
             &rotated,
-            &fresh,
+            fresh,
             &PublicKey::of(&key(4)),
             NOW,
         )
         .unwrap();
+        let (fresh_input, fresh_approval, fresh_source_approval, _) = rotated_fixture.commit();
+        let fresh_committed = rotated_fixture.accept(&fresh_input, &fresh_source_approval);
+        let fresh_context = rotated_fixture.import(NOW);
+        checked("rotated_target_install", || {
+            verify_cross_node_recovery_stream_installation(
+                fresh_context.clone(),
+                &fresh_approval,
+                &fresh_committed,
+                &PublicKey::of(&key(7)),
+                &Nonce::from_bytes([44; 32]),
+                NOW,
+            )
+        });
+        let claim = verify_node_claim(
+            &encode(&fresh.payload.target_claim).unwrap(),
+            &key(7).public_key_hex(),
+            Nonce::from_bytes([44; 32]).as_str(),
+            NOW as f64,
+        )
+        .unwrap();
+        let reused_key_error =
+            "recovery requires independent root and client keys unused by historical policy";
+        let public_reused_key_error = format!("InvalidProof({reused_key_error:?})");
         for old_key_as_root in [true, false] {
+            let next_root = key(if old_key_as_root { 2 } else { 51 });
+            let next_client = key(if old_key_as_root { 50 } else { 2 });
+            assert_eq!(
+                cross_node::build_cross_node_recovery_request(
+                    &rotated_fixture.material,
+                    &next_root,
+                    &next_client,
+                    &claim,
+                    &encode(&fresh.payload.source_read_resources).unwrap(),
+                    (END - 1000) as f64,
+                    NOW as f64,
+                    EXPIRY as f64,
+                )
+                .unwrap_err(),
+                public_reused_key_error,
+            );
             let mut changed = fresh.payload.clone();
             if old_key_as_root {
                 changed.new_root_public_key = old_recovery.clone();
@@ -1878,11 +2302,94 @@ mod tests {
                 changed.new_device_public_key = old_recovery.clone();
             }
             let changed = Signed::sign(changed, &key(9)).unwrap();
-            assert!(
+            assert!(matches!(
                 cross_node::verify_cross_node_recovery_request(
                     &rotated,
                     &changed,
                     &PublicKey::of(&key(4)),
+                    NOW,
+                ),
+                Err(AuthorizationError::InvalidProof(message)) if message == reused_key_error
+            ));
+            let request_hash = changed.hash().unwrap();
+            let mut snapshot = rotated_fixture.snapshot.payload.clone();
+            snapshot.request_hash = request_hash.clone();
+            let snapshot = Signed::sign(snapshot, &key(4)).unwrap();
+            assert!(matches!(
+                begin_cross_node_recovery_context_import(
+                    &rotated_fixture.material,
+                    &encode(&changed).unwrap(),
+                    &encode(&snapshot).unwrap(),
+                    NOW as f64,
+                ),
+                Err(message) if message == public_reused_key_error
+            ));
+            let mut import = checked("reused_key_target_import_begin", || {
+                begin_cross_node_recovery_policy_import(
+                    &encode(&changed).unwrap(),
+                    &encode(&snapshot).unwrap(),
+                    &key(7).public_key_hex(),
+                    Nonce::from_bytes([44; 32]).as_str(),
+                    NOW,
+                )
+            });
+            let mut previous = snapshot.hash().unwrap();
+            for page in &rotated_fixture.pages {
+                let mut page = page.payload.clone();
+                page.request_hash = request_hash.clone();
+                page.previous_page_hash = previous;
+                let page = Signed::sign(page, &key(4)).unwrap();
+                previous = page.hash().unwrap();
+                checked("reused_key_target_import_page", || {
+                    import.append_page(&encode(&page).unwrap(), NOW as f64)
+                });
+            }
+            let mut witness = rotated_fixture.witness.payload.clone();
+            witness.request_hash = request_hash;
+            witness.final_page_hash = previous;
+            let witness = Signed::sign(witness, &key(4)).unwrap();
+            checked("reused_key_target_import_rejected", || {
+                match import.finish_native(witness, NOW) {
+                    Err(AuthorizationError::InvalidProof(message))
+                        if message == reused_key_error =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err("C import did not reject the exact historical key reuse"),
+                }
+            });
+            let mut changed_possession = fresh_input.possession.clone();
+            changed_possession.request = changed;
+            assert!(
+                approve_cross_node_recovery_import(
+                    &fresh_context,
+                    &changed_possession,
+                    &key(7),
+                    &Nonce::from_bytes([44; 32]),
+                    NOW,
+                )
+                .is_err()
+            );
+            let mut changed_committed = fresh_committed.clone();
+            changed_committed.request.possession = changed_possession;
+            let mut changed_receipt = changed_committed.receipt.payload.clone();
+            changed_receipt.request_hash =
+                changed_committed.request.possession.request.hash().unwrap();
+            changed_receipt.input_hash = ObjectHash::body(&changed_committed.request).unwrap();
+            changed_receipt.new_device_public_key = PublicKey::of(&next_client);
+            changed_committed.receipt = Signed::sign(changed_receipt, &key(4)).unwrap();
+            let mut changed_approval = fresh_approval.payload.clone();
+            changed_approval.new_root_public_key = PublicKey::of(&next_root);
+            changed_approval.new_device_public_key = PublicKey::of(&next_client);
+            changed_approval.possession_hash =
+                ObjectHash::body(&changed_committed.request.possession).unwrap();
+            assert!(
+                verify_cross_node_recovery_stream_installation(
+                    fresh_context.clone(),
+                    &Signed::sign(changed_approval, &key(7)).unwrap(),
+                    &changed_committed,
+                    &PublicKey::of(&key(7)),
+                    &Nonce::from_bytes([44; 32]),
                     NOW,
                 )
                 .is_err()

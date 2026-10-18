@@ -8,6 +8,12 @@ pub(crate) struct CachedPolicyProof {
 }
 
 impl CachedPolicyProof {
+    pub(crate) fn from_verified_snapshot(
+        snapshot: &crate::authorization::policy_import::VerifiedPolicySnapshot,
+    ) -> Self {
+        Self::from_locally_approved_state(snapshot.state())
+    }
+
     pub(crate) fn from_locally_approved_state(state: &VerifiedPolicySet) -> Self {
         Self {
             known: BTreeMap::new(),
