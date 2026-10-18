@@ -2995,7 +2995,7 @@ pub(crate) mod tests {
             body: &Value,
         ) -> Result<(
             VerifiedDispatchFacts,
-            VerifiedAuthorization,
+            TaskScopedAuthorization,
             FreshnessProof,
             TransportEvidence,
         )> {
@@ -3008,7 +3008,7 @@ pub(crate) mod tests {
             at: u64,
         ) -> Result<(
             VerifiedDispatchFacts,
-            VerifiedAuthorization,
+            TaskScopedAuthorization,
             FreshnessProof,
             TransportEvidence,
         )> {
@@ -3029,7 +3029,7 @@ pub(crate) mod tests {
             leaf: &ObjectHash,
         ) -> Result<(
             VerifiedDispatchFacts,
-            VerifiedAuthorization,
+            TaskScopedAuthorization,
             FreshnessProof,
             TransportEvidence,
         )> {
@@ -3037,6 +3037,29 @@ pub(crate) mod tests {
                 .store
                 .execution_dispatch_facts(body, &self.audience, at)?;
             let facts = dispatch.facts();
+            if body["method"] == "bind_execution" {
+                let source = self.confirmed_project_client(at)?;
+                let context = vibeface_secure::authorization::prepare::PrepareContext {
+                    context: facts.context.clone(),
+                    binding_generation: Some(1),
+                    canonical_cwd: body["cwd"].as_str().map(str::to_owned),
+                    execution_target_public_key: Some(PublicKey::parse(
+                        &self.executor.node.public_key_hex()?,
+                    )?),
+                };
+                let selection = json!({"execution_resource":self.execution,
+                    "target_public_key":self.executor.node.public_key_hex()?,"execution_grant":self.grant});
+                let pins = self.executor.pins.clone();
+                self.imported_execution_policy(
+                    &source,
+                    &selection,
+                    &context,
+                    facts.action,
+                    vibeface_secure::authorization::remote_execution_policy::RemoteExecutionPolicyPurpose::Execution,
+                    &pins,
+                    at,
+                )?;
+            }
             let device = DeviceId::from_key(&PublicKey::of(signer));
             let mut heads = vec![
                 self.store
@@ -3084,10 +3107,20 @@ pub(crate) mod tests {
                 signer,
             )?;
             let transport = TransportEvidence::DirectNoise { device };
-            let auth =
+            let auth = self.store.authorize_scoped_request_for_body(
+                &self.project.node,
+                &invocation,
+                facts,
+                &transport,
+                body,
+                at,
+            )?;
+            let dispatch =
                 self.store
-                    .authorize_request_for_body(&invocation, facts, &transport, body, at)?;
-            let challenge = self.store.issue_freshness(&auth, CheckStage::Admit, at)?;
+                    .execution_dispatch_facts_in_scope(&auth, body, auth.audience(), at)?;
+            let challenge = self
+                .store
+                .issue_scoped_freshness(&auth, CheckStage::Admit, at)?;
             let mut receipts =
                 self.store
                     .sign_current_receipts(&challenge, &self.project.node, at)?;
@@ -3128,7 +3161,7 @@ pub(crate) mod tests {
             self.store.bind_execution_dispatch(
                 &self.project.node,
                 &dispatch,
-                &TaskScopedAuthorization::from_primary(auth.clone()),
+                &auth,
                 &proof,
                 &transport,
                 &body,
@@ -3200,23 +3233,56 @@ pub(crate) mod tests {
             let intent = build_remote_execution_policy_read_intent(
                 source,
                 &json!({"selection":selection,"context":context,"expected_action":action,
-                    "purpose":purpose,"execution_pins":independent_pins})
+                    "purpose":purpose,"execution_pins":independent_pins,
+                    "work":ExecutionWorkIntent::TaskSession {
+                        task:EventRef::parse(&self.task.hash)?,
+                        binding_generation:context.binding_generation.context("fixture binding generation is missing")?,
+                        execution_session:context.context.execution_session.clone().context("fixture execution session is missing")?,
+                    }})
                 .to_string(),
                 &self.project.client,
                 at as f64,
                 (at + 60_000) as f64,
             )
             .map_err(anyhow::Error::msg)?;
+            let intent: Value = serde_json::from_str(&intent)?;
+            let choice = self.store.foreign_execution_policy_selection(
+                &self.project.node,
+                &principal,
+                &intent,
+                at,
+            )?;
+            let approval_ref = if choice["approval_ref"].is_null() {
+                self.store.foreign_execution_policy_approve(
+                    &self.project.node,
+                    &principal,
+                    &intent,
+                    at,
+                )?["approval_ref"]
+                    .clone()
+            } else {
+                choice["approval_ref"].clone()
+            };
             let delegation = self.store.remote_execution_policy_delegate(
                 &self.project.node,
                 &principal,
-                &serde_json::from_str(&intent)?,
+                &intent,
                 at,
             )?;
-            let request = json!({"intent":serde_json::from_str::<Value>(&intent)?,
-                "delegation":delegation["delegation"]});
+            let request = json!({"intent":intent,"delegation":delegation["delegation"]});
             let mut c = self.executor.memory()?;
-            c.install_policy_journal(&self.journal, at)?;
+            let execution_journal: Vec<_> = self
+                .journal
+                .iter()
+                .filter(|entry| match entry {
+                    JournalEntry::Resource(value) => value.payload.space == self.executor.space,
+                    JournalEntry::Grant(value) => value.payload.owner_space == self.executor.space,
+                    JournalEntry::Space(value) => value.payload.space == self.executor.space,
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            c.install_policy_journal(&execution_journal, at)?;
             let prepared =
                 c.remote_execution_policy_prepare(&self.executor.node, &principal, &request, at)?;
             assert!(prepared.get("authorization").is_none());
@@ -3229,6 +3295,13 @@ pub(crate) mod tests {
                 at as f64,
             )
             .map_err(anyhow::Error::msg)?;
+            let begun = self.store.foreign_execution_policy_begin(
+                &self.project.node,
+                &principal,
+                &json!({"request":request,"snapshot":prepared["snapshot"],"approval_ref":approval_ref}),
+                at,
+            )?;
+            let import_ref: ObjectHash = serde_json::from_value(begun["import_ref"].clone())?;
             let mut page_count = 0;
             loop {
                 let params = serde_json::from_str(
@@ -3239,6 +3312,12 @@ pub(crate) mod tests {
                 assert!(response.get("authorization").is_none());
                 let page: Signed<RemoteExecutionPolicyPage> =
                     serde_json::from_value(response["page"].clone())?;
+                self.store.foreign_execution_policy_page(
+                    &self.project.node,
+                    &principal,
+                    &json!({"import_ref":import_ref,"page":page}),
+                    at,
+                )?;
                 importer
                     .append_page(&serde_json::to_string(&page)?, at as f64)
                     .map_err(anyhow::Error::msg)?;
@@ -3256,6 +3335,12 @@ pub(crate) mod tests {
             let response =
                 c.remote_execution_policy_finish(&self.executor.node, &principal, &params, at)?;
             assert!(response.get("authorization").is_none());
+            self.store.foreign_execution_policy_finish(
+                &self.project.node,
+                &principal,
+                &json!({"import_ref":import_ref,"witness":response["witness"]}),
+                at,
+            )?;
             importer
                 .finish(&response["witness"].to_string(), at as f64)
                 .map_err(anyhow::Error::msg)
@@ -3325,7 +3410,7 @@ pub(crate) mod tests {
         f.store.accept_execution_dispatch(
             &f.project.node,
             &facts,
-            &TaskScopedAuthorization::from_primary(auth.clone()),
+            &auth,
             &fresh,
             &transport,
             &body,
@@ -3388,7 +3473,7 @@ pub(crate) mod tests {
         f.store.accept_execution_dispatch(
             &f.project.node,
             &dispatch,
-            &TaskScopedAuthorization::from_primary(auth.clone()),
+            &auth,
             &proof,
             &transport,
             &body,
@@ -4146,7 +4231,7 @@ pub(crate) mod tests {
                 .accept_execution_dispatch(
                     &f.project.node,
                     &dispatch,
-                    &TaskScopedAuthorization::from_primary(auth.clone()),
+                    &auth,
                     &proof,
                     &transport,
                     &body,
@@ -4182,7 +4267,7 @@ pub(crate) mod tests {
         let accepted = f.store.accept_execution_dispatch(
             &f.project.node,
             &dispatch,
-            &TaskScopedAuthorization::from_primary(auth.clone()),
+            &auth,
             &proof,
             &transport,
             &body,
@@ -4215,7 +4300,7 @@ pub(crate) mod tests {
                 .accept_execution_dispatch(
                     &f.project.node,
                     &dispatch,
-                    &TaskScopedAuthorization::from_primary(auth.clone()),
+                    &auth,
                     &proof,
                     &transport,
                     &body,
